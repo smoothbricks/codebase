@@ -267,6 +267,43 @@ fn payload_root(image: &Path) -> Result<PathBuf, ApfsStorageError> {
     })
 }
 
+/// Where `image`'s payload is mounted, read without changing anything: for fact passes, which
+/// hold no workspace lock and must not finish a move another operation is making. A move in
+/// flight (the payload waiting at its move sibling) is not a mount yet.
+fn observed_mount(image: &Path) -> Result<Option<PathBuf>, ApfsStorageError> {
+    let metadata = match fs::symlink_metadata(image) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("inspect payload", image, error)),
+    };
+    if !metadata.file_type().is_symlink() || is_real_directory(&move_sibling(image))? {
+        return Ok(None);
+    }
+    let mount_point = fs::read_link(image)
+        .map_err(|error| io_error("read mount record", image, error))?;
+    Ok(is_real_directory(&mount_point)?.then_some(mount_point))
+}
+
+/// Where `image`'s payload directory is now, read without changing anything: its image path,
+/// its move sibling while it moves, or its mountpoint.
+fn observed_payload_root(image: &Path) -> Result<PathBuf, ApfsStorageError> {
+    let metadata = fs::symlink_metadata(image)
+        .map_err(|error| io_error("inspect payload", image, error))?;
+    if metadata.file_type().is_dir() {
+        return Ok(image.to_owned());
+    }
+    let sibling = move_sibling(image);
+    if is_real_directory(&sibling)? {
+        return Ok(sibling);
+    }
+    observed_mount(image)?.ok_or_else(|| {
+        ApfsStorageError::Host(format!(
+            "mount record {} names no payload",
+            image.display()
+        ))
+    })
+}
+
 /// Refuse unless `image`'s payload is at its image path: renaming a mount record into the
 /// trash or an undo generation would move a symlink and leave the payload behind.
 fn require_home(image: &Path) -> Result<(), ApfsStorageError> {
@@ -535,6 +572,9 @@ impl DirectoryExecutionHost {
         &self.config
     }
 
+    /// No symlink between the store root and `path`. An image path's own final entry is exempt:
+    /// while its payload is mounted it is the mount record, a symlink naming the mountpoint, and
+    /// [`settle`] validates it before anything reaches the payload through it.
     fn verify_controller_path(&self, path: &Path) -> Result<(), ApfsStorageError> {
         if path == self.config.store_root {
             let metadata = fs::symlink_metadata(path)
@@ -545,7 +585,11 @@ impl DirectoryExecutionHost {
                 ));
             }
         } else if path.starts_with(&self.config.store_root) {
-            verify_no_symlinks(&self.config.store_root, path)?;
+            let checked = match path.parent() {
+                Some(parent) if is_image_path(path) && parent != self.config.store_root => parent,
+                _ => path,
+            };
+            verify_no_symlinks(&self.config.store_root, checked)?;
         }
         Ok(())
     }
@@ -653,29 +697,58 @@ impl DirectoryExecutionHost {
         Ok(facts)
     }
 
+    /// Whether `path` is a payload of this store mounted there: the marker inside it names a
+    /// workspace whose image path is a mount record naming `path`. A tree that merely carries a
+    /// marker (a user's checkout with a stale `.cowshed/`) is not one.
+    fn mounted_payload_at(&self, path: &Path) -> Result<bool, ApfsStorageError> {
+        let Ok(marker) = WorkspaceMarker::read_from(&path.join(WORKSPACE_MARKER_PATH)) else {
+            return Ok(false);
+        };
+        let image = layout(&self.config, &marker.repo_id)?
+            .canonical_image(&marker.workspace)?
+            .image()
+            .to_owned();
+        match fs::symlink_metadata(&image) {
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::read_link(&image)
+                .map(|target| target == path)
+                .map_err(|error| io_error("read mount record", &image, error)),
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(io_error("inspect payload", &image, error)),
+        }
+    }
+
     /// Hand the checkout path over to a mountpoint, retaining the displaced tree at `retained`:
     /// one `RENAME_SWAP` of the original tree with an empty directory, then a rename of the tree
-    /// to its retained name. Converges from an interrupted attempt and never moves a bound one.
+    /// to its retained name. Converges from an interrupted attempt and never moves a mounted main.
     fn vacate_checkout_to(
         &self,
         source_checkout: &Path,
         retained: &Path,
     ) -> Result<(), PublicationError> {
         let staging = checkout_mountpoint_staging_path(source_checkout);
-        let checkout = mount_point_state(source_checkout).map_err(PublicationError::rolled_back)?;
-        // A Git checkout cannot be empty. An empty mountpoint is a completed swap only when its
-        // displaced nonempty tree exists at a handoff name; a binding is a mounted main.
-        let already_swapped = match checkout {
-            MountPointState::Bound(_) => true,
-            MountPointState::Vacant => [staging.as_path(), retained]
-                .into_iter()
-                .try_fold(false, |found, path| {
-                    Ok::<_, ApfsStorageError>(
-                        found || (path_exists(path)? && !empty_mountpoint(path)?),
-                    )
-                })
-                .map_err(PublicationError::rolled_back)?,
-            MountPointState::Absent | MountPointState::Occupied => false,
+        // A main mounted at the checkout means the handoff already happened. Otherwise a Git
+        // checkout cannot be empty: an empty mountpoint is a completed swap only when its
+        // displaced nonempty tree exists at a handoff name.
+        let already_swapped = if self
+            .mounted_payload_at(source_checkout)
+            .map_err(PublicationError::rolled_back)?
+        {
+            true
+        } else {
+            match mount_point_state(source_checkout).map_err(PublicationError::rolled_back)? {
+                MountPointState::Vacant => [staging.as_path(), retained]
+                    .into_iter()
+                    .try_fold(false, |found, path| {
+                        Ok::<_, ApfsStorageError>(
+                            found || (path_exists(path)? && !empty_mountpoint(path)?),
+                        )
+                    })
+                    .map_err(PublicationError::rolled_back)?,
+                MountPointState::Absent | MountPointState::Link | MountPointState::Occupied => {
+                    false
+                }
+            }
         };
         if already_swapped {
             if !path_exists(&staging).map_err(PublicationError::forward_only)? {
@@ -745,11 +818,12 @@ impl DirectoryExecutionHost {
         }
     }
 
-    /// Clone the payload tree `source` to the new payload `destination`: every leaf by
-    /// `clonefile` (or a reflink, or a copy where neither exists), until a pass observes the
-    /// source unchanged. A failed clone leaves no destination.
+    /// Clone the payload `source` - read wherever it is, mounted or not - to the new payload
+    /// `destination`: every leaf by `clonefile` (or a reflink, or a copy where neither exists),
+    /// until a pass observes the source unchanged. A failed clone leaves no destination.
     fn clone_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError> {
-        require_payload_directory(source)?;
+        let source = payload_root(source)?;
+        let source = source.as_path();
         if path_exists(destination)? {
             return Err(ApfsStorageError::Host(format!(
                 "clone destination already exists: {}",
@@ -823,11 +897,14 @@ impl DirectoryExecutionHost {
         }
     }
 
-    /// Delete a payload tree inside the store. Its records stay for the caller.
+    /// Delete a payload inside the store, unmounting it first if it is mounted: the mount
+    /// record goes back to being the payload directory, which is then removed. Its records stay
+    /// for the caller.
     fn delete_payload(&self, image: &Path) -> Result<bool, ApfsStorageError> {
         self.require_store_image(image)?;
         match fs::symlink_metadata(image) {
-            Ok(metadata) if metadata.file_type().is_dir() => {
+            Ok(metadata) if metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {
+                release_mount(image, DetachIntent::Release)?;
                 remove_payload_tree(image)?;
                 Ok(true)
             }
@@ -1117,19 +1194,19 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         }))
     }
 
-    /// Unbind whatever binding of `image` the adoption's staging made, then reclaim it.
+    /// Unmount the unpublished payload from wherever it is mounted (its adoption's staging
+    /// mountpoint, or the checkout), then reclaim it.
     fn discard_pending(&self, image: &Path) -> Result<(), ApfsStorageError> {
-        let metadata = read_metadata(image)?;
-        let workspace = metadata_workspace_ref(&metadata)?;
-        let staging = super::apfs::staging_mount(&self.config, &workspace)?;
-        unbind(image, &staging)?;
-        unbind(image, &self.expected_mount_point(&metadata)?)?;
+        self.require_store_image(image)?;
+        if path_exists(image)? {
+            release_mount(image, DetachIntent::Release)?;
+        }
         self.reclaim_image(image)
     }
 
     fn unmount_attachment(&self, attachment: &Self::Attachment) -> Result<(), ApfsStorageError> {
         if let Some(mount_point) = attachment.bound() {
-            unbind(&attachment.image, &mount_point)?;
+            unbind(&attachment.image, &mount_point, DetachIntent::Release)?;
             attachment.set_bound(None);
         }
         Ok(())
@@ -1152,8 +1229,8 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             .map_err(host_error)
     }
 
-    /// Hold the payload `image`: a real directory inside the store with readable metadata. A
-    /// pending fence outside staging is a publication nobody may open.
+    /// Hold the payload `image`: a directory inside the store, at its image path or mounted,
+    /// with readable metadata. A pending fence outside staging is a publication nobody may open.
     fn attach_verified(&self, image: &Path) -> Result<Self::Attachment, ApfsStorageError> {
         self.require_store_image(image)?;
         let metadata = read_metadata(image)?;
@@ -1164,13 +1241,13 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         {
             return Err(ApfsStorageError::PendingPublication(image.to_owned()));
         }
-        require_payload_directory(image)?;
+        payload_root(image)?;
         Ok(DirectoryAttachment::new(image.to_owned()))
     }
 
-    /// Bind `mount_point` to the attachment's payload. A binding cannot be read-only: whoever
-    /// reaches the tree through it can write it, so a read-only mount is refused rather than
-    /// promised. `browse` is a Finder presentation flag with no meaning for a symlink.
+    /// Mount the attachment's payload at `mount_point` by moving it there. A directory cannot be
+    /// mounted read-only: whoever reaches the tree can write it, so a read-only mount is refused
+    /// rather than promised. `browse` is a Finder presentation flag with no meaning here.
     fn mount(
         &self,
         attachment: &Self::Attachment,
@@ -1186,7 +1263,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             && bound != mount_point
         {
             return Err(ApfsStorageError::Host(format!(
-                "{} is already bound at {}",
+                "{} is already mounted at {}",
                 attachment.image.display(),
                 bound.display()
             )));
@@ -1196,7 +1273,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         Ok(())
     }
 
-    /// Reuse a surviving binding of `image` at `mount_point`, or bind it.
+    /// Reuse a surviving mount of `image` at `mount_point`, or mount it there.
     fn attach_and_mount_resumable(
         &self,
         image: &Path,
@@ -1205,7 +1282,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
     ) -> Result<Self::Attachment, ApfsStorageError> {
         self.require_store_image(image)?;
         self.verify_controller_path(mount_point)?;
-        require_payload_directory(image)?;
+        payload_root(image)?;
         bind(image, mount_point)?;
         let attachment = DirectoryAttachment::new(image.to_owned());
         attachment.set_bound(Some(mount_point.to_owned()));
@@ -1338,43 +1415,46 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         validate_private_key(path).map_err(host_error)
     }
 
-    /// Release the attachment: its binding, when it made one. A held directory has nothing
-    /// else to let go of. A binding outlives no process: whoever is inside the tree keeps the
-    /// directory they are in, so neither intent waits for idleness.
+    /// Release the attachment: move its payload home from where this handle mounted it. A
+    /// `WhenIdle` release refuses while any process holds anything in the tree.
     fn detach(
         &self,
         attachment: Self::Attachment,
-        _intent: DetachIntent,
+        intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
-        self.unmount_attachment(&attachment)
+        if let Some(mount_point) = attachment.bound() {
+            unbind(&attachment.image, &mount_point, intent)?;
+        }
+        Ok(())
     }
 
-    /// A binding at the workspace's mountpoint must bind its own canonical payload and carry
-    /// its marker; there are no mount flags to heal.
+    /// A mounted workspace must be mounted at its own mountpoint and carry its own marker;
+    /// there are no mount flags to heal.
     fn heal_mount(
         &self,
         workspace: &LifecycleWorkspace,
         mount_point: &Path,
     ) -> Result<(), ApfsStorageError> {
-        let MountPointState::Bound(target) = mount_point_state(mount_point)? else {
-            return Ok(());
-        };
         let canonical = layout(&self.config, workspace.repo())?
             .canonical_image(workspace.name())?
             .image()
             .to_owned();
-        if target != canonical
+        let Some(current) = observed_mount(&canonical)? else {
+            return Ok(());
+        };
+        if current != mount_point
             || !self.marker_names(
-                &target,
+                &current,
                 workspace.repo(),
                 workspace.name(),
                 workspace.incarnation(),
             )
         {
             return Err(ApfsStorageError::Host(format!(
-                "cannot use unrelated binding at {}: it binds {}, which carries no {}/{} marker for incarnation {}",
+                "cannot use the mount of {} at {}: {} is its mountpoint, and the tree there must carry the {}/{} marker for incarnation {}",
+                canonical.display(),
+                current.display(),
                 mount_point.display(),
-                target.display(),
                 workspace.repo(),
                 workspace.name(),
                 workspace.incarnation()
@@ -1383,8 +1463,8 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         Ok(())
     }
 
-    /// The workspace's mount, kept: its binding must be the canonical one at the workspace's
-    /// mountpoint. The mount id is the binding's inode, which a new binding replaces.
+    /// The workspace's mount, kept: the canonical payload must be mounted, through this handle,
+    /// at the workspace's mountpoint. The mount id is the mount record's inode.
     fn retain_mounted(
         &self,
         workspace: &LifecycleWorkspace,
@@ -1395,30 +1475,35 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             .canonical_image(workspace.name())?
             .image()
             .to_owned();
-        if attachment.image != canonical || attachment.bound().as_deref() != Some(expected.as_path())
+        if attachment.image != canonical
+            || attachment.bound().as_deref() != Some(expected.as_path())
+            || settle(&canonical)? != Payload::Mounted(expected.clone())
         {
             return Err(ApfsStorageError::Host(format!(
-                "retained attachment of {} is not bound at {}'s mountpoint {}",
+                "retained attachment of {} is not mounted at {}'s mountpoint {}",
                 attachment.image.display(),
                 workspace.name(),
                 expected.display()
             )));
         }
-        binding_id(&expected)
+        binding_id(&canonical)
     }
 
     fn detach_mounted(
         &self,
         workspace: &LifecycleWorkspace,
-        _intent: DetachIntent,
+        intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
         let canonical = layout(&self.config, workspace.repo())?
             .canonical_image(workspace.name())?
             .image()
             .to_owned();
+        if !path_exists(&canonical)? {
+            return Ok(());
+        }
         let mount_point =
             main_aware_mount_point(&self.config, workspace.repo(), workspace.name())?;
-        unbind(&canonical, &mount_point)
+        unbind(&canonical, &mount_point, intent)
     }
 
     fn ensure_linked_build_volume(
@@ -1524,12 +1609,14 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
                 "a replacement mounts only at this host's canonical checkout",
             ));
         }
+        if self.mounted_payload_at(checkout)? {
+            return Err(ApfsStorageError::InvalidPlan(
+                "a payload is still mounted at the checkout a replacement mounts on",
+            ));
+        }
         match mount_point_state(checkout)? {
             MountPointState::Vacant => Ok(()),
-            MountPointState::Bound(_) => Err(ApfsStorageError::InvalidPlan(
-                "a payload is still bound at the checkout a replacement mounts on",
-            )),
-            MountPointState::Absent | MountPointState::Occupied => {
+            MountPointState::Absent | MountPointState::Link | MountPointState::Occupied => {
                 Err(ApfsStorageError::InvalidPlan(
                     "the checkout a replacement mounts on is not an empty directory",
                 ))
@@ -1680,6 +1767,8 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         for path in [staged, canonical, undo] {
             self.require_store_image(path)?;
         }
+        require_home(staged)?;
+        require_home(canonical)?;
         ensure_parent(undo)?;
         if path_exists(undo)? {
             return Err(ApfsStorageError::Host(format!(
@@ -1834,6 +1923,9 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         for path in [canonical, undo, staged] {
             self.require_store_image(path)?;
         }
+        for path in [canonical, undo] {
+            require_home(path)?;
+        }
         let canonical_sidecar = sidecar_path(canonical);
         let undo_sidecar = sidecar_path(undo);
         let staged_sidecar = sidecar_path(staged);
@@ -1884,6 +1976,8 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
     fn retire_image(&self, canonical: &Path, trash: &Path) -> Result<(), ApfsStorageError> {
         self.require_store_image(canonical)?;
         self.require_store_image(trash)?;
+        // The trash holds payloads, never mount records: the caller unmounts first.
+        require_home(canonical)?;
         ensure_parent(trash)?;
         let canonical_companion = companion_path(canonical);
         let trash_companion = companion_path(trash);
@@ -2021,38 +2115,39 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         Ok(pending)
     }
 
-    /// Every published workspace bound at its own mountpoint to its own canonical payload,
-    /// whose marker names it. A binding of anything else at a workspace's mountpoint refuses.
+    /// Every published workspace mounted at its own mountpoint, whose tree carries its marker.
+    /// A published payload mounted anywhere else refuses.
     fn mounts(&self, repo: &RepoId) -> Result<Vec<KernelMountFact>, ApfsStorageError> {
         let storage = layout(&self.config, repo)?;
         let mut mounts = Vec::new();
         for fact in self.published_facts(repo)? {
             let workspace = &fact.workspace;
-            let mount_point =
-                main_aware_mount_point(&self.config, workspace.repo(), workspace.name())?;
-            let MountPointState::Bound(target) = mount_point_state(&mount_point)? else {
+            let canonical = storage.canonical_image(workspace.name())?.image().to_owned();
+            let Some(current) = observed_mount(&canonical)? else {
                 continue;
             };
-            let canonical = storage.canonical_image(workspace.name())?.image().to_owned();
-            if target != canonical
+            let mount_point =
+                main_aware_mount_point(&self.config, workspace.repo(), workspace.name())?;
+            if current != mount_point
                 || !self.marker_names(
-                    &target,
+                    &current,
                     workspace.repo(),
                     workspace.name(),
                     workspace.incarnation(),
                 )
             {
                 return Err(ApfsStorageError::Host(format!(
-                    "workspace binding identity mismatch at {}: it binds {}, which carries no {}/{} marker for incarnation {}",
+                    "workspace mount identity mismatch: {} is mounted at {}, its mountpoint is {}, and the tree there must carry the {}/{} marker for incarnation {}",
+                    canonical.display(),
+                    current.display(),
                     mount_point.display(),
-                    target.display(),
                     workspace.repo(),
                     workspace.name(),
                     workspace.incarnation()
                 )));
             }
             mounts.push(KernelMountFact {
-                mount_id: binding_id(&mount_point)?,
+                mount_id: binding_id(&canonical)?,
                 volume_key: fact.volume_key,
             });
         }
@@ -2133,8 +2228,9 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
                 image.display()
             )));
         }
+        let root = observed_payload_root(image)?;
         let usage =
-            tree_usage(image).map_err(|error| io_error("measure payload", image, error))?;
+            tree_usage(&root).map_err(|error| io_error("measure payload", &root, error))?;
         let checkpoint_directory = layout(&self.config, workspace.repo())?
             .project()
             .checkpoints
@@ -2228,14 +2324,6 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         let project = layout(config, plan.repo())?.project().project_root.clone();
         self.execute_gc_plan(&project, plan)
     }
-}
-
-/// The identity of the binding at `mount_point`: its symlink's inode, which every new binding
-/// replaces, as a remount replaces a kernel mount id.
-fn binding_id(mount_point: &Path) -> Result<u64, ApfsStorageError> {
-    fs::symlink_metadata(mount_point)
-        .map(|metadata| metadata.ino())
-        .map_err(|error| io_error("inspect mount binding", mount_point, error))
 }
 
 impl DirectoryExecutionHost {
