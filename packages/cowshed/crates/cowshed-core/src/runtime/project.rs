@@ -92,11 +92,13 @@ pub struct RuntimeLogChunk {
 /// without a `clean` choice is a historical create, and a recorded choice is a fork. Private to
 /// the runtime; the stored `clean` field and its serde shape are unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "macos")]
 enum MintMode {
     Historical,
     Fork { clean: bool },
 }
 
+#[cfg(target_os = "macos")]
 fn mint_mode(options: &crate::storage::recovery::MintOptions) -> MintMode {
     match options.clean {
         None => MintMode::Historical,
@@ -155,7 +157,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
                 "set clean: true when selecting a ref",
             ));
         }
-        if workspace == main_name() {
+        if workspace.is_main() {
             return Err(CowshedError::usage(
                 "main is not a fork destination",
                 "choose a non-main workspace name",
@@ -164,7 +166,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
         self.resume_fork(
             workspace,
             crate::storage::recovery::MintOptions::fork(
-                Some(source.unwrap_or_else(main_name)),
+                Some(source.unwrap_or_else(WorkspaceName::main)),
                 options,
             ),
         )
@@ -662,6 +664,7 @@ mod recovery_scope_tests {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// The unfinished rename claiming `name`, if any: a true rename record names its source and its
 /// destination, and neither may be admitted until the record completes.
 fn unfinished_rename_claim<'a>(
@@ -678,6 +681,7 @@ fn unfinished_rename_claim<'a>(
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Whether a verb naming `scope`'s workspaces replays this pending rename because it names the
 /// rename's source. The destination is then that verb's own work.
 fn rename_selected_by_source(

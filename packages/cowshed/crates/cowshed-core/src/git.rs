@@ -8,7 +8,9 @@ use std::process::Output;
 
 use tokio::process::Command;
 
-use crate::api::dto::{GitOid, Sha256Digest};
+use crate::api::dto::GitOid;
+#[cfg(any(target_os = "macos", test))]
+use crate::api::dto::Sha256Digest;
 use crate::error::{CowshedError, Result};
 use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
 use cowshed_os::timing::timed_async;
@@ -22,6 +24,7 @@ pub struct RemoteUrl {
 /// The working-state digest a rename compares before and after handing a linked worktree across.
 /// A value only: it carries no authority and grants nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) struct RenameWorkState {
     /// SHA-256 of the length-framed status, index-vs-HEAD diff, working-vs-index diff, untracked
     /// and restored-link sections; see `GitRepository::rename_work_state`.
@@ -570,6 +573,7 @@ impl GitRepository {
         parse_oid(value, "HEAD")
     }
 
+    #[cfg(any(target_os = "macos", test))]
     /// Read-only digest of a workspace's working state for rename preservation. Without optional
     /// locks it covers the porcelain status with its branch header, the binary index-against-HEAD
     /// diff, the binary working-against-index diff, and the path, mode and bytes of every
@@ -670,6 +674,7 @@ impl GitRepository {
         })
     }
 
+    #[cfg(any(target_os = "macos", test))]
     /// The index file of a linked worktree, resolved without reading it.
     async fn linked_index_path(&self) -> Result<PathBuf> {
         let output = self
@@ -681,6 +686,7 @@ impl GitRepository {
         parse_one_path(&output.stdout, "linked worktree index")
     }
 
+    #[cfg(any(target_os = "macos", test))]
     /// SHA-256 of index bytes already read, hashed off the runtime's threads.
     async fn digest_index_bytes(bytes: Vec<u8>) -> Result<Sha256Digest> {
         tokio::task::spawn_blocking(move || {
@@ -691,6 +697,7 @@ impl GitRepository {
         .map_err(|error| CowshedError::internal(format!("hash linked worktree index: {error}")))
     }
 
+    #[cfg(any(target_os = "macos", test))]
     /// The restored links Git itself reports as tracked or untracked non-ignored, sorted. Ignored
     /// links are not Git's work, so they are neither exempted nor hashed.
     async fn git_visible_restored_links(&self, restored: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -734,6 +741,7 @@ impl GitRepository {
         Ok(sorted)
     }
 
+    #[cfg(target_os = "macos")]
     /// The plan that restores this tree's inherited links, as the paths it would rewrite, in order.
     /// Refuses, naming each link, when any link cannot be restored.
     pub(crate) async fn rename_link_paths(&self) -> Result<Vec<PathBuf>> {
@@ -3508,6 +3516,7 @@ fn porcelain_records(stdout: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// `git diff` arguments for the rename work digest: no optional locks, no external or textconv
 /// filters, binary bytes, and the pathspecs the caller built (`--`, `.`, and literal exclusions).
 fn diff_args(cached: bool, pathspecs: &[OsString]) -> Vec<OsString> {
@@ -3527,6 +3536,7 @@ fn diff_args(cached: bool, pathspecs: &[OsString]) -> Vec<OsString> {
     args
 }
 
+#[cfg(any(target_os = "macos", test))]
 /// Hash the bytes of untracked non-ignored paths and the presence of restored links. Each path
 /// contributes its raw bytes, mode and content (a symlink contributes its target; a regular file
 /// is streamed without following links). Any other entry type, or any read failure, refuses.
