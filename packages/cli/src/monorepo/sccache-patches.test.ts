@@ -37,6 +37,7 @@ function captureErrors(): { messages: string[]; restore: () => void } {
   return { messages, restore: () => error.mockRestore() };
 }
 
+const COWSHED_MANIFEST = 'packages/cowshed/package.json';
 const FLAKE = 'packages/cowshed/nix/sccache/flake.nix';
 const PATCH = 'packages/cowshed/nix/sccache/sccache-singleflight.patch';
 
@@ -89,11 +90,19 @@ describe('sccache patch references', () => {
     ]);
   });
 
-  it('reports a missing flake rather than passing on an empty directory', async () => {
-    const result = await check({});
+  it('reports a missing flake in a repository that carries cowshed, rather than passing', async () => {
+    const result = await check({ [COWSHED_MANIFEST]: '{}\n' });
     expect(result.failures).toBe(1);
     expect(result.messages).toEqual([
       'packages/cowshed/nix/sccache/flake.nix: missing; the sccache flake is not there',
     ]);
+  });
+
+  // `smoo monorepo check` runs in every consumer repository, and only the one that carries
+  // cowshed has an sccache flake to keep honest.
+  it('returns zero in a repository without cowshed', async () => {
+    const result = await check({ 'package.json': '{}\n' });
+    expect(result.failures).toBe(0);
+    expect(result.messages).toEqual([]);
   });
 });

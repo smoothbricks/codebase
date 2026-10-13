@@ -17,8 +17,14 @@ import { join } from 'node:path';
  *
  * So: every `.patch` in the directory must be referenced by `flake.nix`, and every path
  * `flake.nix` references must exist. Both directions, or the check has no teeth.
+ *
+ * Only a repository that carries cowshed has that flake. `smoo monorepo check` runs in every
+ * consumer repository too, where there is nothing here to keep honest, so the check applies only
+ * when `packages/cowshed` exists. It keys on the package, not on the flake's directory, so a change
+ * that deletes the whole directory here still fails as a missing flake.
  */
-const SCCACHE_FLAKE_DIR = 'packages/cowshed/nix/sccache';
+const COWSHED_PACKAGE_DIR = 'packages/cowshed';
+const SCCACHE_FLAKE_DIR = `${COWSHED_PACKAGE_DIR}/nix/sccache`;
 const SCCACHE_FLAKE = 'flake.nix';
 
 /**
@@ -38,6 +44,9 @@ function report(message: string): number {
 }
 
 export function validateSccachePatches(root: string): number {
+  if (!existsSync(join(root, COWSHED_PACKAGE_DIR))) {
+    return 0;
+  }
   const directory = join(root, SCCACHE_FLAKE_DIR);
   const flakePath = join(directory, SCCACHE_FLAKE);
   if (!existsSync(flakePath)) {
