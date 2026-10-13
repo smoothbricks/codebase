@@ -188,6 +188,7 @@ fn image(program: &str, argv: &[&[u8]]) -> ProcessImage {
             .iter()
             .map(|argument| CommandArg::new(OsString::from_vec(argument.to_vec())))
             .collect(),
+        truncated: false,
     }
 }
 
