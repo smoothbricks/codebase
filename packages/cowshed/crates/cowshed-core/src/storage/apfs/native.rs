@@ -1177,9 +1177,11 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// Name the volume of `image`, an image under the store, `label` (01_storage.md,
     /// "Ownership, identity, and the volume label"). The target is the volume device the kernel's
     /// attachment inventory maps the image to, re-proved under the image's lease and a raw pin
-    /// when the rename runs; never a path, which `diskutil` resolves to whatever volume holds it.
+    /// when the rename runs, with the mountpoint it was found at held and proven still that
+    /// device's mount root; never a path, which `diskutil` resolves to whatever volume holds it.
     /// An image the kernel does not hold, or whose volume is mounted nowhere, names nothing; one
-    /// it holds twice, or holds unformatted, is an inventory fault and refused.
+    /// it holds twice, or holds unformatted, is an inventory fault and refused, as is a volume
+    /// unmounted between the mount table read and the rename.
     pub fn label_image_volume(
         &self,
         image: &Path,
@@ -1199,7 +1201,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         if carries_label(&mount.mount_point, label)? {
             return Ok(super::Labelled::Already);
         }
-        self.backend.rename_volume(&attachment, label)?;
+        self.backend
+            .rename_volume(&attachment, &mount.mount_point, label)?;
         Ok(super::Labelled::Renamed)
     }
 
@@ -4217,11 +4220,12 @@ where
     fn rename_volume(
         &self,
         attachment: &AttachedImage,
+        mount_point: &Path,
         volume_name: &str,
     ) -> Result<(), ApfsStorageError> {
         self.require_store_image(attachment.image())?;
         self.backend
-            .rename_volume(attachment, volume_name)
+            .rename_volume(attachment, mount_point, volume_name)
             .map_err(Into::into)
     }
 

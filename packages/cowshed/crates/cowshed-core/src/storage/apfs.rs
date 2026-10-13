@@ -501,11 +501,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
             },
         }
     }
-    /// Rename the volume of `attachment`, a verified attachment of an image under the store,
-    /// through its device: never a path, which names whatever volume holds it.
+    /// Rename the volume of `attachment`, a verified attachment of an image under the store
+    /// mounted at `mount_point`, through its device: never a path, which names whatever volume
+    /// holds it. `mount_point` is proven still that device's mount root under the image's lease
+    /// before the rename runs.
     fn rename_volume(
         &self,
         attachment: &Self::Attachment,
+        mount_point: &Path,
         volume_name: &str,
     ) -> Result<(), ApfsStorageError>;
     fn mint_workspace_credentials(
@@ -3030,6 +3033,7 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
             if H::HAS_PHYSICAL_VOLUMES {
                 host.rename_volume(
                     &attachment,
+                    &staging_mount,
                     &volume_label(replacement.repo(), replacement.name()),
                 )?;
             }
