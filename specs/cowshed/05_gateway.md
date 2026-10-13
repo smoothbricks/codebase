@@ -458,9 +458,11 @@ core count.
   requests can deadlock on each other's tokens.
 - **Work-conserving.** No grant is capped below `want` for fairness' sake: with nobody else waiting, a grant is
   `min(want, free)`, so a lone runner may hold all N tokens, because idle tokens help nobody and a gate's wall time is
-  what the budget buys. What a newcomer needs is not a reserved half — it never waits out a whole run — but the
-  foreground band (Dynamic QoS, below): a foreground arrival demotes running normal work to utility instead of queueing
-  behind its tokens. Fairness among checkouts (the share rule above) still bounds a grant while another checkout waits.
+  what the budget buys. A lone waiter also takes the remaining free tokens when fewer than its fair share are free: on
+  an 18-token host, a runner holding 12 does not make the sole newcomer wait instead of taking the idle 6. What a
+  newcomer needs is not a reserved half — it never waits out a whole run — but the foreground band (Dynamic QoS, below):
+  a foreground arrival demotes running normal work to utility instead of queueing behind its tokens. Fairness among
+  checkouts (the share rule above) still bounds a grant while another checkout waits.
 - **Dynamic QoS.** A job's class states what it is; its band states how the host schedules it now, and the two move
   independently. Four bands, in scheduler order: **foreground**, **normal**, **utility**, **background**. The land turn
   — its holder and the gate lineage that follows it — and any job a model is waiting on run **foreground**. Ordinary
