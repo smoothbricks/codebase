@@ -67,25 +67,29 @@ Span completion entry types (all written to row 1):
   - Records the thrown value, because a thrown value is arbitrary: an `Error` whose outer message is empty and whose
     meaning sits in its `cause`, an `AggregateError` whose meaning sits in its `errors`, an `Error` from another realm,
     or no `Error` at all. A value is an `Error` when `Error.isError` says so (its `[[ErrorData]]` brand, which holds
-    across realms and which neither a `Symbol.toStringTag` nor a proxy can claim) or when it is an instance of the
-    host's `DOMException`: some hosts (bun) answer `Error.isError` false for a `DOMException`, and an `AbortError` or
-    `TimeoutError` must keep its name, message, code and stack. Recording requires a host with `Error.isError`. A value
-    is an `AggregateError` when it is an instance of this realm's `AggregateError`, so another realm's `AggregateError`
-    is recorded as an `Error` without its `errors`. `message` holds the outer `Error` message, or a non-`Error` value as
-    `<typeof>: <String(value)>`, each bounded to 4096 characters with the cut counted; in `exception_stack` each link's
-    `name` and `message` carry the same bound, so a long message leaves room for its stack. The `exception_stack` column
-    holds, for each `Error` link, `name: message`, then `[code]: <code>` when the link has a string or number `code`,
-    then `[stack]: <stack>`; for an `AggregateError`, each of its `errors` as a chain of its own after
-    `\n[errors <i>]: `; then every `cause` link after `\n[cause]: `. An object recorded earlier in the same value is
-    written as `[already recorded]` and ends its chain; primitives are recorded each time. A non-`Error` link is
-    recorded like a non-`Error` value and ends its chain.
+    across realms and which neither a `Symbol.toStringTag` nor a proxy can claim) or when it carries the host's
+    `DOMException` brand (the receiver check of `DOMException.prototype`'s `code` getter, which neither an object made
+    from that prototype nor a proxy can pass): some hosts (bun) answer `Error.isError` false for a `DOMException`, and
+    an `AbortError` or `TimeoutError` must keep its name, message, code and stack. Recording requires a host with
+    `Error.isError`. A value is an `AggregateError` when it is an instance of this realm's `AggregateError`, so another
+    realm's `AggregateError` is recorded as an `Error` without its `errors`. `message` holds the outer `Error` message,
+    or a non-`Error` value as `<typeof>: <String(value)>`, each bounded to 4096 characters with the cut counted; in
+    `exception_stack` each link's `name` and `message` carry the same bound, so a long message leaves room for its
+    stack. The `exception_stack` column holds, for each `Error` link, `name: message`, then `[code]: <code>` when the
+    link has a string or number `code`, then `[stack]: <stack>`; for an `AggregateError`, each of its `errors` as a
+    chain of its own after `\n[errors <i>]: `, when the list's `length` is a non-negative safe integer (a proxy's
+    `length` may answer anything; any other answer is written as `[unreadable errors: …]` in its place); then every
+    `cause` link after `\n[cause]: `. An object recorded earlier in the same value is written as `[already recorded]`
+    and ends its chain; primitives are recorded each time. A non-`Error` link is recorded like a non-`Error` value and
+    ends its chain.
   - The whole evidence has one budget: at most 64 links (the thrown value, every cause and every aggregated error) and
     16384 characters. Every recorded string, marker included, is cut to what the budget has left; what it cannot hold is
     never walked but marked in place (`[<part> not recorded]` for a link, `[<n> more errors not recorded]` for an
     `AggregateError`'s remaining errors). Two closing lines count what was left out:
     `[evidence budget spent: <n> links not walked]` (a stopped cause chain and each unwalked `errors` entry count as
-    one, whatever lies beneath them) and `[<n> more characters not recorded]`. A thrown value can be any size, and a
-    getter or proxy can mint a new link on every read, so only the budget bounds the work.
+    one, whatever lies beneath them; an `errors` entry that cannot be read still spends its link) and
+    `[<n> more characters not recorded]`. A thrown value can be any size, and a getter or proxy can mint a new link on
+    every read, so only the budget bounds the work.
   - No other own field of the thrown value is read (an `AggregateError`'s `errors` aside), and no non-`Error` value is
     serialized beyond its own bounded `String()`: an error's fields can carry request configuration or credentials, and
     values reach traces only when explicitly logged ([Security by Default](./01a_trace_schema_system.md)). Log what a

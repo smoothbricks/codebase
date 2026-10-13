@@ -743,15 +743,15 @@ The `message` column serves different purposes based on entry type:
 - **For log entries** (`info`, `debug`, `warn`, `error`): Contains the **message template**
 - **For feature flag entries** (`ff-access`, `ff-usage`): Contains the **flag name**
 
-| Entry Type                          | `message` Contains                                     | `uint64_value` Contains     |
-| ----------------------------------- | ------------------------------------------------------ | --------------------------- |
-| `span-start`, `span-ok`, `span-err` | Span name (e.g., `'create-user'`)                      | User `.uint64()` value      |
-| `span-exception`                    | Exception message (e.g., `'x is not a function'`)      | -                           |
-| `info`, `debug`, `warn`, `error`    | Log message template (e.g., `'User {userId} created'`) | User `.uint64()` value      |
-| `ff-access`, `ff-usage`             | Flag name (e.g., `'advancedValidation'`, `'darkMode'`) | -                           |
-| `period-start`                      | -                                                      | Period start timestamp (ns) |
-| `op-*` (all 8 op metric types)      | Op name (e.g., `'GET'`, `'createUser'`)                | Metric value (count or ns)  |
-| `buffer-*` (all 3 buffer types)     | -                                                      | Writes, spans, or capacity  |
+| Entry Type                          | `message` Contains                                                                                     | `uint64_value` Contains     |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------ | --------------------------- |
+| `span-start`, `span-ok`, `span-err` | Span name (e.g., `'create-user'`)                                                                      | User `.uint64()` value      |
+| `span-exception`                    | Outer `Error` message (e.g., `'x is not a function'`), or `<typeof>: <String(value)>`, bounded per 01h | -                           |
+| `info`, `debug`, `warn`, `error`    | Log message template (e.g., `'User {userId} created'`)                                                 | User `.uint64()` value      |
+| `ff-access`, `ff-usage`             | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)                                                 | -                           |
+| `period-start`                      | -                                                                                                      | Period start timestamp (ns) |
+| `op-*` (all 8 op metric types)      | Op name (e.g., `'GET'`, `'createUser'`)                                                                | Metric value (count or ns)  |
+| `buffer-*` (all 3 buffer types)     | -                                                                                                      | Writes, spans, or capacity  |
 
 ### Format String Pattern (CRITICAL) <a id="smoo/lmao!n/arrow-table-message.format-string"></a>
 
