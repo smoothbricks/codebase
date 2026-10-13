@@ -75,6 +75,8 @@ say() {
 rebase_onto_main() {
   while :; do
     base=$(git -C "$main" rev-parse HEAD)
+        # The old range must be explicitly cut off, never replayed by this ordinary rebase.
+    (cd "$main" && direnv exec "$main" bun "$here/land-judge.ts" history "$checkout" "$base") || return 1
     if outcome=$(cowshed --json rebase "$workspace" --expected-onto-head "$base"); then
       printf '%s\n' "$outcome" >&2
       head=$(git -C "$checkout" rev-parse HEAD)

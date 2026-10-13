@@ -14,6 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Call } from './land-host.plan.ts';
+import { judgeHistory, PRE_REWRITE_MAIN } from './land-judge.ts';
 
 // Behavioural tests of tooling/land-host.sh: the script runs for real, against real git repositories for main and the
 // workspace and the real tooling/land-judge.ts. Three things are stand-ins on PATH, because they are this machine's
@@ -323,6 +324,28 @@ function ledgerOf(land: Land, at: 'main' | 'ws' = 'main'): string | null {
 }
 
 describe('land-host.sh', () => {
+  it('refuses old ancestry and accepts only an explicit onto rebase without replaying the old range', () => {
+    const land = fixture();
+    const oldMain = git(land.main, 'rev-parse', 'HEAD');
+    const sourceBefore = git(land.ws, 'rev-parse', 'HEAD');
+    const newMain = git(land.main, 'commit-tree', 'HEAD^{tree}', '-m', 'chore: rewritten base');
+    git(land.main, 'update-ref', 'refs/heads/main', newMain, oldMain);
+    expect(PRE_REWRITE_MAIN).toBe('e9e596563bfaa8b337893bb7df9937f9f65d06ea');
+    expect(judgeHistory(land.ws, newMain, oldMain)).toEqual({
+      kind: 'refused',
+      why: 'source ancestry contains pre-rewrite main ' + oldMain,
+      remedy: 'git rebase --onto ' + newMain + ' ' + oldMain.slice(0, 9),
+    });
+    expect(git(land.ws, 'rev-parse', 'HEAD')).toBe(sourceBefore);
+    git(land.ws, 'fetch', '-q', land.main, newMain);
+    git(land.ws, 'rebase', '--onto', newMain, oldMain);
+    expect(judgeHistory(land.ws, newMain, oldMain)).toEqual({ kind: 'clean' });
+    expect(judgeHistory(join(land.ws, 'missing'), newMain, oldMain).kind).toBe('unavailable');
+    const run = land.land([DAEMON_STOP, passingRun(GATE)]);
+    expect(run.status).toBe(0);
+    expect(git(land.main, 'rev-parse', 'HEAD')).toBe(git(land.ws, 'rev-parse', 'HEAD'));
+  });
+
   it('rebases, stops the daemon, gates every project without bailing, and fast-forwards main to the gated commit', () => {
     const land = fixture();
     const gated = git(land.ws, 'rev-parse', 'HEAD');
