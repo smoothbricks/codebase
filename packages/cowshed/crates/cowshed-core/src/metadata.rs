@@ -16,10 +16,10 @@ pub const MARKER_VERSION: u32 = 1;
 pub const SIDECAR_VERSION: u32 = 1;
 pub const CHECKOUT_ROOT_VERSION: u32 = 1;
 pub const SLOT_BINDINGS_VERSION: u32 = 1;
+use cowshed_apfs::image::{IMAGE_EXTENSION, is_image_path};
 /// The macOS port range and the size new blocks get are the gateway's grammar; core names the
 /// same items rather than restating them.
 pub use cowshed_gateway_types::{MACOS_PORT_MAX, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE};
-use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
 
 #[derive(Debug)]
 pub enum MetadataError {
@@ -153,7 +153,6 @@ fn io_error(path: &Path, source: io::Error) -> MetadataError {
     }
 }
 
-
 /// Refuses any path that is not `<stem>.dmg`, naming the extension it found.
 pub fn validate_image_path(path: &Path) -> Result<(), MetadataError> {
     if is_image_path(path) {
@@ -165,7 +164,6 @@ pub fn validate_image_path(path: &Path) -> Result<(), MetadataError> {
         })
     }
 }
-
 
 /// Shared, immutable text: every request a handle sends carries its workspace, so a clone is a
 /// reference count, not a copy.

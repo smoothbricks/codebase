@@ -10,14 +10,13 @@ use std::time::SystemTime;
 
 use super::{DirectoryExecutionHost, unsupported};
 use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, ReleaseClaim};
-use cowshed_apfs::image::ImageCapacity;
-use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::runtime::build_volumes::Quiet;
 use crate::runtime::storage_host::RuntimeStorageHost;
 use crate::storage::apfs::native::{BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease};
 use crate::storage::apfs::{ApfsStorageError, Labelled};
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::storage::recovery::ReAdoptSource;
+use cowshed_apfs::image::ImageCapacity;
 
 impl RuntimeStorageHost for DirectoryExecutionHost {
     fn label_image_volume(
@@ -113,24 +112,6 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         claim: ReleaseClaim,
     ) -> Result<Option<BuildVolumeRefusal>, ApfsStorageError> {
         DirectoryExecutionHost::release_claimed(self, layout, claim)
-    }
-
-    fn settle_build_link(
-        &self,
-        layout: &BuildVolumeLayout,
-        workspace: &WorkspaceName,
-        incarnation: &WorkspaceIncarnation,
-        checkout: &Path,
-        linked: &BuildVolumeId,
-    ) -> Result<(), ApfsStorageError> {
-        DirectoryExecutionHost::settle_build_link(
-            self,
-            layout,
-            workspace,
-            incarnation,
-            checkout,
-            linked,
-        )
     }
 
     fn build_volume_capacity(

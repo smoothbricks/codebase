@@ -49,8 +49,7 @@ pub const RESTART_DISK_ARBITRATION_HINT: &str = "sudo killall diskarbitrationd: 
 
 /// What clears a 150 the leaked devices do not explain.
 pub const ORPHANS_FIRST_HINT: &str = "kill the orphaned diskimagesiod helpers `cowshed doctor` \
-     names (orphaned-disk-image-helpers), then `cowshed doctor --clear-attach-budget`; reboot if attaches still `;
-core.line
+     names (orphaned-disk-image-helpers), then `cowshed doctor --clear-attach-budget`; reboot if attaches still \
      fail with error code 150";
 
 /// How the lane's checkout runs the operator's reset ([`clear`]): the bin is built from the

@@ -1,0 +1,12 @@
+[package]
+name = "cowshed-apfs-tests"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# Real disk-image scenarios are consumers of the production API, never dependencies of the
+# workspace host. Editing a scenario therefore invalidates this lane, not the host's verdict.
+[dev-dependencies]
+cowshed-apfs = { path = "../cowshed-apfs" }
+cowshed-os = { path = "../cowshed-os" }
+libc = "0.2"

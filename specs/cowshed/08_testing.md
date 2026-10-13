@@ -228,13 +228,13 @@ vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on te
 same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 Lifecycle integration that does not assert a physical-volume property uses the same project controller and lifecycle
-executor with `DirectoryExecutionHost`. Its workspaces and build volumes are real directory payloads, cloned through
-the production tree-copy path; atomic filesystem bindings expose them at checkout and build paths. Git, Nx, gateway
+executor with `DirectoryExecutionHost`. Its workspaces and build volumes are real directory payloads, cloned through the
+production tree-copy path; atomic filesystem bindings expose them at checkout and build paths. Git, Nx, gateway
 connections, command supervision, lock contention, publication records and recovery journals remain real. These
-`directory_*` tests and the clone-intent recovery binary run in ordinary Cargo test shards without creating or
-attaching a disk image. Directory stores report actual tree allocation, not fabricated block-device counters; volume
-labels, physical resizing, read-only mounts and legacy-image conversion remain native-host tests. Their scratch roots
-use `/private/tmp/cowshed-dtest-<pid>-<n>-<label>` and share process cleanup with the image fixtures, but neither their
+`directory_*` tests and the clone-intent recovery binary run in ordinary Cargo test shards without creating or attaching
+a disk image. Directory stores report actual tree allocation, not fabricated block-device counters; volume labels,
+physical resizing, read-only mounts and legacy-image conversion remain native-host tests. Their scratch roots use
+`/private/tmp/cowshed-dtest-<pid>-<n>-<label>` and share process cleanup with the image fixtures, but neither their
 setup nor their cleanup enumerates or releases disk images.
 
 The Linux job-accounting fixture is a separate kernel-counter proof, not a production ZFS workspace-admission proof. It
@@ -259,19 +259,21 @@ reaches its template by `clonefile`, which cannot cross volumes; and Darwin's so
 runner's `TMPDIR`. The lease never detaches an image attached from below it; it keeps such a lease and names it.
 
 On macOS, disk-image coverage runs in the dedicated root `cargo-test-group-real-apfs` target, selected from the
-`cowshed-apfs` crate. Its source inputs are that crate's transitive local Cargo dependency closure: `cowshed-apfs`,
-`cowshed-os` and `cowshed-gateway-types`. The closure includes the image fixture pool and shared process-cleanup
-support. Cargo manifests and lockfile, effective Cargo configuration, nextest policy and the run-wrapper are inputs
-too; unrelated crate sources and the workspace archive's content hash are not inputs of this verdict. Changing an
-APFS implementation or one of its dependencies invalidates it; an unrelated source change preserves its cache key.
+`cowshed-apfs-tests` crate. Its source inputs are that crate's transitive local Cargo dependency closure:
+`cowshed-apfs-tests`, `cowshed-apfs`, `cowshed-os` and `cowshed-gateway-types`. The closure includes the image fixture
+pool and shared process-cleanup support. Cargo manifests and lockfile, effective Cargo configuration, nextest policy and
+the run-wrapper are inputs too; unrelated crate sources and the workspace archive's content hash are not inputs of this
+verdict. The test-only crate depends on the public device API; the host does not depend on the test crate. Changing a
+device scenario invalidates only the device verdict, changing the APFS implementation invalidates both device and host
+verdicts, and an unrelated source change preserves both cache keys.
 
 Native-host integration whose subject combines physical images with core lifecycle state runs in
-`cargo-test-group-real-apfs-host`, with its own core/CLI Cargo dependency closure. This includes actual mount and
-label assertions, image resizing, legacy-image re-adoption and native recovery boundaries. The host target depends on
-the disk-image target: the two groups never run concurrently. Each nextest group declares `max-threads = 1`.
+`cargo-test-group-real-apfs-host`, with its own core/CLI Cargo dependency closure. This includes actual mount and label
+assertions, image resizing, legacy-image re-adoption and native recovery boundaries. The host target depends on the
+disk-image target: the two groups never run concurrently. Each nextest group declares `max-threads = 1`.
 `.config/nextest.toml` owns their package-scoped selection filters, and the code-time wrapper rules select the same
-tests. Ordinary and exceptions shards exclude those filters; ordinary `cargo-test` excludes both groups, while the
-full `test` aggregate reaches them. Every test has one runner, and non-macOS planning creates neither APFS group.
+tests. Ordinary and exceptions shards exclude those filters; ordinary `cargo-test` excludes both groups, while the full
+`test` aggregate reaches them. Every test has one runner, and non-macOS planning creates neither APFS group.
 
 Every test target, the group included, is bounded by progress alone: the run ends when no test has finished for 180s,
 the hang backstop, and names the tests still running; it has no wall-clock ceiling, and no per-test bound kills a test
@@ -319,29 +321,26 @@ unattributed run summary or a failed check leaves it empty too.
 
 **Host limit.** The host's disk-image attach pool runs out (01_storage.md, "How the APFS host degrades" §2), and the
 suite stops spending into a spent one. The harness owns a lane-wide fixture pool
-(`packages/cowshed/crates/cowshed-apfs/tests/support/blank_image.rs`): it
-attaches each scenario image in its registry once per lane run and hands tests handles to mounts of an already-attached
-volume, so a test cannot attach an image of its own through the fixture API — the API hands out shared-fixture handles
-only, and no per-test attach helper is in tests' reach. Seeding a store clones the blank template and attaches nothing.
-Tests that inherently prove attach or detach behaviour keep their own attach through the production host; they are few
-and name that in their docs. Fixtures attach once per scenario and share; tests pay the fewest attach cycles that prove
-their behaviour. The pool refuses to attach past its registry, whose size — computed in code from the registry itself —
-is the lane's attach bound, so a new per-test attach fails the lane instead of silently spending the pool. A test whose
-setup and subject match a neighbour's becomes assertions in that neighbour rather than a separate test, and anything
-that does not need a real device is a pure or unit test with no image at all: the real-device lane holds a few scenario
-tests per fixture, not a test per behaviour. Every fixture first passes `attach_budget::harness_gate`, which reads only
-the boot and the pool record: once any test process meets error code 150, the system runner that met it records it, and
-every later fixture of the run, in whichever process, fails with `AttachPoolExhausted` and its `next:` step without
-attaching. A record the gate cannot read proves nothing about the pool, so it warns and the fixture proceeds. The lane
-stays `--no-fail-fast`, so its ordinary failures still run to the end; the refusal is the harness's own error, not a
-scheduler flag. There is no measured attach-count constant and no pre-lane admission gate: the `harness_gate` refusal at
-the first fixture that would spend into a spent pool is the fail-fast behaviour, and it needs no number from the lane.
-`attach-budget --clear` still ends a recorded 150 after the operator freed what spent it. The leaked-device delta across
-a lane run (`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no
-disk-image command still leaks on a clean run; it must be 0. A run's spend is counted, not estimated: with
-`COWSHED_DISK_COMMAND_RECORD` set (05_gateway.md, "Disk-lifecycle lease"), its `diskutil image attach` lines are its
-attaches, and its `mount_apfs` and `diskutil mount` lines and its attaches without `--noMount` are its mounts. Ordinary
-`cargo-test` records neither.
+(`packages/cowshed/crates/cowshed-apfs/tests/support/blank_image.rs`): it attaches each scenario image in its registry
+once per lane run and hands tests handles to mounts of an already-attached volume, so a test cannot attach an image of
+its own through the fixture API — the API hands out shared-fixture handles only, and no per-test attach helper is in
+tests' reach. Seeding a store clones the blank template and attaches nothing. Tests that inherently prove attach or
+detach behaviour keep their own attach through the production host; they are few and name that in their docs. Fixtures
+attach once per scenario and share; tests pay the fewest attach cycles that prove their behaviour. The pool refuses to
+attach past its registry, whose size — computed in code from the registry itself — is the lane's attach bound, so a new
+per-test attach fails the lane instead of silently spending the pool. A test whose setup and subject match a neighbour's
+becomes assertions in that neighbour rather than a separate test, and anything that does not need a real device is a
+pure or unit test with no image at all: the real-device lane holds a few scenario tests per fixture, not a test per
+behaviour. Every fixture first passes `attach_budget::harness_gate`, which reads only the boot and the pool record: once
+any test process meets error code 150, the system runner that met it records it, and every later fixture of the run, in
+whichever process, fails with `AttachPoolExhausted` and its `next:` step without attaching. A record the gate cannot
+read proves nothing about the pool, so it warns and the fixture proceeds. The lane stays `--no-fail-fast`, so its
+ordinary failures still run to the end; the refusal is the harness's own error, not a scheduler flag. There is no
+measured attach-count constant and no pre-lane admission gate: the `harness_gate` refusal at the first fixture that
+would spend into a spent pool is the fail-fast behaviour, and it needs no number from the lane. `attach-budget --clear`
+still ends a recorded 150 after the operator freed what spent it. The leaked-device delta across a lane run
+(`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no disk-image
+command still leaks on a clean run; it must be 0.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades" §2), so a test pays the fewest

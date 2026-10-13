@@ -832,6 +832,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cowshed-apfs-tests"
+version = "0.1.0"
+dependencies = [
+ "cowshed-apfs",
+ "cowshed-os",
+ "libc",
+]
+
+[[package]]
 name = "cowshed-api-gen"
 version = "0.1.0"
 dependencies = [
@@ -850,8 +859,11 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "cowshed-apfs",
  "cowshed-core",
  "cowshed-gateway",
+ "cowshed-gateway-types",
+ "cowshed-os",
  "cowshed-shell",
  "libc",
  "rcgen",
@@ -908,8 +920,10 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "cowshed-apfs",
  "cowshed-core",
  "cowshed-gateway-types",
+ "cowshed-os",
  "http",
  "http-body",
  "http-body-util",
@@ -988,6 +1002,7 @@ dependencies = [
  "bytes",
  "cowshed-core",
  "cowshed-gateway-types",
+ "cowshed-os",
  "libc",
  "serde",
  "serde_json",

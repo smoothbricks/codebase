@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, ReleaseClaim};
-use {crate::metadata::{WorkspaceIncarnation, WorkspaceName}, cowshed_apfs::image::ImageCapacity};
 use crate::storage::apfs::native::{BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, Labelled};
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::storage::recovery::ReAdoptSource;
+use cowshed_apfs::image::ImageCapacity;
 
 mod native;
 
@@ -81,14 +81,6 @@ pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
         layout: &BuildVolumeLayout,
         claim: ReleaseClaim,
     ) -> Result<Option<BuildVolumeRefusal>, ApfsStorageError>;
-    fn settle_build_link(
-        &self,
-        layout: &BuildVolumeLayout,
-        workspace: &WorkspaceName,
-        incarnation: &WorkspaceIncarnation,
-        checkout: &Path,
-        linked: &BuildVolumeId,
-    ) -> Result<(), ApfsStorageError>;
     fn build_volume_capacity(
         &self,
         layout: &BuildVolumeLayout,
