@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
 import {
+  COWSHED_EXECUTABLE_ENV,
   createHostCommands,
   diskCommand,
   hostLeaseProcesses,
@@ -154,6 +155,22 @@ describe('RAM temp volume on this host', () => {
       expect(() => process.kill(pid, 0)).not.toThrow();
     } finally {
       if (pid > 0) process.kill(-pid, 'SIGKILL');
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('runs disk commands through the cowshed its environment names', async () => {
+    const directory = await ownedSocketDirectory('rt-', 'named-cowshed');
+    const named = join(directory, 'cowshed');
+    await writeFile(named, '#!/bin/sh\necho "checkout cowshed: $*"\n', { mode: 0o755 });
+    const before = process.env[COWSHED_EXECUTABLE_ENV];
+    try {
+      process.env[COWSHED_EXECUTABLE_ENV] = named;
+      const result = await createHostCommands().run('/usr/bin/hdiutil', ['info']);
+      expect(result).toMatchObject({ status: 0, stdout: 'checkout cowshed: disk-command hdiutil -- info\n' });
+    } finally {
+      if (before === undefined) delete process.env[COWSHED_EXECUTABLE_ENV];
+      else process.env[COWSHED_EXECUTABLE_ENV] = before;
       rmSync(directory, { recursive: true, force: true });
     }
   });

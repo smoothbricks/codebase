@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { availableParallelism, userInfo } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 
 import {
@@ -21,6 +21,7 @@ import {
 } from './cpu-tokens.js';
 import { createRunProgress, withProgressReport } from './progress.js';
 import {
+  COWSHED_EXECUTABLE_ENV,
   createHostCommands,
   describeRamTempError,
   RAM_TEMP_CAPACITY_BYTES,
@@ -108,15 +109,26 @@ export function runDefaultBoundedExec(
   options: BoundedExecOptions,
   context: BoundedExecContext,
 ): Promise<BoundedExecResult> {
+  // A target that names the cowshed its disk commands run through names it for this run's own RAM volume work and
+  // for its command alike. Nx resolves `{workspaceRoot}/…` in an option to a workspace-relative path, which the
+  // command, starting in another directory, could not find: it gets the absolute one.
+  const named = options.env?.[COWSHED_EXECUTABLE_ENV];
+  const cowshed = named === undefined ? undefined : resolvePath(context.root, named);
+  const run: BoundedExecOptions =
+    cowshed === undefined ? options : { ...options, env: { ...options.env, [COWSHED_EXECUTABLE_ENV]: cowshed } };
   // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
   const tempVolume =
     process.platform === 'darwin'
-      ? new RamTempVolume(ramTempPaths(userInfo()), RAM_TEMP_CAPACITY_BYTES, createHostCommands())
+      ? new RamTempVolume(
+          ramTempPaths(userInfo()),
+          RAM_TEMP_CAPACITY_BYTES,
+          createHostCommands(undefined, undefined, undefined, cowshed),
+        )
       : null;
   // A command a parent's CPU pool started draws its tokens from that pool. The pool is named by the environment the
   // parent set for this command; a run no parent started has none.
   const inherited = readInheritedCpuPool(process.env);
-  return runBoundedExec(options, context, createProcessTreeKiller(), tempVolume, gatewayCpuBudget(), inherited);
+  return runBoundedExec(run, context, createProcessTreeKiller(), tempVolume, gatewayCpuBudget(), inherited);
 }
 
 /**

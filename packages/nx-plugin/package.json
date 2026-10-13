@@ -245,9 +245,20 @@
       },
       "test-host": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "dependsOn": [
+          {
+            "projects": [
+              "cowshed"
+            ],
+            "target": "build"
+          }
+        ],
         "options": {
           "command": "bun test --timeout=30000 src/executors/bounded-exec/ram-temp-host.test.ts src/executors/bounded-exec/executor-host.test.ts",
           "cwd": "{projectRoot}",
+          "env": {
+            "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed"
+          },
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }
