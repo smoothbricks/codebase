@@ -153,20 +153,76 @@ impl SessionInventory for NativeSessionInventory {
 /// as [`GatewayControl`]: recovery is inventory-driven and needs no runtime of its own.
 #[async_trait]
 pub trait GatewayInstaller: Send + Sync {
-    async fn install_session(&self, session: WorkspaceSession) -> Result<()>;
+    async fn install_session(
+        &self,
+        session: WorkspaceSession,
+    ) -> std::result::Result<(), SessionRestoreRefusal>;
 }
 
-pub async fn install_all_sessions<I, G>(inventory: &I, gateway: &G) -> Result<usize>
+/// Why the startup pass could not restore one session into the daemon it owns.
+///
+/// There is no superseded case: nothing else can install into the daemon before its startup
+/// pass ends (05_gateway.md "Startup contract"), so every refusal is this session's own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionRestoreRefusal {
+    /// Another host process holds the session's base port. The project's next reconcile moves
+    /// the workspace to a free block (05_gateway.md, port block); until then it has no gateway.
+    AddressInUse(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for SessionRestoreRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddressInUse(reason) => write!(formatter, "address in use: {reason}"),
+            Self::Failed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+/// One session the startup pass left out, named the way the operator finds it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRestoreFailure {
+    pub workspace_id: String,
+    pub repo_id: String,
+    pub endpoint: String,
+    pub refusal: SessionRestoreRefusal,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionRestoreReport {
+    pub restored: usize,
+    pub refused: Vec<SessionRestoreFailure>,
+}
+
+/// Restore every attached workspace's session, each on its own.
+///
+/// A session the daemon refuses is reported and skipped: one workspace whose port another
+/// process took must never cost every other workspace its gateway (05_gateway.md "Startup
+/// contract": failures are per-project). Only an inventory that cannot be read at all fails the
+/// pass, because then no session is known to restore.
+pub async fn install_all_sessions<I, G>(inventory: &I, gateway: &G) -> Result<SessionRestoreReport>
 where
     I: SessionInventory,
     G: GatewayInstaller,
 {
     let sessions = inventory.all_sessions().await?;
-    let count = sessions.len();
+    let mut report = SessionRestoreReport::default();
     for session in sessions {
-        gateway.install_session(session).await?;
+        let workspace_id = session.workspace_id.clone();
+        let repo_id = session.repo_id.clone();
+        let endpoint = session.endpoint.to_string();
+        match gateway.install_session(session).await {
+            Ok(()) => report.restored += 1,
+            Err(refusal) => report.refused.push(SessionRestoreFailure {
+                workspace_id,
+                repo_id,
+                endpoint,
+                refusal,
+            }),
+        }
     }
-    Ok(count)
+    Ok(report)
 }
 
 pub fn project_session_prefix(repo_id: &RepoId) -> String {

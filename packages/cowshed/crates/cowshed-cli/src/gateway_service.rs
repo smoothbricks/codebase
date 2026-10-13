@@ -25,8 +25,8 @@ use cowshed_core::{
 };
 use cowshed_gateway::{
     ArrowAuditConfig, ControlError, ControlFailureCode, DaemonStatus, Gateway, GatewayConfig,
-    GatewayControlClient, GatewayHandle, MirrorCacheConfig, StartupHeal, StartupProbe,
-    SupervisorRecovery, WorkspaceSession,
+    GatewayControlClient, GatewayError, GatewayHandle, MirrorCacheConfig, StartupHeal,
+    StartupProbe, SupervisorRecovery, WorkspaceSession,
 };
 use sha2::{Digest as _, Sha256};
 use std::fs;
@@ -38,11 +38,11 @@ use std::time::Duration;
 
 pub use cowshed_core::gateway_sessions::{
     ControlRefusal, GATEWAY_START_HINT, GatewayControl, GatewayInstaller, GatewayPortReallocator,
-    GatewayStatusError, NativeSessionInventory, ReconcileReport, SessionInventory, canonical_home,
-    control_error, effective_uid, gateway_absent, install_all_sessions, policy_from_grants,
-    project_session_prefix, reconcile_against_status, reconcile_project,
-    reconcile_project_with_reallocator, session_from_fact, sessions_from_facts,
-    stable_workspace_id,
+    GatewayStatusError, NativeSessionInventory, ReconcileReport, SessionInventory,
+    SessionRestoreRefusal, SessionRestoreReport, canonical_home, control_error, effective_uid,
+    gateway_absent, install_all_sessions, policy_from_grants, project_session_prefix,
+    reconcile_against_status, reconcile_project, reconcile_project_with_reallocator,
+    session_from_fact, sessions_from_facts, stable_workspace_id,
 };
 pub use cowshed_gateway_types::control_socket_path;
 use std::collections::BTreeSet;
@@ -122,9 +122,15 @@ impl OwnedGateway {
 
 #[async_trait]
 impl GatewayInstaller for OwnedGateway {
-    async fn install_session(&self, session: WorkspaceSession) -> Result<()> {
-        self.0.install(session).await.map_err(|error| {
-            CowshedError::internal(format!("could not restore gateway session: {error}"))
+    async fn install_session(
+        &self,
+        session: WorkspaceSession,
+    ) -> std::result::Result<(), SessionRestoreRefusal> {
+        self.0.install(session).await.map_err(|error| match error {
+            GatewayError::Io(source) if source.kind() == io::ErrorKind::AddrInUse => {
+                SessionRestoreRefusal::AddressInUse(source.to_string())
+            }
+            error => SessionRestoreRefusal::Failed(error.to_string()),
         })
     }
 }
@@ -940,7 +946,7 @@ async fn run_daemon() -> Result<()> {
         serve_supervisors(&store_root, manager).await?;
         heal_recorded_projects(&heal_inventory, repositories, &heal).await;
         heal_sccache_daemon().await;
-        install_all_sessions(&inventory, &handle).await?;
+        report_session_restore(&install_all_sessions(&inventory, &handle).await?);
         heal.restored();
         Ok::<(), CowshedError>(())
     }
@@ -1051,6 +1057,21 @@ async fn heal_sccache_daemon() {
             "cowshed: could not start the sccache daemon at startup: {}",
             error.message
         );
+    }
+}
+
+/// Name every session the startup pass left out, with its typed reason. The daemon serves on:
+/// a workspace whose base port another process took is that workspace's problem, and the
+/// project's next reconcile moves it to a free block (05_gateway.md, port block).
+fn report_session_restore(report: &SessionRestoreReport) {
+    for failure in &report.refused {
+        eprintln!(
+            "cowshed: {}: gateway session {} at {} was not restored at startup: {}",
+            failure.repo_id, failure.workspace_id, failure.endpoint, failure.refusal
+        );
+    }
+    if !report.refused.is_empty() {
+        eprintln!("next: cowshed doctor");
     }
 }
 

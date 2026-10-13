@@ -6,8 +6,8 @@
 use async_trait::async_trait;
 use cowshed_core::gateway_sessions::{
     ControlRefusal, GatewayControl, GatewayInstaller, GatewayStatusError, SessionInventory,
-    install_all_sessions, policy_from_grants, project_session_prefix, reconcile_against_status,
-    reconcile_project, stable_workspace_id,
+    SessionRestoreRefusal, install_all_sessions, policy_from_grants, project_session_prefix,
+    reconcile_against_status, reconcile_project, stable_workspace_id,
 };
 use cowshed_core::metadata::{EgressMode, EgressRule, GrantSet, WorkspaceIncarnation};
 use cowshed_core::repository::RepoId;
@@ -641,11 +641,21 @@ impl SessionInventory for FakeInventory {
 #[derive(Default)]
 struct FakeInstaller {
     installed: Mutex<Vec<(String, u64)>>,
+    /// Sessions whose base port another host process holds.
+    occupied: Vec<String>,
 }
 
 #[async_trait]
 impl GatewayInstaller for FakeInstaller {
-    async fn install_session(&self, session: WorkspaceSession) -> Result<()> {
+    async fn install_session(
+        &self,
+        session: WorkspaceSession,
+    ) -> std::result::Result<(), SessionRestoreRefusal> {
+        if self.occupied.contains(&session.workspace_id) {
+            return Err(SessionRestoreRefusal::AddressInUse(String::from(
+                "Address already in use (os error 48)",
+            )));
+        }
         self.installed
             .lock()
             .expect("installer lock")
@@ -664,15 +674,46 @@ async fn daemon_restart_restores_every_project_inventory_session() {
         all: Mutex::new(Some(vec![session(&a, 2, 1), session(&b, 7, 2)])),
     };
     let gateway = FakeInstaller::default();
-    assert_eq!(
-        install_all_sessions(&inventory, &gateway)
-            .await
-            .expect("recovery succeeds"),
-        2
-    );
+    let report = install_all_sessions(&inventory, &gateway)
+        .await
+        .expect("recovery succeeds");
+    assert_eq!(report.restored, 2);
+    assert!(report.refused.is_empty());
     assert_eq!(
         *gateway.installed.lock().expect("installer lock"),
         vec![(a, 2), (b, 7)]
+    );
+}
+
+/// A test fixture or any other host process holding one session's base port once took the whole
+/// daemon down at startup, and launchd restarted it into the same refusal. The refused session is
+/// reported with its typed reason and every other session is still restored.
+#[tokio::test]
+async fn one_occupied_session_port_does_not_stop_the_startup_restore() {
+    let repo_a = RepoId::parse("acme/widget").expect("repo A");
+    let repo_b = RepoId::parse("other/tool").expect("repo B");
+    let a = workspace_id(&repo_a, "main", 1);
+    let b = workspace_id(&repo_b, "raven", 2);
+    let inventory = FakeInventory {
+        all: Mutex::new(Some(vec![session(&a, 2, 1), session(&b, 7, 2)])),
+    };
+    let gateway = FakeInstaller {
+        occupied: vec![a.clone()],
+        ..FakeInstaller::default()
+    };
+    let report = install_all_sessions(&inventory, &gateway)
+        .await
+        .expect("one refused session does not fail the pass");
+    assert_eq!(report.restored, 1);
+    assert_eq!(report.refused.len(), 1);
+    assert_eq!(report.refused[0].workspace_id, a);
+    assert!(matches!(
+        report.refused[0].refusal,
+        SessionRestoreRefusal::AddressInUse(_)
+    ));
+    assert_eq!(
+        *gateway.installed.lock().expect("installer lock"),
+        vec![(b, 7)]
     );
 }
 
