@@ -374,6 +374,13 @@ the other directories the hash command skips), target sources outside it, its go
 `Cargo.lock`. Nx hashes those from the file hashes it already keeps, so hashing these inputs starts no process. A graph
 with unchanged resolution inputs starts no Cargo process either.
 
+Literal `include_str!` and `include_bytes!` files also belong to the closure, including data inside a crate and tracked
+files outside its directory (such as a shipped Markdown skill). One Rust lexer excludes comments and example strings;
+computed paths and arbitrary build-script reads still need explicit inputs. External path-package digests include the
+same literal data bytes. Inferred `napi-*` and repository-root `cargo-wasm` builds use this resolved closure rather than
+every Rust file in the workspace, while retaining their toolchain pins, wrapper scripts, N-API configuration and CLI
+version.
+
 Members the file index cannot hold, outside the Nx workspace or under `node_modules`, are hashed by one runtime
 `smoo-nx-cargo-hash --closure <projectRoot> <Cargo.toml>` entry, present only while such members exist. Its cached
 resolution checks external manifests too, so a dependency introduced by an external manifest edit is still covered.

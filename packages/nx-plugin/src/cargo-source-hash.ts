@@ -1,7 +1,7 @@
 import { type ChildProcess, type ChildProcessByStdio, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { channel } from 'node:diagnostics_channel';
-import { constants, realpathSync, statSync } from 'node:fs';
+import { constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import {
   access,
   lstat,
@@ -21,6 +21,7 @@ import type { Readable } from 'node:stream';
 import native from 'nx/src/native/index.js';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import { CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
+import { rustTokens } from './rust-tokens.js';
 
 const { FileLock, IS_WASM, WorkspaceContext } = native;
 
@@ -269,6 +270,7 @@ export const HASH_SKIPPED_DIRECTORIES = [
   'target',
   '.git',
   'node_modules',
+  '.nx',
   '.cache',
   '.cowshed',
   '.fseventsd',
@@ -291,8 +293,8 @@ export const CARGO_ANCESTOR_INPUTS = ['Cargo.toml', '.cargo/config', '.cargo/con
  * directory actually depend on, so an edit to an unrelated workspace member
  * leaves the digest alone.
  *
- * This covers Rust sources and Cargo configuration, matching the plugin's
- * in-workspace Rust inputs. Build scripts' other data/environment inputs remain
+ * This covers Rust sources, literal compiled-in files and Cargo configuration,
+ * matching the plugin's in-workspace Rust inputs. Build scripts' other data/environment inputs remain
  * explicit Nx inputs, just as they are for in-workspace crates. Files git
  * ignores beneath a package are left out, like Nx's own file inputs: a
  * generated source is its producer's output, which the consuming target hashes
@@ -775,6 +777,12 @@ export async function hashCargoPathInputs(
     }
   }
   for (const directory of directories) await walk(directory);
+  const compiledCache = new Map<string, string[]>();
+  for (const directory of directories) {
+    for (const file of compiledInFiles(directory, compiledCache)) {
+      if (!ignored(file)) files.add(await realpath(file));
+    }
+  }
   const hash = createHash('sha256');
   hash.update('cargo-path-inputs-v1\0');
   for (const [path, target] of [...links].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))) {
@@ -913,4 +921,51 @@ function gitRepository(directory: string): string | undefined {
       return undefined;
     throw error;
   }
+}
+
+// A tokenized literal macro, never text inside a comment or another string.
+const INCLUDE_CLOSERS: Readonly<Record<string, string>> = { '(': ')', '[': ']', '{': '}' };
+const INCLUDE_STRING = /^"([^"\\\r\n]*)"$/u;
+const INCLUDE_RAW_STRING = /^r(#*)"([\s\S]*)"\1$/u;
+
+/**
+ * Existing literal include_str!/include_bytes! files read by this package's Rust sources.
+ * One graph owns the memo; runtime hashes use a fresh memo. Nested packages own their
+ * sources separately. Computed paths and arbitrary build-script reads remain explicit inputs.
+ */
+export function compiledInFiles(root: string, cache: Map<string, string[]>): string[] {
+  const cached = cache.get(root);
+  if (cached !== undefined) return cached;
+  const found = new Set<string>();
+  const skipped: readonly string[] = HASH_SKIPPED_DIRECTORIES;
+  const scan = [root];
+  while (scan.length > 0) {
+    const current = scan.pop();
+    if (current === undefined || !existsSync(current)) continue;
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const child = join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (!skipped.includes(entry.name) && !existsSync(join(child, 'Cargo.toml'))) scan.push(child);
+      } else if (entry.isFile() && entry.name.endsWith('.rs')) {
+        const text = readFileSync(child, 'utf8');
+        if (!text.includes('include_')) continue;
+        const tokens = rustTokens(text);
+        for (let index = 0; index < tokens.length; index += 1) {
+          if (tokens[index]?.text !== 'include_str' && tokens[index]?.text !== 'include_bytes') continue;
+          if (tokens[index + 1]?.text !== '!') continue;
+          const closing = INCLUDE_CLOSERS[tokens[index + 2]?.text ?? ''];
+          const end = tokens[index + 4]?.text === ',' ? index + 5 : index + 4;
+          if (closing === undefined || tokens[end]?.text !== closing) continue;
+          const literal = tokens[index + 3]?.text ?? '';
+          const path = INCLUDE_STRING.exec(literal)?.[1] ?? INCLUDE_RAW_STRING.exec(literal)?.[2];
+          if (path === undefined || path === '') continue;
+          const file = resolve(current, path);
+          if (statSync(file, { throwIfNoEntry: false })?.isFile()) found.add(file);
+        }
+      }
+    }
+  }
+  const files = [...found].sort();
+  cache.set(root, files);
+  return files;
 }
