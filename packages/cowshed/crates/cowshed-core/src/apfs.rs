@@ -8250,6 +8250,169 @@ mod tests {
             assert!(!root.exists(), "{ending}: {} remains", root.display());
         }
     }
+    /// The fixture root the killed-caller attach pair shares through the environment.
+    #[cfg(target_os = "macos")]
+    const FIXTURE_KILL_ROOT: &str = "COWSHED_TEST_FIXTURE_KILL_ROOT";
+
+    /// A disk-image attach outlives its caller: the caller is ended the way an agent tool
+    /// kills a tree — SIGTERM to every process working in its root, then SIGKILL to the
+    /// caller itself — mid-attach. The detached disk-image command finishes regardless, so
+    /// the next invocation (this parent, after the kill) finds the image attached and
+    /// releases it cleanly, no image device leaks, and no diskimagesiod is orphaned.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let leaked_before = crate::attach_budget::observe()
+            .expect("attach pool before")
+            .reading
+            .image_devices
+            .leaked();
+        let orphans_before: std::collections::BTreeSet<libc::pid_t> =
+            crate::disk_image_helpers::OrphanedHelpers::read()
+                .expect("helper reading before")
+                .orphans()
+                .map(|orphans| orphans.pids().iter().copied().collect())
+                .unwrap_or_default();
+        let root = ScratchRoot::new_owned("fixture-kill").expect("owned scratch root");
+        let image = root.path().join("attach.dmg");
+        let _leak = RealImageCleanup::new(&backend, image.clone());
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "apfs::tests::real_apfs_disk_image_attach_outliving_a_killed_caller",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(FIXTURE_KILL_ROOT, root.path())
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_locked()
+            .expect("spawn the attaching caller");
+        let mut lines = BufReader::new(child.stdout.take().expect("caller stdout")).lines();
+        let mut inflight = false;
+        for line in lines.by_ref() {
+            let line = line.expect("caller line");
+            if line == "inflight" {
+                inflight = true;
+                break;
+            }
+        }
+        assert!(inflight, "the caller's attach never came in flight");
+        // The tree-killer's two strokes: SIGTERM to every process working in the root
+        // (the disk-image child among them, which ignores it), SIGKILL to the caller.
+        for (pid, _) in crate::scratch_apfs::processes_in(|cwd| cwd.starts_with(root.path()))
+            .expect("list the caller's tree")
+        {
+            // SAFETY: kill only names a process; a pid gone since the listing reports ESRCH.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        child.kill().expect("kill the caller mid-attach");
+        let _ = child.wait();
+        lines.for_each(drop);
+        // Reconcile as the next invocation does: an attach that completed is registered.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let devices = backend
+                .attached_whole_devices(&image)
+                .expect("attachment inventory");
+            if !devices.is_empty() {
+                backend
+                    .release_image(
+                        &image,
+                        &std::collections::BTreeSet::new(),
+                        DetachIntent::Release,
+                    )
+                    .expect("release the attach the dead caller finished");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the killed caller's attach neither completed nor left the image attachable"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(
+            backend
+                .attached_whole_devices(&image)
+                .expect("attachment inventory")
+                .is_empty(),
+            "the released image is still attached"
+        );
+        // The lock is free: a fresh attach and detach of the same image both work.
+        let attachment = backend
+            .verify_attachment(&image, MountAccess::ReadWrite, DetachIntent::Release)
+            .expect("attach the released image again");
+        backend
+            .detach(&attachment, DetachIntent::Release)
+            .expect("detach the released image");
+        let leaked_after = crate::attach_budget::observe()
+            .expect("attach pool after")
+            .reading
+            .image_devices
+            .leaked();
+        assert_eq!(
+            leaked_after, leaked_before,
+            "the killed caller's attach leaked an image device"
+        );
+        let orphans_after: std::collections::BTreeSet<libc::pid_t> =
+            crate::disk_image_helpers::OrphanedHelpers::read()
+                .expect("helper reading after")
+                .orphans()
+                .map(|orphans| orphans.pids().iter().copied().collect())
+                .unwrap_or_default();
+        assert!(
+            orphans_after.is_subset(&orphans_before),
+            "new orphaned diskimagesiod helpers: {:?}",
+            orphans_after
+                .difference(&orphans_before)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The caller [`real_apfs_a_disk_image_attach_survives_its_callers_kill`] kills: it
+    /// attaches its image, detaches it, and begins again, so the kill lands mid-attach.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "spawned by real_apfs_a_disk_image_attach_survives_its_callers_kill"]
+    fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
+        let Some(root) = std::env::var_os(FIXTURE_KILL_ROOT) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        std::env::set_current_dir(&root).expect("work in the fixture root");
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let image = root.join("attach.dmg");
+        crate::blank_image::blank_image(&image);
+        // Say when the attach's disk child exists, so the parent kills mid-attach, not
+        // before it: any other process working in this root is the attach's own tree.
+        let watched = root.clone();
+        std::thread::spawn(move || {
+            loop {
+                let found = crate::scratch_apfs::processes_in(|cwd| cwd.starts_with(&watched))
+                    .is_ok_and(|found| !found.is_empty());
+                if found {
+                    println!("inflight");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        loop {
+            println!("attaching");
+            let attachment = backend
+                .verify_attachment(&image, MountAccess::ReadWrite, DetachIntent::Release)
+                .expect("attach a fixture image");
+            backend
+                .detach(&attachment, DetachIntent::Release)
+                .expect("detach a fixture image");
+        }
+    }
 
     /// One real-image fixture run, ended as [`FIXTURE_ENDING`] says: it fails or waits to be
     /// killed once its images are attached and its worker started. The parent owns recovery of
