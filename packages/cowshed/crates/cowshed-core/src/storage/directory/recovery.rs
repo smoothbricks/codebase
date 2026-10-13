@@ -222,6 +222,7 @@ impl DirectoryExecutionHost {
             Ok(Some(None))
         } else {
             acquire_image_locks(&self.config.store_root, &[lock], LockMode::Try)
+                .map_err(Into::into)
                 .map(|guard| guard.map(Some))
         }
     }
@@ -232,6 +233,7 @@ impl DirectoryExecutionHost {
             return Ok(true);
         }
         acquire_image_locks(&self.config.store_root, &[lock.to_owned()], LockMode::Try)
+            .map_err(Into::into)
             .map(|guard| guard.is_some())
     }
 

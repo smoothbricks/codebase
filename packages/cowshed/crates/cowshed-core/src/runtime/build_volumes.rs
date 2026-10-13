@@ -440,7 +440,6 @@ impl Lent {
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct BuildVolumes<H: RuntimeStorageHost = Host> {
     host: Arc<H>,
     pub layout: BuildVolumeLayout,
@@ -1036,8 +1035,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         let Some(live) = self.layout.linked(checkout)? else {
             return Ok(Reseed::NoBuildVolume);
         };
-        match seed_age(&self.host, &self.layout, target, live)? {
-            Some(age) => reseed(&self.host, &self.layout, target, age),
+        match seed_age(&*self.host, &self.layout, target, live)? {
+            Some(age) => reseed(&*self.host, &self.layout, target, age),
             None => Ok(Reseed::NoBuildVolume),
         }
     }
@@ -3254,7 +3253,7 @@ fn main() {
         // Clock ordering is supplied explicitly; this test exercises the real holder and
         // publication boundary, not the independent image-mtime comparison.
         let reseeded = reseed(
-            &scratch.host,
+            &*scratch.host,
             &scratch.layout,
             &target,
             SeedAge {
@@ -3486,7 +3485,7 @@ fn main() {
     const AT_THE_CAP: &str = "[build]\ncapacity = \"1g\"\n";
 
     #[cfg(target_os = "macos")]
-    fn minted(first: &FirstMint) -> MintedVolume {
+    fn minted<H: RuntimeStorageHost>(first: &FirstMint<H>) -> MintedVolume {
         match first {
             FirstMint::Minted(owned) => lock(&owned.slot)
                 .clone()
