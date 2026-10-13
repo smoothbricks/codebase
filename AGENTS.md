@@ -436,9 +436,11 @@ until those tests miss their timeout — 62 images attached, only 27 this projec
 holding commits main lacks by ancestry or patch equivalence, which is the only check that catches a land you _think_
 succeeded. Piping `git merge --ff-only` through `tail` makes the exit status `tail`'s, so a failed merge prints success.
 
-**Markdown edits go straight to main.** A land re-rebases its shed over them, and that re-rebase must hit the Nx cache
-for every task that does not read the edited Markdown; a miss is a bug in that task's inputs, fixed in the land that hit
-it. A spec is the target design and is valid ahead of its code.
+**Markdown-only work needs no shed, and unrelated doc fixes go straight to main.** Commit a change that only edits
+Markdown directly on main. While working on code in a shed, fix any spec or doc problem unrelated to that code at once
+on main rather than carrying it in the shed; docs that belong to the shed's code stay in the shed and land with it. A
+land re-rebases its shed over such commits, and that re-rebase must hit the Nx cache for every task that does not read
+the edited Markdown; a miss is a bug in that task's inputs, fixed in the land that hit it.
 
 **A fleet touching `cfg(target_os)` code MUST run `bun run check:linux` before the last land, not after.** macOS gates
 cannot see the `not(target_os = "macos")` branch, so a green warnings-denied clippy on every branch still lands a red
