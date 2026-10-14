@@ -625,12 +625,6 @@ in {
       fi
       export PATH="$("$PWD/tooling/direnv/repo-path")"
       export PATH="${rustToolchainBin}:$PATH"
-      # The installed cowshed's bin goes ahead of the toolchain's: its `cargo`
-      # is the jobserver launcher for the build the host runs (03_caches.md),
-      # and it must win over every directory that can hold a real cargo. The
-      # link exists only after `cowshed setup` from a build that has it;
-      # absent, the name falls through to the toolchain's cargo unchanged.
-      export PATH="$HOME/Library/Application Support/dev.cowshed/bin:$PATH"
       # devenv enters the shell with TMPDIR unset (not empty) on every platform.
       # Tools then fall back to /tmp, which on Darwin is not the per-user
       # temporary directory the OS hands out, and a test that asserts the
@@ -665,6 +659,9 @@ in {
     # SDKROOT/compilers; the toolchain identity must see the final values). The
     # stamp logic lives in toolchain-stamp.ts; see its header for why.
     (lib.mkAfter ''
+          # Project hooks may prepend real Cargo. Reuse the managed PATH writer
+      # last: its served install identity is the host's, not the private HOME.
+      export PATH="$("$DEVENV_ROOT/repo-path")"
       bun "$DEVENV_ROOT/toolchain-stamp.ts" || exit $?
       if [ -n "$DEVENV_SHELL_PWD" ]; then
         cd "$DEVENV_SHELL_PWD"

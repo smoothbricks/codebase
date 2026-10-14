@@ -37,6 +37,13 @@ pub fn support_directory(home: &Path) -> PathBuf {
     home.join("Library/Application Support/dev.cowshed")
 }
 
+/// The host-stable installed binary directory (05_gateway.md, "The installed cowshed").
+pub fn installed_binary_directory(home: &Path) -> PathBuf {
+    let mut directory = support_directory(home);
+    directory.push("bin");
+    directory
+}
+
 /// Every HOME directory holding cowshed controller state.
 pub fn controller_state(home: &Path) -> [PathBuf; 2] {
     [support_directory(home), cache_directory(home)]

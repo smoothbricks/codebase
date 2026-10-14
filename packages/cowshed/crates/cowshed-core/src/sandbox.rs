@@ -452,6 +452,7 @@ pub enum SandboxError {
     InvalidPath { path: PathBuf, reason: &'static str },
     GrantIntersectsDeny { grant: PathBuf, deny: PathBuf },
     DenyResolution { path: PathBuf, cause: String },
+    InstalledCargo { path: PathBuf, cause: String },
 }
 
 impl fmt::Display for SandboxError {
@@ -473,6 +474,11 @@ impl fmt::Display for SandboxError {
                 "grant {} intersects protected path {}",
                 grant.display(),
                 deny.display()
+            ),
+            Self::InstalledCargo { path, cause } => write!(
+                formatter,
+                "cannot resolve the installed cargo launcher {}: {cause}",
+                path.display()
             ),
             Self::DenyResolution { path, cause } => write!(
                 formatter,
@@ -822,6 +828,46 @@ pub fn seatbelt_profile(
                 &mut profile,
                 &format!("(allow network-outbound (remote tcp \"localhost:{port}\"))"),
             );
+        }
+    }
+
+    if !matches!(
+        role,
+        SandboxProfileRole::GitDiscovery | SandboxProfileRole::GitDiscoveryGitOnly
+    ) {
+        let directory = crate::host_dirs::installed_binary_directory(&config.home);
+        let launcher = directory.join("cargo");
+        let installed = match std::fs::canonicalize(&launcher) {
+            Ok(path) => Some(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(SandboxError::InstalledCargo {
+                    path: launcher.clone(),
+                    cause: error.to_string(),
+                });
+            }
+        };
+        if let Some(installed) = installed {
+            let metadata =
+                std::fs::metadata(&installed).map_err(|error| SandboxError::InstalledCargo {
+                    path: installed.clone(),
+                    cause: error.to_string(),
+                })?;
+            if !metadata.is_file() {
+                return Err(SandboxError::InvalidPath {
+                    path: installed,
+                    reason: "the installed cargo launcher must resolve to one regular executable",
+                });
+            }
+            // Only the installed copy is readable. Lookup of cargo -> cowshed
+            // and their ancestors needs metadata, never directory contents.
+            for name in [&launcher, &directory.join("cowshed"), &installed] {
+                for ancestor in name.ancestors() {
+                    push_literal_rule(&mut profile, "allow file-read-metadata", ancestor)?;
+                }
+            }
+            push_literal_rule(&mut profile, "allow file-read*", &installed)?;
+            push_literal_rule(&mut profile, "allow process-exec", &installed)?;
         }
     }
 

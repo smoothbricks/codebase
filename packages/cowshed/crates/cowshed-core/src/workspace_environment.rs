@@ -41,6 +41,8 @@ pub enum WorkspaceEnvironmentError {
     UnexportableTempDir(std::path::PathBuf),
     #[error("workspace capability variable {0} cannot be exported as UTF-8 shell text")]
     UnexportableCapability(&'static str),
+    #[error("installed cargo directory {0:?} cannot be exported as UTF-8 shell text")]
+    UnexportableInstalledDirectory(std::path::PathBuf),
     #[error(transparent)]
     Publication(#[from] MetadataError),
 }
@@ -55,6 +57,8 @@ pub enum EnvironmentMount<'a> {
     /// link is named after this mount.
     Served {
         workspace_mount: &'a Path,
+        /// The controller-selected host identity, before the job HOME is rebound.
+        host_home: &'a Path,
         temp_dir: &'a Path,
         capability_env: &'a CapabilityContribution,
     },
@@ -118,6 +122,22 @@ pub(crate) fn write_workspace_environment(
             ))
         }
     };
+    let installed_directory = match mount {
+        EnvironmentMount::Served { host_home, .. } => {
+            Some(crate::host_dirs::installed_binary_directory(host_home))
+        }
+        EnvironmentMount::Minted(_) => None,
+    };
+    let installed_directory_text = installed_directory
+        .as_ref()
+        .map(|path| {
+            path.to_str()
+                .filter(|text| !text.contains(['\0', '\n', '\r']))
+                .ok_or_else(|| {
+                    WorkspaceEnvironmentError::UnexportableInstalledDirectory(path.clone())
+                })
+        })
+        .transpose()?;
     // Keep the secret token in one Zeroizing buffer. Reserve capability values'
     // shell-escaped bound too so publication does not reallocate and copy the token.
     let capability_bytes = match mount {
@@ -143,6 +163,7 @@ pub(crate) fn write_workspace_environment(
         192 + token.len()
             + DEV_CI_POLICY.len()
             + capability_bytes
+            + installed_directory_text.map_or(0, |path| path.len() * 4 + 96)
             + served.as_ref().map_or(0, |(temp_dir, _)| temp_dir.len()),
     ));
     contents.push_str(DEV_CI_POLICY);
@@ -169,6 +190,16 @@ pub(crate) fn write_workspace_environment(
         )
         .expect("writing to a String cannot fail");
     }
+    if let Some(directory) = installed_directory_text {
+        contents.push_str("export PATH=");
+        write_shell_quoted(&mut contents, directory);
+        contents.push_str("\"${PATH:+:}${PATH-}\"\n");
+    } else {
+        // A newly minted image has no served runtime identity yet. Do not
+        // let a host shell borrow an inherited sibling's served marker.
+        writeln!(&mut *contents, "unset {RUNTIME_LINK_ENV}")
+            .expect("writing to a String cannot fail");
+    }
     if let EnvironmentMount::Served { capability_env, .. } = mount {
         for name in crate::capabilities::sccache::HOST_ENVIRONMENT
             .into_iter()
@@ -191,16 +222,10 @@ pub(crate) fn write_workspace_environment(
                         writeln!(&mut *contents, "if [ \"${{{name}+x}}\" != x ]; then")
                             .expect("writing to a String cannot fail");
                     }
-                    write!(&mut *contents, "export {name}='")
+                    write!(&mut *contents, "export {name}=")
                         .expect("writing to a String cannot fail");
-                    for character in value.chars() {
-                        if character == '\'' {
-                            contents.push_str("'\\''");
-                        } else {
-                            contents.push(character);
-                        }
-                    }
-                    contents.push_str("'\n");
+                    write_shell_quoted(&mut contents, value);
+                    contents.push('\n');
                     if matches!(action, EnvAction::Default(_)) {
                         contents.push_str("fi\n");
                     }
@@ -217,6 +242,18 @@ pub(crate) fn write_workspace_environment(
         contents.as_bytes(),
     )?;
     Ok(())
+}
+
+fn write_shell_quoted(contents: &mut String, value: &str) {
+    contents.push('\'');
+    for character in value.chars() {
+        if character == '\'' {
+            contents.push_str("'\\''");
+        } else {
+            contents.push(character);
+        }
+    }
+    contents.push('\'');
 }
 
 #[cfg(test)]
@@ -243,6 +280,7 @@ mod tests {
                 write_workspace_environment(
                     EnvironmentMount::Served {
                         workspace_mount: Path::new("/nonexistent-image"),
+                                                host_home: Path::new("/Users/tester"),
                         temp_dir: Path::new(refused),
                         capability_env: &CapabilityContribution::default(),
                     },
@@ -276,6 +314,7 @@ mod tests {
             EnvironmentMount::Served {
                 workspace_mount: root,
                 temp_dir: &temp_dir,
+                host_home: root,
                 capability_env: &CapabilityContribution::default(),
             },
             &Zeroizing::new("token".to_owned()),
@@ -321,6 +360,70 @@ mod tests {
     }
 
     #[test]
+    fn served_cargo_path_uses_host_identity_after_home_is_rebound() {
+        use cowshed_os::fork_lock::Run as _;
+        let root = std::env::temp_dir().join(format!("cowshed-host-path-{}", uuid::Uuid::new_v4()));
+        let mount = root.join("workspace");
+        let home = root.join("host's home $literal");
+        let private_home = mount.join(".cowshed/home");
+        std::fs::create_dir_all(mount.join(".cowshed")).unwrap();
+        write_workspace_environment(
+            EnvironmentMount::Served {
+                workspace_mount: &mount,
+                host_home: &home,
+                temp_dir: &root,
+                capability_env: &CapabilityContribution::default(),
+            },
+            &Zeroizing::new("token".to_owned()),
+            Platform::Linux,
+            None,
+        )
+        .unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                ". \"$1\"; printf '%s\\0' \"$HOME\" \"${PATH%%:*}\"",
+                "served-path",
+            ])
+            .arg(mount.join(WORKSPACE_ENVIRONMENT_PATH))
+            .env_clear()
+            .env("HOME", &private_home)
+            .env("PATH", "/toolchain/bin:/usr/bin:/bin")
+            .output_locked()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            format!(
+                "{}\0{}\0",
+                private_home.display(),
+                crate::host_dirs::installed_binary_directory(&home).display()
+            )
+            .as_bytes()
+        );
+        write_workspace_environment(
+            EnvironmentMount::Minted(&mount),
+            &Zeroizing::new("token".to_owned()),
+            Platform::Linux,
+            None,
+        )
+        .unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                ". \"$1\"; printf '%s' \"${COWSHED_RUNTIME_LINK-unset}\"",
+                "minted-path",
+            ])
+            .arg(mount.join(WORKSPACE_ENVIRONMENT_PATH))
+            .env("COWSHED_RUNTIME_LINK", "/tmp/stale-sibling")
+            .output_locked()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"unset");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn host_capability_values_are_shell_quoted_and_defaults_preserve_overrides() {
         use cowshed_os::fork_lock::Run;
         let root =
@@ -338,6 +441,7 @@ mod tests {
         write_workspace_environment(
             EnvironmentMount::Served {
                 workspace_mount: &root,
+                host_home: &root,
                 temp_dir: &root,
                 capability_env: &contribution,
             },

@@ -62,6 +62,13 @@ cowshed setup                          # install that build; `cowshed` on PATH n
 and only another install changes them ([gateway.md](gateway.md#start-at-login-launchd)). A later `cowshed setup` typed
 at the shell runs that installed copy, so it repairs the host but installs nothing new.
 
+The managed Cargo path is published from the controller's trusted host installation, not from the private `HOME` inside
+a sandbox. The same environment writer runs after shell PATH hooks, so a toolchain cannot displace the launcher. Sandbox
+profiles permit only the current installed binary to be read and executed, with lookup metadata; the install directory
+and controller records remain closed to reads/writes, and the gateway control socket remains host-only
+([03 Caches](../../../specs/cowshed/03_caches.md), launcher; [04 Sandbox](../../../specs/cowshed/04_sandbox.md),
+installed-launcher exception).
+
 The same directory also holds `cargo`, a relative link to the stable `cowshed` name. In the managed environment it comes
 first on `PATH` and launches the next real Cargo under the gateway's jobserver budget. Inherited jobservers,
 `bounded-exec` grants and non-compiling commands avoid a second grant; an absent gateway runs Cargo unbudgeted and says

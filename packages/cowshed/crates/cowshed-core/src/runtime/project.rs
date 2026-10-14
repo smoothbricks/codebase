@@ -10915,6 +10915,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         crate::workspace_credentials::publish_workspace_environment(
                             crate::workspace_environment::EnvironmentMount::Served {
                                 workspace_mount: &config.workspace_mount,
+                                host_home: &config.home,
                                 temp_dir: &config.exec_temp_dir,
                                 capability_env: &config.capabilities.contribution,
                             },
@@ -15636,6 +15637,10 @@ fn validate_grant_sandbox(config: &crate::sandbox::SandboxConfig) -> Result<()> 
         crate::sandbox::SandboxError::DenyResolution { .. } => CowshedError::environment_missing(
             error.to_string(),
             "repair the named deny path and retry",
+        ),
+        crate::sandbox::SandboxError::InstalledCargo { .. } => CowshedError::environment_missing(
+            error.to_string(),
+            "repair the installed cowshed and cargo links, then rerun cowshed setup",
         ),
     })
 }

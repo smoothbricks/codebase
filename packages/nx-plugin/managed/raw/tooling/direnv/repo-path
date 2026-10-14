@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single source of truth for repo-local PATH entries.
+# Single source of truth for repo-local PATH and installed Cargo launcher precedence.
 # All tooling that sets up PATH must call this instead of hardcoding paths.
 #
 # Usage:
@@ -30,5 +30,12 @@ case "${1:-}" in
     printf '%s\n' "${entries[@]}" ;;
   *)
     IFS=:
-    echo "${entries[*]}:$PATH" ;;
+    export PATH="${entries[*]}:$PATH"
+    if [[ -f "$root/.cowshed/env" ]]; then
+      source "$root/.cowshed/env"
+    fi
+    if [[ -z "${COWSHED_RUNTIME_LINK:-}" ]]; then
+      export PATH="$HOME/Library/Application Support/dev.cowshed/bin:$PATH"
+    fi
+    printf '%s\n' "$PATH" ;;
 esac

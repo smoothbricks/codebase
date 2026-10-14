@@ -146,7 +146,7 @@ pub fn mint_workspace_credentials(
 }
 
 /// Derives `.cowshed/env` from the image's published token, the workspace's recorded platform
-/// and port block, and, at a served mount, the sandbox's `TMPDIR` and runtime link. This is the
+/// and port block, and, at a served mount, the trusted host install PATH, sandbox `TMPDIR` and runtime link. This is the
 /// file's one writer: adopt, clone and restore publish it as they mint, and every supervisor
 /// start publishes it again served, so a live workspace's file follows its metadata — a
 /// workspace minted before a variable existed gains it on its next start.
@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(
             first_environment,
             format!(
-                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={first_token}\nexport {PORT_BASE_ENV}=40960\nexport {PORT_BLOCK_SIZE_ENV}=16\n"
+                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={first_token}\nexport {PORT_BASE_ENV}=40960\nexport {PORT_BLOCK_SIZE_ENV}=16\nunset {RUNTIME_LINK_ENV}\n"
             )
         );
 
@@ -666,6 +666,7 @@ mod tests {
         publish_workspace_environment(
             EnvironmentMount::Served {
                 workspace_mount: &image_mount,
+                host_home: &root,
                 temp_dir: &temp_dir,
                 capability_env: &crate::capabilities::CapabilityContribution::default(),
             },
@@ -676,9 +677,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(image_mount.join(".cowshed/env")).expect("environment"),
             format!(
-                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\nexport {TEMP_DIR_ENV}='{}'\nexport {RUNTIME_LINK_ENV}={}\n",
+                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={token}\nexport {PORT_BASE_ENV}=40976\nexport {PORT_BLOCK_SIZE_ENV}=16\nexport {TEMP_DIR_ENV}='{}'\nexport {RUNTIME_LINK_ENV}={}\nexport PATH='{}'\"${{PATH:+:}}${{PATH-}}\"\n",
                 temp_dir.display(),
-                crate::sandbox::workspace_runtime_link(&image_mount).display()
+                crate::sandbox::workspace_runtime_link(&image_mount).display(),
+                crate::host_dirs::installed_binary_directory(&root).display()
             )
         );
         assert_eq!(
@@ -708,7 +710,9 @@ mod tests {
         let token = fs::read_to_string(image_mount.join(WORKSPACE_TOKEN_PATH)).expect("token");
         assert_eq!(
             environment,
-            format!("{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={token}\n")
+            format!(
+                "{DEV_CI_POLICY}export {WORKSPACE_TOKEN_ENV}={token}\nunset {RUNTIME_LINK_ENV}\n"
+            )
         );
         assert!(!environment.contains("COWSHED_PORT_BASE"));
         assert!(!environment.contains("COWSHED_PORT_BLOCK_SIZE"));
