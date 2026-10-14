@@ -7511,6 +7511,7 @@ mod tests {
     struct TwoVolumeImage {
         image: PathBuf,
         commands: std::sync::Mutex<Vec<cowshed_apfs::CommandRequest>>,
+        mounted: std::sync::Mutex<std::collections::BTreeSet<String>>,
     }
 
     impl TwoVolumeImage {
@@ -7553,7 +7554,20 @@ mod tests {
                 .lock()
                 .expect("recorded commands")
                 .push(request.clone());
+            if request.program == Path::new("/usr/sbin/diskutil")
+                && request.args.first().is_some_and(|arg| arg == "unmount")
+                && let Some(device) = request.args.last().and_then(|arg| arg.to_str())
+            {
+                self.mounted.lock().expect("mounted volumes").remove(device);
+            }
             Ok(cowshed_apfs::CommandOutput::success([]))
+        }
+        fn volume_is_mounted(&self, volume_device: &str) -> io::Result<bool> {
+            Ok(self
+                .mounted
+                .lock()
+                .expect("mounted volumes")
+                .contains(volume_device))
         }
         fn image_lease(
             &self,
@@ -7621,6 +7635,9 @@ mod tests {
             TwoVolumeImage {
                 image: image.clone(),
                 commands: std::sync::Mutex::new(Vec::new()),
+                mounted: std::sync::Mutex::new(std::collections::BTreeSet::from([
+                    "/dev/disk5s2".into()
+                ])),
             },
             ApfsSubstrateConfig::new(&store, root.join("mnt")),
             FixedMounts(vec![KernelMountSnapshot::new(
