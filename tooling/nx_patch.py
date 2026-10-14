@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 from urllib.request import urlopen
@@ -57,7 +58,11 @@ def generate(root: Path, prepared: Path, archive: bytes) -> bytes:
     with tempfile.TemporaryDirectory(prefix="nx-patch-regenerate-") as temporary:
         source = Path(temporary) / "package"
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
-            tar.extractall(temporary, filter="data")
+            if sys.version_info >= (3, 12):
+                tar.extractall(temporary, filter="data")
+            else:
+                # Older Python has no filter keyword; the archive's lock integrity was checked above.
+                tar.extractall(temporary)
         git(source, "init", "--quiet")
         git(source, "add", "--force", "--all")
         # Keep the registry files in Git's index, then replace only its worktree.

@@ -3,9 +3,11 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from nx_patch import generate
 
@@ -53,6 +55,17 @@ class NxPatchRegeneration(unittest.TestCase):
             self.assertNotIn("node_modules", patch)
             self.assertNotIn(str(root), patch)
             self.assertEqual(patch.encode(), generate(root, prepared, archive))
+
+    def test_extraction_keeps_the_data_filter_when_the_runtime_supports_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prepared, archive = self.fixture(root)
+            extractall = tarfile.TarFile.extractall
+            with patch.object(tarfile.TarFile, "extractall", autospec=True, side_effect=extractall) as extract:
+                self.assertEqual(generate(root, prepared, archive), b"")
+            self.assertEqual(extract.call_count, 1)
+            expected = {"filter": "data"} if sys.version_info >= (3, 12) else {}
+            self.assertEqual(extract.call_args.kwargs, expected)
 
     def test_archive_integrity_is_required(self):
         with tempfile.TemporaryDirectory() as temporary:
