@@ -127,7 +127,9 @@ The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
   per-manifest `cargo fetch`, Biome and ESLint) stay in a `commands` list that Nx runs side by side.
 - **Overrides:** normal Nx merging applies. Explicit `nx.targets` fields replace inferred fields, while omitted fields
   retain their inferred base. Use `"dependsOn": ["...", "extra"]` to preserve inferred prerequisites when adding an
-  edge; replacing the array makes its author responsible for fetching before frozen Cargo commands.
+  edge; replacing the array makes its author responsible for fetching before frozen Cargo commands and producing the
+  archive before any runner consumes it. This repository also declares the archive producer explicitly in both APFS
+  runners' owning project targets, so a cold checkout reaches it before extraction.
 
 Member and exclude patterns may use `*` and `?` in any path segment (for example, `packages/*/crates/*`). Unsupported
 patterns and member patterns that match no directory fail graph construction instead of silently omitting crates.
