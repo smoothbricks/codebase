@@ -77,15 +77,17 @@ repairs an adopted identity with `cowshed mv main --repo-id`.
 
 Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It creates an
 absent store volume, remounts a detached or mis-mounted one at its canonical path, FileVault-encrypts an unencrypted
-volume in place, stores its independent random passphrase in `/Library/Keychains/System.keychain`, validates the volume
-marker, pins the boot mount in `/etc/fstab`, and installs the root-owned `dev.cowshed.storage` system LaunchDaemon. That
-daemon runs a fixed `/bin/sh` script of the volume UUIDs and canonical paths
+volume in place, stores its independent random passphrase in `/Library/Keychains/System.keychain` and verifies it reads
+back before encrypting, stores the same passphrase under the volume UUID for macOS's own login-time volume discovery,
+validates the volume marker, pins the boot mount in `/etc/fstab`, and installs the root-owned `dev.cowshed.storage`
+system LaunchDaemon. That daemon runs a fixed `/bin/sh` script of the volume UUIDs and canonical paths
 (`/Library/Application Support/dev.cowshed/mount-volumes.sh`); before login and without invoking the cowshed binary, it
 reads each passphrase from System.keychain, runs `diskutil apfs unlockVolume -nomount`, then mounts the volume with
-`-nobrowse` at its canonical path. fstab keeps `noauto` so Disk Arbitration does not race it. Setup never recreates a
-volume: existing volumes are encrypted in place, and the only volume it ever deletes is a retired caches volume, under
-`--retire-caches-volume` (below). On a healthy host it changes nothing and says so. Every storage error in the CLI
-points here — a host with no volumes has no checkout to adopt.
+`-nobrowse` at its canonical path; a refusal names its step and script line in `/var/log/cowshed-storage.log`. fstab
+keeps `noauto` so Disk Arbitration does not race it. Setup never recreates a volume: existing volumes are encrypted in
+place, and the only volume it ever deletes is a retired caches volume, under `--retire-caches-volume` (below). On a
+healthy host it changes nothing and says so. Every storage error in the CLI points here — a host with no volumes has no
+checkout to adopt.
 
 Once storage repair succeeds, setup installs the build it runs from as the host's cowshed — the gateway daemon's binary
 and the `cowshed` you type, as one artifact. The build is copied to a content-addressed file,
@@ -177,7 +179,7 @@ cowshed: no volumes will be created or deleted; existing data is untouched
 cowshed: cowshed.store exists (UUID 1D6F0E1A-…-AAAA, 1.0 TB) and will be mounted at /private/cowshed/store
 cowshed: cowshed.store exists (UUID 1D6F0E1A-…-AAAA, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain
 cowshed: /etc/fstab will pin UUID 1D6F0E1A-…-AAAA at /private/cowshed/store so it mounts at every boot
-cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login
+cowshed: system LaunchDaemon dev.cowshed.storage and encrypted-volume discovery credentials will be converged; current service files remain unchanged
 cowshed: cowshed.store (store): present but not mounted -> mounted
 cowshed: pinned the boot mounts in /etc/fstab
 cowshed: host storage is set up (one administrator authorization was used)
@@ -207,11 +209,11 @@ cowshed: no volumes will be created or deleted; existing data is untouched
 cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be mounted at /private/cowshed/store
 cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain
 cowshed: /etc/fstab will pin UUID …-A at /private/cowshed/store so it mounts at every boot
-cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login
+cowshed: system LaunchDaemon dev.cowshed.storage and encrypted-volume discovery credentials will be converged; current service files remain unchanged
 cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be mounted at /private/cowshed/store: done
 cowshed: cowshed.store exists (UUID …-A, 1.0 TB) and will be FileVault-encrypted in place; passphrase stored in System.keychain: done
 cowshed: /etc/fstab will pin UUID …-A at /private/cowshed/store so it mounts at every boot: FAILED — could not write /etc/fstab
-cowshed: system LaunchDaemon dev.cowshed.storage will be installed to unlock and mount cowshed volumes before login: not attempted
+cowshed: system LaunchDaemon dev.cowshed.storage and encrypted-volume discovery credentials will be converged; current service files remain unchanged: not attempted
 cowshed: host storage is NOT set up: 2 actions done, 1 failed, 1 not attempted
 cowshed: could not write /etc/fstab
 next: cowshed doctor --json
@@ -326,13 +328,13 @@ cowshed: cowshed.caches (UUID 1D6F0E1A-…-BBBB) at /private/cowshed/caches hold
 
 `--uninstall` is the same transaction backwards, and narrower on purpose. It removes cowshed's **machine presence** —
 the cowshed-tagged `/etc/fstab` pins, the `dev.cowshed.storage` system LaunchDaemon, the `cowshed.store` item in
-`/Library/Keychains/System.keychain` (and a retired volume's `cowshed.caches` item, if one is still there), the
-`dev.cowshed.gateway` and `dev.cowshed.sccache` LaunchAgents, the `cowshed` links on your `PATH` that name the installed
-cowshed, the installed cowshed itself (its stable name, every stored copy and their build records), and sccache's nix GC
-root — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It
-therefore refuses while the volumes still hold workspaces, or while their occupancy cannot be established at all (an
-unmounted store looks empty to every cheap check), until `--force` says the caller means it anyway. There is no
-interactive prompt — the refusal is the prompt, and its hint is the completed command line:
+`/Library/Keychains/System.keychain` (and a retired volume's `cowshed.caches` item, if one is still there) with their
+UUID-keyed discovery items, the `dev.cowshed.gateway` and `dev.cowshed.sccache` LaunchAgents, the `cowshed` links on
+your `PATH` that name the installed cowshed, the installed cowshed itself (its stable name, every stored copy and their
+build records), and sccache's nix GC root — and touches no volume, no image, and no workspace. Nothing it removes holds
+data; everything it leaves does. It therefore refuses while the volumes still hold workspaces, or while their occupancy
+cannot be established at all (an unmounted store looks empty to every cheap check), until `--force` says the caller
+means it anyway. There is no interactive prompt — the refusal is the prompt, and its hint is the completed command line:
 
 ```
 $ cowshed setup --uninstall

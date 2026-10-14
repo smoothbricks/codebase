@@ -1385,7 +1385,7 @@ fn action_intent(action: &HostAction) -> String {
             mounted_at.display()
         ),
         HostAction::InstallMountService { label } => format!(
-            "system LaunchDaemon {label} will be installed to unlock and mount cowshed volumes before login"
+            "system LaunchDaemon {label} and encrypted-volume discovery credentials will be converged; current service files remain unchanged"
         ),
         // Named, not counted: 01a_apfs.md ("Dedicated store volume") requires reclaimable stubs to
         // be enumerated, because "3 files will be deleted" is not something a person can agree to.

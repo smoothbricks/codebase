@@ -3991,7 +3991,7 @@ fn host_action_evidence(action: &HostAction) -> String {
         ),
         HostAction::InstallMountService { label } => {
             format!(
-                "install system LaunchDaemon {label} to unlock and mount cowshed volumes before login"
+                "converge system LaunchDaemon {label} and verified encrypted-volume credentials for boot and login discovery"
             )
         }
         HostAction::ReclaimStubs { paths } => format!(
@@ -4200,7 +4200,7 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
             HostAction::InstallMountService { label } => findings.push(Finding {
                 code: "host-mount-service".into(),
                 severity: FindingSeverity::Error,
-                message: format!("system LaunchDaemon {label} is missing, outdated, or not loaded"),
+                message: format!("system LaunchDaemon {label} or its encrypted-volume discovery credentials need repair"),
                 hint: "cowshed setup".into(),
                 path: Some(PathBuf::from(MOUNT_SERVICE_PLIST)),
             }),

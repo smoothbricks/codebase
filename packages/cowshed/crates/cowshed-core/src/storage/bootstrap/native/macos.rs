@@ -16,6 +16,8 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod keychain;
+
 use super::super::{
     APFS_CACHES_VOLUME, APFS_STORE_VOLUME, ApfsProvisionKind, ApfsVolumeProvision, BlockingLane,
     BootstrapEvidence, BootstrapExecutionError, BootstrapHost, BootstrapPlan, CanonicalRoots,
@@ -505,6 +507,12 @@ const SPOTLIGHT_EXCLUSIONS_SHELL: &str = r#"ensure_spotlight_exclusions() (
 )
 "#;
 
+/// Boot failures retain the refusing step and source line without exposing credential bytes.
+const BOOT_FAILURE_SHELL: &str = r#"boot_step='initialize boot mounts'
+boot_line=1
+trap 'status=$?; if [ "$status" -ne 0 ]; then printf "cowshed storage: %s:%s: %s refused (exit %s)\n" "$0" "$boot_line" "$boot_step" "$status" >&2; fi' EXIT
+"#;
+
 fn spotlight_roots(
     roots: &CanonicalRoots,
     home: &Path,
@@ -564,19 +572,29 @@ fn desired_mount_service(
 set -eu
 umask 022
 
-{SPOTLIGHT_EXCLUSIONS_SHELL}
+{BOOT_FAILURE_SHELL}{SPOTLIGHT_EXCLUSIONS_SHELL}boot_step='merge Spotlight Search Privacy exclusions'
+boot_line=$((LINENO + 1))
 ensure_spotlight_exclusions '/System/Volumes/Data/.Spotlight-V100/VolumeConfiguration.plist' {exclusions}
 
 mount_volume() {{
     label=$1
     uuid=$2
     mountpoint=$3
+    boot_step="inspect $label ($uuid)"
+    boot_line=$((LINENO + 1))
     info=$(/usr/sbin/diskutil info -plist "$uuid")
-    current=$(printf '%s' "$info" | /usr/bin/plutil -extract MountPoint raw -o - - 2>/dev/null || :)
-
+    printf '%s' "$info" | /usr/bin/plutil -lint -s -
+    # MountPoint is absent for an unmounted volume; malformed plist input already refused.
+    if current=$(printf '%s' "$info" | /usr/bin/plutil -extract MountPoint raw -expect string -o - -); then
+        :
+    else
+        current=''
+    fi
     if [ "$current" = "$mountpoint" ]; then
         return 0
     fi
+    boot_step="validate mountpoint for $label ($uuid)"
+    boot_line=$LINENO
     if [ -n "$current" ]; then
         echo "cowshed storage: $uuid is mounted at $current, expected $mountpoint" >&2
         return 1
@@ -592,12 +610,28 @@ mount_volume() {{
         echo "cowshed storage: refusing nonempty mountpoint $mountpoint" >&2
         return 1
     fi
-
-    {SECURITY} find-generic-password -a "$label" -s "$label" -w {SYSTEM_KEYCHAIN} \
-        | /usr/sbin/diskutil apfs unlockVolume "$uuid" -nomount -stdinpassphrase
+    boot_step="read System.keychain credential for $label ($uuid)"
+    boot_line=$((LINENO + 1))
+    if password=$({SECURITY} find-generic-password -a "$label" -s "$label" -w {SYSTEM_KEYCHAIN}); then
+        if [ -z "$password" ]; then
+            echo "cowshed storage: empty System.keychain credential for $label ($uuid)" >&2
+            return 1
+        fi
+    else
+        status=$?
+        return "$status"
+    fi
+    boot_step="unlock $label ($uuid)"
+    boot_line=$((LINENO + 1))
+    printf '%s\n' "$password" | /usr/sbin/diskutil apfs unlockVolume "$uuid" -nomount -stdinpassphrase
+    unset password
+    boot_step="mount $label ($uuid)"
+    boot_line=$((LINENO + 1))
     /usr/sbin/diskutil mount -nobrowse -mountPoint "$mountpoint" "$uuid"
+    boot_step="verify mounted $label ($uuid)"
+    boot_line=$((LINENO + 1))
     info=$(/usr/sbin/diskutil info -plist "$uuid")
-    current=$(printf '%s' "$info" | /usr/bin/plutil -extract MountPoint raw -o - -)
+    current=$(printf '%s' "$info" | /usr/bin/plutil -extract MountPoint raw -expect string -o - -)
     if [ "$current" != "$mountpoint" ]; then
         echo "cowshed storage: $uuid mounted at $current, expected $mountpoint" >&2
         return 1
@@ -618,6 +652,8 @@ mount_volume() {{
     <string>/bin/sh</string>
     <string>{MOUNT_SERVICE_SCRIPT}</string>
   </array>
+  <key>StandardErrorPath</key>
+  <string>/var/log/cowshed-storage.log</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -707,9 +743,32 @@ fn mount_service_is_current(files: &MountServiceFiles) -> bool {
         )
 }
 
+fn volume_passwords_are_current(
+    snapshot: &SetupSnapshot,
+    host: &dyn BootstrapHost,
+) -> Result<bool, HostError> {
+    for volume in &snapshot.classified {
+        if volume.file_vault != Some(true) {
+            return Ok(false);
+        }
+        let Some(uuid) = &volume.volume_uuid else {
+            return Ok(false);
+        };
+        let Some(password) = lookup_volume_password(host, volume.name)? else {
+            return Ok(false);
+        };
+        if !keychain::uuid_volume_password_matches(host, volume.name, uuid, password.as_str())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn add_mount_service_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBootstrapError> {
     if let Some(files) = mount_service_files(snapshot)?
-        && !mount_service_is_current(&files)
+        && (!mount_service_is_current(&files)
+            || !volume_passwords_are_current(snapshot, &SystemBootstrapHost)
+                .map_err(NativeBootstrapError::Host)?)
     {
         snapshot.actions.push(HostAction::InstallMountService {
             label: MOUNT_SERVICE_LABEL.to_owned(),
@@ -1338,8 +1397,7 @@ fn lookup_volume_password(
         }
     }
     if password.is_empty() {
-        // AuthorizationExecuteWithPrivileges reports success and empty stdout when
-        // `security` exits 44 (item not found); stderr is not on the communications pipe.
+        // An empty item cannot unlock a FileVault volume.
         return Ok(None);
     }
     Ok(Some(Zeroizing::new(password)))
@@ -1359,35 +1417,47 @@ fn encrypt_volume_with(host: &dyn BootstrapHost, name: &str, uuid: &str) -> Resu
         Some(existing) => existing,
         None => {
             let password = random_volume_password()?;
-            required_host_command(
-                host,
-                HostCommand::new(
+            let output = host.run_command(&HostCommand::new(
+                SECURITY,
+                [
+                    "add-generic-password",
+                    "-a",
+                    name,
+                    "-s",
+                    name,
+                    "-l",
+                    format!("{name} encryption password").as_str(),
+                    "-D",
+                    "Encrypted volume password",
+                    "-w",
+                    password.as_str(),
+                    "-T",
                     SECURITY,
-                    [
-                        "add-generic-password",
-                        "-a",
-                        name,
-                        "-s",
-                        name,
-                        "-l",
-                        format!("{name} encryption password").as_str(),
-                        "-D",
-                        "Encrypted volume password",
-                        "-w",
-                        password.as_str(),
-                        "-T",
-                        SECURITY,
-                        "-T",
-                        APFS_USER_AGENT,
-                        "-T",
-                        CS_USER_AGENT,
-                        SYSTEM_KEYCHAIN,
-                    ],
-                ),
-            )?;
-            password
+                    "-T",
+                    APFS_USER_AGENT,
+                    "-T",
+                    CS_USER_AGENT,
+                    SYSTEM_KEYCHAIN,
+                ],
+            ))?;
+            if !output.succeeded() {
+                return Err(HostError::new(format!(
+                    "persist System.keychain password for {name} before encryptVolume {uuid}: {}",
+                    output.status
+                )));
+            }
+            let stored = lookup_volume_password(host, name)?.ok_or_else(|| {
+                HostError::new(format!("verify System.keychain password readback for {name} before encryptVolume {uuid}: item absent or unreadable"))
+            })?;
+            if stored.as_bytes() != password.as_bytes() {
+                return Err(HostError::new(format!(
+                    "verify System.keychain password readback for {name} before encryptVolume {uuid}: stored bytes differ; refusing encryption"
+                )));
+            }
+            stored
         }
     };
+    keychain::ensure_uuid_volume_password(host, name, uuid, password.as_str())?;
     let command = HostCommand::new(
         DISKUTIL,
         [
@@ -1480,6 +1550,7 @@ fn delete_retired_volume_with(
             SYSTEM_KEYCHAIN,
         ],
     ))?;
+    keychain::delete_uuid_volume_password(host, uuid)?;
     Ok(())
 }
 
@@ -1618,7 +1689,31 @@ async fn install_mount_service(
         .ok_or_else(|| {
             CowshedError::internal("mount service installation requires both APFS volume UUIDs")
         })?;
-    tokio::task::spawn_blocking(move || install_mount_service_with(host.as_ref(), &files))
+    let credentials = snapshot
+        .classified
+        .iter()
+        .map(|volume| {
+            volume
+                .volume_uuid
+                .as_ref()
+                .map(|uuid| (volume.name, uuid.clone()))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            CowshedError::internal(
+                "mount service credential repair requires every APFS volume UUID",
+            )
+        })?;
+    tokio::task::spawn_blocking(move || {
+        for (label, uuid) in credentials {
+            let password = lookup_volume_password(host.as_ref(), label)?.ok_or_else(|| {
+                HostError::new(format!("cannot repair APFS discovery password for {label} ({uuid}): verified System.keychain boot password is missing"))
+            })?;
+            keychain::ensure_uuid_volume_password(host.as_ref(), label, &uuid, password.as_str())?;
+        }
+        if mount_service_is_current(&files) { return Ok(()); }
+        install_mount_service_with(host.as_ref(), &files)
+    })
         .await
         .map_err(|error| {
             setup_execution_error(
@@ -1962,10 +2057,47 @@ fn volume_keychain_item_present(label: &str) -> Result<bool, HostError> {
     .map(|output| output.succeeded())
 }
 
+fn volume_keychain_identities() -> Result<Vec<String>, NativeBootstrapError> {
+    let mut identities = VOLUME_KEYCHAIN_LABELS
+        .iter()
+        .map(|label| (*label).to_owned())
+        .collect::<Vec<_>>();
+    let inventory = system_apfs_inventory()?;
+    identities.extend(
+        inventory
+            .containers
+            .into_iter()
+            .flat_map(|container| container.volumes)
+            .filter(|volume| VOLUME_KEYCHAIN_LABELS.contains(&volume.name.as_str()))
+            .map(|volume| volume.volume_uuid),
+    );
+    // A failed credential deletion can leave the owned pin after the volume is already gone.
+    for line in read_fstab_text()
+        .map_err(NativeBootstrapError::Host)?
+        .lines()
+    {
+        let Some((pin, label)) = line.split_once(COWSHED_FSTAB_TAG) else {
+            continue;
+        };
+        if !VOLUME_KEYCHAIN_LABELS.contains(&label.trim()) {
+            continue;
+        }
+        if let Some(uuid) = pin
+            .split_whitespace()
+            .next()
+            .and_then(|field| field.strip_prefix("UUID="))
+            && !identities.iter().any(|identity| identity == uuid)
+        {
+            identities.push(uuid.to_owned());
+        }
+    }
+    Ok(identities)
+}
+
 fn host_uninstall_plan(home: &Path) -> Result<HostUninstallPlan, NativeBootstrapError> {
     let existing = read_fstab_text().map_err(NativeBootstrapError::Host)?;
     let mut plan = host_uninstall_plan_from_text(home, &existing)?;
-    let has_keychain_items = VOLUME_KEYCHAIN_LABELS
+    let has_keychain_items = volume_keychain_identities()?
         .iter()
         .try_fold(false, |found, label| {
             volume_keychain_item_present(label).map(|present| found || present)
@@ -2020,9 +2152,11 @@ pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallRepor
         let remove_fstab = !plan.pins_to_remove.is_empty();
         let removed_keychain_labels = tokio::task::spawn_blocking(move || {
             let mut keychain_labels = Vec::new();
-            for label in VOLUME_KEYCHAIN_LABELS {
-                if volume_keychain_item_present(label)? {
-                    keychain_labels.push(label);
+            for identity in
+                volume_keychain_identities().map_err(|error| HostError::new(error.to_string()))?
+            {
+                if volume_keychain_item_present(&identity)? {
+                    keychain_labels.push(identity);
                 }
             }
             let mut session = MacAuthorizationSession::acquire()?;
@@ -2047,9 +2181,9 @@ pub async fn execute_host_uninstall(home: &Path) -> crate::Result<UninstallRepor
                         [
                             "delete-generic-password",
                             "-a",
-                            *label,
+                            label.as_str(),
                             "-s",
-                            *label,
+                            label.as_str(),
                             SYSTEM_KEYCHAIN,
                         ],
                     ),
@@ -2764,9 +2898,9 @@ fn run_command_with(
     })
     .map_err(|source| {
         HostError::new(format!(
-            "cannot execute {:?} with argv {:?}: {source}",
+            "cannot execute {:?} with {} arguments: {source}",
             command.program(),
-            command.args()
+            command.args().len()
         ))
     })?;
     Ok(output.into())
@@ -3345,9 +3479,12 @@ impl MacAuthorizationSession {
                 command.program()
             ))
         })?);
-        for argument in command.args() {
+        for (index, argument) in command.args().iter().enumerate() {
             arguments.push(CString::new(argument.as_bytes()).map_err(|_| {
-                HostError::new(format!("authorized argument contains NUL: {argument:?}"))
+                HostError::new(format!(
+                    "authorized argument {index} contains NUL for {:?}",
+                    command.program()
+                ))
             })?);
         }
         let mut argument_pointers: Vec<*mut libc::c_char> = arguments
@@ -4752,6 +4889,10 @@ mod tests {
                 .unwrap()
                 < script.find("mount_volume 'cowshed.store'").unwrap()
         );
+        assert!(script.contains("boot_step='merge Spotlight Search Privacy exclusions'"));
+        assert!(script.contains("if password=$("));
+        assert!(script.contains("unset password"));
+        assert!(script.contains("refused (exit %s)"));
         assert!(script.starts_with("#!/bin/sh\nset -eu\n"));
         assert!(script.contains(
             "mount_volume 'cowshed.store' 'FEC35F46-22C8-40BC-943A-ADC4BD39CAE5' '/private/cowshed/store'"
@@ -4774,6 +4915,8 @@ mod tests {
         assert!(plist.contains(MOUNT_SERVICE_SCRIPT));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<key>SuccessfulExit</key>"));
+        assert!(plist.contains("<key>StandardErrorPath</key>"));
+        assert!(plist.contains("/var/log/cowshed-storage.log"));
         Value::from_reader_xml(files.plist.as_slice()).expect("valid launchd plist");
         let mut shell = Command::new("/bin/sh")
             .arg("-n")
@@ -7970,10 +8113,19 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         }
     }
 
+    fn encryption_fixture_password_output(password: &str) -> HostCommandOutput {
+        let mut bytes = Vec::with_capacity(password.len() + 1);
+        bytes.extend_from_slice(password.as_bytes());
+        bytes.push(b'\n');
+        HostCommandOutput::success(bytes)
+    }
+
     struct EncryptCommandHost {
         commands: mpsc::Sender<(HostCommand, Option<Vec<u8>>)>,
         existing_password: Option<&'static str>,
         persist_output: Option<HostCommandOutput>,
+        stored: std::sync::Mutex<BTreeMap<String, Zeroizing<String>>>,
+        readback_output: Option<HostCommandOutput>,
     }
 
     impl BootstrapHost for EncryptCommandHost {
@@ -7998,29 +8150,74 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         }
 
         fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
-            self.commands
-                .send((command.clone(), None))
-                .expect("encryption command receiver remains alive");
+            assert!(
+                self.commands.send((command.clone(), None)).is_ok(),
+                "encryption command receiver remains alive"
+            );
+            let key = || {
+                let account = &command
+                    .args()
+                    .windows(2)
+                    .find(|pair| pair[0] == "-a")
+                    .expect("keychain account")[1];
+                let service = &command
+                    .args()
+                    .windows(2)
+                    .find(|pair| pair[0] == "-s")
+                    .expect("keychain service")[1];
+                assert_eq!(
+                    account, service,
+                    "boot and discovery credentials use one exact identity"
+                );
+                account
+            };
             if command
                 .args()
                 .first()
                 .is_some_and(|argument| argument == "find-generic-password")
             {
-                return Ok(match self.existing_password {
-                    Some(password) => HostCommandOutput::success(format!("{password}\n")),
-                    None => HostCommandOutput::failure(
-                        44,
-                        "The specified item could not be found in the keychain.",
-                    ),
-                });
+                let identity = key();
+                let stored = self.stored.lock().expect("fixture keychain");
+                if let Some(password) = stored.get(identity) {
+                    if matches!(identity.as_str(), APFS_STORE_VOLUME | APFS_CACHES_VOLUME)
+                        && let Some(output) = &self.readback_output
+                    {
+                        return Ok(output.clone());
+                    }
+                    return Ok(encryption_fixture_password_output(password));
+                }
+                return Ok(
+                    match self.existing_password.filter(|_| {
+                        matches!(identity.as_str(), APFS_STORE_VOLUME | APFS_CACHES_VOLUME)
+                    }) {
+                        Some(password) => encryption_fixture_password_output(password),
+                        None => HostCommandOutput::failure(
+                            44,
+                            "The specified item could not be found in the keychain.",
+                        ),
+                    },
+                );
             }
             if command
                 .args()
                 .first()
                 .is_some_and(|argument| argument == "add-generic-password")
-                && let Some(output) = &self.persist_output
             {
-                return Ok(output.clone());
+                if let Some(output) = &self.persist_output
+                    && !output.succeeded()
+                {
+                    return Ok(output.clone());
+                }
+                let password = &command
+                    .args()
+                    .windows(2)
+                    .find(|pair| pair[0] == "-w")
+                    .expect("keychain password")[1];
+                self.stored
+                    .lock()
+                    .expect("fixture keychain")
+                    .insert(key().clone(), Zeroizing::new(password.clone()));
+                return Ok(self.persist_output.clone().unwrap_or_default());
             }
             Ok(HostCommandOutput::default())
         }
@@ -8030,9 +8227,12 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             command: &HostCommand,
             input: &[u8],
         ) -> Result<HostCommandOutput, HostError> {
-            self.commands
-                .send((command.clone(), Some(input.to_vec())))
-                .expect("encryption command receiver remains alive");
+            assert!(
+                self.commands
+                    .send((command.clone(), Some(input.to_vec())))
+                    .is_ok(),
+                "encryption command receiver remains alive"
+            );
             Ok(HostCommandOutput::default())
         }
 
@@ -8060,57 +8260,78 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             commands,
             existing_password: None,
             persist_output: None,
+            stored: std::sync::Mutex::new(BTreeMap::new()),
+            readback_output: None,
         };
         let uuid = "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5";
         encrypt_volume_with(&host, APFS_STORE_VOLUME, uuid).unwrap();
         let commands = received.try_iter().collect::<Vec<_>>();
-        assert_eq!(commands.len(), 3);
-        assert_eq!(commands[0].0.program(), SECURITY);
+        assert_eq!(commands.len(), 7);
         assert_eq!(commands[0].0.args()[0], "find-generic-password");
-        assert_eq!(commands[1].0.program(), SECURITY);
         assert_eq!(commands[1].0.args()[0], "add-generic-password");
-        assert!(commands[1].0.args().windows(2).any(|pair| {
-            pair == ["-a", APFS_STORE_VOLUME] || pair == ["-s", APFS_STORE_VOLUME]
-        }));
+        assert_eq!(commands[2].0.args()[0], "find-generic-password");
+        assert!(
+            commands[2]
+                .0
+                .args()
+                .windows(2)
+                .any(|pair| pair == ["-a", APFS_STORE_VOLUME])
+        );
+        assert!(
+            commands[1]
+                .0
+                .args()
+                .windows(2)
+                .any(|pair| pair == ["-a", APFS_STORE_VOLUME])
+        );
         for trusted in [SECURITY, APFS_USER_AGENT, CS_USER_AGENT] {
             assert!(
                 commands[1]
                     .0
                     .args()
                     .windows(2)
-                    .any(|pair| { pair[0] == "-T" && pair[1] == trusted })
+                    .any(|pair| pair == ["-T", trusted])
             );
         }
         assert_eq!(
             commands[1].0.args().last().map(String::as_str),
             Some(SYSTEM_KEYCHAIN)
         );
-        let password_index = commands[1]
+        let password = &commands[1]
             .0
             .args()
-            .iter()
-            .position(|argument| argument == "-w")
-            .expect("security password argument")
-            + 1;
-        let password = &commands[1].0.args()[password_index];
+            .windows(2)
+            .find(|pair| pair[0] == "-w")
+            .unwrap()[1];
         assert_eq!(password.len(), 32);
         assert!(password.bytes().all(|byte| byte.is_ascii_hexdigit()));
-
-        assert_eq!(commands[2].0.program(), DISKUTIL);
+        assert!(
+            commands[3]
+                .0
+                .args()
+                .windows(2)
+                .any(|pair| pair == ["-a", uuid])
+        );
+        assert_eq!(commands[4].0.args()[0], "add-generic-password");
+        assert_eq!(commands[5].0.args()[0], "find-generic-password");
+        assert_eq!(commands[6].0.program(), DISKUTIL);
         assert_eq!(
-            commands[2].0.args(),
+            commands[6].0.args(),
             [
                 "apfs",
                 "encryptVolume",
                 uuid,
                 "-user",
                 "disk",
-                "-stdinpassphrase",
+                "-stdinpassphrase"
             ]
         );
-        let mut expected_input = password.as_bytes().to_vec();
-        expected_input.push(b'\n');
-        assert_eq!(commands[2].1.as_deref(), Some(expected_input.as_slice()));
+        let mut expected = password.as_bytes().to_vec();
+        expected.push(b'\n');
+        assert!(
+            commands[6].1.as_deref() == Some(expected.as_slice()),
+            "encryption stdin must match the persisted password bytes"
+        );
     }
 
     #[test]
@@ -8120,23 +8341,36 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             commands,
             existing_password: Some("already-stored-pass"),
             persist_output: None,
+            stored: std::sync::Mutex::new(BTreeMap::new()),
+            readback_output: None,
         };
         let uuid = "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5";
         encrypt_volume_with(&host, APFS_STORE_VOLUME, uuid).unwrap();
         let commands = received.try_iter().collect::<Vec<_>>();
-        assert_eq!(commands.len(), 2);
+        assert_eq!(commands.len(), 5);
         assert_eq!(commands[0].0.args()[0], "find-generic-password");
         assert!(
             !commands.iter().any(|(command, _)| command
                 .args()
                 .first()
-                .is_some_and(|argument| argument == "add-generic-password")),
-            "a stored passphrase must not be replaced"
+                .is_some_and(|arg| arg == "add-generic-password")
+                && command
+                    .args()
+                    .windows(2)
+                    .any(|pair| pair == ["-a", APFS_STORE_VOLUME])),
+            "a stored canonical passphrase must not be replaced"
         );
-        assert_eq!(commands[1].0.args()[0], "apfs");
-        assert_eq!(
-            commands[1].1.as_deref(),
-            Some(b"already-stored-pass\n".as_slice())
+        assert!(
+            commands[1]
+                .0
+                .args()
+                .windows(2)
+                .any(|pair| pair == ["-a", uuid])
+        );
+        assert_eq!(commands[4].0.args()[0], "apfs");
+        assert!(
+            commands[4].1.as_deref() == Some(b"already-stored-pass\n".as_slice()),
+            "encryption stdin must reuse the persisted password bytes"
         );
     }
 
@@ -8147,6 +8381,8 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             commands,
             existing_password: Some(""),
             persist_output: None,
+            stored: std::sync::Mutex::new(BTreeMap::new()),
+            readback_output: None,
         };
         encrypt_volume_with(
             &host,
@@ -8156,7 +8392,8 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         .unwrap();
         let commands = received.try_iter().collect::<Vec<_>>();
         assert_eq!(commands[1].0.args()[0], "add-generic-password");
-        assert_eq!(commands[2].0.args()[0], "apfs");
+        assert_eq!(commands[2].0.args()[0], "find-generic-password");
+        assert_eq!(commands[6].0.args()[0], "apfs");
     }
 
     #[test]
@@ -8165,7 +8402,10 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             authorized_command_output(b"secret\n--cowshed-aewp-exit:44--\n".to_vec()).unwrap();
         assert!(!output.succeeded());
         assert_eq!(output.status, cowshed_os::process::ProcessStatus::Exit(44));
-        assert_eq!(output.stdout, b"secret");
+        assert!(
+            output.stdout.as_slice() == b"secret",
+            "authorized stdout payload must be preserved"
+        );
     }
 
     #[test]
@@ -8191,26 +8431,72 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
                 1,
                 "could not add the generic password",
             )),
+            stored: std::sync::Mutex::new(BTreeMap::new()),
+            readback_output: None,
         };
-        encrypt_volume_with(
+        let error = encrypt_volume_with(
             &host,
             APFS_STORE_VOLUME,
             "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5",
         )
-        .expect_err("failed add-generic-password must not reach encryptVolume");
+        .expect_err("failed add must not encrypt");
         let commands = received.try_iter().collect::<Vec<_>>();
-        assert!(commands.iter().any(|(command, _)| {
-            command
-                .args()
-                .first()
-                .is_some_and(|argument| argument == "add-generic-password")
-        }));
+        let password = &commands[1]
+            .0
+            .args()
+            .windows(2)
+            .find(|pair| pair[0] == "-w")
+            .unwrap()[1];
+        assert!(!error.to_string().contains(password));
+        assert!(
+            error
+                .to_string()
+                .contains("persist System.keychain password"),
+            "persistence failure must name its credential step"
+        );
         assert!(
             !commands
                 .iter()
-                .any(|(command, _)| command.program() == DISKUTIL),
-            "encryptVolume must not run without a persisted keychain item"
+                .any(|(command, _)| command.program() == DISKUTIL)
         );
+    }
+
+    #[test]
+    fn encryption_refuses_an_unreadable_persisted_key_before_encrypting() {
+        for readback in [
+            HostCommandOutput::failure(44, "missing persisted item"),
+            HostCommandOutput::success("different-persisted-bytes\n"),
+        ] {
+            let (commands, received) = mpsc::channel();
+            let host = EncryptCommandHost {
+                commands,
+                existing_password: None,
+                persist_output: None,
+                stored: std::sync::Mutex::new(BTreeMap::new()),
+                readback_output: Some(readback),
+            };
+            let error = encrypt_volume_with(
+                &host,
+                APFS_STORE_VOLUME,
+                "FEC35F46-22C8-40BC-943A-ADC4BD39CAE5",
+            )
+            .expect_err("canonical readback must match before any UUID effect or encryption");
+            assert!(error.to_string().contains("System.keychain"));
+            let commands = received.try_iter().collect::<Vec<_>>();
+            assert_eq!(commands.len(), 3);
+            assert_eq!(commands[2].0.args()[0], "find-generic-password");
+            assert!(
+                commands
+                    .iter()
+                    .all(|(command, _)| command.program() != DISKUTIL)
+            );
+            assert!(commands.iter().all(|(command, _)| {
+                command
+                    .args()
+                    .windows(2)
+                    .any(|pair| pair == ["-a", APFS_STORE_VOLUME])
+            }));
+        }
     }
 
     /// Bootstrap preserves the shared runner's actual outcome. A total deadline may expire
