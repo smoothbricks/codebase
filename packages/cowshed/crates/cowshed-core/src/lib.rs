@@ -44,9 +44,7 @@ use cowshed_apfs::{
     SystemCommandRunner, attach_budget,
 };
 #[cfg(all(test, target_os = "macos"))]
-use cowshed_apfs::{
-    mounts::kernel_mounts, store_lock::verify_no_symlinks, template::blank_template,
-};
+use cowshed_apfs::{store_lock::verify_no_symlinks, template::blank_template};
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../../cowshed-apfs/tests/support/blank_image.rs"]
 mod blank_image;

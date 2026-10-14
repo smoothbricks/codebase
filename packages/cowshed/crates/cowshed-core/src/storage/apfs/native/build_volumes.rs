@@ -1064,7 +1064,8 @@ mod tests {
             crate::blank_image::blank_image(&image);
             let checkout = root.join("lane");
             fs::create_dir_all(&checkout).unwrap();
-            host.backend
+            let attachment = host
+                .backend
                 .attach_mounted(&image, &checkout, MountAccess::ReadWrite, false)
                 .expect("attach and mount the workspace");
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
