@@ -4162,6 +4162,12 @@ mod tests {
             CachesVolume::Keep,
         )
         .unwrap();
+        assert!(
+            !first
+                .actions
+                .iter()
+                .any(|action| matches!(action, HostAction::EncryptVolume { .. }))
+        );
         let PlannedFstab::NeedsPin(pins) = first.fstab else {
             panic!("pin plan");
         };
@@ -7821,24 +7827,6 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
             &snapshot.actions[3],
             HostAction::EncryptVolume { name, .. } if name == APFS_CACHES_VOLUME
         ));
-    }
-
-    #[test]
-    fn filevault_volumes_with_usable_keychain_items_do_not_plan_encryption() {
-        let mut source = healthy_existing_source();
-        let snapshot = prepare_setup_snapshot(
-            &mut source,
-            Path::new("/Users/alice"),
-            "",
-            CachesVolume::Keep,
-        )
-        .unwrap();
-        assert!(
-            !snapshot
-                .actions
-                .iter()
-                .any(|action| matches!(action, HostAction::EncryptVolume { .. }))
-        );
     }
 
     #[test]
