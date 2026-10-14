@@ -347,6 +347,10 @@ modification time so binding renames do not count as build writes. A missing roo
 name the actual path. The deterministic listing-then-removal regression checks those clocks and root refusal; the
 ordinary directory rebase lifecycle proves main can run Nx, fork, land and carry its indexed entries afterward.
 
+Re-adoption has independent real walks for RAW replacement, prepublication RAW recovery, and retained legacy-input
+recovery. Each interrupted walk resumes the recorded replacement through `mount main` and ordinary startup without
+issuing a second replacement or retained generation, preserving the checkout and warm build-volume identity.
+
 The Linux job-accounting fixture is a separate kernel-counter proof, not a production ZFS workspace-admission proof. It
 runs from the ordinary runner through a passwordless-sudo delegated scope; only its parent prepares and cleans up a
 test-owned ext4 image on a declared root-only loop device. Delegation of cgroupfs does not confer mount authority. The
