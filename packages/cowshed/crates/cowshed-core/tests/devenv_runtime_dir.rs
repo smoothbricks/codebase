@@ -1432,16 +1432,14 @@ async fn host_controller_cargo_discovery_asks_the_toolchain_the_dev_environment_
         &mount.join(".cowshed/bin/cargo"),
         "#!/bin/sh\necho 'the bootstrap cargo cannot read this project' >&2\nexit 101\n",
     );
-    let real_cargo = std::env::split_paths(&std::env::var_os("PATH").expect("host PATH"))
-        .map(|directory| directory.join("cargo"))
-        .find(|candidate| candidate.is_file())
-        .expect("the gate's own cargo is on PATH");
-    std::fs::create_dir_all(mount.join("toolchain")).expect("dev environment toolchain");
-    std::os::unix::fs::symlink(
-        std::fs::canonicalize(real_cargo).expect("resolve the gate's cargo"),
-        mount.join("toolchain/cargo"),
+    // PATH starts with the jobserver launcher; CARGO names the real driver.
+    let real_cargo = std::fs::canonicalize(
+        std::env::var_os("CARGO").expect("Cargo publishes its real compiler driver"),
     )
-    .expect("dev environment cargo");
+    .expect("real Cargo driver");
+    std::fs::create_dir_all(mount.join("toolchain")).expect("dev environment toolchain");
+    std::os::unix::fs::symlink(real_cargo, mount.join("toolchain/cargo"))
+        .expect("dev environment cargo");
     std::fs::write(mount.join(".envrc"), "PATH_add \"$PWD/toolchain\"\n").expect("envrc");
     std::fs::write(
         mount.join("Cargo.toml"),
