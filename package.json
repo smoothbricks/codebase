@@ -134,6 +134,28 @@
           }
         ]
       },
+      "cargo-test-group-real-apfs": {
+        "dependsOn": [
+          "...",
+          {
+            "projects": [
+              "@smoothbricks/codebase"
+            ],
+            "target": "cargo-test-archive"
+          }
+        ]
+      },
+      "cargo-test-group-real-apfs-host": {
+        "dependsOn": [
+          "...",
+          {
+            "projects": [
+              "@smoothbricks/codebase"
+            ],
+            "target": "cargo-test-archive"
+          }
+        ]
+      },
       "cargo-test-compile": {
         "dependsOn": [
           "...",
