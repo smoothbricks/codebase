@@ -111,6 +111,47 @@ describe('CI workflow definition', () => {
     }
   });
 
+  it('keeps Build argv and step numbers while retaining failed graph diagnostics before cleanup', () => {
+    for (const actionsProvider of ['github', 'forgejo'] as const) {
+      const definition = options({ actionsProvider });
+      const expectedBuild = defineCiWorkflow(definition).find((step) => step.kind === CiWorkflowStepKind.Build);
+      if (expectedBuild === undefined) throw new Error('the CI definition omitted its Build step');
+      const workflow = typia.assert<{
+        jobs: {
+          main: {
+            steps: Array<{
+              run?: string;
+              uses?: string;
+              if?: string;
+              with?: { name?: string; path?: string; 'include-hidden-files'?: boolean; 'if-no-files-found'?: string };
+            }>;
+          };
+        };
+      }>(Bun.YAML.parse(renderCiWorkflowYaml(definition)));
+      const steps = workflow.jobs.main.steps;
+      const build = steps.find((step) => step.run?.includes('nx-smart --target build '));
+      expect(build?.run).toBe(
+        `NX_VERBOSE_LOGGING=true smoo github-ci nx-smart --target build --name "Build" --step ${expectedBuild.number}`,
+      );
+      for (const step of steps.filter((step) => step !== build && step.run?.includes('nx-smart --target '))) {
+        expect(step.run).not.toContain('NX_VERBOSE_LOGGING');
+      }
+      const uploadIndex = steps.findIndex((step) => step.with?.name === 'trace-results-${{ github.run_id }}');
+      const cleanupIndex = steps.findIndex((step) => step.uses === './.github/actions/save-nix-devenv');
+      expect(uploadIndex).toBeGreaterThanOrEqual(0);
+      expect(cleanupIndex).toBeGreaterThan(uploadIndex);
+      const upload = steps[uploadIndex];
+      expect(upload?.if).toBe('always()');
+      expect(upload?.with?.['include-hidden-files']).toBe(true);
+      expect(upload?.with?.['if-no-files-found']).toBe('ignore');
+      expect(upload?.with?.path?.trim().split('\n')).toEqual([
+        'packages/*/.cache/lmao/trace-results.db*',
+        "${{ job.status == 'failure' && format('{0}/project-graph.json', env.NX_WORKSPACE_DATA_DIRECTORY || '.nx/workspace-data') || '' }}",
+        "${{ job.status == 'failure' && format('{0}/d/daemon.log', env.NX_WORKSPACE_DATA_DIRECTORY || '.nx/workspace-data') || '' }}",
+      ]);
+    }
+  });
+
   it('adds only generic Cloudflare credentials for Wrangler-backed deploys', () => {
     const rendered = renderCiWorkflowYaml(options({ deploy: true, deployProvider: 'cloudflare' }));
 

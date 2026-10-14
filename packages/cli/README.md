@@ -867,6 +867,12 @@ CI status deeplinks depend on [GitHub Actions]' top-level job step anchors. The 
 comments next to each top-level step, and the `smoo github-ci nx-smart --step <number>` values for lint, test, and build
 must stay synchronized with those comments. Composite action internals do not change the top-level step numbers.
 
+Only CI's Build invocation enables `NX_VERBOSE_LOGGING=true`, so Nx prints the underlying project-graph exception
+instead of only its generic title; target selection, status/step links, daemon choice and cache behavior are unchanged.
+Before cleanup, the existing trace artifact upload also retains the current workspace-data `project-graph.json` and
+`d/daemon.log` when present on a failed job, honoring `NX_WORKSPACE_DATA_DIRECTORY`. These are diagnostic records, not a
+successful build or a freshness verdict.
+
 Managed CI setup is split across local composite actions:
 
 - `setup-devenv` detects the runner kind first. On a GitHub-hosted Linux runner it then frees disk: it prints `df -h /`,
