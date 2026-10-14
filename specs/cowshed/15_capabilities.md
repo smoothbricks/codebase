@@ -137,7 +137,15 @@ Each detector returns data through one `CapabilityContribution`:
   PATH or an entire Nix profile. A detector may resolve an individual bootstrap tool through its installation
   conventions. Store-resolved executables receive immutable Nix-store reads; that alone does not grant Nix caches or
   daemon access. The same read-only store grant follows any program link in the mode's `tools/bin` or the workspace's
-  `.cowshed/bin` that targets the store, with or without a Nix project; a host with no store gets none.
+  `.cowshed/bin` that targets the store, with or without a Nix project; a host with no store gets none. Independently of
+  detected project capabilities, core contributes the installed `cowshed` executable as the `cowshed` command in the
+  mode's private `tools/bin`. This bootstrap entry admits executables, never controller state: only the stable program
+  link and its resolved executable receive literal read grants; ancestors receive metadata-only lookup. It permits no
+  directory listing, adjacent controller data, write authority or controller-socket access, and does not relax the
+  filesystem-grant prohibition above. Consuming-repository lint can therefore run `cowshed build-state --json` against
+  its checkout's build-volume record without duplicating its reader. The contribution merge records core ownership of
+  the program name; a conflicting detector contribution returns a typed conflict naming core and the detector, never a
+  missing-owner panic.
 
   When the registered `cowshed` multicall executable owns the exec host, detected `bun`, `npm` and `pnpm` entries use
   that same staged executable as their install wrapper. Their actual capability-resolved executables stay under the

@@ -219,6 +219,12 @@ An exit-watch fixture waits for an executed-body readiness byte before its paren
 registers the watch. The parent holds the child's input gate until registration; returning from spawn alone is not
 readiness. Its actual parent retains the child unreaped through the exit observation.
 
+The build-state CLI probe launches the installed `cowshed` binary through private `tools/bin` beneath the executed-child
+profile in both read-write and read-only modes. Its program link and resolved executable have literal read access with
+metadata-only ancestors, matching the installed-binary contract in the package guide. The probe requires the checkout's
+recorded build-state paths and refuses controller-data reads and listing the executable's parent directory; it grants no
+controller socket or controller-state authority.
+
 Process-observation fixtures hold a child and grandchild under their root with FIFO gates and independent PID/parent
 oracles. The real served supervisor and trusted N-API embedder read the same retained birth-order records and exec/exit
 events. Dropping a stream leaves the workload running; a later subscriber replays the same history. Their sole
