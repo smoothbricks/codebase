@@ -1078,8 +1078,11 @@ the same unit-identity environment. Concretely:
   `-Zremap-cwd-prefix` (relative), or no remap.
 - **No checkout-resolved linker paths.** `target.<triple>.linker` and `host.linker` are a bare PATH program or an
   immutable store path, never a checkout-relative path: Cargo hashes the resolved linker into every unit. On macOS the
-  repository's store-installed linker uses exported `SDKROOT` without discovery and executes `/usr/bin/clang` directly;
-  only an absent SDK invokes `xcrun`.
+  repository's store-installed linker uses exported `SDKROOT` without discovery and executes `/usr/bin/clang` with
+  `-fuse-ld=/usr/bin/ld`, selecting Apple's linker independently of PATH; only an absent SDK invokes `xcrun`. The Darwin
+  dev shell disables devenv's C tools, uses a compiler-free stdenv, and removes only the Rust toolchain's propagated Nix
+  compiler while retaining the pinned components and their runtime dependencies. Linux retains its existing C tools,
+  stdenv and toolchain propagation.
 - **Two profiles.** `dev`, which includes unit tests, and `release`, for a released binary. `test` inherits `dev`.
   Danny, 2026-09-30: "BUILD EVERYTHING ONCE. CARGO ALREADY TRACKS CHANGES AND REBUILDS WHAT HAS CHANGED"; "You have
   realistically 2 profiles: dev (which includes unit testing) and release". 03_caches.md states the profile rule.

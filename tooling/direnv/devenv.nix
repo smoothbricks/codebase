@@ -11,7 +11,23 @@ let
 in {
   # The SmoothBricks shell contract: PATH, toolchain, compiler-cache policy, and
   # the enterShell prologue/epilogue every repo shares. Managed by `smoo monorepo`.
-  imports = [./devenv.smoo.nix];
+  imports = [
+    ./devenv.smoo.nix
+    {
+      # Apply after devenv assembles the pinned components: changing component
+      # pins or PATH would create a second toolchain instead of removing its cc.
+      options.languages.rust.toolchainPackage = lib.mkOption {
+        apply = toolchain:
+          if pkgs.stdenv.isDarwin
+          then
+            toolchain.overrideAttrs (previous: {
+              propagatedBuildInputs = lib.remove pkgs.stdenv.cc (previous.propagatedBuildInputs or []);
+              depsHostHostPropagated = lib.remove pkgs.stdenv.cc (previous.depsHostHostPropagated or []);
+            })
+          else toolchain;
+      };
+    }
+  ];
 
   # https://devenv.sh/overlays/
   overlays = [
@@ -103,20 +119,12 @@ in {
   # https://github.com/cachix/devenv/issues/1674
   apple.sdk = null;
 
-  # devenv's languages.rust switches on languages.c to expose `cc`, and that
-  # module then adds an editor language server and a debugger by default. No C
-  # is written here, so ccls serves nothing; and lldb is redundant on the one
-  # platform devenv defaults to it, because this shell already defers to the
-  # Xcode command line tools for the SDK and the compiler (see
-  # tooling/direnv/apple-developer.sh) and those ship lldb too.
-  #
-  # 35.5 MB off every shell and every macOS CI store restore — ccls 1.6 MB plus
-  # lldb and its tails 33.9 MB. clang-tools is the larger 149.2 MB share and
-  # stays: languages.c adds it unconditionally, so shedding it means disabling
-  # languages.c outright, which takes `cc` off PATH where rustc and cc-rs
-  # resolve it. That is a linker change, not a cache change, and does not belong
-  # in a commit about closure size.
+  # Rust enables devenv's C tools by default. Darwin uses the selected Apple
+  # toolchain instead: neither that module nor the shell's own stdenv should
+  # add Nix compiler/linker binaries to PATH. Linux keeps its existing tools.
+  stdenv = lib.mkIf pkgs.stdenv.isDarwin pkgs.stdenvNoCC;
   languages.c = {
+    enable = !pkgs.stdenv.isDarwin;
     lsp.enable = false;
     debugger = null;
   };
