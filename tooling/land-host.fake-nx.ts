@@ -1,12 +1,12 @@
 #!/usr/bin/env bun
 // A stand-in `nx` for land-host.test.ts: plays back the calls the test scripted, in order, and leaves behind what a
 // real run leaves for tooling/land-host.sh to read in the working directory (the workspace root): what the run prints,
-// and the bounded-exec verdict and report of each task it ran.
+// and its exit status. No report can override a failed gate.
 //
 // FIX_STATE names a directory holding `plan.json`, an array of calls. A call whose arguments are not the next
 // scripted one, or one past the end of the plan, exits 97 or 98 and says so: the script under test did something the
 // scenario did not expect. An expected argument ending in `*` matches any argument that starts the same way.
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Call } from './land-host.plan.ts';
 
@@ -17,7 +17,7 @@ if (state === undefined) {
 const plan: readonly Call[] = JSON.parse(readFileSync(join(state, 'plan.json'), 'utf8'));
 const counter = join(state, 'nx.count');
 const index = existsSync(counter) ? Number(readFileSync(counter, 'utf8')) : 0;
-const args = process.argv.slice(2).filter((arg) => !arg.startsWith('--outputStyle='));
+const args = process.argv.slice(2);
 appendFileSync(join(state, 'nx.log'), `${args.join(' ')}\n`);
 
 const call = plan[index];
@@ -36,18 +36,6 @@ if (!matches) {
 }
 writeFileSync(counter, String(index + 1));
 
-const graphFile = args.find((arg) => arg.startsWith('--graph='))?.slice('--graph='.length);
-if (call.graph !== undefined && graphFile !== undefined) {
-  writeFileSync(graphFile, JSON.stringify(call.graph));
-}
-for (const { task, record, report } of call.records ?? []) {
-  const directory = join('.nx/workspace-data/bounded-exec', encodeURIComponent(task));
-  mkdirSync(directory, { recursive: true });
-  writeFileSync(join(directory, 'verdict.json'), JSON.stringify(record));
-  if (report !== undefined) {
-    writeFileSync(join(directory, 'report.xml'), report);
-  }
-}
 if (call.output !== undefined) {
   process.stdout.write(`${call.output}\n`);
 }

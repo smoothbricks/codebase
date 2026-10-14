@@ -108,27 +108,18 @@ describe('the real-APFS serial groups of this repository', () => {
     }
   });
 
-  it("are reached by no target of this repository's real task graph but the host group's edge to the device group", async () => {
+  it('reaches host groups only through the explicit host and land gates, preserving the old land task set', async () => {
     const graph = await repositoryProjectGraph();
     const projects = Object.keys(graph.nodes);
     const targets = [...new Set(projects.flatMap((name) => Object.keys(graph.nodes[name]?.data.targets ?? {})))];
-    // Every task of every project, as one run-many of every target would plan it.
     const tasks = createTaskGraph(graph, {}, projects, targets, undefined, {});
     const device = `${ROOT_PROJECT}:${DEVICE_GROUP}`;
     const host = `${ROOT_PROJECT}:${HOST_GROUP}`;
-    // package.json declares both targets even off macOS. Their explicit dependency edges remain,
-    // but only macOS inference supplies a runner: a placeholder is not an executable APFS test.
-    expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([device, host]));
-    for (const name of [DEVICE_GROUP, HOST_GROUP]) {
-      const target = graph.nodes[ROOT_PROJECT]?.data.targets?.[name];
-      expect(target, name).toBeDefined();
-      if (process.platform === 'darwin') {
-        expect(target?.executor, name).toBe('@smoothbricks/nx-plugin:bounded-exec');
-        expect(target?.options?.command, name).toContain('nextest run');
-      } else {
-        expect(target?.executor, name).toBeUndefined();
-        expect(target?.options?.command, name).toBeUndefined();
-      }
+    const hostGate = `${ROOT_PROJECT}:host-e2e`;
+    const gate = `${ROOT_PROJECT}:gate`;
+    expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([hostGate, gate]));
+    if (process.platform === 'darwin') {
+      expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([device, host]));
     }
     const edges = (id: string): string[] => [
       ...(tasks.dependencies[id] ?? []),
@@ -143,14 +134,24 @@ describe('the real-APFS serial groups of this repository', () => {
         seen.add(next);
         pending.push(...edges(next));
       }
-      const groups = [...seen].filter((reached) => reached === device || reached === host);
+      const groups = [...seen].filter((reached) => reached === device || reached === host).sort();
       if (groups.length > 0) groupsReached[id] = groups;
     }
-    // A real-image group runs only as its own target, named by the gate, and only when its own inputs changed: an
-    // aggregate that reached one pulled 21 minutes of real-image tests into a plain `-t test`.
-    // nx.json orders the explicitly declared host target after the device target on every host.
-    // No other target may reach either, including when these nodes have no executable runner.
-    expect(groupsReached).toEqual({ [host]: [device] });
+    // Ordinary tests must not pull expensive images into the inner loop. Only these explicit aggregates may.
+    expect(groupsReached).toEqual(
+      process.platform === 'darwin' ? { [host]: [device], [hostGate]: [device, host], [gate]: [device, host] } : {},
+    );
+    const planned = (selected: string[]): string[] => {
+      const runnable = projects.filter((name) =>
+        selected.some((target) => graph.nodes[name]?.data.targets?.[target] !== undefined),
+      );
+      return Object.keys(createTaskGraph(graph, {}, runnable, selected, undefined, {}).tasks).sort();
+    };
+    const oldGate = planned(['lint', 'test', 'build', DEVICE_GROUP, HOST_GROUP]);
+    expect(planned(['gate']).filter((id) => id !== gate && id !== hostGate)).toEqual(oldGate);
+    expect(planned(['host-e2e']).filter((id) => id !== hostGate)).toEqual(planned([DEVICE_GROUP, HOST_GROUP]));
+    expect(planned(['test'])).not.toContain(device);
+    expect(planned(['test'])).not.toContain(host);
   }, 120_000);
 
   it('wrap exactly their tests in the 30s code-bound class, behind the 60s class that wins first', async () => {

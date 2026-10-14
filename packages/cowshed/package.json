@@ -517,7 +517,7 @@
       },
       "test": {
         "executor": "nx:noop",
-        "//": "Replaces the inferred test. cargo-test is the ordinary crate suite alone, reached here through napi-test. The root's serial real-image groups are reached by no target: the land gate names them (tooling/land-host.sh), and they run only when their own inputs change.",
+        "//": "Replaces the inferred test. cargo-test is the ordinary crate suite alone, reached here through napi-test. The root's host-e2e aggregate owns the serial real-image groups, and gate reaches them without adding them to ordinary test. They replay from cache unless their own inputs change.",
         "dependsOn": [
           "napi-test",
           "launcher-test",

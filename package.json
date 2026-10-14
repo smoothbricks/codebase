@@ -73,6 +73,37 @@
   "nx": {
     "includedScripts": [],
     "targets": {
+      "host-e2e": {
+        "executor": "nx:noop",
+        "dependsOn": [
+          "cargo-test-group-real-apfs",
+          "cargo-test-group-real-apfs-host"
+        ]
+      },
+      "gate": {
+        "executor": "nx:noop",
+        "dependsOn": [
+          {
+            "target": "lint",
+            "projects": [
+              "*"
+            ]
+          },
+          {
+            "target": "test",
+            "projects": [
+              "*"
+            ]
+          },
+          {
+            "target": "build",
+            "projects": [
+              "*"
+            ]
+          },
+          "host-e2e"
+        ]
+      },
       "lint": {
         "inputs": [
           "...",
