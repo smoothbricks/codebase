@@ -648,8 +648,8 @@ lands and the target itself ran in the meantime. Adopting the landing volume as 
 entries are content-addressed and every one is a correct hit for any tree that computes its hash: a fork made right
 after such a land would miss tasks main's previous volume held at that very tree. So before the target adopts the
 landing volume, every Nx cache entry the target's task database indexes and the landing volume's does not is copied into
-the landing volume and indexed there. Only Nx's state and an absent code-graph index (below) are carried: a Cargo target
-directory is per tree and mtime-fresh, so the landing volume's is the one that matches the landed tree.
+the landing volume and indexed there. Only Nx state is carried; codegraph is cloned/adopted per Owned index links. A
+Cargo target directory is per tree and mtime-fresh, so the landing volume's is the one that matches the landed tree.
 
 The staged carry owns a shared hold on the source build volume until commit finishes or staging is abandoned; the quiet
 landing volume already owns the destination hold. These holds protect both filesystems across the daemon-close interval,

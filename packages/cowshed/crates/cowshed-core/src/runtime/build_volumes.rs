@@ -1332,14 +1332,6 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                         Some(reason) => carry::Staged::stopped(reason),
                         None => carry::stage(&mount, &state, &quiet.mount, &quiet.state),
                     };
-                    if let Err(error) =
-                        carry::codegraph(&mount, &state, &quiet.mount, &quiet.state)
-                    {
-                        eprintln!(
-                            "cowshed: landing build volume {} takes no code-graph index from {target}: {error}; the target adopts it without one, and its indexer starts over",
-                            quiet.id
-                        );
-                    }
                     staged
                 }
                 None => stopped.map_or_else(carry::Staged::default, carry::Staged::stopped),
