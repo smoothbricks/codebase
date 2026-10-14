@@ -256,6 +256,14 @@ impl CommandRunner for RecordingRunner {
             format!("the recording runner grows no image: {}", image.display()),
         ))
     }
+    fn volume_is_mounted(&self, volume_device: &str) -> std::io::Result<bool> {
+        Ok(self
+            .mounted
+            .lock()
+            .expect("mounts")
+            .values()
+            .any(|device| device == volume_device))
+    }
     fn hold_mount(&self, mount_point: &Path) -> std::io::Result<cowshed_apfs::mounts::HeldMount> {
         match self.mounted.lock().expect("mounts").get(mount_point) {
             Some(device) => Ok(cowshed_apfs::mounts::HeldMount::stated(
@@ -3126,6 +3134,46 @@ fn published_listing_distinguishes_missing_sessions_from_an_invalid_sessions_pat
 
     std::fs::write(&layout.project().sessions, b"not a directory").expect("sessions file");
     assert!(host.list(&repo()).is_err());
+}
+
+#[test]
+fn real_apfs_unmount_verified_twice_preserves_the_attached_image() {
+    let fixture = RealFixture::new("unmount-twice");
+    let image = fixture.root().join("owned.dmg");
+    let mount = fixture.root().join("mounted");
+    fixture.blank_image(&image);
+    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let attachment = backend
+        .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)
+        .expect("mount owned image");
+    assert_eq!(
+        kernel_mount_at(&mount).expect("owned mount").source_device,
+        attachment.volume_device()
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            backend
+                .unmount_within_grace(&attachment)
+                .expect("idempotent exact-volume unmount"),
+            cowshed_apfs::Unmounted::Unforced
+        );
+        assert!(
+            kernel_mount_at(&mount).is_none(),
+            "the owned namespace must be released"
+        );
+        let still = backend
+            .existing_attachment(&image)
+            .expect("current owned mapping")
+            .expect("namespace unmount must not detach the image");
+        assert_eq!(
+            (still.whole_device(), still.volume_device()),
+            (attachment.whole_device(), attachment.volume_device())
+        );
+    }
+    backend
+        .detach(&attachment, DetachIntent::Release)
+        .expect("release owned image");
+    assert!(!attached(&image));
 }
 
 /// Independent exact-whole image-driver detach attempts release after cowshed has checked its

@@ -418,9 +418,12 @@ already-absent file, needs no release command. A failed explicit cleanup is neve
 
 A namespace-only unmount, needed for adopt handoff or a sealed capture without releasing the device, is
 `diskutil unmount <verified-volume-device>`. It holds the image lease and the raw IOMedia pin that proves the exact
-image/whole-device/volume identity across the host lease wait, never a path selected by an untrusted child.
-Restart-owned mounts additionally require their incarnation marker and matching kernel source. `WhenIdle` returns the
-recognized command dissent without force; `Release` waits the existing grace before
+image/whole-device/volume identity across the host lease wait, never a path selected by an untrusted child. After each
+host storage lease wait, the guarded unmount reads the kernel mount table for that exact pinned volume. Confirmed
+absence is an idempotent no-effect success, including a second unmount; no child is spawned and nothing is reported
+forced. An unreadable mount table remains a typed error, never absence. A controller's earlier snapshot cannot authorize
+the command after the wait. Restart-owned mounts additionally require their incarnation marker and matching kernel
+source. `WhenIdle` returns the recognized command dissent without force; `Release` waits the existing grace before
 `diskutil unmount force <verified-volume-device>`. Other errors remain errors. Ordinary image release uses the same
 exact-volume unmount boundary for each currently-owned mounted volume before `hdiutil detach` of the physical whole
 device; namespace-only unmount does not release that device.
