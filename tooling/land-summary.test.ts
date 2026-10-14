@@ -47,20 +47,22 @@ describe('land failure summary', () => {
     expect(summarizeFailures(output)).toBe('failed cli:test-shard-3\n' + message + '\n');
   });
 
-  it('keeps tasks separate, strips color and does not include successful compact task lines', () => {
-    const output =
-      '\u001b[31m> nx run a:lint\u001b[0m\n\nfile.ts:4:2 error TS2322: wrong type\n\n+  nx run a:build [local cache]\n> nx run b:test\n\nunknown tool says broken\n\n NX   Running target gate failed\n\nFailed tasks:\n\n- a:lint\n- b:test\n';
-    expect(summarizeFailures(output)).toBe(
-      'failed a:lint\nfile.ts:4:2 error TS2322: wrong type\n\nfailed b:test\nunknown tool says broken\n',
-    );
-  });
-
-  it('reports missing diagnostics honestly and names stopped and unfinished tasks', () => {
-    const output =
-      'Tasks stopped before they finished:\n\n- b:test\n\nTasks the run ended without finishing:\n\n- c:build\n\nFailed tasks:\n\n- a:test\n';
-    expect(summarizeFailures(output)).toBe(
-      'failed a:test\ndiagnostic unavailable: this run printed no task output\n\nstopped b:test: Nx stopped it before it finished\n\nunfinished c:build: the run ended without finishing it\n',
-    );
+  it.each([
+    {
+      name: 'keeps tasks separate, strips color and excludes successful compact task lines',
+      output:
+        '\u001b[31m> nx run a:lint\u001b[0m\n\nfile.ts:4:2 error TS2322: wrong type\n\n+  nx run a:build [local cache]\n> nx run b:test\n\nunknown tool says broken\n\n NX   Running target gate failed\n\nFailed tasks:\n\n- a:lint\n- b:test\n',
+      expected: 'failed a:lint\nfile.ts:4:2 error TS2322: wrong type\n\nfailed b:test\nunknown tool says broken\n',
+    },
+    {
+      name: 'reports missing diagnostics honestly and names stopped and unfinished tasks',
+      output:
+        'Tasks stopped before they finished:\n\n- b:test\n\nTasks the run ended without finishing:\n\n- c:build\n\nFailed tasks:\n\n- a:test\n',
+      expected:
+        'failed a:test\ndiagnostic unavailable: this run printed no task output\n\nstopped b:test: Nx stopped it before it finished\n\nunfinished c:build: the run ended without finishing it\n',
+    },
+  ])('$name', ({ output, expected }) => {
+    expect(summarizeFailures(output)).toBe(expected);
   });
 
   it('extracts exact errors from verbose failed tasks instead of replaying fixture progress and daemon dumps', () => {
