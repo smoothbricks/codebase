@@ -866,17 +866,17 @@ describe('what shell entry keeps linked', () => {
       return at;
     }
 
-    it('resolves declarations at this checkout even when a cowshed marker names another root', async () => {
+    it('links each installed declared package beside the main checkout a cowshed marker names', async () => {
       await withManagedRepository(
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '../local-lib' } },
         async ({ root, enterShell: enter }) => {
           expect(await enter()).toEqual(HEALTHY);
-          // The marker cannot change the root against which declarations resolve.
+          // Genuine sibling declarations share the main anchor without reading its tree.
           const main = join(dirname(root), 'projects', 'main');
           await mkdir(main, { recursive: true });
           await mkdir(join(root, '.cowshed'), { recursive: true });
           await writeFile(join(root, '.cowshed', 'workspace.json'), JSON.stringify({ projectRoot: main }));
-          const local = await checkout(join(dirname(root), 'local-lib'), '@fixture/lib');
+          const local = await checkout(join(dirname(root), 'projects', 'local-lib'), '@fixture/lib');
 
           expect((await enter({ links: true, check: true })).exitCode).toBe(1);
           const linked = await enter({ links: true });
@@ -940,14 +940,13 @@ describe('what shell entry keeps linked', () => {
           expect(readlinkSync(join(root, LINKED))).toBe(relative(dirname(join(root, LINKED)), local));
           expect(readFileSync(join(legacy, 'package.json'), 'utf8')).toContain('@fixture/lib');
           expect((await enter({ links: true, check: true })).exitCode).toBe(0);
-          // The explicit declaration is authoritative: an external binding to an independent checkout is
-          // repointed to the declared local product.
+          // A genuinely unrelated checkout remains the developer's independent choice.
           const independent = await checkout(join(dirname(root), 'independent-lib'), '@fixture/lib');
           await rm(join(root, LINKED));
           symlinkSync(independent, join(root, LINKED));
-          expect((await enter({ links: true, check: true })).exitCode).toBe(1);
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
           expect((await enter({ links: true })).exitCode).toBe(0);
-          expect(readlinkSync(join(root, LINKED))).toBe(relative(dirname(join(root, LINKED)), local));
+          expect(readlinkSync(join(root, LINKED))).toBe(independent);
         },
       );
     });
@@ -1020,8 +1019,8 @@ describe('what shell entry keeps linked', () => {
           await rm(join(root, LINKED));
           symlinkSync(sibling, join(root, LINKED));
           const check = await enter({ links: true, check: true });
-          expect(check.exitCode).toBe(1);
-          expect(check.stderr).toContain('does not exist on this machine');
+          expect(check.exitCode).toBe(0);
+          expect(check.stderr).toBe('');
           const applied = await enter({ links: true });
           expect(applied.exitCode).toBe(0);
           expect(applied.stderr).toContain('does not exist on this machine');
@@ -1041,9 +1040,8 @@ describe('what shell entry keeps linked', () => {
           expect(entered.stderr).toContain('has no package.json here');
           expect(entered.stderr).not.toContain('ENOENT');
           const check = await enter({ links: true, check: true });
-          expect(check.exitCode).toBe(1);
-          expect(check.stderr).toContain('has no package.json here');
-          expect(check.stderr).not.toContain('ENOENT');
+          expect(check.exitCode).toBe(0);
+          expect(check.stderr).toBe('');
         },
       );
     });
@@ -1073,7 +1071,7 @@ describe('what shell entry keeps linked', () => {
           const refused = await enter({ links: true, check: true });
           expect(refused.exitCode).toBe(1);
           expect(refused.stderr).toContain(
-            'smoo.developerLinks @fixture/lib must be a directory relative to this checkout, not "/opt/lib"',
+            'smoo.developerLinks @fixture/lib must be a directory relative to the main checkout, not "/opt/lib"',
           );
         },
       );
