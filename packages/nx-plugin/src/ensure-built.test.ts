@@ -1076,12 +1076,16 @@ import { spawnSync } from 'node:child_process';
 import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
 const { daemonClient } = createRequire(process.cwd() + '/package.json')('nx/src/daemon/client/client');
 daemonClient.hashTasks = async () => { throw new Error('readonly consumer must not hash its own environment'); };
+const packageJson = createRequire(process.cwd() + '/package.json')('nx/src/utils/package-json');
+const readModulePackageJson = packageJson.readModulePackageJson;
+let moduleInspections = 0;
+packageJson.readModulePackageJson = (...args) => { moduleInspections += 1; return readModulePackageJson(...args); };
 process.env.PRODUCER_CONSUMER_DIFFERENCE = 'consumer-only';
 const first = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 const empty = spawnSync('git', ['-c', 'user.name=Receipt fixture', '-c', 'user.email=receipt@example.invalid', 'commit', '--allow-empty', '-qm', 'same tree'], { encoding: 'utf8' });
 if (empty.status !== 0) throw new Error(empty.stderr);
 const sameTree = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
-await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ first, sameTree }) + "\\n", error => error ? reject(error) : resolve()));
+await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ first, sameTree, moduleInspections }) + "\\n", error => error ? reject(error) : resolve()));
 `,
           );
           const producerEnvironment = await run('bun', producerEnvironmentEntry, workspace, [], {
@@ -1094,9 +1098,11 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
           const environmentResults = typia.json.assertParse<{
             first: EnsureBuiltProbeResult;
             sameTree: EnsureBuiltProbeResult;
+            moduleInspections: number;
           }>(producerEnvironment.stdout);
           expect(environmentResults.first.disposition, producerEnvironment.stderr).toBe('hit');
           expect(environmentResults.sameTree).toEqual(environmentResults.first);
+          expect(environmentResults.moduleInspections).toBe(0);
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
         },
         'workspace',

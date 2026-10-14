@@ -876,6 +876,9 @@ loud miss/refusal without running a target or writing provider outputs. A manage
 to `ensureBuilt` or a producer writer. `ensureBuilt` remains the normal build/stream operation with its existing
 hit/built/failed results and Nx's current source/cache/artifact verdict.
 
+A FILE-only source plan does not perform a redundant installation census for absent runtime recipes; the complete
+producer tool/module and output SHA evidence is still captured and independently revalidated on every product probe.
+
 Git source provenance is the committed tree and the producer's clean tracked source basis, not an unrelated untracked
 user file in its working directory. An actual FILE input outside HEAD, a modified tracked input, changed membership,
 opaque custom/native input proof or genuinely unbounded runtime source cannot be signed. Bounded runtime/env identity is

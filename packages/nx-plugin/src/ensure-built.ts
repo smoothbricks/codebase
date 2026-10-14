@@ -906,6 +906,7 @@ export function providerInputProof(
     for (const dependency of projectGraph.dependencies[name] ?? []) includeProject(dependency.target);
   }
   let conservative = false;
+  let hasRuntime = false;
   const projectConfigs = Object.fromEntries(
     Object.entries(projectGraph.nodes).map(([name, node]) => [name, node.data]),
   );
@@ -921,6 +922,7 @@ export function providerInputProof(
       };
     }
     for (const file of input.files) files.add(file);
+    hasRuntime ||= input.runtime.length > 0;
     if (input.runtime.length > 0 || input.environment.length > 0) conservative = true;
     const node = projectGraph.nodes[task.target.project];
     if (node === undefined) throw new Error(`Lost project for receipt ${task.id}`);
@@ -953,24 +955,26 @@ export function providerInputProof(
   ]) {
     if (existsSync(join(workspaceRoot, path))) files.add(path);
   }
-  const installation = graphInstallationIdentity(
-    workspaceRoot,
-    nxJson,
-    requireNx('nx/src/utils/package-json').readModulePackageJson,
-    requireNx('nx/src/native').expandOutputs,
-    graphInputContractIdentity(
-      workspaceRoot,
-      nxJson,
-      workspaceSnapshot(
+  const installation = hasRuntime
+    ? graphInstallationIdentity(
         workspaceRoot,
-        new (requireNx('nx/src/native').WorkspaceContext)(
+        nxJson,
+        requireNx('nx/src/utils/package-json').readModulePackageJson,
+        requireNx('nx/src/native').expandOutputs,
+        graphInputContractIdentity(
           workspaceRoot,
-          requireNx('nx/src/utils/cache-directory').workspaceDataDirectoryForWorkspace(workspaceRoot),
+          nxJson,
+          workspaceSnapshot(
+            workspaceRoot,
+            new (requireNx('nx/src/native').WorkspaceContext)(
+              workspaceRoot,
+              requireNx('nx/src/utils/cache-directory').workspaceDataDirectoryForWorkspace(workspaceRoot),
+            ),
+            undefined,
+          ),
         ),
-        undefined,
-      ),
-    ),
-  );
+      )
+    : null;
   const runtimeSource = boundedReceiptRuntimes(inputs, [...directories], [...files], installation !== null);
   return {
     kind: conservative ? 'conservative-provider-source' : 'exact-file-inputs',
