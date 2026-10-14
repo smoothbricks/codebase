@@ -22,6 +22,8 @@ popd >/dev/null
 # re-enters through this watch too.
 watch_file \
   package.json bun.lock uv.lock Cargo.lock \
+  tooling/direnv/nixpkgs-overlay/flake.nix \
+  tooling/direnv/nixpkgs-overlay/_sources/generated.nix \
   tooling/direnv/repo-path \
   tooling/direnv/nx-socket-dir.sh \
   tooling/direnv/ttsc-env.sh \

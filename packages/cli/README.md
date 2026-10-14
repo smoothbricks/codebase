@@ -501,7 +501,12 @@ nothing when nothing changed:
   fresh checkout or a runner that restored another lockfile's `node_modules` the hook would abort the capture before the
   install could run. This repository's `tooling/direnv/enter-shell.ts` does. The managed `.envrc` watches
   `package.json`, the lockfiles and the scripts shell entry runs, so a shell direnv keeps loaded re-enters after a pull
-  or a script change.
+  or a script change. Local nvfetcher overlays also watch `nixpkgs-overlay/flake.nix` and `_sources/generated.nix`.
+  Import the existing local flake outputs directly in `devenv.nix`
+  (`((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default`), rather than declaring the overlay as a `path:`
+  flake input: the live import makes generated pins part of devenv's evaluation dependencies as well as direnv's
+  watches. Ordinary activation then selects changed pins while an unchanged shell stays cached; no forced refresh or
+  second version witness is needed.
 - Shell secrets resolve only for an entry that installs; see below.
 - `tooling/direnv/ttsc-env.sh`, sourced by shell entry and by the git hooks, names the checkout's own native compiler in
   `TTSC_TSGO_BINARY`, caches ttsc in the checkout's `.cache/ttsc` and its Go build cache in `.cache/ttsc/go-build`.

@@ -249,6 +249,27 @@ describe('managed raw files', () => {
     expect(generated).toBe(source);
   });
 
+  it('keeps local overlay freshness in the owner evaluation and managed direnv watches', async () => {
+    const [managedEnvrc, envrc, module, yaml, json, lock] = await Promise.all([
+      readFile(join(REPO_ROOT, 'packages/nx-plugin/managed/raw/envrc'), 'utf8'),
+      readFile(join(REPO_ROOT, '.envrc'), 'utf8'),
+      readFile(join(REPO_ROOT, 'tooling/direnv/devenv.nix'), 'utf8'),
+      readFile(join(REPO_ROOT, 'tooling/direnv/devenv.yaml'), 'utf8'),
+      readFile(join(REPO_ROOT, 'tooling/direnv/devenv.json'), 'utf8'),
+      readFile(join(REPO_ROOT, 'tooling/direnv/devenv.lock'), 'utf8'),
+    ]);
+    expect(envrc).toBe(managedEnvrc);
+    const watches = managedEnvrc.match(/watch_file ([\s\S]*?)\n\n/)?.[1];
+    expect(watches).toBeDefined();
+    expect(watches).toContain('tooling/direnv/nixpkgs-overlay/flake.nix');
+    expect(watches).toContain('tooling/direnv/nixpkgs-overlay/_sources/generated.nix');
+    expect(module).toContain('((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default');
+    expect(module).not.toContain('inputs.nixpkgs-overlay');
+    expect(yaml).not.toContain('nixpkgs-overlay:');
+    expect(json).not.toContain('"nixpkgs-overlay"');
+    expect(lock).not.toContain('"nixpkgs-overlay"');
+  });
+
   it('manages the pre-push hook as an executable copy', async () => {
     expect(managedFileTargetsForTest).toContainEqual({
       target: 'tooling/git-hooks/pre-push.sh',

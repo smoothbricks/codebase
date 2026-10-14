@@ -20,11 +20,6 @@ inputs:
   nixpkgs-go:
     url: github:NixOS/nixpkgs/39ad350a0602fa0a58a544344e3e9187526ea45c
     flake: true
-  nixpkgs-overlay:
-    url: path:../../tooling/direnv/nixpkgs-overlay
-    flake: true
-    overlays:
-      - default
   # Its own nixpkgs is the single largest duplication in the shell closure. This
   # is a Python script, and on Darwin nixpkgs' python3 retains the whole SDK
   # chain (apple-sdk -> cctools-libtool -> llvm-lib -> clang-lib), so a second
