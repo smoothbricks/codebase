@@ -623,7 +623,8 @@ mount_volume() {{
     fi
     boot_step="unlock $label ($uuid)"
     boot_line=$((LINENO + 1))
-    printf '%s\n' "$password" | /usr/sbin/diskutil apfs unlockVolume "$uuid" -nomount -stdinpassphrase
+    printf '%s\n' "$password" \
+        | /usr/sbin/diskutil apfs unlockVolume "$uuid" -nomount -stdinpassphrase
     unset password
     boot_step="mount $label ($uuid)"
     boot_line=$((LINENO + 1))
