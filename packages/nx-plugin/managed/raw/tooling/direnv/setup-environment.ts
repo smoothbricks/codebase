@@ -166,9 +166,11 @@ try {
       process.exit(0);
     }
     if (flags.check === true) {
-      process.exit(
-        planDeclaredLinks(projectRoot).changes.length === 0 && !hasStaleDeveloperLinks(projectRoot, ['nx']) ? 0 : 1,
-      );
+      const plan = await planDeclaredLinks(projectRoot);
+      // A refused or unclaimed snapshot is current only when said: the exec that follows names its cause.
+      const current =
+        plan.changes.length === 0 && plan.unavailable.every((unavailable) => unavailable.kind === 'absent');
+      process.exit(current && !hasStaleDeveloperLinks(projectRoot, ['nx']) ? 0 : 1);
     }
     await withInstallLock(async () => {
       // Recheck under the install lock: another shell may already have repaired
@@ -178,7 +180,7 @@ try {
         if (error !== undefined) reportSetupFailure(error);
         ensureTypeScriptApiPackage(projectRoot);
       }
-      applyDeclaredLinks(projectRoot, planDeclaredLinks(projectRoot));
+      applyDeclaredLinks(projectRoot, await planDeclaredLinks(projectRoot));
     });
     process.exit(0);
   }

@@ -597,6 +597,39 @@ A successful managed install reconciles recorded links to the current declaratio
 its postinstall result. A failed install restores the captured link and its provenance together. Restored manual
 overrides are not claimed by a receipt the install's postinstall temporarily created.
 
+A declaration can instead bind a sealed snapshot of the checkout, so that the provider's own builds, lands and installs
+never change a file a running consumer task resolves:
+
+```json
+{
+  "smoo": {
+    "developerLinks": {
+      "@smoothbricks/lmao": {
+        "directory": "../smoothbricks/packages/lmao",
+        "snapshot": {
+          "targets": ["lmao:build", "lmao:cargo-thread-ffi"],
+          "artifactModules": ["@smoothbricks/lmao/bun/thread-ffi-path"]
+        }
+      }
+    }
+  }
+}
+```
+
+`tooling/direnv/linked-snapshots.ts` copies the package, every provider workspace package its links reach (manifest,
+`files`, `tsconfig.json` and its relative `extends`), the provider root manifest, each native library an artifact
+module's `nativeArtifactPath({})` names, and the provider-local `node_modules/.bun` entries those packages link; links
+into Bun's global cache stay links. It refuses any other link target. Each target is probed with the read-only
+`probeBuilt`, which builds nothing, and every copied provider file must be HEAD's tracked blob or an output the probe's
+receipt inventories with the same bytes. A target that is not current, a modified or untracked source, stale output or a
+provider written to during the copy refuses with its cause, and every alias keeps its current binding. The snapshot is
+named by one SHA-256 over its census (each entry's path, type, executable bit, and bytes or link text) and its producer
+receipt (provider root, HEAD, its tree, file-input provenance, every task id and hash), sealed read-only under
+`.cache/linked-snapshots/<id>`, and never changes; a new provider state is a new snapshot. A cowshed checkout declares
+`.cache/linked-snapshots` as `[build] state`, so snapshots live on its build volume; until a refresh has linked that
+path, capture refuses and names `cowshed exec`. An unrecorded alias that already links the live checkout is reported,
+not claimed: remove it and install once to bind the snapshot.
+
 Declarations are applied at the end of every install. smoo's root script policy sets the root `postinstall` to
 `bun tooling/direnv/developer-links.ts`, and Bun runs root lifecycle scripts after it re-points the dependencies,
 including on an install that has nothing to do. A plain `bun install` therefore ends with the declared links in place.

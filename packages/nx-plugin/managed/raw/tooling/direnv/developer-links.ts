@@ -63,6 +63,15 @@
  * CI never applies them: it builds against the published packages the
  * lockfile names (setup-environment.ts `--links`).
  *
+ * A declaration may also ask for a snapshot: `{ "directory": …, "snapshot":
+ * { "targets": [...], "artifactModules": [...] } }` binds every alias to a
+ * sealed copy of that checkout instead of the live directory, so the
+ * provider's own builds, lands and installs never change a file a running
+ * consumer task resolves (linked-snapshots.ts). The snapshot is taken here, at
+ * the install and shell-entry boundary, and only when the provider's Nx
+ * targets vouch for every copied byte; otherwise the refusal is said and the
+ * alias keeps its current binding.
+ *
  * Declarations are applied at the end of every install. smoo's root script
  * policy makes the root's `postinstall` run this file, and bun runs the
  * root's lifecycle scripts after it has re-pointed the dependencies, an
@@ -98,6 +107,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
+import { type SnapshotDeclaration, snapshotBinding } from './linked-snapshots.ts';
 
 interface DeveloperLink {
   /** Where the link is, relative to the project root. */
@@ -154,12 +164,18 @@ export async function keepDeveloperLinks<T>(
         if (receipt?.target === link.target) restored.set(link.path, receipt);
         else restored.delete(link.path);
       } else {
-        restored.delete(link.path);
+        const at = path.join(root, link.path);
+        const receipt = restored.get(link.path);
+        // Keep the receipt postinstall wrote for the selected replacement,
+        // but never retain an old receipt for a different final binding.
+        if (!lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink() || readlinkSync(at) !== receipt?.target) {
+          restored.delete(link.path);
+        }
       }
     }
     writeDeclaredRecord(root, restored);
     if (succeeded && recorded.size > 0 && process.env.GITHUB_ACTIONS !== 'true') {
-      applyDeclaredLinks(root, planDeclaredLinks(root));
+      applyDeclaredLinks(root, await planDeclaredLinks(root));
     }
     if (options !== undefined) {
       reportDeveloperLinks(root);
@@ -301,20 +317,28 @@ function restoreLink(root: string, link: DeveloperLink): void {
   symlinkSync(link.target, at);
 }
 
-/** One tree entry a declaration wants pointed at its package's local checkout. */
+/** What a declaration binds its aliases to: the checkout it names, or a sealed snapshot of it. */
+export type DeclaredBinding =
+  | { readonly kind: 'checkout'; readonly target: string }
+  | { readonly kind: 'snapshot'; readonly target: string; readonly id: string };
+
+/** One tree entry a declaration wants pointed at its package's local checkout or its snapshot. */
 export interface DeclaredLinkChange {
   /** Where the entry is, relative to the project root. */
   readonly path: string;
-  /** The checkout directory it should link to, absolute. */
-  readonly target: string;
+  /** The absolute directory it should link to, and what that directory is. */
+  readonly binding: DeclaredBinding;
 }
 
-/** A declaration this machine cannot honour: its checkout directory is not there to link to. */
-export interface UnavailableDeclaredLink {
-  readonly name: string;
-  readonly target: string;
-  readonly reason: string;
-}
+/**
+ * A declaration this machine cannot honour now: its checkout directory is not there to link to (the installed
+ * version stays), no snapshot of it can be made (whatever the alias binds now stays), or an alias still links the
+ * live checkout without a receipt, which a declaration never claims retroactively.
+ */
+export type UnavailableDeclaredLink =
+  | { readonly kind: 'absent'; readonly name: string; readonly target: string; readonly reason: string }
+  | { readonly kind: 'snapshot-refused'; readonly name: string; readonly source: string; readonly reason: string }
+  | { readonly kind: 'snapshot-unclaimed'; readonly name: string; readonly path: string; readonly source: string };
 
 export interface DeclaredLinksPlan {
   readonly changes: readonly DeclaredLinkChange[];
@@ -325,14 +349,18 @@ export interface DeclaredLinksPlan {
  * What `smoo.developerLinks` asks of the trees under `root` that they do not
  * already hold. An entry needs a change when the package is installed there
  * (as the store link or directory bun made) and is not already a link to the
- * declared directory. An entry a developer pointed at another checkout of
- * their own stays theirs, and a tree without the package gains nothing: a
- * declaration links what the manifests depend on, never adds a dependency.
+ * declared directory, or for a snapshot declaration to its current snapshot.
+ * An entry a developer pointed at another checkout of their own stays theirs,
+ * and a tree without the package gains nothing: a declaration links what the
+ * manifests depend on, never adds a dependency. An unrecorded alias that links
+ * the live checkout a snapshot declaration names is reported, not claimed: an
+ * owner relinks it once (remove it, then install) to bind the snapshot.
  * A contained declaration this checkout cannot honour throws rather than keep a
  * binding it inherited from the main checkout, or reach through a redirected or
- * escaping path.
+ * escaping path. Resolving a snapshot may capture one (linked-snapshots.ts),
+ * which writes only the snapshot store.
  */
-export function planDeclaredLinks(root: string): DeclaredLinksPlan {
+export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan> {
   const declared = readDeclaredLinks(root);
   if (declared.length === 0) {
     return { changes: [], unavailable: [] };
@@ -343,18 +371,30 @@ export function planDeclaredLinks(root: string): DeclaredLinksPlan {
   const recorded = readDeclaredRecord(root);
   const changes: DeclaredLinkChange[] = [];
   const unavailable: UnavailableDeclaredLink[] = [];
-  for (const [name, relative] of declared) {
-    const target = declaredTarget(root, anchor, relative);
-    const contained = containsPath(path.resolve(root), target);
+  for (const { name, directory: relative, snapshot } of declared) {
+    const source = declaredTarget(root, anchor, relative);
+    const contained = containsPath(path.resolve(root), source);
     if (contained) {
-      assertOwnedPath(canonicalRoot, path.resolve(canonicalRoot, path.relative(path.resolve(root), target)));
+      assertOwnedPath(canonicalRoot, path.resolve(canonicalRoot, path.relative(path.resolve(root), source)));
     }
-    const reason = unavailableReason(target);
+    const reason = unavailableReason(source);
     if (reason !== null) {
-      if (contained) assertNoInheritedBinding(root, anchor, name, relative, target);
-      unavailable.push({ name, target, reason });
+      if (contained) assertNoInheritedBinding(root, anchor, name, relative, source);
+      unavailable.push({ kind: 'absent', name, target: source, reason });
       continue;
     }
+    let binding: DeclaredBinding = { kind: 'checkout', target: source };
+    if (snapshot !== undefined) {
+      const outcome = await snapshotBinding(root, name, source, snapshot);
+      if (outcome.kind === 'refused') {
+        unavailable.push({ kind: 'snapshot-refused', name, source, reason: outcome.reason });
+        continue;
+      }
+      binding = { kind: 'snapshot', target: outcome.directory, id: outcome.id };
+    }
+    const target = binding.target;
+    // The live checkout a snapshot replaces, by physical identity: a link spelled through another path is the same one.
+    const sourcePhysical = binding.kind === 'snapshot' ? realpathSync(source) : undefined;
     for (const tree of trees) {
       const entry = path.join(tree, name);
       const at = path.join(root, entry);
@@ -373,9 +413,14 @@ export function planDeclaredLinks(root: string): DeclaredLinksPlan {
         const inherited = inheritedContainedBinding(anchor, relative, current);
         const managed = recorded.get(entry)?.target === text;
         if (current === target && text === packageAliasTarget(root, at, target)) continue;
+        const physical = sourcePhysical === undefined ? undefined : realpathOrNull(current);
+        if (binding.kind === 'snapshot' && foreign && !inherited && !managed && physical === sourcePhysical) {
+          unavailable.push({ kind: 'snapshot-unclaimed', name, path: entry, source });
+          continue;
+        }
         if (foreign && !inherited && !managed && current !== target) continue;
       }
-      changes.push({ path: entry, target });
+      changes.push({ path: entry, binding });
     }
   }
   return { changes, unavailable };
@@ -404,11 +449,27 @@ function assertNoInheritedBinding(root: string, anchor: string, name: string, re
  * which declarations this machine cannot honour.
  */
 export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void {
-  for (const { name, target, reason } of plan.unavailable) {
-    console.error(`! smoo.developerLinks ${name}: ${target} ${reason}; the installed version stays`);
+  for (const unavailable of plan.unavailable) {
+    switch (unavailable.kind) {
+      case 'absent':
+        console.error(
+          `! smoo.developerLinks ${unavailable.name}: ${unavailable.target} ${unavailable.reason}; the installed version stays`,
+        );
+        break;
+      case 'snapshot-refused':
+        console.error(
+          `! smoo.developerLinks ${unavailable.name}: no snapshot of ${unavailable.source}: ${unavailable.reason}; its current binding stays`,
+        );
+        break;
+      case 'snapshot-unclaimed':
+        console.error(
+          `! smoo.developerLinks ${unavailable.name}: ${unavailable.path} links the live checkout ${unavailable.source} without a receipt, so it is not bound to a snapshot; remove that link and run the install once to bind it`,
+        );
+        break;
+    }
   }
   if (plan.changes.length === 0) return;
-  const declared = new Map(readDeclaredLinks(root));
+  const declared = new Map(readDeclaredLinks(root).map((link) => [link.name, link.directory]));
   const recorded = readDeclaredRecord(root);
   const counts = new Map<string, number>();
   for (const change of plan.changes) {
@@ -416,10 +477,13 @@ export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void 
     const declaration = declared.get(name);
     if (declaration === undefined) throw new Error(`cannot apply an undeclared developer link: ${name}`);
     const at = path.join(root, change.path);
-    replacePackageAlias(root, at, change.target);
+    replacePackageAlias(root, at, change.binding.target);
     recorded.set(change.path, { path: change.path, declaration, target: readlinkSync(at) });
     writeDeclaredRecord(root, recorded);
-    const named = `${name} -> ${change.target}`;
+    const named =
+      change.binding.kind === 'snapshot'
+        ? `${name} -> snapshot ${change.binding.id} (${change.binding.target})`
+        : `${name} -> ${change.binding.target}`;
     counts.set(named, (counts.get(named) ?? 0) + 1);
   }
   if (counts.size > 0) {
@@ -508,13 +572,26 @@ function inheritedContainedBinding(anchor: string, relative: string, current: st
 /** A package name as npm spells one: `name` or `@scope/name`, one segment each. */
 const PACKAGE_NAME = /^(?:@[A-Za-z0-9_-][A-Za-z0-9._-]*\/)?[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 
+/** An Nx task target as a declaration names one: `project:target`, optionally `:configuration`. */
+const TARGET = /^[^:\s]+:[^:\s]+(?::[^:\s]+)?$/;
+
+/** One `smoo.developerLinks` declaration: its package, its checkout directory, and whether aliases bind a snapshot. */
+interface DeclaredLink {
+  readonly name: string;
+  readonly directory: string;
+  readonly snapshot: SnapshotDeclaration | undefined;
+}
+
 /**
  * `smoo.developerLinks` from the root manifest: each package name with its
- * checkout directory, relative. Hand-validated, like secret-references.ts
- * validates `smoo.secrets`: this runs before anything is installed. The shape
- * is `PackageSmooConfig.developerLinks` in the nx-plugin's workspace-manifest.ts.
+ * checkout directory, relative, given alone or as `{ directory, snapshot }`
+ * where `snapshot` names the provider targets that build it and its native
+ * artifact modules (linked-snapshots.ts). Hand-validated, like
+ * secret-references.ts validates `smoo.secrets`: this runs before anything is
+ * installed. The shape is `PackageSmooConfig.developerLinks` in the
+ * nx-plugin's workspace-manifest.ts.
  */
-function readDeclaredLinks(root: string): [string, string][] {
+function readDeclaredLinks(root: string): DeclaredLink[] {
   const manifestPath = path.join(root, 'package.json');
   const manifest: unknown = JSON.parse(readFileSync(manifestPath, 'utf8'));
   const smoo = typeof manifest === 'object' && manifest !== null ? Reflect.get(manifest, 'smoo') : undefined;
@@ -525,7 +602,7 @@ function readDeclaredLinks(root: string): [string, string][] {
   if (typeof declared !== 'object' || declared === null || Array.isArray(declared)) {
     throw new Error(`${manifestPath}: smoo.developerLinks must map package names to checkout directories`);
   }
-  return Object.entries(declared).map(([name, directory]) => {
+  return Object.entries(declared).map(([name, declaration]): DeclaredLink => {
     if (!PACKAGE_NAME.test(name)) {
       throw new Error(`${manifestPath}: smoo.developerLinks key ${JSON.stringify(name)} is not a package name`);
     }
@@ -534,12 +611,31 @@ function readDeclaredLinks(root: string): [string, string][] {
         `${manifestPath}: smoo.developerLinks.nx is obsolete: the consumer lockfile and patch own Nx; run smoo monorepo update`,
       );
     }
+    const object = typeof declaration === 'object' && declaration !== null && !Array.isArray(declaration);
+    const directory: unknown = object ? Reflect.get(declaration, 'directory') : declaration;
     if (typeof directory !== 'string' || directory.length === 0 || path.isAbsolute(directory)) {
       throw new Error(
         `${manifestPath}: smoo.developerLinks ${name} must be a directory relative to the main checkout, not ${JSON.stringify(directory)}`,
       );
     }
-    return [name, directory];
+    if (!object) return { name, directory, snapshot: undefined };
+    const snapshot: unknown = Reflect.get(declaration, 'snapshot');
+    const targets: unknown =
+      typeof snapshot === 'object' && snapshot !== null ? Reflect.get(snapshot, 'targets') : undefined;
+    const artifactModules: unknown =
+      typeof snapshot === 'object' && snapshot !== null ? Reflect.get(snapshot, 'artifactModules') : undefined;
+    if (
+      !Array.isArray(targets) ||
+      targets.length === 0 ||
+      !targets.every((target): target is string => typeof target === 'string' && TARGET.test(target)) ||
+      !Array.isArray(artifactModules) ||
+      !artifactModules.every((module): module is string => typeof module === 'string' && module.startsWith(`${name}/`))
+    ) {
+      throw new Error(
+        `${manifestPath}: smoo.developerLinks ${name}.snapshot must name its provider targets ("project:target") and the ${name}/… modules that resolve its native artifacts`,
+      );
+    }
+    return { name, directory, snapshot: { targets, artifactModules } };
   });
 }
 
@@ -647,5 +743,15 @@ function writeDeclaredRecord(root: string, recorded: ReadonlyMap<string, Declare
  */
 if (import.meta.main && process.env.GITHUB_ACTIONS !== 'true') {
   const root = process.cwd();
-  applyDeclaredLinks(root, planDeclaredLinks(root));
+  applyDeclaredLinks(root, await planDeclaredLinks(root));
+}
+
+/** Where `at` physically resolves, or null when nothing is there. */
+function realpathOrNull(at: string): string | null {
+  try {
+    return realpathSync(at);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) return null;
+    throw error;
+  }
 }
