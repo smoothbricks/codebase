@@ -93,7 +93,9 @@ not a best-effort script:
    sized to available cores processes independent leaves. Each leaf first requests an APFS metadata clone and falls back
    only that leaf to `copyfile` data copy on `EXDEV`/`ENOTSUP`, so one cross-volume subtree never aborts completed
    siblings. Re-run delta passes while the source keeps changing; refuse (exit 4) if the tree fails to quiesce within
-   the pass budget, naming the churning paths.
+   the pass budget, naming the churning paths. Quiescence compares source identity, length, mode, links, mtime and
+   ctime, not allocated blocks: filesystem writeback or compression can change allocation without a repository write.
+   Allocation remains separate fidelity and space-accounting evidence.
 4. Write `.cowshed/workspace.json` (`role: "main"`), mint `.cowshed/token`, mint main's per-workspace CA (private key
    controller-side next to the grant file; CA cert placed in-image as a trust anchor with the tool anchors wired —
    04_sandbox.md/05_gateway.md), create in-image cache roots, and write platform endpoint plus shared-cache wiring into
@@ -170,7 +172,10 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    source's, both read at verification time, because an include can name a file inside the checkout, which is an empty
    mountpoint until publication. The raw local config is compared with the recorded one, then the `.git` directory byte
    for byte (a linked worktree's `.git` file must reach the same administrative directory and index, which are read in
-   place and never written), and every tracked and untracked-not-ignored path's raw bytes.
+   place and never written), and every tracked and untracked-not-ignored path's raw bytes. Retain the complete raw
+   count-objects probe. Its loose-object `size` is allocated disk space, so that value may differ after writeback or
+   copying; every count, pack/garbage size, alternate and diagnostic must still match. Loose-object identity and
+   contents remain covered by byte comparison and fsck, not by physical allocation equality.
 5. Reuse adopt's atomic `PendingFence` activation and mount the verified replacement at the exact original checkout
    path. Recovery resumes the recorded replacement; it never starts an unrelated adopt or deletes a retained source.
    Verify the remounted content, Git state and build identity against the recorded before-state. Return the retained

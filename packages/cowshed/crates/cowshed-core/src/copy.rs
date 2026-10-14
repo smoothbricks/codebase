@@ -124,6 +124,19 @@ impl Entry {
         }
     }
 
+    /// Writeback and compression can move st_blocks without a repository write.
+    /// Keep allocation for fidelity/accounting, but judge quiescence by source identity and metadata.
+    fn same_source(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.mode == other.mode
+            && self.size == other.size
+            && self.mtime == other.mtime
+            && self.ctime == other.ctime
+            && self.device == other.device
+            && self.inode == other.inode
+            && self.links == other.links
+    }
+
     /// Whether this file is one of several names for a single inode.
     const fn is_hard_linked(&self) -> bool {
         matches!(self.kind, EntryKind::File) && self.links > 1
@@ -911,7 +924,7 @@ fn describe_churn(previous: &Snapshot, current: &Snapshot) -> Vec<String> {
     for (path, entry) in current {
         match previous.get(path) {
             None => changes.push(format!("added {}", render_path(path))),
-            Some(before) if before != entry => {
+            Some(before) if !before.same_source(entry) => {
                 changes.push(format!("changed {}", render_path(path)));
             }
             Some(_) => {}
@@ -1444,6 +1457,31 @@ mod tests {
                 .contains("stop the processes writing those paths"),
             "{}",
             error.hint
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn allocation_only_changes_converge_in_one_pass() {
+        let (root, source, destination) = copy_roots("allocation-only");
+        fs::write(source.join("file"), b"unchanged\n").expect("write file");
+        let initial = snapshot(&source).expect("source snapshot");
+        let mut observation = 0;
+        let mut observe = |_: &Path| -> super::Result<Snapshot> {
+            let mut tree = initial.clone();
+            tree.get_mut(Path::new("file"))
+                .expect("file")
+                .allocated_bytes += observation * 4096;
+            observation += 1;
+            Ok(tree)
+        };
+        let report = converge(&source, &destination, 1, &mut observe)
+            .expect("allocation writeback is not a repository write");
+        assert_eq!(report.passes, 1);
+        assert_eq!(report.changed_entries, 0);
+        assert_eq!(
+            fs::read(destination.join("file")).expect("copy"),
+            b"unchanged\n"
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }

@@ -69,6 +69,36 @@ impl From<Output> for Probe {
     }
 }
 
+/// Git's loose-object "size" is on_disk_bytes(st), unlike size-pack and size-garbage,
+/// which use file lengths. Reallocation is not object loss. Retain the raw probe, but
+/// compare every byte except a well-formed loose-allocation value; copied object bytes
+/// and fsck are verified independently. Unknown fields and diagnostics remain evidence.
+#[cfg(any(target_os = "macos", test))]
+fn count_objects_equal(expected: &Probe, actual: &Probe) -> bool {
+    fn identity_line(line: &[u8]) -> Option<&[u8]> {
+        if let Some(size) = line.strip_prefix(b"size: ")
+            && !size.is_empty()
+            && size.iter().all(u8::is_ascii_digit)
+        {
+            None
+        } else {
+            Some(line)
+        }
+    }
+    if !expected.succeeded() || !actual.succeeded() {
+        return expected == actual;
+    }
+    expected.stderr == actual.stderr
+        && expected
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .map(identity_line)
+            .eq(actual
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .map(identity_line))
+}
+
 /// Durable before-state, including raw evidence rather than lossy text parsing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,7 +217,7 @@ impl GitPreservationSnapshot {
             (Component::Porcelain, live.status_differs),
             (
                 Component::CountObjects,
-                self.count_objects != actual.count_objects,
+                !count_objects_equal(&self.count_objects, &actual.count_objects),
             ),
             (Component::Refs, self.refs != actual.refs),
             (Component::Reflogs, self.reflogs != actual.reflogs),
@@ -874,6 +904,79 @@ mod tests {
         let decoded: GitPreservationSnapshot =
             serde_json::from_slice(&encoded).expect("deserialize raw evidence");
         assert_eq!(before, decoded);
+    }
+
+    #[test]
+    fn allocation_only_changes_preserve_git_evidence_but_never_hide_corruption() {
+        use std::os::unix::fs::MetadataExt as _;
+        let repository = Repository::new();
+        let directory = repository.root.join(".git/objects/aa");
+        fs::create_dir_all(&directory).expect("object directory");
+        let object = directory.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        fs::File::create(&object)
+            .expect("sparse object")
+            .set_len(1024 * 1024)
+            .expect("sparse size");
+        let before_blocks = fs::metadata(&object).expect("sparse metadata").blocks();
+        let before_bytes = fs::read(&object).expect("sparse bytes");
+        let before = repository.snapshot();
+        fs::write(&object, &before_bytes).expect("materialize the same bytes");
+        assert_eq!(fs::read(&object).expect("dense bytes"), before_bytes);
+        assert_ne!(
+            fs::metadata(&object).expect("dense metadata").blocks(),
+            before_blocks
+        );
+        let after = repository.snapshot();
+        assert_ne!(before.count_objects.stdout, after.count_objects.stdout);
+        before
+            .compare(&after)
+            .expect("physical allocation is not Git object identity");
+        let error = verify(&repository.root, &repository.root, &before)
+            .expect_err("equal evidence never admits corrupt objects");
+        assert!(error.message.contains("fsck failed"), "{error}");
+    }
+
+    #[test]
+    fn object_counts_sizes_diagnostics_and_unknown_fields_remain_evidence() {
+        let output = "count: 6\nsize: 24\nin-pack: 2\npacks: 1\nsize-pack: 8\nprune-packable: 1\ngarbage: 0\nsize-garbage: 0\nalternate: /objects\n";
+        let before = Probe {
+            code: Some(0),
+            signal: None,
+            stdout: output.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        for (field, replacement, equal) in [
+            ("size: 24", "size: 0", true),
+            ("size: 24", "size: unknown", false),
+            ("size: 24", "size: ", false),
+            ("size: 24\n", "", false),
+            ("count: 6", "count: 5", false),
+            ("in-pack: 2", "in-pack: 3", false),
+            ("packs: 1", "packs: 2", false),
+            ("size-pack: 8", "size-pack: 9", false),
+            ("prune-packable: 1", "prune-packable: 0", false),
+            ("garbage: 0", "garbage: 1", false),
+            ("size-garbage: 0", "size-garbage: 1", false),
+            ("alternate: /objects", "alternate: /other", false),
+            ("alternate: /objects", "future: 1", false),
+        ] {
+            let mut after = before.clone();
+            after.stdout = output.replace(field, replacement).into_bytes();
+            assert_eq!(
+                count_objects_equal(&before, &after),
+                equal,
+                "{field} -> {replacement}"
+            );
+        }
+        let mut after = before.clone();
+        after.stderr = b"warning: object changed".to_vec();
+        assert!(!count_objects_equal(&before, &after));
+        after = before.clone();
+        after.code = Some(1);
+        assert!(!count_objects_equal(&before, &after));
+        after = before.clone();
+        after.signal = Some(9);
+        assert!(!count_objects_equal(&before, &after));
     }
 
     #[test]
