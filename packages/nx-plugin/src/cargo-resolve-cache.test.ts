@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
+import { FileLock } from 'nx/src/native/index.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import {
   type CannedCargo,
@@ -20,7 +21,7 @@ import {
 } from './__tests__/counted-cargo.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
-import { type CargoResolve, readCargoResolve } from './cargo-source-hash.js';
+import { boundedCargoLockWait, type CargoResolve, readCargoResolve } from './cargo-source-hash.js';
 import { createNodesV2 } from './index.js';
 
 useFixtureCargoHome();
@@ -973,3 +974,36 @@ it('fresh smoo-nx-cargo-hash processes over an unchanged Cargo workspace run Car
     expect(await spawned(cargo)).toBe(2);
   });
 }, 120_000);
+
+it('a Cargo child that never answers is killed and named at the resolve bound', async () => {
+  await withCannedWorkspace(async ({ cargo, answer, workspace, manifest }) => {
+    await answer('before');
+    await cargo.beforeAnswer.close();
+    try {
+      const refused = await rejectionOf(readCargoResolve(manifest, workspace, undefined, 100));
+      expect(String(refused)).toContain('did not finish within 100ms');
+    } finally {
+      await cargo.beforeAnswer.open();
+    }
+  });
+}, 20_000);
+
+it('a resolve lock held by another worker fails its waiter at the bound, naming the lock', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-resolve-lock-')));
+  try {
+    const lockFile = join(root, 'resolve.lock');
+    const holder = new FileLock(lockFile);
+    holder.lock();
+    try {
+      const refused = await rejectionOf(boundedCargoLockWait(new FileLock(lockFile), lockFile, 50));
+      expect(String(refused)).toContain('waited 50ms for the Cargo resolve lock');
+      expect(String(refused)).toContain(lockFile);
+    } finally {
+      holder.unlock();
+    }
+    // Once the holder lets go, the same wait takes the lock at once.
+    await boundedCargoLockWait(new FileLock(lockFile), lockFile, 50);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 20_000);

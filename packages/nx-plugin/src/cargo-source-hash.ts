@@ -189,7 +189,7 @@ function disownCargoChildren(): void {
  * under its own pid, which a runtime input would hash as a new digest on
  * every run.
  */
-function runCargo(args: readonly string[], cwd: string): Promise<string> {
+function runCargo(args: readonly string[], cwd: string, boundMs: number = CARGO_RESOLVE_BOUND_MS): Promise<string> {
   // spawn forwards detached groups; execFile does not. The public ES2022
   // library API requires the constructor form, not Promise.withResolvers.
   return new Promise((settle, reject) => {
@@ -217,6 +217,16 @@ function runCargo(args: readonly string[], cwd: string): Promise<string> {
       failure ??= error;
       killCargoChild(child);
     };
+    const timer = setTimeout(
+      () =>
+        fail(
+          new Error(
+            `cargo ${args.join(' ')} in ${cwd} did not finish within ${boundMs}ms; killed it, ` +
+              'because an unbounded Cargo wait hangs every project-graph construction with no output',
+          ),
+        ),
+      boundMs,
+    );
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
@@ -243,6 +253,7 @@ function runCargo(args: readonly string[], cwd: string): Promise<string> {
     child.stdout.on('error', fail);
     child.stderr.on('error', fail);
     child.on('close', (code, signal) => {
+      clearTimeout(timer);
       cargoChildren.delete(child);
       if (cargoChildren.size === 0) disownCargoChildren();
       if (failure !== undefined) reject(failure);
@@ -338,6 +349,14 @@ interface ResolveState {
 }
 const resolves = new Map<string, ResolveState>();
 const RESOLVE_CACHE_SCHEMA = 'cargo-resolve-v1';
+
+/**
+ * The longest one Cargo child, or one wait for a foreign resolve flight's lock, may take.
+ * Both waits sit on every project-graph construction, so an unbounded one is a silent,
+ * output-free hang of every gate that resolves the graph (a stopped lock holder, a Cargo
+ * process convoy): at the bound the wait fails, naming what it waited on and for how long.
+ */
+export const CARGO_RESOLVE_BOUND_MS = 300_000;
 
 /**
  * The full manifest SET, not merely the last closure: adding a glob workspace
@@ -481,6 +500,7 @@ export async function readCargoResolve(
   manifestPath: string,
   cwd: string,
   indexed?: ReadonlySet<string>,
+  boundMs: number = CARGO_RESOLVE_BOUND_MS,
 ): Promise<CargoResolve> {
   let manifest = resolve(manifestPath);
   try {
@@ -526,7 +546,7 @@ export async function readCargoResolve(
       if (state.cached?.key === key) return state.cached.cargo;
       if (joined === 3) break;
       const active = state;
-      const promise = resolveAndCache(root, manifest, index, directory, file, active);
+      const promise = resolveAndCache(root, manifest, index, directory, file, active, boundMs);
       active.pending = { key, promise };
       try {
         return await promise;
@@ -548,13 +568,21 @@ async function resolveAndCache(
   directory: string,
   file: string,
   state: ResolveState,
+  boundMs: number = CARGO_RESOLVE_BOUND_MS,
 ): Promise<CargoResolve> {
   if (IS_WASM)
     throw new Error('Cargo resolution requires the native Nx file lock; a WASM Nx host cannot own Cargo children');
   await mkdir(directory, { recursive: true });
+  // A warm cache answers with no lock: reading it and keying it spawns nothing and
+  // waits for nobody, so an unchanged workspace never queues behind a foreign flight.
+  state.cached = await loadResolveCache(file);
+  {
+    const key = await resolutionKey(root, manifest, state.cached?.cargo ?? null, indexed);
+    if (state.cached?.key === key) return state.cached.cargo;
+  }
   const lockFile = join(directory, 'resolve.lock');
   const lock = new FileLock(lockFile);
-  while (lock.check()) await lock.wait();
+  await boundedCargoLockWait(lock, lockFile, boundMs);
   // Nx's lock() is synchronous: losing this inter-process check/acquire race
   // can block for one foreign flight. Only the in-process leader reaches it.
   lock.lock();
@@ -570,7 +598,7 @@ async function resolveAndCache(
       // discovered external input edited during this flight requires replay.
       await writeFile(lockFile, '');
       const started = (await stat(lockFile)).mtimeMs;
-      const metadata = await resolveCargoMetadata(manifest, root);
+      const metadata = await resolveCargoMetadata(manifest, root, boundMs);
       const cargo = cargoFromMetadata(metadata);
       // Capture the published key before validation. Reading it afterwards
       // could pair a post-edit key with Cargo's pre-edit answer.
@@ -604,10 +632,49 @@ async function resolveAndCache(
   }
 }
 
-async function resolveCargoMetadata(manifestPath: string, cwd: string): Promise<CargoMetadata> {
+/**
+ * Take `lock` once it is free, or fail at `boundMs` naming the lock and the wait: the
+ * native wait has no bound of its own, and a stopped or stuck holder must not hang
+ * every project-graph construction behind it with no output.
+ */
+
+export async function boundedCargoLockWait(
+  lock: InstanceType<typeof FileLock>,
+  lockFile: string,
+  boundMs: number,
+): Promise<void> {
+  if (!lock.check()) return;
+  // The public ES2022 library API requires the constructor form, not Promise.withResolvers.
+  let timer: NodeJS.Timeout | undefined;
+  const bound = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error(
+            `waited ${boundMs}ms for the Cargo resolve lock ${lockFile}, held by another Nx worker; ` +
+              'refusing to wait longer, because an unbounded wait hangs every project-graph construction with no output. ' +
+              'Look for a stopped or stuck Nx or Cargo process holding it.',
+          ),
+        ),
+      boundMs,
+    );
+  });
+  try {
+    await Promise.race([lock.wait(), bound]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveCargoMetadata(
+  manifestPath: string,
+  cwd: string,
+  boundMs: number = CARGO_RESOLVE_BOUND_MS,
+): Promise<CargoMetadata> {
   const stdout = await runCargo(
     ['metadata', '--format-version', '1', '--locked', '--offline', '--manifest-path', manifestPath],
     cwd,
+    boundMs,
   );
   const metadata = parseCargoMetadata(stdout);
   metadata.workspace_root = await realpath(metadata.workspace_root);
@@ -625,6 +692,7 @@ async function resolveCargoMetadata(manifestPath: string, cwd: string): Promise<
             await runCargo(
               ['locate-project', '--workspace', '--manifest-path', pkg.manifest_path, '--message-format', 'plain'],
               cwd,
+              boundMs,
             )
           ).trim(),
         );
