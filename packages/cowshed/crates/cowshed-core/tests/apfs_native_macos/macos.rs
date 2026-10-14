@@ -87,13 +87,24 @@ impl FakeInventory {
             attached.push(args.last().expect("attached image").clone());
             ATTACH_PLIST.as_bytes().to_vec()
         } else {
-            if args.first().is_some_and(|argument| argument == "eject") {
-                // Every fixture attachment holds the same devices, so a detach releases all.
-                attached.clear();
-            }
             Vec::new()
         };
         CommandOutput::success(stdout)
+    }
+
+    fn eject(&self, image: &Path, whole_device: &str) -> Result<bool, ApfsError> {
+        let mut attached = self.0.lock().expect("fake inventory");
+        if !attached.iter().any(|path| Path::new(path) == image) {
+            return Ok(false);
+        }
+        if whole_device != "/dev/disk9" {
+            return Err(ApfsError::InvalidAttachmentInventory(format!(
+                "{} no longer owns {whole_device}",
+                image.display()
+            )));
+        }
+        attached.retain(|path| Path::new(path) != image);
+        Ok(true)
     }
 
     fn images(&self) -> Vec<AttachedDiskImage> {
@@ -116,10 +127,21 @@ impl FakeInventory {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeMountEffect {
+    image: PathBuf,
+    whole_device: String,
+    volume_device: String,
+    mount_point: PathBuf,
+    policy: cowshed_apfs::MountPolicy,
+}
+
 #[derive(Clone)]
 struct RecordingRunner {
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<CommandRequest>>>,
+    ejections: Arc<Mutex<Vec<(PathBuf, String, bool)>>>,
+    mount_effects: Arc<Mutex<Vec<NativeMountEffect>>>,
     volume_name: Arc<Mutex<String>>,
     inventory: FakeInventory,
     /// The fake kernel's mounts, by mountpoint, as a held mountpoint answers them. A path not
@@ -132,6 +154,8 @@ impl Default for RecordingRunner {
         Self {
             calls: Arc::default(),
             requests: Arc::default(),
+            ejections: Arc::default(),
+            mount_effects: Arc::default(),
             volume_name: Arc::new(Mutex::new("cowshed.acme--widget.main".to_owned())),
             inventory: FakeInventory::default(),
             mounted: Arc::default(),
@@ -155,6 +179,66 @@ impl RecordingRunner {
 }
 
 impl CommandRunner for RecordingRunner {
+    fn mount(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        volume_device: &str,
+        mount_point: &Path,
+        policy: cowshed_apfs::MountPolicy,
+    ) -> Result<(), cowshed_apfs::ApfsError> {
+        let images = self.inventory.images();
+        let mut matches = images.iter().filter(|attached|
+                matches!(&attached.source, cowshed_apfs::DiskImageSource::File(path) if path == image));
+        if matches.next().is_none()
+            || matches.next().is_some()
+            || whole_device != "/dev/disk9"
+            || volume_device != "/dev/disk10s1"
+        {
+            return Err(ApfsError::InvalidAttachmentInventory(format!(
+                "{} does not own exactly {whole_device}/{volume_device}",
+                image.display()
+            )));
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.mount_effects
+            .lock()
+            .expect("native mounts")
+            .push(NativeMountEffect {
+                image: image.to_owned(),
+                whole_device: whole_device.to_owned(),
+                volume_device: volume_device.to_owned(),
+                mount_point: mount_point.to_owned(),
+                policy,
+            });
+        self.mounted
+            .lock()
+            .expect("mounts")
+            .insert(mount_point.to_owned(), volume_device.to_owned());
+        Ok(())
+    }
+
+    fn eject(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        force: bool,
+    ) -> Result<bool, cowshed_apfs::ApfsError> {
+        if !self.inventory.eject(image, whole_device)? {
+            return Ok(false);
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.ejections.lock().expect("native ejections").push((
+            image.to_owned(),
+            whole_device.to_owned(),
+            force,
+        ));
+        self.mounted
+            .lock()
+            .expect("mounts")
+            .retain(|_, device| device != "/dev/disk10s1");
+        Ok(true)
+    }
     fn run_guarded<E>(
         &self,
         request: &cowshed_apfs::CommandRequest,
@@ -194,29 +278,7 @@ impl CommandRunner for RecordingRunner {
                 &volume_name,
             )))
         } else {
-            let output = self.inventory.respond(request);
-            if request.program == Path::new("/usr/sbin/diskutil")
-                && let Some(pair) = request
-                    .args
-                    .windows(2)
-                    .find(|pair| pair[0] == "--mountPoint" || pair[0] == "-mountPoint")
-            {
-                let device = if request.args.first().is_some_and(|arg| arg == "image") {
-                    "/dev/disk10s1".to_owned()
-                } else {
-                    request
-                        .args
-                        .last()
-                        .expect("mounted device")
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                self.mounted
-                    .lock()
-                    .expect("mounts")
-                    .insert(PathBuf::from(&pair[1]), device);
-            }
-            Ok(output)
+            Ok(self.inventory.respond(request))
         }
     }
     fn image_lease(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
@@ -253,6 +315,39 @@ impl CommandRunner for RecordingRunner {
 struct UnreadableFirstInventoryRunner(AtomicUsize);
 
 impl CommandRunner for UnreadableFirstInventoryRunner {
+    fn mount(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        volume_device: &str,
+        mount_point: &Path,
+        policy: cowshed_apfs::MountPolicy,
+    ) -> Result<(), cowshed_apfs::ApfsError> {
+        panic!(
+            "GC must not mount: {} {whole_device}/{volume_device} at {} {policy:?}",
+            image.display(),
+            mount_point.display()
+        );
+    }
+
+    fn eject(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        force: bool,
+    ) -> Result<bool, cowshed_apfs::ApfsError> {
+        let _ = (image, whole_device, force);
+        if !self
+            .attached_disk_images()
+            .map_err(ApfsError::KernelInventory)?
+            .is_empty()
+        {
+            return Err(ApfsError::InvalidAttachmentInventory(
+                "GC double unexpectedly holds an image".into(),
+            ));
+        }
+        Ok(false)
+    }
     fn run_guarded<E>(
         &self,
         request: &cowshed_apfs::CommandRequest,
@@ -917,19 +1012,22 @@ fn recovering_an_unmounted_attachment_uses_da_mount_without_reattaching() {
         .expect("reuse the existing attachment");
 
     assert_eq!(attachment.volume_device(), "/dev/disk10s1");
+    assert!(
+        runner.requests().is_empty(),
+        "recovery must neither attach nor spawn a mount"
+    );
     assert_eq!(
-        runner.requests(),
-        [CommandRequest::new(
-            "/usr/sbin/diskutil",
-            [
-                std::ffi::OsString::from("mount"),
-                std::ffi::OsString::from("-mountOptions"),
-                std::ffi::OsString::from("nobrowse,owners,noatime"),
-                std::ffi::OsString::from("-mountPoint"),
-                mount.as_os_str().to_owned(),
-                std::ffi::OsString::from("/dev/disk10s1"),
-            ],
-        )]
+        *runner.mount_effects.lock().expect("native mounts"),
+        [NativeMountEffect {
+            image: image.image().to_owned(),
+            whole_device: "/dev/disk9".to_owned(),
+            volume_device: "/dev/disk10s1".to_owned(),
+            mount_point: mount,
+            policy: cowshed_apfs::MountPolicy::Workspace {
+                access: MountAccess::ReadWrite,
+                browse: false
+            },
+        }]
     );
 }
 
@@ -2971,6 +3069,32 @@ struct UnformattedAttachment {
 }
 
 impl CommandRunner for UnformattedAttachment {
+    fn mount(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        volume_device: &str,
+        mount_point: &Path,
+        policy: cowshed_apfs::MountPolicy,
+    ) -> Result<(), cowshed_apfs::ApfsError> {
+        panic!(
+            "the unformatted image has no volume to mount: {} {whole_device}/{volume_device} at {} {policy:?}",
+            image.display(),
+            mount_point.display()
+        );
+    }
+
+    fn eject(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        force: bool,
+    ) -> Result<bool, cowshed_apfs::ApfsError> {
+        panic!(
+            "the unformatted-label control must not release {} ({whole_device}, force={force})",
+            image.display()
+        );
+    }
     fn run_guarded<E>(
         &self,
         request: &cowshed_apfs::CommandRequest,
@@ -3140,7 +3264,7 @@ fn published_listing_distinguishes_missing_sessions_from_an_invalid_sessions_pat
     assert!(host.list(&repo()).is_err());
 }
 
-/// A real, independent diskutil process attempts to release the image precisely after cowshed
+/// An independent native Disk Arbitration operation attempts release precisely after cowshed
 /// has checked its identity and before fsck opens diskN. A pathname check alone loses that race;
 /// the raw volume descriptor must keep the kernel from recycling diskN even for a forced eject.
 struct EjectAtFsck {
@@ -3148,7 +3272,90 @@ struct EjectAtFsck {
     ejected: AtomicUsize,
 }
 
+impl EjectAtFsck {
+    fn try_recycle(&self, volume: &str) -> Result<(), CommandRunError> {
+        let system = SystemCommandRunner;
+        let owned = system
+            .attached_disk_images()
+            .expect("current registry inventory")
+            .into_iter()
+            .find(|image| {
+                image
+                    .media
+                    .iter()
+                    .any(|media| media.device == format!("/dev/{volume}"))
+            })
+            .expect("the pinned volume belongs to a current image");
+        let cowshed_apfs::DiskImageSource::File(image) = owned.source else {
+            panic!("the fixture image is file-backed");
+        };
+        let wholes = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
+            .attached_whole_devices(&image)
+            .expect("exact whole image mapping");
+        assert_eq!(
+            wholes.len(),
+            1,
+            "the pinned fixture owns exactly one current whole device"
+        );
+        let whole = wholes.into_iter().next().expect("one fixture whole");
+        let eject = system.eject(&image, &whole, true);
+        if matches!(eject, Ok(true)) {
+            self.ejected.store(1, Ordering::SeqCst);
+            let attached = system.run(&CommandRequest::new(
+                "/usr/sbin/diskutil",
+                [
+                    std::ffi::OsString::from("image"),
+                    std::ffi::OsString::from("attach"),
+                    std::ffi::OsString::from("--nobrowse"),
+                    std::ffi::OsString::from("--plist"),
+                    self.foreign.as_os_str().to_owned(),
+                ],
+            ))?;
+            assert!(
+                attached.succeeded(),
+                "foreign image attach failed: {attached:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&attached.stdout)
+                    .contains(&format!("<string>{volume}</string>")),
+                "recycled volume did not reuse {volume}: {}",
+                String::from_utf8_lossy(&attached.stdout)
+            );
+            eprintln!("foreign mounted on recycled {volume} before the pinned operation");
+        } else {
+            assert!(
+                matches!(eject, Err(ref error) if cowshed_apfs::detach_was_dissented(error)),
+                "the raw pin must produce a native Busy refusal: {eject:?}"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl CommandRunner for EjectAtFsck {
+    fn mount(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        volume_device: &str,
+        mount_point: &Path,
+        policy: cowshed_apfs::MountPolicy,
+    ) -> Result<(), cowshed_apfs::ApfsError> {
+        let volume = volume_device
+            .strip_prefix("/dev/")
+            .ok_or_else(|| ApfsError::InvalidVolumeDevice(volume_device.to_owned()))?;
+        self.try_recycle(volume)?;
+        SystemCommandRunner.mount(image, whole_device, volume_device, mount_point, policy)
+    }
+
+    fn eject(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        force: bool,
+    ) -> Result<bool, cowshed_apfs::ApfsError> {
+        SystemCommandRunner.eject(image, whole_device, force)
+    }
     fn run_guarded<E>(
         &self,
         request: &CommandRequest,
@@ -3160,61 +3367,16 @@ impl CommandRunner for EjectAtFsck {
         SystemCommandRunner.run_guarded(request, check)
     }
     fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-        let system = SystemCommandRunner;
-        let device = if request.program == Path::new("/sbin/fsck_apfs") {
-            request
+        if request.program == Path::new("/sbin/fsck_apfs")
+            && let Some(volume) = request
                 .args
                 .last()
                 .and_then(|raw| raw.to_str())
                 .and_then(|raw| raw.strip_prefix("/dev/r"))
-        } else if request.program == Path::new("/usr/sbin/diskutil")
-            && request
-                .args
-                .first()
-                .is_some_and(|argument| argument == "mount")
         {
-            request
-                .args
-                .last()
-                .and_then(|device| device.to_str())
-                .and_then(|device| device.strip_prefix("/dev/"))
-        } else {
-            None
-        };
-        if let Some(volume) = device {
-            let container = volume.strip_suffix("s1").expect("one APFS volume");
-            let eject = system.run(&CommandRequest::new(
-                "/usr/sbin/diskutil",
-                ["eject", "force", &format!("/dev/{container}")],
-            ))?;
-            if eject.succeeded() {
-                self.ejected.store(1, Ordering::SeqCst);
-                // Real disk image and real attach bytes. A foreign mounted volume is planted
-                // into the just-released device namespace before fsck resolves its pathname.
-                let attached = system.run(&CommandRequest::new(
-                    "/usr/sbin/diskutil",
-                    [
-                        std::ffi::OsString::from("image"),
-                        std::ffi::OsString::from("attach"),
-                        std::ffi::OsString::from("--nobrowse"),
-                        std::ffi::OsString::from("--plist"),
-                        self.foreign.as_os_str().to_owned(),
-                    ],
-                ))?;
-                assert!(
-                    attached.succeeded(),
-                    "foreign image attach failed: {attached:?}"
-                );
-                assert!(
-                    String::from_utf8_lossy(&attached.stdout)
-                        .contains(&format!("<string>{volume}</string>")),
-                    "recycled volume did not reuse {volume}: {}",
-                    String::from_utf8_lossy(&attached.stdout)
-                );
-                eprintln!("foreign mounted on recycled {volume} before fsck");
-            }
+            self.try_recycle(volume)?;
         }
-        system.run(request)
+        SystemCommandRunner.run(request)
     }
 
     fn image_lease(&self, identity: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
@@ -3236,7 +3398,7 @@ impl CommandRunner for EjectAtFsck {
 
 /// The raw pin is held from cowshed's identity check through fsck and the mount that follows. An
 /// independent forced release is refused in each window: the injected releases fire inside fsck and
-/// mount (`EjectAtFsck`), and the external diskutil and hdiutil releases below fire between
+/// mount (`EjectAtFsck`), and the independent native DA and hdiutil releases below fire between
 /// verification and mount. A foreign volume is never attached, whichever window the release tries.
 #[test]
 fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
@@ -3256,14 +3418,9 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
     assert_eq!(
         backend.runner().ejected.load(Ordering::SeqCst),
         0,
-        "foreign diskutil ejected an image while its raw volume was pinned"
+        "independent native DA ejected an image while its raw volume was pinned"
     );
-    let ejected = SystemCommandRunner
-        .run(&CommandRequest::new(
-            "/usr/sbin/diskutil",
-            ["eject", "force", attachment.whole_device()],
-        ))
-        .expect("external forced eject");
+    let ejected = SystemCommandRunner.eject(&owned, attachment.whole_device(), true);
     let image_driver_ejected = SystemCommandRunner
         .run(&CommandRequest::new(
             "/usr/bin/hdiutil",
@@ -3274,7 +3431,7 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
         !image_driver_ejected.succeeded(),
         "image driver released a pinned owner: {image_driver_ejected:?}"
     );
-    if ejected.succeeded() {
+    if matches!(ejected, Ok(true)) {
         let attached_foreign = SystemCommandRunner
             .run(&CommandRequest::new(
                 "/usr/sbin/diskutil",
@@ -3299,9 +3456,8 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
         );
     }
     assert!(
-        !ejected.succeeded(),
-        "verified image was ejected before mount: {}",
-        String::from_utf8_lossy(&ejected.stdout)
+        matches!(ejected, Err(ref error) if cowshed_apfs::detach_was_dissented(error)),
+        "verified image must refuse native forced release while pinned: {ejected:?}"
     );
     let mount = fixture.root().join("owned-mount");
     backend
@@ -3310,7 +3466,7 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
     assert_eq!(
         backend.runner().ejected.load(Ordering::SeqCst),
         0,
-        "foreign diskutil ejected an image while its raw volume was pinned during mount"
+        "independent native DA ejected an image while its raw volume was pinned during mount"
     );
     backend
         .detach(&attachment, DetachIntent::Release)
@@ -3427,6 +3583,25 @@ struct EjectAfterAttach {
 }
 
 impl CommandRunner for EjectAfterAttach {
+    fn mount(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        volume_device: &str,
+        mount_point: &Path,
+        policy: cowshed_apfs::MountPolicy,
+    ) -> Result<(), cowshed_apfs::ApfsError> {
+        SystemCommandRunner.mount(image, whole_device, volume_device, mount_point, policy)
+    }
+
+    fn eject(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        force: bool,
+    ) -> Result<bool, cowshed_apfs::ApfsError> {
+        SystemCommandRunner.eject(image, whole_device, force)
+    }
     fn run_guarded<E>(
         &self,
         request: &CommandRequest,
@@ -3453,31 +3628,19 @@ impl CommandRunner for EjectAfterAttach {
             && self.ejected.fetch_add(1, Ordering::SeqCst) == 0
         {
             assert!(output.succeeded(), "owner attach failed: {output:?}");
-            let plist = plist::Value::from_reader(std::io::Cursor::new(&output.stdout))
-                .expect("real attach plist");
-            let volume = plist
-                .as_dictionary()
-                .and_then(|entry| entry.get("system-entities"))
-                .and_then(plist::Value::as_array)
-                .expect("real attach entities")
-                .iter()
-                .find(|entity| {
-                    entity
-                        .as_dictionary()
-                        .and_then(|entry| entry.get("content-hint"))
-                        .and_then(plist::Value::as_string)
-                        == Some("Apple_APFS_Volume")
-                })
-                .and_then(plist::Value::as_dictionary)
-                .and_then(|entry| entry.get("dev-entry"))
-                .and_then(plist::Value::as_string)
-                .expect("real APFS volume");
-            let container = volume.strip_suffix("s1").expect("single-volume image");
-            let ejected = system.run(&CommandRequest::new(
-                "/usr/sbin/diskutil",
-                ["eject", "force", &format!("/dev/{container}")],
-            ))?;
-            assert!(ejected.succeeded(), "unheld device must eject: {ejected:?}");
+            let wholes = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
+                .attached_whole_devices(&self.owned)
+                .expect("exact current owner mapping");
+            assert_eq!(
+                wholes.len(),
+                1,
+                "the attached fixture owns exactly one current whole device"
+            );
+            let whole = wholes.into_iter().next().expect("one fixture whole");
+            let ejected = system
+                .eject(&self.owned, &whole, true)
+                .expect("unheld owned device must eject natively");
+            assert!(ejected, "the registered owner image must really eject");
             let attached = system.run(&CommandRequest::new(
                 "/usr/sbin/diskutil",
                 [
@@ -6262,6 +6425,25 @@ fn set_file_flags(path: &Path, flags: u32) {
 }
 
 impl CommandRunner for ImmutableDuringResize {
+    fn mount(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        volume_device: &str,
+        mount_point: &Path,
+        policy: cowshed_apfs::MountPolicy,
+    ) -> Result<(), cowshed_apfs::ApfsError> {
+        SystemCommandRunner.mount(image, whole_device, volume_device, mount_point, policy)
+    }
+
+    fn eject(
+        &self,
+        image: &Path,
+        whole_device: &str,
+        force: bool,
+    ) -> Result<bool, cowshed_apfs::ApfsError> {
+        SystemCommandRunner.eject(image, whole_device, force)
+    }
     fn run_guarded<E>(
         &self,
         request: &CommandRequest,

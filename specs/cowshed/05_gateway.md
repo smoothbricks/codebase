@@ -349,16 +349,18 @@ Every request is one line. A one-shot request is followed by the client's EOF an
 
 ## Disk-lifecycle lease
 
-Disk-changing tools cowshed runs on the host — the CLI's, a supervisor's, the gateway's own startup pass, and every
-test's — run under a host-wide lease the gateway schedules. One code path takes it: `SystemCommandRunner` reads the
-command's class from its program and arguments and holds that lease around the child; setup uses the same client. An
-attach spends most of its time in StorageKit's `syncAllDisks`, after its device already exists, and that sync does not
-finish while the mount table keeps changing (01a_apfs.md, "How the APFS host degrades"), so attaches stall beside mount
-churn and stay fast once the two are kept apart. Attaches among themselves only queue on `storagekitd`; so the lease is
-two classes that exclude each other rather than N interchangeable tokens.
+Disk-changing operations cowshed runs on the host — the CLI's, a supervisor's, the gateway's own startup pass, and every
+test's — run under a host-wide lease the gateway schedules. One client path takes it: `SystemCommandRunner` classifies
+external commands from their program/arguments and names native owned-media DA mount and release truthfully as storage
+operations. It holds the lease around the actual child or native callbacks; setup uses the same client. An attach spends
+most of its time in StorageKit's `syncAllDisks`, after its device already exists, and that sync does not finish while
+the mount table keeps changing (01a_apfs.md, "How the APFS host degrades"), so attaches stall beside mount churn and
+stay fast once the two are kept apart. Attaches among themselves only queue on `storagekitd`; so the lease is two
+classes that exclude each other rather than N interchangeable tokens.
 
-- **Storage**: `diskutil` except `renameVolume`, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs` and `umount`.
-  Read-only operations (`fsck_apfs`, IORegistry reads) and cosmetic `diskutil renameVolume` take no lease.
+- **Storage**: `diskutil` except `renameVolume`, `hdiutil`, `newfs_apfs`, and native owned-media DA mount and release.
+  **Namespace**: `mount_apfs` and `umount`. Read-only operations (`fsck_apfs`, IORegistry reads) and cosmetic
+  `diskutil renameVolume` take no lease.
 - **A label does not change the disk lifecycle.** A rename keeps a mounted volume's mount-table position and st_dev, and
   renames neither starve attaches nor delay namespace work. A background cosmetic rename therefore must not hold either
   phase and make an attach wait behind it.
@@ -374,10 +376,12 @@ two classes that exclude each other rather than N interchangeable tokens.
   stderr names it — `disk-lease evicted a <class> holder after <held> while <class> waited`, with its pid and the
   command line it asked for. Its command may still be running beside the next phase; a hung `umount` costs that one
   overlap, not every attach on the host. A client's own deadline still kills its child at 120 s, except a disk-image
-  command (`diskutil image …`, `diskutil eject`, `hdiutil`), which it warns about from 120 s every 30 s and never kills,
-  because a killed one can leak its device until reboot (01a_apfs.md, "How the APFS host degrades" §2).
-- **Wire.** The client writes `{"op":"disk-lease","class":"storage"|"namespace","command":"<argv>"}`, with
-  `"share":"alone"` when it asks for the whole phase, and does not half-close. The gateway answers
+  command (`diskutil image …`, external `diskutil eject`, `hdiutil`), which it warns about from 120 s every 30 s and
+  never kills, because a killed one can leak its device until reboot (01a_apfs.md, "How the APFS host degrades" §2).
+  Native DA mount and release likewise wait for their actual callbacks, warning at the same points without abandoning
+  the owned session.
+- **Wire.** The client writes `{"op":"disk-lease","class":"storage"|"namespace","command":"<operation description>"}`,
+  with `"share":"alone"` when it asks for the whole phase, and does not half-close. The gateway answers
   `{"ok":true,"lease":"queued"}` at once and `{"ok":true,"lease":"granted"}` when the command may run; the lease lasts
   until the client closes the connection, so a client that dies holding one releases it with its socket, and one that
   closes while queued leaves the queue.
@@ -395,8 +399,9 @@ two classes that exclude each other rather than N interchangeable tokens.
   start before it asks and its end once the wait is over, so the real-APFS lane can bound a test's code time without the
   host's queue (08_testing.md, "Integration tests (real substrate)"). Nothing on the wire changes.
 - **A run's commands are recorded.** When `COWSHED_DISK_COMMAND_RECORD` names a file, cowshed's `leased` also appends
-  every disk command as `<class> <argv>` before it runs, leased or not, so a test run counts the images it attached and
-  the volumes it mounted (08_testing.md, "Integration tests (real substrate)").
+  every disk operation as `<class> <operation description>` before it runs, leased or not: external commands retain argv
+  and native DA calls name the exact image/media and policy, never fake executable/argv. A test run counts the images it
+  attached and the volumes it mounted (08_testing.md, "Integration tests (real substrate)").
 
 The regression is `cowshed-gateway`'s `contention_attaches_stay_fast_beside_mount_churn_only_under_the_lease`, run by
 name with `--ignored`: eight real attach/detach loops beside two real mount loops for 40 s, first through a real

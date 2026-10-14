@@ -453,8 +453,8 @@ image remains live and mounted throughout capture.
 2. Open the source inode without following symlinks and descriptor-clone it to `sessions/<ws>.dmg`. RAW has no outer
    allocation map; the filesystem snapshot is crash-consistent, not an application-state transaction. Create the
    complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
-3. Attach and mount at `<mount-root>/<owner>/<repo>/<ws>` in one Disk Arbitration transaction
-   (`diskutil image attach --mountPoint ... --mountOptions ... --plist`, flags per 01a_apfs.md). RAW makes no fixed
+3. Attach once without mounting, then mount the exact freshly probed, pinned APFS volume through native Disk Arbitration
+   at `<mount-root>/<owner>/<repo>/<ws>` (flags and ownership boundary per 01a_apfs.md §Mounts). RAW makes no fixed
    attach-latency guarantee. Before attach, the `first-write` step rewrites the clone's first block with the bytes it
    holds, which copies the source image's extent map (01a_apfs.md, "Clone cost follows extents, not size"). On a
    long-used main that costs tens of seconds, and under host load a container-wide metadata stall follows it, until

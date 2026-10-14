@@ -7505,6 +7505,7 @@ mod tests {
     struct TwoVolumeImage {
         image: PathBuf,
         commands: std::sync::Mutex<Vec<cowshed_apfs::CommandRequest>>,
+        ejections: std::sync::Mutex<Vec<(PathBuf, String, bool)>>,
     }
 
     impl TwoVolumeImage {
@@ -7525,6 +7526,46 @@ mod tests {
     }
 
     impl CommandRunner for TwoVolumeImage {
+        fn mount(
+            &self,
+            image: &Path,
+            whole_device: &str,
+            volume_device: &str,
+            mount_point: &Path,
+            policy: cowshed_apfs::MountPolicy,
+        ) -> Result<(), cowshed_apfs::ApfsError> {
+            panic!(
+                "release never mounts the two-volume image: {} {whole_device}/{volume_device} at {} {policy:?}",
+                image.display(),
+                mount_point.display()
+            );
+        }
+
+        fn eject(
+            &self,
+            image: &Path,
+            whole_device: &str,
+            force: bool,
+        ) -> Result<bool, cowshed_apfs::ApfsError> {
+            if self
+                .attached_disk_images()
+                .map_err(cowshed_apfs::ApfsError::KernelInventory)?
+                .is_empty()
+            {
+                return Ok(false);
+            }
+            if image != self.image || whole_device != "/dev/disk4" {
+                return Err(cowshed_apfs::ApfsError::InvalidAttachmentInventory(
+                    "native release scope does not match the owned two-volume image".into(),
+                ));
+            }
+            self.ejections.lock().expect("native ejections").push((
+                image.to_owned(),
+                whole_device.to_owned(),
+                force,
+            ));
+            Ok(true)
+        }
         fn run_guarded<E>(
             &self,
             request: &cowshed_apfs::CommandRequest,
@@ -7562,12 +7603,7 @@ mod tests {
             Ok(None)
         }
         fn attached_disk_images(&self) -> io::Result<Vec<cowshed_apfs::AttachedDiskImage>> {
-            let detached = self
-                .commands
-                .lock()
-                .expect("recorded commands")
-                .iter()
-                .any(|request| request.args.first().is_some_and(|arg| arg == "eject"));
+            let detached = !self.ejections.lock().expect("native ejections").is_empty();
             Ok(if detached {
                 Vec::new()
             } else {
@@ -7614,6 +7650,7 @@ mod tests {
             TwoVolumeImage {
                 image: image.clone(),
                 commands: std::sync::Mutex::new(Vec::new()),
+                ejections: std::sync::Mutex::new(Vec::new()),
             },
             ApfsSubstrateConfig::new(&store, root.join("mnt")),
             FixedMounts(vec![KernelMountSnapshot::new(
@@ -7627,7 +7664,19 @@ mod tests {
         .unwrap();
         host.detach_existing_image(&image, DetachIntent::Release)
             .unwrap();
-        assert_eq!(host.backend().runner().argv(), [["eject", "/dev/disk4"]]);
+        assert!(
+            host.backend().runner().argv().is_empty(),
+            "native release runs no process command"
+        );
+        assert_eq!(
+            *host
+                .backend()
+                .runner()
+                .ejections
+                .lock()
+                .expect("native ejections"),
+            [(image.clone(), "/dev/disk4".to_owned(), false)]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

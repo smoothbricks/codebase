@@ -72,25 +72,40 @@ impl<'a> RealImageCleanup<'a> {
             return self.backend.detach(attachment, DetachIntent::Release);
         }
         // Creation can fail after attach but before the caller receives an AttachedImage.
-        // No tracked handle is not proof of a detached fixture or permission to unlink it.
-        if self.image.exists() && self.backend.attached_whole_devices(&self.image)?.is_empty() {
-            return Err(ApfsError::InvalidAttachmentInventory(format!(
-                "cannot prove fixture image {} was released; retaining its backing file",
-                self.image.display()
-            )));
-        }
+        // Recover and release the exact image; no returned handle grants no unlink authority.
         self.backend
             .release_image(&self.image, DetachIntent::Release)
+    }
+
+    fn delete_released_backing_file(&self) -> Result<(), ApfsError> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Registered-media absence is not proof that a departed helper released its file lock.
+        // Keep the exclusive descriptor across unlink, so an attach cannot enter that gap.
+        let _unlocked = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_EXLOCK | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&self.image)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(ApfsError::FileOperation {
+                    operation: "prove released fixture backing file unlocked",
+                    path: self.image.clone(),
+                    source,
+                });
+            }
+        };
+        self.backend.delete_image(&self.image)
     }
 
     fn finish(mut self) -> Result<(), ApfsError> {
         // Exactly one cleanup attempt: a failure retains its media and original error.
         self.armed = false;
         self.release_attachment()?;
-        if self.image.exists() {
-            self.backend.delete_image(&self.image)?;
-        }
-        Ok(())
+        self.delete_released_backing_file()
     }
 }
 
@@ -98,12 +113,9 @@ impl<'a> RealImageCleanup<'a> {
 impl Drop for RealImageCleanup<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let released = self.release_attachment().and_then(|()| {
-                if self.image.exists() {
-                    self.backend.delete_image(&self.image)?;
-                }
-                Ok(())
-            });
+            let released = self
+                .release_attachment()
+                .and_then(|()| self.delete_released_backing_file());
             if let Err(error) = released {
                 eprintln!(
                     "cowshed: retained real APFS fixture {}: {error}",
@@ -125,6 +137,43 @@ fn finish_real_image_test(result: Result<(), ApfsError>, cleanup: RealImageClean
         }
     }
 }
+/// A missing attachment handle and empty registered mapping do not release a helper's file
+/// lock. The fixture preserves that refusal; an unlocked backing file is removable without an
+/// image attach, and the same cleanup accepts a file already absent.
+#[cfg(target_os = "macos")]
+#[test]
+fn fixture_cleanup_proves_backing_file_unlock_before_unlink() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let root = ScratchRoot::new_owned("cleanup-lock").expect("owned scratch root");
+    let image = root.path().join("unreturned.dmg");
+    fs::write(&image, b"fixture backing file").expect("create fixture backing file");
+    let helper = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_SHLOCK | libc::O_NONBLOCK)
+        .open(&image)
+        .expect("hold the helper's image-file lock");
+    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let refused = RealImageCleanup::new(&backend, image.clone()).finish();
+    assert!(matches!(
+        refused,
+        Err(ApfsError::FileOperation { operation: "prove released fixture backing file unlocked", source, .. })
+            if source.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert_eq!(
+        fs::read(&image).expect("retained backing file"),
+        b"fixture backing file"
+    );
+    drop(helper);
+    RealImageCleanup::new(&backend, image.clone())
+        .finish()
+        .expect("exact-image absence and exclusive open permit unlink");
+    assert!(!image.exists());
+    RealImageCleanup::new(&backend, image)
+        .finish()
+        .expect("an absent backing file needs no unlink");
+}
+
 #[cfg(target_os = "macos")]
 fn lease_test_image(staged_stem: PathBuf, volume_name: &str) -> CreateImageRequest {
     CreateImageRequest {
@@ -320,7 +369,10 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
                     report(Progress::Step("unmount"));
                     backend.unmount_verified(attachment, DetachIntent::Release)?;
                     report(Progress::Step("detach"));
-                    backend.detach(attachment, DetachIntent::Release)
+                    // Exercise cleanup recovery when a caller received no attachment handle:
+                    // only the exact image's current registry mapping may authorize release.
+                    cleanup.attachment.take();
+                    cleanup.release_attachment()
                 })();
                 report(Progress::Step("cleanup"));
                 finish_real_image_test(result, cleanup);
@@ -676,10 +728,9 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
     let backend = MacOsApfsBackend::new(SystemCommandRunner);
     let image = root.join("attach.dmg");
     crate::blank_image::blank_image(&image);
-    // Announce each attach's own diskutil by pid once it runs, so the parent kills
-    // mid-attach, not during the inventory reads before it or the eject after it: the detach
-    // is a `diskutil eject` too, and it runs only once the attach returned, so a diskutil
-    // working in this root while the loop is attaching is the attach itself.
+    // Announce only the attaching diskutil while attach is in flight, so the parent kills
+    // mid-attach rather than during inventory reads or the native DA release afterward.
+    // Release starts only after attach returned and the attaching flag has been cleared.
     let watched = root.clone();
     let attaching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watching = std::sync::Arc::clone(&attaching);
