@@ -116,9 +116,19 @@ describe('the real-APFS serial groups of this repository', () => {
     const tasks = createTaskGraph(graph, {}, projects, targets, undefined, {});
     const device = `${ROOT_PROJECT}:${DEVICE_GROUP}`;
     const host = `${ROOT_PROJECT}:${HOST_GROUP}`;
-    if (process.platform === 'darwin') {
-      // The groups exist where they run; elsewhere the plugin infers neither and there is nothing to reach.
-      expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([device, host]));
+    // package.json declares both targets even off macOS. Their explicit dependency edges remain,
+    // but only macOS inference supplies a runner: a placeholder is not an executable APFS test.
+    expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([device, host]));
+    for (const name of [DEVICE_GROUP, HOST_GROUP]) {
+      const target = graph.nodes[ROOT_PROJECT]?.data.targets?.[name];
+      expect(target, name).toBeDefined();
+      if (process.platform === 'darwin') {
+        expect(target?.executor, name).toBe('@smoothbricks/nx-plugin:bounded-exec');
+        expect(target?.options?.command, name).toContain('nextest run');
+      } else {
+        expect(target?.executor, name).toBeUndefined();
+        expect(target?.options?.command, name).toBeUndefined();
+      }
     }
     const edges = (id: string): string[] => [
       ...(tasks.dependencies[id] ?? []),
@@ -138,7 +148,9 @@ describe('the real-APFS serial groups of this repository', () => {
     }
     // A real-image group runs only as its own target, named by the gate, and only when its own inputs changed: an
     // aggregate that reached one pulled 21 minutes of real-image tests into a plain `-t test`.
-    expect(groupsReached).toEqual(process.platform === 'darwin' ? { [host]: [device] } : {});
+    // nx.json orders the explicitly declared host target after the device target on every host.
+    // No other target may reach either, including when these nodes have no executable runner.
+    expect(groupsReached).toEqual({ [host]: [device] });
   }, 120_000);
 
   it('wrap exactly their tests in the 30s code-bound class, behind the 60s class that wins first', async () => {

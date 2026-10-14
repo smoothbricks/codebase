@@ -641,7 +641,9 @@ Concrete targets come from concrete files:
 - Inference orders nothing between two serial groups: each is serial only within its own runner. A repository that needs
   two never concurrent states the edge as explicit target config, `"dependsOn": ["...", "cargo-test-group-<other>"]`
   under `nx.json` `targetDefaults` or the owning project's `nx.targets`, and Nx starts the later group once the earlier
-  one has finished.
+  one has finished. Explicit target declarations are not platform-conditional: dependency-only target nodes and their
+  ordering edges remain off macOS even though no executable group runner is inferred. The ordinary `test` and
+  `cargo-test` aggregates must still reach neither group.
 - Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
   triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
   GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling
