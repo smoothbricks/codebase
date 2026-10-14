@@ -117,9 +117,18 @@ describe('the real-APFS serial groups of this repository', () => {
     const host = `${ROOT_PROJECT}:${HOST_GROUP}`;
     const hostGate = `${ROOT_PROJECT}:host-e2e`;
     const gate = `${ROOT_PROJECT}:gate`;
-    expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([hostGate, gate]));
-    if (process.platform === 'darwin') {
-      expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([device, host]));
+    // Package-declared nodes and explicit edges exist on every host; only macOS inference supplies a runner.
+    expect(Object.keys(tasks.tasks)).toEqual(expect.arrayContaining([device, host, hostGate, gate]));
+    for (const name of [DEVICE_GROUP, HOST_GROUP]) {
+      const target = graph.nodes[ROOT_PROJECT]?.data.targets?.[name];
+      expect(target, name).toBeDefined();
+      if (process.platform === 'darwin') {
+        expect(target?.executor, name).toBe('@smoothbricks/nx-plugin:bounded-exec');
+        expect(target?.options?.command, name).toContain('nextest run');
+      } else {
+        expect(target?.executor, name).toBeUndefined();
+        expect(target?.options?.command, name).toBeUndefined();
+      }
     }
     const edges = (id: string): string[] => [
       ...(tasks.dependencies[id] ?? []),
@@ -138,9 +147,7 @@ describe('the real-APFS serial groups of this repository', () => {
       if (groups.length > 0) groupsReached[id] = groups;
     }
     // Ordinary tests must not pull expensive images into the inner loop. Only these explicit aggregates may.
-    expect(groupsReached).toEqual(
-      process.platform === 'darwin' ? { [host]: [device], [hostGate]: [device, host], [gate]: [device, host] } : {},
-    );
+    expect(groupsReached).toEqual({ [host]: [device], [hostGate]: [device, host], [gate]: [device, host] });
     const planned = (selected: string[]): string[] => {
       const runnable = projects.filter((name) =>
         selected.some((target) => graph.nodes[name]?.data.targets?.[target] !== undefined),

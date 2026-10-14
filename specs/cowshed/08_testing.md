@@ -348,8 +348,8 @@ tests. Ordinary and exceptions shards exclude those filters. The root `host-e2e`
 This reaches the same checks as naming the ordinary targets and both host groups explicitly, but Nx owns the target
 list. Ordinary `test` remains free of the expensive host groups: Rule 2 keeps the inner loop cheap, while the explicit
 land gate includes host coverage and each group replays from cache unless its own inputs changed.
-`nx run-many -t host-e2e` is the focused host proof. Every test has one runner, and non-macOS inference creates neither
-APFS group.
+`nx run-many -t host-e2e` is the focused host proof. Every test has one runner, and non-macOS inference supplies neither
+APFS runner; package-declared placeholders and explicit dependency edges may remain.
 
 The land gate uses `--outputStyle=static-failures-only` and must exit zero before the expected-tip fast-forward and
 workspace retirement. Any failed task, timeout or infrastructure failure stops the land: there is no bound-only retry,
