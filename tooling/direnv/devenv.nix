@@ -19,13 +19,29 @@ in {
     # devenv's file-read tracing, leaving generated pins absent from the eval cache.
     ((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default
     inputs.rust-overlay.overlays.default
+    # https://bugs.gnu.org/81060: tee 9.11 spins at close after a nonblocking write sets EAGAIN.
+    # Keep stdenv's coreutils unchanged; only the shell selects the patched package.
+    # Remove when nixpkgs coreutils includes this upstream fix.
+    (_: previous: {
+      coreutils-tee = previous.coreutils.overrideAttrs (old: {
+        patches =
+          (old.patches or [])
+          ++ [
+            (previous.fetchpatch {
+              url = "https://github.com/coreutils/coreutils/commit/0d6fcb99d691d920961938e61c43478566ef626e.patch";
+              includes = ["src/iopoll.c" "src/iopoll.h" "src/tee.c"];
+              hash = "sha256-mtBtXvroe1whqHVGsxiWjQ7/3QyjSxXX0G515qaCD7E=";
+            })
+          ];
+      });
+    })
   ];
 
   # https://devenv.sh/packages/
   packages =
     (with pkgs; [
       gnutar # Tarball inspection for package validation
-      coreutils # Provides fmt for commit message wrapping
+      coreutils-tee # Patched tee and fmt for commit message wrapping
       git # Git hooks and repository inspection
       gh # GitHub Actions and release inspection
       direnv # Cowshed .envrc activation; hosted CI has no ambient direnv
