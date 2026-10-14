@@ -14,6 +14,7 @@ import {
 } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
+import type { ParsedCommandLine } from 'typescript';
 
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import {
@@ -388,7 +389,7 @@ function projectLintCommands(
       // A test program can live anywhere the declaration selects, not just src.
       // Use the compiler's file set and the existing declaration-chain hasher,
       // so inherited includes and files outside this project keep their keys.
-      const program = readTsConfig(testConfig);
+      const program: ParsedCommandLine = readTsConfig(testConfig);
       const errors = program.errors.filter(({ code }) => code !== 18003);
       if (errors.length > 0) {
         throw new Error(
