@@ -72,6 +72,7 @@ fn mutates_host(operation: &HostOperation) -> bool {
     matches!(
         operation,
         HostOperation::EnsureDirectory(_)
+            | HostOperation::EnsureOwnedDirectory { .. }
             | HostOperation::ReclaimMountpoint(_)
             | HostOperation::MountApfsVolume { .. }
             | HostOperation::ProvisionApfsVolumes { .. }

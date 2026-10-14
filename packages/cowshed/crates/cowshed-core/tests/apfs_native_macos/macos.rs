@@ -597,7 +597,7 @@ fn assert_capture_carries_source(
     );
 }
 
-/// The live rule (01_storage.md, "Live source snapshots"): unheld RW/RO captures and destination
+/// The live rule (01a_apfs.md, "Live source snapshots"): unheld RW/RO captures and destination
 /// refusals leave the source's mount, device, flags and attachment unchanged. A held RW capture
 /// also succeeds without changing those facts. RW volume writes are flushed; RO has none, so the
 /// RW capture's payload is the one read back through a mount of its own. One source attachment
@@ -5220,7 +5220,7 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
     assert!(host.mounts(&repo()).expect("healed facts").is_empty());
 }
 
-/// fseventsd's persistent event log on real volumes (01_storage.md, "The event log"). A fresh
+/// fseventsd's persistent event log on real volumes (01a_apfs.md, "The event log"). A fresh
 /// volume is opted out at its first read-write mount. A volume carrying a log a root fseventsd
 /// created — what a browsable mount leaves, and what every clone of such a volume inherits — has
 /// it replaced by the marker at its next mount, through one mount that ignores ownership; the
@@ -5228,7 +5228,7 @@ fn real_apfs_kernel_mount_flag_truth_table_allows_browse_but_requires_owners() {
 /// across the immediate remount (measured: three runs in four), so only the marker is asserted
 /// there. Every mount, the retiring one included, ends honoring ownership and without access
 /// times. Live delivery is not asserted: on this host fseventsd loses a just-mounted volume's
-/// events whether it is logged or not (01_storage.md records the measurement).
+/// events whether it is logged or not (01a_apfs.md, "The event log", records the measurement).
 #[test]
 fn real_apfs_mount_opts_volumes_out_of_the_event_log_and_retires_an_inherited_one() {
     let fixture = RealFixture::new("event-log");

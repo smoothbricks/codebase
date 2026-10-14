@@ -1,8 +1,8 @@
-//! The store's blank templates (01_storage.md, "Images"): one formatted, verified, detached RAW
+//! The store's blank templates (01a_apfs.md, "Images"): one formatted, verified, detached RAW
 //! image per capacity and owner, from which every new image is cloned. A mint is then one
 //! `clonefile` and one attach. The `diskutil image create`, the formatting attach, the
 //! `newfs_apfs` and the detach are paid once per store and capacity, here, instead of once per
-//! image — and the create and the attach queue on `storagekitd` (01_storage.md, "How the APFS
+//! image — and the create and the attach queue on `storagekitd` (01a_apfs.md, "How the APFS
 //! host degrades").
 
 use std::fmt;
@@ -122,7 +122,7 @@ const BLANK_TEMPLATE_DIRECTORY: &str = ".blank";
 /// after its workspace, a build volume after the checkout that links it. Relabelling queues on
 /// Disk Arbitration, so it runs off every provisioning path, but it always runs: Disk Utility
 /// shows every attached volume, and one named only this says nothing about what it is
-/// (01_storage.md, "Ownership, identity, and the volume label"; 16_build_volumes.md,
+/// (01a_apfs.md, "Ownership, identity, and the volume label"; 16_build_volumes.md,
 /// "Substrate").
 pub const BLANK_TEMPLATE_LABEL: &str = "[cowshed]";
 

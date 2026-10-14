@@ -99,7 +99,7 @@ impl ScratchRoot {
 /// Recover exactly the scratch root an owned child reported, after that child has been reaped.
 /// This does not take the host-wide sweep lock, enumerate unrelated dead roots, or rewrite the
 /// suite's sweep record. The parent's panic/kill witness uses the same cleanup as root drop.
-pub(crate) fn reclaim_dead_root(path: &Path) -> std::io::Result<()> {
+pub fn reclaim_dead_root(path: &Path) -> std::io::Result<()> {
     if path.parent() != Some(Path::new("/private/tmp"))
         || !owner_pid(&path.to_string_lossy()).is_some_and(process_is_gone)
     {

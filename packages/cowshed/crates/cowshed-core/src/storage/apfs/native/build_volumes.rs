@@ -58,7 +58,7 @@ where
     R: CommandRunner + Send + Sync + 'static,
 {
     /// Mint the empty build volume `id` at `capacity` and mount it, without a record: one
-    /// `clonefile` of the store's blank template and one attach (01_storage.md, "Images"). The
+    /// `clonefile` of the store's blank template and one attach (01a_apfs.md, "Images"). The
     /// caller writes the record last, once the volume holds what it should (a migration's copied
     /// build state); until then the volume is an interrupted creation, which collection deletes
     /// unless a live build link names it. The clone carries the template's label until the

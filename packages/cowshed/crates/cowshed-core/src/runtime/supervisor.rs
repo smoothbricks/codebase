@@ -180,7 +180,7 @@ impl LeafCoverage {
 
 /// Names the volume of a workspace's image through the APFS host, which renames only the volume
 /// device the kernel's attachment inventory maps that image under the store to, and only when the
-/// file system's own name differs (01_storage.md, "Ownership, identity, and the volume label").
+/// file system's own name differs (01a_apfs.md, "Ownership, identity, and the volume label").
 /// Handed an image, never a mount path, so a checkout nothing is mounted at names nothing.
 /// Injected, so the supervisor names its checkout's volumes without owning the storage backend.
 pub trait VolumeLabeller: Send + Sync + 'static {

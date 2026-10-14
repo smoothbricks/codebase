@@ -1,13 +1,13 @@
 //! Real APFS images for tests, cloned from one blank template per host user, and the lane-wide
 //! fixture pool that attaches each scenario image once per lane run.
 //!
-//! The template is a store's blank template (01_storage.md, "Images"), minted by the production
+//! The template is a store's blank template (01a_apfs.md, "Images"), minted by the production
 //! code into the user's template directory as if that directory were a store. A test that needs
 //! an image gets an APFS clone of it: `clonefile` reaches no disk tool. A test whose store mints
 //! through the production host seeds the store by putting a clone where the host looks for its
 //! template (`blank_template_path`), so the store's mints clone the seed instead of each store
 //! paying a `diskutil image create` and a formatting attach — both queued on root `storagekitd`
-//! (01_storage.md, "How the APFS host degrades") — a `newfs_apfs` and a detach for a template of
+//! (01a_apfs.md, "How the APFS host degrades") — a `newfs_apfs` and a detach for a template of
 //! its own. Tests that prove template minting itself leave the store unseeded.
 //!
 //! Seeding attaches nothing. The only attach in this support code is the fixture pool's: it
@@ -137,7 +137,7 @@ impl SharedImage {
     }
 
     /// Mount this image's volume at `mount_point` through Disk Arbitration, as production mounts
-    /// (01_storage.md, "Mounts"), with `options` handed verbatim to the filesystem's `mount -o`
+    /// (01a_apfs.md, "Mounts"), with `options` handed verbatim to the filesystem's `mount -o`
     /// (`diskutil mount -mountOptions`): a mount of an already-attached volume, never an attach.
     /// The options are the caller's whole flag set, so a test can mount the one shared volume
     /// under any combination. The returned guard unmounts it; the image stays attached for the

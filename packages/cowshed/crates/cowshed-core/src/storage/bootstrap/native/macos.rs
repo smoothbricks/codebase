@@ -37,13 +37,16 @@ use super::shared::{
 use crate::error::CowshedError;
 use crate::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
-use crate::storage::host_config::{DEFAULT_MOUNT_RELATIVE, HostConfig};
+use crate::storage::host_config::{
+    HostConfig, MACOS_MOUNT_PREFIX, default_mount_root, macos_mount_root,
+};
 use cowshed_apfs::mounts::KernelMountSnapshot;
 use cowshed_apfs::{
     CommandRequest, CommandRunFailure, DISK_CHILD_DEADLINE, RegisteredApfsContainer,
     SystemCommandRunner, registered_apfs_containers,
 };
 use cowshed_os::fork_lock::Run as _;
+use cowshed_os::fsio::AnchoredDirectory;
 
 const DISKUTIL_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const DISKUTIL_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
@@ -223,6 +226,16 @@ impl BootstrapHost for AuthorizedBootstrapHost {
         create_authorized_directory(&mut *self.session()?, path)
     }
 
+    fn ensure_owned_directory(
+        &self,
+        path: &Path,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+    ) -> Result<(), HostError> {
+        ensure_authorized_owned_directory(&mut *self.session()?, path, uid, gid, mode)
+    }
+
     fn reclaim_mountpoint(&self, path: &Path) -> Result<(), HostError> {
         reclaim_authorized_mountpoint(&mut *self.session()?, path)
     }
@@ -385,6 +398,9 @@ fn read_only_validation_actions(plan: &BootstrapPlan) -> Vec<String> {
             HostOperation::EnsureDirectory(path) => {
                 Some(format!("create mountpoint {}", path.display()))
             }
+            HostOperation::EnsureOwnedDirectory { path, .. } => {
+                Some(format!("provision owned directory {}", path.display()))
+            }
             HostOperation::ReclaimMountpoint(path) => {
                 Some(format!("reclaim mountpoint {}", path.display()))
             }
@@ -503,7 +519,7 @@ fn spotlight_roots(
 ) -> Result<Vec<PathBuf>, NativeBootstrapError> {
     let config = HostConfig::load(roots.store(), home)
         .map_err(|error| NativeBootstrapError::Host(HostError::new(error.to_string())))?;
-    let default_mount = home.join(DEFAULT_MOUNT_RELATIVE);
+    let default_mount = default_mount_root(home);
     Ok(BTreeSet::from([
         roots
             .store()
@@ -708,6 +724,212 @@ fn add_mount_service_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBo
         });
     }
     Ok(())
+}
+
+fn mount_root_operations(uid: u32, gid: u32) -> [HostOperation; 3] {
+    let prefix = PathBuf::from(MACOS_MOUNT_PREFIX);
+    [
+        HostOperation::EnsureOwnedDirectory {
+            path: prefix.clone(),
+            uid: 0,
+            gid: 0,
+            mode: 0o755,
+        },
+        HostOperation::EnsureOwnedDirectory {
+            path: prefix.join(uid.to_string()),
+            uid,
+            gid,
+            mode: 0o700,
+        },
+        HostOperation::EnsureOwnedDirectory {
+            path: macos_mount_root(uid),
+            uid,
+            gid,
+            mode: 0o700,
+        },
+    ]
+}
+
+fn plan_mount_root_directories(
+    uid: u32,
+    gid: u32,
+    mut inspect: impl FnMut(&Path, u32, u32, u32) -> Result<bool, HostError>,
+) -> Result<Vec<HostOperation>, HostError> {
+    let mut needed = Vec::new();
+    let mut ancestor_needs_repair = false;
+    for operation in mount_root_operations(uid, gid) {
+        let HostOperation::EnsureOwnedDirectory {
+            path,
+            uid,
+            gid,
+            mode,
+        } = &operation
+        else {
+            unreachable!("mount root operations are owned-directory attestations");
+        };
+        // A missing or inaccessible parent must be provisioned first. The executor rechecks
+        // every child without following links before changing it; planning cannot read it yet.
+        if ancestor_needs_repair || !inspect(path, *uid, *gid, *mode)? {
+            ancestor_needs_repair = true;
+            needed.push(operation);
+        }
+    }
+    Ok(needed)
+}
+
+fn add_selected_mount_root_action(
+    snapshot: &mut SetupSnapshot,
+    selected: &Path,
+    config_missing: bool,
+    uid: u32,
+    gid: u32,
+    inspect: impl FnMut(&Path, u32, u32, u32) -> Result<bool, HostError>,
+) -> Result<(), HostError> {
+    let root = macos_mount_root(uid);
+    if selected != root {
+        return Ok(());
+    }
+    let needed = plan_mount_root_directories(uid, gid, inspect)?;
+    if !needed.is_empty() || config_missing {
+        for operation in needed {
+            snapshot.plan.push_operation(operation);
+        }
+        snapshot.actions.push(HostAction::EnsureMountRoot {
+            path: root,
+            uid,
+            gid,
+        });
+    }
+    Ok(())
+}
+
+fn add_mount_root_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBootstrapError> {
+    // A detached existing store holds authoritative host.json. Read it only after remount:
+    // post-evidence provisions its chosen root through the already-open authorization session.
+    if snapshot.classified.iter().any(|volume| {
+        volume.role == VolumeRole::Store
+            && !matches!(
+                volume.storage,
+                ExistingStorage::Absent | ExistingStorage::MountedValid { .. }
+            )
+    }) {
+        return Ok(());
+    }
+    let config = HostConfig::load(snapshot.plan.roots().store(), snapshot.plan.home())
+        .map_err(|error| NativeBootstrapError::Host(HostError::new(error.to_string())))?;
+    let config_path = snapshot
+        .plan
+        .roots()
+        .store()
+        .join(crate::storage::host_config::HOST_CONFIG_FILE);
+    let config_missing = match fs::symlink_metadata(&config_path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(NativeBootstrapError::Host(host_io_error(
+                "inspect host configuration",
+                &config_path,
+                error,
+            )));
+        }
+    };
+    add_selected_mount_root_action(
+        snapshot,
+        config.mount_root(),
+        config_missing,
+        unsafe { libc::getuid() },
+        unsafe { libc::getgid() },
+        owned_directory_current,
+    )
+    .map_err(NativeBootstrapError::Host)
+}
+
+fn publish_setup_mount_root(store: &Path, home: &Path, root: &Path) -> crate::Result<()> {
+    let config = HostConfig::load(store, home)
+        .map_err(|error| CowshedError::environment_missing(error.to_string(), "cowshed setup"))?;
+    if config.mount_root() != root {
+        return Err(CowshedError::conflict(
+            "host mount root changed during setup",
+            "cowshed setup",
+        ));
+    }
+    let path = store.join(crate::storage::host_config::HOST_CONFIG_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => config
+            .save(store)
+            .map_err(|error| CowshedError::environment_missing(error.to_string(), "cowshed setup")),
+        Err(error) => Err(CowshedError::environment_missing(
+            host_io_error("inspect host configuration", &path, error).to_string(),
+            "cowshed setup",
+        )),
+    }
+}
+
+/// Plan only the managed stable-root directory transaction. Other configured roots retain
+/// their existing unprivileged setup behavior; this does not authorize a configuration change.
+pub fn plan_mount_root_provisioning(root: &Path) -> crate::Result<HostSetupPlan> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    if root != macos_mount_root(uid) {
+        return Ok(HostSetupPlan::new(Vec::new(), Vec::new(), false));
+    }
+    let operations = plan_mount_root_directories(uid, gid, owned_directory_current)
+        .map_err(|error| existing_host_storage_error(NativeBootstrapError::Host(error)))?;
+    let actions = if operations.is_empty() {
+        Vec::new()
+    } else {
+        vec![HostAction::EnsureMountRoot {
+            path: root.to_owned(),
+            uid,
+            gid,
+        }]
+    };
+    Ok(HostSetupPlan::new(
+        actions,
+        Vec::new(),
+        !operations.is_empty(),
+    ))
+}
+
+/// Use one authorization session for the stable-root transaction after the caller's
+/// authoritative attached-session fence has passed.
+pub async fn execute_mount_root_provisioning(root: &Path) -> crate::Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    if root != macos_mount_root(uid) {
+        return Ok(());
+    }
+    let operations = plan_mount_root_directories(uid, gid, owned_directory_current)
+        .map_err(|error| existing_host_storage_error(NativeBootstrapError::Host(error)))?;
+    if !operations.is_empty() {
+        let session = tokio::task::spawn_blocking(MacAuthorizationSession::acquire)
+            .await
+            .map_err(|error| CowshedError::internal(format!("mount root authorization lane failed: {error}")))?
+            .map_err(|error| {
+                if error.is_authorization_denied() {
+                    CowshedError::sandbox_denied(
+                        format!("administrator authorization was declined; workspace mount root {} was not provisioned", root.display()),
+                        "cowshed setup --mount-root <dir>",
+                    )
+                } else {
+                    setup_execution_error(NativeBootstrapError::Host(error), "cowshed setup --mount-root <dir>")
+                }
+            })?;
+        let host: Arc<dyn BootstrapHost> = Arc::new(AuthorizedBootstrapHost::new(session));
+        execute_setup_operations(&operations, host).await.map_err(|error| {
+            if error.code == crate::error::ErrorCode::SandboxDenied {
+                CowshedError::sandbox_denied(
+                    format!("administrator authorization was declined while provisioning workspace mount root {}; earlier directories may have been created or repaired", root.display()),
+                    "cowshed setup --mount-root <dir>",
+                )
+            } else {
+                error
+            }
+        })?;
+    }
+    attest_mount_root(uid, gid)
+        .map_err(|error| existing_host_storage_error(NativeBootstrapError::Host(error)))
 }
 
 fn prepare_setup_snapshot(
@@ -1002,7 +1224,8 @@ fn setup_requires_authorization(snapshot: &SetupSnapshot) -> bool {
         .any(|operation| match operation {
             HostOperation::ProvisionApfsVolumes { .. }
             | HostOperation::PinVolumesInFstab { .. }
-            | HostOperation::MountApfsVolume { .. } => true,
+            | HostOperation::MountApfsVolume { .. }
+            | HostOperation::EnsureOwnedDirectory { .. } => true,
             HostOperation::RunCommand(command) => {
                 command.program() == DISKUTIL
                     && command
@@ -1022,6 +1245,7 @@ fn action_volume_name(action: &HostAction) -> Option<&str> {
         | HostAction::EncryptVolume { name, .. }
         | HostAction::DeleteVolume { name, .. } => Some(name),
         HostAction::PinFstab { .. }
+        | HostAction::EnsureMountRoot { .. }
         | HostAction::ReclaimStubs { .. }
         | HostAction::InstallMountService { .. } => None,
     }
@@ -1072,6 +1296,7 @@ fn operations_for_volume(plan: &BootstrapPlan, volume: &ClassifiedVolume) -> Vec
             HostOperation::ReportVolumeIssue { name, .. } => *name == volume.name,
             HostOperation::VerifyZfsDelegation { .. }
             | HostOperation::ProvisionApfsVolumes { .. }
+            | HostOperation::EnsureOwnedDirectory { .. }
             | HostOperation::WriteMarkerAtomic { .. }
             | HostOperation::PinVolumesInFstab { .. } => false,
         })
@@ -1457,6 +1682,28 @@ async fn execute_snapshot_actions(
     while index < outcomes.len() {
         let action = outcomes[index].action.clone();
         let result = match &action {
+            HostAction::EnsureMountRoot { path, uid, gid } => {
+                let operations = snapshot
+                    .plan
+                    .operations()
+                    .iter()
+                    .filter(|operation| {
+                        matches!(operation, HostOperation::EnsureOwnedDirectory { .. })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let result = execute_setup_operations(&operations, Arc::clone(&host)).await;
+                result.and_then(|()| {
+                    attest_mount_root(*uid, *gid).map_err(|error| {
+                        CowshedError::environment_missing(error.to_string(), "cowshed setup")
+                    })?;
+                    publish_setup_mount_root(
+                        snapshot.plan.roots().store(),
+                        snapshot.plan.home(),
+                        path,
+                    )
+                })
+            }
             HostAction::ReclaimStubs { .. } => {
                 let operations = snapshot
                     .classified
@@ -1568,6 +1815,7 @@ async fn gather_setup_snapshot(
         };
         let mut snapshot =
             prepare_setup_snapshot(&mut source, &home, &existing_fstab, caches_volume)?;
+        add_mount_root_action(&mut snapshot)?;
         add_mount_service_action(&mut snapshot)?;
         Ok(snapshot)
     })
@@ -1688,6 +1936,7 @@ pub async fn execute_host_setup(
                     HostAction::EncryptVolume { .. }
                         | HostAction::PinFstab { .. }
                         | HostAction::InstallMountService { .. }
+                        | HostAction::EnsureMountRoot { .. }
                 )
             });
             let (post_outcomes, post_failure) =
@@ -3523,6 +3772,194 @@ fn reclaim_system_mountpoint(path: &Path) -> Result<(), HostError> {
     }
 }
 
+fn owned_directory_state(
+    path: &Path,
+    metadata: &libc::stat,
+    uid: u32,
+    gid: u32,
+    desired_mode: u32,
+) -> Result<bool, HostError> {
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(HostError::new(format!(
+            "refusing symlink or non-directory workspace mount path {}",
+            path.display()
+        )));
+    }
+    let owner_uid = metadata.st_uid;
+    let owner_gid = metadata.st_gid;
+    if owner_uid != uid || owner_gid != gid {
+        return Err(HostError::new(format!(
+            "refusing foreign workspace mount directory {}: owned by {owner_uid}:{owner_gid}, expected {uid}:{gid}",
+            path.display()
+        )));
+    }
+    Ok(u32::from(metadata.st_mode) & 0o7777 == desired_mode)
+}
+
+fn owned_directory_current(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<bool, HostError> {
+    require_host_canonical(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| HostError::new("mount directory has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| HostError::new("mount directory has no filename"))?;
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| HostError::new("mount directory filename contains NUL"))?;
+    let directory = match AnchoredDirectory::open(parent) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(host_io_error(
+                "open no-follow mount directory parent",
+                parent,
+                error,
+            ));
+        }
+    };
+    let Some(metadata) = directory
+        .stat_child(&name)
+        .map_err(|error| host_io_error("inspect no-follow mount directory", path, error))?
+    else {
+        return Ok(false);
+    };
+    owned_directory_state(path, &metadata, uid, gid, mode)
+}
+
+fn attest_mount_root(uid: u32, gid: u32) -> Result<(), HostError> {
+    if !plan_mount_root_directories(uid, gid, owned_directory_current)?.is_empty() {
+        return Err(HostError::new(format!(
+            "workspace mount root {} is not provisioned with the required ownership and permissions",
+            macos_mount_root(uid).display()
+        )));
+    }
+    Ok(())
+}
+
+// Modifications address a held physical cwd, never a re-resolved child path. Links,
+// non-directories and foreign existing owners are refused, including setup substitutions.
+const OWNED_DIRECTORY_SCRIPT: &str = r#"set -eu
+path=$1; uid=$2; gid=$3; mode=$4
+parent=${path%/*}; leaf=${path##*/}
+refuse() { printf 'refusing workspace mount directory %s: %s\n' "$path" "$1" >&2; exit 1; }
+cd -P "$parent"
+[ "$(/bin/pwd -P)" = "$parent" ] || refuse 'parent is not canonical'
+[ ! -L "$leaf" ] || refuse 'symlink'
+parent_uid=$(/usr/bin/stat -f '%u' .)
+parent_mode=$(/usr/bin/stat -f '%Lp' .)
+created=no
+if [ ! -e "$leaf" ]; then
+    [ "$parent_uid" = 0 ] && [ "$((0$parent_mode & 022))" = 0 ] || refuse 'new privileged directory requires a root-owned non-writable parent'
+    /bin/mkdir -m 700 "$leaf"
+    created=yes
+fi
+[ ! -L "$leaf" ] && [ -d "$leaf" ] || refuse 'not a no-follow directory'
+cd -P "$leaf"
+[ "$(/bin/pwd -P)" = "$path" ] && [ ! -L "$path" ] || refuse 'path changed'
+owner=$(/usr/bin/stat -f '%u:%g' .)
+if [ "$created" = yes ]; then
+    [ "${owner%%:*}" = 0 ] || refuse "new directory has unexpected owner $owner"
+    /usr/sbin/chown "$uid:$gid" .
+else
+    [ "$owner" = "$uid:$gid" ] || refuse "foreign owner $owner, expected $uid:$gid"
+fi
+/bin/chmod "$mode" .
+"#;
+
+fn prepare_invoker_mount_leaf(path: &Path, uid: u32, gid: u32) -> Result<(), HostError> {
+    if owned_directory_current(path, uid, gid, 0o700)? {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| HostError::new("mount directory has no parent"))?;
+    if !owned_directory_current(parent, uid, gid, 0o700)? {
+        return Err(HostError::new(format!(
+            "workspace mount UID directory {} is not provisioned",
+            parent.display()
+        )));
+    }
+    // This parent is invoker-mutable. Create the leaf as that invoker, never as root followed
+    // by chown: substitution of a different root-owned directory must not transfer ownership.
+    match AnchoredDirectory::create(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // An existing owned mode-000 directory needs the session's pinned-cwd mode repair.
+            // Attest its entry before that repair; missing, linked or foreign entries refuse.
+            let directory = AnchoredDirectory::open(parent).map_err(|source| {
+                host_io_error("open no-follow mount UID directory", parent, source)
+            })?;
+            let name = CString::new(
+                path.file_name()
+                    .ok_or_else(|| HostError::new("mount directory has no filename"))?
+                    .as_bytes(),
+            )
+            .map_err(|_| HostError::new("mount directory filename contains NUL"))?;
+            let metadata = directory
+                .stat_child(&name)
+                .map_err(|source| host_io_error("inspect invoker mount leaf", path, source))?
+                .ok_or_else(|| host_io_error("create invoker mount leaf", path, error))?;
+            owned_directory_state(path, &metadata, uid, gid, 0o700)?;
+            Ok(())
+        }
+        Err(error) => Err(host_io_error(
+            "create no-follow invoker mount leaf",
+            path,
+            error,
+        )),
+    }
+}
+
+fn ensure_authorized_owned_directory(
+    session: &mut impl PrivilegedCommandSession,
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+) -> Result<(), HostError> {
+    if path == macos_mount_root(uid)
+        && uid == unsafe { libc::getuid() }
+        && gid == unsafe { libc::getgid() }
+    {
+        prepare_invoker_mount_leaf(path, uid, gid)?;
+    }
+    ensure_authorized_owned_directory_with(session, path, uid, gid, mode, owned_directory_current)
+}
+
+fn ensure_authorized_owned_directory_with(
+    session: &mut impl PrivilegedCommandSession,
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    mut inspect: impl FnMut(&Path, u32, u32, u32) -> Result<bool, HostError>,
+) -> Result<(), HostError> {
+    require_host_canonical(path)?;
+    if inspect(path, uid, gid, mode)? {
+        return Ok(());
+    }
+    let command = HostCommand::new(
+        PRIVILEGED_SHELL,
+        [
+            "-c".to_owned(),
+            OWNED_DIRECTORY_SCRIPT.to_owned(),
+            "cowshed-mount-root".to_owned(),
+            path_argument(path)?,
+            uid.to_string(),
+            gid.to_string(),
+            format!("{mode:o}"),
+        ],
+    );
+    run_privileged_command(session, &command)?;
+    if !inspect(path, uid, gid, mode)? {
+        return Err(HostError::new(format!(
+            "authorized workspace mount directory {} failed ownership/permission attestation",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn create_authorized_directory(
     session: &mut impl PrivilegedCommandSession,
     path: &Path,
@@ -3626,6 +4063,379 @@ mod tests {
     use cowshed_gateway_types::STORE_ROOT;
     use cowshed_os::fork_lock::Spawn as _;
     use uuid::Uuid;
+
+    fn directory_metadata(mode: libc::mode_t, uid: u32, gid: u32) -> libc::stat {
+        // SAFETY: stat is plain scalar storage; the classifier reads only these initialized fields.
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        metadata.st_mode = mode;
+        metadata.st_uid = uid;
+        metadata.st_gid = gid;
+        metadata
+    }
+
+    #[test]
+    fn stable_mount_root_plan_has_fixed_ownership_and_is_idempotent() {
+        let root = Path::new("/private/var/folders/cowshed/501/mnt");
+        let missing = plan_mount_root_directories(501, 20, |_, _, _, _| Ok(false)).unwrap();
+        assert_eq!(
+            missing.as_slice(),
+            mount_root_operations(501, 20).as_slice()
+        );
+        assert!(
+            matches!(&missing[0], HostOperation::EnsureOwnedDirectory { path, uid: 0, gid: 0, mode: 0o755 } if path == Path::new(MACOS_MOUNT_PREFIX))
+        );
+        assert!(
+            matches!(&missing[1], HostOperation::EnsureOwnedDirectory { path, uid: 501, gid: 20, mode: 0o700 } if path == root.parent().unwrap())
+        );
+        assert!(
+            matches!(&missing[2], HostOperation::EnsureOwnedDirectory { path, uid: 501, gid: 20, mode: 0o700 } if path == root)
+        );
+        assert!(
+            plan_mount_root_directories(501, 20, |_, _, _, _| Ok(true))
+                .unwrap()
+                .is_empty()
+        );
+        let repair = plan_mount_root_directories(501, 20, |path, _, _, _| {
+            Ok(path == Path::new(MACOS_MOUNT_PREFIX))
+        })
+        .unwrap();
+        assert_eq!(repair.as_slice(), &mount_root_operations(501, 20)[1..]);
+    }
+
+    #[test]
+    fn stable_mount_root_refuses_links_files_and_foreign_owners_but_repairs_modes() {
+        let path = Path::new("/private/var/folders/cowshed/501/mnt");
+        assert!(
+            owned_directory_state(
+                path,
+                &directory_metadata(libc::S_IFDIR | 0o700, 501, 20),
+                501,
+                20,
+                0o700
+            )
+            .unwrap()
+        );
+        assert!(
+            !owned_directory_state(
+                path,
+                &directory_metadata(libc::S_IFDIR | 0o755, 501, 20),
+                501,
+                20,
+                0o700
+            )
+            .unwrap()
+        );
+        for kind in [libc::S_IFLNK, libc::S_IFREG] {
+            let error = owned_directory_state(
+                path,
+                &directory_metadata(kind | 0o700, 501, 20),
+                501,
+                20,
+                0o700,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("symlink or non-directory"));
+            assert!(error.to_string().contains(path.to_str().unwrap()));
+        }
+        for (uid, gid) in [(502, 20), (501, 80)] {
+            let error = owned_directory_state(
+                path,
+                &directory_metadata(libc::S_IFDIR | 0o700, uid, gid),
+                501,
+                20,
+                0o700,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("foreign"));
+            assert!(error.to_string().contains(&format!("{uid}:{gid}")));
+            assert!(error.to_string().contains("expected 501:20"));
+        }
+    }
+
+    #[test]
+    fn stable_mount_root_planning_preserves_explicit_roots_and_healthy_store_still_plans_root() {
+        let mut source = healthy_existing_source();
+        let first = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            "",
+            CachesVolume::Keep,
+        )
+        .unwrap();
+        let PlannedFstab::NeedsPin(pins) = first.fstab else {
+            panic!("pin plan");
+        };
+        let current = build_fstab("", &pins).unwrap();
+        let mut source = healthy_existing_source();
+        let mut snapshot = prepare_setup_snapshot(
+            &mut source,
+            Path::new("/Users/alice"),
+            &current,
+            CachesVolume::Keep,
+        )
+        .unwrap();
+        add_selected_mount_root_action(
+            &mut snapshot,
+            Path::new("/Users/alice/.cowshed/mnt"),
+            false,
+            501,
+            20,
+            |_, _, _, _| panic!("legacy root must not be inspected"),
+        )
+        .unwrap();
+        assert!(snapshot.actions.is_empty());
+        let root = macos_mount_root(501);
+        let mut already_current = snapshot.clone();
+        add_selected_mount_root_action(
+            &mut already_current,
+            &root,
+            false,
+            501,
+            20,
+            |_, _, _, _| Ok(true),
+        )
+        .unwrap();
+        assert!(already_current.actions.is_empty());
+        assert!(!setup_requires_authorization(&already_current));
+        add_selected_mount_root_action(&mut already_current, &root, true, 501, 20, |_, _, _, _| {
+            Ok(true)
+        })
+        .unwrap();
+        assert!(matches!(
+            already_current.actions.as_slice(),
+            [HostAction::EnsureMountRoot { .. }]
+        ));
+        assert!(
+            !setup_requires_authorization(&already_current),
+            "recording an already-correct root needs no approval"
+        );
+        add_selected_mount_root_action(&mut snapshot, &root, false, 501, 20, |_, _, _, _| {
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(
+            snapshot.actions,
+            vec![HostAction::EnsureMountRoot {
+                path: root,
+                uid: 501,
+                gid: 20
+            }]
+        );
+        assert!(setup_requires_authorization(&snapshot));
+    }
+
+    #[test]
+    fn fresh_mount_root_selection_is_persisted_without_rewriting_existing_config() {
+        let store = std::env::temp_dir().join(format!("cowshed-root-config-{}", Uuid::new_v4()));
+        fs::create_dir_all(&store).unwrap();
+        let home = Path::new("/Users/alice");
+        let root = default_mount_root(home);
+        publish_setup_mount_root(&store, home, &root).unwrap();
+        let path = store.join(crate::storage::host_config::HOST_CONFIG_FILE);
+        let before = fs::read(&path).unwrap();
+        publish_setup_mount_root(&store, Path::new("/Users/another"), &root).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        HostConfig::new("/Users/alice/.cowshed/mnt")
+            .unwrap()
+            .save(&store)
+            .unwrap();
+        let legacy = fs::read(&path).unwrap();
+        assert!(publish_setup_mount_root(&store, home, &root).is_err());
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+        fs::remove_dir_all(store).unwrap();
+    }
+
+    #[test]
+    fn stable_mount_root_no_follow_inspection_refuses_leaf_and_ancestor_links() {
+        let temporary =
+            std::env::temp_dir().join(format!("cowshed-root-no-follow-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temporary).unwrap();
+        let root = fs::canonicalize(&temporary).unwrap();
+        let directory = root.join("directory");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        assert!(owned_directory_current(&directory, uid, gid, 0o700).unwrap());
+        assert!(!owned_directory_current(&root.join("missing"), uid, gid, 0o700).unwrap());
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        assert!(owned_directory_current(&link, uid, gid, 0o700).is_err());
+        assert!(owned_directory_current(&link.join("child"), uid, gid, 0o700).is_err());
+        let file = root.join("file");
+        fs::write(&file, b"foreign file").unwrap();
+        assert!(owned_directory_current(&file, uid, gid, 0o700).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"foreign file");
+        assert_eq!(fs::read_link(&link).unwrap(), directory);
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn stable_mount_root_user_mutable_leaf_is_created_as_invoker_without_owner_takeover() {
+        let temporary =
+            std::env::temp_dir().join(format!("cowshed-user-mount-leaf-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temporary).unwrap();
+        let parent = fs::canonicalize(&temporary).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let gid = fs::metadata(&parent).unwrap().gid();
+        let path = parent.join("mnt");
+        prepare_invoker_mount_leaf(&path, uid, gid).unwrap();
+        assert!(owned_directory_current(&path, uid, gid, 0o700).unwrap());
+        let inode = fs::metadata(&path).unwrap().ino();
+        prepare_invoker_mount_leaf(&path, uid, gid).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        fs::remove_dir(&path).unwrap();
+        std::os::unix::fs::symlink(&parent, &path).unwrap();
+        assert!(prepare_invoker_mount_leaf(&path, uid, gid).is_err());
+        assert_eq!(fs::read_link(&path).unwrap(), parent);
+        assert!(OWNED_DIRECTORY_SCRIPT.contains("root-owned non-writable parent"));
+        assert!(OWNED_DIRECTORY_SCRIPT.contains("0$parent_mode & 022"));
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn stable_mount_root_successful_command_requires_real_directory_attestation() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut session = FakePrivilegedSession {
+            events: Rc::clone(&events),
+            outputs: VecDeque::from([Ok(HostCommandOutput::success(Vec::new()))]),
+        };
+        let path = Path::new("/private/var/folders/cowshed/501/mnt");
+        let error = ensure_authorized_owned_directory_with(
+            &mut session,
+            path,
+            501,
+            20,
+            0o700,
+            |_, _, _, _| Ok(false),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed ownership/permission attestation")
+        );
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+        assert_eq!(events.borrow().len(), 1);
+    }
+
+    #[test]
+    fn stable_mount_root_authorization_denial_and_bad_paths_do_not_mutate() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut session = FakePrivilegedSession {
+            events: Rc::clone(&events),
+            outputs: VecDeque::from([Err(HostError::authorization_denied("declined"))]),
+        };
+        let path = Path::new("/private/var/folders/cowshed/501/mnt");
+        let error = ensure_authorized_owned_directory_with(
+            &mut session,
+            path,
+            501,
+            20,
+            0o700,
+            |_, _, _, _| Ok(false),
+        )
+        .unwrap_err();
+        assert!(error.is_authorization_denied());
+        assert_eq!(events.borrow().len(), 1);
+        events.borrow_mut().clear();
+        let error = ensure_authorized_owned_directory_with(
+            &mut session,
+            Path::new("/private/var/folders/../bad"),
+            501,
+            20,
+            0o700,
+            |_, _, _, _| panic!("invalid path must be refused first"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("path must be absolute and normalized"),
+            "{error}"
+        );
+        assert!(events.borrow().is_empty());
+        let error = ensure_authorized_owned_directory_with(
+            &mut session,
+            path,
+            501,
+            20,
+            0o700,
+            |_, _, _, _| Err(HostError::new("foreign owner 502:20")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("foreign owner"));
+        assert!(
+            events.borrow().is_empty(),
+            "foreign ownership is refused before any command"
+        );
+    }
+
+    #[test]
+    fn stable_mount_root_reuses_session_and_attests_each_directory() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut session = FakePrivilegedSession {
+            events: Rc::clone(&events),
+            outputs: VecDeque::from([
+                Ok(HostCommandOutput::success(Vec::new())),
+                Ok(HostCommandOutput::success(Vec::new())),
+                Ok(HostCommandOutput::success(Vec::new())),
+            ]),
+        };
+        for operation in mount_root_operations(501, 20) {
+            let HostOperation::EnsureOwnedDirectory {
+                path,
+                uid,
+                gid,
+                mode,
+            } = operation
+            else {
+                unreachable!();
+            };
+            let mut reads = 0;
+            ensure_authorized_owned_directory_with(
+                &mut session,
+                &path,
+                uid,
+                gid,
+                mode,
+                |_, _, _, _| {
+                    reads += 1;
+                    Ok(reads == 2)
+                },
+            )
+            .unwrap();
+            assert_eq!(reads, 2);
+        }
+        let commands = events.borrow();
+        assert_eq!(commands.len(), 3);
+        for event in commands.iter() {
+            let ProvisionEvent::Command { program, args } = event else {
+                panic!("directory command");
+            };
+            assert_eq!(program, PRIVILEGED_SHELL);
+            assert_eq!(args[1], OWNED_DIRECTORY_SCRIPT);
+            assert!(!args[1].contains("chown -R"));
+            assert!(!args[1].contains("mkdir -p"));
+            assert!(args[1].contains("/bin/chmod \"$mode\" ."));
+        }
+        drop(commands);
+        ensure_authorized_owned_directory_with(
+            &mut session,
+            &macos_mount_root(501),
+            501,
+            20,
+            0o700,
+            |_, _, _, _| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(
+            events.borrow().len(),
+            3,
+            "correct directories execute no commands"
+        );
+    }
 
     /// The production read-only planner keeps the home device's container as its selection
     /// anchor while an unrelated image tears down, whatever stage of that teardown the one kernel
@@ -3938,14 +4748,23 @@ mod tests {
         let roots = CanonicalRoots::at(store.clone());
         let defaults = spotlight_roots(&roots, &home).unwrap();
         assert!(defaults.contains(&directory.join("physical")));
-        assert!(defaults.contains(&home.join(".cowshed")));
-        assert!(defaults.contains(&home.join(DEFAULT_MOUNT_RELATIVE)));
+        let default_mount = default_mount_root(&home);
+        assert!(
+            defaults
+                .iter()
+                .any(|root| root.as_path() == default_mount.parent().unwrap())
+        );
+        assert!(defaults.contains(&default_mount));
         let custom = directory.join("Dev/.cowshed");
         HostConfig::new(&custom).unwrap().save(&store).unwrap();
         let configured = spotlight_roots(&roots, &home).unwrap();
         assert!(configured.contains(&custom));
-        assert!(configured.contains(&home.join(".cowshed")));
-        assert!(!configured.contains(&home.join(DEFAULT_MOUNT_RELATIVE)));
+        assert!(
+            configured
+                .iter()
+                .any(|root| root.as_path() == default_mount.parent().unwrap())
+        );
+        assert!(!configured.contains(&default_mount));
         fs::remove_dir_all(directory).unwrap();
     }
 

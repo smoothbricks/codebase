@@ -2,7 +2,7 @@
 //! format transition and space reclamation", steps 2, 4 and 5. The surrounding
 //! transaction preserves the complete filesystem, including Git's administrative
 //! files; these probes independently check Git's interpretation of that copy.
-//! `01_storage.md` "Images" keeps the retained source until verification passes.
+//! `01a_apfs.md` "Images" keeps the retained source until verification passes.
 //!
 //! Capture requires a quiescent checkout. Every probe disables optional locks,
 //! retains stdout/stderr bytes, and uses the existing controller Git runner.

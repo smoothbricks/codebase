@@ -2,7 +2,7 @@
 
 cowshed's workspace physics — cheap CoW clone, instant delete, own inode namespace — is provided by a substrate.
 Everything above the substrate (grants, sandbox model, gateway, CLI contract, marker files, cache taxonomy) is
-substrate-independent. There are two substrates: **APFS images** (macOS, 01_storage.md/02_workspaces.md are written
+substrate-independent. There are two substrates: **APFS images** (macOS, 01a_apfs.md/02_workspaces.md are written
 against it) and **ZFS datasets** (Linux; macOS only where OpenZFS is already installed).
 
 ## Public lifecycle and substrate API
@@ -207,15 +207,15 @@ scans pools or silently picks one. A configured pool must contain or permit crea
 
 ## APFS image substrate (reference)
 
-As specified in 01_storage.md and 02_workspaces.md: one RAW image (`.dmg`) per workspace, a sparse file holding a
+As specified in 01a_apfs.md and 02_workspaces.md: one RAW image (`.dmg`) per workspace, a sparse file holding a
 case-sensitive APFS volume. Formatted images attach and mount in one
 `diskutil image attach --mountPoint ... --mountOptions ... --plist` transaction; Disk Arbitration owns filesystem
 checking and mount bookkeeping, and cowshed verifies the resulting image/device/mount identity before publication
-(01_storage.md, "Mounts"). Detached checkpoint verification and resize, and blank-image formatting, intentionally attach
+(01a_apfs.md, "Mounts"). Detached checkpoint verification and resize, and blank-image formatting, intentionally attach
 without mounting. Deletion unlinks one file. Clones are logically independent of their source (no GC coupling), but
 inherit its extent map, so a fragmented main makes every clone's first write slow until `cowshed defrag main`
-(01_storage.md, "Clone cost follows extents, not size"), and they share its blocks until every sharer is released
-(01_storage.md, "Space reclamation"). Timing budgets are in 08_testing.md ("Performance budgets").
+(01a_apfs.md, "Clone cost follows extents, not size"), and they share its blocks until every sharer is released
+(01a_apfs.md, "Space reclamation"). Timing budgets are in 08_testing.md ("Performance budgets").
 
 ## ZFS substrate
 

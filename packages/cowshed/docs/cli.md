@@ -124,9 +124,18 @@ next: run `cowshed setup` from the cowshed you mean to use: it installs that bui
 `disk-command`, `--version` and `--help` do not ask: `doctor` diagnoses the disagreement, and `setup` ends it. No daemon
 answering is not a disagreement.
 
-`--mount-root <dir>` sets the host workspace mount root (default `~/.cowshed/mnt`). Session workspaces mount at
-`<mount-root>/<owner>/<repo>/<ws>`. The path must be absolute. The root can change only while every workspace is
-detached; otherwise setup names the attached workspaces and refuses. Stdout is the configured root.
+`--mount-root <dir>` sets the one host session workspace mount root. Fresh macOS setup defaults to
+`/private/var/folders/cowshed/<uid>/mnt`, using the invoking numeric UID; Linux retains `~/.cowshed/mnt`. Sessions mount
+at `<mount-root>/<owner>/<repo>/<ws>`. Setup provisions the stable macOS prefix as root:wheel 0755 and its UID/mnt
+directories as the invoking user, 0700, through the existing single privileged approval; it reports the path and refuses
+symlinks, non-directories and foreign ownership.
+
+Existing explicit or legacy root configuration is preserved, and existing workspaces are never moved by an upgrade. The
+root can change only while no sessions are attached; otherwise setup names them and refuses. To switch an existing host
+at that maintenance boundary, run `cowshed setup --mount-root /private/var/folders/cowshed/$(id -u)/mnt`. Stdout is the
+configured root. The path must be absolute. The stable canonical path avoids Spotlight's media-reference acquisition
+before indexing policy is considered; it is not a temporary `T` directory or a daemon-restart workaround. See
+[APFS mount-root policy](../../../specs/cowshed/01a_apfs.md#stable-workspace-mount-root).
 
 After a repair, and after `--mount-root`, setup probes git identity for every adopted checkout: it runs
 `git config --list --show-origin` in the checkout and in a throwaway repository under the mount root
@@ -398,7 +407,7 @@ attach RAW images only.
 RAW images are sparse at creation: capacity is a cap, not a reservation, and nothing returns guest-freed space
 automatically. In the RAW measurement, a deleted 1 GiB payload kept its host allocation after guest sync, image fsync,
 clean unmount and detach. Space returns only after verification and explicit release of the retained old image and every
-clone or checkpoint sharing its blocks. See 02_workspaces.md §Re-adoption and 01_storage.md, "Space reclamation".
+clone or checkpoint sharing its blocks. See 02_workspaces.md §Re-adoption and 01a_apfs.md, "Space reclamation".
 
 Workspace environment lives in the image at `.cowshed/env` and is rewritten on token rotation. The repository `.envrc`
 is a two-liner that sources that file. Cowshed does not authorize direnv or devenv trust databases. Reattach a detached

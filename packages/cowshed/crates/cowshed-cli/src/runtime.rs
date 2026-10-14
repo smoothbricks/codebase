@@ -3623,6 +3623,10 @@ where
 
 fn host_action_evidence(action: &HostAction) -> String {
     match action {
+        HostAction::EnsureMountRoot { path, uid, gid } => format!(
+            "provision or repair workspace mount root {} for uid {uid}, gid {gid}",
+            path.display()
+        ),
         HostAction::CreateVolume {
             name,
             container,
@@ -3830,6 +3834,16 @@ fn host_storage_findings(plan: &HostSetupPlan) -> Vec<Finding> {
     }
     for action in &plan.actions {
         match action {
+            HostAction::EnsureMountRoot { path, uid, gid } => findings.push(Finding {
+                code: "host-mount-root".into(),
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "workspace mount root {} needs provisioning or repair (uid {uid}, gid {gid})",
+                    path.display()
+                ),
+                hint: "cowshed setup".into(),
+                path: Some(path.clone()),
+            }),
             HostAction::EncryptVolume {
                 name,
                 uuid,
@@ -4188,8 +4202,9 @@ fn orphaned_disk_image_helpers_finding(
 
 /// The host's disk-image attach pool (attach_budget.rs): the leaked image devices, user
 /// clients, volumes and media, the ceiling the leaked devices run out at and the headroom left.
-/// A pool spent this boot is an error; low headroom or a volume leak warns. The hint names what
-/// frees each leak.
+/// A pool spent this boot is an error; low headroom warns. The hint names what frees each leak.
+/// Departed volumes and media take no pool slot, so [`departed_volume_references_finding`] reports
+/// them, never this finding.
 fn disk_image_attach_budget_finding(
     budget: std::io::Result<cowshed_apfs::attach_budget::Budget>,
 ) -> Option<Finding> {
@@ -4219,6 +4234,23 @@ fn disk_image_attach_budget_finding(
             path: None,
         }),
     }
+}
+
+/// Departed APFS volumes and media the kernel has not freed (attach_budget.rs, `Departed`),
+/// read from the same snapshot as the attach pool. A warning from the first one, never an error:
+/// they take no attach-pool slot, so they stay out of `disk-image-attach-budget` and its remedy.
+/// What holds them is not assumed: the hint attributes them by registry ID and changes nothing
+/// (01a_apfs.md, "Spotlight media references").
+fn departed_volume_references_finding(
+    reading: &cowshed_apfs::attach_budget::KernelReading,
+) -> Option<Finding> {
+    reading.departed().map(|departed| Finding {
+        code: "departed-volume-references".into(),
+        severity: FindingSeverity::Warning,
+        message: departed.to_string(),
+        hint: cowshed_apfs::attach_budget::DEPARTED_ATTRIBUTION_HINT.into(),
+        path: None,
+    })
 }
 
 struct HostDiagnosis {
@@ -4271,9 +4303,16 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
         .extend(orphaned_disk_image_helpers_finding(
             cowshed_apfs::disk_image_helpers::OrphanedHelpers::read(),
         ));
-    diagnosis.findings.extend(disk_image_attach_budget_finding(
-        cowshed_apfs::attach_budget::observe(),
-    ));
+    // One snapshot answers both findings: departed volumes need no census of their own.
+    let budget = cowshed_apfs::attach_budget::observe();
+    let departed = budget
+        .as_ref()
+        .ok()
+        .and_then(|budget| departed_volume_references_finding(&budget.reading));
+    diagnosis
+        .findings
+        .extend(disk_image_attach_budget_finding(budget));
+    diagnosis.findings.extend(departed);
     match crate::capabilities::sccache::service::service_status().await {
         Ok(status) => diagnosis.findings.push(sccache_finding(&status)),
         Err(error) => diagnosis.findings.push(Finding {
@@ -5359,7 +5398,7 @@ mod tests {
     #[test]
     fn doctor_reports_the_attach_budget_and_says_reboot_once_the_pool_ran_out() {
         use cowshed_apfs::attach_budget::{
-            Boot, ClassCount, KernelReading, PoolRecord, REBOOT_HINT, RESTART_DISK_ARBITRATION_HINT,
+            Boot, ClassCount, KernelReading, PoolRecord, REBOOT_HINT,
         };
         let count = |instances, registered| ClassCount {
             instances,
@@ -5416,10 +5455,7 @@ mod tests {
                 .contains("66 disk images attached and 1024 leaked image devices"),
             "{exhausted:?}"
         );
-        assert_eq!(
-            exhausted.hint,
-            format!("{RESTART_DISK_ARBITRATION_HINT}; then {REBOOT_HINT}")
-        );
+        assert_eq!(exhausted.hint, REBOOT_HINT);
 
         // After the reboot the recorded leak is the ceiling; headroom near it warns.
         let rebooted = finding(&spent, next, rebooted_host);
@@ -5439,6 +5475,90 @@ mod tests {
         let refused = std::io::Error::other("IOServiceMatching refused");
         let unread = disk_image_attach_budget_finding(Err(refused)).expect("a failed read");
         assert_eq!(unread.severity, FindingSeverity::Warning);
+    }
+
+    #[test]
+    fn doctor_reports_departed_volumes_from_the_first_one_apart_from_the_pool() {
+        use cowshed_apfs::attach_budget::{
+            Boot, ClassCount, DEPARTED_ATTRIBUTION_HINT, KernelReading, PoolRecord, REBOOT_HINT,
+        };
+        let count = |instances, registered| ClassCount {
+            instances,
+            registered,
+        };
+        let boot = Boot {
+            session: "C979D80A-3BC4-4F57-A9E2-1FE362B935C7".into(),
+            booted_at: 1_791_515_025,
+        };
+        let next = "0E3E6D1C-6C7B-4B53-8A1E-6C5C1E0D1F00";
+        // This host at its first 150 on 2026-10-10, and just after the reboot.
+        let spent_host = KernelReading {
+            image_devices: count(1090, 66),
+            user_clients: count(1077, 66),
+            apfs_volumes: count(1065, 81),
+            media: count(1075, 80),
+        };
+        let rebooted_host = KernelReading {
+            image_devices: count(178, 178),
+            user_clients: count(178, 178),
+            apfs_volumes: count(193, 193),
+            media: count(185, 185),
+        };
+        let pool = |record: &PoolRecord, session: &str, reading: KernelReading| {
+            disk_image_attach_budget_finding(Ok(record.budget(session, reading)))
+                .expect("the budget is always reported")
+        };
+
+        // Beside a spent pool the departed volumes are a warning of their own: the pool's error
+        // names the reboot alone, and the warning's hint attributes them.
+        let departed = departed_volume_references_finding(&spent_host)
+            .expect("departed volumes are a finding");
+        assert_eq!(departed.code, "departed-volume-references");
+        assert_eq!(departed.severity, FindingSeverity::Warning);
+        assert!(
+            departed
+                .message
+                .starts_with("984 departed AppleAPFSVolume and 995 departed IOMedia instances: "),
+            "{departed:?}"
+        );
+        assert_eq!(departed.hint, DEPARTED_ATTRIBUTION_HINT);
+        assert_eq!(departed.path, None);
+        let spent = PoolRecord::default().exhausted(&boot, Some(spent_host.image_devices), Some(0));
+        let exhausted = pool(&spent, &boot.session, spent_host);
+        assert_eq!(exhausted.severity, FindingSeverity::Error);
+        assert_eq!(exhausted.hint, REBOOT_HINT);
+
+        // The first departed instance of either class warns, and the pool does not move for it.
+        for (reading, counts) in [
+            (
+                KernelReading {
+                    apfs_volumes: count(194, 193),
+                    ..rebooted_host
+                },
+                "1 departed AppleAPFSVolume and 0 departed IOMedia instances: ",
+            ),
+            (
+                KernelReading {
+                    media: count(186, 185),
+                    ..rebooted_host
+                },
+                "0 departed AppleAPFSVolume and 1 departed IOMedia instances: ",
+            ),
+        ] {
+            let first = departed_volume_references_finding(&reading)
+                .expect("the first departed instance is a finding");
+            assert_eq!(first.severity, FindingSeverity::Warning);
+            assert!(first.message.starts_with(counts), "{first:?}");
+            let unmoved = pool(&PoolRecord::default(), next, reading);
+            assert_eq!(unmoved.severity, FindingSeverity::Info);
+            assert_eq!(unmoved.hint, "nothing to free");
+            assert!(unmoved.message.contains("headroom 1024"), "{unmoved:?}");
+        }
+        // Nothing departed, nothing to report.
+        assert!(departed_volume_references_finding(&rebooted_host).is_none());
+
+        // A warning never makes the host unhealthy: only an error does.
+        assert!(doctor_report(vec![departed]).healthy);
     }
 
     #[test]

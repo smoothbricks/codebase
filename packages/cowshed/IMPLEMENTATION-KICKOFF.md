@@ -12,10 +12,10 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 
 ## Read first (in order)
 
-1. `specs/cowshed/*.md` (repo root) — the committed design: 00 overview, 01 storage, 02 workspaces, 03 caches, 04
-   sandbox, 05 gateway, 06 CLI, 07 API, 08 testing, 09 substrates (ZFS/Linux), 10 CI runner, 11 shell layer, 12 MCP, 13
-   telemetry, 14 nix/declarative host setup + deployment postures. Implement from them and resolve any conflict in favor
-   of the specs.
+1. `specs/cowshed/*.md` (repo root) — the committed design: 00 overview, 01 storage, 01a APFS, 02 workspaces, 03 caches,
+   04 sandbox, 05 gateway, 06 CLI, 07 API, 08 testing, 09 substrates (ZFS/Linux), 10 CI runner, 11 shell layer, 12 MCP,
+   13 telemetry, 14 nix/declarative host setup + deployment postures. Implement from them and resolve any conflict in
+   favor of the specs.
 2. `packages/cowshed/docs/` — user-facing UX acceptance documents, not evidence of an implementation.
 3. `specs/cowshed/prototypes/apfs-workspace-bench/` — benchmark harness, report, and results backing the design numbers.
 
@@ -23,11 +23,12 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 
 - **Substrate**: clonefile'd disk images (Option B). Shadows rejected (2.34× worse sync writes, base-file GC
   dependency). **One format: RAW (UDRW) `.dmg` holding one case-sensitive APFS volume, stored as a sparse file**
-  (01_storage.md §Images). No fallback, no format field anywhere, macOS 26 is the floor. Historical, pre-cutover ASIF
+  (01a_apfs.md §Images). No fallback, no format field anywhere, macOS 26 is the floor. Historical, pre-cutover ASIF
   measurements: ASIF was measured faster than SPARSE on every row (2.1× create, 2.5× write, 5.6× read, 2.3× metadata;
   clonefile equal) and equal to case-insensitive ASIF within noise; they do not describe RAW. Blank templates are
   created unprivileged: `diskutil image create blank --format RAW --fs None`, attach `--noMount`,
-  `newfs_apfs -U/-G … -e`, `fsck_apfs -q`, `hdiutil detach`; attach is `diskutil image attach` (01_storage.md).
+  `newfs_apfs -U/-G … -e`, `fsck_apfs -q`, `hdiutil detach`; attach is `diskutil image attach` (01a_apfs.md §Images,
+  §Mounts).
 - **No workspace pools**: main-as-base; formatted blank templates serve image minting only. `cowshed adopt` turns the
   existing checkout into an image mounted at its original path; `cowshed fork` descriptor-clones main's live image after
   a flush, with main still mounted (filesystem crash-consistent). Safe because secrets never live in worktrees (gateway
@@ -63,20 +64,16 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 - **Denial evidence, never string-sniffing**: exit/typed 6 is emitted only on authoritative evidence: pre-spawn
   validation, profile-application failure, gateway policy denial, or a verified kernel signal. Child output and bounded
   summaries never establish a denial or synthesize a grant.
-- **Layout — one dedicated volume, zero `~/Library` for images** (except the launchd plists, which must live there,
-  home-manager-owned on nix hosts, and cowshed's own cache directory `~/Library/Caches/dev.cowshed` holding the gateway
-  mirrors): `cowshed.store` mounted AT `~/.cowshed` (the dotdir IS the volume — no `store/` level; images, grants,
-  quarantine, gateway state, telemetry at the volume root). Layer-3 caches stay at each tool's own default in the host
-  HOME (03_caches.md), so no caches volume is provisioned; an earlier release's `cowshed.caches` is emptied by
-  `cowshed setup` and deleted by `cowshed setup --retire-caches-volume`. The store is lazily created, space-sharing the
-  container; it mounts first (the workspace mountpoints live on it) and the volume-root marker `.cowshed-volume.json`
-  distinguishes mounted from bare — absent means unmounted, heal before acting. Workspace mounts at
-  `<mount-root>/<owner>/<repo>/<ws>` (the host-configured root defaults to `~/.cowshed/mnt`; primary `repo_id`, with
-  each component separately validated and encoded; nobrowse, owners on, NOT /Volumes). Data-volume home footprint: one
-  empty mountpoint directory. Rationale: Data's local snapshots would pin churned image blocks (path-level tmutil
-  exclusion doesn't stop snapshotting); a dedicated volume also collapses backup policy to a per-volume decision and
-  separates the images' fsck/corruption domain. Sandbox consequence: ONE `~/.cowshed` subtree deny + carve-backs
-  replaces the enumerated store/sibling-mount denies (04_sandbox.md). Spec: 01_storage.md.
+- **Layout — one dedicated store volume, separate empty mountpoints.** `cowshed.store` mounts at
+  `/private/cowshed/store`, with images, grants, quarantine and telemetry at its root; the volume marker distinguishes
+  the mounted store from its bare mountpoint. Layer-3 caches stay at their tools' own HOME defaults (03_caches.md), and
+  the gateway's repository mirrors live in `~/Library/Caches/dev.cowshed`. Session mounts use
+  `<mount-root>/<owner>/<repo>/<ws>`, with independently validated and encoded primary repository components. Fresh
+  macOS setup provisions `/private/var/folders/cowshed/<uid>/mnt` as the default root, outside Spotlight's
+  media-reference admission path; existing explicit/legacy roots remain unchanged. The mount root is a plain directory
+  on Data, not the store volume. An existing host changes it only at the detached-session boundary. Durable image churn
+  stays outside Data snapshots and its fsck domain. Spec: 01_storage.md §Directory layout; 01a_apfs.md §Stable workspace
+  mount root and §Dedicated store volume.
 - **Declarative host setup + deployment postures (14_nix.md)**: on nix hosts, `programs.cowshed` (home-manager) owns the
   launchd agents and TM exclusions declaratively — `adopt`/`doctor` VALIDATE and never mutate when HM owns the host
   (detection: HM symlinks resolve into /nix/store); imperative mode stays the non-nix fallback. Volume creation and

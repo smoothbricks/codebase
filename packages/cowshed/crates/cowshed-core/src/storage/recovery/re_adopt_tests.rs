@@ -3,7 +3,7 @@
 //! Governing specs: `specs/cowshed/02_workspaces.md` "Re-adoption: format transition and space
 //! reclamation" steps 1-5 (the durable intent records the exact source backing path, incarnation,
 //! checkout, build identity, kernel capacities and retained paths before anything changes, and an
-//! existing `<checkout>.pre-cowshed` is never overwritten); `specs/cowshed/01_storage.md` "Images"
+//! existing `<checkout>.pre-cowshed` is never overwritten); `specs/cowshed/01a_apfs.md` "Images"
 //! (capacity is recorded from the kernel before detach); `specs/cowshed/16_build_volumes.md`
 //! "Targets and seeds" (owner record preserved verbatim; old-incarnation seeds stay retained).
 //!
@@ -44,7 +44,7 @@ const SEED_IDS: [&str; 2] = [
     "fedcba9876543210fedcba9876543210",
     "00000000000000000000000000000001",
 ];
-/// 100 GiB, the default image capacity (`01_storage.md` "Images").
+/// 100 GiB, the default image capacity (`01a_apfs.md` "Images").
 const MAIN_CAPACITY_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 const BUILD_CAPACITY_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 

@@ -1,4 +1,4 @@
-//! The host's disk-image attach pool (01_storage.md, "How the APFS host degrades" §2;
+//! The host's disk-image attach pool (01a_apfs.md, "How the APFS host degrades" §2;
 //! 08_testing.md, "Host limit").
 //!
 //! Every `diskutil image attach` creates an `AppleDiskImageDevice`, its `DIDeviceIOUserClient`
@@ -12,9 +12,10 @@
 //! Both sides are read unprivileged and without attaching anything: the instance counts are the
 //! registry root's `IOKitDiagnostics` class counts, which `ioclasscount` prints, and the
 //! registered counts are the registry's own entries. A device instance with no registered entry
-//! is leaked. The same subtraction for `AppleAPFSVolume` and `IOMedia` names references to
-//! departed volumes, which `diskarbitrationd` was measured holding and which a restart of it
-//! frees.
+//! is leaked. The same subtraction for `AppleAPFSVolume` and `IOMedia` counts departed volumes
+//! and media the kernel has not freed ([`Departed`]). They take no slot in the pool, so they
+//! never spend its headroom: `doctor` reports them as a finding of their own, and what holds
+//! them is attributed by registry ID, not assumed (01a_apfs.md, "Spotlight media references").
 //!
 //! The ceiling is an observation, not a documented limit: on 2026-10-10 the first 150 struck
 //! with 1090 `AppleDiskImageDevice` instances and 66 registered, exactly 1024 leaked, and no
@@ -35,17 +36,20 @@ const POOL_EXHAUSTED: &[u8] = b"error code 150";
 /// until this host records a 150 of its own that no orphaned helper explains.
 pub const OBSERVED_LEAK_CEILING: u64 = 1024;
 
-/// Leaked volume or media references at which `doctor` names `diskarbitrationd`. One clean
-/// attach→mount→detach cycle was measured leaving one `AppleAPFSVolume`, so a few are routine.
-pub const VOLUME_LEAK_WARNING: u64 = 64;
-
 /// What frees leaked image devices.
 pub const REBOOT_HINT: &str =
     "reboot the host: only a reboot frees leaked disk-image devices (sudo shutdown -r now)";
 
-/// What frees leaked volume and media references.
-pub const RESTART_DISK_ARBITRATION_HINT: &str = "sudo killall diskarbitrationd: launchd \
-     restarts it, and the departed volumes it held are freed";
+/// What attributes departed volumes and media to the process that holds them. It reads and
+/// changes nothing and names no restart: the holder has differed between builds, classes and
+/// boots, so anything done about a holder starts from its exact pid, re-read as still holding
+/// the IDs (01a_apfs.md, "Spotlight media references", "Release and device custody").
+pub const DEPARTED_ATTRIBUTION_HINT: &str = "attribute the departed volumes and media by exact \
+     registry ID before acting; this changes nothing. As root, count per process the rights in \
+     `lsmp -a` (`IOKIT-OBJECT AppleAPFSVolume(0x...)`, `IOKIT-OBJECT IOMedia(0x...)`) whose ID \
+     is absent from `ioreg -r -c IOMedia -d 1 -w0` (`id 0x...`, AppleAPFSVolume entries \
+     included). A count matching the finding names the holder's exact pid, to be re-read as \
+     still holding those IDs before it is touched; IDs no process holds are held in the kernel";
 
 /// What clears a 150 the leaked devices do not explain.
 pub const ORPHANS_FIRST_HINT: &str = "kill the orphaned diskimagesiod helpers `cowshed doctor` \
@@ -117,9 +121,37 @@ pub struct KernelReading {
 }
 
 impl KernelReading {
-    /// Leaked references to departed volumes and media, the larger of the two classes.
-    pub fn leaked_volumes(&self) -> u64 {
-        self.apfs_volumes.leaked().max(self.media.leaked())
+    /// The departed volumes and media the kernel has not freed, from the first of either, or
+    /// `None` when no `AppleAPFSVolume` or `IOMedia` instance outlives its registry entry.
+    pub fn departed(&self) -> Option<Departed> {
+        let departed = Departed {
+            volumes: self.apfs_volumes.leaked(),
+            media: self.media.leaked(),
+        };
+        (departed.volumes > 0 || departed.media > 0).then_some(departed)
+    }
+}
+
+/// Departed APFS volumes and media the kernel has not freed: instances no registered entry
+/// accounts for. They take no attach-pool slot, so they are no part of the pool's headroom
+/// (01a_apfs.md, "Spotlight media references"). The instances and the registry are two reads
+/// ([`KernelReading`]), so a disk command in flight between them can account for a few.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Departed {
+    pub volumes: u64,
+    pub media: u64,
+}
+
+impl fmt::Display for Departed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} departed AppleAPFSVolume and {} departed IOMedia instances: live in the kernel, \
+             registered nowhere. They take no attach-pool slot. Nothing here says what holds \
+             them, and a disk command in flight between doctor's registry read and its instance \
+             read can account for a few",
+            self.volumes, self.media
+        )
     }
 }
 
@@ -151,7 +183,7 @@ impl Exhaustion {
 }
 
 /// Disk-image commands killed at a hard deadline during one boot: each probably left its device
-/// leaked. Cowshed no longer kills one (01_storage.md, "No disk-image command is killed"); the
+/// leaked. Cowshed no longer kills one (01a_apfs.md, "No disk-image command is killed"); the
 /// count is what an earlier build recorded this boot, still reported until the boot ends.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -351,9 +383,9 @@ impl Budget {
     /// What frees enough of the pool for `need` more attaches, which a refusal always names:
     /// the orphaned helpers when the leaked devices do not explain a spent boot, the recorded
     /// ceiling when it alone is below `need`, and otherwise a reboot, the one thing that frees
-    /// leaked image devices. Leaked volumes and media add the `diskarbitrationd` restart first.
+    /// leaked image devices. Departed volumes and media take no slot, so they name nothing here.
     fn refusal_remedy(&self, need: u64) -> String {
-        let step = match self.ceiling {
+        match self.ceiling {
             _ if self.spent.is_some() && !self.devices_full() => ORPHANS_FIRST_HINT.to_owned(),
             Ceiling::Observed { leaked, .. } if self.spent.is_none() && leaked < need => format!(
                 "the ceiling recorded at this host's last error code 150, {leaked} leaked \
@@ -362,11 +394,6 @@ impl Budget {
                  forgets it (back to {OBSERVED_LEAK_CEILING})"
             ),
             Ceiling::Observed { .. } | Ceiling::Default => REBOOT_HINT.to_owned(),
-        };
-        if self.reading.leaked_volumes() >= VOLUME_LEAK_WARNING {
-            format!("{RESTART_DISK_ARBITRATION_HINT}; then {step}")
-        } else {
-            step
         }
     }
 
@@ -375,29 +402,22 @@ impl Budget {
         self.headroom() == 0
     }
 
-    /// Whether `doctor` should warn.
+    /// Whether `doctor` should warn about the pool.
     pub fn is_low(&self) -> bool {
         self.spent.is_some()
             || self.headroom() <= self.ceiling.leaked() / 4
-            || self.reading.leaked_volumes() >= VOLUME_LEAK_WARNING
             || self.probable_leaks > 0
     }
 
     /// What frees what leaked.
     pub fn remedy(&self) -> String {
-        let mut steps = Vec::new();
-        if self.reading.leaked_volumes() >= VOLUME_LEAK_WARNING {
-            steps.push(RESTART_DISK_ARBITRATION_HINT);
-        }
         if self.spent.is_some() && !self.devices_full() {
-            steps.push(ORPHANS_FIRST_HINT);
+            ORPHANS_FIRST_HINT.to_owned()
         } else if self.spent.is_some() || self.headroom() <= self.ceiling.leaked() / 4 {
-            steps.push(REBOOT_HINT);
+            REBOOT_HINT.to_owned()
+        } else {
+            "nothing to free".to_owned()
         }
-        if steps.is_empty() {
-            return "nothing to free".to_owned();
-        }
-        steps.join("; then ")
     }
 }
 
@@ -838,9 +858,15 @@ mod tests {
     #[test]
     fn leaked_is_instances_no_registered_entry_accounts_for() {
         assert_eq!(spent_host().image_devices.leaked(), 1024);
-        assert_eq!(spent_host().leaked_volumes(), 995);
+        assert_eq!(
+            spent_host().departed(),
+            Some(Departed {
+                volumes: 984,
+                media: 995
+            })
+        );
         assert_eq!(count(3, 5).leaked(), 0);
-        assert_eq!(rebooted_host().leaked_volumes(), 0);
+        assert_eq!(rebooted_host().departed(), None);
     }
 
     #[test]
@@ -897,10 +923,7 @@ mod tests {
             report.contains("with 66 disk images attached and 1024 leaked image devices"),
             "{report}"
         );
-        assert_eq!(
-            budget.remedy(),
-            format!("{RESTART_DISK_ARBITRATION_HINT}; then {REBOOT_HINT}")
-        );
+        assert_eq!(budget.remedy(), REBOOT_HINT);
 
         // A second 150 in the same boot keeps where the pool first ran out.
         assert_eq!(
@@ -995,24 +1018,101 @@ mod tests {
         assert_eq!(record.budget(NEXT_BOOT, rebooted_host()).probable_leaks, 0);
     }
 
+    /// Departed volumes and media take no slot in the pool: with or without them the headroom,
+    /// the warning, the remedy and the gate read alike, and the first departed instance of either
+    /// class is reported all the same.
     #[test]
-    fn the_remedy_names_what_frees_what_leaked() {
+    fn departed_volumes_never_spend_the_pool_and_the_first_is_reported() {
         let record = PoolRecord::default();
-        let volumes = KernelReading {
+        let departed = |reading: KernelReading| KernelReading {
             apfs_volumes: count(1065, 81),
+            media: count(1075, 80),
+            ..reading
+        };
+        for leaked in [0, 700, 1024] {
+            let without = record.budget(NEXT_BOOT, leaking(leaked));
+            let with = record.budget(NEXT_BOOT, departed(leaking(leaked)));
+            assert_eq!(with.headroom(), without.headroom(), "{leaked} leaked");
+            assert_eq!(with.is_low(), without.is_low(), "{leaked} leaked");
+            assert_eq!(with.remedy(), without.remedy(), "{leaked} leaked");
+            for need in [1, 400] {
+                assert_eq!(
+                    with.admits(need).map_err(|refused| refused.remedy),
+                    without.admits(need).map_err(|refused| refused.remedy),
+                    "{leaked} leaked, {need} needed"
+                );
+            }
+        }
+        let healthy = record.budget(NEXT_BOOT, departed(rebooted_host()));
+        assert_eq!(healthy.remedy(), "nothing to free");
+        assert!(!healthy.is_low());
+        assert!(healthy.admits(1024).is_ok());
+
+        // The first departed instance of either class is counted, and moves nothing in the pool.
+        let first_volume = KernelReading {
+            apfs_volumes: count(194, 193),
             ..rebooted_host()
         };
         assert_eq!(
-            record.budget(NEXT_BOOT, volumes).remedy(),
-            RESTART_DISK_ARBITRATION_HINT
+            first_volume.departed(),
+            Some(Departed {
+                volumes: 1,
+                media: 0
+            })
         );
-        assert!(record.budget(NEXT_BOOT, volumes).is_low());
-        let few = KernelReading {
-            media: count(185 + VOLUME_LEAK_WARNING - 1, 185),
+        let first_media = KernelReading {
+            media: count(186, 185),
             ..rebooted_host()
         };
-        assert!(!record.budget(NEXT_BOOT, few).is_low());
-        assert_eq!(record.budget(NEXT_BOOT, few).remedy(), "nothing to free");
+        assert_eq!(
+            first_media.departed(),
+            Some(Departed {
+                volumes: 0,
+                media: 1
+            })
+        );
+        for first in [first_volume, first_media] {
+            let budget = record.budget(NEXT_BOOT, first);
+            assert!(!budget.is_low());
+            assert_eq!(budget.remedy(), "nothing to free");
+            assert_eq!(budget.headroom(), 1024);
+        }
+        // Fewer instances than registered entries is no departure.
+        let freed = KernelReading {
+            apfs_volumes: count(192, 193),
+            media: count(184, 185),
+            ..rebooted_host()
+        };
+        assert_eq!(freed.departed(), None);
+        assert_eq!(rebooted_host().departed(), None);
+    }
+
+    /// The counts are named departed and no holder is: what holds them differs between builds,
+    /// classes and boots, so the hint attributes by registry ID and kills or restarts nothing.
+    #[test]
+    fn the_departed_message_names_no_holder_and_its_hint_changes_nothing() {
+        let message = Departed {
+            volumes: 3,
+            media: 0,
+        }
+        .to_string();
+        assert!(
+            message.starts_with("3 departed AppleAPFSVolume and 0 departed IOMedia instances: "),
+            "{message}"
+        );
+        assert!(message.contains("take no attach-pool slot"), "{message}");
+        for holder in ["mds", "Spotlight", "diskarbitrationd"] {
+            assert!(!message.contains(holder), "{holder} in {message}");
+        }
+        assert!(DEPARTED_ATTRIBUTION_HINT.contains("`lsmp -a`"));
+        assert!(DEPARTED_ATTRIBUTION_HINT.contains("registry ID"));
+        assert!(DEPARTED_ATTRIBUTION_HINT.contains("exact pid"));
+        for change in ["kill", "restart", "reboot", "diskarbitrationd"] {
+            assert!(
+                !DEPARTED_ATTRIBUTION_HINT.contains(change),
+                "{change} in the hint"
+            );
+        }
     }
 
     fn scratch(label: &str) -> PathBuf {
@@ -1094,10 +1194,8 @@ mod tests {
             .budget(NEXT_BOOT, volumes)
             .admits(400)
             .expect_err("324 < 400");
-        assert_eq!(
-            refused.remedy,
-            format!("{RESTART_DISK_ARBITRATION_HINT}; then {REBOOT_HINT}")
-        );
+        // Departed volumes add nothing to a refusal: the remedy is the reboot alone.
+        assert_eq!(refused.remedy, REBOOT_HINT);
         // A spent boot the leaked devices do not explain sends the operator to the orphans.
         let orphaned = PoolRecord::default()
             .exhausted(&boot(BOOT), Some(count(96, 66)), Some(10))

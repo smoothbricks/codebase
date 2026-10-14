@@ -23,6 +23,8 @@ pub use native::{
     UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_host_setup,
     execute_host_uninstall, plan_host_setup, plan_host_uninstall,
 };
+#[cfg(target_os = "macos")]
+pub use native::{execute_mount_root_provisioning, plan_mount_root_provisioning};
 
 pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
 pub const APFS_STORE_VOLUME: &str = "cowshed.store";
@@ -1023,6 +1025,13 @@ pub enum HostOperation {
         substrate: SubstrateKind,
     },
     EnsureDirectory(PathBuf),
+    /// Provision or attest one no-follow directory without taking over foreign ownership.
+    EnsureOwnedDirectory {
+        path: PathBuf,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+    },
     /// Delete a launchd StandardErrorPath stub so an existing cowshed volume can remount.
     ReclaimMountpoint(PathBuf),
     MountApfsVolume {
@@ -1619,6 +1628,18 @@ pub trait BootstrapHost: Send + Sync {
     fn verify_zfs_delegation(&self, pool: &str, required_root: &str) -> Result<(), HostError>;
     fn inspect_mountpoint(&self, path: &Path) -> Result<MountpointState, HostError>;
     fn create_dir_all(&self, path: &Path) -> Result<(), HostError>;
+    fn ensure_owned_directory(
+        &self,
+        path: &Path,
+        _uid: u32,
+        _gid: u32,
+        _mode: u32,
+    ) -> Result<(), HostError> {
+        Err(HostError::new(format!(
+            "host cannot provision an owned directory at {}",
+            path.display()
+        )))
+    }
     fn reclaim_mountpoint(&self, path: &Path) -> Result<(), HostError>;
     fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError>;
     fn run_command_with_input(
@@ -1794,6 +1815,14 @@ where
         },
         HostOperation::EnsureDirectory(path) => host
             .create_dir_all(path)
+            .map_err(BootstrapExecutionError::Host),
+        HostOperation::EnsureOwnedDirectory {
+            path,
+            uid,
+            gid,
+            mode,
+        } => host
+            .ensure_owned_directory(path, *uid, *gid, *mode)
             .map_err(BootstrapExecutionError::Host),
         HostOperation::ReclaimMountpoint(path) => host
             .reclaim_mountpoint(path)

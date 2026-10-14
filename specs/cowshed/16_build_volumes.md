@@ -1,6 +1,6 @@
 # Build Volumes: Millisecond Forks and Lands
 
-A workspace is two volumes: the **source volume** (the workspace image of 01_storage.md: the git tree, installed
+A workspace is two volumes: the **source volume** (the workspace image of 01a_apfs.md: the git tree, installed
 dependencies, every build tool's declared outputs) and a **build volume** (the build tools' own incremental state: Cargo
 target directories and Nx's task cache with its database). A fork clones both and is warm for every task main built. A
 land moves main to the build volume the landing workspace already built, by renaming one link: main builds nothing that
@@ -9,8 +9,8 @@ exists, and how each is enforced. It is the one place these rules live; other sp
 
 ## Goal
 
-- **Fork in milliseconds, warm.** `cowshed fork` clones images (milliseconds; 01_storage.md "Images") and attaches them
-  (a fraction of a second each, independent of how many images the host has attached). Every Nx task main ran is a cache
+- **Fork in milliseconds, warm.** `cowshed fork` clones images (milliseconds; 01a_apfs.md "Images") and attaches them (a
+  fraction of a second each, independent of how many images the host has attached). Every Nx task main ran is a cache
   hit in the fork and every Cargo unit is `Fresh`: the fork reseeds main first when main's volume holds work its seed
   does not (Targets and seeds). Only the fork's own edits invalidate anything, and exactly what the same edit would
   invalidate on main.
@@ -30,7 +30,7 @@ Carrying source, dependencies and build state in one image per workspace has thr
 each of them.
 
 1. **Main fragments, and every fork pays for it.** Fragmentation comes from writing an image while a clone shares its
-   blocks (01_storage.md "Images", its clone-cost bullet): extents multiply under churn while clones are held, and the
+   blocks (01a_apfs.md "Images", its clone-cost bullet): extents multiply under churn while clones are held, and the
    first write to a clone costs time per extent. Build state is where nearly all of main's churn comes from: every build
    of main rewrites gigabytes under `target/` and `.nx/cache` while sessions hold clones of main's image. With build
    state on its own volume, main's source image changes only when its tree changes (a land's fast-forward, an edit), and
@@ -66,7 +66,7 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
 
 ### Substrate
 
-- **APFS**: a build volume is a sparse RAW image of its own, created exactly as a workspace image is (01_storage.md
+- **APFS**: a build volume is a sparse RAW image of its own, created exactly as a workspace image is (01a_apfs.md
   "Images": case-sensitive APFS), stored beside the workspace's image as `<owner>/<repo>/build/<id>.dmg` with its
   sidecar `<id>.dmg.json`. It is attached `nobrowse` at a store-side mountpoint,
   `<mount-root>/.build/<owner>/<repo>/<id>`, never inside another volume.
@@ -86,7 +86,7 @@ writers at once. Content-addressed caches, whose entries are immutable and valid
   source's capacity: an image clone carries its capacity, and configuration only ever names the capacity of a volume
   nothing was cloned from.
 - **Resize**: `cowshed resize <ws|main> --build <size>` grows the workspace's build volume exactly as a workspace image
-  grows (01_storage.md "Detached growth"), and its seed with it, so every later fork of the workspace inherits the new
+  grows (01a_apfs.md "Detached growth"), and its seed with it, so every later fork of the workspace inherits the new
   capacity. The workspace's jobs and Nx daemon stop first, because the image has to leave the kernel; any other holder
   of the volume refuses the resize before anything changes. A land never shrinks its target: while the landing volume is
   quiet (Land step 4) it grows to the target's capacity when it is smaller, before the seed is frozen from it, so the
@@ -148,10 +148,10 @@ again in the canonical job environment (the caller's `CARGO_TARGET_DIR` and the 
 state): new paths join the volume, held ones never move. A checkout with build state and no volume gets its first one
 (its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it is a target from then on.
 Main's first volume is minted while `cowshed adopt` stages main's image, at the capacity the adopted checkout's
-`.cowshed.toml` asks, so the two attaches wait on `storagekitd` once (01_storage.md, "How the APFS host degrades"),
-unless nothing in the checkout can name build state (no tracked Cargo or package manifest, no declared `[build] state`,
-no enabled Nx detector match), whose first touch makes no volume. Main's first touch links it once main is mounted at
-the checkout, when main links no volume yet and asks the capacity it was minted at (the checkout's `.cowshed.toml` may
+`.cowshed.toml` asks, so the two attaches wait on `storagekitd` once (01a_apfs.md, "How the APFS host degrades"), unless
+nothing in the checkout can name build state (no tracked Cargo or package manifest, no declared `[build] state`, no
+enabled Nx detector match), whose first touch makes no volume. Main's first touch links it once main is mounted at the
+checkout, when main links no volume yet and asks the capacity it was minted at (the checkout's `.cowshed.toml` may
 change while main is copied; the first touch then mints its own at the capacity asked now). A mint that failed fails
 only a first touch that needs a volume, with the mint's own error, and is not retried. An adoption releases the volume
 before it completes whenever its first touch does not link it (nothing to hold, a refusal, a failure, a volume already
@@ -275,7 +275,7 @@ A **seed** is a build volume nobody writes: a target's frozen build state at one
 latest seed.** Every fork of a target clones that target's seed, never the target's live build volume. A target's live
 build volume is written by whatever runs there (a developer's build, a reload, the target's own check); cloning it
 mid-write would copy a Cargo unit or an Nx database half-written. An APFS seed stays detached, and its source inode is
-held with a shared no-follow lock excluding attachment while descriptor cloning runs (01_storage.md, "Images").
+held with a shared no-follow lock excluding attachment while descriptor cloning runs (01a_apfs.md, "Images").
 
 A target's seed is made when the target is created (a clone of the seed it was forked from, or of its first build volume
 at its first touch), and **every land into the target refreshes it from the landing workspace's build volume**:
@@ -343,9 +343,9 @@ while it clones the seed, so a reseed never deletes a seed a fork is cloning:
    unmounted and detached without force. A late host Cargo build, a new profile, an editor or any other filesystem
    holder refuses that seal; it is reported as a busy-volume skip and the old seed remains. An unmount the kernel
    accepted leaves no file open, so a detach refused after it names no filesystem holder: it is retried without force
-   within the detach grace (01_storage.md, "Mounts"), and only a detach still refused when the grace ends is a busy
-   seal, reported as the device's refusal. The detached image is flushed and its source inode held against reattachment
-   while it is cloned;
+   within the detach grace (01a_apfs.md, "Mounts"), and only a detach still refused when the grace ends is a busy seal,
+   reported as the device's refusal. The detached image is flushed and its source inode held against reattachment while
+   it is cloned;
 5. the live volume is restored at canonical with the same mount flags and current attachment identity, still under the
    exclusive build hold. Its volume and image are flushed and the post-restore image clock is marked on the seed. The
    clone's extent-map write and owner-record publication complete before the hold is released. Reopening admission is
@@ -440,8 +440,8 @@ workspace. All sources use one mint path, carrying edits and untracked files war
    (rule "One Nx state per checkout").
 
 Steps 2 and 3 up to the attach run beside step 1's attach of the cloned image, under the same lock: every attach waits
-in the host's one `storagekitd` queue (01_storage.md "How the APFS host degrades"), and the two in flight together wait
-in it once. The new workspace's own seed is cloned, and its link written, only once its checkout is staged; a clone that
+in the host's one `storagekitd` queue (01a_apfs.md "How the APFS host degrades"), and the two in flight together wait in
+it once. The new workspace's own seed is cloned, and its link written, only once its checkout is staged; a clone that
 never stages releases the volume made for it.
 
 The fork is warm for everything the seed's volume held when it was last frozen: at the latest land, at the next fork
@@ -500,7 +500,7 @@ an integration workspace; "the target" is whichever one it is.
 
    Resolving either build volume for mounting takes its per-image lease **before** reading the attachment inventory. A
    recovered attachment owns a raw IOMedia pin across the subsequent kernel mount-table read and mount, just as a
-   freshly verified attachment does (01_storage.md, "Mounts"). A concurrent fork's reseed may finish while that lease is
+   freshly verified attachment does (01a_apfs.md, "Mounts"). A concurrent fork's reseed may finish while that lease is
    awaited: the lookup then resolves its restored device, not the earlier device name. Once pinned, a reseed cannot
    detach that attachment before the mount decision completes. Reading the attachment before awaiting the lease would
    let a land's `close-target` pin open a device a concurrent `cowshed new` has already detached, after Git delivery but
@@ -766,7 +766,7 @@ again at any level above it.
   image absence, the sidecar and live links, then deletes the orphan sidecar with zero image bytes reclaimed. An image
   appearing or a record/link changing defers it; linked records and retained existing seed images are not relabeled or
   collected by this rule. This includes payload-absent legacy `<id>.asif.json` seed sidecars as the explicit
-  metadata-only exception to RAW-only enumeration (01_storage.md §Images). A strict Seed record is required. Reuse
+  metadata-only exception to RAW-only enumeration (01a_apfs.md §Images). A strict Seed record is required. Reuse
   `claim_re_adopt_source` to claim the legacy image's actual hold file, then re-read record, image absence, live links
   and forming lifecycle work under that same claim; then remove the sidecar and its obsolete hold file, and sync the
   images directory. No legacy payload is attached, converted, relabeled or released, and an existing legacy seed image

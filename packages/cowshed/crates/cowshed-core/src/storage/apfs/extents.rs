@@ -1,7 +1,7 @@
 //! An image file's physical layout: how many extents its data occupies, and a rewrite that lays
 //! the same bytes out again contiguously.
 //!
-//! Extents are the whole cost of cloning an image (01_storage.md, "Clone cost follows extents,
+//! Extents are the whole cost of cloning an image (01a_apfs.md, "Clone cost follows extents,
 //! not size"): `clonefile` shares the source's extent map and the first write to either file
 //! copies it. A main image fragments with every write it takes while clones share its blocks, so
 //! the one remedy is to write its data again into fresh, contiguous space.

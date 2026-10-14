@@ -4,7 +4,7 @@
 //! There is no second runner here. The request goes to [`SystemCommandRunner`], the runner every
 //! cowshed disk child goes through, so the caller gets what cowshed gets: the host disk lease,
 //! the child's own session, the attach-pool bookkeeping, and a disk-image command that is
-//! detached, file-backed and never killed (01_storage.md, "How the APFS host degrades" §2). This
+//! detached, file-backed and never killed (01a_apfs.md, "How the APFS host degrades" §2). This
 //! module adds only the shape a script reads: the tool's bytes on stdout and stderr, and its exit
 //! status as this process's.
 

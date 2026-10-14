@@ -65,6 +65,11 @@ pub enum CachesVolume {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum HostAction {
+    EnsureMountRoot {
+        path: PathBuf,
+        uid: u32,
+        gid: u32,
+    },
     CreateVolume {
         name: String,
         container: String,
@@ -301,6 +306,9 @@ pub(crate) fn mutating_setup_actions(plan: &BootstrapPlan) -> Vec<String> {
             | HostOperation::ReportVolumeIssue { .. } => None,
             HostOperation::RunCommand(command) if is_unprivileged_apfs_remount(command) => None,
             HostOperation::RunCommand(_) => Some("run privileged host command".to_owned()),
+            HostOperation::EnsureOwnedDirectory { path, .. } => {
+                Some(format!("provision owned directory {}", path.display()))
+            }
             HostOperation::ProvisionApfsVolumes { volumes, .. } => {
                 Some(provision_volumes_action(volumes))
             }
