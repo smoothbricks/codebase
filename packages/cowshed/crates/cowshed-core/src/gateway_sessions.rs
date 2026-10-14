@@ -325,6 +325,10 @@ pub fn policy_from_grants(grants: &GrantSet) -> Result<WorkspacePolicy> {
     Ok(policy)
 }
 
+/// Convert typed macOS inventory, including off-host collision fixtures (05_gateway.md).
+/// IDs, token, CA and policy are validated by their constructors here. Validate the recorded
+/// port-block topology, not the runner's platform; the gateway validates the current host
+/// again at installation, where Linux continues to require a Unix endpoint.
 pub fn session_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSession> {
     let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, fact.port_block.base()));
     let token = WorkspaceToken::parse(fact.credentials.token()).map_err(|error| {
@@ -365,15 +369,18 @@ pub fn session_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSession> {
         ca,
         policy: policy_from_grants(&fact.grants)?,
     };
-    session.validate().map_err(|error| {
-        CowshedError::integrity(
-            format!(
-                "gateway session for {}/{} is invalid: {error}",
-                fact.repo_id, fact.workspace
-            ),
-            "cowshed doctor --json",
-        )
-    })?;
+    session
+        .endpoint
+        .validate_macos_port_block()
+        .map_err(|error| {
+            CowshedError::integrity(
+                format!(
+                    "gateway session for {}/{} is invalid: {error}",
+                    fact.repo_id, fact.workspace
+                ),
+                "cowshed doctor --json",
+            )
+        })?;
     Ok(session)
 }
 

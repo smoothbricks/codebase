@@ -92,7 +92,8 @@ impl StartupHealState {
     }
 }
 
-/// Complete controller-authoritative input for installing one gateway workspace session.
+/// Controller-authoritative macOS port-block inventory for one gateway session.
+/// This pure inventory can be inspected off-host; installation still validates the host platform.
 pub struct GatewaySessionFact {
     pub repo_id: RepoId,
     pub workspace: WorkspaceName,
@@ -3323,7 +3324,21 @@ mod tests {
         let ids = |sessions: Vec<cowshed_gateway_types::WorkspaceSession>| {
             sessions
                 .into_iter()
-                .map(|session| session.workspace_id)
+                .map(|session| {
+                    session
+                        .endpoint
+                        .validate_macos_port_block()
+                        .expect("macOS fixture endpoint");
+                    #[cfg(target_os = "linux")]
+                    assert!(
+                        matches!(
+                            session.validate(),
+                            Err(cowshed_gateway_types::ConfigError::ExpectedUnixEndpoint)
+                        ),
+                        "a macOS inventory session must never install on Linux"
+                    );
+                    session.workspace_id
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(
