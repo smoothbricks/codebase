@@ -12,6 +12,7 @@ import { getExecutorNameForTask } from 'nx/src/tasks-runner/utils';
 import { signalToCode } from 'nx/src/utils/exit-codes';
 import typia from 'typia';
 import { nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
+import type { EnsureBuiltProbeResult } from './ensure-built.js';
 import {
   assignEnvironment,
   callerOwnsWorkspace,
@@ -716,7 +717,11 @@ describe('smoo-nx-exec without a daemon', () => {
 });
 
 /** Fixture Nx configuration: its cache and database stay under its removable root. */
-const FIXTURE_NX_JSON = { useDaemonProcess: true, cacheDirectory: '.nx/cache' };
+const FIXTURE_NX_JSON = {
+  useDaemonProcess: true,
+  cacheDirectory: '.nx/cache',
+  plugins: [{ plugin: '@smoothbricks/nx-plugin', options: { producerReceipts: { targets: ['app:build'] } } }],
+};
 
 /**
  * Two projects, `app:build` reading `lib:build`'s outputs through
@@ -1036,6 +1041,19 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
             { encoding: 'utf8' },
           );
           expect(sourceCommit.status, sourceCommit.stdout + sourceCommit.stderr).toBe(0);
+          const published = await run(
+            'node',
+            nxEntry,
+            workspace,
+            ['run', 'app:build', '--outputStyle=static-failures-only'],
+            {
+              NX_DAEMON: 'true',
+              NX_WORKSPACE_ROOT_PATH: workspace,
+              ...ownEnv,
+            },
+          );
+          expect(published.code, published.stdout + published.stderr).toBe(0);
+          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
           const probeEntry = join(root, 'probe-receipt.ts');
           await writeFile(
             probeEntry,
@@ -1060,7 +1078,7 @@ await writeFile(source, 'new uncached source');
 const uncached = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 const outputAfterMiss = await readFile(output, 'utf8');
 await writeFile(source, originalSource);
-console.log(JSON.stringify({ hit, daemonless, stale, uncached, outputUnwritten: before.ino === after.ino && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs, outputAfterMiss }));
+await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ hit, daemonless, stale, uncached, outputUnwritten: before.ino === after.ino && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs, outputAfterMiss }) + "\\n", error => error ? reject(error) : resolve()));
 `,
           );
           const probed = await run('bun', probeEntry, workspace, [], {
@@ -1071,10 +1089,10 @@ console.log(JSON.stringify({ hit, daemonless, stale, uncached, outputUnwritten: 
           });
           expect(probed.code, probed.stdout + probed.stderr).toBe(0);
           const receipts = typia.json.assertParse<{
-            hit: import('./ensure-built.js').EnsureBuiltProbeResult;
-            daemonless: import('./ensure-built.js').EnsureBuiltProbeResult;
-            stale: import('./ensure-built.js').EnsureBuiltProbeResult;
-            uncached: import('./ensure-built.js').EnsureBuiltProbeResult;
+            hit: EnsureBuiltProbeResult;
+            daemonless: EnsureBuiltProbeResult;
+            stale: EnsureBuiltProbeResult;
+            uncached: EnsureBuiltProbeResult;
             outputUnwritten: boolean;
             outputAfterMiss: string;
           }>(probed.stdout);
@@ -1087,55 +1105,43 @@ console.log(JSON.stringify({ hit, daemonless, stale, uncached, outputUnwritten: 
                 .find(({ path }) => path === 'packages/app/dist/marker.txt'),
             ).toMatchObject({ type: 'file', sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
           }
-          expect(receipts.daemonless).toEqual({
-            disposition: 'miss',
-            reason: { kind: 'no-daemon', taskId: 'app:build' },
-          });
-          expect(receipts.stale).toEqual({
-            disposition: 'miss',
-            reason: { kind: 'stale-outputs', taskId: 'app:build' },
-          });
-          expect(receipts.uncached.disposition).toBe('miss');
+          expect(receipts.daemonless.disposition).toBe('hit');
+          expect(receipts.stale).toMatchObject({ disposition: 'failed', reason: { kind: 'provider-proof' } });
+          expect(receipts.uncached.disposition).toBe('failed');
           expect(receipts.outputUnwritten).toBe(true);
           expect(receipts.outputAfterMiss).toBe('built\nlib\n');
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
 
-          const sourceRaceEntry = join(root, 'receipt-source-race.ts');
+          const producerEnvironmentEntry = join(root, 'producer-environment-independence.ts');
           await writeFile(
-            sourceRaceEntry,
+            producerEnvironmentEntry,
             `
 import { createRequire } from 'node:module';
-import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
-const source = join(process.cwd(), 'packages/lib/source.txt');
-const text = await readFile(source, 'utf8');
 const { daemonClient } = createRequire(process.cwd() + '/package.json')('nx/src/daemon/client/client');
-const hash = daemonClient.hashTasks.bind(daemonClient);
-daemonClient.hashTasks = async (...args) => {
-  const result = await hash(...args);
-  await writeFile(source, 'transient source');
-  await writeFile(source, text);
-  return result;
-};
-console.log(JSON.stringify(await probeBuilt({ target: 'app:build', cwd: process.cwd() })));
+daemonClient.hashTasks = async () => { throw new Error('readonly consumer must not hash its own environment'); };
+process.env.PRODUCER_CONSUMER_DIFFERENCE = 'consumer-only';
+const first = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
+const empty = spawnSync('git', ['-c', 'user.name=Receipt fixture', '-c', 'user.email=receipt@example.invalid', 'commit', '--allow-empty', '-qm', 'same tree'], { encoding: 'utf8' });
+if (empty.status !== 0) throw new Error(empty.stderr);
+const sameTree = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
+await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ first, sameTree }) + "\\n", error => error ? reject(error) : resolve()));
 `,
           );
-          const sourceRace = await run('bun', sourceRaceEntry, workspace, [], {
+          const producerEnvironment = await run('bun', producerEnvironmentEntry, workspace, [], {
             NX_DAEMON: 'true',
             NX_USE_LOCAL: 'true',
             NX_WORKSPACE_ROOT_PATH: workspace,
             ...ownEnv,
           });
-          expect(sourceRace.code, sourceRace.stdout + sourceRace.stderr).toBe(0);
-          const sourceRaceResult = typia.json.assertParse<import('./ensure-built.js').EnsureBuiltProbeResult>(
-            sourceRace.stdout,
-          );
-          expect(sourceRaceResult).toMatchObject({
-            disposition: 'failed',
-            reason: { kind: 'provider-proof', detail: expect.stringContaining('across Nx hashing') },
-          });
-          expect(sourceRace.stderr).toContain('Provider source');
+          expect(producerEnvironment.code, producerEnvironment.stdout + producerEnvironment.stderr).toBe(0);
+          const environmentResults = typia.json.assertParse<{
+            first: EnsureBuiltProbeResult;
+            sameTree: EnsureBuiltProbeResult;
+          }>(producerEnvironment.stdout);
+          expect(environmentResults.first.disposition, producerEnvironment.stderr).toBe('hit');
+          expect(environmentResults.sameTree).toEqual(environmentResults.first);
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
 
           // An awaited daemon graph can see B while both disk snapshots see

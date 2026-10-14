@@ -8,6 +8,8 @@ import {
   type CreateNodesContextV2,
   type CreateNodesResultV2,
   type CreateNodesV2,
+  type PostTasksExecution,
+  type PreTasksExecution,
   readJsonFile,
   type TargetConfiguration,
 } from 'nx/src/devkit-exports.js';
@@ -71,9 +73,14 @@ import {
   EXTRACTED_TARGET_DIR,
   NEXTEST_EXTRACT_BIN,
 } from './nextest-extraction.js';
+import {
+  type ProducerReceiptsOptions,
+  postTasksExecution as postProducerReceipts,
+  preTasksExecution as preProducerReceipts,
+} from './producer-receipts.js';
 import { runtimeInput, shellWord } from './runtime-input.js';
 import { isNonSourceDirectory } from './source-directories.js';
-import { postTasksExecution, preTasksExecution } from './task-results.js';
+import { postTasksExecution as postTaskResults, preTasksExecution as preTaskResults } from './task-results.js';
 import { SHARD_TIMINGS_EXECUTOR, SHARD_TIMINGS_TARGET, timingsShardedSuite } from './test-timings.js';
 import {
   isBuildOutputTargetName,
@@ -83,7 +90,7 @@ import {
 } from './workspace-config-policy.js';
 import { globIndexedFiles } from './workspace-index.js';
 
-export { CARGO_TEST_COMPILE_TARGET, postTasksExecution, preTasksExecution };
+export { CARGO_TEST_COMPILE_TARGET };
 
 /** Makes a version live and proves it answers; never cached. */
 export const DEPLOY_TARGET = 'deploy';
@@ -1076,6 +1083,20 @@ function isBuildOutputPackageJson(packageJsonPath: string): boolean {
   const normalized = `/${packageJsonPath.replaceAll('\\', '/')}`;
   return BUILD_OUTPUT_SEGMENTS.some((segment) => normalized.includes(segment));
 }
+
+/**
+ * Nx accepts one pre/post task-hook pair per plugin. Two independent observers share it: the controller's task-results
+ * hint and the opt-in producer completion receipts. Each sees the same options and run context; neither reads the
+ * other's output. The hint is recorded first so a producer-receipt bug cannot cost the controller its evidence.
+ */
+export const preTasksExecution: PreTasksExecution<ProducerReceiptsOptions> = async (options, context) => {
+  preTaskResults(options, context);
+  await preProducerReceipts(options, context);
+};
+export const postTasksExecution: PostTasksExecution<ProducerReceiptsOptions> = async (options, context) => {
+  await postTaskResults(options, context);
+  await postProducerReceipts(options, context);
+};
 
 export default { createNodesV2, postTasksExecution, preTasksExecution };
 

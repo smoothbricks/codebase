@@ -1,27 +1,36 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import type { BigIntStats } from 'node:fs';
 import { closeSync, lstatSync, openSync, readdirSync, readlinkSync, readSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, relative } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import type { Task } from 'nx/src/config/task-graph';
 import type { expandOutputs, HashInputs } from 'nx/src/native';
 import { CARGO_TOOLCHAIN_PIN_INPUTS, cargoRuntimeInput } from './cargo-toolchain-policy.js';
-import type { EnsureBuiltOutputReceipt, EnsureBuiltProbeFailure, EnsureBuiltReceipt } from './ensure-built.js';
+import type {
+  EnsureBuiltOutputReceipt,
+  EnsureBuiltProbeFailure,
+  EnsureBuiltProducerFileInput,
+  EnsureBuiltProducerReceipt,
+  EnsureBuiltReceipt,
+} from './ensure-built.js';
 import { type NodeWitness, nodeStamp, nodesUnchanged } from './ensure-built-witness.js';
 
-type Evidence<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly detail: string };
-
+export type ReceiptEvidence<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly detail: string };
 export interface ProviderInputProof {
   readonly kind: 'exact-file-inputs' | 'conservative-provider-source';
   readonly files: readonly string[];
   readonly inputs: Readonly<Record<string, HashInputs>>;
   readonly runtimeSource: { readonly kind: 'bounded' } | { readonly kind: 'opaque'; readonly detail: string };
 }
-
-function git(root: string, args: string[]): Evidence<string> {
-  // Provenance belongs to this provider, not a Git directory/index/object
-  // namespace an outer build lent the process. Nx's hashing environment is
-  // unchanged; only these read-only evidence children bind their own Git state.
+export interface ProducerSourceWitness {
+  readonly head: string;
+  readonly headTree: string;
+  readonly files: readonly EnsureBuiltProducerFileInput[];
+  readonly nodes: readonly NodeWitness[];
+  readonly outputs: readonly string[];
+}
+export function receiptGit(root: string, args: string[]): ReceiptEvidence<string> {
   const env = { ...process.env };
   for (const key of [
     'GIT_DIR',
@@ -41,8 +50,7 @@ function git(root: string, args: string[]): Evidence<string> {
         detail: `git ${args.join(' ')}: ${child.error?.message ?? child.stderr.trim()} (exit ${child.status}, signal ${child.signal})`,
       };
 }
-
-/** NUL-delimited Git paths preserve whitespace, rename sources and index-only changes. */
+/** NUL-delimited paths preserve whitespace, rename sources and index-only changes. */
 export function dirtyProviderPaths(status: string): string[] {
   const entries = status.split('\0');
   const paths: string[] = [];
@@ -57,15 +65,192 @@ export function dirtyProviderPaths(status: string): string[] {
   }
   return paths;
 }
-
+function graphConfiguration(path: string): boolean {
+  const name = path.slice(path.lastIndexOf('/') + 1);
+  return [
+    'nx.json',
+    'project.json',
+    'package.json',
+    'bun.lock',
+    'bun.lockb',
+    'package-lock.json',
+    'pnpm-lock.yaml',
+    'yarn.lock',
+  ].includes(name);
+}
+let readBuffer: Buffer | undefined;
+function fileReadBuffer(): Buffer {
+  if (readBuffer === undefined) readBuffer = Buffer.allocUnsafe(1 << 20);
+  return readBuffer;
+}
+function hashFile(path: string, size: number, algorithms: readonly ('sha1' | 'sha256')[], blob: boolean): string[] {
+  const hashes = algorithms.map((algorithm) => createHash(algorithm));
+  if (blob) for (const hash of hashes) hash.update(`blob ${size}\0`);
+  const buffer = fileReadBuffer();
+  const descriptor = openSync(path, 'r');
+  try {
+    for (let offset = 0; offset < size; offset += buffer.length) {
+      const length = Math.min(buffer.length, size - offset);
+      if (readSync(descriptor, buffer, 0, length, offset) !== length)
+        throw new Error(`File moved while reading ${path}`);
+      for (const hash of hashes) hash.update(buffer.subarray(0, length));
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  return hashes.map((hash) => hash.digest('hex'));
+}
+function sourceFileDigests(
+  path: string,
+  size: number,
+  algorithm: 'sha1' | 'sha256',
+): { readonly gitBlob: string; readonly sha256: string } {
+  const blob = createHash(algorithm).update(`blob ${size}\0`);
+  const raw = createHash('sha256');
+  const buffer = fileReadBuffer();
+  const descriptor = openSync(path, 'r');
+  try {
+    for (let offset = 0; offset < size; offset += buffer.length) {
+      const length = Math.min(buffer.length, size - offset);
+      if (readSync(descriptor, buffer, 0, length, offset) !== length)
+        throw new Error(`Source moved while reading ${path}`);
+      const bytes = buffer.subarray(0, length);
+      blob.update(bytes);
+      raw.update(bytes);
+    }
+  } finally {
+    closeSync(descriptor);
+  }
+  return { gitBlob: blob.digest('hex'), sha256: raw.digest('hex') };
+}
+/** One independently read node; absolute paths also serve tool/package closures. */
+export function receiptNode(path: string, name: string, observed: NodeWitness[]): EnsureBuiltOutputReceipt {
+  const stats = lstatSync(path, { bigint: true });
+  observed.push({ path, stamp: nodeStamp(stats) });
+  const mode = Number(stats.mode & 0o7777n);
+  if (stats.isFile())
+    return { path: name, type: 'file', mode, sha256: hashFile(path, Number(stats.size), ['sha256'], false)[0] };
+  if (stats.isSymbolicLink()) return { path: name, type: 'symlink', mode, linkText: readlinkSync(path) };
+  if (stats.isDirectory()) {
+    const entries = readdirSync(path).sort();
+    return {
+      path: name,
+      type: 'directory',
+      mode,
+      entries,
+      sha256: createHash('sha256').update(JSON.stringify(entries)).digest('hex'),
+    };
+  }
+  throw new Error(`Unsupported receipt node ${path}`);
+}
+/** Capture every tracked source byte at pre. Unrelated untracked files are not source basis. */
+export function captureProducerSource(
+  root: string,
+  outputs: readonly string[],
+): ReceiptEvidence<ProducerSourceWitness> {
+  try {
+    const revision = receiptGit(root, ['rev-parse', '--verify', 'HEAD']);
+    if (!revision.ok) return revision;
+    const head = revision.value.trim();
+    const tree = receiptGit(root, ['rev-parse', '--verify', `${head}^{tree}`]);
+    if (!tree.ok) return tree;
+    const listed = receiptGit(root, ['ls-tree', '-r', '-z', '--full-tree', head]);
+    if (!listed.ok) return listed;
+    const format = receiptGit(root, ['rev-parse', '--show-object-format']);
+    if (!format.ok) return format;
+    const algorithm = format.value.trim();
+    if (algorithm !== 'sha1' && algorithm !== 'sha256')
+      return { ok: false, detail: `Unproved Git object format ${algorithm}` };
+    const excluded = new Set(outputs.filter((path) => !graphConfiguration(path)));
+    const nodes: NodeWitness[] = [];
+    const files: EnsureBuiltProducerFileInput[] = [];
+    for (const entry of listed.value.split('\0')) {
+      if (entry === '') continue;
+      const tab = entry.indexOf('\t');
+      const [mode, kind, oid] = entry.slice(0, tab).split(' ');
+      if (tab < 0 || oid === undefined || mode === undefined)
+        return { ok: false, detail: `Unproved HEAD tree entry ${entry}` };
+      if (kind !== 'blob') return { ok: false, detail: `Unbound tracked source namespace ${entry}` };
+      const file = entry.slice(tab + 1);
+      if (excluded.has(file)) continue;
+      const path = join(root, file);
+      const stats = lstatSync(path, { bigint: true });
+      nodes.push({ path, stamp: nodeStamp(stats) });
+      const actualMode = stats.isSymbolicLink() ? '120000' : (stats.mode & 0o111n) !== 0n ? '100755' : '100644';
+      if (actualMode !== mode) return { ok: false, detail: `Tracked source mode differs from HEAD: ${file}` };
+      let gitBlob: string;
+      let sha256: string;
+      if (stats.isFile()) {
+        const digests = sourceFileDigests(path, Number(stats.size), algorithm);
+        gitBlob = digests.gitBlob;
+        sha256 = digests.sha256;
+      } else if (stats.isSymbolicLink()) {
+        const text = readlinkSync(path);
+        gitBlob = createHash(algorithm)
+          .update(`blob ${Buffer.byteLength(text)}\0`)
+          .update(text)
+          .digest('hex');
+        sha256 = createHash('sha256').update(text).digest('hex');
+      } else return { ok: false, detail: `Unbound tracked source node: ${file}` };
+      if (gitBlob !== oid) return { ok: false, detail: `Tracked source bytes differ from HEAD: ${file}` };
+      files.push({ path: file, mode: Number(stats.mode & 0o7777n), gitBlob, sha256 });
+    }
+    const status = receiptGit(root, ['status', '--porcelain=v1', '-z', '--untracked-files=no']);
+    if (!status.ok) return status;
+    const dirty = dirtyProviderPaths(status.value).filter((path) => !excluded.has(path));
+    if (dirty.length !== 0)
+      return { ok: false, detail: `Tracked source/index differs from ${head}: ${dirty.join(', ')}` };
+    if (!nodesUnchanged(nodes)) return { ok: false, detail: 'Tracked source moved during producer pre capture' };
+    return { ok: true, value: { head, headTree: tree.value.trim(), files, nodes, outputs } };
+  } catch (error) {
+    if (error instanceof Error) return { ok: false, detail: `Cannot prove tracked producer tree: ${error.message}` };
+    throw error;
+  }
+}
+export function producerSourceUnchanged(root: string, before: ProducerSourceWitness): ReceiptEvidence<true> {
+  const revision = receiptGit(root, ['rev-parse', '--verify', 'HEAD']);
+  if (!revision.ok) return revision;
+  const status = receiptGit(root, ['status', '--porcelain=v1', '-z', '--untracked-files=no']);
+  if (!status.ok) return status;
+  const outputs = new Set(before.outputs.filter((path) => !graphConfiguration(path)));
+  const tree = receiptGit(root, ['rev-parse', '--verify', `${revision.value.trim()}^{tree}`]);
+  if (!tree.ok) return tree;
+  if (
+    tree.value.trim() !== before.headTree ||
+    dirtyProviderPaths(status.value).some((path) => !outputs.has(path)) ||
+    !nodesUnchanged(before.nodes)
+  )
+    return { ok: false, detail: 'Producer HEAD/tracked source nodes changed across actual task execution' };
+  return { ok: true, value: true };
+}
+/** Enumerate exact public nodes; never exempt a broad directory of tracked source. */
+export function producerOutputPaths(root: string, tasks: readonly Task[], expand: typeof expandOutputs): string[] {
+  const paths = new Set<string>();
+  function visit(path: string): void {
+    if (isAbsolute(path) || path.split('/').includes('..')) throw new Error(`Output escapes provider: ${path}`);
+    if (paths.has(path)) return;
+    paths.add(path);
+    let stats: ReturnType<typeof lstatSync>;
+    try {
+      stats = lstatSync(join(root, path));
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return;
+      throw error;
+    }
+    if (stats.isDirectory()) for (const name of readdirSync(join(root, path))) visit(join(path, name));
+  }
+  for (const task of tasks) for (const path of expand(root, task.outputs)) visit(path);
+  return [...paths].sort();
+}
 export function providerReceipt(
-  workspaceRoot: string,
+  root: string,
   taskId: string,
   tasks: readonly Task[],
   proof: ProviderInputProof,
   expand: typeof expandOutputs,
+  source: ProducerSourceWitness,
+  producer: Omit<EnsureBuiltProducerReceipt, 'outputSha256'>,
 ): { readonly disposition: 'hit'; readonly receipt: EnsureBuiltReceipt } | EnsureBuiltProbeFailure {
-  const root = realpathSync(workspaceRoot);
   const failed = (detail: string): EnsureBuiltProbeFailure => ({
     disposition: 'failed',
     reason: { kind: 'provider-proof', taskId, workspaceRoot: root, detail },
@@ -73,167 +258,75 @@ export function providerReceipt(
     signal: null,
   });
   if (proof.runtimeSource.kind === 'opaque') return failed(proof.runtimeSource.detail);
-  const revision = git(root, ['rev-parse', '--verify', 'HEAD']);
-  if (!revision.ok) return failed(revision.detail);
-  const head = revision.value.trim();
-  const tree = git(root, ['rev-parse', '--verify', `${head}^{tree}`]);
-  if (!tree.ok) return failed(tree.detail);
-  const status = git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
-  if (!status.ok) return failed(status.detail);
-  const listed = git(root, ['ls-tree', '-r', '-z', '--full-tree', head]);
-  if (!listed.ok) return failed(listed.detail);
-  const format = git(root, ['rev-parse', '--show-object-format']);
-  if (!format.ok) return failed(format.detail);
-  const algorithm = format.value.trim();
-  if (algorithm !== 'sha1' && algorithm !== 'sha256') return failed(`Unproved Git object format ${algorithm}`);
-  const tracked = new Map<string, { mode: string; oid: string }>();
-  for (const entry of listed.value.split('\0')) {
-    if (entry === '') continue;
-    const tab = entry.indexOf('\t');
-    const [mode, kind, oid] = entry.slice(0, tab).split(' ');
-    if (tab < 0 || oid === undefined) return failed(`Unproved HEAD tree entry ${entry}`);
-    if (kind !== 'blob') continue;
-    tracked.set(entry.slice(tab + 1), { mode, oid });
+  const stable = producerSourceUnchanged(root, source);
+  if (!stable.ok) return failed(stable.detail);
+  const sourceFiles = new Map(source.files.map((file) => [file.path, file]));
+  for (const file of proof.files) {
+    const record = sourceFiles.get(file);
+    if (record === undefined) return failed(`Actual Nx FILE input is not bound to provider HEAD: ${file}`);
+    if (!lstatSync(join(root, file)).isFile()) return failed(`Unbound linked/non-file Nx source: ${file}`);
   }
   const observed: NodeWitness[] = [];
-  const buffer = Buffer.allocUnsafe(1 << 20);
-  const outputNodes = new Map<string, EnsureBuiltOutputReceipt>();
-  function observe(path: string): BigIntStats {
-    const stats = lstatSync(path, { bigint: true });
-    observed.push({ path, stamp: nodeStamp(stats) });
-    return stats;
-  }
-  function fileDigest(path: string, size: number, algorithm: 'sha1' | 'sha256', gitBlob: boolean): string {
-    const hash = createHash(algorithm);
-    if (gitBlob) hash.update(`blob ${size}\0`);
-    const fd = openSync(path, 'r');
-    try {
-      for (let offset = 0; offset < size; offset += buffer.length) {
-        const count = Math.min(buffer.length, size - offset);
-        if (readSync(fd, buffer, 0, count, offset) !== count) throw new Error(`File moved while reading ${path}`);
-        hash.update(buffer.subarray(0, count));
-      }
-    } finally {
-      closeSync(fd);
+  const outputs = new Map<string, EnsureBuiltOutputReceipt>();
+  function visit(path: string): void {
+    if (outputs.has(path)) return;
+    const absolute = join(root, path);
+    let node = receiptNode(absolute, path, observed);
+    if (node.type === 'directory') {
+      for (const entry of node.entries) visit(join(path, entry));
+      const children = node.entries.map((entry) => outputs.get(join(path, entry)));
+      node = { ...node, sha256: createHash('sha256').update(JSON.stringify(children)).digest('hex') };
     }
-    return hash.digest('hex');
-  }
-  function visit(path: string): EnsureBuiltOutputReceipt {
-    const rel = relative(root, path);
-    if (rel === '..' || rel.startsWith('../') || isAbsolute(rel)) throw new Error(`Output escapes provider: ${path}`);
-    const previous = outputNodes.get(rel);
-    if (previous !== undefined) return previous;
-    const stats = observe(path);
-    const mode = Number(stats.mode & 0o7777n);
-    let node: EnsureBuiltOutputReceipt;
-    if (stats.isFile()) {
-      node = { path: rel, type: 'file', mode, sha256: fileDigest(path, Number(stats.size), 'sha256', false) };
-    } else if (stats.isSymbolicLink()) {
-      node = { path: rel, type: 'symlink', mode, linkText: readlinkSync(path) };
-    } else if (stats.isDirectory()) {
-      const children = readdirSync(path)
-        .sort()
-        .map((name) => visit(join(path, name)));
-      const entries = children.map(({ path: child }) => relative(rel, child));
-      node = {
-        path: rel,
-        type: 'directory',
-        mode,
-        entries,
-        sha256: createHash('sha256').update(JSON.stringify(children)).digest('hex'),
-      };
-    } else {
-      throw new Error(`Unsupported public output node ${path}`);
-    }
-    outputNodes.set(rel, node);
-    return node;
+    outputs.set(path, node);
   }
   try {
     const receipts: EnsureBuiltReceipt['tasks'][number][] = [];
     for (const task of tasks) {
-      if (task.hash === undefined) return failed(`No current hash for ${task.id}`);
+      if (task.hash === undefined) return failed(`Actual completion supplied no hash for ${task.id}`);
       const entries = task.outputs.length === 0 ? [] : expand(root, task.outputs);
-      if (task.outputs.length > 0 && entries.length === 0) return failed(`No public outputs for ${task.id}`);
-      const selected = new Set<string>();
+      if (task.outputs.length !== 0 && entries.length === 0) return failed(`No public outputs for ${task.id}`);
       for (const entry of entries) {
-        if (isAbsolute(entry) || entry.split('/').includes('..'))
-          return failed(`Invalid public output ${entry} for ${task.id}`);
-        // Root-to-entry parent directories must be real; do not follow a
-        // parent link into an unrelated tree and sign its bytes.
+        if (isAbsolute(entry) || entry.split('/').includes('..')) return failed(`Output escapes provider: ${entry}`);
         let parent = root;
         for (const segment of entry.split('/').slice(0, -1)) {
           parent = join(parent, segment);
-          if (!observe(parent).isDirectory()) return failed(`Symlinked public output parent ${parent}`);
+          const stats = lstatSync(parent, { bigint: true });
+          observed.push({ path: parent, stamp: nodeStamp(stats) });
+          if (!stats.isDirectory()) return failed(`Symlinked public output parent ${parent}`);
         }
-        visit(join(root, entry));
-        for (const path of outputNodes.keys()) {
-          if (path === entry || path.startsWith(`${entry}/`)) selected.add(path);
-        }
+        visit(entry);
       }
       receipts.push({
         id: task.id,
         hash: task.hash,
-        outputs: [...selected].sort().map((path) => {
-          const node = outputNodes.get(path);
-          if (node === undefined) throw new Error(`Lost output census node ${path}`);
-          return node;
-        }),
+        outputs: [...outputs]
+          .filter(([path]) => entries.some((entry) => path === entry || path.startsWith(`${entry}/`)))
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([, node]) => node),
       });
     }
-    const fileInputs = new Set(proof.files);
-    const deletedSource = status.value
-      .split('\0')
-      .some((entry) => (entry[0] === 'D' || entry[1] === 'D') && !outputNodes.has(entry.slice(3)));
-    const effectiveKind = deletedSource ? 'conservative-provider-source' : proof.kind;
-    const dirty = dirtyProviderPaths(status.value).filter(
-      (path) =>
-        (!outputNodes.has(path) || fileInputs.has(path)) &&
-        (effectiveKind === 'conservative-provider-source' || fileInputs.has(path)),
-    );
-    if (dirty.length > 0) return failed(`${effectiveKind}: provider source differs from ${head}: ${dirty.join(', ')}`);
-    for (const file of fileInputs) {
-      const expected = tracked.get(file);
-      if (expected === undefined) return failed(`Nx file input is not in provider HEAD tree: ${file}`);
-      const path = join(root, file);
-      const stats = observe(path);
-      const mode = stats.isSymbolicLink() ? '120000' : (stats.mode & 0o111n) !== 0n ? '100755' : '100644';
-      if (mode !== expected.mode) return failed(`Nx file input mode differs from provider HEAD: ${file}`);
-      if (!stats.isFile()) return failed(`Unproved linked or non-file input source closure: ${file}`);
-      const oid = fileDigest(path, Number(stats.size), algorithm, true);
-      if (oid !== expected.oid) return failed(`Nx file input bytes differ from provider HEAD: ${file}`);
-    }
-    const finalHead = git(root, ['rev-parse', '--verify', 'HEAD']);
-    const finalStatus = git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
-    if (!finalHead.ok) return failed(finalHead.detail);
-    if (!finalStatus.ok) return failed(finalStatus.detail);
-    const newlyDirty = dirtyProviderPaths(finalStatus.value).some(
-      (path) =>
-        (!outputNodes.has(path) || fileInputs.has(path)) &&
-        (effectiveKind === 'conservative-provider-source' || fileInputs.has(path)),
-    );
-    if (finalHead.value.trim() !== head || newlyDirty || !nodesUnchanged(observed)) {
-      return failed('Provider source, revision or public output nodes moved during receipt capture');
-    }
+    const final = producerSourceUnchanged(root, source);
+    if (!final.ok || !nodesUnchanged(observed))
+      return failed(final.ok ? 'Public outputs changed during independent census' : final.detail);
+    const outputSha256 = createHash('sha256').update(JSON.stringify(receipts)).digest('hex');
     return {
       disposition: 'hit',
       receipt: {
-        workspaceRoot: root,
-        head,
-        headTree: tree.value.trim(),
-        tasks: receipts,
-        fileInputProvenance: effectiveKind,
+        workspaceRoot: realpathSync(root),
+        head: source.head,
+        headTree: source.headTree,
+        fileInputProvenance: proof.kind,
         runtimeEnvironmentProvenance: 'nx-task-hash-only',
+        producer: { ...producer, outputSha256 },
+        tasks: receipts,
       },
     };
   } catch (error) {
-    if (error instanceof Error) return failed(`Cannot prove provider source/public outputs: ${error.message}`);
+    if (error instanceof Error) return failed(`Cannot prove public product census: ${error.message}`);
     throw error;
   }
 }
-
-/** Admit only recipes emitted by the same owning toolchain generator.
- * No shell parsing or keyword approximation confers file-source provenance.
- */
+/** Admit only version recipes emitted by the owning generator and declared toolchain pins. */
 export function boundedReceiptRuntimes(
   inputs: Readonly<Record<string, HashInputs>>,
   directories: readonly string[],

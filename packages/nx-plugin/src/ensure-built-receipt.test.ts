@@ -6,14 +6,21 @@ import { join } from 'node:path';
 import type { Task } from 'nx/src/config/task-graph';
 import { expandOutputs } from 'nx/src/native';
 import { cargoRuntimeInput } from './cargo-toolchain-policy.js';
+import type { EnsureBuiltProducerReceipt } from './ensure-built.js';
 import {
   boundedReceiptRuntimes,
+  captureProducerSource,
   dirtyProviderPaths,
+  type ProducerSourceWitness,
   type ProviderInputProof,
+  producerOutputPaths,
+  producerSourceUnchanged,
   providerReceipt,
 } from './ensure-built-receipt.js';
 
 let root = '';
+let source: ProducerSourceWitness;
+let producer: Omit<EnsureBuiltProducerReceipt, 'outputSha256'>;
 const task = {
   id: 'app:build',
   target: { project: 'app', target: 'build' },
@@ -46,6 +53,28 @@ beforeEach(async () => {
   await symlink('file', join(root, 'output/link'));
   await chmod(join(root, 'output/file'), 0o644);
   await chmod(join(root, 'output/empty'), 0o755);
+  const captured = captureProducerSource(root, producerOutputPaths(root, [task], expandOutputs));
+  if (!captured.ok) throw new Error(captured.detail);
+  source = captured.value;
+  producer = {
+    version: 1,
+    target: task.id,
+    argv: ['nx', 'run', task.id],
+    trackedTreeClean: true,
+    environmentIdentity: 'unit-fixture-nx-hash-identity',
+    tools: [],
+    wallTimeMs: 0,
+    inputs: [
+      {
+        taskId: task.id,
+        overrides: task.overrides,
+        declared: [],
+        expanded: inputs,
+        hashDetails: { command: 'unit-fixture', nodes: {} },
+        files: source.files.filter(({ path }) => inputs.files.includes(path)),
+      },
+    ],
+  };
 });
 afterEach(async () => {
   await rm(root, { recursive: true, force: true });
@@ -56,14 +85,14 @@ describe('provider receipt', () => {
     const saved = process.env.GIT_DIR;
     process.env.GIT_DIR = join(root, 'not-the-provider-git-directory');
     try {
-      expect(providerReceipt(root, task.id, [task], proof, expandOutputs).disposition).toBe('hit');
+      expect(providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer).disposition).toBe('hit');
     } finally {
       if (saved === undefined) delete process.env.GIT_DIR;
       else process.env.GIT_DIR = saved;
     }
   });
   it('names current hashes, HEAD/tree, independent file digests, link text and empty directory modes', async () => {
-    const result = providerReceipt(root, task.id, [task], proof, expandOutputs);
+    const result = providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer);
     expect(result.disposition).toBe('hit');
     if (result.disposition !== 'hit') throw new Error(result.reason.detail);
     expect(result.receipt.head).toMatch(/^[a-f0-9]{40,64}$/);
@@ -91,51 +120,93 @@ describe('provider receipt', () => {
     });
   });
 
-  it('does not refuse an unrelated untracked source when FILE closure is exactly proven', async () => {
+  it('ignores unrelated untracked files while retaining tracked-tree production provenance', async () => {
     await writeFile(join(root, 'unrelated.ts'), 'unrelated');
-    expect(providerReceipt(root, task.id, [task], proof, expandOutputs).disposition).toBe('hit');
+    expect(providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer).disposition).toBe('hit');
     expect(
-      providerReceipt(root, task.id, [task], { ...proof, kind: 'conservative-provider-source' }, expandOutputs)
-        .disposition,
-    ).toBe('failed');
+      providerReceipt(
+        root,
+        task.id,
+        [task],
+        { ...proof, kind: 'conservative-provider-source' },
+        expandOutputs,
+        source,
+        producer,
+      ).disposition,
+    ).toBe('hit');
   });
 
   it('refuses modified, deleted, newly matched and index-only dirty FILE inputs', async () => {
     await writeFile(join(root, 'source.txt'), 'changed');
-    expect(providerReceipt(root, task.id, [task], proof, expandOutputs).disposition).toBe('failed');
+    expect(providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer).disposition).toBe('failed');
     git('add', 'source.txt');
     await writeFile(join(root, 'source.txt'), 'source');
-    expect(providerReceipt(root, task.id, [task], proof, expandOutputs).disposition).toBe('failed');
+    expect(providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer).disposition).toBe('failed');
     git('restore', '--staged', 'source.txt');
     await writeFile(join(root, 'new-source.txt'), 'new');
     expect(
-      providerReceipt(root, task.id, [task], { ...proof, files: [...proof.files, 'new-source.txt'] }, expandOutputs)
-        .disposition,
+      providerReceipt(
+        root,
+        task.id,
+        [task],
+        { ...proof, files: [...proof.files, 'new-source.txt'] },
+        expandOutputs,
+        source,
+        producer,
+      ).disposition,
     ).toBe('failed');
     await rm(join(root, 'source.txt'));
-    expect(providerReceipt(root, task.id, [task], { ...proof, files: [] }, expandOutputs).disposition).toBe('failed');
+    expect(
+      providerReceipt(root, task.id, [task], { ...proof, files: [] }, expandOutputs, source, producer).disposition,
+    ).toBe('failed');
   });
 
   it('recomputes output byte/directory identities after every public mutation', async () => {
-    const first = providerReceipt(root, task.id, [task], proof, expandOutputs);
+    const first = providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer);
     if (first.disposition !== 'hit') throw new Error(first.reason.detail);
     await writeFile(join(root, 'output/file'), 'PUBLIC BYTES');
     await chmod(join(root, 'output/empty'), 0o700);
-    const next = providerReceipt(root, task.id, [task], proof, expandOutputs);
+    const next = providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer);
     if (next.disposition !== 'hit') throw new Error(next.reason.detail);
     expect(next.receipt.tasks[0].outputs).not.toEqual(first.receipt.tasks[0].outputs);
     expect(next.receipt.tasks[0].outputs.find(({ path }) => path === 'output/empty')).toMatchObject({ mode: 0o700 });
   });
 
+  it('accepts a new HEAD at the same committed tree without rewriting the producer basis', () => {
+    const original = providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer);
+    if (original.disposition !== 'hit') throw new Error(original.reason.detail);
+    git(
+      '-c',
+      'user.name=Receipt fixture',
+      '-c',
+      'user.email=receipt@example.invalid',
+      'commit',
+      '--allow-empty',
+      '-qm',
+      'same tree',
+    );
+    expect(producerSourceUnchanged(root, source)).toEqual({ ok: true, value: true });
+    const next = providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer);
+    if (next.disposition !== 'hit') throw new Error(next.reason.detail);
+    expect(next.receipt.head).toBe(original.receipt.head);
+    expect(next.receipt.headTree).toBe(original.receipt.headTree);
+    expect(next.receipt.producer.outputSha256).toBe(original.receipt.producer.outputSha256);
+  });
+  it('revokes a producer pre-source witness for a write/revert even when final bytes match HEAD', async () => {
+    await writeFile(join(root, 'source.txt'), 'edited');
+    await writeFile(join(root, 'source.txt'), 'source');
+    expect(producerSourceUnchanged(root, source).ok).toBe(false);
+    expect(providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer).disposition).toBe('failed');
+  });
   it('refuses unreadable public bytes, missing outputs and opaque runtime closure', async () => {
     await chmod(join(root, 'output/file'), 0);
     try {
-      expect(providerReceipt(root, task.id, [task], proof, expandOutputs).disposition).toBe('failed');
+      expect(providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer).disposition).toBe('failed');
     } finally {
       await chmod(join(root, 'output/file'), 0o600);
     }
     await rm(join(root, 'output'), { recursive: true });
-    expect(providerReceipt(root, task.id, [task], proof, expandOutputs).disposition).toBe('failed');
+    expect(providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer).disposition).toBe('failed');
     expect(
       providerReceipt(
         root,
@@ -143,6 +214,8 @@ describe('provider receipt', () => {
         [task],
         { ...proof, runtimeSource: { kind: 'opaque', detail: 'unnameable command input closure' } },
         expandOutputs,
+        source,
+        producer,
       ),
     ).toMatchObject({
       disposition: 'failed',

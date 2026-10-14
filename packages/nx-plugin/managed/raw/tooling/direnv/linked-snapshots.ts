@@ -26,7 +26,7 @@
  *
  * Provenance is the provider's own Nx producer receipt. Every declared target
  * must be a probe hit (the read-only `probeBuilt`, which runs and
- * writes nothing), all at one HEAD, and every copied provider file must be
+ * writes nothing), all at one committed tree, and every copied provider file must be
  * either the blob HEAD tracks at its path or an output the receipt inventories
  * with the same bytes. A stale output, a modified or untracked source file, or
  * a target that is not current refuses with its cause; nothing in the provider
@@ -37,11 +37,15 @@
  * A snapshot is named by the SHA-256 of its census (every entry's path, type,
  * executable bit, and its bytes or link text) together with its producer
  * receipt identity: the provider root, HEAD and its tree, the probe's file-input
- * provenance, and every task id and hash. Other bytes, another commit or another
- * task hash is another snapshot, and nothing binds without a fresh probe, so no
+ * provenance, every task id and hash, and the digest of each target's whole
+ * producer completion record (argv, environment identity, inputs, tools, output
+ * digest, wall time). Other bytes, another commit, another task hash or another
+ * production is another snapshot, and nothing binds without a fresh probe, so no
  * name or provenance is ever reused for a provider state it does not describe.
- * Files are sealed read-only, and a reader that trusts a snapshot verifies its
- * census and name (`verifySnapshot`): modes and paths prove nothing.
+ * A receipt without a producer record of a known version, as an older plugin's
+ * cache hit gives, is refused. Files are sealed read-only, and a reader that
+ * trusts a snapshot verifies its census, its retained producer records and its
+ * name (`verifySnapshot`): modes and paths prove nothing.
  *
  * The store is `.cache/linked-snapshots` in the consumer checkout. Under cowshed
  * it is declared build state (`.cowshed.toml` `[build] state`), so it lives on
@@ -102,7 +106,7 @@ export type CensusEntry =
   | { readonly path: string; readonly type: 'file'; readonly executable: boolean; readonly sha256: string }
   | { readonly path: string; readonly type: 'symlink'; readonly linkText: string };
 
-/** The provider state a snapshot was copied from: its HEAD and the Nx tasks whose outputs it holds. */
+/** The committed provider tree and original producer bases whose attested outputs the snapshot holds. */
 export interface SnapshotProvenance {
   readonly root: string;
   readonly head: string;
@@ -110,6 +114,8 @@ export interface SnapshotProvenance {
   /** How each probe vouched for its file inputs: exactly, or conservatively over the whole provider source. */
   readonly fileInputs: readonly string[];
   readonly tasks: readonly { readonly id: string; readonly hash: string }[];
+  /** Each declared target's producer completion record, by the SHA-256 of its canonical JSON. */
+  readonly producers: readonly { readonly target: string; readonly basis: string; readonly sha256: string }[];
 }
 
 export interface SnapshotReceipt {
@@ -119,6 +125,8 @@ export interface SnapshotReceipt {
   /** The declared package's directory inside the snapshot. */
   readonly packagePath: string;
   readonly provenance: SnapshotProvenance;
+  /** The producer completion records `provenance.producers` digests, retained verbatim in target order. */
+  readonly producerReceipts: readonly unknown[];
   readonly census: readonly CensusEntry[];
 }
 
@@ -147,6 +155,11 @@ type ProducerOutput = Extract<
   EnsureBuiltProbeResult,
   { readonly disposition: 'hit' }
 >['receipt']['tasks'][number]['outputs'][number];
+
+type ProducerRecord = Extract<EnsureBuiltProbeResult, { readonly disposition: 'hit' }>['receipt']['producer'];
+
+/** The producer protocol versions this consumer reads. */
+const PRODUCER_VERSION = 1;
 
 /**
  * The snapshot `source` binds to now: its provider is probed, copied and attested every time, and the result is
@@ -488,8 +501,8 @@ async function capture(
   probe: ProducerProbe,
   fingerprint: string,
 ): Promise<string> {
-  const { provenance, outputs } = await producerReceipt(plan, declaration, probe);
-  const tracked = trackedBlobs(plan, provenance.head);
+  const { provenance, producers, outputs } = await producerReceipt(plan, declaration, probe);
+  const tracked = trackedBlobs(plan, provenance.headTree);
   const incoming = mkdtempSync(path.join(store, '.incoming-'));
   try {
     const census: CensusEntry[] = [];
@@ -522,6 +535,7 @@ async function capture(
       name: plan.name,
       packagePath: plan.packagePath,
       provenance,
+      producerReceipts: producers,
       census,
     };
     writeFileSync(path.join(incoming, SNAPSHOT_RECEIPT), `${JSON.stringify(receipt)}\n`, { mode: 0o444 });
@@ -533,20 +547,26 @@ async function capture(
 }
 
 /**
- * Every declared target probed as a hit at one HEAD, and the outputs those hits inventory by path. A target that
+ * Every declared target has a producer hit for one committed tree; each original basis remains provenance. A target that
  * is not current is refused with the `nx run` that makes it so.
  */
 async function producerReceipt(
   plan: SnapshotPlan,
   declaration: SnapshotDeclaration,
   probe: ProducerProbe,
-): Promise<{ readonly provenance: SnapshotProvenance; readonly outputs: ReadonlyMap<string, ProducerOutput> }> {
+): Promise<{
+  readonly provenance: SnapshotProvenance;
+  readonly producers: readonly ProducerRecord[];
+  readonly outputs: ReadonlyMap<string, ProducerOutput>;
+}> {
   if (declaration.targets.length === 0)
     throw new SnapshotRefusal(`${plan.name} declares no provider targets to vouch for its build`);
   let head: { readonly head: string; readonly headTree: string } | undefined;
   const tasks = new Map<string, string>();
   const fileInputs = new Set<string>();
   const outputs = new Map<string, ProducerOutput>();
+  const producers: ProducerRecord[] = [];
+  const identities: SnapshotProvenance['producers'][number][] = [];
   for (const target of declaration.targets) {
     const result = await probe(target, plan.root);
     switch (result.disposition) {
@@ -568,10 +588,15 @@ async function producerReceipt(
       throw new SnapshotRefusal(`${target} was probed in ${receipt.workspaceRoot}, not ${plan.root}`);
     }
     head ??= { head: receipt.head, headTree: receipt.headTree };
-    if (receipt.head !== head.head || receipt.headTree !== head.headTree) {
-      throw new SnapshotRefusal(`${plan.root} moved from ${head.head} to ${receipt.head} while it was probed`);
+    if (receipt.headTree !== head.headTree) {
+      throw new SnapshotRefusal(
+        `${plan.root} moved from tree ${head.headTree} to ${receipt.headTree} while it was probed`,
+      );
     }
     fileInputs.add(receipt.fileInputProvenance);
+    const producer = producerOf(receipt, target, plan.root);
+    producers.push(producer);
+    identities.push({ target: producer.target, basis: receipt.head, sha256: sha256(canonicalJson(producer)) });
     for (const task of receipt.tasks) {
       const known = tasks.get(task.id);
       if (known !== undefined && known !== task.hash) {
@@ -595,9 +620,61 @@ async function producerReceipt(
       headTree: head.headTree,
       fileInputs: [...fileInputs].sort(compare),
       tasks: [...tasks].sort(([left], [right]) => compare(left, right)).map(([id, hash]) => ({ id, hash })),
+      producers: identities,
     },
+    producers,
     outputs,
   };
+}
+
+/**
+ * The producer completion record a hit carries for `target`: present, of a version this consumer reads, produced for
+ * that target from a clean tracked tree, with inputs for every task the receipt inventories. A receipt without one is
+ * an older plugin's cache hit, which vouches for no production, and is refused rather than read some other way.
+ */
+function producerOf(
+  receipt: Extract<EnsureBuiltProbeResult, { readonly disposition: 'hit' }>['receipt'],
+  target: string,
+  root: string,
+): ProducerRecord {
+  const present: unknown = Reflect.get(receipt, 'producer');
+  if (typeof present !== 'object' || present === null) {
+    throw new SnapshotRefusal(
+      `${target} in ${root} has no producer completion receipt: its plugin vouches only for a cache hit, so publish ${target} through a plugin with producer receipts and run it there`,
+    );
+  }
+  const version: unknown = Reflect.get(present, 'version');
+  if (version !== PRODUCER_VERSION) {
+    throw new SnapshotRefusal(
+      `${target} in ${root} has a producer receipt of unknown version ${JSON.stringify(version)}`,
+    );
+  }
+  const producer = receipt.producer;
+  if (producer.target !== target) {
+    throw new SnapshotRefusal(`${target} in ${root} carries the producer receipt of ${producer.target}`);
+  }
+  if (producer.trackedTreeClean !== true) {
+    throw new SnapshotRefusal(`${target} in ${root} was produced from a tracked tree that was not clean`);
+  }
+  const described = new Set(producer.inputs.map(({ taskId }) => taskId));
+  for (const task of receipt.tasks) {
+    if (!described.has(task.id)) {
+      throw new SnapshotRefusal(`${target} in ${root} has a producer receipt that records no inputs of ${task.id}`);
+    }
+  }
+  return producer;
+}
+
+/** JSON with every object's keys in code-unit order, so one record has one digest wherever it was serialized. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(',')}]`;
+  if (typeof value === 'object' && value !== null) {
+    const entries = Object.entries(value)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => compare(left, right));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 /** The blob HEAD tracks at each planned provider path, with its mode. */
@@ -641,7 +718,7 @@ function attest(
   if (blob !== undefined) {
     if (gitBlobId(bytes, blob.id.length) !== blob.id || (blob.mode === '100755') !== executable) {
       throw new SnapshotRefusal(
-        `${path.join(plan.root, relative)} differs from HEAD ${provenance.head}: a snapshot is one commit's source, so commit or discard it`,
+        `${path.join(plan.root, relative)} differs from tree ${provenance.headTree} (producer basis ${provenance.head}): a snapshot is committed source, so commit or discard it`,
       );
     }
     return;
@@ -649,7 +726,7 @@ function attest(
   const output = outputs.get(relative);
   if (output === undefined) {
     throw new SnapshotRefusal(
-      `${path.join(plan.root, relative)} is neither tracked at HEAD ${provenance.head} nor an output Nx recorded for ${provenance.tasks.map(({ id }) => id).join(', ')}`,
+      `${path.join(plan.root, relative)} is neither tracked at tree ${provenance.headTree} (producer basis ${provenance.head}) nor an output Nx recorded for ${provenance.tasks.map(({ id }) => id).join(', ')}`,
     );
   }
   if (output.type !== 'file' || output.sha256 !== digest) {
@@ -691,6 +768,7 @@ function snapshotId(census: readonly CensusEntry[], provenance: SnapshotProvenan
       provenance.headTree,
       [...provenance.fileInputs].sort(compare),
       [...provenance.tasks].sort((left, right) => compare(left.id, right.id)).map(({ id, hash }) => [id, hash]),
+      provenance.producers.map(({ target, basis, sha256: digest }) => [target, basis, digest]),
     ]),
   );
 }
@@ -747,6 +825,20 @@ export function verifySnapshot(directory: string): SnapshotReceipt {
   if (receipt === null) throw new SnapshotRefusal(`${directory} is not a sealed snapshot`);
   if (snapshotId(receipt.census, receipt.provenance) !== receipt.id)
     throw new SnapshotRefusal(`${directory} has a census and receipt that are not its name`);
+  if (
+    receipt.producerReceipts.length !== receipt.provenance.producers.length ||
+    receipt.producerReceipts.some((record, index) => {
+      const named = receipt.provenance.producers[index];
+      return (
+        named === undefined ||
+        sha256(canonicalJson(record)) !== named.sha256 ||
+        typeof record !== 'object' ||
+        record === null ||
+        Reflect.get(record, 'target') !== named.target
+      );
+    })
+  )
+    throw new SnapshotRefusal(`${directory} retains producer receipts that are not the ones its name binds`);
   const expected = new Map(receipt.census.map((entry) => [entry.path, entry]));
   let seen = 0;
   const walk = (at: string) => {
@@ -793,8 +885,11 @@ function parseReceipt(input: unknown, directory: string): SnapshotReceipt {
   const provenance = field('provenance');
   if (typeof provenance !== 'object' || provenance === null) return fail('no provenance');
   const tasks = Reflect.get(provenance, 'tasks');
+  const producers = Reflect.get(provenance, 'producers');
+  const producerReceipts = field('producerReceipts');
   const census = field('census');
   if (!Array.isArray(tasks) || !Array.isArray(census)) return fail('no tasks or census');
+  if (!Array.isArray(producers) || !Array.isArray(producerReceipts)) return fail('no producer receipts');
   return {
     version: 1,
     id: text(field('id'), 'id'),
@@ -810,7 +905,17 @@ function parseReceipt(input: unknown, directory: string): SnapshotReceipt {
           ? { id: text(Reflect.get(task, 'id'), 'task id'), hash: text(Reflect.get(task, 'hash'), 'task hash') }
           : fail('a task is not an object'),
       ),
+      producers: producers.map((producer: unknown) =>
+        typeof producer === 'object' && producer !== null
+          ? {
+              target: text(Reflect.get(producer, 'target'), 'producer target'),
+              basis: text(Reflect.get(producer, 'basis'), 'producer basis'),
+              sha256: text(Reflect.get(producer, 'sha256'), 'producer sha256'),
+            }
+          : fail('a producer is not an object'),
+      ),
     },
+    producerReceipts,
     census: census.map((entry: unknown): CensusEntry => {
       if (typeof entry !== 'object' || entry === null) return fail('a census entry is not an object');
       const entryPath = text(Reflect.get(entry, 'path'), 'census path');

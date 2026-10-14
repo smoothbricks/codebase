@@ -834,37 +834,49 @@ for all those nodes. It is evidence of the same previously compared bytes, never
 rule. Missing/unreadable evidence or moved nodes require a full comparison; mutations to either the cache or working
 tree, parent symlink replacement, and directory membership changes cannot borrow an old equality verdict.
 
-`probeBuilt({ target, cwd })` is the distinct typed read-only provider operation. It returns `EnsureBuiltProbeResult`: a
-`miss` with its `MissReason` without starting Nx's runner or writing producer outputs; the existing operational socket
-failure; a loud `provider-proof` failure; or a `hit` with `EnsureBuiltReceipt`. `ensureBuilt` is build/stream-only and
-its CLI callers retain the existing hit/built/failed result. With the daemon disabled, `probeBuilt` returns a no-daemon
-miss instead of running the target. Both operations preserve Nx argument normalization, hooks, per-task environments and
-local cache parity; the read-only operation additionally requires exact-cache artifact equality. A managed consumer
-requires the installed module's `probeBuilt` function before making any producer call; a missing operation refuses
-loudly without falling back to `ensureBuilt` or writing provider outputs.
+`probeBuilt({ target, cwd })` is the distinct typed read-only product operation. Its `hit` is an actual published
+`EnsureBuiltReceipt`, not a cache hit re-probed under the consumer's environment. The producer opts into publication in
+its own Nx plugin options as `producerReceipts: { targets: ["lmao:build", "lmao:cargo-thread-ffi"] }`. The pre-task hook
+captures the committed HEAD/tree and tracked-source/tool basis; the post-task hook uses Nx's actual successful
+`TaskResults`, hashes/hash details, argv and start/end times, including successful uncacheable prerequisites, and
+atomically publishes the receipt in that checkout's existing Nx workspace-data. Disabled publication performs no source
+prepass, so an ordinary consumer CLI pays none of that producer work. No file permission, path, daemon state or cached
+row can invent a completion receipt. Nx takes one pre/post task-hook pair per plugin, so the plugin's pair runs the
+controller's `COWSHED_NX_TASK_RECEIPT_ID` task-results hint first and these producer hooks second, each with the same
+options and run context and neither reading the other's output.
 
-A probe receipt names the real provider workspace, Git HEAD and HEAD's tree, every task id/current Nx hash in the
-selected target's dependency graph, and an independently read census of every Nx-expanded public output. Files carry
-SHA-256; symlinks carry their text and mode without following them; directories carry mode, ordered membership and a
-child-census digest, including empty directories. Source/revision/output nodes must remain unchanged across capture.
-Missing, unreadable or stale output evidence refuses, never starts a build and never signs daemon-state identity.
+The receipt binds the selected target, basis commit SHA and committed tree SHA, actual argv, declared producer
+environment identity and bound tool/module inputs, independent product output SHA-256, measured wall time, and an
+explicit clean tracked-tree assertion. It includes every completed required task's Nx identity and every Nx-expanded
+public output. Files carry SHA-256; symlinks carry text and mode without following them; directories carry mode, ordered
+membership and child-census digest, including empty directories. The producer source/tool/output witnesses must stay
+stable through publication. The command's stdout/stderr digest is not a product digest.
 
-Git provenance covers Nx's planned FILE inputs and the owning project/dependency manifests and root graph configuration.
-Dirty matched inputs (including new or index-only changes) refuse. The native inspector cannot prove deleted membership
-or a custom hasher's opaque reads: a deleted provider source or a bounded runtime/env input therefore uses conservative
-any-dirty-provider-source refusal, excluding public outputs rather than treating them as committed source. Runtime/env
-values remain explicitly labelled `nx-task-hash-only`, not Git provenance. Only the existing toolchain generator's exact
-version-only recipe with declared cwd, a declared toolchain FILE pin and proved installed-module closure is bounded;
-arbitrary shell/file/runtime commands and unavailable custom/native input proofs categorically refuse receipts. A caller
-probing multiple targets uses the existing single-target API and rejects differing provider HEAD/tree identities before
-publishing its immutable snapshot. This producer evidence binds a managed linked-package snapshot to one current build;
-Nx alone decides whether its current keys and cache/output bytes match. A caller from another workspace never lends its
-socket, database or cache overrides to the provider. Inside a managed shell (`DEVENV_RUNTIME`), `ensureBuilt` asks the
-packaged `nx-socket-dir.sh` owner for the provider's binding: the root's verified cowshed runtime link when present,
-otherwise its canonical checkout spelling under that shell runtime. Outside a managed shell, Nx retains its normal
-defaults. A socket-owner refusal returns `disposition: 'failed'` with `reason.kind: 'workspace-socket'`, the selected
-`taskId`, `workspaceRoot` and operational `detail`, before any task or daemon client starts. The owner's actual exit or
-signal is preserved; the wrapper must not report that the target ran.
+Validity compares the committed tree, not the current HEAD spelling. An empty commit with an identical tree keeps the
+receipt valid and its original basis SHA unchanged; the consumer never rewrites that provenance. A genuinely changed
+tree invalidates the receipt. Multi-target consumers require one tree and retain each producer's actual basis.
+
+The consumer validates this stored receipt against its declared target, committed-tree/configuration identity, declared
+environment/tool inputs and actual output census. It never re-hashes the provider's task graph in its own environment. A
+valid receipt is the hit. A missing, mismatched, stale or unbound receipt requires the authoritative graph RPC, then a
+loud miss/refusal without running a target or writing provider outputs. A managed consumer requires the installed
+`probeBuilt` operation and the complete producer-receipt contract; an old receipt lacking it refuses, never falls back
+to `ensureBuilt` or a producer writer. `ensureBuilt` remains the normal build/stream operation with its existing
+hit/built/failed results and Nx's current source/cache/artifact verdict.
+
+Git source provenance is the committed tree and the producer's clean tracked source basis, not an unrelated untracked
+user file in its working directory. An actual FILE input outside HEAD, a modified tracked input, changed membership,
+opaque custom/native input proof or genuinely unbounded runtime source cannot be signed. Bounded runtime/env identity is
+explicitly labelled `nx-task-hash-only`; the existing generator-owned version recipes still require their declared
+cwd/toolchain FILE pins and proved installed closure. Public outputs are excluded precisely from source stability, never
+with broad exclusions that can hide manifests or configuration. A caller probing multiple targets requires the same
+provider committed-tree identity, retaining each original producer basis, before publishing its sealed snapshot. A
+caller from another workspace never lends its socket, database or cache overrides to the provider. Inside a managed
+shell (`DEVENV_RUNTIME`), `ensureBuilt` asks the packaged `nx-socket-dir.sh` owner for the provider's binding: the
+root's verified cowshed runtime link when present, otherwise its canonical checkout spelling under that shell runtime.
+Outside a managed shell, Nx retains its normal defaults. A socket-owner refusal returns `disposition: 'failed'` with
+`reason.kind: 'workspace-socket'`, the selected `taskId`, `workspaceRoot` and operational `detail`, before any task or
+daemon client starts. The owner's actual exit or signal is preserved; the wrapper must not report that the target ran.
 
 ```typescript
 import { ensureBuilt } from '@smoothbricks/nx-plugin/ensure-built';
