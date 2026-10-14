@@ -10,7 +10,7 @@ use bytes::Bytes;
 #[cfg(target_os = "macos")]
 use cowshed_apfs::{
     CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
-    mounts::kernel_mounts, store_lock::verify_no_symlinks,
+    store_lock::verify_no_symlinks,
 };
 use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,

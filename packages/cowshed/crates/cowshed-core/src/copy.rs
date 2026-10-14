@@ -1780,9 +1780,8 @@ mod tests {
             .with_extension(cowshed_apfs::image::IMAGE_EXTENSION);
         crate::blank_image::blank_image(&image);
         let backend = MacOsApfsBackend::new(SystemCommandRunner);
-        let attachment = backend.attach_verified(&image).unwrap();
-        backend
-            .mount(&attachment, &destination, MountAccess::ReadWrite, false)
+        let attachment = backend
+            .attach_mounted(&image, &destination, MountAccess::ReadWrite, false)
             .unwrap();
         assert_ne!(
             fs::metadata(&source).unwrap().dev(),

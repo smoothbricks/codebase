@@ -29,19 +29,13 @@ use std::time::Duration;
 
 use crate::device::{DISKUTIL, container_of, identifier_depth};
 
-/// The disk-image driver's detach interface. Creation and attachment of RAW images use
-/// `diskutil image`; releasing an owned image goes directly through `hdiutil detach`. Which
-/// images are attached is read from the kernel ([`CommandRunner::attached_disk_images`]), never
-/// from `hdiutil info`.
+/// The disk-image driver's own tool. Cowshed attaches, mounts, unmounts and ejects its images
+/// through `diskutil` (Disk Arbitration); `hdiutil` remains only a program `cowshed disk-command`
+/// runs for callers outside cowshed, classed like any disk-image command. Which images are
+/// attached is read from the kernel ([`CommandRunner::attached_disk_images`]), never from
+/// `hdiutil info`.
 pub(crate) const HDIUTIL: &str = "/usr/bin/hdiutil";
 const FSCK_APFS: &str = "/sbin/fsck_apfs";
-/// The kernel mount helper. Workspace volumes are mounted with it rather than `diskutil mount`
-/// because `diskutil` routes the mount through Disk Arbitration, which serialises every client
-/// on the host: under a loaded fleet a mount that `mount_apfs` completes in about a second was
-/// measured queueing for 68 s at the median and past the 120 s child deadline at the tail.
-/// Disk Arbitration still observes the mounted volume, so eject and inventory keep working.
-pub(crate) const MOUNT_APFS: &str = "/sbin/mount_apfs";
-pub(crate) const UMOUNT: &str = "/sbin/umount";
 pub(crate) const NEWFS_APFS: &str =
     "/System/Library/Filesystems/apfs.fs/Contents/Resources/newfs_apfs";
 
@@ -214,7 +208,7 @@ pub trait CommandRunner {
     /// same inode. The real overlap regression exercises symlinked-parent and hard-link aliases
     /// against that kernel authority while the registered image's lease remains held.
     /// What the lease does not exclude is a non-cooperating eject (another user, a manual
-    /// `hdiutil`) inside the two unpinned mutations, `newfs_apfs` and `hdiutil detach`: a raw pin
+    /// `hdiutil`) inside the two unpinned mutations, `newfs_apfs` and `diskutil eject`: a raw pin
     /// makes both fail with EBUSY, so neither can run pinned.
     ///
     /// Recording runners must explicitly opt out; production cannot silently omit the lease.
@@ -1170,8 +1164,9 @@ impl RetainedAttachment {
     }
 }
 
-/// The slowest an accepted `hdiutil detach` normally takes: measured 35–500ms on idle and
-/// loaded developer hosts alike. A slower one keeps hdiutil's account of what it went through.
+/// The slowest an accepted image release normally takes: measured 35–500ms for `hdiutil detach`
+/// on idle and loaded developer hosts alike. A slower `diskutil eject` keeps its report in the
+/// trace.
 const SLOW_DETACH: Duration = Duration::from_secs(1);
 
 /// A child's diagnostic output as one trace line: lines joined with ` | `, blank lines dropped.
@@ -1758,6 +1753,15 @@ pub trait ApfsBackend {
         volume_name: &str,
     ) -> Result<(), ApfsError>;
     fn attach_verified(&self, image: &Path) -> Result<AttachedImage, ApfsError>;
+    /// Attach and mount a formatted image in one Disk Arbitration transaction.
+    /// Detached verification and resizing use `attach_verified` instead.
+    fn attach_mounted(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        access: MountAccess,
+        browse: bool,
+    ) -> Result<AttachedImage, ApfsError>;
     fn mount(
         &self,
         attachment: &AttachedImage,
@@ -1888,27 +1892,8 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
     }
 
-    /// Whether `attachment`'s volume is still one of the volumes its image's driver holds under
-    /// that whole device: what a release revalidates before each unmount, however many volumes
-    /// the driver's container holds.
-    fn require_released_volume(&self, attachment: &AttachedImage) -> Result<(), ApfsError> {
-        let image = attachment_inventory_path(&attachment.image)?;
-        let views = release_views_of(&image, &self.attached_disk_images()?)?;
-        if views.iter().any(|view| {
-            view.whole_device == attachment.whole_device
-                && view.volumes.contains(&attachment.volume_device)
-        }) {
-            Ok(())
-        } else {
-            Err(reused_device(
-                attachment,
-                views.iter().map(ReleaseView::whole_device),
-            ))
-        }
-    }
-
     /// Remove an owned volume from the filesystem namespace before releasing its image.
-    /// The raw IOMedia pin freezes the device identity while native unmount bypasses DA.
+    /// The raw IOMedia pin freezes the device identity while Disk Arbitration unmounts it.
     pub fn unmount_verified(
         &self,
         attachment: &AttachedImage,
@@ -1933,28 +1918,11 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         self.unmount_volume_unlocked(attachment, intent, "unmount verified APFS volume")
     }
 
-    /// Unmount one volume of a released image's driver under the image's lease and a fresh raw
-    /// pin of that volume, once the pin proves the driver still holds it
-    /// ([`Self::require_released_volume`]): the single-volume identity check would refuse every
-    /// volume of a container that holds more than one.
-    pub(crate) fn unmount_released(
-        &self,
-        volume: &ReleasedVolume,
-        intent: DetachIntent,
-    ) -> Result<(), ApfsError> {
-        let attachment = &volume.0;
-        let _lease = self.image_lease(&attachment.image)?;
-        let _pin = self.pin_volume(attachment, |attachment| {
-            self.require_released_volume(attachment)
-        })?;
-        self.unmount_volume_unlocked(attachment, intent, "unmount verified APFS volume")
-            .map(|_| ())
-    }
-
-    /// `umount` the attachment's volume, the caller holding its image lease and pin. A volume
-    /// something still holds is waited on for the detach grace and then, under
-    /// [`DetachIntent::Release`], forced; [`DetachIntent::WithinGrace`] answers the dissent
-    /// still standing then, and [`DetachIntent::WhenIdle`] the first one.
+    /// `diskutil unmount` the attachment's volume through Disk Arbitration, the caller holding
+    /// its image lease and pin. A volume something still holds is waited on for the detach grace
+    /// and then, under [`DetachIntent::Release`], unmounted with `force`;
+    /// [`DetachIntent::WithinGrace`] answers the dissent still standing then, and
+    /// [`DetachIntent::WhenIdle`] the first one.
     fn unmount_volume_unlocked(
         &self,
         attachment: &AttachedImage,
@@ -1965,13 +1933,14 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         let mut started = None;
         let mut force = false;
         loop {
-            let mut args = Vec::with_capacity(1 + usize::from(force));
+            let mut args = Vec::with_capacity(2 + usize::from(force));
+            args.push(OsString::from("unmount"));
             if force {
-                args.push(OsString::from("-f"));
+                args.push(OsString::from("force"));
             }
             args.push(OsString::from(&attachment.volume_device));
             let result = timed_apfs_step(apfs_step_leg(&attachment.image), "unmount", || {
-                self.run_checked(operation, CommandRequest::new(UMOUNT, args))
+                self.run_checked(operation, CommandRequest::new(DISKUTIL, args))
             });
             match result {
                 Ok(_) if force => return Ok(Unmounted::Forced),
@@ -2461,18 +2430,13 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             .collect())
     }
 
-    /// Detach every attachment the kernel holds for `image`, under its lease, each by the whole
-    /// device that attachment is detached through, re-reading the image's own mapping before
-    /// each one. A path held twice is released twice; a path held by nothing is already
-    /// released. One attachment is one detach: target the image driver's physical whole
-    /// device, not its synthesized APFS container. Nothing here unmounts first: a mounted
-    /// volume's caller unmounts it ([`Self::unmount_released`]); an unmounted template has
-    /// nothing to unmount.
-    pub fn release_every_attachment(
-        &self,
-        image: &Path,
-        intent: DetachIntent,
-    ) -> Result<(), ApfsError> {
+    /// Release every attachment the kernel holds for `image`, under its lease: one
+    /// `diskutil eject` of each attachment's physical whole device, which unmounts the volumes
+    /// that device carries through Disk Arbitration and releases the image driver. The image's own
+    /// mapping is re-read before each eject. A path held twice is released twice; a path held by
+    /// nothing is already released. One attachment is one eject: target the image driver's
+    /// physical whole device, never its synthesized APFS container or a volume.
+    pub fn release_image(&self, image: &Path, intent: DetachIntent) -> Result<(), ApfsError> {
         let _lease = self.image_lease(image)?;
         let devices = self
             .release_views(image)?
@@ -2483,24 +2447,6 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             self.detach_image_device_unlocked(image, &device, intent)?;
         }
         Ok(())
-    }
-
-    /// Release `image` from every attachment the kernel holds for it: each volume of each
-    /// attachment's container whose device is in `mounted` (the kernel's mount sources) is
-    /// unmounted through its own pinned identity ([`Self::unmount_released`]), then every whole
-    /// device is detached once ([`Self::release_every_attachment`]), taking the unmounted rest.
-    pub fn release_image(
-        &self,
-        image: &Path,
-        mounted: &BTreeSet<String>,
-        intent: DetachIntent,
-    ) -> Result<(), ApfsError> {
-        for view in self.release_views(image)? {
-            for volume in view.mounted_volumes(mounted) {
-                self.unmount_released(&volume, intent)?;
-            }
-        }
-        self.release_every_attachment(image, intent)
     }
 
     /// The devices `image` holds before an attach, which must be none. The image driver refuses
@@ -2520,28 +2466,41 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
     }
 
-    /// Attach `image` without mounting it, answering the volume and container the attach itself
-    /// reports ([`attached_apfs_volume`]). No Disk Arbitration query follows the attach.
-    fn attach_without_mounting(
+    /// Attach an image, optionally mounting its formatted volume through Disk Arbitration.
+    /// Unmounted attachment is reserved for detached verification, resizing and formatting.
+    fn attach_image(
         &self,
         image: &Path,
         access: MountAccess,
+        mount: Option<(&Path, bool)>,
         cleanup: DetachIntent,
     ) -> Result<AttachedImage, ApfsError> {
         let attached_before = self.refuse_second_attach(image)?;
-        let request = CommandRequest::new(
-            DISKUTIL,
-            [OsString::from("image"), OsString::from("attach")]
-                .into_iter()
-                .chain((access == MountAccess::ReadOnly).then(|| OsString::from("--readOnly")))
-                .chain([
-                    OsString::from("--nobrowse"),
-                    OsString::from("--noMount"),
-                    OsString::from("--plist"),
-                    image.as_os_str().to_owned(),
-                ]),
-        );
-        let output = match self.run_checked("attach image without mounting", request) {
+        let mut args = Vec::with_capacity(10);
+        args.extend([OsString::from("image"), OsString::from("attach")]);
+        if access == MountAccess::ReadOnly {
+            args.push(OsString::from("--readOnly"));
+        }
+        if !mount.is_some_and(|(_, browse)| browse) {
+            args.push(OsString::from("--nobrowse"));
+        }
+        match mount {
+            Some((mount_point, browse)) => args.extend([
+                OsString::from("--mountPoint"),
+                mount_point.as_os_str().to_owned(),
+                OsString::from("--mountOptions"),
+                OsString::from(mount_options(access, browse)),
+            ]),
+            None => args.push(OsString::from("--noMount")),
+        }
+        args.extend([OsString::from("--plist"), image.as_os_str().to_owned()]);
+        let request = CommandRequest::new(DISKUTIL, args);
+        let operation = if mount.is_some() {
+            "attach and mount APFS image through Disk Arbitration"
+        } else {
+            "attach image without mounting"
+        };
+        let output = match self.run_checked(operation, request) {
             Ok(output) => output,
             Err(primary) => {
                 return Err(self.failed_attachment(image, &attached_before, primary, cleanup));
@@ -2573,7 +2532,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             let mut retried_lost_device = false;
             loop {
                 let attachment = timed_apfs_step(leg, "attach", || {
-                    self.attach_without_mounting(image, access, cleanup)
+                    self.attach_image(image, access, None, cleanup)
                 })?;
                 // A raw descriptor pins the actual IOMedia from identity verification
                 // through fsck; its ownership is handed to the attachment until mount.
@@ -2630,6 +2589,54 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
     }
 
+    fn attach_mounted_image(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        access: MountAccess,
+        browse: bool,
+        cleanup: DetachIntent,
+    ) -> Result<AttachedImage, ApfsError> {
+        let _lease = self.image_lease(image)?;
+        fs::create_dir_all(mount_point).map_err(|source| ApfsError::FileOperation {
+            operation: "create mount point",
+            path: mount_point.to_owned(),
+            source,
+        })?;
+        let attachment = timed_apfs_step(apfs_step_leg(image), "attach-mount", || {
+            self.attach_image(image, access, Some((mount_point, browse)), cleanup)
+        })?;
+        let verified = (|| {
+            let _pin = self.pin_attached_volume(&attachment)?;
+            let held =
+                self.runner
+                    .hold_mount(mount_point)
+                    .map_err(|source| ApfsError::FileOperation {
+                        operation: "verify Disk Arbitration mount point",
+                        path: mount_point.to_owned(),
+                        source,
+                    })?;
+            if !held.is_root() || held.source_device() != attachment.volume_device {
+                return Err(ApfsError::InvalidAttachmentInventory(format!(
+                    "Disk Arbitration did not mount {} at {}: found {} (mount root: {})",
+                    attachment.volume_device,
+                    mount_point.display(),
+                    held.source_device(),
+                    held.is_root(),
+                )));
+            }
+            drop(held);
+            if access == MountAccess::ReadWrite {
+                self.opt_out_of_event_log(&attachment, mount_point, mount_options(access, browse))?;
+            }
+            Ok(())
+        })();
+        match verified {
+            Ok(()) => Ok(attachment),
+            Err(primary) => Err(self.failed_attachment(image, &BTreeSet::new(), primary, cleanup)),
+        }
+    }
+
     #[cfg(target_os = "macos")]
     pub fn existing_retained_attachment(
         &self,
@@ -2657,6 +2664,22 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     ) -> Result<RetainedAttachment, ApfsError> {
         self.verify_attachment(input.path(), MountAccess::ReadOnly, DetachIntent::WhenIdle)
             .map(RetainedAttachment)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn attach_retained_mounted(
+        &self,
+        input: &RetainedInput<'_>,
+        mount_point: &Path,
+    ) -> Result<RetainedAttachment, ApfsError> {
+        self.attach_mounted_image(
+            input.path(),
+            mount_point,
+            MountAccess::ReadOnly,
+            false,
+            DetachIntent::WhenIdle,
+        )
+        .map(RetainedAttachment)
     }
 
     #[cfg(target_os = "macos")]
@@ -2726,20 +2749,20 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         }
     }
 
-    /// One `hdiutil detach -verbose`. hdiutil's verbose account is the only record of what an
-    /// eject went through, so it is kept as an attribute of the detach step whenever the eject
-    /// was refused (`dissent=`, DiskArbitration's reason) or slower than the normal floor
+    /// One `diskutil eject` of an image's physical whole device: Disk Arbitration unmounts every
+    /// volume the device carries and releases the image driver; `force` ejects past whatever
+    /// dissents. The command's report is kept as an attribute of the detach step whenever the
+    /// eject was refused (`dissent=`, Disk Arbitration's dissenter) or slower than the normal floor
     /// (`waited=`, at least [`SLOW_DETACH`]); a fast, accepted eject adds nothing to the trace.
     fn detach_once(&self, image: &Path, target: &str, force: bool) -> Result<bool, ApfsError> {
-        let mut args = Vec::with_capacity(3 + usize::from(force));
-        args.push(OsString::from("detach"));
+        let mut args = Vec::with_capacity(2 + usize::from(force));
+        args.push(OsString::from("eject"));
         if force {
-            args.push(OsString::from("-force"));
+            args.push(OsString::from("force"));
         }
-        args.push(OsString::from("-verbose"));
         args.push(OsString::from(target));
         let started = std::time::Instant::now();
-        let request = CommandRequest::new(HDIUTIL, args);
+        let request = CommandRequest::new(DISKUTIL, args);
         cowshed_os::timing::attribute(
             "apfs-command",
             format_args!("detach image"),
@@ -2771,19 +2794,19 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             });
         let account = match &result {
             Ok(Some(output)) => {
-                (started.elapsed() >= SLOW_DETACH).then_some(("waited", output.stderr.as_slice()))
+                (started.elapsed() >= SLOW_DETACH).then_some(("waited", output.stdout.as_slice()))
             }
             Err(ApfsError::CommandFailed { output, .. }) => {
                 Some(("dissent", output.stderr.as_slice()))
             }
             Ok(None) | Err(_) => None,
         };
-        if let Some((key, stderr)) = account {
+        if let Some((key, report)) = account {
             cowshed_os::timing::attribute(
                 "apfs-command",
                 format_args!("detach image"),
                 key,
-                one_line(stderr),
+                one_line(report),
             );
         }
         result.map(|output| output.is_some())
@@ -3021,6 +3044,17 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         self.verify_attachment(image, MountAccess::ReadWrite, DetachIntent::Release)
     }
 
+    fn attach_mounted(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        access: MountAccess,
+        browse: bool,
+    ) -> Result<AttachedImage, ApfsError> {
+        validate_image_path(image)?;
+        self.attach_mounted_image(image, mount_point, access, browse, DetachIntent::Release)
+    }
+
     fn mount(
         &self,
         attachment: &AttachedImage,
@@ -3048,12 +3082,7 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         })?;
         // `noatime`: builds are read-heavy, and access-time updates on read are metadata writes no
         // workflow here consults.
-        let options = match (access, browse) {
-            (MountAccess::ReadWrite, false) => "nobrowse,owners,noatime",
-            (MountAccess::ReadWrite, true) => "owners,noatime",
-            (MountAccess::ReadOnly, false) => "rdonly,nobrowse,owners,noatime",
-            (MountAccess::ReadOnly, true) => "rdonly,owners,noatime",
-        };
+        let options = mount_options(access, browse);
         let mounted = timed_apfs_step(apfs_step_leg(&attachment.image), "mount", || {
             self.run_checked(
                 "mount verified APFS volume",
@@ -3309,10 +3338,19 @@ fn attachment_capacity(
     })
 }
 
-/// Whether a failed detach failed because something still holds the volume.
-///
-/// The image driver reports EBUSY plus its resource-busy diagnostic. Anything else — a bad
-/// device, a missing tool, a spawn failure — is not a dissent and must not be waited on.
+/// Disk Arbitration's dissent from an eject, as `diskutil eject` reports it on stderr with exit
+/// status 1: "Unmount of diskN failed: at least one volume could not be unmounted", then this
+/// line naming the dissenting process, then that process's parent.
+const EJECT_DISSENT: &[u8] = b"Unmount was dissented by PID ";
+
+/// Disk Arbitration's dissent from an unmount, as `diskutil unmount` reports it on stderr with
+/// exit status 1: "Volume <name> on <device> failed to unmount: dissented by PID <pid> (<path>)",
+/// then the dissenting process's parent.
+const UNMOUNT_DISSENT: &[u8] = b" failed to unmount: dissented by PID ";
+
+/// Whether a failed unmount or eject failed because something still holds the volume: Disk
+/// Arbitration named the process that dissented. Anything else — a bad device, a missing tool, a
+/// spawn failure, a failure that names no dissenter — is not a dissent and must not be waited on.
 pub fn detach_was_dissented(error: &ApfsError) -> bool {
     if let ApfsError::CaptureSourceBusy { refusal, .. } = error {
         return detach_was_dissented(refusal);
@@ -3323,21 +3361,35 @@ pub fn detach_was_dissented(error: &ApfsError) -> bool {
     else {
         return false;
     };
-    contains_bytes(&output.stderr, b"Resource busy")
-        && ((request.program == Path::new(HDIUTIL)
-            && request.args.first().is_some_and(|arg| arg == "detach")
-            && output.status == ProcessStatus::Exit(libc::EBUSY))
-            || (request.program == Path::new(UMOUNT) && output.status == ProcessStatus::Exit(1)))
+    let dissent = match request.args.first().and_then(|verb| verb.to_str()) {
+        Some("eject") => EJECT_DISSENT,
+        Some("unmount") => UNMOUNT_DISSENT,
+        _ => return false,
+    };
+    request.program == Path::new(DISKUTIL)
+        && output.status == ProcessStatus::Exit(1)
+        && contains_bytes(&output.stderr, dissent)
+}
+
+fn mount_options(access: MountAccess, browse: bool) -> &'static str {
+    match (access, browse) {
+        (MountAccess::ReadWrite, false) => "nobrowse,owners,noatime",
+        (MountAccess::ReadWrite, true) => "owners,noatime",
+        (MountAccess::ReadOnly, false) => "rdonly,nobrowse,owners,noatime",
+        (MountAccess::ReadOnly, true) => "rdonly,owners,noatime",
+    }
 }
 
 fn mount_request(attachment: &AttachedImage, options: &str, mount_point: &Path) -> CommandRequest {
     CommandRequest::new(
-        MOUNT_APFS,
+        DISKUTIL,
         [
-            OsString::from("-o"),
+            OsString::from("mount"),
+            OsString::from("-mountOptions"),
             OsString::from(options),
-            OsString::from(&attachment.volume_device),
+            OsString::from("-mountPoint"),
             mount_point.as_os_str().to_owned(),
+            OsString::from(&attachment.volume_device),
         ],
     )
 }
@@ -3627,44 +3679,13 @@ fn image_attachments(
         .collect()
 }
 
-/// One attachment of an image as its release undoes it: the whole device whose one detach takes
-/// the attachment, and every APFS volume its container holds, none for an unformatted image.
-/// Cowshed's images hold one volume, but a release also takes a container something added a
-/// volume to: each mounted volume is unmounted, then the whole device detached once.
+/// One attachment of an image as its release undoes it: the physical whole device whose one
+/// eject takes the attachment and every volume on it. Cowshed's images hold one volume, but a
+/// release also takes a container something added a volume to. The volumes are still read, so a
+/// formatted attachment whose volumes cannot be named exactly is refused rather than ejected.
 pub(crate) struct ReleaseView {
-    image: PathBuf,
     whole_device: String,
-    volumes: Vec<String>,
 }
-
-impl ReleaseView {
-    pub fn whole_device(&self) -> &str {
-        &self.whole_device
-    }
-
-    /// Each volume of the container that `mounted` (the kernel's mount sources) names, as the
-    /// release unmounts it. An unmounted volume goes with the container's detach.
-    pub(crate) fn mounted_volumes<'a>(
-        &'a self,
-        mounted: &'a BTreeSet<String>,
-    ) -> impl Iterator<Item = ReleasedVolume> + 'a {
-        self.volumes
-            .iter()
-            .filter(|volume| mounted.contains(*volume))
-            .map(|volume| {
-                ReleasedVolume(AttachedImage {
-                    image: self.image.clone(),
-                    whole_device: self.whole_device.clone(),
-                    volume_device: volume.clone(),
-                    pin: std::sync::Mutex::new(None),
-                })
-            })
-    }
-}
-
-/// One volume of a [`ReleaseView`]. Only a release view names one, and only
-/// [`MacOsApfsBackend::unmount_released`] acts on it, revalidating it against the driver first.
-pub(crate) struct ReleasedVolume(AttachedImage);
 
 /// Every attachment the kernel holds for `image`, in inventory order, as its release sees it.
 fn release_views_of(
@@ -3676,16 +3697,15 @@ fn release_views_of(
         .filter(|attached| attached.is_backed_by(image))
         .map(|attached| {
             let entities = attachment_entities(attached);
-            let (whole_device, volumes) = match unformatted_whole_device(&entities) {
-                Some(whole_device) => (whole_device.to_owned(), Vec::new()),
-                None => attached_apfs_volumes(&entities)
-                    .map_err(ApfsError::InvalidAttachmentInventory)?,
+            let whole_device = match unformatted_whole_device(&entities) {
+                Some(whole_device) => whole_device.to_owned(),
+                None => {
+                    attached_apfs_volumes(&entities)
+                        .map_err(ApfsError::InvalidAttachmentInventory)?
+                        .0
+                }
             };
-            Ok(ReleaseView {
-                image: image.to_owned(),
-                whole_device,
-                volumes,
-            })
+            Ok(ReleaseView { whole_device })
         })
         .collect()
 }
@@ -5450,11 +5470,21 @@ mod tests {
         Reply::Command(CommandOutput::failure(status, stderr))
     }
 
-    /// The resource-busy refusal observed from a real held-file image detach.
+    /// Disk Arbitration's refusal of an eject while a process holds the volume, as `diskutil
+    /// eject` reported it on a held probe image.
     fn dissent() -> Reply {
         failed(
-            libc::EBUSY,
-            "hdiutil: couldn't unmount \"disk5\" - Resource busy",
+            1,
+            "Unmount of disk4 failed: at least one volume could not be unmounted\nUnmount was dissented by PID 13258 (/bin/bash)\nDissenter parent PPID 20243 (/usr/bin/python3)\n",
+        )
+    }
+
+    /// Disk Arbitration's refusal of an unmount while a process holds the volume, as `diskutil
+    /// unmount` reported it on a held probe image.
+    fn unmount_dissent() -> Reply {
+        failed(
+            1,
+            "Volume [cowshed] on disk5s1 failed to unmount: dissented by PID 13258 (/bin/bash)\nDissenter parent PPID 20243 (/usr/bin/python3)\n",
         )
     }
 
@@ -5602,13 +5632,13 @@ mod tests {
             Err(ApfsError::AttachmentCleanupFailed { .. })
         ));
         let requests = backend.runner().requests();
-        assert_eq!(argv(&requests[1]), ["detach", "-verbose", "/dev/disk4"]);
+        assert_eq!(argv(&requests[1]), ["eject", "/dev/disk4"]);
         assert!(
             requests.iter().all(|request| {
                 request
                     .args
                     .iter()
-                    .all(|argument| argument != OsStr::new("-force"))
+                    .all(|argument| argument != OsStr::new("force"))
             }),
             "a retained source is never force-detached, including attach-failure cleanup"
         );
@@ -5696,8 +5726,8 @@ mod tests {
                 return Ok(CommandOutput::success("<plist><dict><key>malformed"));
             }
             assert!(
-                request.program == Path::new(HDIUTIL)
-                    && args == ["detach", "-verbose", self.new_device.as_str()],
+                request.program == Path::new(DISKUTIL)
+                    && args == ["eject", self.new_device.as_str()],
                 "unexpected command: {request:?}"
             );
             if self.fail_detach {
@@ -6144,16 +6174,180 @@ mod tests {
         assert_eq!(steps[3].command().program, Path::new(FSCK_APFS));
         assert_eq!(argv(steps[3].command()), ["-q", "/dev/rdisk5s1"]);
         assert_eq!(steps[4], Seen::Inventory);
-        assert_eq!(steps[5].command().program, Path::new(HDIUTIL));
-        assert_eq!(
-            argv(steps[5].command()),
-            ["detach", "-verbose", "/dev/disk4"]
-        );
+        assert_eq!(steps[5].command().program, Path::new(DISKUTIL));
+        assert_eq!(argv(steps[5].command()), ["eject", "/dev/disk4"]);
         assert!(
             !commands(&steps)
                 .iter()
                 .any(|request| argv(request).first().is_some_and(|arg| arg == "mount"))
         );
+    }
+
+    /// Every access and browse combination of a mounted attach is one `diskutil image attach` that
+    /// hands Disk Arbitration its mount point and its exact options (01_storage.md, "Mounts").
+    /// Nothing mounts, checks or verifies the volume after it: the kernel pin proves the image's
+    /// mapping, and the held mount point proves Disk Arbitration mounted that volume there. A
+    /// read-write mount is opted out of the event log; a read-only one is left as mounted.
+    #[test]
+    fn a_mounted_attach_is_one_disk_arbitration_call_for_every_access_and_browse() {
+        for (label, access, browse, options) in [
+            (
+                "rw-hidden",
+                MountAccess::ReadWrite,
+                false,
+                "nobrowse,owners,noatime",
+            ),
+            ("rw-browse", MountAccess::ReadWrite, true, "owners,noatime"),
+            (
+                "ro-hidden",
+                MountAccess::ReadOnly,
+                false,
+                "rdonly,nobrowse,owners,noatime",
+            ),
+            (
+                "ro-browse",
+                MountAccess::ReadOnly,
+                true,
+                "rdonly,owners,noatime",
+            ),
+        ] {
+            let image = temp_path(&format!("attach-mounted-{label}"), IMAGE_EXTENSION);
+            let mount = temp_path(&format!("attach-mounted-{label}"), "mnt");
+            let _ = fs::remove_dir_all(&mount);
+            let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+                no_images(),
+                ok(ATTACH_PLIST),
+                holding_verified_volume(&image),
+                Reply::Mount("/dev/disk5s1", true),
+            ]));
+            let attachment = backend
+                .attach_mounted(&image, &mount, access, browse)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!(attachment.whole_device(), "/dev/disk4", "{label}");
+            assert_eq!(attachment.volume_device(), "/dev/disk5s1", "{label}");
+            let steps = backend.runner().steps();
+            assert_eq!(steps.len(), 4, "{label}: {steps:?}");
+            assert_eq!(steps[0], Seen::Inventory, "{label}");
+            assert_eq!(steps[1].command().program, Path::new(DISKUTIL), "{label}");
+            let mut expected = vec!["image".to_owned(), "attach".to_owned()];
+            if access == MountAccess::ReadOnly {
+                expected.push("--readOnly".to_owned());
+            }
+            if !browse {
+                expected.push("--nobrowse".to_owned());
+            }
+            expected.extend([
+                "--mountPoint".to_owned(),
+                mount.to_str().unwrap().to_owned(),
+                "--mountOptions".to_owned(),
+                options.to_owned(),
+                "--plist".to_owned(),
+                image.to_str().unwrap().to_owned(),
+            ]);
+            assert_eq!(argv(steps[1].command()), expected, "{label}");
+            assert_eq!(steps[2], Seen::Inventory, "{label}");
+            assert_eq!(steps[3], Seen::HoldMount(mount.clone()), "{label}");
+            let marker = mount.join(EVENT_LOG_DIRECTORY).join(EVENT_LOG_OPT_OUT);
+            assert_eq!(
+                marker.is_file(),
+                access == MountAccess::ReadWrite,
+                "{label}: the event-log opt-out follows a read-write mount only"
+            );
+            drop(attachment);
+            fs::remove_dir_all(&mount).unwrap();
+        }
+    }
+
+    /// A mounted attach that cannot prove its mount is refused, and releases exactly what it
+    /// attached: Disk Arbitration put the volume somewhere else (the mount point is not that
+    /// mount's root), another device is mounted at the mount point, the attach report is
+    /// malformed, or the image's mapping is unreadable at the pin. Each detaches the image's
+    /// physical whole device once, after re-reading that the image still holds it, and nothing
+    /// mounts, checks or opts the volume out of anything.
+    #[test]
+    fn a_mounted_attach_that_cannot_prove_its_mount_detaches_what_it_attached() {
+        for label in [
+            "not-root",
+            "foreign-device",
+            "malformed-report",
+            "unreadable-pin",
+        ] {
+            let image = temp_path(&format!("attach-mounted-refused-{label}"), IMAGE_EXTENSION);
+            let mount = temp_path(&format!("attach-mounted-refused-{label}"), "mnt");
+            let _ = fs::remove_dir_all(&mount);
+            let mut replies = match label {
+                "not-root" => vec![
+                    no_images(),
+                    ok(ATTACH_PLIST),
+                    holding_verified_volume(&image),
+                    Reply::Mount("/dev/disk5s1", false),
+                ],
+                "foreign-device" => vec![
+                    no_images(),
+                    ok(ATTACH_PLIST),
+                    holding_verified_volume(&image),
+                    Reply::Mount("/dev/disk9s1", true),
+                ],
+                "malformed-report" => vec![no_images(), ok("not an attach report")],
+                _ => vec![no_images(), ok(ATTACH_PLIST), unreadable_inventory()],
+            };
+            let before_cleanup = replies.len();
+            replies.extend([
+                holding(&image, "/dev/disk4"),
+                holding(&image, "/dev/disk4"),
+                ok([]),
+                no_images(),
+                no_images(),
+            ]);
+            let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs(replies));
+            let error = backend
+                .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)
+                .expect_err(label);
+            let refused = match label {
+                "not-root" => matches!(
+                    &error,
+                    ApfsError::InvalidAttachmentInventory(message) if *message == format!(
+                        "Disk Arbitration did not mount /dev/disk5s1 at {}: found /dev/disk5s1 (mount root: false)",
+                        mount.display()
+                    )
+                ),
+                "foreign-device" => matches!(
+                    &error,
+                    ApfsError::InvalidAttachmentInventory(message) if *message == format!(
+                        "Disk Arbitration did not mount /dev/disk5s1 at {}: found /dev/disk9s1 (mount root: true)",
+                        mount.display()
+                    )
+                ),
+                "malformed-report" => matches!(&error, ApfsError::InvalidAttachmentPlist(_)),
+                _ => matches!(&error, ApfsError::KernelInventory(_)),
+            };
+            assert!(refused, "{label}: {error:?}");
+            let steps = backend.runner().steps();
+            assert_eq!(steps.len(), before_cleanup + 5, "{label}: {steps:?}");
+            let cleanup = &steps[before_cleanup..];
+            assert_eq!(cleanup[0], Seen::Inventory, "{label}");
+            assert_eq!(cleanup[1], Seen::Inventory, "{label}");
+            assert_eq!(cleanup[2].command().program, Path::new(DISKUTIL), "{label}");
+            assert_eq!(
+                argv(cleanup[2].command()),
+                ["eject", "/dev/disk4"],
+                "{label}"
+            );
+            assert_eq!(cleanup[3], Seen::Inventory, "{label}");
+            assert_eq!(cleanup[4], Seen::Inventory, "{label}");
+            let requests = commands(&steps);
+            assert_eq!(
+                requests.len(),
+                2,
+                "{label}: one attach and one detach, nothing between"
+            );
+            assert_eq!(argv(&requests[0])[..2], ["image", "attach"], "{label}");
+            assert!(
+                !mount.join(EVENT_LOG_DIRECTORY).exists(),
+                "{label}: an unproven mount is never opted out"
+            );
+            let _ = fs::remove_dir_all(&mount);
+        }
     }
 
     /// A path the kernel already holds is never attached again, neither to verify nor to format:
@@ -6249,10 +6443,7 @@ mod tests {
         );
         assert_eq!(steps[2], Seen::Inventory);
         assert_eq!(steps[3], Seen::Inventory);
-        assert_eq!(
-            argv(steps[4].command()),
-            ["detach", "-verbose", "/dev/disk8"]
-        );
+        assert_eq!(argv(steps[4].command()), ["eject", "/dev/disk8"]);
         assert_eq!(steps[6], Seen::Inventory);
         assert!(
             !commands(&steps)
@@ -6321,10 +6512,7 @@ mod tests {
         assert_eq!(steps[1], Seen::Inventory);
         assert_eq!(steps[3], Seen::Inventory);
         assert_eq!(steps[4], Seen::Inventory);
-        assert_eq!(
-            argv(steps[5].command()),
-            ["detach", "-verbose", "/dev/disk8"]
-        );
+        assert_eq!(argv(steps[5].command()), ["eject", "/dev/disk8"]);
         assert_eq!(steps[6], Seen::Inventory);
         fs::remove_file(image).unwrap();
     }
@@ -6358,10 +6546,7 @@ mod tests {
         }
         let steps = backend.runner().steps();
         assert_eq!(steps.len(), 6);
-        assert_eq!(
-            argv(steps[4].command()),
-            ["detach", "-verbose", "/dev/disk8"]
-        );
+        assert_eq!(argv(steps[4].command()), ["eject", "/dev/disk8"]);
         assert_eq!(steps[5], Seen::Inventory);
     }
 
@@ -6602,13 +6787,12 @@ mod tests {
             no_images(),
         ]);
         backend
-            .release_every_attachment(&image, DetachIntent::Release)
+            .release_image(&image, DetachIntent::Release)
             .unwrap();
         assert_eq!(fs::read(&image).unwrap(), b"unformatted");
         assert!(
             backend.runner().requests().iter().any(|request| {
-                request.program == Path::new(HDIUTIL)
-                    && argv(request) == ["detach", "-verbose", "/dev/disk8"]
+                request.program == Path::new(DISKUTIL) && argv(request) == ["eject", "/dev/disk8"]
             }),
             "positive fresh image ownership permits only its own device release"
         );
@@ -6624,7 +6808,7 @@ mod tests {
         let backend =
             graced_backend([holding(&image, "/dev/disk8"), holding(&image, "/dev/disk9")]);
         let error = backend
-            .release_every_attachment(&image, DetachIntent::Release)
+            .release_image(&image, DetachIntent::Release)
             .unwrap_err();
         assert!(matches!(error, ApfsError::InvalidAttachmentInventory(_)));
         assert_eq!(fs::read(&image).unwrap(), b"unformatted");
@@ -6633,7 +6817,7 @@ mod tests {
                 .runner()
                 .requests()
                 .iter()
-                .any(|request| { request.args.first().is_some_and(|arg| arg == "detach") }),
+                .any(|request| { request.args.first().is_some_and(|arg| arg == "eject") }),
             "a second positive conflicting mapping retains the image without a false release"
         );
         fs::remove_file(image).unwrap();
@@ -6681,10 +6865,7 @@ mod tests {
         assert_eq!(steps[7].command().program, Path::new(FSCK_APFS));
         assert_eq!(argv(steps[7].command()), ["-q", "/dev/rdisk5s1"]);
         assert_eq!(steps[8], Seen::Inventory);
-        assert_eq!(
-            argv(steps[9].command()),
-            ["detach", "-verbose", "/dev/disk8"]
-        );
+        assert_eq!(argv(steps[9].command()), ["eject", "/dev/disk8"]);
         assert_eq!(steps[10], Seen::Inventory);
         assert!(
             !commands(&steps)
@@ -6736,7 +6917,7 @@ mod tests {
         assert!(
             !commands
                 .iter()
-                .any(|request| argv(request).first().is_some_and(|arg| arg == "detach")),
+                .any(|request| argv(request).first().is_some_and(|arg| arg == "eject")),
             "nothing detaches the image it formatted"
         );
         assert_eq!(
@@ -6776,7 +6957,7 @@ mod tests {
         let steps = backend.runner().steps();
         assert_eq!(
             argv(commands(&steps).last().unwrap()),
-            ["detach", "-verbose", "/dev/disk8"]
+            ["eject", "/dev/disk8"]
         );
     }
 
@@ -6806,7 +6987,7 @@ mod tests {
                 .runner()
                 .requests()
                 .iter()
-                .any(|request| request.args.first().is_some_and(|arg| arg == "detach")),
+                .any(|request| request.args.first().is_some_and(|arg| arg == "eject")),
             "an unknown mapping authorizes no eject"
         );
     }
@@ -6840,7 +7021,7 @@ mod tests {
         assert!(
             !backend.runner().requests().iter().any(|request| {
                 request.program == Path::new(NEWFS_APFS)
-                    || request.args.first().is_some_and(|arg| arg == "detach")
+                    || request.args.first().is_some_and(|arg| arg == "eject")
             }),
             "an observed foreign mapping authorizes no mutation"
         );
@@ -6874,7 +7055,7 @@ mod tests {
         assert!(
             !backend.runner().requests().iter().any(|request| {
                 request.program == Path::new(NEWFS_APFS)
-                    || request.args.first().is_some_and(|arg| arg == "detach")
+                    || request.args.first().is_some_and(|arg| arg == "eject")
             }),
             "absence is not permission to format, eject or remove a backing file"
         );
@@ -6922,10 +7103,7 @@ mod tests {
         assert_eq!(steps.len(), 8);
         assert_eq!(steps[4].command().program, Path::new(NEWFS_APFS));
         assert_eq!(steps[5], Seen::Inventory);
-        assert_eq!(
-            argv(steps[6].command()),
-            ["detach", "-verbose", "/dev/disk8"]
-        );
+        assert_eq!(argv(steps[6].command()), ["eject", "/dev/disk8"]);
         assert_eq!(steps[7], Seen::Inventory);
     }
 
@@ -7259,7 +7437,7 @@ mod tests {
         assert!(
             requests
                 .iter()
-                .all(|request| !argv(request).contains(&"-force".into()))
+                .all(|request| !argv(request).contains(&"force".into()))
         );
     }
 
@@ -7276,7 +7454,7 @@ mod tests {
         assert_eq!(backend.runner().requests().len(), 1);
         assert_eq!(
             argv(&backend.runner().requests()[0]),
-            ["detach", "-verbose", "/dev/disk12"]
+            ["eject", "/dev/disk12"]
         );
     }
 
@@ -7292,7 +7470,7 @@ mod tests {
         ]);
 
         backend
-            .release_every_attachment(&image, DetachIntent::Release)
+            .release_image(&image, DetachIntent::Release)
             .unwrap();
         assert_eq!(backend.runner().requests().len(), 1);
     }
@@ -7376,8 +7554,8 @@ mod tests {
         );
     }
 
-    /// The image driver's resource-busy refusal buys the whole grace, and the force lands
-    /// exactly once at the end of it.
+    /// Disk Arbitration's dissent buys the whole grace, and the force lands exactly once at the end
+    /// of it.
     #[test]
     fn a_released_detach_spends_its_grace_before_forcing_once() {
         let image = temp_path("detach-grace", IMAGE_EXTENSION);
@@ -7399,15 +7577,12 @@ mod tests {
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 4, "three polite attempts, then one force");
         for request in requests.iter() {
-            assert_eq!(request.program, Path::new(HDIUTIL));
+            assert_eq!(request.program, Path::new(DISKUTIL));
         }
         for request in requests.iter().take(3) {
-            assert_eq!(argv(request), ["detach", "-verbose", "/dev/disk4"]);
+            assert_eq!(argv(request), ["eject", "/dev/disk4"]);
         }
-        assert_eq!(
-            argv(&requests[3]),
-            ["detach", "-force", "-verbose", "/dev/disk4"]
-        );
+        assert_eq!(argv(&requests[3]), ["eject", "force", "/dev/disk4"]);
         assert_eq!(
             *backend.sleeper.waits(),
             [Duration::from_millis(10), Duration::from_millis(10)]
@@ -7440,7 +7615,7 @@ mod tests {
             ApfsError::CommandFailed {
                 operation: "detach image",
                 output: CommandOutput {
-                    status: ProcessStatus::Exit(libc::EBUSY),
+                    status: ProcessStatus::Exit(1),
                     ..
                 },
                 ..
@@ -7472,7 +7647,7 @@ mod tests {
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 2, "one dissent, then the accepted retry");
         for request in requests.iter() {
-            assert_eq!(argv(request), ["detach", "-verbose", "/dev/disk4"]);
+            assert_eq!(argv(request), ["eject", "/dev/disk4"]);
         }
         assert_eq!(*backend.sleeper.waits(), [Duration::from_millis(10)]);
     }
@@ -7499,7 +7674,7 @@ mod tests {
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 3, "three unforced attempts and no force");
         for request in requests.iter() {
-            assert_eq!(argv(request), ["detach", "-verbose", "/dev/disk4"]);
+            assert_eq!(argv(request), ["eject", "/dev/disk4"]);
         }
         assert_eq!(
             *backend.sleeper.waits(),
@@ -7533,6 +7708,10 @@ mod tests {
             (1, "no such device"),
             (libc::EBUSY, "permission denied"),
             (1, "Resource busy"),
+            (
+                1,
+                "Unmount of disk4 failed: at least one volume could not be unmounted",
+            ),
         ] {
             let image = temp_path("detach-failed", IMAGE_EXTENSION);
             let backend = graced_backend([holding(&image, "/dev/disk4"), failed(status, message)]);
@@ -7547,6 +7726,77 @@ mod tests {
             assert_eq!(backend.runner().requests().len(), 1);
             assert!(backend.sleeper.waits().is_empty());
         }
+    }
+
+    /// An unmount Disk Arbitration dissents is waited on for the grace and then forced once under
+    /// `Release`, each attempt one `diskutil unmount` of the volume; `WhenIdle` hands the first
+    /// dissent straight back, and a failure that names no dissenter is never waited on.
+    #[test]
+    fn a_dissented_unmount_waits_its_grace_then_forces_once_and_when_idle_never_does() {
+        let attachment = AttachedImage {
+            image: temp_path("unmount-dissent", IMAGE_EXTENSION),
+            whole_device: "/dev/disk4".into(),
+            volume_device: "/dev/disk5s1".into(),
+            pin: std::sync::Mutex::new(None),
+        };
+        let backend = graced_backend([
+            unmount_dissent(),
+            unmount_dissent(),
+            unmount_dissent(),
+            ok([]),
+        ]);
+        let unmounted = backend
+            .unmount_volume_unlocked(
+                &attachment,
+                DetachIntent::Release,
+                "unmount verified APFS volume",
+            )
+            .unwrap();
+        assert_eq!(unmounted, Unmounted::Forced);
+        let requests = backend.runner().requests();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.program == Path::new(DISKUTIL))
+        );
+        let commands: Vec<Vec<String>> = requests.iter().map(argv).collect();
+        assert_eq!(
+            commands,
+            [
+                vec!["unmount", "/dev/disk5s1"],
+                vec!["unmount", "/dev/disk5s1"],
+                vec!["unmount", "/dev/disk5s1"],
+                vec!["unmount", "force", "/dev/disk5s1"],
+            ]
+        );
+        assert_eq!(
+            *backend.sleeper.waits(),
+            [Duration::from_millis(10), Duration::from_millis(10)]
+        );
+
+        let backend = graced_backend([unmount_dissent()]);
+        let error = backend
+            .unmount_volume_unlocked(
+                &attachment,
+                DetachIntent::WhenIdle,
+                "unmount verified APFS volume",
+            )
+            .unwrap_err();
+        assert!(detach_was_dissented(&error), "{error}");
+        assert_eq!(backend.runner().requests().len(), 1);
+        assert!(backend.sleeper.waits().is_empty());
+
+        let backend = graced_backend([failed(1, "Volume [cowshed] on disk5s1 failed to unmount")]);
+        let error = backend
+            .unmount_volume_unlocked(
+                &attachment,
+                DetachIntent::Release,
+                "unmount verified APFS volume",
+            )
+            .unwrap_err();
+        assert!(!detach_was_dissented(&error), "{error}");
+        assert_eq!(backend.runner().requests().len(), 1);
+        assert!(backend.sleeper.waits().is_empty());
     }
 
     /// What attaching `image` through the verified path asks: no prior attachment, the attach
@@ -7915,7 +8165,8 @@ mod tests {
             }
         }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            assert_eq!(request.program, Path::new(MOUNT_APFS));
+            assert_eq!(request.program, Path::new(DISKUTIL));
+            assert_eq!(request.args.first(), Some(&OsString::from("mount")));
             assert!(request.args.iter().any(|arg| arg == "/dev/disk25s1"));
             assert!(
                 self.pins.newest_pin_held(),
@@ -9226,114 +9477,50 @@ mod tests {
         )]
     }
 
-    /// A release of an image whose container holds two volumes detaches the container once,
-    /// neither refusing it as ambiguous nor detaching a volume on its own.
+    /// A release of an image whose container holds two volumes ejects its physical whole device
+    /// once, neither refusing it as ambiguous nor unmounting or ejecting a volume on its own: the
+    /// eject takes the mounted volumes with it. Cleanup releases retained inputs too; it does not
+    /// admit their format to ordinary runtime use.
     #[test]
-    fn a_release_detaches_a_two_volume_container_once() {
-        let image = temp_path("two-volume-release", IMAGE_EXTENSION);
-        let backend = graced_backend([
-            Reply::Inventory(Ok(two_volume_image(&image))),
-            Reply::Inventory(Ok(two_volume_image(&image))),
-            ok([]),
-            no_images(),
-        ]);
-        backend
-            .release_every_attachment(&image, DetachIntent::Release)
-            .unwrap();
-        let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
-        assert_eq!(commands, [["detach", "-verbose", "/dev/disk4"]]);
-    }
-
-    /// A release unmounts each volume of the container under its own revalidation against the
-    /// driver, and refuses a volume the driver does not hold without unmounting anything.
-    #[test]
-    fn a_release_revalidates_each_volume_it_unmounts_and_refuses_a_stranger() {
-        let image = temp_path("two-volume-unmount", IMAGE_EXTENSION);
-        let views = release_views_of(&image, &two_volume_image(&image)).unwrap();
-        let [view] = views.as_slice() else {
-            panic!("one attachment is one release view");
-        };
-        assert_eq!(view.whole_device(), "/dev/disk4");
-        let both = BTreeSet::from(["/dev/disk5s1".to_owned(), "/dev/disk5s2".to_owned()]);
-        let volumes: Vec<ReleasedVolume> = view.mounted_volumes(&both).collect();
-        let backend = graced_backend([
-            Reply::Inventory(Ok(two_volume_image(&image))),
-            ok([]),
-            Reply::Inventory(Ok(two_volume_image(&image))),
-            ok([]),
-            Reply::Inventory(Ok(two_volume_image(&image))),
-        ]);
-        for volume in &volumes {
-            backend
-                .unmount_released(volume, DetachIntent::Release)
-                .unwrap();
-        }
-        let stranger = ReleasedVolume(AttachedImage {
-            image: image.clone(),
-            whole_device: "/dev/disk4".into(),
-            volume_device: "/dev/disk5s3".into(),
-            pin: std::sync::Mutex::new(None),
-        });
-        let refused = backend
-            .unmount_released(&stranger, DetachIntent::Release)
-            .unwrap_err();
-        assert!(
-            matches!(&refused, ApfsError::InvalidAttachmentInventory(message)
-                if message.contains("no longer owns /dev/disk4 / /dev/disk5s3")),
-            "{refused}"
-        );
-        let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
-        assert_eq!(commands, [["/dev/disk5s1"], ["/dev/disk5s2"]]);
-    }
-
-    /// A release unmounts exactly the container's mounted volumes, each under its own
-    /// revalidation, and leaves the unmounted one to the physical image's single detach. Cleanup
-    /// releases retained inputs too; it does not admit their format to ordinary runtime use.
-    #[test]
-    fn a_release_unmounts_only_the_mounted_volumes_then_detaches_the_physical_image_once() {
+    fn a_release_ejects_a_two_volume_container_once() {
         for extension in [IMAGE_EXTENSION, "asif"] {
-            let image = temp_path("two-volume-mixed", extension);
+            let image = temp_path("two-volume-release", extension);
             let backend = graced_backend([
-                Reply::Inventory(Ok(two_volume_image(&image))),
-                Reply::Inventory(Ok(two_volume_image(&image))),
-                ok([]),
                 Reply::Inventory(Ok(two_volume_image(&image))),
                 Reply::Inventory(Ok(two_volume_image(&image))),
                 ok([]),
                 no_images(),
             ]);
-            let mounted = BTreeSet::from(["/dev/disk5s2".to_owned(), "/dev/disk9s1".to_owned()]);
             backend
-                .release_image(&image, &mounted, DetachIntent::Release)
+                .release_image(&image, DetachIntent::Release)
                 .unwrap();
-            let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
-            assert_eq!(
-                commands,
-                [
-                    vec!["/dev/disk5s2".to_owned()],
-                    vec!["detach".into(), "-verbose".into(), "/dev/disk4".into()],
-                ]
+            let requests = backend.runner().requests();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.program == Path::new(DISKUTIL))
             );
+            let commands: Vec<Vec<String>> = requests.iter().map(argv).collect();
+            assert_eq!(commands, [["eject", "/dev/disk4"]], "{extension}");
         }
     }
 
-    /// A release under `WhenIdle` hands a held volume's dissent straight back: no wait, no forced
-    /// unmount, and no detach of the container.
+    /// A release under `WhenIdle` hands a held volume's dissent straight back: one unforced
+    /// eject, no wait and no force.
     #[test]
-    fn a_when_idle_release_returns_a_held_volumes_dissent_without_forcing_or_detaching() {
+    fn a_when_idle_release_returns_a_held_volumes_dissent_without_waiting_or_forcing() {
         let image = temp_path("two-volume-held", IMAGE_EXTENSION);
         let backend = graced_backend([
             Reply::Inventory(Ok(two_volume_image(&image))),
             Reply::Inventory(Ok(two_volume_image(&image))),
-            failed(1, "umount: unmount(/private/tmp/sibling): Resource busy"),
+            dissent(),
         ]);
-        let mounted = BTreeSet::from(["/dev/disk5s2".to_owned()]);
         let error = backend
-            .release_image(&image, &mounted, DetachIntent::WhenIdle)
+            .release_image(&image, DetachIntent::WhenIdle)
             .unwrap_err();
         assert!(detach_was_dissented(&error), "{error}");
         let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
-        assert_eq!(commands, [["/dev/disk5s2"]]);
+        assert_eq!(commands, [["eject", "/dev/disk4"]]);
         assert!(backend.sleeper.waits().is_empty());
     }
 
@@ -9369,7 +9556,7 @@ mod tests {
 
     /// A release view refuses what it cannot name exactly: a formatted attachment with no
     /// volume, a volume whose container is not reported, and volumes in two containers. An
-    /// unformatted image is its whole device with no volume to unmount.
+    /// unformatted image is its whole device alone.
     #[test]
     fn a_release_view_refuses_what_it_cannot_name_and_takes_an_unformatted_image() {
         let image = temp_path("release-view-refusals", IMAGE_EXTENSION);
@@ -9406,9 +9593,7 @@ mod tests {
         let [view] = views.as_slice() else {
             panic!("one attachment is one release view");
         };
-        assert_eq!(view.whole_device(), "/dev/disk4");
-        let whole = BTreeSet::from(["/dev/disk4".to_owned()]);
-        assert_eq!(view.mounted_volumes(&whole).count(), 0);
+        assert_eq!(view.whole_device, "/dev/disk4");
     }
 
     #[test]
@@ -9444,13 +9629,13 @@ mod tests {
                 ],
             )]))
         };
-        let backend = graced_backend([inventory(), inventory(), inventory(), ok([]), no_images()]);
+        let backend = graced_backend([inventory(), inventory(), ok([]), no_images()]);
         backend
-            .release_image(&image, &BTreeSet::new(), DetachIntent::Release)
+            .release_image(&image, DetachIntent::Release)
             .unwrap();
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].program, Path::new(HDIUTIL));
-        assert_eq!(argv(&requests[0]), ["detach", "-verbose", "/dev/disk7"]);
+        assert_eq!(requests[0].program, Path::new(DISKUTIL));
+        assert_eq!(argv(&requests[0]), ["eject", "/dev/disk7"]);
     }
 }

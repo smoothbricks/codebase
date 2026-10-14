@@ -136,29 +136,35 @@ impl SharedImage {
         &self.volume_device
     }
 
-    /// Mount this image's volume at `mount_point` with `options` (as `mount_apfs -o` takes
-    /// them): a mount of an already-attached volume, never an attach. The returned guard
-    /// unmounts it; the image stays attached for the next test.
+    /// Mount this image's volume at `mount_point` through Disk Arbitration, as production mounts
+    /// (01_storage.md, "Mounts"), with `options` handed verbatim to the filesystem's `mount -o`
+    /// (`diskutil mount -mountOptions`): a mount of an already-attached volume, never an attach.
+    /// The options are the caller's whole flag set, so a test can mount the one shared volume
+    /// under any combination. The returned guard unmounts it; the image stays attached for the
+    /// next test.
     pub fn mount_at(&self, mount_point: &Path, options: &str) -> SharedMount {
         fs::create_dir_all(mount_point)
             .unwrap_or_else(|error| panic!("mount point {}: {error}", mount_point.display()));
         let mounted = disk_tool(
-            "/sbin/mount_apfs",
+            "/usr/sbin/diskutil",
             &[
-                "-o".as_ref(),
+                "mount".as_ref(),
+                "-mountOptions".as_ref(),
                 options.as_ref(),
-                self.volume_device.as_ref(),
+                "-mountPoint".as_ref(),
                 mount_point.as_os_str(),
+                self.volume_device.as_ref(),
             ],
         );
         assert!(
             mounted.status.success(),
-            "mount_apfs -o {options} {} {}: {}",
-            self.volume_device,
+            "diskutil mount -mountOptions {options} -mountPoint {} {}: {}",
             mount_point.display(),
+            self.volume_device,
             String::from_utf8_lossy(&mounted.stderr)
         );
         SharedMount {
+            image: self.image.clone(),
             mount_point: mount_point.to_owned(),
         }
     }
@@ -166,6 +172,7 @@ impl SharedImage {
 
 /// One mount of a [`SharedImage`]'s volume; dropping it unmounts and nothing more.
 pub struct SharedMount {
+    image: PathBuf,
     mount_point: PathBuf,
 }
 
@@ -177,12 +184,19 @@ impl SharedMount {
 
 impl Drop for SharedMount {
     fn drop(&mut self) {
-        let unmounted = disk_tool("/sbin/umount", &[self.mount_point.as_os_str()]);
-        if !unmounted.status.success() {
+        let backend = MacOsApfsBackend::new(SystemCommandRunner);
+        let unmounted = backend
+            .existing_attachment(&self.image)
+            .and_then(|attachment| match attachment {
+                Some(attachment) => {
+                    backend.unmount_verified(&attachment, cowshed_apfs::DetachIntent::WhenIdle)
+                }
+                None => Ok(()),
+            });
+        if let Err(error) = unmounted {
             eprintln!(
-                "unmount shared fixture volume at {}: {}",
-                self.mount_point.display(),
-                String::from_utf8_lossy(&unmounted.stderr)
+                "unmount shared fixture volume at {}: {error}",
+                self.mount_point.display()
             );
         }
     }
@@ -260,6 +274,9 @@ pub fn shared_image_at(scenario: &str, image: &Path) -> SharedImage {
     if !image.exists() {
         blank_image(image);
     }
+    // Attached without a mount on purpose: every test of the run shares this one volume and
+    // mounts it at its own path with its own flags through `SharedImage::mount_at`, so no single
+    // mount point belongs to the attach.
     let attachment = MacOsApfsBackend::new(SystemCommandRunner)
         .attach_verified(image)
         .unwrap_or_else(|error| panic!("attach the pool's {scenario} image: {error}"));

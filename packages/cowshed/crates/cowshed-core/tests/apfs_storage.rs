@@ -270,6 +270,7 @@ impl ApfsExecutionHost for FakeHost {
         &self,
         capacity: ImageCapacity,
         image: &Path,
+        mount_point: &Path,
     ) -> Result<Self::Attachment, ApfsStorageError> {
         if !is_image_path(image) {
             return Err(ApfsStorageError::Host(
@@ -277,7 +278,8 @@ impl ApfsExecutionHost for FakeHost {
             ));
         }
         self.record_path(image);
-        self.record(format!("create-attached+fsck:{capacity}"));
+        self.record(format!("create-mounted+checked:{capacity}"));
+        self.mount(&FakeAttachment, mount_point, MountAccess::ReadWrite, false)?;
         Ok(FakeAttachment)
     }
 
@@ -398,6 +400,23 @@ impl ApfsExecutionHost for FakeHost {
             ));
         }
         self.record("attach-no-mount+fsck");
+        Ok(FakeAttachment)
+    }
+
+    fn attach_mounted(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        access: MountAccess,
+        browse: bool,
+    ) -> Result<Self::Attachment, ApfsStorageError> {
+        if !is_image_path(image) {
+            return Err(ApfsStorageError::Host(
+                "attach of a path that is not an image".to_owned(),
+            ));
+        }
+        self.record("attach-mounted+checked");
+        self.mount(&FakeAttachment, mount_point, access, browse)?;
         Ok(FakeAttachment)
     }
 
@@ -1214,7 +1233,7 @@ async fn adopt_publishes_main_by_activating_its_fence_on_one_attachment() {
             "observe",
             // The fence is durable before the payload name appears.
             "atomic-metadata+parent-fsync:FreshPendingFence",
-            "create-attached+fsck:100g",
+            "create-mounted+checked:100g",
             "mount",
             "copy-until-quiescent",
             "mint-workspace-credentials",
@@ -1238,8 +1257,7 @@ async fn adopt_publishes_main_by_activating_its_fence_on_one_attachment() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| event.starts_with("create-attached")
-                || event.starts_with("attach-no-mount"))
+            .filter(|event| event.starts_with("create-mounted") || event.starts_with("attach-"))
             .count(),
         1,
         "main is attached exactly once"
@@ -1454,7 +1472,7 @@ async fn adopt_replaces_an_unpublished_main_copied_from_another_commit() {
         .expect("stale main discarded");
     let created = events
         .iter()
-        .position(|event| event.starts_with("create-attached"))
+        .position(|event| event.starts_with("create-mounted"))
         .expect("fresh main created");
     assert!(discarded < created);
 }
@@ -1481,7 +1499,7 @@ async fn adopt_replaces_a_pending_main_whose_volume_was_never_formatted() {
     let order = [
         "resume-unformatted",
         "discard-pending",
-        "create-attached+fsck:100g",
+        "create-mounted+checked:100g",
     ]
     .map(|step| {
         events
@@ -1702,7 +1720,7 @@ async fn finishing_a_published_adoption_swaps_and_mounts_once() {
         tail,
         [
             "atomic-adopt-checkout-vacate",
-            "attach-no-mount+fsck",
+            "attach-mounted+checked",
             "mount",
             "validate-marker",
             "retain-mounted",
@@ -1889,7 +1907,7 @@ async fn ensure_mounted_is_idempotent_for_an_already_mounted_workspace() {
         !host
             .events()
             .iter()
-            .any(|event| event.starts_with("attach-no-mount")),
+            .any(|event| event.starts_with("attach-")),
         "an already-mounted image must not be attached a second time"
     );
 }
@@ -1949,7 +1967,7 @@ async fn restore_staging_failure_leaves_the_old_workspace_untouched() {
     assert!(!events.contains(&"atomic-restore-swap+undo".to_owned()));
     assert!(events.contains(&"idempotent-reclaim".to_owned()));
     assert!(!events.contains(&"detach-mounted:Release".to_owned()));
-    assert!(!events.contains(&"attach-no-mount+fsck".to_owned()));
+    assert!(!events.contains(&"attach-mounted+checked".to_owned()));
     assert_eq!(
         host.list(&repo()).expect("active workspace"),
         vec![StorageFact {
@@ -2000,7 +2018,7 @@ async fn restore_post_swap_marker_failure_rolls_back_and_remounts_old_image() {
     assert!(
         events[rollback + 1..]
             .iter()
-            .any(|event| event == "attach-no-mount+fsck")
+            .any(|event| event == "attach-mounted+checked")
     );
     assert_eq!(events.last().map(String::as_str), Some("retain-mounted"));
 }
@@ -2251,7 +2269,7 @@ async fn a_new_workspace_is_first_written_after_its_clone_and_before_its_attach(
         .expect("create");
     assert_eq!(
         around_the_clone(host.events()),
-        ["clone", "first-write", "attach-no-mount+fsck"]
+        ["clone", "first-write", "attach-mounted+checked"]
     );
 
     host.clear_events();
@@ -2267,7 +2285,7 @@ async fn a_new_workspace_is_first_written_after_its_clone_and_before_its_attach(
         .expect("fork");
     assert_eq!(
         around_the_clone(host.events()),
-        ["clone", "first-write", "attach-no-mount+fsck"]
+        ["clone", "first-write", "attach-mounted+checked"]
     );
 
     host.clear_events();
@@ -2929,7 +2947,7 @@ async fn create_uses_one_canonical_attach_and_mount_without_detach_churn() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| event.as_str() == "attach-no-mount+fsck")
+            .filter(|event| event.as_str() == "attach-mounted+checked")
             .count(),
         1,
         "one canonical attachment, got {events:?}"

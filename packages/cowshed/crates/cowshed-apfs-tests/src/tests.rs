@@ -80,7 +80,7 @@ impl<'a> RealImageCleanup<'a> {
             )));
         }
         self.backend
-            .release_every_attachment(&self.image, DetachIntent::Release)
+            .release_image(&self.image, DetachIntent::Release)
     }
 
     fn finish(mut self) -> Result<(), ApfsError> {
@@ -271,7 +271,7 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
                 alias.display()
             );
             // Releases only the alias's own (empty) inventory, never A's device.
-            backend.release_every_attachment(alias, DetachIntent::Release)?;
+            backend.release_image(alias, DetachIntent::Release)?;
             match backend.recovered_image_attachment(&image_a)? {
                 Some(RecoveredImageAttachment::Apfs(still)) => assert_eq!(
                     (still.whole_device(), still.volume_device()),
@@ -308,10 +308,13 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
                     report(Progress::Step("create"));
                     let created = backend
                         .create_staged_image(&lease_test_image(stem_b, "cowshed-lease-free"))?;
-                    report(Progress::Step("attach"));
-                    let attachment = cleanup.track(backend.attach_verified(&created)?);
-                    report(Progress::Step("mount"));
-                    backend.mount(attachment, mount_b, MountAccess::ReadWrite, false)?;
+                    report(Progress::Step("attach-mount"));
+                    let attachment = cleanup.track(backend.attach_mounted(
+                        &created,
+                        mount_b,
+                        MountAccess::ReadWrite,
+                        false,
+                    )?);
                     fs::write(mount_b.join("written-beside-a-held-lease"), b"independent")
                         .expect("write into B's volume");
                     report(Progress::Step("unmount"));
@@ -625,11 +628,7 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
         "the killed caller's attach (diskutil {attach}) did not complete"
     );
     backend
-        .release_image(
-            &image,
-            &std::collections::BTreeSet::new(),
-            DetachIntent::Release,
-        )
+        .release_image(&image, DetachIntent::Release)
         .expect("release the attach the dead caller finished");
     assert!(
         backend
@@ -683,9 +682,12 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
     let image = root.join("attach.dmg");
     crate::blank_image::blank_image(&image);
     // Announce each attach's own diskutil by pid once it runs, so the parent kills
-    // mid-attach, not during the inventory reads before it: a process working in this root
-    // whose executable is diskutil is an attach itself (the detach is `hdiutil`).
+    // mid-attach, not during the inventory reads before it or the eject after it: the detach
+    // is a `diskutil eject` too, and it runs only once the attach returned, so a diskutil
+    // working in this root while the loop is attaching is the attach itself.
     let watched = root.clone();
+    let attaching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watching = std::sync::Arc::clone(&attaching);
     std::thread::spawn(move || {
         let mut announced = std::collections::BTreeSet::new();
         loop {
@@ -700,7 +702,10 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
                 let diskutil = usize::try_from(length).is_ok_and(|length| {
                     length > 0 && String::from_utf8_lossy(&path[..length]).ends_with("/diskutil")
                 });
-                if diskutil && announced.insert(pid) {
+                if diskutil
+                    && watching.load(std::sync::atomic::Ordering::SeqCst)
+                    && announced.insert(pid)
+                {
                     println!("inflight {pid}");
                 }
             }
@@ -709,9 +714,11 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
     });
     loop {
         println!("attaching");
+        attaching.store(true, std::sync::atomic::Ordering::SeqCst);
         let attachment = backend
             .attach_verified(&image)
             .expect("attach a fixture image");
+        attaching.store(false, std::sync::atomic::Ordering::SeqCst);
         backend
             .detach(&attachment, DetachIntent::Release)
             .expect("detach a fixture image");
@@ -737,12 +744,9 @@ fn real_apfs_fixture_run_ended_by_its_parent() {
         if extension == IMAGE_EXTENSION {
             let mount = root.path().join(format!("{name}-volume"));
             fs::create_dir(&mount).expect("a fixture mountpoint");
-            let attachment = backend
-                .attach_verified(&image)
-                .expect("attach a RAW fixture");
             backend
-                .mount(&attachment, &mount, MountAccess::ReadWrite, false)
-                .expect("mount RAW fixture");
+                .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)
+                .expect("attach and mount a RAW fixture");
         } else {
             let converted = SystemCommandRunner
                 .run(&CommandRequest::new(

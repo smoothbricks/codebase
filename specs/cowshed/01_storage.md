@@ -141,13 +141,13 @@ every clone automatically). Main and sessions use identical wiring; only the san
   GC exception is specified in [16_build_volumes.md §Garbage collection](./16_build_volumes.md#garbage-collection). Each
   store keeps one **blank template** per capacity and owner, `.blank/<capacity-bytes>-<uid>-<gid>.dmg`, and a **mint** —
   adopt's main image, a build volume's first touch — is one `clonefile` of it to the image's canonical name plus one
-  `diskutil image attach --nobrowse --noMount --plist`, verified with `fsck_apfs -q` like every attach. The clone takes
+  `diskutil image attach --nobrowse --mountPoint <path> --mountOptions nobrowse,owners,noatime --plist`. The clone takes
   the canonical name whole, so the name only ever holds a complete, formatted volume. A template is minted lazily, the
   first time a store mints at its capacity, in five unprivileged steps:
   `diskutil image create blank --format RAW --size <capacity-bytes> --volumeName [cowshed] --fs None <stem>-minting-<nonce>.dmg`,
   `diskutil image attach --nobrowse --noMount --plist <image>`,
   `newfs_apfs -U <uid> -G <gid> -e -v [cowshed] <whole-device>`, a `fsck_apfs -q` of the new volume, and
-  `hdiutil detach <whole-device>`; only then is it renamed to its name. Only minting takes the template's lock, and a
+  `diskutil eject <whole-device>`; only then is it renamed to its name. Only minting takes the template's lock, and a
   minter that finds the template once it holds the lock returns it, so concurrent first mints make one template and a
   mint that finds it needs no lock at all. Each minter stages under a name of its own (`-minting-<nonce>`), so a path is
   attached at most once: a minter killed with its attach still queued on `storagekitd` can have that attach land after
@@ -181,9 +181,9 @@ every clone automatically). Main and sessions use identical wiring; only the san
   volume only when it is read-write, and flush the backing file before descriptor-cloning the live image. A read-only
   mount has no dirty volume writes; its volume flush is skipped, not an EROFS error suppressed. Any flush failure on a
   read-write mount remains an error. Capture never unmounts, detaches, seals, or changes the source's mount flags. The
-  clone is verified with `fsck_apfs` before its first mount. A shell whose cwd is in main, an editor, or a source
-  watcher does not prevent a fork. This is filesystem crash consistency, not an application-state guarantee: build
-  volumes still use the sealed seeds and writer exclusion in 16_build_volumes.md.
+  clone passes Disk Arbitration's filesystem checks in its attach-and-mount transaction. A shell whose cwd is in main,
+  an editor, or a source watcher does not prevent a fork. This is filesystem crash consistency, not an application-state
+  guarantee: build volumes still use the sealed seeds and writer exclusion in 16_build_volumes.md.
 - **Space reclamation**: sparse creation does not imply automatic return of guest-freed space. The measured RAW producer
   retained a deleted 1 GiB payload's host allocation after guest sync, image fsync, clean unmount, and detach.
   `hdiutil compact` supports SPARSE and SPARSEBUNDLE, not RAW. Reclaim guest-freed space by the verified re-adoption
@@ -236,31 +236,44 @@ every clone automatically). Main and sessions use identical wiring; only the san
 
 ## Mounts
 
-Attach is `diskutil image attach --nobrowse --noMount --plist <image>`, whose machine-readable output names the APFS
-volume device. Before the first mount, cowshed runs `fsck_apfs -q <device>`; any non-zero result detaches the image and
-fails without exposing a workspace mount. It then mounts with the kernel helper as the invoking user,
-`mount_apfs -o nobrowse,owners,noatime <device> <path>` (`--browse` omits `nobrowse`), not `diskutil mount`: Disk
-Arbitration serialises every mount on the host, and under a loaded fleet a mount `mount_apfs` completes in about a
-second queued there for 68 s at the median. Owned-image detach is `hdiutil detach <whole-device>`, using the disk-image
-driver's release interface rather than general `diskutil eject`; the latter spent 11.086 s detaching a mounted staging
-image in a hosted arm64 release. A local real-ASIF comparison measured 127–173 ms for the image-driver detach against
-257–298 ms for general eject; this does not establish a hosted latency bound. `WhenIdle` returns the observed
-EBUSY/resource-busy refusal without forcing. `Release` gives the first refusal its 10 s monotonic wall-clock grace,
-including command execution and disk-lease waits between retries, then uses `hdiutil detach -force`; requested poll
-sleeps alone never define that deadline. `WithinGrace` retries through the same grace without forcing and then returns
-the refusal still standing; a build seed's seal detaches with it after an accepted unmount (16_build_volumes.md,
-"Targets and seeds"). Every other error remains authoritative. There is no general-eject fallback. Every detach runs
-`-verbose`, and hdiutil's account becomes an attribute of the `detach image` span: a refused eject prints
-`dissent=<reason>`, and an accepted one slower than 1 s prints `waited=<account>`. A forced eject of an unmounted volume
-measured 2.57 s on a loaded host with no dissent in its account: the wait is DiskArbitration's own queue (the unmount
-and eject callbacks), which `-force` does not bypass. The kernel's I/O Registry is the one host view that maps an
-image's path to its devices (`diskutil image info` reports none): one `IOServiceGetMatchingServices("IOMedia")`
-snapshot, each node walked up to its `AppleDiskImageDevice` and that device's `DiskImageURL`. `hdiutil info -plist` is
-not an inventory: while any other image attaches or detaches it answers a truncated image list with nothing marking it
-(a reviewer probe that kept one image attached while churning another saw it missing from 11–89 of every 648–1551 polls,
-and from none of the same polls' registry reads). Reading that omission as absence once skipped a post-format release,
-leaving the image attached for `diskutil image resize` to refuse as busy, and once lost a mounted workspace's attachment
-on restart.
+APFS image attach, mount, unmount and eject go through `diskutil` and Disk Arbitration: one call per operation, OS-owned
+mount and unmount bookkeeping, and the supported DA handshake rather than a hand-built sequence of kernel mount helpers
+and image-driver release calls. A formatted image is attached and mounted in one transaction:
+`diskutil image attach --nobrowse --mountPoint <path> --mountOptions nobrowse,owners,noatime --plist <image>`. Read-only
+mounts add `--readOnly` and `rdonly`; `--browse` omits `--nobrowse` and the `nobrowse` mount option. The mountpoint
+exists before attach. The default `forceMount` policy refuses an image without a mountable filesystem; there is no
+manual `mount_apfs` fallback. Disk Arbitration owns filesystem checking and mount bookkeeping. After success, cowshed
+pins and verifies the reported image/device identity, then holds the requested mount root and checks that its source is
+the reported volume before publishing or writing any in-image marker. A failed command, malformed reply, or wrong mount
+root/device releases the new attachment or reports the cleanup refusal.
+
+An already-attached formatted or recovered volume mounts with
+`diskutil mount -mountOptions <options> -mountPoint <path> <verified-volume-device>`, through the same DA owner.
+Unmounted attachment remains intentional for a blank RAW image before `newfs_apfs`, detached checkpoint verification and
+resize, and test fixtures explicitly exercising unmounted states. Those paths retain `--noMount` and explicit
+`fsck_apfs -q` where a formatted volume is verified without mounting. The change in mount ownership is not itself a
+claim that Spotlight releases every departed media reference.
+
+On the measured 2026-10-14 host, the same cloned single-volume RAW APFS probe retained one individually identified
+AppleAPFSVolume in mds after each of four successful release paths: default hdiutil attach/detach under `/Volumes`;
+diskutil noMount plus manual mount_apfs/native unmount/hdiutil detach; combined DA attach/mount plus hdiutil detach; and
+combined DA attach/mount plus diskutil eject. Each object left the registry but remained in the same mds task's IOKit
+rights. Thus neither manual mounting nor the choice of eject command uniquely explains this host-side retention, and the
+DA cutover is not a demonstrated prevention. Filesystem/layout and delayed-release mechanisms require separate controls;
+indexing suppression is not evidence that media references are absent or released. Owned-image release is one
+`diskutil eject <whole-device>`; DA unmounts the image's volumes and ejects the device. There is no preliminary kernel
+unmount or automatic `hdiutil` fallback. `WhenIdle` returns a measured DA dissenter refusal immediately, without force.
+`Release` gives the first dissent its existing 10 s monotonic wall-clock grace, including command execution and
+disk-lease waits, then issues one `diskutil eject force <whole-device>`. `WithinGrace` waits through that same grace and
+returns the dissent without forcing. Only the measured diskutil dissent forms are retryable; unrelated failures remain
+authoritative. Refusal output and slow accepted output remain attributes of the release span. Neither the grace nor the
+120 s child policy is increased. The kernel's I/O Registry is the one host view that maps an image's path to its devices
+(`diskutil image info` reports none): one `IOServiceGetMatchingServices("IOMedia")` snapshot, each node walked up to its
+`AppleDiskImageDevice` and that device's `DiskImageURL`. `hdiutil info -plist` is not an inventory: while any other
+image attaches or detaches it answers a truncated image list with nothing marking it (a reviewer probe that kept one
+image attached while churning another saw it missing from 11–89 of every 648–1551 polls, and from none of the same
+polls' registry reads). Reading that omission as absence once skipped a post-format release, leaving the image attached
+for `diskutil image resize` to refuse as busy, and once lost a mounted workspace's attachment on restart.
 
 The image driver registers an attach's media before `diskutil image attach` reports them, so creation requires the
 reported blank whole device to be the image's exact single-device mapping in one registry read before formatting.
@@ -269,9 +282,9 @@ inventory is a typed refusal; each leaves both the attachment and backing file i
 retried and no unproved device is formatted. Shared owned-image cleanup distinguishes this unformatted whole-device
 state from an APFS volume: it rechecks the exact mapping under the image's lease and releases only that owned device
 without deleting the backing file first. Every detach attempt, including a dissent retry and the final force, rechecks
-that mapping after the host storage lease is granted, immediately before spawning `hdiutil`. A check before the lease
-wait is not authority afterward: the image may have departed and another attachment, including a RAM volume, may have
-reused its `diskN`. Confirmed image absence needs no child; a positive conflicting mapping or unreadable inventory
+that mapping after the host storage lease is granted, immediately before spawning `diskutil eject`. A check before the
+lease wait is not authority afterward: the image may have departed and another attachment, including a RAM volume, may
+have reused its `diskN`. Confirmed image absence needs no child; a positive conflicting mapping or unreadable inventory
 refuses the mutation. A release deduplicates whole-device views, so the same attachment is never detached twice.
 
 The disk-images framework behind `diskutil image` and `hdiutil` answers through helper daemons over XPC, and under host
@@ -290,23 +303,19 @@ after formatting. Real fixture cleanup likewise cannot treat a missing returned 
 recovers the current typed attachment before unlinking and retains unproved media on failure, without retrying a failed
 explicit cleanup from its destructor.
 
-Mounted-image release first uses `/sbin/umount <verified-volume-device>`, the kernel's unmount interface. Merely
-changing general eject to `hdiutil detach` did not remove the hosted mounted-volume delay: that command still spent
-10.694 s in the next release run. The native host reads kernel mount facts, then holds the image's lease and a fresh raw
-IOMedia pin while cross-checking exact image/whole-device/volume identity before unmount. It never unmounts a path
-selected by an untrusted child. Restart-owned mounts additionally require their incarnation marker and matching kernel
-source. `WhenIdle` returns native unmount's observed resource-busy refusal without force; `Release` waits the existing
-grace before `umount -f`. Other errors remain errors. Only after filesystem removal does the image driver's detach
-release the device. Local real mounted-image probes measured 29–42 ms for native unmount; hosted deadline closure is not
-implied.
+A namespace-only unmount, needed for adopt handoff or a sealed capture without releasing the device, is
+`diskutil unmount <verified-volume-device>`. It holds the image lease and raw IOMedia pin while rechecking the exact
+image/whole-device/volume identity, never a path selected by an untrusted child. Restart-owned mounts additionally
+require their incarnation marker and matching kernel source. `WhenIdle` returns the observed DA dissent without force;
+`Release` waits the existing grace before `diskutil unmount force <verified-volume-device>`. Other errors remain errors.
+Ordinary image release does not do this extra operation: its one DA eject owns unmount and release.
 
 Attach, verification and every lookup that answers one attachment require exactly one APFS volume in one reported
 container, and refuse anything else by naming what was reported. A release reads each of the image's attachments as its
 whole device plus every APFS volume in that container, so it can also take an owned image whose container gained a
-volume (for example, one a dead test added). Each mounted volume is unmounted under the image's lease and its own raw
-pin, once that volume is rechecked as a member of the attachment. The whole device is then detached once, taking the
-unmounted volumes with it. A formatted attachment that reports no volume, reports a volume without its container, or
-spans two containers is still refused.
+volume (for example, one a dead test added). The image lease and exact whole-device identity fence one DA eject, which
+owns every volume's unmount and the device release; cowshed does not issue a separate unmount per volume. A formatted
+attachment that reports no volume, reports a volume without its container, or spans two containers is still refused.
 
 Concurrent mount-table reads use `getfsstat(MNT_NOWAIT)` into a buffer each call owns: count first, allocate checked
 space with room for new mounts, and grow and reread if the returned buffer is full. No reader borrows `getmntinfo`'s
@@ -326,20 +335,20 @@ covers, so no same-user cowshed process recycles it inside the critical section.
 helper thread that hands the locked descriptor back when the holder releases it, bounded by the 120 s disk-child
 deadline; expiry names the lease file, the image and the holder's recorded pid. The lease does **not** constrain another
 user's disk tools or a manual eject during the two mutations that cannot run raw-pinned, `newfs_apfs` and
-`hdiutil detach`, because a read-only raw pin makes both fail with EBUSY. Before `fsck_apfs` or `mount_apfs`, cowshed
-opens the reported raw volume read-only, then verifies that the attachment inventory maps **both** its whole container
-and its volume to the exact image. A verified attachment owns that raw descriptor across the `attach_verified` → `mount`
-method boundary. A mount lookup of an existing attachment likewise takes the image lease before reading inventory and
-returns a handle owning its raw pin through the kernel mount-table read and mount decision. It is released when an
-already-mounted handle is dropped, after `mount_apfs` finishes, before intentional detach, or before the exclusive
-`diskutil apfs resizeContainer` writer, which cannot run with a raw descriptor open. Independent device ejects during
-container resize after pin release are not covered. While held, the descriptor prevents even external
-`diskutil eject force` or `hdiutil detach -force` from releasing the image and recycling its device name. If the image
-lost the reported device before the descriptor could be pinned, cowshed performs at most one fresh attachment, and only
-when inventory shows no remaining attachment for that image. A conflicting or unreadable mapping fails closed, without
-running fsck on the reported device. No live-fsck option authorizes touching a foreign mounted container. Blank-image
-formatting keeps its image-to-whole-device check under the image's lease; its exclusive formatter cannot share a
-raw-device descriptor with another opener.
+`diskutil eject`, because an open raw pin prevents releasing the device. Before detached `fsck_apfs` or a
+recovered-volume DA mount, cowshed opens the reported raw volume read-only, then verifies that the attachment inventory
+maps **both** its whole container and its volume to the exact image. A verified attachment owns that raw descriptor
+across the `attach_verified` → `mount` method boundary. A mount lookup of an existing attachment likewise takes the
+image lease before reading inventory and returns a handle owning its raw pin through the kernel mount-table read and
+mount decision. It is released when an already-mounted handle is dropped, after the DA mount finishes, before
+intentional detach, or before the exclusive `diskutil apfs resizeContainer` writer, which cannot run with a raw
+descriptor open. Independent device ejects during container resize after pin release are not covered. While held, the
+descriptor prevents even external `diskutil eject force` or `hdiutil detach -force` from releasing the image and
+recycling its device name. If the image lost the reported device before the descriptor could be pinned, cowshed performs
+at most one fresh attachment, and only when inventory shows no remaining attachment for that image. A conflicting or
+unreadable mapping fails closed, without running fsck on the reported device. No live-fsck option authorizes touching a
+foreign mounted container. Blank-image formatting keeps its image-to-whole-device check under the image's lease; its
+exclusive formatter cannot share a raw-device descriptor with another opener.
 
 For every mounted attachment:
 
@@ -422,7 +431,7 @@ null result means historical events are unavailable, so subscribers use `kFSEven
   Planting it under a mounted, logged volume — renaming root's `.fseventsd` aside, which the volume's owner may do —
   changes nothing until the volume mounts again.
 
-So every read-write mount opts its volume out, after `mount_apfs` returns and before the mount is handed back:
+So every read-write mount opts its volume out after Disk Arbitration returns and before the mount is handed back:
 
 - No `.fseventsd`: create it (0700) and an empty `no_log` in it, exclusively; nothing is followed through a symlink. It
   governs the next mount and every clone made from the volume; this mount was `nobrowse` and fresh, so `fseventsd` gave
@@ -574,7 +583,7 @@ What the substrate does about each:
 
 - **Fewest storagekitd round-trips.** Production operations sit at their floor: a mint is one `clonefile` of the store's
   blank template plus one attach ("Images"), a fork or cold mount is one attach, a land with no retire makes no
-  disk-tool call, and a detach goes through `hdiutil`. The mint floor was one `image create` plus a formatting attach
+  disk-tool call, and a release is one `diskutil eject`. The mint floor was one `image create` plus a formatting attach
   and `newfs_apfs`. Measured on the same host and tests (CLI adopt and build-volume first touch, `apfs <leg>/mint`
   spans), adopt's mint went from 537–705 ms to 303–345 ms and first touch from 565–756 ms to 312–317 ms on a quiet
   queue; under a loaded parallel suite the old adopt mint took 10.6 s (create 2.4 s, attach 7.7 s) against 5.0 s for the
@@ -584,8 +593,9 @@ What the substrate does about each:
 - **No attach→detach→attach on a success path**, and no verify-by-reattach.
 - **Storage calls and mount-table changes never overlap.** Every disk tool on the host runs under the gateway's
   disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease"): `diskutil`, `hdiutil` and `newfs_apfs` share one phase,
-  `mount_apfs` and `umount` the other, and the two alternate. The same eight attach loops beside two mount loops made
-  106 attaches in 43 s with the phases kept apart, at 0.94 s p50 and 1.78 s p95 under load 167–212.
+  external/manual `mount_apfs` and `umount` the other, and the two alternate. Cowshed's own mounts and unmounts now stay
+  in the DA storage phase. The same eight attach loops beside two mount loops made 106 attaches in 43 s with the phases
+  kept apart, at 0.94 s p50 and 1.78 s p95 under load 167–212.
 - **Test images are 1 GiB** and a fixture detaches its images on every exit path it survives, panic included; a killed
   run's images are reclaimed by the next run's sweep (08_testing.md). A leaked image costs one slot of the host's finite
   attach budget for as long as it stays attached. Tests mint one blank template per host user with the production
@@ -651,17 +661,17 @@ kernel's attachment inventory maps that image to. An image no attachment holds n
 twice, or held unformatted, is an inventory fault and is refused. One whose volume the kernel mount table does not list
 names nothing (`NotMounted`). Both skips are typed outcomes, not errors, and the supervisor says each one in the daemon
 log. The rename runs under the image's lease and a raw IOMedia pin that re-proves the mapping, as a release proves it
-before `umount` ("Mounts"), and the pin is held across the `diskutil` call. The mount the label found is re-proven under
-them too, immediately before the rename. A device rename is not enough on its own: Disk Arbitration names a mounted
-volume through the mount path it recorded for the disk, not the device node (Apple's DiskArbitration source; not
-measured here), and a volume unmounted between the mount table read and the rename (cowshed's own unmount bypasses Disk
-Arbitration, which then learns of it late) leaves that path a bare directory of the host's Data volume — which once
-carried a fixture's `[cowshed] fixture · dispatch — main` label. So the rename opens the mountpoint as a directory and
-reads the filesystem that descriptor lies on (`fstatfs`): anything but that image's volume device, or a directory inside
-it rather than its root, refuses the rename (`RenameTargetNotMounted`) before `diskutil` runs. The descriptor is held
-across the call, so an unforced unmount of that volume fails busy until the rename returns, and every cooperating
-unmount of the image already waits on its lease; only a forced unmount by another process can still land inside the
-call. No internal disk is an attachment of an image under the store, so the device a rename names is never the host's.
+before a namespace-only DA unmount ("Mounts"), and the pin is held across the `diskutil` call. The mount the label found
+is re-proven under them too, immediately before the rename. A device rename is not enough on its own: Disk Arbitration
+names a mounted volume through the mount path it recorded for the disk, not the device node (Apple's DiskArbitration
+source; not measured here), and a volume unmounted between the mount table read and the rename leaves that path a bare
+directory of the host's Data volume — which once carried a fixture's `[cowshed] fixture · dispatch — main` label. So the
+rename opens the mountpoint as a directory and reads the filesystem that descriptor lies on (`fstatfs`): anything but
+that image's volume device, or a directory inside it rather than its root, refuses the rename (`RenameTargetNotMounted`)
+before `diskutil` runs. The descriptor is held across the call, so an unforced unmount of that volume fails busy until
+the rename returns, and every cooperating unmount of the image already waits on its lease; only a forced unmount by
+another process can still land inside the call. No internal disk is an attachment of an image under the store, so the
+device a rename names is never the host's.
 
 Open item: the rename holds the image's lease for the whole `diskutil renameVolume` call, and Disk Arbitration's queue
 sits inside that call (9.5–27.8 s under load, bounded by the 120 s disk-child deadline). Meanwhile a mount, unmount or

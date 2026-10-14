@@ -87,8 +87,8 @@ not a best-effort script:
    main out of ordinary enumeration, gateway inventory, and every verb that would mount or serve it. Both path
    components come from the validated primary `repo_id` and are encoded independently as specified in 01_storage.md. The
    image is minted (01_storage.md "Images"): one `clonefile` of the store's formatted blank template takes the canonical
-   name whole, so the name only ever holds a complete, formatted volume, and one attach verifies it with `fsck_apfs -q`.
-   That attach is the only one main gets; the volume is mounted at a staging mountpoint.
+   name whole, so the name only ever holds a complete, formatted volume, and one Disk Arbitration transaction attaches
+   and mounts it. That attach is the only one main gets; the volume is mounted at a staging mountpoint.
 3. Copy the full tree (including `.git`), preserving metadata, in delta passes until quiescent. A bounded worker pool
    sized to available cores processes independent leaves. Each leaf first requests an APFS metadata clone and falls back
    only that leaf to `copyfile` data copy on `EXDEV`/`ENOTSUP`, so one cross-volume subtree never aborts completed
@@ -104,12 +104,12 @@ not a best-effort script:
    git relies on it matching the filesystem. The main sidecar contains `portBlock` only on macOS; Linux omits it and
    creates its per-incarnation socket/netns connector when the published workspace is attached. Verify the copied tree
    against the source before publication.
-5. Publish, building every durable artifact before the user's tree is touched: unmount the staging mount through the
-   kernel (`umount`, no Disk Arbitration), then activate the sidecar from `PendingFence` to `Active` in one atomic
-   rewrite — the publication point. Only then does the checkout path change hands, in the way the chosen layout
-   prescribes, and the same attachment mounts there with `mount_apfs`. The normal path has no detach, image rename,
-   second attach, or second fsck: an attached image is never renamed, because its identity is the backing path it was
-   attached from.
+5. Publish, building every durable artifact before the user's tree is touched: unmount the staging mount through Disk
+   Arbitration (`diskutil unmount`), then activate the sidecar from `PendingFence` to `Active` in one atomic rewrite —
+   the publication point. Only then does the checkout path change hands, in the way the chosen layout prescribes, and
+   the same attachment mounts there through Disk Arbitration. The normal path has no detach, image rename, second
+   attach, or second fsck: an attached image is never renamed, because its identity is the backing path it was attached
+   from.
 
 ### Re-adoption: format transition and space reclamation
 
@@ -451,15 +451,15 @@ image remains live and mounted throughout capture.
 2. Open the source inode without following symlinks and descriptor-clone it to `sessions/<ws>.dmg`. RAW has no outer
    allocation map; the filesystem snapshot is crash-consistent, not an application-state transaction. Create the
    complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
-3. Attach without mounting (`diskutil image attach --noMount`, flags per 01_storage.md), run `fsck_apfs -q` against the
-   clone's APFS volume device, then mount at `<mount-root>/<owner>/<repo>/<ws>`. RAW makes no fixed attach-latency
-   guarantee. Before attach, the `first-write` step rewrites the clone's first block with the bytes it holds, which
-   copies the source image's extent map (01_storage.md, "Clone cost follows extents, not size"). On a long-used main
-   that costs tens of seconds, and under host load a container-wide metadata stall follows it, until
-   `cowshed defrag main` rewrites main contiguously. Verification precedes the first mount; a clone never mounts
-   unchecked.
-4. On fsck failure, delete the clone and retry once from a fresh live RAW capture. If verification fails again, refuse
-   publication with the actual fsck result; never detach the live source as a fallback.
+3. Attach and mount at `<mount-root>/<owner>/<repo>/<ws>` in one Disk Arbitration transaction
+   (`diskutil image attach --mountPoint ... --mountOptions ... --plist`, flags per 01_storage.md). RAW makes no fixed
+   attach-latency guarantee. Before attach, the `first-write` step rewrites the clone's first block with the bytes it
+   holds, which copies the source image's extent map (01_storage.md, "Clone cost follows extents, not size"). On a
+   long-used main that costs tens of seconds, and under host load a container-wide metadata stall follows it, until
+   `cowshed defrag main` rewrites main contiguously. Disk Arbitration owns the filesystem check and mount; cowshed then
+   verifies the exact image/device and held mount-root identity before publication.
+4. On attach/mount or identity failure, refuse publication with the actual error and release the destination attachment
+   or report its cleanup refusal; never detach the live source as a fallback.
 5. Rewrite `.cowshed/workspace.json` (`role: "workspace"`, `baseCommit` = source HEAD), mint a fresh `.cowshed/token`,
    mint a fresh per-workspace CA (private key controller-side next to the grant file; CA cert placed in-image as a trust
    anchor with the tool anchors wired — 04_sandbox.md/05_gateway.md), and complete platform wiring. On macOS, use the

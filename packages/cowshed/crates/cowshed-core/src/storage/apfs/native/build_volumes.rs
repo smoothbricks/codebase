@@ -73,21 +73,8 @@ where
         let image = layout.image(id);
         self.verify_controller_path(&image)?;
         Self::ensure_parent(&image)?;
-        let attachment = self.mint(capacity, &image)?;
         let mount = layout.mount(id);
-        if let Err(primary) = self
-            .backend
-            .mount(&attachment, &mount, MountAccess::ReadWrite, false)
-        {
-            return super::super::combine_cleanup(
-                "mount build volume",
-                primary.into(),
-                self.backend
-                    .detach(&attachment, DetachIntent::Release)
-                    .and_then(|()| self.backend.delete_image(&image))
-                    .map_err(Into::into),
-            );
-        }
+        self.mint(capacity, &image, &mount)?;
         Ok(mount)
     }
 
@@ -294,7 +281,11 @@ where
         self.verify_controller_path(&image)?;
         let attachment = match self.backend.existing_attachment_for_mount(&image)? {
             Some(attachment) => attachment,
-            None => self.backend.attach_verified(&image)?,
+            None => {
+                self.backend
+                    .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)?;
+                return Ok(mount);
+            }
         };
         for mounted in self.mount_source.mounts()? {
             if mounted.source_device != attachment.volume_device() {
@@ -715,12 +706,12 @@ mod tests {
         }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
             let output = SystemCommandRunner.run(request)?;
-            if request.program == Path::new("/sbin/mount_apfs")
+            if request.program == Path::new("/usr/sbin/diskutil")
                 && output.succeeded()
-                && request
-                    .args
-                    .last()
-                    .is_some_and(|mount| Path::new(mount) == self.layout.mount(&self.source))
+                && request.args.windows(2).any(|pair| {
+                    (pair[0] == "--mountPoint" || pair[0] == "-mountPoint")
+                        && Path::new(&pair[1]) == self.layout.mount(&self.source)
+                })
                 && self.armed.swap(false, Ordering::SeqCst)
             {
                 if let Some((runtime, socket)) = &self.socket {
@@ -1071,15 +1062,11 @@ mod tests {
 
             let image = root.join("store/lane.dmg");
             crate::blank_image::blank_image(&image);
-            let attachment = host
-                .backend
-                .attach_verified(&image)
-                .expect("attach the workspace");
             let checkout = root.join("lane");
             fs::create_dir_all(&checkout).unwrap();
             host.backend
-                .mount(&attachment, &checkout, MountAccess::ReadWrite, false)
-                .expect("mount the workspace");
+                .attach_mounted(&image, &checkout, MountAccess::ReadWrite, false)
+                .expect("attach and mount the workspace");
             fs::create_dir_all(checkout.join(".cowshed")).unwrap();
 
             let build_id = BuildVolumeId::mint();

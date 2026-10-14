@@ -292,7 +292,7 @@ fn attach_loop(
             arm,
             socket,
             DiskClass::Storage,
-            &["/usr/bin/hdiutil", "detach", "-force", &device],
+            &["/usr/sbin/diskutil", "eject", "force", &device],
         );
         if !detached.succeeded() {
             return Err(format!("detach {device}: {detached:?}"));
@@ -301,7 +301,9 @@ fn attach_loop(
     Ok(attaches)
 }
 
-/// One mount/unmount loop on an attached volume until `stop` or a failure.
+/// One raw `mount_apfs`/`umount` loop on an attached volume until `stop` or a failure: the
+/// adversarial namespace churn of a tool outside cowshed, which mounts through Disk Arbitration
+/// itself. The lease still has to keep such churn out of every storage phase.
 fn mount_loop(
     arm: Arm,
     socket: &Path,
@@ -430,8 +432,10 @@ fn report(arm: Arm, measured: &Measured) -> (Duration, Duration) {
     (p95, percentile(&total, 0.95))
 }
 
-/// The regression for the lease itself: eight attach/detach loops beside two mount/unmount loops
-/// on real images, first through a real gateway's lease and then free for all. Leased, the two
+/// The regression for the lease itself: eight attach/detach loops beside two raw
+/// `mount_apfs`/`umount` loops on real images (adversarial namespace churn from a tool outside
+/// cowshed, not cowshed's own Disk Arbitration mounts), first through a real gateway's lease and
+/// then free for all. Leased, the two
 /// never overlap and an attach stays under two seconds at p95; free, mount churn starves
 /// `storagekitd`'s `syncAllDisks` and an attach takes tens of seconds. The leased arm goes first
 /// because the free arm leaves `storagekitd` a backlog the next minute's attaches inherit. It
