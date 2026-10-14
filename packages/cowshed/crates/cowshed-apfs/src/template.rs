@@ -263,7 +263,7 @@ fn release_leftovers<R: CommandRunner>(
 ) -> Result<(), TemplateError> {
     for image in backend.attached_image_files()? {
         if is_staging_image(store_root, capacity, &image) {
-            backend.release_image(&image, DetachIntent::Release)?;
+            backend.release_every_attachment(&image, DetachIntent::Release)?;
         }
     }
     let directory = blank_template_path(store_root, capacity)

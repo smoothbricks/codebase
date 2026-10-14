@@ -16003,32 +16003,6 @@ mod retired_recovery_tests {
     struct NoDiskCommands;
 
     impl cowshed_apfs::CommandRunner for NoDiskCommands {
-        fn mount(
-            &self,
-            image: &Path,
-            whole_device: &str,
-            volume_device: &str,
-            mount_point: &Path,
-            policy: cowshed_apfs::MountPolicy,
-        ) -> std::result::Result<(), cowshed_apfs::ApfsError> {
-            panic!(
-                "reclaiming a detached image must not mount: {} {whole_device}/{volume_device} at {} {policy:?}",
-                image.display(),
-                mount_point.display()
-            );
-        }
-
-        fn eject(
-            &self,
-            image: &Path,
-            whole_device: &str,
-            force: bool,
-        ) -> std::result::Result<bool, cowshed_apfs::ApfsError> {
-            panic!(
-                "reclaiming a detached retired image invoked native Eject: {} {whole_device} force={force}",
-                image.display()
-            );
-        }
         fn run_guarded<E>(
             &self,
             request: &cowshed_apfs::CommandRequest,
@@ -21087,35 +21061,6 @@ mod volume_labeller_tests {
     }
 
     impl cowshed_apfs::CommandRunner for RecordedDiskCommands {
-        fn mount(
-            &self,
-            image: &Path,
-            whole_device: &str,
-            volume_device: &str,
-            mount_point: &Path,
-            policy: cowshed_apfs::MountPolicy,
-        ) -> std::result::Result<(), cowshed_apfs::ApfsError> {
-            panic!(
-                "the label control holds no mountable image: {} {whole_device}/{volume_device} at {} {policy:?}",
-                image.display(),
-                mount_point.display()
-            );
-        }
-
-        fn eject(
-            &self,
-            image: &Path,
-            whole_device: &str,
-            force: bool,
-        ) -> std::result::Result<bool, cowshed_apfs::ApfsError> {
-            let _ = (image, whole_device, force);
-            assert!(
-                self.attached_disk_images()
-                    .map_err(cowshed_apfs::ApfsError::KernelInventory)?
-                    .is_empty()
-            );
-            Ok(false)
-        }
         fn run_guarded<E>(
             &self,
             request: &cowshed_apfs::CommandRequest,

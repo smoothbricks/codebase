@@ -1209,12 +1209,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         attachment: &AttachedImage,
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
+        self.unmount_attached(attachment, intent)?;
         self.backend.detach(attachment, intent).map_err(Into::into)
     }
 
     /// Release a controller-owned image from every attachment the kernel holds for it now, not
-    /// from a cached diskN: Disk Arbitration ejects each owned whole device once, including all
-    /// its mounted volumes, under fresh image/device identity checks. A path held
+    /// from a cached diskN: each mounted volume of each attachment's container is unmounted
+    /// through its own pinned identity, then every whole device is detached once. A path held
     /// twice — a dead process's attach that landed after its file was replaced — is released
     /// twice rather than refused as ambiguous, and a container holding a volume something added
     /// beside the image's own is released with it.
@@ -1224,8 +1225,14 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
+        let mounted: std::collections::BTreeSet<String> = self
+            .mount_source
+            .mounts()?
+            .into_iter()
+            .map(|mount| mount.source_device)
+            .collect();
         self.backend
-            .release_image(image, intent)
+            .release_image(image, &mounted, intent)
             .map_err(Into::into)
     }
 
@@ -3562,7 +3569,7 @@ where
     /// Put back on its mount a workspace a failed step detached, reporting the step's failure.
     ///
     /// The step must have left the image an image — untouched, or grown whole — and the verified
-    /// Disk Arbitration mount is what checks its filesystem again. A failed remount is reported
+    /// attach (fsck included) is what proves it mounts again. A failed remount is reported
     /// beside the step's failure, never in place of it.
     fn remount_after_failure(
         &self,
@@ -4191,7 +4198,7 @@ where
         self.verify_controller_path(image)?;
         // The canonical name only ever holds a clone of a formatted template, so the payload is
         // an APFS volume from the moment it exists. A legacy unformatted payload is replaced;
-        // Disk Arbitration mount/check failures remain authoritative.
+        // Filesystem verification and command mount failures remain authoritative.
         match self.attach_and_mount_resumable(image, mount_point, workspace) {
             Ok(attachment) => Ok(Some(attachment)),
             Err(ApfsStorageError::Apfs(ApfsError::NoApfsVolume)) => Ok(None),
@@ -4291,8 +4298,7 @@ where
                 .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
                 .map_err(Into::into);
         };
-        // Disk Arbitration checks the existing filesystem as part of its mount transaction.
-        // Keep the crash-left attachment: no detach and second attach are needed.
+        // Mount the freshly probed and pinned crash-left volume without another attachment.
         match self.mount(&attachment, mount_point, MountAccess::ReadWrite, false) {
             Ok(()) => Ok(attachment),
             Err(primary) => match self.detach(attachment, DetachIntent::Release) {
@@ -7505,7 +7511,6 @@ mod tests {
     struct TwoVolumeImage {
         image: PathBuf,
         commands: std::sync::Mutex<Vec<cowshed_apfs::CommandRequest>>,
-        ejections: std::sync::Mutex<Vec<(PathBuf, String, bool)>>,
     }
 
     impl TwoVolumeImage {
@@ -7526,46 +7531,6 @@ mod tests {
     }
 
     impl CommandRunner for TwoVolumeImage {
-        fn mount(
-            &self,
-            image: &Path,
-            whole_device: &str,
-            volume_device: &str,
-            mount_point: &Path,
-            policy: cowshed_apfs::MountPolicy,
-        ) -> Result<(), cowshed_apfs::ApfsError> {
-            panic!(
-                "release never mounts the two-volume image: {} {whole_device}/{volume_device} at {} {policy:?}",
-                image.display(),
-                mount_point.display()
-            );
-        }
-
-        fn eject(
-            &self,
-            image: &Path,
-            whole_device: &str,
-            force: bool,
-        ) -> Result<bool, cowshed_apfs::ApfsError> {
-            if self
-                .attached_disk_images()
-                .map_err(cowshed_apfs::ApfsError::KernelInventory)?
-                .is_empty()
-            {
-                return Ok(false);
-            }
-            if image != self.image || whole_device != "/dev/disk4" {
-                return Err(cowshed_apfs::ApfsError::InvalidAttachmentInventory(
-                    "native release scope does not match the owned two-volume image".into(),
-                ));
-            }
-            self.ejections.lock().expect("native ejections").push((
-                image.to_owned(),
-                whole_device.to_owned(),
-                force,
-            ));
-            Ok(true)
-        }
         fn run_guarded<E>(
             &self,
             request: &cowshed_apfs::CommandRequest,
@@ -7603,7 +7568,12 @@ mod tests {
             Ok(None)
         }
         fn attached_disk_images(&self) -> io::Result<Vec<cowshed_apfs::AttachedDiskImage>> {
-            let detached = !self.ejections.lock().expect("native ejections").is_empty();
+            let detached = self
+                .commands
+                .lock()
+                .expect("recorded commands")
+                .iter()
+                .any(|request| request.args.first().is_some_and(|arg| arg == "detach"));
             Ok(if detached {
                 Vec::new()
             } else {
@@ -7633,8 +7603,9 @@ mod tests {
         }
     }
 
-    /// Disk Arbitration owns mounted release: eject the image's physical whole device
-    /// (`disk4`, not its synthesized container `disk5`) once, with no preliminary unmount.
+    /// Detaching an existing image unmounts exactly the volumes the kernel mount table names, here
+    /// the added sibling and not the unmounted image volume, then detaches the image's physical
+    /// device (`disk4`, not its synthesized container `disk5`) once.
     #[test]
     fn detaching_an_existing_image_unmounts_only_its_mounted_volumes_then_detaches_it_once() {
         let root = std::env::temp_dir().join(format!(
@@ -7650,7 +7621,6 @@ mod tests {
             TwoVolumeImage {
                 image: image.clone(),
                 commands: std::sync::Mutex::new(Vec::new()),
-                ejections: std::sync::Mutex::new(Vec::new()),
             },
             ApfsSubstrateConfig::new(&store, root.join("mnt")),
             FixedMounts(vec![KernelMountSnapshot::new(
@@ -7664,18 +7634,12 @@ mod tests {
         .unwrap();
         host.detach_existing_image(&image, DetachIntent::Release)
             .unwrap();
-        assert!(
-            host.backend().runner().argv().is_empty(),
-            "native release runs no process command"
-        );
         assert_eq!(
-            *host
-                .backend()
-                .runner()
-                .ejections
-                .lock()
-                .expect("native ejections"),
-            [(image.clone(), "/dev/disk4".to_owned(), false)]
+            host.backend().runner().argv(),
+            [
+                vec!["unmount".into(), "/dev/disk5s2".to_owned()],
+                vec!["detach".into(), "-verbose".into(), "/dev/disk4".into()],
+            ]
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -216,22 +216,24 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 
 Parametrized over the substrate the host provides, and never gated off on it: a missing capability is a failure, not a
 skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small `.dmg` images (1 GiB caps) under
-`/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the production host — real `diskutil`/`hdiutil` and Disk
-Arbitration mounts, the live kernel mount table. A mount state a test needs (wrong flags, an impostor volume, a busy
-holder) is produced on a real volume, never by a substitute mount source. Every scratch root selects its backing image
-paths, then calls the same production owned-attachment cleanup used by normal removal, recovery-marker reads,
-reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup rereads image/whole-device/volume
-identity and issues a DA eject under the image's lease; a previously cached disk number or mountpoint never authorizes a
-detach. A failed release keeps the scratch tree intact for the next run, rather than deleting a still-attached image's
-backing files. Before any release, a scratch root ends every process working in its tree, selected by the working
-directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a deleted directory): `SIGTERM`,
-as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a fixture started detaches from its
-starter, so a failed test's unwinding otherwise never reached it and it kept running in the deleted root. Successful
-cleanup removes the root, and every run first ends the processes working under, then reclaims the roots and attachments
-of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with
-datasets destroyed and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the
-Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
-both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+`/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the production host — real
+`diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, the live kernel mount table. A mount state a test needs (wrong flags, an
+impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Every scratch root
+selects its backing image paths, then calls the same production owned-attachment cleanup used by normal removal,
+recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup rereads
+image/whole-device/volume identity, raw-pins each currently-owned mounted volume for guarded `diskutil unmount`, then
+runs guarded `hdiutil detach` of the exact physical device under the image's lease. Guards recheck after the host lease
+wait; a previously cached disk number or mountpoint never authorizes an unmount or detach. A failed release keeps the
+scratch tree intact for the next run, rather than deleting a still-attached image's backing files. Before any release, a
+scratch root ends every process working in its tree, selected by the working directory the kernel reports
+(`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a deleted directory): `SIGTERM`, as `nx daemon --stop` sends
+it, then `SIGKILL` after a 10s grace. A stock Nx daemon a fixture started detaches from its starter, so a failed test's
+unwinding otherwise never reached it and it kept running in the deleted root. Successful cleanup removes the root, and
+every run first ends the processes working under, then reclaims the roots and attachments of, runs whose owner pid is
+gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool
+exported on teardown; the Linux leg also exercises `cowshed-helper` and the Landlock/netns exec path. A suite-level
+guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on both; substrate-specific assertions
+(fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
 line-start image records (RAW, then retained ASIF) and the worker record; neither a sibling's output nor a host
@@ -240,17 +242,18 @@ the single-threaded pretty harness from prefixing the first record with `test <n
 inherited `RUST_TEST_THREADS=1`, even while independent parent tests run in parallel. The strict two-record assertion
 and exact-root teardown remain unchanged; no delay, retry, dropped assertion or broad sweep repairs a framing failure.
 
-Native owned-image DA mount and release controls pin current provider-tree projection, excluding a foreign/stale cached
-BSD descendant before any native effect, and retain moved/reused-device refusals. Mount requires the exact single owned
-APFS volume; its native Busy, NotMounted and other refusals never earn release grace or retry. The five mount-policy
-controls retain read-only/visibility/owners/noatime and the separate event-store-repair `nobrowse,noowners` state.
-Native refusal tables distinguish Busy/encoded EBUSY from permission, general and unknown errors; real image teardown
-still proves the complete mounted RAW plus unmounted retained-ASIF panic/kill walk. An isolated pass after operator
-cleanup is not a repair verdict when the unchanged full gate repeats the failure; preserve both witnesses and exercise
-the real native cutover. The lease overlap fixture also drops B's returned handle before cleanup to prove exact-image
-recovery. A no-device cleanup control holds the backing-file lock: unlink refuses and preserves its bytes until an
-exclusive no-follow open proves it unlocked, then cleanup accepts both that file and an already-absent file without
-spending an image attach.
+Owned-image command-boundary controls pin current provider-tree projection, excluding a foreign/stale cached BSD
+descendant before any command effect, and retain moved/reused-device refusals. Mount requires the exact single owned
+APFS volume, pinned fsck before the first mount and a positive registry/image guard after the host lease wait; a failed
+fsck or mount never earns release grace or retry. Option controls retain read-only/visibility/owners/noatime and the
+separate event-store-repair `nobrowse,noowners` state. Release controls retain exact-volume `diskutil unmount`, exact
+physical-device `hdiutil detach`, post-grant guards and the unchanged named-dissenter/busy parsers; permission, general
+and unrecognized refusals remain errors. Real image teardown still proves the complete mounted RAW plus unmounted
+retained-ASIF panic/kill walk. An isolated pass after operator cleanup is not a repair verdict when the unchanged full
+gate repeats the failure; preserve both historical witnesses and exercise the real command cutover. The lease overlap
+fixture also drops B's returned handle before cleanup to prove exact-image recovery. A no-device cleanup control holds
+the backing-file lock: unlink refuses and preserves its bytes until an exclusive no-follow open proves it unlocked, then
+cleanup accepts both that file and an already-absent file without spending an image attach.
 
 The killed-caller attach fixture captures helper PIDs from the existing I/O Registry creator walker, joined to its exact
 backing image before release. After its own attach/release operations finish, two reads must find no orphan among those
@@ -336,7 +339,9 @@ disk-image target: the two groups never run concurrently. Each nextest group dec
 `.config/nextest.toml` owns their package-scoped selection filters, and the code-time wrapper rules select the same
 tests. Ordinary and exceptions shards exclude those filters. No target depends on either group but the host group's edge
 to the device group: a group runs only as its own target, named by the land gate, and only when its own inputs change.
-Every test has one runner, and non-macOS planning creates neither APFS group.
+Every test has one runner. Non-macOS planning creates neither executable APFS runner; the static placeholder target
+names in root `package.json` remain graph nodes, not executable group coverage (`packages/nx-plugin/README.md`, serial
+test-group inference).
 
 Every test target, the groups included, is bounded by progress alone: the run ends when no test has finished for 180s,
 the hang backstop, and names the tests still running; it has no wall-clock ceiling, and no per-test bound kills a test
@@ -573,20 +578,22 @@ Covered flows:
   completes under N, an inner per-command profile can only narrow N and cannot broaden it, the next exec observes N+1,
   and reconnecting a named session bound to N returns the documented stale-session conflict rather than silently
   rebinding. Repeat for both grant and revoke.
-- **One no-mount attach and pinned native DA mount** on APFS: assert attach flags/plist parsing, the exact current
-  image/whole/volume identity after the storage grant, native mount options and requested root, then held mount-root
-  identity before publication. A malformed reply or refused/wrong mount releases only the owned attachment or names its
-  cleanup refusal. Foreign/stale descendants are neither targets nor vetoes. No fallback, retry or separate live fsck is
-  permitted. Detached verification/resize and unformatted RAW retain intentional unmounted fixtures;
+- **One exact-image no-mount attach → pinned fsck → pinned `mount_apfs`** on APFS: assert attach flags/plist parsing,
+  exact current image/whole/volume identity, `fsck_apfs -q` before the first mount, and the mapping guard after the host
+  namespace grant, then helper options, requested root and held mount-root/source identity before publication. A
+  structurally-bad clone refuses before mounting. A malformed reply, failed fsck or refused/wrong mount releases only
+  the owned attachment or names its cleanup refusal. Foreign/stale descendants are neither targets nor vetoes. No
+  combined `--mountPoint` attach, fallback or retry is permitted. Detached verification/resize and unformatted RAW
+  retain intentional unmounted fixtures;
 - **Live source capture stays mounted; build seeds are sealed**: a live capture (`fork`, `checkpoint`) flushes the
   source volume and backing file, descriptor-clones the live RAW image, and asserts that the source's attachment and
-  mount flags are unchanged (01a_apfs.md, "Images"). `fork` and `restore` pass a formatted clone to the DA exact-image
-  attach and pinned native mount path and verify the resulting mount identity. A failed operation refuses publication
-  and cleans up only the destination, never the live source (02_workspaces.md, fork step 4). A build seed is the
-  exception (16_build_volumes.md): the sealed capture detaches its source without force, clones through its held inode,
-  and restores identical access/visibility and an updated registry after both success and failure; busy-source refusal
-  names visible holders and leaves source bytes and mounts intact. RAW has no outer allocation map for a live capture to
-  split (02_workspaces.md, fork step 2).
+  mount flags are unchanged (01a_apfs.md, "Images"). `fork` and `restore` pass a formatted clone to the one exact-image
+  no-mount attach, pinned `fsck_apfs -q` and `mount_apfs` path and verify the resulting held mount identity. A failed
+  operation refuses publication and cleans up only the destination, never the live source (02_workspaces.md, fork step
+  4). A build seed is the exception (16_build_volumes.md): the sealed capture detaches its source without force, clones
+  through its held inode, and restores identical access/visibility and an updated registry after both success and
+  failure; busy-source refusal names visible holders and leaves source bytes and mounts intact. RAW has no outer
+  allocation map for a live capture to split (02_workspaces.md, fork step 2).
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
@@ -717,13 +724,13 @@ fork argument, and the API rejects a ref with `clean: false`.
 
 ### APFS / Seatbelt (macOS)
 
-| Operation                | Budget (median, local)  | Basis                                                        |
-| ------------------------ | ----------------------- | ------------------------------------------------------------ |
-| `cowshed fork` cold      | ≤ 1 s                   | clonefile + first write + DA attach-and-mount                |
-| `cowshed rm` (perceived) | ≤ 100 ms to return      | rename + grant-file unlink; detach is background             |
-| `cowshed checkpoint`     | ≤ 1 s                   | descriptor-clone path                                        |
-| `cowshed path` / `ls`    | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design |
-| exec sandbox overhead    | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                            |
+| Operation                | Budget (median, local)  | Basis                                                            |
+| ------------------------ | ----------------------- | ---------------------------------------------------------------- |
+| `cowshed fork` cold      | ≤ 1 s                   | clonefile + first write + attach + `fsck_apfs -q` + `mount_apfs` |
+| `cowshed rm` (perceived) | ≤ 100 ms to return      | rename + grant-file unlink; detach is background                 |
+| `cowshed checkpoint`     | ≤ 1 s                   | descriptor-clone path                                            |
+| `cowshed path` / `ls`    | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design     |
+| exec sandbox overhead    | ≤ 50 ms over bare spawn | profile generation + sandbox-exec                                |
 
 **What the budgets are.** They are regression thresholds on medians of primitive-operation costs, not end-to-end cowshed
 SLOs: a median is stated because a small sample cannot fix a stable tail. Clone-backed images rather than shadow mounts
