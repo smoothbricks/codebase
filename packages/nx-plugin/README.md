@@ -1129,10 +1129,12 @@ callers use the CLI facade rather than introducing another disk-command runner.
 Without an inherited parent pool, a `bounded-exec` command takes CPU tokens from cowshed's host budget before it starts,
 when the gateway answers on the same socket (`specs/cowshed/05_gateway.md`, "Host CPU budget"), so concurrent gates on
 one host keep their runnable work near the core count instead of each sizing its runners to the whole machine. It asks
-for as many tokens as the command's runner runs at once — a `nextest run` its `--test-threads` or one per core,
-`bun test --parallel=N` N, a cargo build one per core, anything else one, or the target's `parallelism` option — and
-sizes the runner to the grant: `NEXTEST_TEST_THREADS`, a rewritten `--test-threads=`/`--parallel=` count,
-`CARGO_BUILD_JOBS` and `RUST_TEST_THREADS`, and `BOUNDED_EXEC_CPU_TOKENS` for every command. The gateway shares tokens
+for the runner's requested parallelism — nextest's `--test-threads` or one per core, `bun test --parallel=N` N, a cargo
+build one per core, anything else one, or the target's `parallelism` option — bounded by positive inherited
+`NEXTEST_TEST_THREADS`/`CARGO_BUILD_JOBS` ceilings. A configured count can lower an inherited ceiling, never raise it.
+The runner uses `min(bounded request, granted tokens)`: nextest's environment and named flag, Bun's parallel flag, and
+Cargo's jobs are sized to that limit. Cargo's `RUST_TEST_THREADS` retains its independent inherited/configured ceiling.
+`BOUNDED_EXEC_CPU_TOKENS`, the sub-ledger and telemetry still name the actual held grant. The gateway shares tokens
 fairly between checkouts (Nx workspace roots). `timeoutMs` and `idleTimeoutMs` start at the grant. The tokens go back
 when the command exits, or with the executor's socket when it is killed. The wait prints one
 `cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. With no gateway listening, the command runs

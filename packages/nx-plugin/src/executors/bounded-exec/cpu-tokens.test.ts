@@ -48,57 +48,99 @@ const NEXTEST_PIECE =
 
 describe('cowshed CPU budget client', () => {
   it('asks for what each runner would run at once', () => {
-    expect(runnerDemand(NEXTEST_PIECE, undefined, 18)).toEqual({ kind: 'nextest', want: 18 });
-    expect(runnerDemand('cargo-nextest nextest run --archive-file a.tar.zst', undefined, 12)).toEqual({
+    expect(runnerDemand(NEXTEST_PIECE, undefined, 18, {})).toEqual({ kind: 'nextest', want: 18 });
+    expect(runnerDemand('cargo-nextest nextest run --archive-file a.tar.zst', undefined, 12, {})).toEqual({
       kind: 'nextest',
       want: 12,
     });
-    expect(runnerDemand('cargo nextest run --test-threads=4', undefined, 18)).toEqual({ kind: 'nextest', want: 4 });
-    expect(runnerDemand('bun test --timeout=30000 --parallel=3', undefined, 18)).toEqual({
+    expect(runnerDemand('cargo nextest run --test-threads=4', undefined, 18, {})).toEqual({ kind: 'nextest', want: 4 });
+    expect(runnerDemand('bun test --timeout=30000 --parallel=3', undefined, 18, {})).toEqual({
       kind: 'bun-parallel',
       want: 3,
     });
-    expect(runnerDemand('bun test --parallel ./a.test.ts', undefined, 18)).toEqual({ kind: 'bun-parallel', want: 18 });
+    expect(runnerDemand('bun test --parallel ./a.test.ts', undefined, 18, {})).toEqual({
+      kind: 'bun-parallel',
+      want: 18,
+    });
     // A runtime pinned by path is the same runner.
-    expect(runnerDemand('../bun-runtime/.runtime/bun test --parallel=5', undefined, 18)).toEqual({
+    expect(runnerDemand('../bun-runtime/.runtime/bun test --parallel=5', undefined, 18, {})).toEqual({
       kind: 'bun-parallel',
       want: 5,
     });
     // One bun process: `test.concurrent` inside it is not another CPU.
-    expect(runnerDemand('bun test --timeout=30000 native.test.ts', undefined, 18)).toEqual({
+    expect(runnerDemand('bun test --timeout=30000 native.test.ts', undefined, 18, {})).toEqual({
       kind: 'process',
       want: 1,
     });
-    expect(runnerDemand('cargo --frozen test --workspace', undefined, 18)).toEqual({ kind: 'cargo', want: 18 });
-    expect(runnerDemand('napi build --platform --release', undefined, 8)).toEqual({ kind: 'cargo', want: 8 });
-    expect(runnerDemand('bun scripts/test-shard.ts 3', undefined, 18)).toEqual({ kind: 'process', want: 1 });
-    // A declared parallelism outranks what the command names.
-    expect(runnerDemand('bun scripts/test-shard.ts 3', 2, 18)).toEqual({ kind: 'process', want: 2 });
-    expect(runnerDemand('cargo nextest run --test-threads=4', 6, 18)).toEqual({ kind: 'nextest', want: 6 });
+    expect(runnerDemand('cargo --frozen test --workspace', undefined, 18, {})).toEqual({
+      kind: 'cargo',
+      want: 18,
+      testThreads: null,
+    });
+    expect(runnerDemand('napi build --platform --release', undefined, 8, {})).toEqual({
+      kind: 'cargo',
+      want: 8,
+      testThreads: null,
+    });
+    expect(runnerDemand('bun scripts/test-shard.ts 3', undefined, 18, {})).toEqual({ kind: 'process', want: 1 });
+    // A declared parallelism outranks what the command names, within inherited ceilings.
+    expect(runnerDemand('bun scripts/test-shard.ts 3', 2, 18, {})).toEqual({ kind: 'process', want: 2 });
+    expect(runnerDemand('cargo nextest run --test-threads=4', 6, 18, {})).toEqual({ kind: 'nextest', want: 6 });
   });
 
   it('sizes each runner to its grant', () => {
-    expect(sizeRunner('nextest', NEXTEST_PIECE, 5)).toEqual({
+    expect(sizeRunner({ kind: 'nextest', want: 18 }, NEXTEST_PIECE, 5)).toEqual({
       command: NEXTEST_PIECE,
       env: { [CPU_TOKENS_ENV]: '5', NEXTEST_TEST_THREADS: '5' },
     });
-    expect(sizeRunner('nextest', 'cargo nextest run --test-threads 16 -E all()', 3).command).toBe(
+    expect(sizeRunner({ kind: 'nextest', want: 16 }, 'cargo nextest run --test-threads 16 -E all()', 3).command).toBe(
       'cargo nextest run --test-threads=3 -E all()',
     );
-    expect(sizeRunner('bun-parallel', 'bun test --parallel=3 --timeout=1', 2)).toEqual({
+    expect(sizeRunner({ kind: 'bun-parallel', want: 3 }, 'bun test --parallel=3 --timeout=1', 2)).toEqual({
       command: 'bun test --parallel=2 --timeout=1',
       env: { [CPU_TOKENS_ENV]: '2' },
     });
-    expect(sizeRunner('bun-parallel', 'bun test --parallel', 7).command).toBe('bun test --parallel=7');
-    expect(sizeRunner('cargo', 'cargo test', 4).env).toEqual({
+    expect(sizeRunner({ kind: 'bun-parallel', want: 18 }, 'bun test --parallel', 7).command).toBe(
+      'bun test --parallel=7',
+    );
+    expect(sizeRunner({ kind: 'cargo', want: 18, testThreads: null }, 'cargo test', 4).env).toEqual({
       [CPU_TOKENS_ENV]: '4',
       CARGO_BUILD_JOBS: '4',
       RUST_TEST_THREADS: '4',
     });
-    expect(sizeRunner('process', 'bun scripts/x.ts', 1)).toEqual({
+    expect(sizeRunner({ kind: 'process', want: 1 }, 'bun scripts/x.ts', 1)).toEqual({
       command: 'bun scripts/x.ts',
       env: { [CPU_TOKENS_ENV]: '1' },
     });
+  });
+
+  it('treats inherited runner bounds as ceilings even under larger grants', () => {
+    const inherited = { NEXTEST_TEST_THREADS: '6', CARGO_BUILD_JOBS: '4', RUST_TEST_THREADS: '2' };
+    const configured = { NEXTEST_TEST_THREADS: '64', CARGO_BUILD_JOBS: '64', RUST_TEST_THREADS: '64' };
+    const nextest = runnerDemand('cargo nextest run --test-threads=18', 18, 18, inherited, configured);
+    const cargo = runnerDemand('cargo test', 18, 18, inherited, configured);
+    expect(nextest).toEqual({ kind: 'nextest', want: 6 });
+    expect(cargo).toEqual({ kind: 'cargo', want: 4, testThreads: 2 });
+    for (const tokens of [15, 18]) {
+      expect(sizeRunner(nextest, 'cargo nextest run --test-threads=18', tokens)).toEqual({
+        command: 'cargo nextest run --test-threads=6',
+        env: { [CPU_TOKENS_ENV]: String(tokens), NEXTEST_TEST_THREADS: '6' },
+      });
+      expect(sizeRunner(cargo, 'cargo test', tokens).env).toEqual({
+        [CPU_TOKENS_ENV]: String(tokens),
+        CARGO_BUILD_JOBS: '4',
+        RUST_TEST_THREADS: '2',
+      });
+    }
+    expect(sizeRunner(nextest, NEXTEST_PIECE, 3).env.NEXTEST_TEST_THREADS).toBe('3');
+    expect(sizeRunner(cargo, 'cargo test', 3).env).toEqual({
+      [CPU_TOKENS_ENV]: '3',
+      CARGO_BUILD_JOBS: '3',
+      RUST_TEST_THREADS: '2',
+    });
+    expect(runnerDemand(NEXTEST_PIECE, 18, 18, inherited, { NEXTEST_TEST_THREADS: '2' }).want).toBe(2);
+    expect(runnerDemand('cargo build', 18, 18, {}, { CARGO_BUILD_JOBS: '4' }).want).toBe(4);
+    expect(runnerDemand(NEXTEST_PIECE, 18, 18, { NEXTEST_TEST_THREADS: '0' }).want).toBe(18);
   });
 
   it('reads an inherited count only as a positive safe integer', () => {
@@ -112,7 +154,9 @@ describe('cowshed CPU budget client', () => {
   });
 
   it('reads back the count a runner was sized to', () => {
-    expect(parseInheritedTokens(sizeRunner('process', 'bun scripts/x.ts', 5).env[CPU_TOKENS_ENV])).toBe(5);
+    expect(
+      parseInheritedTokens(sizeRunner({ kind: 'process', want: 5 }, 'bun scripts/x.ts', 5).env[CPU_TOKENS_ENV]),
+    ).toBe(5);
   });
 
   it('asks the gateway with one line, takes the granted count, and holds until released', async () => {

@@ -24,12 +24,10 @@ export type RunnerKind =
   /** Anything else, one `bun test` process included: one process unless it declares more. */
   | 'process';
 
-/** What a runner asks the budget for. */
-export interface Demand {
-  kind: RunnerKind;
-  /** The threads or processes it runs at once unbudgeted; at least 1. */
-  want: number;
-}
+/** What a runner asks the budget for; Cargo also carries its independent test-thread ceiling. */
+export type Demand =
+  | { kind: 'cargo'; want: number; testThreads: number | null }
+  | { kind: Exclude<RunnerKind, 'cargo'>; want: number };
 
 /** Every budgeted command learns its grant here, so a script that starts a runner can size it. */
 export const CPU_TOKENS_ENV = 'BOUNDED_EXEC_CPU_TOKENS';
@@ -44,9 +42,15 @@ const INHERITED_COUNT = /^[1-9]\d*$/;
  * What `command` asks for: its kind by invocation, and `declared` (the target's `parallelism`)
  * when it says, else the count the command names (`--test-threads=N`, `--parallel=N`), else the
  * runner's own default — one thread per core for nextest, a bare `--parallel` and cargo, one
- * process for anything else.
+ * process for anything else. Positive inherited runner counts are ceilings; configured counts may only lower them.
  */
-export function runnerDemand(command: string, declared: number | undefined, cores: number): Demand {
+export function runnerDemand(
+  command: string,
+  declared: number | undefined,
+  cores: number,
+  inherited: Readonly<NodeJS.ProcessEnv>,
+  configured?: Readonly<NodeJS.ProcessEnv>,
+): Demand {
   const kind: RunnerKind =
     command.search(NEXTEST_RUN) !== -1
       ? 'nextest'
@@ -60,34 +64,58 @@ export function runnerDemand(command: string, declared: number | undefined, core
     counted === null
       ? []
       : [...command.matchAll(counted)].flatMap((match) => (match[1] === undefined ? [] : [Number(match[1])]));
-  const want = declared ?? (named.length > 0 ? Math.max(...named) : kind === 'process' ? 1 : cores);
-  return { kind, want: Math.max(1, want) };
+  const requested = declared ?? (named.length > 0 ? Math.max(...named) : kind === 'process' ? 1 : cores);
+  const ceiling =
+    kind === 'nextest'
+      ? inheritedCeiling(inherited.NEXTEST_TEST_THREADS, configured?.NEXTEST_TEST_THREADS)
+      : kind === 'cargo'
+        ? inheritedCeiling(inherited.CARGO_BUILD_JOBS, configured?.CARGO_BUILD_JOBS)
+        : null;
+  const want = Math.max(1, Math.min(requested, ceiling ?? requested));
+  return kind === 'cargo'
+    ? { kind, want, testThreads: inheritedCeiling(inherited.RUST_TEST_THREADS, configured?.RUST_TEST_THREADS) }
+    : { kind, want };
 }
 
 /**
- * `command` and the environment that size a `kind` runner to `tokens`: a count the command names
- * is rewritten, since a flag outranks the environment, and the runner's own variables are set.
- * Every kind gets `CPU_TOKENS_ENV`.
+ * Size the runner to the lesser of its bounded demand and grant, retaining Cargo's test-thread ceiling.
+ * Rewrite named flags so they cannot outrank that ceiling. `CPU_TOKENS_ENV` still reports the actual held grant.
  */
 export function sizeRunner(
-  kind: RunnerKind,
+  demand: Demand,
   command: string,
   tokens: number,
 ): { command: string; env: Record<string, string> } {
-  const count = String(tokens);
-  switch (kind) {
+  const runnerCount = Math.min(tokens, demand.want);
+  const count = String(runnerCount);
+  const held = String(tokens);
+  switch (demand.kind) {
     case 'nextest':
       return {
         command: command.replace(TEST_THREADS, `--test-threads=${count}`),
-        env: { [CPU_TOKENS_ENV]: count, NEXTEST_TEST_THREADS: count },
+        env: { [CPU_TOKENS_ENV]: held, NEXTEST_TEST_THREADS: count },
       };
     case 'bun-parallel':
-      return { command: command.replace(BUN_PARALLEL, `--parallel=${count}`), env: { [CPU_TOKENS_ENV]: count } };
+      return { command: command.replace(BUN_PARALLEL, `--parallel=${count}`), env: { [CPU_TOKENS_ENV]: held } };
     case 'cargo':
-      return { command, env: { [CPU_TOKENS_ENV]: count, CARGO_BUILD_JOBS: count, RUST_TEST_THREADS: count } };
+      return {
+        command,
+        env: {
+          [CPU_TOKENS_ENV]: held,
+          CARGO_BUILD_JOBS: count,
+          RUST_TEST_THREADS: String(Math.min(runnerCount, demand.testThreads ?? runnerCount)),
+        },
+      };
     case 'process':
-      return { command, env: { [CPU_TOKENS_ENV]: count } };
+      return { command, env: { [CPU_TOKENS_ENV]: held } };
   }
+}
+
+/** A configured value may lower an inherited ceiling, never raise it. */
+function inheritedCeiling(inherited: string | undefined, configured: string | undefined): number | null {
+  const left = parseInheritedTokens(inherited);
+  const right = parseInheritedTokens(configured);
+  return left === null ? right : right === null ? left : Math.min(left, right);
 }
 
 /**

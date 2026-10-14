@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readInheritedCpuPool } from './cpu-pool.js';
-import { CPU_TOKENS_ENV, type CpuBudget, type TokenGrant } from './cpu-tokens.js';
+import { CPU_TOKENS_ENV, type CpuBudget, parseInheritedTokens, type TokenGrant } from './cpu-tokens.js';
 import {
   type BoundedExecContext,
   createProcessTreeKiller,
@@ -21,6 +21,8 @@ import { VERDICT_FILE } from './verdict.js';
 const workspaces: string[] = [];
 const originalStdoutWrite = process.stdout.write;
 const originalStderrWrite = process.stderr.write;
+
+const nextestWant = Math.min(8, parseInheritedTokens(process.env.NEXTEST_TEST_THREADS) ?? 8);
 
 /**
  * Prints the budget variables it sees, then what a grandchild sees: a command's environment reaches its descendants,
@@ -617,6 +619,57 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(volume.released).toEqual([directory]);
   });
 
+  it('keeps inherited nextest and Cargo ceilings under oversized grants', async () => {
+    const previousNextest = process.env.NEXTEST_TEST_THREADS;
+    const previousCargo = process.env.CARGO_BUILD_JOBS;
+    const previousRust = process.env.RUST_TEST_THREADS;
+    process.env.NEXTEST_TEST_THREADS = '6';
+    process.env.CARGO_BUILD_JOBS = '4';
+    process.env.RUST_TEST_THREADS = '6';
+    try {
+      for (const tokens of [15, 18]) {
+        const workspace = await createWorkspace();
+        const asked: number[] = [];
+        const released: number[] = [];
+        const budget: CpuBudget = {
+          async take(want) {
+            asked.push(want);
+            return heldGrant(tokens, released);
+          },
+        };
+        for (const scenario of [
+          { runner: 'nextest run', variable: 'NEXTEST_TEST_THREADS', cap: 6 },
+          { runner: 'cargo test', variable: 'CARGO_BUILD_JOBS', cap: 4 },
+        ]) {
+          const command = `node -e "console.log('cap=' + process.env.${scenario.variable} + ' held=' + process.env.BOUNDED_EXEC_CPU_TOKENS)" # ${scenario.runner}`;
+          const result = await runBoundedExec(
+            {
+              command,
+              timeoutMs: 5_000,
+              parallelism: 18,
+              env: { NEXTEST_TEST_THREADS: '64', CARGO_BUILD_JOBS: '64', RUST_TEST_THREADS: '64' },
+            },
+            workspace.context,
+            createProcessTreeKiller(),
+            null,
+            budget,
+          );
+          expect(result.success).toBe(true);
+          expect(asked.at(-1)).toBe(scenario.cap);
+          expect(result.terminalOutput).toContain(`cap=${scenario.cap} held=${tokens}`);
+        }
+        expect(released).toEqual([tokens, tokens]);
+      }
+    } finally {
+      if (previousNextest === undefined) delete process.env.NEXTEST_TEST_THREADS;
+      else process.env.NEXTEST_TEST_THREADS = previousNextest;
+      if (previousCargo === undefined) delete process.env.CARGO_BUILD_JOBS;
+      else process.env.CARGO_BUILD_JOBS = previousCargo;
+      if (previousRust === undefined) delete process.env.RUST_TEST_THREADS;
+      else process.env.RUST_TEST_THREADS = previousRust;
+    }
+  });
+
   it('starts the runner once granted, sized to its grant, and returns the tokens when it exits', async () => {
     const workspace = await createWorkspace();
     const asked: { want: number; checkout: string; command: string }[] = [];
@@ -640,10 +693,13 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     expect(result.success).toBe(true);
-    expect(asked).toEqual([{ want: 8, checkout: workspace.root, command }]);
-    expect(result.terminalOutput).toContain('threads=3 tokens=3');
+    expect(asked).toEqual([{ want: nextestWant, checkout: workspace.root, command }]);
+    expect(result.terminalOutput).toContain(`threads=${Math.min(3, nextestWant)} tokens=3`);
     expect(result.terminalOutput).toMatch(
-      /^cowshed: cpu-tokens wait done elapsed=\d+ms status=ok tokens=3\/8 runner=nextest$/m,
+      new RegExp(
+        `^cowshed: cpu-tokens wait done elapsed=\\d+ms status=ok tokens=3/${nextestWant} runner=nextest$`,
+        'm',
+      ),
     );
     expect(released).toEqual([3]);
   });
@@ -706,7 +762,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         return heldGrant(1, released);
       },
     };
-    const lent = lentCount(8, 3);
+    const lent = lentCount(nextestWant, 3);
 
     const result = await withPool(3, (pool) =>
       runBoundedExec(
@@ -727,7 +783,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(asked).toEqual([]);
     expect(released).toEqual([]);
     expect(result.terminalOutput).toContain(`tokens=${lent}\n`);
-    expect(result.terminalOutput).toContain(`inherited=true tokens=${lent}/8 runner=nextest`);
+    expect(result.terminalOutput).toContain(`inherited=true tokens=${lent}/${nextestWant} runner=nextest`);
   });
 
   it('lends a runner no more than it asks for, even with no budget client', async () => {
@@ -775,10 +831,13 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     expect(result.success).toBe(true);
-    expect(asked).toEqual([8]);
+    expect(asked).toEqual([nextestWant]);
     expect(released).toEqual([3]);
     expect(result.terminalOutput).toMatch(
-      /^cowshed: cpu-tokens wait done elapsed=\d+ms status=ok tokens=3\/8 runner=nextest$/m,
+      new RegExp(
+        `^cowshed: cpu-tokens wait done elapsed=\\d+ms status=ok tokens=3/${nextestWant} runner=nextest$`,
+        'm',
+      ),
     );
     expect(result.terminalOutput).not.toContain('inherited');
   });
@@ -794,7 +853,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         return heldGrant(3, []);
       },
     };
-    const lent = lentCount(8, 3);
+    const lent = lentCount(nextestWant, 3);
 
     const borrowed = await withPool(3, (pool) =>
       runBoundedExec(
@@ -820,12 +879,12 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const borrowedRecord: unknown = JSON.parse(await readFile(join(borrowedDir, VERDICT_FILE), 'utf8'));
     expect(borrowedRecord).toHaveProperty('cpu', {
       tokens: lent,
-      want: 8,
+      want: nextestWant,
       waitedMs: expect.any(Number),
       inherited: true,
     });
     const ownedRecord: unknown = JSON.parse(await readFile(join(ownedDir, VERDICT_FILE), 'utf8'));
-    expect(ownedRecord).toHaveProperty('cpu', { tokens: 3, want: 8, waitedMs: expect.any(Number) });
+    expect(ownedRecord).toHaveProperty('cpu', { tokens: 3, want: nextestWant, waitedMs: expect.any(Number) });
     expect(ownedRecord).not.toHaveProperty('cpu.inherited');
   });
 
@@ -888,10 +947,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     expect(result.success).toBe(true);
-    expect(asked).toEqual([8]);
+    expect(asked).toEqual([nextestWant]);
     expect(released).toEqual([3]);
     expect(result.terminalOutput).toContain('cowshed: cpu-tokens parent pool refused: ');
-    expect(result.terminalOutput).toContain('status=ok tokens=3/8 runner=nextest');
+    expect(result.terminalOutput).toContain(`status=ok tokens=3/${nextestWant} runner=nextest`);
     expect(result.terminalOutput).not.toContain('inherited=true');
   });
 

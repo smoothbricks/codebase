@@ -252,7 +252,7 @@ export async function runBoundedExec(
   // The wait is one span line, as cowshed's own spans read. With no gateway listening, as on any
   // host without cowshed, the command runs exactly as asked and nothing is said.
   const cores = availableParallelism();
-  const demand = runnerDemand(requested, options.parallelism, cores);
+  const demand = runnerDemand(requested, options.parallelism, cores, process.env, options.env);
   const asked = Date.now();
   // A run a parent's CPU pool lent tokens to takes them there. Only an absent pool leaves the host budget to ask.
   // A pool that answered and refused still holds tokens of its own: asking the host then would hold them while waiting
@@ -282,7 +282,7 @@ export async function runBoundedExec(
   let cpu: BoundedExecRecord['cpu'];
   let sized: { command: string; env: Record<string, string> } = { command: requested, env: {} };
   if (grant !== null) {
-    sized = sizeRunner(demand.kind, requested, grant.tokens);
+    sized = sizeRunner(demand, requested, grant.tokens);
     cpu = { tokens: grant.tokens, want: demand.want, waitedMs, ...(grant.inherited ? { inherited: true } : {}) };
     appendStderr(
       `cowshed: cpu-tokens wait done elapsed=${waitedMs}ms status=ok ${grant.inherited ? 'inherited=true ' : ''}tokens=${grant.tokens}/${demand.want} runner=${demand.kind}\n`,

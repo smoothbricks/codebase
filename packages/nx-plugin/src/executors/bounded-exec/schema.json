@@ -43,7 +43,7 @@
     "parallelism": {
       "type": "integer",
       "minimum": 1,
-      "description": "Most threads or processes the command runs at once: the CPU tokens it asks its live parent pool or the cowshed host budget for before it starts. Omit to let the runner in the command decide (nextest and cargo one per core, `bun test --parallel=N` N, anything else one). The actual grant reaches the command as BOUNDED_EXEC_CPU_TOKENS, with its sub-pool in BOUNDED_EXEC_CPU_POOL."
+      "description": "Requested threads or processes before inherited runner ceilings: positive NEXTEST_TEST_THREADS and CARGO_BUILD_JOBS cap their respective runners, and configured counts may only lower an inherited ceiling. Omit to let the command decide (nextest and cargo one per core, `bun test --parallel=N` N, anything else one). Runner concurrency is min(bounded request, granted tokens); the actual held grant reaches the command as BOUNDED_EXEC_CPU_TOKENS, with its sub-pool in BOUNDED_EXEC_CPU_POOL."
     },
     "forwardAllArgs": {
       "type": "boolean",
