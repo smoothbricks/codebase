@@ -6,10 +6,10 @@
 use super::*;
 
 use super::nx_process::server_executable;
-use cowshed_core::fork_lock::Run as _;
 use cowshed_gateway::{
     AuditEvent, AuditStatus, GatewayTimeouts, NxCacheServiceConfig, NxPublication,
 };
+use cowshed_os::fork_lock::Run as _;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::time::Duration;

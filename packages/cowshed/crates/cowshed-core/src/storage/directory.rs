@@ -1422,6 +1422,23 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         }
         // A clone arrives with its source's marker in place: that marker is the lineage.
         let lineage = clone_lineage_from(&marker_path, workspace.repo());
+        // Preserve a restored tree's revision; a newly minted tree already has its owned links.
+        let copied = match WorkspaceMarker::read_from(&marker_path) {
+            Ok(old) => Some(old).filter(|old| {
+                forked_from.is_none()
+                    && old.repo_id == *workspace.repo()
+                    && old.workspace == *workspace.name()
+            }),
+            Err(crate::metadata::MetadataError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(ApfsStorageError::MarkerMismatch(error.to_string())),
+        };
+        let owned_links_revision = copied.map_or(crate::metadata::OWNED_LINKS_REVISION, |old| {
+            old.owned_links_revision
+        });
         let marker = WorkspaceMarker {
             version: MARKER_VERSION,
             repo_id: workspace.repo().clone(),
@@ -1434,6 +1451,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             forked_from: forked_from.cloned(),
             created_trace: identity.created_trace.clone(),
             lineage: Some(lineage),
+            owned_links_revision,
         };
         marker.validate().map_err(host_error)?;
         let parent = marker_path.parent().ok_or(ApfsStorageError::InvalidPlan(

@@ -13,9 +13,9 @@ use std::process::{Command, ExitStatus};
 use crate::capabilities::bun::BUN_HOME;
 use crate::capabilities::cache::SharedToolHome;
 use crate::capabilities::pnpm::PNPM_HOME;
-use crate::fork_lock::Run as _;
-use crate::fsio::AnchoredDirectory;
 use crate::{CowshedError, Result};
+use cowshed_os::fork_lock::Run as _;
+use cowshed_os::fsio::AnchoredDirectory;
 
 pub const ROOT_ENV: &str = "COWSHED_PACKAGE_MANAGER_ROOT";
 pub const TOOL_BIN_ENV: &str = "COWSHED_TOOL_BIN";
@@ -716,8 +716,8 @@ mod tests {
     use super::*;
     use crate::capabilities::bun::BUN_HOME as BUN;
     use crate::capabilities::pnpm::PNPM_HOME as PNPM;
-    use crate::fork_lock::Run;
-    use crate::fsio::{Syncs, take_syncs};
+    use cowshed_os::fork_lock::Run;
+    use cowshed_os::fsio::{Syncs, take_syncs};
     use std::os::unix::fs::symlink;
 
     /// The stores of the fixture home beside a checkout. No fixture link names a store root, so

@@ -6,7 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use cowshed_core::fork_lock::{self, Fenced};
+use cowshed_os::fork_lock::{self, Fenced};
 use http::{Method, StatusCode};
 use thiserror::Error;
 use tokio::{
@@ -3656,7 +3656,7 @@ mod tests {
     }
 
     async fn unit_child() -> tokio::process::Child {
-        use cowshed_core::fork_lock::Spawn as _;
+        use cowshed_os::fork_lock::Spawn as _;
         tokio::process::Command::new("/bin/cat")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())

@@ -244,7 +244,7 @@ pub(crate) async fn start_backend(
     config: &NxCacheServiceConfig,
     repo_id: &str,
 ) -> Result<(NxCacheBackend, tokio::process::Child), String> {
-    use cowshed_core::fork_lock::Spawn as _;
+    use cowshed_os::fork_lock::Spawn as _;
     use sha2::{Digest as _, Sha256};
     use std::{os::unix::fs::DirBuilderExt as _, process::Stdio};
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};

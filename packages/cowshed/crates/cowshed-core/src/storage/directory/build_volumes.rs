@@ -160,6 +160,20 @@ fn holders_of(image: &Path) -> Result<Vec<Holder>, ApfsStorageError> {
     super::confirmed_tree_holders(image)
 }
 
+fn hold_owners(
+    layout: &BuildVolumeLayout,
+    id: &BuildVolumeId,
+) -> Result<Vec<Holder>, ApfsStorageError> {
+    let hold = layout.hold_path(id);
+    crate::build_volume::nx::holders(&hold).map_err(|error| {
+        io_error(
+            "list the processes holding a build volume's hold",
+            &hold,
+            error,
+        )
+    })
+}
+
 fn journal_release(layout: &BuildVolumeLayout, image: &Path, recorded: Option<&BuildVolumeRole>) {
     use crate::storage::deletion_log::{DeletionKind, DeletionOp, log_deletion};
     let (kind, workspace) = match recorded {
@@ -246,7 +260,7 @@ impl DirectoryExecutionHost {
                     return Err(ApfsStorageError::BuildVolumeHeld {
                         image: layout.image(source),
                         hold: layout.hold_path(source),
-                        holds: Vec::new(),
+                        holds: hold_owners(layout, source)?,
                         open,
                     });
                 }
@@ -499,7 +513,7 @@ impl DirectoryExecutionHost {
                 return Err(ApfsStorageError::BuildVolumeHeld {
                     hold: layout.hold_path(id),
                     image,
-                    holds: Vec::new(),
+                    holds: hold_owners(layout, id)?,
                     open,
                 });
             }

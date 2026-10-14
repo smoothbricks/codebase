@@ -746,9 +746,15 @@ impl GitRepository {
     /// Refuses, naming each link, when any link cannot be restored.
     pub(crate) async fn rename_link_paths(&self) -> Result<Vec<PathBuf>> {
         let root = self.root.clone();
-        let plan = tokio::task::spawn_blocking(move || crate::inherited_links::plan(&root, &root))
-            .await
-            .map_err(|error| CowshedError::internal(format!("plan inherited links: {error}")))??;
+        let plan = tokio::task::spawn_blocking(move || {
+            crate::inherited_links::plan(
+                &root,
+                &root,
+                crate::inherited_links::RestoreScope::Inherited,
+            )
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("plan inherited links: {error}")))??;
         if !plan.refusals.is_empty() {
             return Err(CowshedError::integrity(
                 format!(
@@ -1398,7 +1404,13 @@ impl GitRepository {
 
     async fn porcelain_status(&self, operation: &str) -> Result<Output> {
         let output = self
-            .run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            .run([
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ])
             .await?;
         if !output.status.success() {
             return Err(git_internal(operation, &output));
@@ -5707,6 +5719,11 @@ mod tests {
             .adopt_as_linked_worktree("raven", &main, None)
             .await
             .expect("adopt source as linked worktree");
+        // A clean tracked entry gets different filesystem stat data in the clone. Git diff's
+        // default auto-refresh used to rewrite that clone's index while the digest read it.
+        fs::write(source.join("stable.txt"), "unchanged\n").expect("clean tracked file");
+        git(&source, &["add", "stable.txt"]);
+        git(&source, &["commit", "-qm", "keep a clean stat-cache entry"]);
 
         fs::write(source.join("README"), "test\nstaged\n").expect("stage README edit");
         git(&source, &["add", "README"]);
@@ -5743,6 +5760,16 @@ mod tests {
         let cedar_admin = main.join(".git/worktrees/cedar");
         let original = snapshot(&source, &source_admin);
         assert_eq!(original.0, "cowshed/raven");
+        assert!(source_repo.is_dirty().await.expect("read removal fence"));
+        assert_eq!(
+            snapshot(&source, &source_admin),
+            original,
+            "observing the source must not refresh its preserved index bytes"
+        );
+        let source_state = source_repo
+            .rename_work_state(true, &[])
+            .await
+            .expect("fenced source work state");
 
         copy_tree(&source, &destination);
         let main_repo = GitRepository::from_root(&main);
@@ -5757,6 +5784,11 @@ mod tests {
             .expect("resume preservation after registration");
         assert_eq!(snapshot(&destination, &cedar_admin), original);
         assert_eq!(snapshot(&source, &source_admin), original);
+        assert_eq!(
+            destination_repo.rename_work_state(true, &[]).await.unwrap(),
+            source_state,
+            "the linked registration carries the read-only rename fence"
+        );
         assert_eq!(
             fs::read_to_string(cedar_admin.join("gitdir")).expect("destination gitdir"),
             format!(

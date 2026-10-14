@@ -21,7 +21,7 @@ function localResult(hash) {
     throw new Error('the qualified receipt contains an invalid Nx task hash');
   }
   const result = getLocal(hash);
-  if (!result || result.code !== 0 || !fs.statSync(result.outputsPath, { throwIfNoEntry: false })?.isDirectory()) {
+  if (result?.code !== 0 || !fs.statSync(result.outputsPath, { throwIfNoEntry: false })?.isDirectory()) {
     throw new Error(`qualified task ${hash} has no successful complete local cache artifact`);
   }
   return result;
@@ -160,7 +160,7 @@ async function inspect() {
     }
     for (const task of tasks) {
       const result = results.get(task.id);
-      if (!result || result.code !== 0 || !SUCCESS.has(result.status)) {
+      if (result?.code !== 0 || !SUCCESS.has(result.status)) {
         throw new Error(`the checked task ${task.id} has no successful result`);
       }
     }

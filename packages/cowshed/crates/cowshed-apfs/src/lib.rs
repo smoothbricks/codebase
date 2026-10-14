@@ -1196,7 +1196,7 @@ pub struct AttachedImage {
     /// An attachment verified or recovered for mounting holds its raw IOMedia open. The
     /// kernel refuses even forced ejects until mount finishes or the handle is dropped;
     /// an observation-only recovered attachment has no pin.
-    pin: parking_lot::Mutex<Option<Fenced<File>>>,
+    pin: std::sync::Mutex<Option<Fenced<File>>>,
 }
 
 impl AttachedImage {
@@ -1210,7 +1210,10 @@ impl AttachedImage {
         &self.volume_device
     }
     fn release_pin(&self) {
-        self.pin.lock().take();
+        self.pin
+            .lock()
+            .expect("attachment pin mutex poisoned")
+            .take();
     }
 }
 
@@ -1993,10 +1996,10 @@ pub struct MacOsApfsBackend<R, S = ThreadSleeper> {
 
 /// A verified volume pinned under its image lease. Keep this value alive through the
 /// mount-table decision and any observation of a refused mount, not merely the child command.
-pub(crate) struct MountLease<'a, R, S> {
+pub struct MountLease<'a, R, S> {
     backend: &'a MacOsApfsBackend<R, S>,
     attachment: &'a AttachedImage,
-    inherited_pin: parking_lot::MutexGuard<'a, Option<Fenced<File>>>,
+    inherited_pin: std::sync::MutexGuard<'a, Option<Fenced<File>>>,
     _fresh_pin: Option<Fenced<File>>,
     _lease: Option<Fenced<File>>,
 }
@@ -2008,7 +2011,7 @@ impl<R, S> Drop for MountLease<'_, R, S> {
 }
 
 impl<R: CommandRunner, S: Sleeper> MountLease<'_, R, S> {
-    pub(crate) fn mount(
+    pub fn mount(
         &self,
         mount_point: &Path,
         access: MountAccess,
@@ -2083,12 +2086,15 @@ impl<R, S> MacOsApfsBackend<R, S> {
 impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     /// Acquire mount authority before consulting the mount table. A recovered attachment's
     /// pin fences its device across this reacquisition, but another mounter may have won.
-    pub(crate) fn prepare_mount<'a>(
+    pub fn prepare_mount<'a>(
         &'a self,
         attachment: &'a AttachedImage,
     ) -> Result<MountLease<'a, R, S>, ApfsError> {
         let lease = self.image_lease(&attachment.image)?;
-        let inherited_pin = attachment.pin.lock();
+        let inherited_pin = attachment
+            .pin
+            .lock()
+            .expect("attachment pin mutex poisoned");
         let fresh_pin = if inherited_pin.is_some() {
             // The verified IOMedia handle survived fsck and still prevents eject.
             None
@@ -2748,7 +2754,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         if !output.succeeded() {
             return Err(ApfsError::VerificationFailed { request, output });
         }
-        *attachment.pin.lock() = pin;
+        *attachment
+            .pin
+            .lock()
+            .expect("attachment pin mutex poisoned") = pin;
         Ok(attachment)
     }
 
@@ -2801,7 +2810,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         let Some(mut attachment) = self.existing_attachment(image)? else {
             return Ok(None);
         };
-        *attachment.pin.get_mut() = self.pin_attached_volume(&attachment)?;
+        *attachment
+            .pin
+            .get_mut()
+            .expect("attachment pin mutex poisoned") = self.pin_attached_volume(&attachment)?;
         Ok(Some(attachment))
     }
 
@@ -2924,7 +2936,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             image: image.to_owned(),
             whole_device,
             volume_device,
-            pin: parking_lot::Mutex::new(None),
+            pin: std::sync::Mutex::new(None),
         })
     }
 
@@ -2954,7 +2966,10 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             (attachment, request, output, pin)
         };
         if output.succeeded() {
-            *attachment.pin.get_mut() = pin;
+            *attachment
+                .pin
+                .get_mut()
+                .expect("attachment pin mutex poisoned") = pin;
             return Ok(attachment);
         }
         drop(pin);
@@ -3693,7 +3708,7 @@ fn attachment_capacity(
 
 /// The mount helper's already-in-progress refusal is an invitation to observe, not to retry.
 /// Unrelated failures remain failures even if a matching mount appears afterwards.
-pub(crate) fn mount_is_in_progress(error: &ApfsError) -> bool {
+pub fn mount_is_in_progress(error: &ApfsError) -> bool {
     matches!(error, ApfsError::CommandFailed { request, output, .. }
         if request.program == Path::new(MOUNT_APFS)
             && contains_bytes(&output.stderr, b"Operation already in progress"))
@@ -4024,7 +4039,7 @@ fn image_attachments(
                         image: image.to_owned(),
                         whole_device,
                         volume_device,
-                        pin: parking_lot::Mutex::new(None),
+                        pin: std::sync::Mutex::new(None),
                     })
                 }
             })
@@ -4055,7 +4070,7 @@ impl ReleaseView {
                 image: self.image.clone(),
                 whole_device: self.whole_device.clone(),
                 volume_device,
-                pin: parking_lot::Mutex::new(None),
+                pin: std::sync::Mutex::new(None),
             })
         })
     }
@@ -7824,7 +7839,7 @@ mod tests {
             image: temp_path(label, IMAGE_EXTENSION),
             whole_device: "/dev/disk12".into(),
             volume_device: "/dev/disk12s1".into(),
-            pin: parking_lot::Mutex::new(None),
+            pin: std::sync::Mutex::new(None),
         }
     }
 
@@ -10010,7 +10025,7 @@ mod tests {
             image: image.clone(),
             whole_device: "/dev/disk4".into(),
             volume_device: "/dev/disk5s3".into(),
-            pin: parking_lot::Mutex::new(None),
+            pin: std::sync::Mutex::new(None),
         });
         let refused = backend
             .unmount_released(&stranger, DetachIntent::Release)
@@ -10623,7 +10638,7 @@ mod tests {
             image: image.clone(),
             whole_device: "/dev/disk5".into(),
             volume_device: "/dev/disk5s1".into(),
-            pin: parking_lot::Mutex::new(None),
+            pin: std::sync::Mutex::new(None),
         };
         assert!(matches!(
             backend.unmount_verified(&attachment, DetachIntent::Release),

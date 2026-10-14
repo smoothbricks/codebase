@@ -6,7 +6,7 @@
 //! without executing a task. This is a focused proof of the bridge only: it is neither a protected
 //! land, a publication, nor a cutover claim.
 
-use cowshed_core::fork_lock::{Run as _, Spawn as _};
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use std::io::Write;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::io::{BufRead, BufReader, Read};
