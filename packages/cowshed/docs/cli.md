@@ -300,14 +300,15 @@ cowshed: caches volume: cowshed setup --retire-caches-volume cannot run until ea
 
 A repository-placed HOME cache is declared in main's `.cowshed.toml` (`[caches] home`). A toolchain cache whose actual
 writer uses a declared checkout build-state path instead moves through that existing build-volume link, not into a new
-shared HOME cache. For legacy `ttsc/`, explicitly select the owning main's declared `.cache/ttsc` and preserve the tree
-there while its writers are quiet; several mains declaring that path do not authorize an arbitrary global match. Setup
-also recognizes the historically nested `nix/.bun/install/cache`, `nix/bun` and `nix/nix` trees: Bun's caches go to
-their own HOME defaults, and the mutable Nix tree is preserved intact under `~/.cache/nix/cowshed-retired/nix-nix`,
-never overwritten or host-wins-dropped. These retained bytes are named in the move report. Once only the marker is left,
-a plain `setup` names the attended step and never escalates for it; the flag plans the deletion, the fstab rewrite and
-the mount-service rewrite into setup's one authorization, and refuses — deleting nothing — while anything else is still
-on the volume:
+shared HOME cache. For legacy `ttsc/`, explicitly select the owning main's declared `.cache/ttsc` and preserve a
+divergent legacy tree whole at `.cache/ttsc/cowshed-retired/ttsc` while its writers are quiet. This stays within the
+existing declared build state without merging mutable lock or usage bookkeeping; several mains declaring that path do
+not authorize an arbitrary global match. Setup also recognizes the historically nested `nix/.bun/install/cache`,
+`nix/bun` and `nix/nix` trees: Bun's caches go to their own HOME defaults, and the mutable Nix tree is preserved intact
+under `~/.cache/nix/cowshed-retired/nix-nix`, never overwritten or host-wins-dropped. These retained bytes are named in
+the move report. Once only the marker is left, a plain `setup` names the attended step and never escalates for it; the
+flag plans the deletion, the fstab rewrite and the mount-service rewrite into setup's one authorization, and refuses —
+deleting nothing — while anything else is still on the volume:
 
 ```
 $ cowshed setup

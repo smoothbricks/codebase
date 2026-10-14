@@ -320,8 +320,8 @@ fn retained_mutable_state_resumes_without_overwriting_different_bytes() {
     assert_eq!(fs::read(target.join("a.sqlite")).unwrap(), vec![b'y'; 11]);
 }
 
-/// Explicit selection follows an existing declared build-state link; no global HOME declaration
-/// or detector is needed, and the unrelated main's independently owned cache stays untouched.
+/// Explicit selection follows an existing declared build-state link. Divergent legacy state
+/// stays whole beneath it; current bookkeeping, the fixed link and another main stay unchanged.
 #[test]
 fn an_explicit_toolchain_placement_preserves_the_selected_build_state() {
     let fixture = Fixture::new();
@@ -330,21 +330,23 @@ fn an_explicit_toolchain_placement_preserves_the_selected_build_state() {
     fs::create_dir_all(selected.parent().unwrap()).unwrap();
     fs::create_dir_all(&build).unwrap();
     symlink(&build, &selected).unwrap();
+    fixture.file(&selected.join("plugins/same/.last-used"), 3);
     let other = fixture.root.join("other/.cache/ttsc");
-    fixture.file(&other.join("plugins/other/plugin"), 3);
+    fixture.file(&other.join("plugins/other/plugin"), 4);
     let source = fixture.volume.join("ttsc");
-    fixture.file(&source.join("plugins/old/plugin"), 5);
+    fixture.file(&source.join("plugins/same/.last-used"), 5);
     fixture.file(&source.join("go-build/aa/old-d"), 7);
     let bytes = tree_bytes(&source).unwrap();
     let plan = Plan {
-        steps: vec![Step::Merge {
+        steps: vec![Step::Move {
             placement: Placement {
-                label: "selected declared ttsc build state".to_owned(),
+                label: "selected declared ttsc build state (retained)".to_owned(),
                 volume: source,
-                host: selected.clone(),
+                host: selected.join("cowshed-retired/ttsc"),
                 merge: Merge::Preserve,
                 owner: None,
             },
+            replace_link: false,
             bytes,
         }],
         leftovers: Vec::new(),
@@ -354,11 +356,22 @@ fn an_explicit_toolchain_placement_preserves_the_selected_build_state() {
         (report.caches[0].moved_bytes, report.caches[0].dropped_bytes),
         (12, 0)
     );
-    assert_eq!(fs::read_link(selected).unwrap(), build);
+    assert_eq!(fs::read_link(&selected).unwrap(), build);
+    assert_eq!(
+        fs::read(selected.join("plugins/same/.last-used"))
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        fs::read(selected.join("cowshed-retired/ttsc/plugins/same/.last-used"))
+            .unwrap()
+            .len(),
+        5
+    );
     assert!(
-        fixture
-            .root
-            .join("build/declared/.cache/ttsc/plugins/old/plugin")
+        selected
+            .join("cowshed-retired/ttsc/go-build/aa/old-d")
             .is_file()
     );
     assert!(other.join("plugins/other/plugin").is_file());
