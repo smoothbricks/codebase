@@ -59,6 +59,14 @@
     Avoid needless allocation/copying, pay for computation once and retain what it proves. Specs state the target design
     in present tense, not a diary: implement an agreed better design and update its spec with the same unit, never omit
     the capability. Put implementation gaps and evidence in the owning brief, not status notes in the spec.
+14. **Depend on published revisions, never host paths.** Patch a dependency by git source and locked revision
+    (`rev = "<sha>"`), never by filesystem path: Cargo serves it from the local git cache, so the same tree builds on
+    any host and in CI. A path patch bakes one machine's checkout into the build and fails everywhere else.
+15. **Fail early and fix the root cause.** A failure is information: stop the work that depends on it, name the cause
+    and fix it there. Never retry around it, tolerate it, widen a bound, skip the check or route around it - a tolerated
+    failure is a defect with a receipt. Every error you raise carries the context you already have at the throw site -
+    the operation, the subject (ids, paths, versions), the values involved and the cause - in the structured error
+    result, so the reader needs no second run to understand it.
 
 ### Conduct
 
