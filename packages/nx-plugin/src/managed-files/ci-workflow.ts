@@ -410,10 +410,9 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         `      - name: ${step.name}`,
         `        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}`,
         '        with:',
-        '          filter: blob:none',
+        '          # Full history includes blobs needed by nx affected after checkout credentials are removed.',
         '          fetch-depth: 0',
-        '          # nx affected lazily fetches blobs from the partial clone',
-        '          persist-credentials: true',
+        '          persist-credentials: false',
       ];
     case CiWorkflowStepKind.SourceCheckouts:
       return sourceCheckoutsStepLines(step, options.sourceCheckouts ?? []);
@@ -1415,14 +1414,13 @@ export function artifactStepLines(
   inputs: readonly string[],
   condition = 'success()',
 ): string[] {
-  // GitHub resolves every action before evaluating step conditions, so a
-  // Forgejo absolute action URL must never appear in a GitHub workflow.
-  // Forgejo 15 supports v4 artifacts; its pinned clients remove the GHES gate.
+  // Local adapters keep both providers in GitHub's workflow grammar while
+  // Forgejo runs its exact pinned clients without the GitHub GHES rejection.
   const action =
     provider === 'forgejo'
       ? kind === 'upload'
-        ? 'https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245'
-        : 'https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f'
+        ? './.github/actions/forgejo-upload-artifact'
+        : './.github/actions/forgejo-download-artifact'
       : kind === 'upload'
         ? `${githubActionPins.uploadArtifact.ref} # ${githubActionPins.uploadArtifact.version}`
         : `${githubActionPins.downloadArtifact.ref} # ${githubActionPins.downloadArtifact.version}`;

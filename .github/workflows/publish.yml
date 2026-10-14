@@ -56,10 +56,10 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
-          filter: blob:none
           fetch-depth: 0
-          # release version lazily fetches historical package manifests from the partial clone
-          persist-credentials: true
+          # No remote is read or written from this job: the clone is complete and the
+          # candidate commit leaves only as the transferred bundle.
+          persist-credentials: false
 
       # Step 3. Composite action internals do not affect top-level job step
       # anchors; update these comments if top-level steps move.
@@ -228,7 +228,6 @@ jobs:
     env:
       LMAO_GIT_REVISION: ${{ github.sha }}
       GH_TOKEN: ${{ github.token }}
-
     steps:
       # --- Setup --------------------------------------------------------------
 
@@ -238,9 +237,10 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
-          filter: blob:none
           fetch-depth: 0
           # build-platform-outputs fetches the release branch and tags from origin
+          # (packages/cli/src/release/index.ts:335). This job pushes nothing, but a private origin refuses
+          # that fetch without the checkout credential, so it stays persisted.
           persist-credentials: true
 
       # Step 3. Composite action internals do not affect top-level job step
@@ -336,7 +336,6 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
-          filter: blob:none
           fetch-depth: 0
           # smoo publish and pending-release repair push release refs.
           persist-credentials: true

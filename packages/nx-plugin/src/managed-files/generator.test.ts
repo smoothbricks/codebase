@@ -10,6 +10,7 @@ import type { PackageJson } from '../workspace-manifest.js';
 import type { WorkspaceProjects } from './context.js';
 import { generateManagedFiles } from './generator.js';
 import { INLINE_LOCAL_BEGIN, INLINE_LOCAL_END, LOCAL_SECTION_MARKER } from './managed-content.js';
+import { renderPublishWorkflowYaml } from './publish-workflow.js';
 import { assertNoManagedConflicts } from './tree.js';
 
 const repository = 'https://github.com/example/workspace.git';
@@ -63,6 +64,60 @@ describe('managed-files generator', () => {
     expect(tree.read('.github/workflows/publish.yml', 'utf8')).toContain('name: Publish');
     expect(tree.read('tooling/direnv/devenv.smoo.nix', 'utf8')).toContain('languages.rust');
     expect(tree.listChanges().find((change) => change.path === 'tooling/devenv')?.options?.mode).toBe(0o755);
+  });
+
+  it('passes the real workflow validator for both artifact providers without rule exceptions', async () => {
+    for (const actionsProvider of ['github', 'forgejo'] as const) {
+      const root = mkdtempSync(join(tmpdir(), 'smoo-workflow-lint-'));
+      expect(Bun.spawnSync(['git', 'init', '--quiet', root]).exitCode).toBe(0);
+      temporaryRoots.push(root);
+      const tree = workspace();
+      updateJson<PackageJson>(tree, 'package.json', (pkg) => ({
+        ...pkg,
+        smoo: { github: { actionsProvider } },
+      }));
+      flushChanges(root, tree.listChanges());
+      const generated = new FsTree(root, false);
+      await generate(generated);
+      const producer = renderPublishWorkflowYaml({
+        repoName: 'example/workspace',
+        actionsProvider,
+        platformTargetGlobs: ['*-macos'],
+        privateNpm: { scope: '@example', readTokenEnv: 'READ_TOKEN', publishTokenEnv: 'PUBLISH_TOKEN' },
+        platformProducer: {
+          kind: 'linux-cross',
+          preflight: 'test -n "$name$delimiter$SDKROOT"',
+          env: {
+            name: 'first value',
+            delimiter: 'second value',
+            __SMOO_ENV_DELIMITER: 'former scratch name',
+            SDKROOT: '${{ runner.temp }}/sdk',
+            // GitHub refuses NODE_OPTIONS through GITHUB_ENV, so only a step's own env carries it, beside the others.
+            NODE_OPTIONS: '--require ${{ runner.temp }}/preload.cjs --max-old-space-size=4096',
+            TRUE: 'upper true identifier',
+            FALSE: 'upper false identifier',
+            NULL: 'upper null identifier',
+            // Names generated steps also declare keep the step's own value: the validator rejects a repeated key.
+            SMOO_RELEASE_PROJECTS: 'producer-chosen projects',
+            PUBLISH_TOKEN: 'producer-chosen credential',
+          },
+        },
+      });
+      // The validator must judge the direct env on more than one step, not a workflow that dropped it.
+      const carriers = workflowSteps(producer).filter((step) => {
+        const env = step.get('env');
+        return typeof env === 'object' && env !== null && 'NODE_OPTIONS' in env;
+      });
+      expect(carriers.length).toBeGreaterThan(1);
+      generated.write('.github/workflows/producer.yml', producer);
+      flushChanges(root, generated.listChanges());
+      const result = Bun.spawnSync(['jactionlint', '--no-online', '--config-file', '/dev/null', '--strict-exit'], {
+        cwd: root,
+        env: process.env,
+      });
+      expect(result.stderr.toString() + result.stdout.toString()).toBe('');
+      expect(result.exitCode).toBe(0);
+    }
   });
 
   it('uses manifest edits from Tree, not the checkout that runs the tests', async () => {

@@ -28,7 +28,13 @@ A release is valid only when all of these remain true:
 - Every transferred file is verified by source SHA, size, and SHA-256 before it enters the publishing worktree.
 - Paths, symlinks, undeclared files, duplicate destinations, and destination collisions fail closed.
 - The final Ubuntu job restores every file that enters the package tarball; it does not rebuild producer work.
+- Forgejo artifacts use managed local actions which run exact pinned GHES-gate-free Forgejo clients; GitHub clients
+  remain SHA-pinned; runner-independent GitHub grammar is linted with unchanged default rules.
 - Release validation does not honor ordinary-CI `ci:skip:<target>` tags.
+- A producer's declared environment is merged into each step's `env`, with step-local fields taking precedence. An
+  unsupported declaration name fails generation with the name in its diagnostic, never a silent drop. Producer
+  environment does not travel through `GITHUB_ENV`, because
+  [GitHub forbids setting `NODE_OPTIONS` through that file](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-an-environment-variable).
 - Only the final publishing job receives trusted-publishing/OIDC capability.
 - The generated `# Step N` comments remain aligned with GitHub's job-local step numbering because external deeplinks use
   those anchors.

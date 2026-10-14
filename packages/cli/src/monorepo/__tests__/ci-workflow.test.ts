@@ -62,6 +62,55 @@ describe('CI workflow definition', () => {
     expect(rendered).toContain("# Step 13\n      # Nx's database cache needs artifact files");
   });
 
+  it('pins every external action and materializes full read-only checkouts with finite bounds', () => {
+    for (const actionsProvider of ['github', 'forgejo'] as const) {
+      const definition = options({
+        actionsProvider,
+        deploy: true,
+        browserTests: true,
+        e2eDeployment: true,
+        productionOnPush: true,
+        crossTestArchives: [
+          { triple: 'aarch64-apple-darwin', path: '.cache/nextest/archive-aarch64-apple-darwin.tar.zst' },
+        ],
+      });
+      const rendered = renderCiWorkflowYaml(definition);
+      const workflow = typia.assert<{
+        jobs: Record<
+          string,
+          {
+            'timeout-minutes': number;
+            steps: Array<{
+              uses?: string;
+              with?: { 'persist-credentials'?: boolean; 'fetch-depth'?: number; filter?: string };
+            }>;
+          }
+        >;
+      }>(Bun.YAML.parse(rendered));
+      expect(Object.keys(workflow.jobs).sort()).toEqual([
+        'deploy-production',
+        'e2e-deployment',
+        'macos-cross-tests',
+        'main',
+      ]);
+      for (const job of Object.values(workflow.jobs)) {
+        expect(job['timeout-minutes']).toBeGreaterThan(0);
+        const checkouts = job.steps.filter((step) => step.uses?.startsWith('actions/checkout@'));
+        expect(checkouts).toHaveLength(1);
+        for (const step of job.steps) {
+          if (step.uses && !step.uses.startsWith('./')) expect(step.uses).toMatch(/^[^@]+@[0-9a-f]{40}$/);
+        }
+        for (const checkout of checkouts) {
+          expect(checkout.with?.['persist-credentials']).toBe(false);
+          expect(checkout.with?.['fetch-depth']).toBe(0);
+          expect(checkout.with?.filter).toBeUndefined();
+        }
+      }
+      const expected = defineCiWorkflow(definition);
+      for (const step of expected) expect(rendered).toContain('- name: ' + step.name);
+    }
+  });
+
   it('adds only generic Cloudflare credentials for Wrangler-backed deploys', () => {
     const rendered = renderCiWorkflowYaml(options({ deploy: true, deployProvider: 'cloudflare' }));
 
@@ -1060,7 +1109,7 @@ describe('renderCiWorkflowYaml with cross-built test archives', () => {
       // other artifact here does instead of naming `actions/` itself.
       expect(artifacts.filter((step) => step.uses?.includes('download-artifact'))).toHaveLength(1);
       for (const step of artifacts) {
-        expect(step.uses?.startsWith('https://code.forgejo.org/')).toBe(actionsProvider === 'forgejo');
+        expect(step.uses?.startsWith('./.github/actions/forgejo-')).toBe(actionsProvider === 'forgejo');
         expect(step.uses?.startsWith('actions/')).toBe(actionsProvider !== 'forgejo');
       }
     }

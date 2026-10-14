@@ -1,5 +1,7 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are emitted literally. */
 
+import { isMap, isScalar, parseDocument } from 'yaml';
+
 import {
   LINUX_PLATFORM_TARGET_GLOBS,
   MACOS_PLATFORM_TARGET_GLOBS,
@@ -426,7 +428,12 @@ function shouldRunStep(
  */
 export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions = {}): string {
   if (options.release === false) {
-    return `${renderPublishWorkflowHeader(options)}${renderPublishWorkflowSteps(definePublishWorkflow(options).steps, options)}`;
+    const steps = definePublishWorkflow(options).steps;
+    const rendered =
+      skipsPublishHandoff(options) && options.platformProducer !== undefined
+        ? renderSingleJobPublishWorkflowSteps(steps, options)
+        : renderPublishWorkflowSteps(steps, options);
+    return `${renderPublishWorkflowHeader(options)}${rendered}`;
   }
   if (hasMacosPlatformTargets(options) && !skipsPublishHandoff(options)) {
     return renderPlatformPublishWorkflowYaml(options);
@@ -435,7 +442,11 @@ export function renderPublishWorkflowYaml(options: PublishWorkflowDefinitionOpti
   // runner. Splitting jobs then buys nothing and costs a real transfer: the
   // outputs get tarred, uploaded, downloaded into a second checkout, and two
   // more devenv setups pay for themselves twice. One job, no artifacts.
-  if (hasMacosPlatformTargets(options) || hasLinuxPlatformTargets(options)) {
+  if (
+    hasMacosPlatformTargets(options) ||
+    hasLinuxPlatformTargets(options) ||
+    (skipsPublishHandoff(options) && options.platformProducer !== undefined)
+  ) {
     return `${renderPublishWorkflowHeader(options)}${renderSingleJobPublishWorkflowSteps(
       definePublishWorkflow(options).steps,
       options,
@@ -503,7 +514,7 @@ ${options.release === false ? renderRunsOnLine(options.runsOn) : publishJobRunsO
     timeout-minutes: ${options.platformTargetGlobs?.length ? 90 : 45}
     env:
       LMAO_GIT_REVISION: ${githubExpression('github.sha')}
-      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}${platformProducerJobEnv(options)}
+      GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
     steps:
 `;
 }
@@ -563,7 +574,6 @@ function yamlLinesForStep(step: PublishWorkflowStep, options: PublishWorkflowDef
         `      - name: ${step.name}`,
         `        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}`,
         '        with:',
-        '          filter: blob:none',
         '          fetch-depth: 0',
         ...(options.release === false
           ? ['          persist-credentials: false']
@@ -800,47 +810,57 @@ function renderSingleJobPublishWorkflowSteps(
   options: PublishWorkflowDefinitionOptions,
 ): string {
   const lines: string[] = [];
-  const producer = options.platformProducer;
-  const crossOnThisRunner = skipsPublishHandoff(options) && hasMacosPlatformTargets(options);
+  const handoffSkipped = skipsPublishHandoff(options);
+  // The declared producer runs only in a job that skips the publish handoff; any other
+  // single job renders without it, and so without its environment.
+  const producer = handoffSkipped ? options.platformProducer : undefined;
+  const crossOnThisRunner = handoffSkipped && hasMacosPlatformTargets(options);
+  let stepNumber = 2;
   for (const step of steps) {
-    lines.push(...sectionLinesBefore(step));
-    lines.push(...commentLinesForStep(step));
-    lines.push(...yamlLinesForStep(step, options));
+    const numberedStep = { ...step, number: stepNumber++ };
+    lines.push(...sectionLinesBefore(numberedStep));
+    lines.push(...commentLinesForStep(numberedStep));
+    lines.push(...yamlLinesForStep(numberedStep, options));
     lines.push('');
-    if (crossOnThisRunner && producer && step.kind === PublishWorkflowStepKind.Checkout) {
-      // Before any toolchain setup or build, exactly as the dedicated producer
-      // job ordered it: the SDK has to be on disk before devenv resolves it.
-      lines.push(
-        '      - name: Check cross-platform toolchain prerequisites',
-        '        working-directory: .',
-        '        run: |',
-        '          set -euo pipefail',
-        ...producer.preflight.split('\n').map((line) => `          ${line}`),
-        '',
-      );
+    if (producer && step.kind === PublishWorkflowStepKind.Checkout) {
+      // A declared producer always runs, even when the graph selects no platform family.
+      lines.push('      # Step ' + stepNumber++, ...platformProducerPreflightStepLines(producer), '');
     }
-    if (step.kind === PublishWorkflowStepKind.Build) {
+    if (
+      step.kind === PublishWorkflowStepKind.Build &&
+      (hasMacosPlatformTargets(options) || hasLinuxPlatformTargets(options))
+    ) {
       lines.push(
+        '      # Step ' + stepNumber++,
         '      - name: 🐧 Build supplemental Linux targets',
         "        if: steps.version.outputs.mode != 'none'",
-        `        run: smoo github-ci nx-run-many --targets "${LINUX_PLATFORM_TARGET_GLOBS.join(',')}" --projects "${githubExpression(
-          'steps.version.outputs.projects',
-        )}" ${RELEASE_BUILD_ARGUMENT}`,
+        '        run:',
+        '          smoo github-ci nx-run-many --targets "' +
+          LINUX_PLATFORM_TARGET_GLOBS.join(',') +
+          '" --projects "' +
+          githubExpression('steps.version.outputs.projects') +
+          '" ' +
+          RELEASE_BUILD_ARGUMENT,
         '',
       );
       if (crossOnThisRunner) {
         lines.push(
+          '      # Step ' + stepNumber++,
           '      - name: 🍎 Build selected macOS and iOS release outputs',
           "        if: steps.version.outputs.mode != 'none'",
-          `        run: smoo github-ci nx-run-many --targets "${macosPlatformFamilies(options).join(',')}" --projects "${githubExpression(
-            'steps.version.outputs.projects',
-          )}" ${RELEASE_BUILD_ARGUMENT}`,
+          '        run:',
+          '          smoo github-ci nx-run-many --targets "' +
+            macosPlatformFamilies(options).join(',') +
+            '" --projects "' +
+            githubExpression('steps.version.outputs.projects') +
+            '" ' +
+            RELEASE_BUILD_ARGUMENT,
           '',
         );
       }
     }
   }
-  return `${lines.join('\n').trimEnd()}\n`;
+  return mergeProducerStepEnvironment(lines, producer).join('\n').trimEnd() + '\n';
 }
 
 function renderPlatformPublishWorkflowYaml(options: PublishWorkflowDefinitionOptions): string {
@@ -913,9 +933,6 @@ ${renderMacosJobHeaderLines(options)}
     env:
       LMAO_GIT_REVISION: ${githubExpression('github.sha')}
       GH_TOKEN: ${githubExpression('github.token')}${remoteCacheJobEnv(options)}${cargoCredentialsJobEnv(options)}${privateNpmInstallJobEnv(options)}
-${Object.entries(options.platformProducer?.env ?? {})
-  .map(([name, value]) => `      ${name}: ${JSON.stringify(value)}`)
-  .join('\n')}
     steps:
 ${renderMacosPlatformSteps(options)}
 
@@ -968,10 +985,10 @@ function renderLinuxReleaseCandidateSteps(
         `        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}`,
         '        with:',
         `          ref: ${githubExpression('github.sha')}`,
-        '          filter: blob:none',
         '          fetch-depth: 0',
-        '          # release version lazily fetches historical package manifests from the partial clone',
-        '          persist-credentials: true',
+        '          # No remote is read or written from this job: the clone is complete and the',
+        '          # candidate commit leaves only as the transferred bundle.',
+        '          persist-credentials: false',
       );
     } else if (step.kind === PublishWorkflowStepKind.Build) {
       lines.push(
@@ -1091,24 +1108,14 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     `        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}`,
     '        with:',
     `          ref: ${githubExpression('github.sha')}`,
-    '          filter: blob:none',
     '          fetch-depth: 0',
     '          # build-platform-outputs fetches the release branch and tags from origin',
+    '          # (packages/cli/src/release/index.ts:335). This job pushes nothing, but a private origin refuses',
+    '          # that fetch without the checkout credential, so it stays persisted.',
     '          persist-credentials: true',
   ];
   if (options.platformProducer) {
-    if (!options.platformProducer.preflight.trim()) {
-      throw new Error('Linux cross-platform production requires a nonempty toolchain preflight command.');
-    }
-    lines.push(
-      '',
-      `      # Step ${stepNumber++}`,
-      '      - name: Check cross-platform toolchain prerequisites',
-      '        working-directory: .',
-      '        run: |',
-      '          set -euo pipefail',
-      ...options.platformProducer.preflight.split('\n').map((line) => `          ${line}`),
-    );
+    lines.push('', `      # Step ${stepNumber++}`, ...platformProducerPreflightStepLines(options.platformProducer));
   }
   const macosCargoCredentials = cargoCredentialsStepLines(options);
   if (macosCargoCredentials.length > 0) {
@@ -1222,7 +1229,7 @@ function renderMacosPlatformSteps(options: PublishWorkflowDefinitionOptions): st
     '        with:',
     `          devenv-cache-hit: ${githubExpression('steps.setup.outputs.devenv-cache-hit')}`,
   );
-  return lines.join('\n').trimEnd();
+  return mergeProducerStepEnvironment(lines, options.platformProducer).join('\n').trimEnd();
 }
 
 function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions): string {
@@ -1237,7 +1244,6 @@ function renderFinalLinuxPublishSteps(options: PublishWorkflowDefinitionOptions)
     `        uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}`,
     '        with:',
     `          ref: ${githubExpression('github.sha')}`,
-    '          filter: blob:none',
     '          fetch-depth: 0',
     '          # smoo publish and pending-release repair push release refs.',
     '          persist-credentials: true',
@@ -1533,20 +1539,202 @@ function skipsPublishHandoff(options: PublishWorkflowDefinitionOptions): boolean
   return !hasMacosPlatformTargets(options) || options.platformProducer?.kind === 'linux-cross';
 }
 
+type PlatformProducer = NonNullable<PublishWorkflowDefinitionOptions['platformProducer']>;
+
+/** Names become YAML keys of every step's `env:`, so only portable identifiers are admissible. */
+const PLATFORM_PRODUCER_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 /**
- * Toolchain environment for a foreign-platform producer, rendered onto whichever
- * job runs its builds. In the flattened single-job shape that is the publish job
- * itself, so the SDK path and cross flags have to reach it the same way the
- * dedicated producer job received them.
+ * The producer's toolchain preflight, shared by the dedicated producer job and
+ * the flattened single job. It is an ordinary step of that job: the declared
+ * environment reaches it through `mergeProducerStepEnvironment` exactly as it
+ * reaches every other step, so the preflight checks the toolchain the build sees.
  */
-function platformProducerJobEnv(options: PublishWorkflowDefinitionOptions): string {
-  const producer = options.platformProducer;
-  if (!producer || !skipsPublishHandoff(options)) {
-    return '';
+function platformProducerPreflightStepLines(producer: PlatformProducer): string[] {
+  if (!producer.preflight.trim()) {
+    throw new Error('Linux cross-platform production requires a nonempty toolchain preflight command.');
   }
-  return Object.entries(producer.env ?? {})
-    .map(([name, value]) => `\n      ${name}: ${JSON.stringify(value)}`)
-    .join('');
+  return [
+    '      - name: Check cross-platform toolchain prerequisites',
+    '        working-directory: .',
+    '        run: |',
+    '          set -euo pipefail',
+    ...producer.preflight.split('\n').map((line) => `          ${line}`),
+  ];
+}
+
+/** One declared producer variable. */
+type ProducerEnvEntry = readonly [name: string, value: string];
+
+/**
+ * The declared variables, each proved a valid key of a step `env:`. GitHub
+ * rejects mapping keys that differ only by case as duplicates, so such a pair
+ * cannot share one env mapping: it fails here, naming both, not in CI.
+ */
+function platformProducerEnvEntries(producer: PlatformProducer | undefined): ProducerEnvEntry[] {
+  const entries = Object.entries(producer?.env ?? {});
+  const byUpperCase = new Map<string, string>();
+  for (const [name] of entries) {
+    if (!PLATFORM_PRODUCER_ENV_NAME.test(name)) {
+      throw new Error(
+        `smoo.github.platformProducer.env name ${JSON.stringify(name)} is not a valid environment variable name.`,
+      );
+    }
+    const upper = name.toUpperCase();
+    const twin = byUpperCase.get(upper);
+    if (twin !== undefined) {
+      throw new Error(
+        `smoo.github.platformProducer.env names ${JSON.stringify(twin)} and ${JSON.stringify(name)} differ only by case, which GitHub Actions rejects as a duplicate env key.`,
+      );
+    }
+    byUpperCase.set(upper, name);
+  }
+  return entries;
+}
+
+/** A top-level step opens with exactly this prefix, and its own env mapping with exactly this header. */
+const RENDERED_STEP_OPENER = '      - name:';
+const RENDERED_STEP_ENV_HEADER = '        env:';
+
+/**
+ * The producer's declared environment, carried by every step of its job as that
+ * step's own `env:`.
+ *
+ * Step env is the one transport that carries every declarable name: GitHub
+ * forbids `NODE_OPTIONS` in `GITHUB_ENV`, and a job-level `env` cannot evaluate
+ * the `runner` context an SDK path under `runner.temp` needs. A step's own fields
+ * win: a variable the step already scopes (release inputs, the publisher
+ * credential, Cargo and source-checkout secrets) keeps its value and only the
+ * producer's copy is omitted from that step, so no step carries a key twice.
+ * What cannot be carried fails generation naming the declared variables and the
+ * step: a step-local key equal to a declared name ignoring case (GitHub rejects
+ * such duplicates), or an `env:` this function cannot read.
+ *
+ * `lines` are the renderer's own fragments, not arbitrary YAML: every top-level
+ * step opens with exactly `      - name:` and its own env is exactly
+ * `        env:` with entries nested deeper. Only that block is parsed, and only
+ * for its keys; every existing line and comment is kept as written.
+ */
+function mergeProducerStepEnvironment(lines: string[], producer: PlatformProducer | undefined): string[] {
+  const entries = platformProducerEnvEntries(producer);
+  if (entries.length === 0) {
+    return lines;
+  }
+  const merged: string[] = [];
+  let steps = 0;
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.startsWith(RENDERED_STEP_OPENER)) {
+      if (/^ {6}- /.test(line)) {
+        throw producerEnvMergeError(
+          entries,
+          `generated step ${JSON.stringify(line.trim())}`,
+          'a top-level step must open with "- name:"',
+        );
+      }
+      merged.push(line);
+      index += 1;
+      continue;
+    }
+    // A step runs until the next non-blank line indented no deeper than its opener:
+    // the next step, or the anchor comment above it.
+    let end = index + 1;
+    while (end < lines.length && (lines[end].trim() === '' || /^ {7}/.test(lines[end]))) {
+      end += 1;
+    }
+    merged.push(...mergeStepEnvironment(lines.slice(index, end), entries));
+    steps += 1;
+    index = end;
+  }
+  if (steps === 0) {
+    throw producerEnvMergeError(entries, 'the rendered job', 'it has no step to carry the environment');
+  }
+  return merged;
+}
+
+/**
+ * One step's lines with the producer's variables added to its own `env:`. A step
+ * without one gets an empty header under its opener, so both shapes merge the
+ * same way; the step's own keys win.
+ */
+function mergeStepEnvironment(step: readonly string[], entries: readonly ProducerEnvEntry[]): string[] {
+  const where = `generated step ${JSON.stringify(step[0].slice(RENDERED_STEP_OPENER.length).trim())}`;
+  const envFields = step.flatMap((line, index) => (/^ {8}env:/.test(line) ? [index] : []));
+  if (envFields.length > 1) {
+    throw producerEnvMergeError(entries, where, 'it declares env more than once');
+  }
+  const lines = envFields.length === 0 ? [step[0], RENDERED_STEP_ENV_HEADER, ...step.slice(1)] : step;
+  const header = envFields.length === 0 ? 1 : envFields[0];
+  if (lines[header] !== RENDERED_STEP_ENV_HEADER) {
+    throw producerEnvMergeError(
+      entries,
+      where,
+      `its env field ${JSON.stringify(lines[header])} is not a block mapping header`,
+    );
+  }
+  // Entries are indented deeper than the header; the block ends at the next field or step comment.
+  let end = header + 1;
+  while (end < lines.length && /^ {9}/.test(lines[end])) {
+    end += 1;
+  }
+  const ownKeys =
+    envFields.length === 0
+      ? []
+      : stepEnvKeys(lines.slice(header, end), (reason, cause) => producerEnvMergeError(entries, where, reason, cause));
+  const stamped: string[] = [];
+  for (const entry of entries) {
+    const [name, value] = entry;
+    const ownKey = ownKeys.find((key) => key.toUpperCase() === name.toUpperCase());
+    if (ownKey === undefined) {
+      stamped.push(`          ${JSON.stringify(name)}: ${JSON.stringify(value)}`);
+    } else if (ownKey !== name) {
+      throw producerEnvMergeError(
+        [entry],
+        where,
+        `its own env key ${JSON.stringify(ownKey)} differs from the declared name only by case, which GitHub Actions rejects as a duplicate key`,
+      );
+    }
+  }
+  return [...lines.slice(0, header + 1), ...stamped, ...lines.slice(header + 1)];
+}
+
+/** The keys of one step's own `env:` block, read by the YAML parser; the block's lines stay as written. */
+function stepEnvKeys(block: readonly string[], fail: (reason: string, cause?: unknown) => Error): string[] {
+  const document = parseDocument(block.join('\n'), { prettyErrors: false });
+  if (document.errors.length > 0) {
+    const reasons = document.errors.map((error) => `${error.message} (${error.code})`).join('; ');
+    throw fail(`its env block is not valid YAML: ${reasons}`, document.errors[0]);
+  }
+  const root = document.contents;
+  const field = isMap(root) ? root.items.find((item) => isScalar(item.key) && item.key.value === 'env') : undefined;
+  const env = field?.value;
+  if (env === null || (isScalar(env) && env.value === null)) {
+    return [];
+  }
+  if (!isMap(env)) {
+    throw fail('its env block is not a mapping');
+  }
+  return env.items.map((pair) => {
+    const key = pair.key;
+    if (!isScalar(key) || typeof key.value !== 'string') {
+      throw fail('its env block has a key that is not a string', pair);
+    }
+    return key.value;
+  });
+}
+
+function producerEnvMergeError(
+  entries: readonly ProducerEnvEntry[],
+  where: string,
+  reason: string,
+  cause?: unknown,
+): Error {
+  const names = entries.map(([name]) => JSON.stringify(name)).join(', ');
+  return new Error(
+    `smoo.github.platformProducer.env ${names} cannot be merged into ${where}: ${reason}.`,
+    cause === undefined ? undefined : { cause },
+  );
 }
 
 function privateNpmInstallJobEnv(options: PublishWorkflowDefinitionOptions): string {

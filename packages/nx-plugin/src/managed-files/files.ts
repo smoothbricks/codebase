@@ -254,6 +254,31 @@ const managedFiles: ManagedFileDescriptor[] = [
     source: 'github/actions/cache-nx/action.yml',
     target: '.github/actions/cache-nx/action.yml',
   },
+  {
+    kind: 'template',
+    source: 'github/actions/forgejo-upload-artifact/action.yml',
+    target: '.github/actions/forgejo-upload-artifact/action.yml',
+  },
+  {
+    kind: 'template',
+    source: 'github/actions/forgejo-upload-artifact/index.cjs',
+    target: '.github/actions/forgejo-upload-artifact/index.cjs',
+  },
+  {
+    kind: 'template',
+    source: 'github/actions/forgejo-download-artifact/action.yml',
+    target: '.github/actions/forgejo-download-artifact/action.yml',
+  },
+  {
+    kind: 'template',
+    source: 'github/actions/forgejo-download-artifact/index.cjs',
+    target: '.github/actions/forgejo-download-artifact/index.cjs',
+  },
+  {
+    kind: 'template',
+    source: 'github/actions/forgejo-artifact.cjs',
+    target: '.github/actions/forgejo-artifact.cjs',
+  },
 ];
 
 export const managedFileTargetsForTest = managedFiles.map(({ target, executable }) => ({ target, executable }));
