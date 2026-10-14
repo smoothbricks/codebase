@@ -53,8 +53,8 @@
  * A repository can also DECLARE such links, so every checkout of it on a
  * developer machine gets them without anyone running `bun link`: the root
  * package.json's `smoo.developerLinks` maps a package name to a relative
- * directory, resolved against this checkout's own root. Existing sibling
- * links carried into a cowshed workspace keep their absolute targets.
+ * directory. Contained targets belong to this checkout; genuine sibling
+ * targets are anchored at the project's main checkout (see `linkAnchor`).
  * `applyDeclaredLinks` makes it so: in every node_modules tree that has the
  * package installed, the entry becomes a link to that directory, unless a
  * developer already pointed it at a checkout of their own. An existing real
@@ -144,7 +144,8 @@ export async function keepDeveloperLinks<T>(
   const recorded = readDeclaredRecord(root);
   const undeclared = new Set<string>();
   if (recorded.size > 0) {
-    const declared = new Map(readDeclaredLinks(root));
+    const declared = new Set<string>();
+    for (const { name } of readDeclaredLinks(root)) declared.add(name);
     for (const link of live) {
       if (recorded.get(link.path)?.target === link.target && !declared.has(packageName(link))) {
         undeclared.add(link.path);
@@ -188,20 +189,9 @@ export async function keepDeveloperLinks<T>(
       restoreLink(root, link);
       const receipt = recorded.get(link.path);
       // The install's postinstall may have claimed this alias after Bun replaced
-      // it. Restoring a manual override restores it as the developer's binding
-      // under the current declaration, so a later plan does not claim it.
-      if (receipt?.target === link.target) {
-        restored.set(link.path, receipt);
-      } else if (receipt !== undefined) {
-        const declaration = new Map(readDeclaredLinks(root)).get(packageName(link));
-        if (declaration !== undefined) {
-          restored.set(link.path, { path: link.path, declaration, target: link.target });
-        } else {
-          restored.delete(link.path);
-        }
-      } else {
-        restored.delete(link.path);
-      }
+      // it. Restoring a manual override must restore its lack of ownership too.
+      if (receipt?.target === link.target) restored.set(link.path, receipt);
+      else restored.delete(link.path);
     }
     writeDeclaredRecord(root, restored);
     if (succeeded && recorded.size > 0 && process.env.GITHUB_ACTIONS !== 'true') {
@@ -396,7 +386,6 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
     return { changes: [], unavailable: [] };
   }
   const anchor = linkAnchor(root);
-  const manifestMtime = statSync(path.join(root, 'package.json')).mtimeMs;
   const canonicalRoot = realpathSync(root);
   const trees = nodeModulesTrees(root);
   const recorded = readDeclaredRecord(root);
@@ -442,16 +431,7 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
         // A receipt proves an earlier managed sibling binding; an unrecorded
         // sibling or a manual retarget remains the developer's own choice.
         const inherited = inheritedContainedBinding(anchor, relative, current);
-        const receipt = recorded.get(entry);
-        // A contained declaration owns its entry at whatever target it was retargeted to. A
-        // managed sibling entry follows the declaration while the link is exactly what this
-        // owner last wrote; a retarget after that stays the developer's. An unrecorded foreign
-        // link answers to the declaration it was made under: one made while this declaration
-        // stood is claimed, one a later declaration change overtook is not.
-        const managed =
-          contained ||
-          (receipt !== undefined && receipt.target === text && receipt.declaration !== relative) ||
-          (receipt === undefined && stats.mtimeMs >= manifestMtime);
+        const managed = recorded.get(entry)?.target === text;
         if (current === target && text === packageAliasTarget(root, at, target)) continue;
         const physical = sourcePhysical === undefined ? undefined : realpathOrNull(current);
         if (binding.kind === 'snapshot' && foreign && !inherited && !managed && physical === sourcePhysical) {
@@ -669,7 +649,7 @@ function readDeclaredLinks(root: string): DeclaredLink[] {
     const directory: unknown = object ? Reflect.get(declaration, 'directory') : declaration;
     if (typeof directory !== 'string' || directory.length === 0 || path.isAbsolute(directory)) {
       throw new Error(
-        `${manifestPath}: smoo.developerLinks ${name} must be a directory relative to ${import.meta.main ? 'the main' : 'this'} checkout, not ${JSON.stringify(directory)}`,
+        `${manifestPath}: smoo.developerLinks ${name} must be a directory relative to the main checkout, not ${JSON.stringify(directory)}`,
       );
     }
     if (!object) return { name, directory, snapshot: undefined };
@@ -693,13 +673,11 @@ function readDeclaredLinks(root: string): DeclaredLink[] {
   });
 }
 
-/** Project-contained declared directories follow their checkout; siblings resolve beside this
- * checkout, never the main checkout its marker names. */
+/** Project-contained declared directories follow their checkout; siblings retain the shared main anchor. */
 function declaredTarget(root: string, anchor: string, relative: string): string {
   const shared = path.resolve(anchor, relative);
   const inside = path.relative(anchor, shared);
-  if (inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside))
-    return path.resolve(root, relative);
+  if (inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) return shared;
   const candidate = path.resolve(root, inside);
   const canonicalRoot = realpathSync(root);
   let existing = candidate;
@@ -720,10 +698,10 @@ function declaredTarget(root: string, anchor: string, relative: string): string 
 }
 
 /**
- * The marker names the donor only to recognize a contained binding inherited from it.
- * It grants no read of the donor tree and never selects a declaration target: both
- * contained and sibling declarations resolve at this checkout through `declaredTarget`,
- * with physical containment checked against symlink escapes.
+ * The stable anchor for genuine sibling directories is the project's main checkout.
+ * A cowshed marker names it without reading main's tree. Contained declared
+ * directories are projected into the current checkout by `declaredTarget`, with
+ * physical containment checked against symlink escapes.
  */
 function linkAnchor(root: string): string {
   let marker: unknown;

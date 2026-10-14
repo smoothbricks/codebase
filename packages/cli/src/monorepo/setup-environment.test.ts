@@ -969,30 +969,24 @@ describe('what shell entry keeps linked', () => {
       );
     });
 
-    it('repoints a foreign link to the declared checkout, and keeps the installed version where this machine lacks it', async () => {
+    it("keeps a developer's own link and diagnoses an absent declared checkout on application", async () => {
       await withManagedRepository(
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '../absent-lib', util: '../declared-util' } },
         async ({ root, enterShell: enter }) => {
           expect(await enter()).toEqual(HEALTHY);
-          const declared = await checkout(join(dirname(root), 'declared-util'), 'util');
+          await checkout(join(dirname(root), 'declared-util'), 'util');
           const mine = await checkout(join(dirname(root), 'my-util'), 'util');
           await rm(join(root, UNLINKED));
           symlinkSync(mine, join(root, UNLINKED));
-
-          // The explicit declaration is authoritative: the old external binding is repointed.
-          const check = await enter({ links: true, check: true });
-          expect(check.exitCode).toBe(1);
-          expect(check.stderr).toContain('does not exist on this machine');
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
           const entered = await enter({ links: true });
           expect(entered.exitCode).toBe(0);
           expect(entered.stderr).toContain(
             `! smoo.developerLinks @fixture/lib: ${join(dirname(root), 'absent-lib')} does not exist on this machine; the installed version stays`,
           );
           expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
-          const final = await enter({ links: true, check: true });
-          expect(final.exitCode).toBe(1);
-          expect(final.stderr).toContain('does not exist on this machine');
-          expect(readlinkSync(join(root, UNLINKED))).toBe(declared);
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+          expect(readlinkSync(join(root, UNLINKED))).toBe(mine);
         },
       );
     });
