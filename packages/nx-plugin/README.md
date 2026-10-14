@@ -797,6 +797,28 @@ conservative graph witness too. Only Nx's current task hashes and matching artif
 unrelated edit does not force cached-log replay, and an actual input edit cannot hit an old source snapshot. Argument
 normalization, per-task environments and plugin pre/post hooks still run.
 
+A local graph plugin can declare `options.graphInputContract` with `version: 1`, one explicit `kind` (`native-only`,
+`tsconfig-extends` or `reference-scan`), `modules: [{ path, sha256 }]` and `packages: [name]`. Module paths are
+workspace-relative and the first module is the configured entry. The literal SHA-256 values bind the audited
+entry/helper import closure to that input contract; changing code cannot inherit its former proof, and checking a
+declaration never rewrites its approval hashes. The installed `@smoothbricks/nx-plugin/graph-input-contract` factory
+collects a read witness from the owning reader, not a second parser or a guessed file list. Pure native-only callbacks
+need no outside-read trace, but still require their exact audited module and package-resolution closure.
+
+The other kinds publish complete or unproved evidence in the existing Nx workspace-data directory as a byproduct of the
+actual callback. A complete witness binds its contract, native file/hash/namespace identity before and after the
+callback, read file/directory stamps, missing paths, physical package resolutions, tools and environment. TypeScript
+extends and reference scans retain their existing results while recording the outside inputs they really read, including
+Git configuration origins and relevant namespace inventories. Installed Nx owns daemon/worker environment normalization;
+loader/preload settings are not silently dropped. Missing or changed declarations, missing traces, stale read evidence
+and unknown loaders, dynamic configuration or unbounded reads make the proof unproved and require the ordinary
+authoritative graph RPC. A declared kind alone is never admission, and this witness never replaces current Nx task
+hashing or artifact comparison.
+
+A physically missing required factory after the clean cutover is an invalid installation and fails loudly; it is not a
+proof miss that can fall back to the graph RPC. Consumers adopt the normal static import only after the public producer
+is available.
+
 The daemon's output records are lossy: they are held in memory, tracked per collapsed directory, and erased by writes it
 processes more than two seconds late — including, on a busy daemon, a restore's own writes. When it cannot vouch for a
 task's outputs, the working tree is compared with Nx's local cache artifact for that exact task hash, entry by entry as
