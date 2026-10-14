@@ -73,17 +73,6 @@
         "type": "github"
       }
     },
-    "nixpkgs-overlay": {
-      "locked": {
-        "path": "nixpkgs-overlay",
-        "type": "path"
-      },
-      "original": {
-        "path": "nixpkgs-overlay",
-        "type": "path"
-      },
-      "parent": []
-    },
     "nixpkgs-src": {
       "flake": false,
       "locked": {
@@ -123,7 +112,6 @@
         "git-format-staged": "git-format-staged",
         "nixpkgs": "nixpkgs",
         "nixpkgs-go": "nixpkgs-go",
-        "nixpkgs-overlay": "nixpkgs-overlay",
         "rust-overlay": "rust-overlay"
       }
     },

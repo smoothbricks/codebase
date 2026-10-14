@@ -15,7 +15,9 @@ in {
 
   # https://devenv.sh/overlays/
   overlays = [
-    inputs.nixpkgs-overlay.overlays.default
+    # Import the live owner source: a flake input evaluates its overlay outside
+    # devenv's file-read tracing, leaving generated pins absent from the eval cache.
+    ((import ./nixpkgs-overlay/flake.nix).outputs {}).overlays.default
     inputs.rust-overlay.overlays.default
   ];
 
