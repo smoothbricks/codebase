@@ -306,6 +306,11 @@ selects nothing fails rather than passing a run of no test. The RAM host walk an
 production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing case bounds. The shards
 exclude `*-host.test.ts`; the host target names both owned host files.
 
+Re-executed libtest fixture roles that report a line protocol use `--nocapture --quiet`. With an inherited
+`RUST_TEST_THREADS=1`, ordinary libtest output prefixes the first report with its unfinished test-name line; a reader
+waiting for a report at the start of a line then waits forever. Quiet formatting preserves the CPU grant and the exact
+report parser. The held-parent CPU and listening-group regressions must also pass under a one-token runner.
+
 **A real-APFS test's class is on its code time.** Every disk command a test's process tree runs first queues for the
 host-wide disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease") behind every other cowshed process on the host:
 the same warm-fork walk took 37-70s on a loaded host with 0.2-28s of it spent waiting for grants, against a 25s run when

@@ -2240,6 +2240,7 @@ mod tests {
                 "--exact",
                 "runtime::job_groups::tests::listener_fixture_role",
                 "--nocapture",
+                "--quiet",
             ])
             .env(LISTENER_ROLE, "1")
             .stdin(Stdio::null())
@@ -2250,7 +2251,7 @@ mod tests {
         let mut output =
             std::io::BufReader::new(leader.stdout.take().expect("the group's piped stdout"));
         let mut line = String::new();
-        // The test harness prints its own lines first.
+        // Quiet libtest output keeps its single-thread test-name prefix off the fixture line.
         while !line.starts_with("fixture ") {
             line.clear();
             let read = output.read_line(&mut line).expect("the fixture's line");

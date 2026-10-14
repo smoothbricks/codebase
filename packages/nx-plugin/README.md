@@ -218,7 +218,10 @@ lock.
 The `@smoothbricks/nx-plugin:cargo-resolve` diagnostics channel reports `{ phase: "join", manifest }` when a caller
 joins an existing flight. With no subscribers, inference neither allocates nor publishes an event. The cache regressions
 use this readiness signal and Cargo control-channel events to prove concurrency and child teardown without sleep-based
-timing assumptions; their outer hang guards report still-open test spans and process/gate state.
+timing assumptions; their outer hang guards report still-open test spans and process/gate state. The counted Cargo
+fixture delegates to the command selected before its shim was installed, with that original search path. An installed
+jobserver launcher remains in the chain; it must not rediscover the counted shim and recursively enter the broker. The
+real-producer regression covers both counted metadata and forwarded workspace discovery, with one metadata child.
 
 Keep workspace-owned runtime state outside Nx's source index. The root `.nxignore` ignores every dot path with `.*` and
 re-includes each tracked dot input by its dot-named prefix, such as `!/.github` or `!/packages/lmao/.cargo`: a dot-named

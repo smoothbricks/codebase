@@ -327,7 +327,8 @@ async function shim(
   /** How long the fixture's waits may take: longer over the real Cargo. */
   guardMs: number,
 ): Promise<{ cargo: CountedCargo; answer(text: string): void }> {
-  const real = Bun.which('cargo');
+  const path = process.env.PATH ?? '';
+  const real = Bun.which('cargo', { PATH: path });
   if (real === null) throw new Error('cargo is not on PATH');
   const directory = join(root, 'counted-cargo');
   const bin = join(directory, 'bin');
@@ -570,6 +571,8 @@ async function shim(
     join(bin, 'cargo'),
     [
       '#!/bin/sh',
+      // Delegate with the caller's original search path: a launcher must not resolve this shim again.
+      `export PATH=${quote(path)}`,
       `real=${quote(real)}`,
       `if [ "$1" != metadata ]; then ${forward}; fi`,
       `exec ${quote(process.execPath)} ${quote(PROGRAM)} metadata ${port} "$real" ${quote(directory)} "$@"`,
@@ -590,7 +593,7 @@ async function shim(
   const cargo: CountedCargo = {
     bin,
     environment: {
-      PATH: `${bin}${delimiter}${process.env.PATH ?? ''}`,
+      PATH: `${bin}${delimiter}${path}`,
       NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx/workspace-data'),
     },
     beforeRead: latch('read'),

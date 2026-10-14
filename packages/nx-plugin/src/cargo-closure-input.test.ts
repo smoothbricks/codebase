@@ -1,8 +1,9 @@
 import { expect, it } from 'bun:test';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { promisify } from 'node:util';
 
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
 import { Watcher } from 'nx/src/native/index.js';
@@ -241,6 +242,39 @@ function leafControls(workspace: string, edit: (path: string, text: string) => P
       }),
   };
 }
+
+it('delegates counted Cargo through the caller launcher without re-entering its broker', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-counted-delegate-')));
+  let fixtureCargo: CountedCargo | undefined;
+  try {
+    const { workspace } = await closureFixture(root);
+    const manifest = join(workspace, 'Cargo.toml');
+    const args = ['metadata', '--format-version', '1', '--locked', '--offline', '--manifest-path', manifest];
+    const expected = execFileSync('cargo', args, { encoding: 'utf8' });
+    const cargo = await countedCargo(root);
+    fixtureCargo = cargo;
+    await withEnvironment(cargo.environment, async () => {
+      const answer = promisify(execFile)('cargo', args);
+      await cargo.waitForRuns((runs) => runs.read === 1, 'the delegated real Cargo answer');
+      expect((await answer).stdout).toBe(expected);
+      expect(await cargo.runs()).toMatchObject({ spawned: 1, read: 1, peak: 1 });
+      // Forwarded subcommands must use the same original delegate path, not loop through the shim.
+      const located = await promisify(execFile)('cargo', [
+        'locate-project',
+        '--workspace',
+        '--manifest-path',
+        manifest,
+        '--message-format',
+        'plain',
+      ]);
+      expect(located.stdout.trim()).toBe(manifest);
+      expect((await cargo.runs()).spawned).toBe(1);
+    });
+  } finally {
+    await fixtureCargo?.release();
+    await rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
 
 it('shares one Cargo child among overlapping graph computations, and an unchanged workspace never asks Cargo again', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-overlap-')));

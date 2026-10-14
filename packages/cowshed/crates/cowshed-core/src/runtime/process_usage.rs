@@ -975,6 +975,7 @@ mod tests {
     // A native parent that waits for a child burning a CPU second.
 
     /// The fixture roles, run only when a test re-executes this binary with [`ROLE`] set.
+    /// Quiet libtest output keeps its single-thread test-name prefix off the report lines.
     #[test]
     fn process_usage_role() {
         let Some(role) = std::env::var_os(ROLE) else {
@@ -984,7 +985,7 @@ mod tests {
         match role.to_str() {
             Some("parent") => {
                 let mut burner = Command::new(std::env::current_exe().expect("test binary"))
-                    .args(["--exact", ROLE_TEST, "--nocapture"])
+                    .args(["--exact", ROLE_TEST, "--nocapture", "--quiet"])
                     .env(ROLE, "burner")
                     .stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
@@ -1266,7 +1267,7 @@ mod tests {
     #[test]
     fn a_waiting_parent_is_not_charged_the_cpu_its_child_burned() {
         let mut parent = Command::new(std::env::current_exe().expect("test binary"))
-            .args(["--exact", ROLE_TEST, "--nocapture"])
+            .args(["--exact", ROLE_TEST, "--nocapture", "--quiet"])
             .env(ROLE, "parent")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1348,7 +1349,7 @@ mod tests {
         use crate::runtime::job_groups::Birth;
 
         let mut parent = Command::new(std::env::current_exe().expect("test binary"))
-            .args(["--exact", ROLE_TEST, "--nocapture"])
+            .args(["--exact", ROLE_TEST, "--nocapture", "--quiet"])
             .env(ROLE, "parent")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1535,7 +1536,7 @@ mod tests {
         /// Start `role` and wait for its `ready` report.
         fn start(role: &str, ready: &str) -> Self {
             let mut child = Command::new(std::env::current_exe().expect("test binary"))
-                .args(["--exact", ROLE_TEST, "--nocapture"])
+                .args(["--exact", ROLE_TEST, "--nocapture", "--quiet"])
                 .env(ROLE, role)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
