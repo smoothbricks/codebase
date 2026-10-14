@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -6516,43 +6515,12 @@ pub(in crate::storage) fn io_error(
 }
 
 pub(crate) fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageError> {
-    #[cfg(target_os = "macos")]
-    {
-        let left_name = CString::new(left.as_os_str().as_bytes())
-            .map_err(|_| ApfsStorageError::Host("canonical image path contains NUL".to_owned()))?;
-        let right_name = CString::new(right.as_os_str().as_bytes())
-            .map_err(|_| ApfsStorageError::Host("staged image path contains NUL".to_owned()))?;
-        const _: () = assert!(libc::RENAME_SWAP == 0x0000_0002);
-        // SAFETY: both paths are `CString`s, so the pointers are NUL-terminated
-        // and not mutated for the call. `AT_FDCWD` is the process cwd.
-        // `RENAME_SWAP` (Darwin 0x2) exchanges two directory entries atomically
-        // or fails; the two buffers do not alias.
-        let result = unsafe {
-            libc::renameatx_np(
-                libc::AT_FDCWD,
-                left_name.as_ptr(),
-                libc::AT_FDCWD,
-                right_name.as_ptr(),
-                libc::RENAME_SWAP,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io_error(
-                "atomically swap restore images",
-                left,
-                io::Error::last_os_error(),
-            ))
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (left, right);
-        Err(ApfsStorageError::Host(
-            "atomic APFS restore swap requires macOS renameatx_np".to_owned(),
-        ))
-    }
+    let left_name = CString::new(left.as_os_str().as_bytes())
+        .map_err(|_| ApfsStorageError::Host("canonical image path contains NUL".to_owned()))?;
+    let right_name = CString::new(right.as_os_str().as_bytes())
+        .map_err(|_| ApfsStorageError::Host("staged image path contains NUL".to_owned()))?;
+    cowshed_os::fsio::rename_exchange(libc::AT_FDCWD, &left_name, &right_name)
+        .map_err(|error| io_error("atomically swap restore images", left, error))
 }
 
 /// Whether the volume mounted at `mount_point` already carries `label`. It is read straight from

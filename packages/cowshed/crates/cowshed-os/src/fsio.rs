@@ -694,6 +694,57 @@ pub fn rename_noreplace(
     ))
 }
 
+/// Atomically exchange two directory entries, without following either entry's symlink.
+/// Darwin uses RENAME_SWAP; Linux uses the renameat2 syscall directly so this also works
+/// with libc versions predating its wrapper. A failure leaves both entries unchanged.
+pub fn rename_exchange(
+    directory: std::os::fd::RawFd,
+    source: &CStr,
+    destination: &CStr,
+) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    // SAFETY: the NUL-terminated names remain live for the call. The caller owns the directory
+    // descriptor, or passes AT_FDCWD. RENAME_SWAP exchanges entries in one kernel operation.
+    let result = unsafe {
+        libc::renameatx_np(
+            directory,
+            source.as_ptr(),
+            directory,
+            destination.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    // SAFETY: the names and descriptor have the same lifetime contract as above. The syscall
+    // uses the kernel ABI flags, avoiding a dependency on glibc's newer renameat2 wrapper.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory,
+            source.as_ptr(),
+            directory,
+            destination.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (directory, source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic directory-entry exchange is unsupported",
+        ))
+    }
+}
+
 /// Open the directory at `path` for directory-relative work, refusing a symlink or a
 /// non-directory at its last component. Earlier components resolve normally, so a root below a
 /// linked system prefix (macOS `/var` → `/private/var`) opens.
@@ -1134,6 +1185,40 @@ mod tests {
         assert_eq!(fs::read(temporary.join("filled/entry")).unwrap(), b"kept");
         assert_eq!(fs::read(temporary.join("file")).unwrap(), b"kept");
         fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn exchange_moves_entries_without_following_links_and_failure_preserves_both() {
+        let root = std::env::temp_dir().join(format!("fsio-exchange-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("payload/src")).unwrap();
+        fs::write(root.join("payload/src/proof"), b"payload").unwrap();
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("proof"), b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("record")).unwrap();
+        let directory = open_directory_nofollow(&root).unwrap();
+
+        rename_exchange(directory.as_raw_fd(), c"payload", c"record").unwrap();
+        assert_eq!(fs::read_link(root.join("payload")).unwrap(), outside);
+        assert_eq!(fs::read(root.join("record/src/proof")).unwrap(), b"payload");
+        assert_eq!(fs::read(outside.join("proof")).unwrap(), b"outside");
+        assert_eq!(
+            rename_exchange(directory.as_raw_fd(), c"record", c"absent")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read(root.join("record/src/proof")).unwrap(), b"payload");
+        assert_eq!(fs::read_link(root.join("payload")).unwrap(), outside);
+        assert!(!root.join("absent").exists());
+
+        rename_exchange(directory.as_raw_fd(), c"record", c"payload").unwrap();
+        assert_eq!(
+            fs::read(root.join("payload/src/proof")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(fs::read_link(root.join("record")).unwrap(), outside);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
