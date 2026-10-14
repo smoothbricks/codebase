@@ -2121,9 +2121,15 @@
             "record": "/fixture/Dev/widget/.nx/workspace-data/d/server-process.json"
           }
         },
-        "seeded": false
+        "seed": {
+          "kind": "unchanged"
+        }
       },
       "landedHead": "1111111111111111111111111111111111111111",
+      "remoteCache": {
+        "kind": "missingQualification",
+        "reason": "fixture has no protected Nx check receipt"
+      },
       "retired": false,
       "targetBranch": "main",
       "targetWasCheckedOut": false
