@@ -15,7 +15,7 @@
  * @module opContext/opGroupTypes
  */
 
-import type { Op } from '../op.js';
+import type { AnyOp } from '../op.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type { OpContext } from './types.js';
@@ -101,7 +101,7 @@ export function validateOpName(name: string): void {
 // PUBLIC OP GROUP INTERFACES (visible to users in intellisense)
 // =============================================================================
 
-export type OpGroupOps<Ctx extends OpContext> = Record<string, Op<Ctx, unknown[], unknown, unknown>>;
+export type OpGroupOps<Ctx extends OpContext> = Record<string, AnyOp<Ctx>>;
 type NoOpMembers = Record<never, never>;
 
 /**

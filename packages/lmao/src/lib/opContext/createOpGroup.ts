@@ -18,7 +18,7 @@
 
 import { createRemapDescriptor } from '../library.js';
 import type { RemapDescriptor } from '../logBinding.js';
-import { Op } from '../op.js';
+import { type AnyOp, Op } from '../op.js';
 import { SYSTEM_SCHEMA_FIELD_NAMES } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type {
@@ -62,7 +62,7 @@ function createReverseMapping(mapping: Record<string, string | null | undefined>
   return reverse;
 }
 
-function isOpInstance<Ctx extends OpContext>(value: unknown): value is Op<Ctx, unknown[], unknown, unknown> {
+function isOpInstance<Ctx extends OpContext>(value: unknown): value is AnyOp<Ctx> {
   return value instanceof Op;
 }
 

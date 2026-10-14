@@ -14,7 +14,7 @@ import type { AnyResult, ExtractError, ExtractSuccess } from '../result.js';
 import { runtimeHintMessageLayoutFamily, runtimeHintMessagePhysicalLayout } from '../runtimeHint.js';
 import { getSpanBufferClass } from '../spanBuffer.js';
 import type { OpGroup, OpGroupOps } from './opGroupTypes.js';
-import type { Op, OpCompileMetadata, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
+import type { AnyOp, Op, OpCompileMetadata, OpDefinition, OpMetadata, OpsFromRecord } from './opTypes.js';
 import type { SpanContext } from './spanContextTypes.js';
 import type { OpContext } from './types.js';
 
@@ -284,14 +284,14 @@ export function createDefineOp<Ctx extends OpContext>(
 /**
  * Type guard to check if a definition is an existing Op instance.
  */
-function isOp<Ctx extends OpContext>(def: unknown): def is Op<Ctx, unknown[], unknown, unknown> {
+function isOp<Ctx extends OpContext>(def: unknown): def is AnyOp<Ctx> {
   return def instanceof OpClass;
 }
 
-function hasAllDefinedOps<
-  Ctx extends OpContext,
-  Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>,
->(definitions: Defs, ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>): ops is OpsFromRecord<Ctx, Defs> {
+function hasAllDefinedOps<Ctx extends OpContext, Defs extends Record<string, OpDefinition<Ctx>>>(
+  definitions: Defs,
+  ops: OpGroupOps<Ctx>,
+): ops is OpsFromRecord<Ctx, Defs> {
   for (const name in definitions) {
     if (!(name in ops)) {
       return false;
@@ -320,22 +320,20 @@ function hasAllDefinedOps<
 export function createDefineOps<Ctx extends OpContext>(
   factoryConfig: DefineOpFactoryConfig<Ctx>,
   createOpGroup: CreateOpGroupFn<Ctx>,
-): <Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>>(
+): <Defs extends Record<string, OpDefinition<Ctx>>>(
   definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>,
   compileMetadataByKey?: Partial<Record<keyof Defs, OpCompileMetadata>>,
 ) => OpGroup<Ctx, OpsFromRecord<Ctx, Defs>> {
   // Get the defineOp function for wrapping raw functions
   const defineOp = createDefineOp<Ctx>(factoryConfig);
 
-  return function defineOpsImpl<
-    Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>,
-  >(
+  return function defineOpsImpl<Defs extends Record<string, OpDefinition<Ctx>>>(
     definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>,
     compileMetadataByKey?: Partial<Record<keyof Defs, OpCompileMetadata>>,
   ): OpGroup<Ctx, OpsFromRecord<Ctx, Defs>> {
     // Build the ops record by processing each definition.
     // Keep the runtime container broad, then narrow once we've populated every key.
-    const ops: Record<string, Op<Ctx, unknown[], unknown, unknown>> = {};
+    const ops: OpGroupOps<Ctx> = {};
 
     for (const name in definitions) {
       const def = definitions[name];
