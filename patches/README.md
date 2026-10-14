@@ -124,6 +124,20 @@ clients at the same barrier, requires one real producer and one shared waiter wh
 both clients to complete after it exits. Drop these hunks only when the installed upstream orchestrator protects the
 same complete lifetime and atomic startup, retaining the regressions.
 
+## Non-workspace file packages
+
+Bun's `file:` protocol identifies an installation source, not workspace membership. The pinned Nx parser keeps a
+non-workspace file package as an external node, with its consumer dependency edges. A resolved file path is a workspace
+only when its normalized lockfile-relative target names a declared workspace root; ordinary `workspace:` resolutions
+remain workspace packages. This keeps copied local packages visible without inventing registry packages or converting
+their consumers to workspace dependencies.
+
+`packages/nx-plugin/src/bun-file-packages.test.ts` runs the real installed parser and native hasher against a locked
+file package, its consumer and a distinct actual workspace. It requires the external file node and consumer edge, while
+the workspace stays out of the external-node set. Normal nx-plugin test shards enroll the control. Regenerate and
+activate the carried patch through the owning flow above; do not repair graph coverage by weakening a scope check or
+deleting a runtime input.
+
 ## Dependency-graph resolution cache identity
 
 The cached dependency edges of an unchanged file are reusable only while its resolution context is unchanged.
