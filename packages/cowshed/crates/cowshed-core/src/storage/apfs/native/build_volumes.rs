@@ -694,6 +694,14 @@ mod tests {
     }
 
     impl CommandRunner for RestoreAdmissionRunner {
+        fn eject(
+            &self,
+            image: &Path,
+            whole_device: &str,
+            force: bool,
+        ) -> Result<bool, cowshed_apfs::ApfsError> {
+            SystemCommandRunner.eject(image, whole_device, force)
+        }
         fn run_guarded<E>(
             &self,
             request: &CommandRequest,
@@ -705,13 +713,18 @@ mod tests {
             SystemCommandRunner.run_guarded(request, check)
         }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            let output = SystemCommandRunner.run(request)?;
-            if request.program == Path::new("/usr/sbin/diskutil")
-                && output.succeeded()
-                && request.args.windows(2).any(|pair| {
-                    (pair[0] == "--mountPoint" || pair[0] == "-mountPoint")
-                        && Path::new(&pair[1]) == self.layout.mount(&self.source)
-                })
+            SystemCommandRunner.run(request)
+        }
+        fn mount(
+            &self,
+            image: &Path,
+            whole_device: &str,
+            volume_device: &str,
+            mount_point: &Path,
+            policy: cowshed_apfs::MountPolicy,
+        ) -> Result<(), cowshed_apfs::ApfsError> {
+            SystemCommandRunner.mount(image, whole_device, volume_device, mount_point, policy)?;
+            if mount_point == self.layout.mount(&self.source)
                 && self.armed.swap(false, Ordering::SeqCst)
             {
                 if let Some((runtime, socket)) = &self.socket {
@@ -727,7 +740,7 @@ mod tests {
                 }
                 self.denied.store(true, Ordering::SeqCst);
             }
-            Ok(output)
+            Ok(())
         }
 
         fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<fs::File>>> {

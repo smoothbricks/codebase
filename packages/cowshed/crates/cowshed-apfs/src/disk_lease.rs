@@ -1,7 +1,7 @@
 //! The client half of the host disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease").
 //!
-//! Every disk tool cowshed runs — production and tests alike — runs inside [`leased`]: the
-//! command's class is read off its program, a lease of that class is taken from the gateway's
+//! Every disk tool and native release — production and tests alike — uses [`leased_operation`]: the
+//! command's class is read off its program by [`leased`]; native release supplies storage. A lease is taken from the gateway's
 //! control socket, and the command runs while the connection stays open. Two lifecycle spans
 //! say what that cost: `disk-lease <class> wait` from asking to the grant, and
 //! `disk-lease <class> phase` around the command the grant admitted.
@@ -73,9 +73,18 @@ pub fn leased<T, E: fmt::Display>(
     let Some(class) = class_of(program, args) else {
         return run();
     };
-    let command = describe(program, args);
+    leased_operation(class, &describe(program, args), run)
+}
+
+/// Run a classed lifecycle operation under the existing host lease. Native operations name
+/// their actual API here, not an executable or child process they never ran.
+pub fn leased_operation<T, E: fmt::Display>(
+    class: DiskClass,
+    command: &str,
+    run: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
     if let Some(record) = COMMAND_RECORD.as_ref() {
-        record.append(class, &command);
+        record.append(class, command);
     }
     let share = match predates_recently() {
         Some(Predates::Leases) => return run(),
@@ -83,7 +92,7 @@ pub fn leased<T, E: fmt::Display>(
         None => wanted_share(),
     };
     let socket = cowshed_gateway_types::control_socket_path();
-    lease_then(&socket, class, share, &command, remember_predates, run)
+    lease_then(&socket, class, share, command, remember_predates, run)
 }
 
 /// [`leased`] against the control socket at `socket`, for a command already classed and named.
@@ -362,9 +371,10 @@ static COMMAND_RECORD: LazyLock<Option<CommandRecord>> = LazyLock::new(|| {
     })
 });
 
-/// The file every disk command [`leased`] runs is appended to, one line per command, before it
-/// runs: `<class> <program> <args…>`, as the lease names it. A run's attaches are its lines of
-/// `diskutil image attach` (normally also mounting), and recovered mounts use `diskutil mount`.
+/// The file every operation [`leased_operation`] runs is appended to before it runs:
+/// `<class> <operation>`. Commands retain `<program> <args…>`; native release names
+/// `DiskArbitration eject` and its image/whole/force scope, without inventing an executable.
+/// Attaches retain `diskutil image attach`; recovered mounts retain `diskutil mount`.
 #[derive(Debug)]
 struct CommandRecord {
     path: PathBuf,
@@ -813,6 +823,29 @@ mod tests {
             "only the alone ask went unleased; the shared one was granted: {said:?}"
         );
         assert!(said[0].contains("predates alone disk leases"), "{said:?}");
+    }
+
+    #[test]
+    fn native_release_records_its_actual_api_and_storage_scope() {
+        let path = PathBuf::from(format!(
+            "/tmp/cowshed-native-release-{}.record",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let record = CommandRecord {
+            path: path.clone(),
+            failed: AtomicBool::new(false),
+        };
+        record.append(
+            DiskClass::Storage,
+            "DiskArbitration eject image=/tmp/owned.dmg whole=/dev/disk177 force=false",
+        );
+        let text = std::fs::read_to_string(&path).expect("native operation record");
+        std::fs::remove_file(path).expect("remove operation record");
+        assert_eq!(
+            text,
+            "storage DiskArbitration eject image=/tmp/owned.dmg whole=/dev/disk177 force=false\n"
+        );
+        assert!(!record.failed.load(Ordering::Relaxed));
     }
 
     #[test]

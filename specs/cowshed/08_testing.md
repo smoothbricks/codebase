@@ -240,6 +240,18 @@ the single-threaded pretty harness from prefixing the first record with `test <n
 inherited `RUST_TEST_THREADS=1`, even while independent parent tests run in parallel. The strict two-record assertion
 and exact-root teardown remain unchanged; no delay, retry, dropped assertion or broad sweep repairs a framing failure.
 
+Native owned-image DA mount and release controls pin current provider-tree projection, excluding a foreign/stale cached
+BSD descendant before any native effect, and retain moved/reused-device refusals. Mount requires the exact single owned
+APFS volume; its native Busy, NotMounted and other refusals never earn release grace or retry. The five mount-policy
+controls retain read-only/visibility/owners/noatime and the separate event-store-repair `nobrowse,noowners` state.
+Native refusal tables distinguish Busy/encoded EBUSY from permission, general and unknown errors; real image teardown
+still proves the complete mounted RAW plus unmounted retained-ASIF panic/kill walk. An isolated pass after operator
+cleanup is not a repair verdict when the unchanged full gate repeats the failure; preserve both witnesses and exercise
+the real native cutover. The lease overlap fixture also drops B's returned handle before cleanup to prove exact-image
+recovery. A no-device cleanup control holds the backing-file lock: unlink refuses and preserves its bytes until an
+exclusive no-follow open proves it unlocked, then cleanup accepts both that file and an already-absent file without
+spending an image attach.
+
 The killed-caller attach fixture captures helper PIDs from the existing I/O Registry creator walker, joined to its exact
 backing image before release. After its own attach/release operations finish, two reads must find no orphan among those
 captured PIDs; unrelated helpers and disk tools do not decide this owned verdict. Pure controls prove both that a
@@ -561,19 +573,20 @@ Covered flows:
   completes under N, an inner per-command profile can only narrow N and cannot broaden it, the next exec observes N+1,
   and reconnecting a named session bound to N returns the documented stale-session conflict rather than silently
   rebinding. Repeat for both grant and revoke.
-- **One-call DA attach and mount** on APFS: assert the requested mountpoint, read-only/visibility/ownership/noatime
-  flags and plist parsing, then the kernel image/device and held mount-root identity before publication. A malformed
-  reply or refused/wrong mount releases the owned attachment or names the cleanup refusal. No manual mount fallback or
-  live fsck is permitted. Detached verification/resize and unformatted RAW retain intentional unmounted fixtures;
+- **One no-mount attach and pinned native DA mount** on APFS: assert attach flags/plist parsing, the exact current
+  image/whole/volume identity after the storage grant, native mount options and requested root, then held mount-root
+  identity before publication. A malformed reply or refused/wrong mount releases only the owned attachment or names its
+  cleanup refusal. Foreign/stale descendants are neither targets nor vetoes. No fallback, retry or separate live fsck is
+  permitted. Detached verification/resize and unformatted RAW retain intentional unmounted fixtures;
 - **Live source capture stays mounted; build seeds are sealed**: a live capture (`fork`, `checkpoint`) flushes the
   source volume and backing file, descriptor-clones the live RAW image, and asserts that the source's attachment and
-  mount flags are unchanged (01a_apfs.md, "Images"). `fork` and `restore` pass a formatted clone to the DA
-  attach-and-mount transaction and verify the resulting mount identity. A failed transaction refuses publication and
-  cleans up only the destination, never the live source (02_workspaces.md, fork step 4). A build seed is the exception
-  (16_build_volumes.md): the sealed capture detaches its source without force, clones through its held inode, and
-  restores identical access/visibility and an updated registry after both success and failure; busy-source refusal names
-  visible holders and leaves source bytes and mounts intact. RAW has no outer allocation map for a live capture to split
-  (02_workspaces.md, fork step 2).
+  mount flags are unchanged (01a_apfs.md, "Images"). `fork` and `restore` pass a formatted clone to the DA exact-image
+  attach and pinned native mount path and verify the resulting mount identity. A failed operation refuses publication
+  and cleans up only the destination, never the live source (02_workspaces.md, fork step 4). A build seed is the
+  exception (16_build_volumes.md): the sealed capture detaches its source without force, clones through its held inode,
+  and restores identical access/visibility and an updated registry after both success and failure; busy-source refusal
+  names visible holders and leaves source bytes and mounts intact. RAW has no outer allocation map for a live capture to
+  split (02_workspaces.md, fork step 2).
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
