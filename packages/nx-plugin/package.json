@@ -75,6 +75,12 @@
       "import": "./dist/test-timings.js",
       "default": "./dist/test-timings.js"
     },
+    "./graph-input-contract": {
+      "types": "./dist/graph-input-contract.d.ts",
+      "development": "./src/graph-input-contract.ts",
+      "import": "./dist/graph-input-contract.js",
+      "default": "./dist/graph-input-contract.js"
+    },
     "./ensure-built": {
       "types": "./dist/ensure-built.d.ts",
       "development": "./src/ensure-built.ts",

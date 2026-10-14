@@ -18,6 +18,7 @@ import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { FileData, WorkspaceContext } from 'nx/src/native';
 import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
 import typia from 'typia';
+import type { GraphInputContractProof } from './graph-input-contract.js';
 
 /** Identity of a previously read node, not a timestamp freshness threshold. */
 export function nodeStamp(stats: BigIntStats): string {
@@ -150,9 +151,11 @@ export function graphInstallationIdentity(
   workspaceRoot: string,
   nxJson: NxJsonConfiguration,
   resolvePackage: typeof readModulePackageJsonWithoutFallbacks,
+  localInputs: GraphInputContractProof | null,
 ): string | null {
   const plugins = (nxJson.plugins ?? []).map((plugin) => (typeof plugin === 'string' ? plugin : plugin.plugin));
-  if (plugins.some((plugin) => plugin !== '@smoothbricks/nx-plugin')) return null;
+  if (plugins.some((plugin) => plugin !== '@smoothbricks/nx-plugin' && !localInputs?.plugins.includes(plugin)))
+    return null;
   const nodes: NodeWitness[] = [];
   const files: { path: string; sha256: string }[] = [];
   const buffer = Buffer.allocUnsafe(64 * 1024);
@@ -219,9 +222,13 @@ export function graphInstallationIdentity(
     }
   }
   try {
-    for (const name of ['nx', ...plugins]) visit(name, workspaceRoot, false);
+    for (const name of ['nx', ...plugins.filter((plugin) => plugin === '@smoothbricks/nx-plugin')])
+      visit(name, workspaceRoot, false);
+    for (const input of localInputs?.packages ?? []) visit(input.name, input.from, false);
     visit('typescript', workspaceRoot, true);
-    return nodesUnchanged(nodes) ? JSON.stringify({ resolutions, nodes, files }) : null;
+    return nodesUnchanged(nodes)
+      ? JSON.stringify({ resolutions, nodes, files, localInputs: localInputs?.identity ?? null })
+      : null;
   } catch (error) {
     if (systemError(error) && ['EACCES', 'EPERM', 'EIO'].includes(error.code)) throw error;
     // Installation uncertainty disables only graph reuse. Nx's authoritative

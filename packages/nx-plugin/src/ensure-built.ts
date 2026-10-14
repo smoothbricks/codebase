@@ -52,6 +52,7 @@ import {
   workspaceSnapshot,
   writeWitness,
 } from './ensure-built-witness.js';
+import { graphInputContractIdentity } from './graph-input-contract.js';
 import { managedAssetsRoot } from './managed-assets.js';
 
 interface NxRuntimeModules {
@@ -937,6 +938,18 @@ function providerInputProof(
     workspaceRoot,
     nxJson,
     requireNx('nx/src/utils/package-json').readModulePackageJson,
+    graphInputContractIdentity(
+      workspaceRoot,
+      nxJson,
+      workspaceSnapshot(
+        workspaceRoot,
+        new (requireNx('nx/src/native').WorkspaceContext)(
+          workspaceRoot,
+          requireNx('nx/src/utils/cache-directory').workspaceDataDirectoryForWorkspace(workspaceRoot),
+        ),
+        undefined,
+      ),
+    ),
   );
   const runtimeSource = boundedReceiptRuntimes(inputs, [...directories], [...files], installation !== null);
   return {
@@ -1010,14 +1023,24 @@ async function currentProjectGraph(
     await daemonClient.updateWorkspaceContext(created, updated, deleted);
   }
   performance.measure('ensureBuilt:inputs', 'ensureBuilt:inputs:start');
-  const installation = graphInstallationIdentity(workspaceRoot, nxJson, packageResolution.readModulePackageJson);
+  const installation = graphInstallationIdentity(
+    workspaceRoot,
+    nxJson,
+    packageResolution.readModulePackageJson,
+    graphInputContractIdentity(workspaceRoot, nxJson, before),
+  );
   const cached = nodesUnchanged(before.nodes)
     ? reusableGraph(witness, workspaceRoot, environment, installation, before)
     : null;
   if (cached !== null) return cached;
   const { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
   const after = workspaceSnapshot(workspaceRoot, new WorkspaceContext(workspaceRoot, data), before);
-  const finalInstallation = graphInstallationIdentity(workspaceRoot, nxJson, packageResolution.readModulePackageJson);
+  const finalInstallation = graphInstallationIdentity(
+    workspaceRoot,
+    nxJson,
+    packageResolution.readModulePackageJson,
+    graphInputContractIdentity(workspaceRoot, nxJson, after),
+  );
   const stableGeneration = snapshotsEqual(before, after) && nodesUnchanged(before.nodes);
   if (installation !== null && installation === finalInstallation && stableGeneration) {
     const next: GraphWitness = { version: 1, workspaceRoot, environment, installation, snapshot: after, projectGraph };
