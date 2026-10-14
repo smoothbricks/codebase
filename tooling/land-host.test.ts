@@ -29,7 +29,7 @@ const repo = dirname(tooling);
 const bun = process.execPath;
 
 const TASK = 'cowshed:cargo-test-cowshed-core-shard1';
-const GATE = ['run-many', '-t', 'gate', '--nx-bail=false', '--outputStyle=static-failures-only'];
+const GATE = ['run-many', '-t', 'gate', '--parallel=2', '--nx-bail=false', '--outputStyle=static-failures-only'];
 const DAEMON_STOP: Call = { args: ['daemon', '--stop'], exit: 0 };
 const passingRun = (args: readonly string[]): Call => ({ args, exit: 0 });
 
