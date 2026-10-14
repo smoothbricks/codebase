@@ -604,11 +604,5 @@ pub(super) fn cowshed_error(
             details.get_named_property::<napi::JsUnknown>("stdin")?,
         )?;
     }
-    if details.has_named_property("indexMigration")? {
-        error.set_named_property(
-            "indexMigration",
-            details.get_named_property::<napi::JsUnknown>("indexMigration")?,
-        )?;
-    }
     Ok(napi::Error::from(error.into_unknown()))
 }

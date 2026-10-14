@@ -64,8 +64,8 @@ pub struct BuildStateDiscovery {
 /// would otherwise keep an answer an earlier one got wrong, findings included, until a manifest
 /// happens to change. Bump it whenever discovery's questions or the environment they run in
 /// change. 2: Cargo is asked as a job, after the workspace shell's activation. 3: installed
-/// JavaScript packages contribute their `node_modules/.cache`. 4: source indexes are not build state.
-const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 4";
+/// JavaScript packages contribute their `node_modules/.cache`. 5: Codegraph indexes are build-volume state.
+const DISCOVERY_REVISION: &[u8] = b"cowshed build-state discovery 5";
 
 /// The manifest whose directory, once installed, holds a JavaScript package's tool caches.
 const PACKAGE_MANIFEST: &str = "package.json";
@@ -119,6 +119,7 @@ pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
     }
     for detector in [
         &super::nx::DETECTOR,
+        &super::codegraph::DETECTOR,
         &super::bun::DETECTOR,
         &super::npm::DETECTOR,
         &super::pnpm::DETECTOR,
@@ -144,7 +145,7 @@ pub fn tracked_manifest_fingerprint(workspace: &Path) -> Result<String> {
 
 /// Whether discovery at `workspace` can name any build state: it names only a tracked Cargo
 /// manifest's targets, a tracked package manifest's installed tool caches, a declared `[build]
-/// state`, or what an enabled Nx detector contributes. The other tracked build
+/// state`, or what an enabled Nx or Codegraph detector contributes. The other tracked build
 /// inputs (`.cargo/config*`, `go.mod`, whose caches are the host's) name none. A checkout with
 /// none of them has its first touch make no volume, so `adopt` mints none beside main's image
 /// for it.
@@ -165,7 +166,7 @@ pub fn may_name_build_state(workspace: &Path) -> Result<bool> {
     if !settings.build_state().is_empty() {
         return Ok(true);
     }
-    for detector in [&super::nx::DETECTOR] {
+    for detector in [&super::nx::DETECTOR, &super::codegraph::DETECTOR] {
         let setting = settings.capabilities().get(&detector.id);
         if setting.is_some_and(|setting| setting.disabled) {
             continue;
@@ -1191,6 +1192,36 @@ mod tests {
     }
 
     #[test]
+    fn an_owned_index_names_build_state_and_relinking_keeps_its_fingerprint() {
+        let fixture = Fixture::new();
+        git(&fixture, &["init", "--quiet"]);
+        assert!(!may_name_build_state(&fixture.root).unwrap());
+        let absent = tracked_manifest_fingerprint(&fixture.root).unwrap();
+        fs::create_dir(fixture.root.join(".codegraph")).unwrap();
+        assert!(may_name_build_state(&fixture.root).unwrap());
+        let present = tracked_manifest_fingerprint(&fixture.root).unwrap();
+        assert_ne!(absent, present);
+        fs::remove_dir(fixture.root.join(".codegraph")).unwrap();
+        std::os::unix::fs::symlink(".cowshed/build/codegraph", fixture.root.join(".codegraph"))
+            .unwrap();
+        assert_eq!(
+            present,
+            tracked_manifest_fingerprint(&fixture.root).unwrap()
+        );
+        assert_eq!(
+            cargo_paths(&fixture).paths,
+            [BuildStatePath::new(".codegraph", "codegraph").unwrap()]
+        );
+        write(
+            &fixture,
+            ".cowshed.toml",
+            "[capabilities.codegraph]\ndisabled = true\n",
+        );
+        assert!(!may_name_build_state(&fixture.root).unwrap());
+        assert!(cargo_paths(&fixture).paths.is_empty());
+    }
+
+    #[test]
     fn fingerprint_tracks_worktree_bytes_of_all_tracked_tool_inputs_not_untracked_files() {
         let fixture = Fixture::new();
         git(&fixture, &["init", "--quiet"]);
@@ -1239,10 +1270,10 @@ mod tests {
             fingerprint = next;
         }
         fs::create_dir(fixture.root.join(".codegraph")).unwrap();
-        assert_eq!(
+        assert_ne!(
             fingerprint,
             tracked_manifest_fingerprint(&fixture.root).unwrap(),
-            "a source index is not a build-state input"
+            "an indexer marker adds its build state"
         );
     }
 
@@ -1395,7 +1426,10 @@ mod tests {
         upstream_checkout(&fixture);
         fs::create_dir(fixture.root.join(".codegraph")).unwrap();
         let undeclared = tracked_manifest_fingerprint(&fixture.root).unwrap();
-        assert!(cargo_paths(&fixture).paths.is_empty());
+        assert_eq!(
+            cargo_paths(&fixture).paths,
+            [BuildStatePath::new(".codegraph", "codegraph").unwrap()]
+        );
         write(
             &fixture,
             ".cowshed.toml",
@@ -1407,7 +1441,10 @@ mod tests {
         assert!(state.findings.is_empty(), "{:?}", state.findings);
         assert_eq!(
             state.paths,
-            [BuildStatePath::declared("vendor/upstream").unwrap(),]
+            [
+                BuildStatePath::new(".codegraph", "codegraph").unwrap(),
+                BuildStatePath::declared("vendor/upstream").unwrap()
+            ]
         );
         write(
             &fixture,
@@ -1422,6 +1459,7 @@ mod tests {
         assert_eq!(
             cargo_paths(&fixture).paths,
             [
+                BuildStatePath::new(".codegraph", "codegraph").unwrap(),
                 BuildStatePath::declared("tools/.pin").unwrap(),
                 BuildStatePath::declared("vendor/upstream").unwrap(),
             ]

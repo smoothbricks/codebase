@@ -113,12 +113,6 @@ pub struct CowshedError {
         deserialize_with = "known_to_this_build"
     )]
     stdin: Option<Box<StdinRefusal>>,
-    #[serde(
-        rename = "indexMigration",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    index_migration: Option<Box<IndexMigrationRefusal>>,
     /// Boxed like `otherBuild` and `fence`: the structured CAS refusal is rare, and every
     /// `Result` in cowshed carries this type.
     #[serde(skip)]
@@ -332,15 +326,6 @@ impl FenceRefusal {
     }
 }
 
-/// A writer-excluded owned index migration refused without changing its link or bytes.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct IndexMigrationRefusal {
-    pub path: std::path::PathBuf,
-    pub reason: String,
-    pub holders: Vec<crate::api::dto::DatabaseHolder>,
-}
-
 impl CowshedError {
     pub fn new(code: ErrorCode, message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
@@ -354,7 +339,6 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
-            index_migration: None,
             lifecycle_conflict: None,
         }
     }
@@ -384,7 +368,6 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
-            index_migration: None,
             lifecycle_conflict: Some(Box::new(conflict)),
         }
     }
@@ -411,7 +394,6 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
-            index_migration: None,
             lifecycle_conflict: None,
         }
     }
@@ -440,7 +422,6 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
-            index_migration: None,
             lifecycle_conflict: None,
         }
     }
@@ -464,7 +445,6 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
-            index_migration: None,
             lifecycle_conflict: None,
         }
     }
@@ -556,21 +536,6 @@ impl CowshedError {
         Self {
             stdin: Some(Box::new(refusal)),
             ..Self::conflict(message, hint)
-        }
-    }
-
-    pub fn index_migration_refusal(refusal: IndexMigrationRefusal) -> Self {
-        let message = format!(
-            "cannot move owned index {} onto the source volume: {}",
-            refusal.path.display(),
-            refusal.reason
-        );
-        Self {
-            index_migration: Some(Box::new(refusal)),
-            ..Self::conflict(
-                message,
-                "close the named build-volume holders, then retry cowshed exec <workspace> -- true; nothing was forced or discarded",
-            )
         }
     }
 
@@ -714,10 +679,6 @@ impl CowshedError {
     /// Why the job's stdin refused, when this is a stdin write's or close's refusal.
     pub fn stdin_source(&self) -> Option<StdinRefusal> {
         self.stdin.as_deref().copied()
-    }
-
-    pub fn index_migration_source(&self) -> Option<&IndexMigrationRefusal> {
-        self.index_migration.as_deref()
     }
 
     pub const fn exit_code(&self) -> u8 {

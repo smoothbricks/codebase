@@ -791,13 +791,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 }
             };
             let mount = host.mount_build_volume(layout, &id).map_err(storage)?;
-            let held = migrate_owned_indexes(
-                host,
-                layout,
-                &id,
-                &checkout,
-                BuildVolumeState::read(&mount)?,
-            )?;
+            let held = BuildVolumeState::read(&mount)?;
             let (state, added) = match discovered {
                 Discovered::Unchanged => (held.clone(), Vec::new()),
                 Discovered::Changed {
@@ -2365,178 +2359,6 @@ fn say_release(id: &BuildVolumeId, whose: &str, release: &BuildVolumeRelease) {
     }
 }
 
-/// Spec 16's owned index-link cutover. Only a recorded fixed `.codegraph` link is exchanged;
-/// the index is copied from a sealed snapshot, never from the live database.
-fn migrate_owned_indexes(
-    host: &impl RuntimeStorageHost,
-    layout: &BuildVolumeLayout,
-    live: &BuildVolumeId,
-    checkout: &Path,
-    mut state: BuildVolumeState,
-) -> Result<BuildVolumeState> {
-    let is_index = |path: &BuildStatePath| {
-        !path.is_declared()
-            && path.checkout.as_path().file_name() == Some(std::ffi::OsStr::new(".codegraph"))
-    };
-    if !state.paths.iter().any(is_index) {
-        return Ok(state);
-    }
-    let mut owned = Vec::new();
-    for path in state.paths.iter().filter(|path| is_index(path)) {
-        let (parent, name) = link::contained_parent(checkout, path.checkout.as_path())
-            .map_err(|error| io("inspect the index parent", checkout, &error))?;
-        let at = parent.join(name);
-        match std::fs::symlink_metadata(&at) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let target = std::fs::read_link(&at)
-                    .map_err(|error| io("read the index link", &at, &error))?;
-                if target == link::relative_target(path.checkout.as_path(), path.volume.as_path()) {
-                    owned.push((at, path));
-                }
-            }
-            Ok(_) => {} // A real directory is a completed publication; foreign entries stay.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io("inspect the index link", &at, &error)),
-        }
-    }
-    if !owned.is_empty() {
-        let snapshot = BuildVolumeId::mint();
-        let hold = layout.hold_new(&snapshot).map_err(|error| {
-            io(
-                "hold the index snapshot",
-                &layout.hold_path(&snapshot),
-                &error,
-            )
-        })?;
-        let staging = checkout
-            .join(".cowshed")
-            .join(format!("index-cutover-{snapshot}"));
-        let copied = (|| {
-            match host.clone_build_volume(
-                layout,
-                live,
-                &snapshot,
-                &BuildVolumeRecord::new(None, BuildVolumeRole::Unlinked),
-            ) {
-                Ok(()) => {}
-                Err(ApfsStorageError::Apfs(error))
-                    if cowshed_apfs::detach_was_dissented(&error) =>
-                {
-                    let holders = nx::volume_holders(&layout.mount(live))
-                        .map_err(|error| {
-                            io(
-                                "name the index snapshot holders",
-                                &layout.mount(live),
-                                &error,
-                            )
-                        })?
-                        .into_iter()
-                        .map(database_holder)
-                        .collect();
-                    return Err(CowshedError::index_migration_refusal(
-                        crate::error::IndexMigrationRefusal {
-                            path: owned[0].0.clone(),
-                            reason: error.to_string(),
-                            holders,
-                        },
-                    ));
-                }
-                Err(error) => return Err(storage(error)),
-            }
-            let frozen = host
-                .mount_build_volume(layout, &snapshot)
-                .map_err(storage)?;
-            std::fs::create_dir_all(&staging)
-                .map_err(|error| io("stage the source index", &staging, &error))?;
-            for (index, (at, path)) in owned.iter().enumerate() {
-                let source = frozen.join(path.volume.as_path());
-                if !std::fs::symlink_metadata(&source)
-                    .map_err(|error| io("inspect the sealed index", &source, &error))?
-                    .is_dir()
-                {
-                    return Err(CowshedError::integrity(
-                        format!("{} is not an index directory", source.display()),
-                        "inspect the recorded index path; no foreign target is copied",
-                    ));
-                }
-                let staged = staging.join(index.to_string());
-                std::fs::create_dir(&staged)
-                    .map_err(|error| io("create the staged index directory", &staged, &error))?;
-                crate::copy::copy_until_quiescent_blocking(&source, &staged)?;
-                crate::copy::verify_tree_blocking(&source, &staged)?;
-                let holders = nx::volume_holders(&layout.mount(live)).map_err(|error| {
-                    io(
-                        "recheck index migration holders",
-                        &layout.mount(live),
-                        &error,
-                    )
-                })?;
-                if !holders.is_empty() {
-                    return Err(CowshedError::index_migration_refusal(
-                        crate::error::IndexMigrationRefusal {
-                            path: at.clone(),
-                            reason:
-                                "a holder arrived after the sealed snapshot; publication refused"
-                                    .into(),
-                            holders: holders.into_iter().map(database_holder).collect(),
-                        },
-                    ));
-                }
-                // Re-read immediately before publication. A foreign replacement stays intact.
-                if std::fs::read_link(at)
-                    .map_err(|error| io("revalidate the owned index link", at, &error))?
-                    != link::relative_target(path.checkout.as_path(), path.volume.as_path())
-                {
-                    return Err(CowshedError::conflict(
-                        format!("{} no longer names its recorded index", at.display()),
-                        "leave the foreign link intact and retry after settling the checkout",
-                    ));
-                }
-                crate::storage::apfs::native::swap_paths(at, &staged).map_err(storage)?;
-                cowshed_os::fsio::sync_directory(at.parent().expect("index parent"))
-                    .map_err(|error| io("sync the index publication", at, &error))?;
-                std::fs::remove_file(&staged)
-                    .map_err(|error| io("remove the exchanged index link", &staged, &error))?;
-                eprintln!(
-                    "cowshed: {} now holds its verified index on the source volume",
-                    at.display()
-                );
-            }
-            Ok(())
-        })();
-        let staged_cleanup = match std::fs::remove_dir_all(&staging) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io("remove index staging", &staging, &error)),
-        };
-        drop(hold);
-        let released = host
-            .release_build_volume(layout, &snapshot)
-            .map_err(storage)
-            .and_then(|release| match release {
-                BuildVolumeRelease::Deleted { .. } => Ok(()),
-                BuildVolumeRelease::Held { .. } => Err(CowshedError::integrity(
-                    "the private index snapshot is held after migration",
-                    "cowshed gc retries collection; inspect its named holder",
-                )),
-            });
-        let cleanup = staged_cleanup.and(released);
-        match (copied, cleanup) {
-            (Ok(()), Ok(())) => {}
-            (Ok(()), Err(error)) | (Err(error), Ok(())) => return Err(error),
-            (Err(mut error), Err(cleanup)) => {
-                error
-                    .message
-                    .push_str(&format!("; index snapshot cleanup also failed: {cleanup}"));
-                return Err(error);
-            }
-        }
-    }
-    state.paths.retain(|path| !is_index(path));
-    state.write(&layout.mount(live))?;
-    Ok(state)
-}
-
 /// `target`'s seed against its live volume `live`, both measured against `tree` in the target's
 /// repository at `checkout`, or `None` when `live` is an interrupted first touch's, unpublished:
 /// only a fresh discovery finishes that one.
@@ -4079,18 +3901,208 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn real_apfs_owned_index_cutover_preserves_a_busy_holder_and_resumes() {
+    async fn directory_owned_index_refresh_relinks_legacy_directories_without_copying() {
+        for changed in [false, true] {
+            let scratch = Scratch::directory("index-legacy");
+            tracked_checkout(scratch.root.path(), "main", AT_THE_CAP, &["source.rs"]);
+            let (checkout, live, mount) = scratch.linked_checkout("main", 1);
+            let indexes = [
+                BuildStatePath::new(".codegraph", "codegraph").unwrap(),
+                BuildStatePath::new("packages/app/.codegraph", "packages/app/codegraph").unwrap(),
+            ];
+            let mut paths = vec![
+                BuildStatePath::new("target", "target").unwrap(),
+                BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+            ];
+            paths.extend(indexes.iter().cloned());
+            let state = BuildVolumeState {
+                paths,
+                fingerprint: Some("fixture".into()),
+            };
+            let mut held = state.clone();
+            if changed {
+                held.paths.retain(|path| !indexes.contains(path));
+                held.fingerprint = Some("source-side-cutover".into());
+            }
+            held.write(&mount).unwrap();
+            link::link_paths(&checkout, &mount, &state.paths).unwrap();
+            for path in &state.paths {
+                fs::write(
+                    mount.join(path.volume.as_path()).join("warm"),
+                    b"volume bytes",
+                )
+                .unwrap();
+            }
+            for path in &indexes {
+                let at = checkout.join(path.checkout.as_path());
+                fs::remove_file(&at).unwrap();
+                fs::create_dir(&at).unwrap();
+                fs::write(at.join("legacy"), b"discard, never copy").unwrap();
+            }
+            let refreshed = scratch
+                .volumes
+                .refresh(
+                    owner("main", '0'),
+                    checkout.clone(),
+                    if changed {
+                        discovered(state.paths.clone())
+                    } else {
+                        Discovered::Unchanged
+                    },
+                    Lent::Nothing,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(refreshed.volume, Some(live));
+            let expected_added = if changed {
+                indexes
+                    .iter()
+                    .map(|path| path.checkout.as_path().to_owned())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(refreshed.added, expected_added);
+            assert_eq!(
+                refreshed
+                    .displaced
+                    .iter()
+                    .map(|finding| finding.path.clone())
+                    .collect::<Vec<_>>(),
+                indexes
+                    .iter()
+                    .map(|path| path.checkout.as_path().to_owned())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
+            for path in &state.paths {
+                let at = checkout.join(path.checkout.as_path());
+                assert_eq!(
+                    fs::read_link(&at).unwrap(),
+                    link::relative_target(path.checkout.as_path(), path.volume.as_path())
+                );
+                assert_eq!(fs::read(at.join("warm")).unwrap(), b"volume bytes");
+                assert!(!at.join("legacy").exists());
+                assert!(!mount.join(path.volume.as_path()).join("legacy").exists());
+            }
+            crate::build_volume::discard::finish(&checkout, |_| {}).unwrap();
+            assert!(
+                crate::build_volume::discard::pending(&checkout)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(fs::read(checkout.join("source.rs")).unwrap(), b"{}\n");
+            assert!(
+                fs::read_dir(checkout.join(".cowshed"))
+                    .unwrap()
+                    .all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("index-cutover-"))
+            );
+            scratch.release_all();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_owned_index_refresh_keeps_exact_links_and_volume_bytes_untouched() {
+        use std::os::unix::fs::MetadataExt as _;
+        for changed in [false, true] {
+            let scratch = Scratch::directory("index-exact");
+            let (checkout, live, mount) = scratch.linked_checkout("main", 1);
+            let state = BuildVolumeState {
+                paths: vec![
+                    BuildStatePath::new(".codegraph", "codegraph").unwrap(),
+                    BuildStatePath::new("packages/app/.codegraph", "packages/app/codegraph")
+                        .unwrap(),
+                    BuildStatePath::new("target", "target").unwrap(),
+                    BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+                ],
+                fingerprint: Some("fixture".into()),
+            };
+            state.write(&mount).unwrap();
+            link::link_paths(&checkout, &mount, &state.paths).unwrap();
+            let before = state
+                .paths
+                .iter()
+                .map(|path| {
+                    let at = checkout.join(path.checkout.as_path());
+                    fs::write(at.join("warm"), b"volume bytes").unwrap();
+                    let metadata = fs::symlink_metadata(&at).unwrap();
+                    (
+                        metadata.ino(),
+                        metadata.modified().unwrap(),
+                        fs::metadata(at.join("warm")).unwrap().modified().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let refreshed = scratch
+                .volumes
+                .refresh(
+                    owner("main", '0'),
+                    checkout.clone(),
+                    if changed {
+                        discovered(state.paths.clone())
+                    } else {
+                        Discovered::Unchanged
+                    },
+                    Lent::Nothing,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(refreshed.volume, Some(live));
+            assert!(refreshed.displaced.is_empty());
+            assert!(refreshed.added.is_empty());
+            assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
+            for (path, (inode, written, bytes_written)) in state.paths.iter().zip(before) {
+                let at = checkout.join(path.checkout.as_path());
+                let metadata = fs::symlink_metadata(&at).unwrap();
+                assert_eq!(
+                    fs::read_link(&at).unwrap(),
+                    link::relative_target(path.checkout.as_path(), path.volume.as_path())
+                );
+                assert_eq!(metadata.ino(), inode);
+                assert_eq!(metadata.modified().unwrap(), written);
+                assert_eq!(fs::read(at.join("warm")).unwrap(), b"volume bytes");
+                assert_eq!(
+                    fs::metadata(at.join("warm")).unwrap().modified().unwrap(),
+                    bytes_written
+                );
+            }
+            assert!(
+                fs::read_dir(checkout.join(".cowshed"))
+                    .unwrap()
+                    .all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("index-cutover-"))
+            );
+            scratch.release_all();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_owned_index_refresh_preserves_a_busy_holder_and_fixed_link() {
         use crate::build_volume::sqlite::Connection;
-        let scratch = Scratch::new("index-cutover");
+        use std::os::unix::fs::MetadataExt as _;
+        let scratch = Scratch::new("index-refresh");
         let (checkout, live, mount) = scratch.linked_checkout("main", 1);
         let index = BuildStatePath::new(".codegraph", "codegraph").unwrap();
         let state = BuildVolumeState {
             paths: vec![index.clone()],
-            fingerprint: Some("before-cutover".into()),
+            fingerprint: Some("fixture".into()),
         };
         state.write(&mount).unwrap();
         link::link_paths(&checkout, &mount, &state.paths).unwrap();
-        let database = checkout.join(".codegraph/codegraph.db");
+        let at = checkout.join(".codegraph");
+        let before = fs::symlink_metadata(&at).unwrap();
+        let database = at.join("codegraph.db");
         fs::write(&database, b"").unwrap();
         let holder = Connection::open(&database).unwrap();
         holder.execute("PRAGMA journal_mode=WAL", &[]).unwrap();
@@ -4100,7 +4112,7 @@ mod tests {
         holder
             .execute("INSERT INTO evidence VALUES ('before')", &[])
             .unwrap();
-        let refused = scratch
+        let refreshed = scratch
             .volumes
             .refresh(
                 owner("main", '0'),
@@ -4109,85 +4121,33 @@ mod tests {
                 Lent::Nothing,
             )
             .await
-            .unwrap_err();
-        let reason = refused
-            .index_migration_source()
-            .expect("typed index migration refusal");
-        assert_eq!(reason.path, checkout.join(".codegraph"));
-        assert!(
-            reason
-                .holders
-                .iter()
-                .any(|held| u32::try_from(held.pid) == Ok(std::process::id()))
-        );
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.volume, Some(live.clone()));
+        assert!(refreshed.displaced.is_empty());
         assert_eq!(BuildVolumeState::read(&mount).unwrap(), state);
         assert_eq!(
-            fs::read_link(checkout.join(".codegraph")).unwrap(),
+            fs::read_link(&at).unwrap(),
             link::relative_target(index.checkout.as_path(), index.volume.as_path())
         );
-        // The same SQLite holder remains usable after the refusal: no force, kill or live copy.
+        assert_eq!(fs::symlink_metadata(&at).unwrap().ino(), before.ino());
+        assert_eq!(
+            fs::symlink_metadata(&at).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
         holder
-            .execute("INSERT INTO evidence VALUES ('after refusal')", &[])
+            .execute("INSERT INTO evidence VALUES ('after refresh')", &[])
             .unwrap();
         let mut rows = holder.prepare("SELECT count(*) FROM evidence").unwrap();
         assert!(rows.step().unwrap());
         assert_eq!(rows.integer(0), 2);
         drop(rows);
         drop(holder);
-        let before = fs::read(&database).unwrap();
-        let written = fs::metadata(&database).unwrap().modified().unwrap();
-        scratch
-            .volumes
-            .refresh(
-                owner("main", '0'),
-                checkout.clone(),
-                Discovered::Unchanged,
-                Lent::Nothing,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            fs::symlink_metadata(checkout.join(".codegraph"))
-                .unwrap()
-                .is_dir()
-        );
-        assert_eq!(fs::read(&database).unwrap(), before);
         assert_eq!(
-            fs::metadata(&database).unwrap().modified().unwrap(),
-            written
+            fs::canonicalize(&database).unwrap(),
+            mount.join("codegraph/codegraph.db")
         );
-        assert!(BuildVolumeState::read(&mount).unwrap().paths.is_empty());
-        let restored = Connection::open(&database).unwrap();
-        let mut rows = restored.prepare("SELECT count(*) FROM evidence").unwrap();
-        assert!(rows.step().unwrap());
-        assert_eq!(rows.integer(0), 2);
-        drop(rows);
-        drop(restored);
-        // A foreign index link is never copied, exchanged, or followed.
-        fs::remove_dir_all(checkout.join(".codegraph")).unwrap();
-        let foreign = scratch.root.path().join("foreign-index");
-        fs::create_dir(&foreign).unwrap();
-        fs::write(foreign.join("marker"), "foreign").unwrap();
-        std::os::unix::fs::symlink(&foreign, checkout.join(".codegraph")).unwrap();
-        state.write(&mount).unwrap();
-        scratch
-            .volumes
-            .refresh(
-                owner("main", '0'),
-                checkout.clone(),
-                Discovered::Unchanged,
-                Lent::Nothing,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(fs::read_link(checkout.join(".codegraph")).unwrap(), foreign);
-        assert_eq!(
-            fs::read_to_string(foreign.join("marker")).unwrap(),
-            "foreign"
-        );
-        assert!(scratch.layout.read_record_present(&live).unwrap().is_some());
+        assert_eq!(scratch.layout.list().unwrap(), [live]);
         scratch.release_all();
     }
 

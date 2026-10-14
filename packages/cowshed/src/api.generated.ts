@@ -356,7 +356,6 @@ export type CowshedError = {
    * where that input stands. Absent from the wire otherwise, like `fence`.
    */
   readonly stdin?: StdinRefusal;
-  readonly indexMigration?: IndexMigrationRefusal;
 };
 
 /**
@@ -790,15 +789,6 @@ export type IdentityReport = {
   readonly added: boolean;
   readonly identity: BoundIdentity;
   readonly identities: ReadonlyArray<BoundIdentity>;
-};
-
-/**
- * A writer-excluded owned index migration refused without changing its link or bytes.
- */
-export type IndexMigrationRefusal = {
-  readonly path: string;
-  readonly reason: string;
-  readonly holders: ReadonlyArray<DatabaseHolder>;
 };
 
 /**
