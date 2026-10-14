@@ -908,7 +908,7 @@ mod tests {
 
     #[test]
     fn allocation_only_changes_preserve_git_evidence_but_never_hide_corruption() {
-        use std::os::unix::fs::MetadataExt as _;
+        use std::io::Write as _;
         let repository = Repository::new();
         let directory = repository.root.join(".git/objects/aa");
         fs::create_dir_all(&directory).expect("object directory");
@@ -917,16 +917,32 @@ mod tests {
             .expect("sparse object")
             .set_len(1024 * 1024)
             .expect("sparse size");
-        let before_blocks = fs::metadata(&object).expect("sparse metadata").blocks();
         let before_bytes = fs::read(&object).expect("sparse bytes");
-        let before = repository.snapshot();
+        let mut before = repository.snapshot();
         fs::write(&object, &before_bytes).expect("materialize the same bytes");
         assert_eq!(fs::read(&object).expect("dense bytes"), before_bytes);
-        assert_ne!(
-            fs::metadata(&object).expect("dense metadata").blocks(),
-            before_blocks
-        );
-        let after = repository.snapshot();
+        let mut after = repository.snapshot();
+        // Allocation is an input to our comparison, not a promise from the filesystem:
+        // compression can keep both representations in one block. Supply distinct size
+        // observations while retaining every other byte of the real Git probes.
+        for (observed, allocated_kib) in [(&mut before, 0), (&mut after, 1024)] {
+            let mut stdout = Vec::with_capacity(observed.count_objects.stdout.len() + 4);
+            let mut sizes = 0;
+            for line in observed
+                .count_objects
+                .stdout
+                .split_inclusive(|byte| *byte == b'\n')
+            {
+                if line.starts_with(b"size: ") {
+                    writeln!(stdout, "size: {allocated_kib}").expect("write observed allocation");
+                    sizes += 1;
+                } else {
+                    stdout.extend_from_slice(line);
+                }
+            }
+            assert_eq!(sizes, 1, "one loose-object allocation field was observed");
+            observed.count_objects.stdout = stdout;
+        }
         assert_ne!(before.count_objects.stdout, after.count_objects.stdout);
         before
             .compare(&after)
@@ -1145,13 +1161,9 @@ mod tests {
         repository.git(&["worktree", "add", "-q", "--detach", peer.to_str().unwrap()]);
         let before = repository.snapshot();
         let staging = repository.scratch.join("stage");
-        let status = std::process::Command::new("/bin/cp")
-            .arg("-R")
-            .arg(&repository.root)
-            .arg(&staging)
-            .status_locked()
+        fs::create_dir(&staging).expect("create copy destination");
+        crate::copy::copy_until_quiescent_blocking(&repository.root, &staging)
             .expect("copy real repository to staging");
-        assert!(status.success());
         let staged = capture(&staging, &repository.root).expect("capture staged copy");
         assert_ne!(
             before.worktrees.stdout, staged.worktrees.stdout,

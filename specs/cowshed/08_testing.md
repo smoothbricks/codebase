@@ -26,7 +26,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
   drift, and copy-only paths. Each witness proves configured filters would run under ordinary Git but never during
   capture or copy verification, verifies restored bytes again, and checks both repositories' config/index bytes remain
   unchanged. Each is an ordinary test that finishes well inside the ordinary 30s slow warning, so the run's progress
-  bound sees it finish; they are not one aggregate of hundreds of serial Git probes.
+  bound sees it finish; they are not one aggregate of hundreds of serial Git probes. Staging uses the production tree
+  copier, not a fixed host executable path. Allocation-only comparison cases supply distinct loose-size probe
+  observations while retaining the other real Git evidence and fsck refusal; they never require compression or sparse
+  writeback to change the host filesystem's allocated-block count.
 - **Grant files**: schema round-trip, revision monotonicity, delta application, wildcard egress matching
   (`*.github.com`), port defaults.
 - **Marker files**: round-trip, unknown-version rejection, role transitions (fork/restore).
