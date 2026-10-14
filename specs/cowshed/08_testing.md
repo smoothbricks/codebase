@@ -317,8 +317,8 @@ assertions, image resizing, legacy-image re-adoption and native recovery boundar
 disk-image target: the two groups never run concurrently. Each nextest group declares `max-threads = 1`.
 `.config/nextest.toml` owns their package-scoped selection filters, and the code-time wrapper rules select the same
 tests. Ordinary and exceptions shards exclude those filters. No target depends on either group but the host group's edge
-to the device group: a group runs only as its own target, which the land gate names (`tooling/land-host.sh`), and only
-when its own inputs change. Every test has one runner, and non-macOS planning creates neither APFS group.
+to the device group: a group runs only as its own target, named by the land gate, and only when its own inputs change.
+Every test has one runner, and non-macOS planning creates neither APFS group.
 
 Every test target, the groups included, is bounded by progress alone: the run ends when no test has finished for 180s,
 the hang backstop, and names the tests still running; it has no wall-clock ceiling, and no per-test bound kills a test
