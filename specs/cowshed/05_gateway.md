@@ -54,6 +54,10 @@ topology is platform-specific:
   `127.0.0.1:7644` is only a namespace-local compatibility endpoint, so fixed service ports neither collide nor reach
   siblings.
 
+Port-block inventory is macOS data even when a pure inventory test runs on another host. Its session conversion
+validates the recorded macOS block; actual gateway installation always validates the current host's topology and rejects
+TCP sessions on Linux. A namespace-local connector is never a TCP gateway-session endpoint.
+
 The allocator's publication marker excludes other cowshed creators while it binds all ports in the candidate block.
 Those listeners are released only after the image and grant are published. A separate host process can still claim a
 port before the daemon installs the session: `AddrInUse` is a typed control refusal, not a stale-grant success. The
