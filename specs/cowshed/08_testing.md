@@ -70,7 +70,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
   Equals guards in one setup, pins `get`/`as-str`/`display` projection metadata, and refuses missing, unknown and extra
   metadata through both assertion and JSON parsing. It consumes the prebuilt owner generator, without an N-API wire
   corpus or native runtime fixture. Rust IR tests independently pin every serialized fact and the exact owner-emitted
-  model/validator bytes. The focused target runs Biome and ESLint before the admission oracle.
+  model/validator bytes. Like the canonical wire-generation fixture, its isolated source clone and generated validator
+  project live in the package's ignored `.cache/`, preserving the owning Typia/dependency lookup while remaining outside
+  strict source scanners. A live-clone inventory control retains the real bootstrap source and excludes the temporary
+  copy. The focused target runs Biome and ESLint before the admission oracle.
 - **Authoritative cwd resolution and env wiring**: fake-host/router tables cover deeply nested cwd success, detached and
   cross-project refusal, malicious marker-only refusal, and overlapping active-mount ambiguity, plus macOS/Linux
   `PortBlock` presence. Capability-wire tests freeze `project.workspaceAt` and reject local CLI inference.

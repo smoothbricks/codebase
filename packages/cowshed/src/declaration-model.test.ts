@@ -4,7 +4,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { DeclarationModel } from '@smoothbricks/cowshed/declaration-ir';
 import typia, { TypeGuardError } from 'typia';
@@ -21,7 +21,6 @@ const assertPublicModel = typia.createAssertEquals<DeclarationModel>();
  * exist, so each refusal is caused by its own mutation and by nothing else.
  */
 
-const sourceDirectory = dirname(fileURLToPath(import.meta.url));
 const project = fileURLToPath(new URL('..', import.meta.url));
 const generator = fileURLToPath(new URL('../.cache/api-generator/cowshed-api-gen', import.meta.url));
 
@@ -203,7 +202,7 @@ describe('declaration model admission', () => {
   let probe = '';
 
   beforeAll(async () => {
-    scratch = mkdtempSync(join(sourceDirectory, '.ir-model-admission-'));
+    scratch = mkdtempSync(join(project, '.cache', 'ir-model-admission-'));
     const core = join(scratch, 'crates/cowshed-core/src');
     cpSync(join(project, 'crates/cowshed-core/src'), core, { recursive: true });
     mkdirSync(join(scratch, 'crates/cowshed-gateway-types/src'), { recursive: true });
@@ -239,6 +238,17 @@ describe('declaration model admission', () => {
     if (scratch !== '') {
       rmSync(scratch, { recursive: true, force: true });
     }
+  });
+
+  it('keeps its live source clone outside the strict disk-command source inventory', () => {
+    const inventory = spawnSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], {
+      cwd: project,
+      encoding: 'utf8',
+    });
+    expect(inventory.error).toBeUndefined();
+    expect(inventory.status).toBe(0);
+    expect(inventory.stdout).toContain('crates/cowshed-core/src/storage/bootstrap/native/macos.rs');
+    expect(inventory.stdout).not.toContain(basename(scratch));
   });
 
   it('admits the model the owner emits for the real cowshed-core declarations', () => {
