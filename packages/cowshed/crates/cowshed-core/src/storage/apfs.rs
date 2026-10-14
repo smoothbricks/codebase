@@ -409,8 +409,9 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
 
     fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError>;
     /// Mint `image`, which must not exist, and hand it back checked and mounted at `mount_point`:
-    /// one `clonefile` of the store's formatted blank template at `capacity`, then one combined
-    /// Disk Arbitration attach/mount (01a_apfs.md, "Images"). The canonical name
+    /// one `clonefile` of the store's formatted blank template at `capacity`, then one exact-image
+    /// `--noMount` attach, pinned `fsck_apfs` check and `mount_apfs` mount (01a_apfs.md, "Mounts").
+    /// The canonical name
     /// only ever holds a complete, formatted volume; it carries the template's label until the
     /// workspace's supervisor relabels it. A failure leaves no image and no attachment.
     fn create_attached(
@@ -461,7 +462,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     ) -> Result<Option<PendingAdoption>, ApfsStorageError>;
     /// Attach and mount an unfinished adoption's canonical image at its staging mountpoint the
     /// way [`Self::attach_and_mount_resumable`] does, or answer `None` when its legacy payload
-    /// never became an APFS volume. Disk Arbitration filesystem-check failures are returned;
+    /// never became an APFS volume. Pinned filesystem-verification failures are returned;
     /// whatever a refused fresh attachment produced is released first.
     fn resume_pending_adopt(
         &self,
@@ -475,12 +476,12 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     /// Release and reclaim an unpublished canonical image no attachment handle is held for:
     /// whatever the kernel still attaches from it, then the image, its companion and sidecar.
     fn discard_pending(&self, image: &Path) -> Result<(), ApfsStorageError>;
-    /// Unmount the volume `attachment` holds through the kernel's own unmount, leaving the image
-    /// attached for its next mount. No Disk Arbitration round trip.
+    /// Unmount the exact verified mounted volume with `diskutil unmount`, leaving the image
+    /// attached for its next mount. An already-unmounted volume needs no command effect.
     fn unmount_attachment(&self, attachment: &Self::Attachment) -> Result<(), ApfsStorageError>;
     fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError>;
     fn attach_verified(&self, image: &Path) -> Result<Self::Attachment, ApfsStorageError>;
-    /// Attach a formatted image and mount it in the same checked Disk Arbitration transaction.
+    /// Attach a formatted image once without mounting, check its pinned volume, then use `mount_apfs`.
     fn attach_mounted(
         &self,
         image: &Path,
@@ -496,7 +497,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         browse: bool,
     ) -> Result<(), ApfsStorageError>;
     /// Attach and mount a pending canonical image, reusing an exact surviving kernel mount or
-    /// checking and mounting its unmounted crash-left attachment through Disk Arbitration.
+    /// checking its pinned unmounted crash-left volume with `fsck_apfs`, then using `mount_apfs`.
     /// Implementations own cleanup when attachment or mounting fails.
     fn attach_and_mount_resumable(
         &self,
