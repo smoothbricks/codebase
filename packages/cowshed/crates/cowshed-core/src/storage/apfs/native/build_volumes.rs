@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::{MacOsApfsExecutionHost, io_error};
-use crate::build_volume::nx::Holder;
 use crate::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, LinkResolution,
     ReleaseClaim, link,
@@ -19,7 +18,6 @@ use crate::metadata::{WorkspaceIncarnation, WorkspaceName};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError};
 use crate::storage::lifecycle::ResizeOutcome;
 use cowshed_apfs::image::ImageCapacity;
-use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess};
 use cowshed_apfs::{ApfsBackend, CommandRunner, DetachIntent, MountAccess, mount_is_in_progress};
 use cowshed_os::process::Holder;
 
