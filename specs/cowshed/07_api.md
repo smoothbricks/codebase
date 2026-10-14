@@ -1352,27 +1352,19 @@ pub struct CowshedError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: String,
-    /* otherBuild, fence, admission, stdin, indexMigration: optional structured sources, read through accessors */
+    /* otherBuild, fence, admission, stdin: optional structured sources, read through accessors */
 }
 impl CowshedError {
     pub fn other_build_source(&self) -> Option<&OtherBuild>;
     pub fn fence_source(&self) -> Option<&FenceRefusal>;
     pub fn admission_source(&self) -> Option<&AdmissionRefusal>;
     pub fn stdin_source(&self) -> Option<StdinRefusal>;
-    pub fn index_migration_source(&self) -> Option<&IndexMigrationRefusal>;
 }
 
 pub enum ErrorCode {
     Internal, EnvironmentMissing, Usage, NotFound, Conflict, SandboxDenied, Integrity,
 }
 
-/// A non-forced owned index-link cutover refused before publication (16_build_volumes.md).
-/// Wire `indexMigration`: exact checkout path, kernel refusal and observed holders. No holder is killed.
-pub struct IndexMigrationRefusal {
-    pub path: PathBuf,
-    pub reason: String,
-    pub holders: Vec<DatabaseHolder>,
-}
 
 /// Why a rebase or land refused at one of its fences, with what the fence observed. `IncarnationMoved` also types
 /// every other exact-incarnation refusal, and `SourceMoved` push's source-head refusal. Wire:

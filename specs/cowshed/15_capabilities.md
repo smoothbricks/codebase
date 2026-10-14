@@ -23,20 +23,21 @@ project code during discovery. A convention that resolves outside the workspace 
 directory marker's fixed link through `.cowshed/build`. Missing markers mean absence; other filesystem errors report the
 path and failure.
 
-| Detector | Convention                                                                     | Contribution                                                                                                                     |
-| -------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
-| direnv   | `.envrc`                                                                       | Contained shell activation, private approval state, read-only host `source_url` store, bootstrap executable                      |
-| Nx       | `nx.json`                                                                      | The checkout's one `.nx` and daemon for every job; short shared socket namespace; discard inherited daemon records               |
-| cargo    | Tracked `Cargo.toml` files                                                     | Distinct workspaces' configured target dirs; shared registry/git caches and exact cache-state files; Git and trust               |
-| Go       | `go.mod` or `go.work` at the selected root, or any tracked `go.mod` below it   | Shared module/build caches; no generated GOENV or toolchain/proxy policy                                                         |
-| Bun      | `package.json` and `bun.lock` or `bun.lockb`                                   | Bun install cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`                            |
-| npm      | `package.json` and `package-lock.json` or `npm-shrinkwrap.json`                | npm content cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`                            |
-| pnpm     | `package.json` and `pnpm-lock.yaml`                                            | pnpm store and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`                                   |
-| uv       | `pyproject.toml` or `uv.lock`                                                  | uv cache and platform certificate opt-in                                                                                         |
-| Zig      | `build.zig`                                                                    | Zig global cache                                                                                                                 |
-| Gradle   | `settings.gradle`, `settings.gradle.kts`, `build.gradle` or `build.gradle.kts` | Gradle cache, not host credentials or configuration                                                                              |
-| Nix      | `flake.nix` or `devenv.nix`, or an `.envrc` chain reaching Nix (below)         | Nix client caches, immutable tool/store reads, canonical live daemon socket, TLS settings and bootstrap executables              |
-| sccache  | cargo convention and an installed host compiler-cache client                   | Compiler wrapper, exact host daemon socket and cache-client settings, identical in served `.cowshed/env` and supervisor children |
+| Detector  | Convention                                                                     | Contribution                                                                                                                     |
+| --------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| direnv    | `.envrc`                                                                       | Contained shell activation, private approval state, read-only host `source_url` store, bootstrap executable                      |
+| Nx        | `nx.json`                                                                      | The checkout's one `.nx` and daemon for every job; short shared socket namespace; discard inherited daemon records               |
+| Codegraph | `.codegraph/` at the selected project root                                     | The project-relative index on the build volume, cloned and adopted behind its fixed relative link                                |
+| cargo     | Tracked `Cargo.toml` files                                                     | Distinct workspaces' configured target dirs; shared registry/git caches and exact cache-state files; Git and trust               |
+| Go        | `go.mod` or `go.work` at the selected root, or any tracked `go.mod` below it   | Shared module/build caches; no generated GOENV or toolchain/proxy policy                                                         |
+| Bun       | `package.json` and `bun.lock` or `bun.lockb`                                   | Bun install cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`                            |
+| npm       | `package.json` and `package-lock.json` or `npm-shrinkwrap.json`                | npm content cache and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`                            |
+| pnpm      | `package.json` and `pnpm-lock.yaml`                                            | pnpm store and JavaScript trust/proxy settings; each installed package's `node_modules/.cache`                                   |
+| uv        | `pyproject.toml` or `uv.lock`                                                  | uv cache and platform certificate opt-in                                                                                         |
+| Zig       | `build.zig`                                                                    | Zig global cache                                                                                                                 |
+| Gradle    | `settings.gradle`, `settings.gradle.kts`, `build.gradle` or `build.gradle.kts` | Gradle cache, not host credentials or configuration                                                                              |
+| Nix       | `flake.nix` or `devenv.nix`, or an `.envrc` chain reaching Nix (below)         | Nix client caches, immutable tool/store reads, canonical live daemon socket, TLS settings and bootstrap executables              |
+| sccache   | cargo convention and an installed host compiler-cache client                   | Compiler wrapper, exact host daemon socket and cache-client settings, identical in served `.cowshed/env` and supervisor children |
 
 A Nix/devenv convention does not activate a shell. Projects that want devenv activation use their own `.envrc` with
 direnv's `use devenv`. There is no built-in devenv shell backend or `[devenv]` configuration. No detector recognizes a

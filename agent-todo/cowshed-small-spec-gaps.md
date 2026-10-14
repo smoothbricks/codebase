@@ -149,3 +149,24 @@ done. They are independent of each other.
 - Acceptance: the helper refuses a dataset outside `<pool>/cowshed/`, any verb outside its set, and a `promote` of any
   dataset but a refresh clone of main. A refresh promotion followed by `rm` of every job clone leaves the previous main
   reclaimable by `gc`, and the snapshot graph is again main at the center.
+
+## Workspace-only operator quiesce and retirement
+
+- Governing contract: specs/cowshed/11_shell.md, "Controller/supervisor protocol" (:273-284), defines drain as stopping
+  admission, letting running jobs finish, then retiring; retirement releases the listener and lease before
+  acknowledgement (:206-213). specs/cowshed/16_build_volumes.md, "Owned index links" (:161-169), requires non-forced
+  holder exclusion for seed capture and forbids copying an index to the source volume to evade a holder.
+- Existing mechanism: runtime/supervisor_socket.rs:345-348 has internal Quiesce/Retire calls; :1317-1327 dispatches
+  them. Its drain at :1503-1537 uses the existing cross-build request and verifies the live socket peer's kernel
+  identity before retaining its exit watch. runtime/supervisor_manager.rs:205-217 exposes only Ensure/SameBuild,
+  dispatched at :945-958. These paths are under packages/cowshed/crates/cowshed-core/src/; none is a public
+  workspace-only operator verb.
+- Contract gap: an operator cannot request that one workspace stop admission and retire through the existing control
+  channel without also detaching or removing it. Define that operator contract before adding a CLI/API route; this entry
+  authorizes no new wire operation. Preserve unrelated workspaces, sessions, jobs and mounts; no fleet stop, raw PID
+  signal, forced detach or ad-hoc socket request substitutes for the missing route.
+- Acceptance for that separate contract: the exact workspace stops admission, completes or reports its admitted jobs,
+  retires its supervisor and Nx keeper, and acknowledges only after releasing its listener and lease; another workspace
+  remains served. A subsequent seed capture uses the normal non-forced exclusion. Index refresh itself needs no drain:
+  it leaves exact fixed links intact or discards a displaced real directory in .cowshed/discard and relinks it, never
+  copying index bytes onto the source volume.

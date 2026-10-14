@@ -456,13 +456,6 @@ export const assertIdentityReportList = typia.createAssertEquals<readonly Api.Id
 export const parseIdentityReportList = (json: string): readonly Api.IdentityReport[] =>
   assertIdentityReportList(JSON.parse(json));
 
-export const assertIndexMigrationRefusal = typia.createAssertEquals<Api.IndexMigrationRefusal>();
-export const parseIndexMigrationRefusal = (json: string): Api.IndexMigrationRefusal =>
-  assertIndexMigrationRefusal(JSON.parse(json));
-export const assertIndexMigrationRefusalList = typia.createAssertEquals<readonly Api.IndexMigrationRefusal[]>();
-export const parseIndexMigrationRefusalList = (json: string): readonly Api.IndexMigrationRefusal[] =>
-  assertIndexMigrationRefusalList(JSON.parse(json));
-
 export const assertJobAccounting = typia.createAssertEquals<Api.JobAccounting>();
 export const parseJobAccounting = (json: string): Api.JobAccounting => assertJobAccounting(JSON.parse(json));
 export const assertJobAccountingList = typia.createAssertEquals<readonly Api.JobAccounting[]>();
