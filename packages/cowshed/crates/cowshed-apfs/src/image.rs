@@ -6,7 +6,8 @@ use std::fmt;
 use std::path::Path;
 
 /// Every workspace image is a sparse RAW file holding one case-sensitive APFS volume
-/// (specs/cowshed/01_storage.md): one extension, no alias, nothing inferred from anything else.
+/// (specs/cowshed/01a_apfs.md, "Images"): one extension, no alias, nothing inferred from
+/// anything else.
 pub const IMAGE_EXTENSION: &str = "dmg";
 
 /// Whether `path` names `<stem>.dmg`.

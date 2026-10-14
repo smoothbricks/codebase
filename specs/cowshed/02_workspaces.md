@@ -82,11 +82,11 @@ not a best-effort script:
    applied otherwise — and the dedicated store volume exists: run the same host setup `cowshed setup` runs, which
    creates and mounts `cowshed.store` at `/private/cowshed/store` (the volume marker in 01_storage.md) before any image
    is created.
-2. Create the image (case-sensitive APFS in sparse RAW, 01_storage.md) at its canonical name, `<owner>/<repo>/main.dmg`,
+2. Create the image (case-sensitive APFS in sparse RAW, 01a_apfs.md) at its canonical name, `<owner>/<repo>/main.dmg`,
    behind a fence: its complete sibling host sidecar is written first, in publication state `PendingFence`, which keeps
    main out of ordinary enumeration, gateway inventory, and every verb that would mount or serve it. Both path
    components come from the validated primary `repo_id` and are encoded independently as specified in 01_storage.md. The
-   image is minted (01_storage.md "Images"): one `clonefile` of the store's formatted blank template takes the canonical
+   image is minted (01a_apfs.md "Images"): one `clonefile` of the store's formatted blank template takes the canonical
    name whole, so the name only ever holds a complete, formatted volume, and one Disk Arbitration transaction attaches
    and mounts it. That attach is the only one main gets; the volume is mounted at a staging mountpoint.
 3. Copy the full tree (including `.git`), preserving metadata, in delta passes until quiescent. A bounded worker pool
@@ -119,19 +119,18 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
 
 1. Require the caller to be outside the checkout and require its source and build volumes to have no holders. Refuse
    with each holder's PID and command; never kill a user process or force an unmount. Each mounted image's holder census
-   runs under its existing image lease (01_storage.md, "Mounts" and "Ownership, identity, and the volume label"), after
-   an in-flight cosmetic rename releases its mount descriptor. Supervisor retirement remains nonwaiting; genuine
-   holders, including the controller's own PID, still refuse. An unmounted input is not censused. Record the exact
-   source backing path, incarnation, original checkout path, build-volume identity, current kernel IOMedia capacities
-   and retained paths in the durable adoption intent before changing any of them. Preserve an existing
-   `<checkout>.pre-cowshed` tree without overwriting or deleting it. Source and build copy mounts use the project's
-   recorded adoption staging namespace, with source and destination names that cannot be parsed as BuildVolumeIds.
-   Without `--repo-id`, the replacement binds the checkout's existing primary `repo_id` from the store rather than
-   deriving one from the remotes. It does so only when the in-image marker at the checkout records this checkout as
-   main's, the controller's Active RAW `main.dmg` sidecar for that repository records the same checkout and incarnation,
-   a binding owns that repository, and no other project's RAW main claims the checkout. Any disagreement refuses. With
-   no main marker at the checkout, or no RAW `main.dmg` for the repository it names, the identity rules of adopt step 1
-   apply.
+   runs under its existing image lease (01a_apfs.md, "Mounts" and "Ownership, identity, and the volume label"), after an
+   in-flight cosmetic rename releases its mount descriptor. Supervisor retirement remains nonwaiting; genuine holders,
+   including the controller's own PID, still refuse. An unmounted input is not censused. Record the exact source backing
+   path, incarnation, original checkout path, build-volume identity, current kernel IOMedia capacities and retained
+   paths in the durable adoption intent before changing any of them. Preserve an existing `<checkout>.pre-cowshed` tree
+   without overwriting or deleting it. Source and build copy mounts use the project's recorded adoption staging
+   namespace, with source and destination names that cannot be parsed as BuildVolumeIds. Without `--repo-id`, the
+   replacement binds the checkout's existing primary `repo_id` from the store rather than deriving one from the remotes.
+   It does so only when the in-image marker at the checkout records this checkout as main's, the controller's Active RAW
+   `main.dmg` sidecar for that repository records the same checkout and incarnation, a binding owns that repository, and
+   no other project's RAW main claims the checkout. Any disagreement refuses. With no main marker at the checkout, or no
+   RAW `main.dmg` for the repository it names, the identity rules of adopt step 1 apply.
 2. Record the source's complete content and Git state while it is quiescent: HEAD, porcelain, count-objects, local
    config including includes, every ref, packed refs or reftables, reflogs and stash, hooks, `info/`, index and worktree
    registrations. Preserve the sheds' links to the same main checkout path. Detach the exact old source without force,
@@ -214,21 +213,24 @@ the user's live tree: a replay before the handoff proves it unheld again and rec
 copies, so a commit or a fetch made after an earlier attempt refused never wedges the recovery.
 
 Re-adoption copies filesystem entries, not allocated-but-free guest blocks. Space returns only after verification and
-explicit release of the old image and any snapshots sharing its blocks (01_storage.md, "Space reclamation"). Existing
-ASIF images are retained inputs to this transaction; ordinary runtime image enumeration and attachment use RAW only.
+explicit release of the old image and any snapshots sharing its blocks (01a_apfs.md, "Space reclamation"). Existing ASIF
+images are retained inputs to this transaction; ordinary runtime image enumeration and attachment use RAW only.
 
 ## Checkout layouts
 
 Main mounts at the checkout's original path — one layout, no per-project choice to record — and every other workspace
-mounts at `<mount-root>/<owner>/<repo>/<workspace>`, where the mount root is host configuration (default
-`~/.cowshed/mnt`, set via `cowshed setup --mount-root`; see 01_storage.md). The root holds only mountpoint directories
-(empty when detached) and is plain per-user directories on Data; nothing is written inside any checkout, so no Git
-exclusion is required for them. Changing the root requires every workspace detached and is refused otherwise.
+mounts at `<mount-root>/<owner>/<repo>/<workspace>`, where the mount root is host configuration, set via
+`cowshed setup --mount-root` (01_storage.md). The macOS default is `/private/var/folders/cowshed/<uid>/mnt`; its
+provisioning and Spotlight admission rule are specified in [01a_apfs.md](./01a_apfs.md#stable-workspace-mount-root).
+Linux retains `~/.cowshed/mnt`, and existing explicit or legacy configuration is preserved. The root holds only
+mountpoint directories (empty when detached) and is plain per-user directories on Data; nothing is written inside any
+checkout, so no Git exclusion is required for them. Changing the root requires every workspace detached and is refused
+otherwise.
 
 **Direct mount.** `main` mounts at the checkout's original path. Publication renames the original tree to
 `<root>.pre-cowshed`, recreates an empty directory as the mountpoint without any shell hook, and attaches there. The
 user's path is the real thing: `pwd -P` reports it, the gitdir physically lives under it, and Finder shows the volume
-label — which is why the label is the repository's name (01_storage.md) rather than an encoded identity. The cost is one
+label — which is why the label is the repository's name (01a_apfs.md) rather than an encoded identity. The cost is one
 mounted volume inside the user's source tree and a mountpoint that cannot be moved by `mv`.
 
 **Why not a symlink.** Mounting main inside the store and leaving a symlink at the original path would keep the tree
@@ -452,9 +454,9 @@ image remains live and mounted throughout capture.
    allocation map; the filesystem snapshot is crash-consistent, not an application-state transaction. Create the
    complete closed-baseline sibling sidecar before attach; allocate `portBlock` only on macOS and omit it on Linux.
 3. Attach and mount at `<mount-root>/<owner>/<repo>/<ws>` in one Disk Arbitration transaction
-   (`diskutil image attach --mountPoint ... --mountOptions ... --plist`, flags per 01_storage.md). RAW makes no fixed
+   (`diskutil image attach --mountPoint ... --mountOptions ... --plist`, flags per 01a_apfs.md). RAW makes no fixed
    attach-latency guarantee. Before attach, the `first-write` step rewrites the clone's first block with the bytes it
-   holds, which copies the source image's extent map (01_storage.md, "Clone cost follows extents, not size"). On a
+   holds, which copies the source image's extent map (01a_apfs.md, "Clone cost follows extents, not size"). On a
    long-used main that costs tens of seconds, and under host load a container-wide metadata stall follows it, until
    `cowshed defrag main` rewrites main contiguously. Disk Arbitration owns the filesystem check and mount; cowshed then
    verifies the exact image/device and held mount-root identity before publication.
@@ -769,10 +771,11 @@ deliberate trade of isolation for immediacy, taken per workspace, and never by d
   incarnation that produced them, while the new incarnation allocates workspace-local monotonic numeric job IDs above
   every inherited allocation. Restore restart recovery reads only substrate facts: the canonical/pending detached
   metadata, the destination-keyed displaced image/grant/CA sidecars, and the exact sibling `.restore.json` recovery fact
-  described in 01_storage.md. Before durable pending-metadata publication it restores the old generation; afterward it
-  leaves the new generation pending for idempotent activation (the restore's audit record is emitted again on the way —
-  the sink is telemetry, so a repeat costs nothing it protects). Repeating startup recovery and activation cleanup has
-  the same result. The project runtime persists no restore fence, journal, or `.restore-fences` path.
+  described in 01a_apfs.md, "Restore publication custody". Before durable pending-metadata publication it restores the
+  old generation; afterward it leaves the new generation pending for idempotent activation (the restore's audit record
+  is emitted again on the way — the sink is telemetry, so a repeat costs nothing it protects). Repeating startup
+  recovery and activation cleanup has the same result. The project runtime persists no restore fence, journal, or
+  `.restore-fences` path.
 
 - `cowshed gc` retains every pinned checkpoint, every checkpoint younger than 14 days, and always the newest five per
   workspace. A supplied label and `--keep` both create explicit pins; only an explicit unpin makes them eligible.
@@ -829,7 +832,7 @@ fetch — the workspace branch plus `+HEAD:refs/cowshed/<ws>/wip` — the same p
 the same trust reason. `refs/cowshed/…` (singular) is the canonical namespace; `land` prunes a workspace's refs at
 retire. Each snapshot is gated by the secrets delta-scan (see "Secrets enforcement"): a finding skips that workspace's
 snapshot with one `cowshed:` warning and never blocks work. Uncommitted work between autosaves is the only loss window —
-images are excluded from backup by design (01_storage.md).
+images are excluded from backup by design (01a_apfs.md).
 
 ## Remote code ingress: `cowshed repo`
 
@@ -855,7 +858,7 @@ was removed or now names another repository, and follows one that moved servers.
   `~/Library/Caches/dev.cowshed/repo-mirrors/` (Linux `$XDG_CACHE_HOME/cowshed/repo-mirrors/`), writes one audit line,
   and returns the mirror path on stdout. Mirrors are created by the gateway with its own config — no agent-writable git
   config is ever in the loop — and are fetch-only and gateway-only: that directory is cowshed controller state, which no
-  sandbox can read or write (01_storage.md, 03_caches.md, 05_gateway.md).
+  sandbox can read or write (01_storage.md, 01a_apfs.md, 03_caches.md, 05_gateway.md).
 - **`cowshed repo clone <url> [dir]`** — sugar: mirror, then a host-side `git clone --dissociate <mirror>` into the
   workspace, so the clone holds its own objects and the sandbox never reads the mirror.
 

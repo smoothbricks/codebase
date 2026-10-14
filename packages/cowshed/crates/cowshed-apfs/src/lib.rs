@@ -259,7 +259,7 @@ pub trait CommandRunner {
 ///
 /// A disk-image command (`diskutil image …`, `hdiutil`) is the exception, and cowshed never kills
 /// one: killed mid-operation, its device can stay leaked in the kernel until reboot
-/// (01_storage.md, "How the APFS host degrades" §2). For it this deadline is a warning point: it
+/// (01a_apfs.md, "How the APFS host degrades" §2). For it this deadline is a warning point: it
 /// is waited for until it ends on its own, still holding its leases, and says what it is waiting
 /// on every [`DISK_IMAGE_WARNING_INTERVAL`].
 ///
@@ -2087,7 +2087,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     /// Opt the read-write volume just mounted at `mount_point` out of fseventsd's persistent
-    /// event log (01_storage.md, "The event log"): an empty `.fseventsd/no_log` at its root.
+    /// event log (01a_apfs.md, "The event log"): an empty `.fseventsd/no_log` at its root.
     /// fseventsd reads the marker when the volume mounts, so it governs the next mount and every
     /// clone. A log a root fseventsd created is root's to write, so only a mount that ignores
     /// ownership can replace it: that volume is mounted once more without ownership, its log
@@ -2190,8 +2190,8 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
 
     /// Create a blank sparse RAW image, attach it without mounting, format its whole device as one
     /// case-sensitive APFS volume (`newfs_apfs -e`) owned by the invoking user (`-U`/`-G`), verify
-    /// it and detach it: the blank template mint's sequence (01_storage.md), so no caller detaches
-    /// a volume the template path would have checked first. Nothing here runs as root.
+    /// it and detach it: the blank template mint's sequence (01a_apfs.md, "Images"), so no caller
+    /// detaches a volume the template path would have checked first. Nothing here runs as root.
     fn create_raw(&self, path: &Path, request: &CreateImageRequest) -> Result<(), ApfsError> {
         validate_image_path(path)?;
         let _lease = self.image_lease(path)?;
@@ -6184,7 +6184,7 @@ mod tests {
     }
 
     /// Every access and browse combination of a mounted attach is one `diskutil image attach` that
-    /// hands Disk Arbitration its mount point and its exact options (01_storage.md, "Mounts").
+    /// hands Disk Arbitration its mount point and its exact options (01a_apfs.md, "Mounts").
     /// Nothing mounts, checks or verifies the volume after it: the kernel pin proves the image's
     /// mapping, and the held mount point proves Disk Arbitration mounted that volume there. A
     /// read-write mount is opted out of the event log; a read-only one is left as mounted.

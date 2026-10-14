@@ -190,7 +190,7 @@ impl Drop for TestPaths {
 /// event; the only deadline is the hang bound, and it names the step still open.
 ///
 /// A's attachment is also the image-growth witness, so growth spends no attach of its own: a
-/// real attachment holds its image file exclusively (01_storage.md, "Images"), so growing A
+/// real attachment holds its image file exclusively (01a_apfs.md, "Images"), so growing A
 /// while attached is refused outright and nothing is written; once A is detached, the grow
 /// lands and A's capacity reports it.
 #[cfg(target_os = "macos")]
@@ -638,7 +638,7 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
         "the released image is still attached"
     );
     // The image is free to attach again: an attachment holds its file exclusively
-    // (01_storage.md, "Images"), and detached growth's own nonblocking exclusive open
+    // (01a_apfs.md, "Images"), and detached growth's own nonblocking exclusive open
     // succeeds, so no image driver still holds it — proved without another attach. The
     // released image is then deleted, so a passing run retains no fixture.
     SystemCommandRunner

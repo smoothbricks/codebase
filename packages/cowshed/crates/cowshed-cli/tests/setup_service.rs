@@ -253,6 +253,15 @@ impl HostSetup for FakeHost {
         Ok(self.retirement.clone())
     }
 
+    async fn plan_mount_root(&mut self, mount_root: &std::path::Path) -> Result<HostSetupPlan> {
+        self.events
+            .push(format!("plan-mount-root:{}", mount_root.display()));
+        match self.mount_root_error.take() {
+            Some(error) => Err(error),
+            None => Ok(self.plan.clone()),
+        }
+    }
+
     async fn configure_mount_root(&mut self, mount_root: &std::path::Path) -> Result<PathBuf> {
         self.events
             .push(format!("configure-mount-root:{}", mount_root.display()));
@@ -356,6 +365,200 @@ fn volume(name: &str, role: VolumeRole, state: VolumeState, action: &str) -> Vol
         state_before: state,
         action: String::from(action),
     }
+}
+
+fn stable_mount_root_action() -> HostAction {
+    HostAction::EnsureMountRoot {
+        path: PathBuf::from("/private/var/folders/cowshed/501/mnt"),
+        uid: 501,
+        gid: 20,
+    }
+}
+
+#[tokio::test]
+async fn setup_healthy_store_announces_one_root_approval_and_reports_actual_path() {
+    let action = stable_mount_root_action();
+    let mut host = FakeHost {
+        plan: HostSetupPlan::new(vec![action.clone()], Vec::new(), true),
+        report: HostSetupReport {
+            action_outcomes: vec![HostActionOutcome {
+                action,
+                outcome: HostActionResult::Done,
+            }],
+            volumes: vec![volume(
+                "cowshed.store",
+                VolumeRole::Store,
+                VolumeState::MountedValid,
+                "already-current",
+            )],
+            fstab: FstabOutcome::AlreadyCurrent,
+            authorized: true,
+        },
+        ..FakeHost::default()
+    };
+    let streams = run(&mut host, REPAIR, false, false).await;
+    assert_eq!(streams.exit, 0);
+    assert!(streams.stdout.is_empty());
+    assert_eq!(
+        streams
+            .stderr
+            .matches("will request administrator authorization once")
+            .count(),
+        1
+    );
+    assert!(streams.stderr.contains("uid 501, gid 20"));
+    assert!(streams.stderr.contains("root:wheel 0755"));
+    assert!(
+        streams.stderr.contains(
+            "workspace mount root is provisioned at /private/var/folders/cowshed/501/mnt"
+        )
+    );
+    assert!(!streams.stderr.contains("will be created in container"));
+    assert_eq!(
+        host.events
+            .iter()
+            .filter(|event| event.as_str() == "execute")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn setup_root_json_reports_the_owned_path_and_done_outcome() {
+    let action = stable_mount_root_action();
+    let mut host = FakeHost {
+        plan: HostSetupPlan::new(vec![action.clone()], Vec::new(), true),
+        report: HostSetupReport {
+            action_outcomes: vec![HostActionOutcome {
+                action,
+                outcome: HostActionResult::Done,
+            }],
+            volumes: Vec::new(),
+            fstab: FstabOutcome::AlreadyCurrent,
+            authorized: true,
+        },
+        ..FakeHost::default()
+    };
+    let streams = run(&mut host, REPAIR, true, false).await;
+    let envelope: serde_json::Value = serde_json::from_str(&streams.stdout).unwrap();
+    assert_eq!(
+        envelope["result"]["actionOutcomes"][0]["action"]["ensureMountRoot"]["path"],
+        "/private/var/folders/cowshed/501/mnt"
+    );
+    assert_eq!(
+        envelope["result"]["actionOutcomes"][0]["action"]["ensureMountRoot"]["uid"],
+        501
+    );
+    assert_eq!(envelope["result"]["actionOutcomes"][0]["outcome"], "done");
+    assert_eq!(envelope["result"]["authorized"], true);
+}
+
+#[tokio::test]
+async fn setup_root_denial_names_intent_without_success_output() {
+    let mut host = FakeHost {
+        plan: HostSetupPlan::new(vec![stable_mount_root_action()], Vec::new(), true),
+        execute_error: Some(CowshedError::sandbox_denied(
+            "authorization denied",
+            "cowshed setup",
+        )),
+        ..FakeHost::default()
+    };
+    let (streams, error) = failing_run(&mut host, REPAIR, true).await;
+    assert_eq!(error.code, ErrorCode::SandboxDenied);
+    assert!(streams.stdout.is_empty());
+    assert!(
+        streams
+            .stderr
+            .contains("/private/var/folders/cowshed/501/mnt")
+    );
+    assert!(error.message.contains("nothing on this host was changed"));
+    assert!(!host.events.iter().any(|event| event == "refresh-services"));
+}
+
+#[tokio::test]
+async fn setup_root_ownership_failure_reports_exact_path_without_success() {
+    let action = stable_mount_root_action();
+    let failure = CowshedError::environment_missing(
+        "refusing foreign workspace mount directory /private/var/folders/cowshed/501/mnt: owned by 502:20, expected 501:20",
+        "cowshed setup",
+    );
+    let mut host = FakeHost {
+        plan: HostSetupPlan::new(vec![action.clone()], Vec::new(), true),
+        report: HostSetupReport {
+            action_outcomes: vec![HostActionOutcome {
+                action,
+                outcome: HostActionResult::Failed { error: failure },
+            }],
+            volumes: Vec::new(),
+            fstab: FstabOutcome::AlreadyCurrent,
+            authorized: true,
+        },
+        ..FakeHost::default()
+    };
+    let (streams, error) = failing_run(&mut host, REPAIR, true).await;
+    assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+    assert!(streams.stdout.is_empty());
+    assert!(streams.stderr.contains("owned by 502:20, expected 501:20"));
+    assert!(
+        streams
+            .stderr
+            .contains("/private/var/folders/cowshed/501/mnt")
+    );
+    assert!(streams.stderr.contains("NOT set up"));
+}
+
+#[tokio::test]
+async fn setup_explicit_stable_root_announces_provisioning_before_configuration() {
+    let mut host = FakeHost {
+        plan: HostSetupPlan::new(vec![stable_mount_root_action()], Vec::new(), true),
+        ..FakeHost::default()
+    };
+    let args = SetupArgs {
+        mount_root: Some(PathBuf::from("/private/var/folders/cowshed/501/mnt")),
+        ..REPAIR
+    };
+    let streams = run(&mut host, args, false, true).await;
+    assert_eq!(streams.stdout, "/private/var/folders/cowshed/501/mnt\n");
+    assert_eq!(
+        streams
+            .stderr
+            .matches("will request administrator authorization once")
+            .count(),
+        1
+    );
+    assert!(streams.stderr.contains("uid 501, gid 20"));
+    assert_eq!(
+        host.events,
+        [
+            "plan-mount-root:/private/var/folders/cowshed/501/mnt",
+            "configure-mount-root:/private/var/folders/cowshed/501/mnt",
+            "git-identity",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn setup_explicit_stable_root_refuses_attached_sessions_before_announcing_or_provisioning() {
+    let mut host = FakeHost {
+        plan: HostSetupPlan::new(vec![stable_mount_root_action()], Vec::new(), true),
+        mount_root_error: Some(CowshedError::conflict(
+            "workspace mount root cannot change while attached: acme/widget/raven",
+            "detach every attached session, then cowshed setup --mount-root <dir>",
+        )),
+        ..FakeHost::default()
+    };
+    let args = SetupArgs {
+        mount_root: Some(PathBuf::from("/private/var/folders/cowshed/501/mnt")),
+        ..REPAIR
+    };
+    let (streams, error) = failing_run(&mut host, args, true).await;
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(streams.stdout.is_empty());
+    assert!(!streams.stderr.contains("administrator authorization"));
+    assert_eq!(
+        host.events,
+        ["plan-mount-root:/private/var/folders/cowshed/501/mnt"]
+    );
 }
 
 /// The three actions a partial run walks: one succeeded, one failed, one was never reached.
@@ -1198,7 +1401,7 @@ async fn a_healthy_host_makes_no_safety_promise() {
 }
 
 /// Reclaimable stubs are named, never counted: "3 files will be deleted" is not something a
-/// person can agree to (01_storage.md).
+/// person can agree to (01a_apfs.md, "Dedicated store volume").
 #[tokio::test]
 async fn reclaimable_stubs_are_enumerated_by_name() {
     let mut host = FakeHost {
@@ -1807,6 +2010,9 @@ fn setup_is_in_the_command_map_between_adopt_and_fork() {
     assert!(page.contains("--uninstall"));
     assert!(page.contains("--force"));
     assert!(page.contains("--mount-root"));
+    assert!(page.contains("/private/var/folders/cowshed/<uid>/mnt"));
+    assert!(page.contains("root:wheel 0755"));
+    assert!(page.contains("Existing configured roots are preserved exactly"));
 
     // `provision` is cowshed's internal word for minting a volume. Parent's rule is that it never
     // reaches a person, and a help page is the most person-facing surface there is.
@@ -1857,6 +2063,7 @@ async fn setup_mount_root_prints_the_configured_path() {
     assert_eq!(
         host.events,
         [
+            "plan-mount-root:/Users/dev/.cowshed/mnt",
             "configure-mount-root:/Users/dev/.cowshed/mnt",
             "git-identity"
         ]
@@ -1901,10 +2108,7 @@ async fn setup_mount_root_refuses_while_workspaces_are_attached() {
     assert!(error.message.contains("acme/widget/swift"));
     assert!(error.message.contains("zeta/widget/raven"));
     assert!(error.hint.contains("detach"));
-    assert_eq!(
-        host.events,
-        ["configure-mount-root:/Users/dev/.cowshed/mnt"]
-    );
+    assert_eq!(host.events, ["plan-mount-root:/Users/dev/.cowshed/mnt"]);
 }
 
 /// Git identity at a workspace depends on the host's git configuration and the mount root, not on

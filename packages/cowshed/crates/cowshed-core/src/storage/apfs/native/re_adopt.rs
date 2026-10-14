@@ -60,7 +60,7 @@ impl<R> MacOsApfsExecutionHost<R>
 where
     R: CommandRunner + Send + Sync + 'static,
 {
-    /// Source census follows recovery's image-lease ordering (01_storage.md, "Mounts" and
+    /// Source census follows recovery's image-lease ordering (01a_apfs.md, "Mounts" and
     /// "Ownership, identity, and the volume label"). A supervisor's started blocking rename
     /// outlives retirement and holds a normal mount descriptor until its command returns. The
     /// image lease lets that descriptor close before census, without waiting in the supervisor
@@ -161,7 +161,7 @@ where
     }
 
     /// The capacity the kernel's IOMedia mapping reports for attached `image`
-    /// (01_storage.md, "Images": an old image's file length is not its virtual capacity).
+    /// (01a_apfs.md, "Images": an old image's file length is not its virtual capacity).
     pub(crate) fn attached_capacity_bytes(&self, image: &Path) -> Result<u64, ApfsStorageError> {
         self.verify_controller_path(image)?;
         Ok(self.backend.attached_capacity(image)?.bytes())

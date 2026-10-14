@@ -4,7 +4,7 @@
 //! Every `diskutil image attach` ends in a StorageKit `syncAllDisks` call to root `storagekitd`,
 //! and that sync does not finish while the host's mount table keeps changing: one loop of
 //! `mount_apfs`/`umount` (6 cycles/s, no attach at all) moved a probe attach from 1.15 s to a
-//! 12.2 s median, and four loops starved it for good (specs/cowshed/01_storage.md, "How the APFS
+//! 12.2 s median, and four loops starved it for good (specs/cowshed/01a_apfs.md, "How the APFS
 //! host degrades"). Attaches among themselves do not starve: they queue on `storagekitd`. So the
 //! lease has two classes that exclude each other, and members of one class share.
 //!

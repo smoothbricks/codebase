@@ -78,11 +78,11 @@ Agent-driven development multiplies workspaces. Three failure modes follow:
 ```
 
 The diagram shows the macOS/APFS substrate: every image is a case-sensitive APFS volume in one RAW file (`.dmg`),
-attached with `diskutil image attach` (01_storage.md). On Linux the same logical shape holds with ZFS datasets in place
-of image files and the store mounted directly at `/private/cowshed/store` (09_substrates.md). The store volume is
-dedicated: the Data volume carries no image or store byte (01_storage.md). Shared caches are not on the store: each
-tool's cache stays at the tool's own default in the host HOME, and the gateway's mirrors in cowshed's user cache
-directory (03_caches.md).
+attached with `diskutil image attach` (01a_apfs.md). On Linux the same logical shape holds with ZFS datasets in place of
+image files and the store mounted directly at `/private/cowshed/store` (09_substrates.md). The store volume is
+dedicated: the Data volume carries no image or store byte (01a_apfs.md). Shared caches are not on the store: each tool's
+cache stays at the tool's own default in the host HOME, and the gateway's mirrors in cowshed's user cache directory
+(03_caches.md).
 
 Gateway reachability is deliberately platform-specific. macOS package clients use the workspace's `portBlock.base`.
 Linux allocates no `portBlock`: each attached workspace has a private loopback/netns and a controller-launched trusted

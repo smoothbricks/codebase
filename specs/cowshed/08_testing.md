@@ -240,6 +240,17 @@ the single-threaded pretty harness from prefixing the first record with `test <n
 inherited `RUST_TEST_THREADS=1`, even while independent parent tests run in parallel. The strict two-record assertion
 and exact-root teardown remain unchanged; no delay, retry, dropped assertion or broad sweep repairs a framing failure.
 
+The manual macOS example `cargo run -p cowshed-cli --example stable_mount_root -- <new-receipt-directory>` exercises
+setup's production mount-root authorization transaction, then the real CLI parser/dispatcher and APFS controller on an
+isolated scratch host: adopt, doctor, fork, rm, doctor. It requires operator approval and a quiet native-fixture window,
+rather than a skipped test or an administrator prompt in ordinary CI. The fresh fixture selects and persists the default
+through `HostConfig`; existing live host configuration is checked byte-for-byte and never changed. No installed daemon
+is replaced. It records actual directory ownership/modes, four-class kernel censuses, mount/device mappings, registry
+IDs, and the running mds process's rights before fork, after publication, and after rm. Growth in any departed-object
+class fails the proof; retained raw records permit per-image attribution when another host process interferes. Teardown
+releases only this fixture's images and refuses to delete a remaining mount. Passing this example proves fresh
+stable-root placement, not migration of an already-configured host or repair of historical leaked objects.
+
 Lifecycle integration that does not assert a physical-volume property uses the same project controller and lifecycle
 executor with `DirectoryExecutionHost`. Its workspaces and build volumes are real directory payloads, cloned through the
 production tree-copy path; atomic filesystem bindings expose them at checkout and build paths. Git, Nx, gateway
@@ -350,7 +361,7 @@ rebase-carries 36.0s, warm fork 30.9s, the foreign database holder 30.2s, agains
 were over 30s, so that class cannot hold them under ordinary host load; 60s holds every measurement. It is below 3×
 their ~25s idle floor (75s): a walk past it on a loaded host is a regression to find, not a class to raise. A class is a
 warning, never a kill or a failure: a test that never returns is ended by its runner's 180s no-progress bound, which
-names it, and a killed test leaves its images attached until the next run's sweep (01_storage.md, "How the APFS host
+names it, and a killed test leaves its images attached until the next run's sweep (01a_apfs.md, "How the APFS host
 degrades" §2).
 
 The genuine-Nx CLI fixtures use the normal enabled daemon (16_build_volumes.md, "The Nx daemon stays on"). Both halves
@@ -361,8 +372,8 @@ in the target because `a:build`'s hit restored no undeclared output, and seals t
 commitment. An empty findings list alone is not evidence that a declared output restored and hit: a busy-volume skip, an
 unattributed run summary or a failed check leaves it empty too.
 
-**Host limit.** The host's disk-image attach pool runs out (01_storage.md, "How the APFS host degrades" §2), and the
-suite stops spending into a spent one. The harness owns a lane-wide fixture pool
+**Host limit.** The host's disk-image attach pool runs out (01a_apfs.md, "How the APFS host degrades" §2), and the suite
+stops spending into a spent one. The harness owns a lane-wide fixture pool
 (`packages/cowshed/crates/cowshed-apfs/tests/support/blank_image.rs`): it attaches each scenario image in its registry
 once per lane run and hands tests handles to mounts of an already-attached volume, so a test cannot attach an image of
 its own through the fixture API — the API hands out shared-fixture handles only, and no per-test attach helper is in
@@ -385,7 +396,7 @@ still ends a recorded 150 after the operator freed what spent it. The leaked-dev
 command still leaks on a clean run; it must be 0.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
-that the host's live sheds lose until reboot (01_storage.md, "How the APFS host degrades" §2), so a test pays the fewest
+that the host's live sheds lose until reboot (01a_apfs.md, "How the APFS host degrades" §2), so a test pays the fewest
 attach cycles that prove its behavior. A run that killed a test leaves that test's images attached until recovery
 reclaims its dead root. `real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end` proves panic and
 SIGKILL cleanup with one RAW image and one retained ASIF input. Its parent owns the helper roots: panic drops the
@@ -454,7 +465,7 @@ selected home device and container remain unchanged. The regression does not req
 installation on an ephemeral runner. Installation validation remains a separate contract and still refuses missing
 storage.
 
-Read-only planning reads the kernel snapshot once, with no retry (01_storage.md "Dedicated store volume"), while an
+Read-only planning reads the kernel snapshot once, with no retry (01a_apfs.md "Dedicated store volume"), while an
 unrelated image may be departing. The same regression proves that a snapshot taken at any teardown stage still finds a
 reserved volume in another container. An incomplete snapshot, an invalid device name or a partially populated record is
 an error, never evidence that a reserved volume is absent, and mutation planning refuses it.
@@ -550,7 +561,7 @@ Covered flows:
   live fsck is permitted. Detached verification/resize and unformatted RAW retain intentional unmounted fixtures;
 - **Live source capture stays mounted; build seeds are sealed**: a live capture (`fork`, `checkpoint`) flushes the
   source volume and backing file, descriptor-clones the live RAW image, and asserts that the source's attachment and
-  mount flags are unchanged (01_storage.md, "Images"). `fork` and `restore` pass a formatted clone to the DA
+  mount flags are unchanged (01a_apfs.md, "Images"). `fork` and `restore` pass a formatted clone to the DA
   attach-and-mount transaction and verify the resulting mount identity. A failed transaction refuses publication and
   cleans up only the destination, never the live source (02_workspaces.md, fork step 4). A build seed is the exception
   (16_build_volumes.md): the sealed capture detaches its source without force, clones through its held inode, and
@@ -560,9 +571,9 @@ Covered flows:
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
-  unchanged (01_storage.md, "Clone cost follows extents, not size");
+  unchanged (01a_apfs.md, "Clone cost follows extents, not size");
 - attach healing matrix: detached image, wrong-flag mount, missing/wrong-flag `cowshed.store` volume (lazy recreate +
-  canonical-flag remount, 01_storage.md), stub `.envrc`;
+  canonical-flag remount, 01a_apfs.md), stub `.envrc`;
 - lazy volume creation at adopt: the store volume created idempotently before the first image;
 - rm-while-busy (open file handle → grace → force detach);
 - gc: trash drain, checkpoint pruning, orphan mountpoint removal; real root-owned `0700` event-log debris on an

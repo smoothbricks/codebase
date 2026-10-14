@@ -18,8 +18,28 @@ pub const RETIRED_LAYOUT_HINT: &str =
 const HOST_CONFIG_VERSION: u32 = 1;
 pub(crate) const RETIRED_MOUNT_DIRECTORY: &str = "mnt";
 
-/// Where a host presents workspace mounts when no configuration has been written.
-pub(crate) const DEFAULT_MOUNT_RELATIVE: &str = ".cowshed/mnt";
+/// Stable macOS presentation root; numeric uid avoids home and temporary-directory aliases.
+#[cfg(target_os = "macos")]
+pub(crate) const MACOS_MOUNT_PREFIX: &str = "/private/var/folders/cowshed";
+
+pub(crate) fn default_mount_root(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = home;
+        macos_mount_root(unsafe { libc::getuid() })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".cowshed/mnt")
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_mount_root(uid: u32) -> PathBuf {
+    Path::new(MACOS_MOUNT_PREFIX)
+        .join(uid.to_string())
+        .join("mnt")
+}
 
 /// One approved gateway-backed registry route, as host state rather than workspace state.
 ///
@@ -164,22 +184,29 @@ impl HostConfig {
     pub fn load(store_root: &Path, home: &Path) -> Result<Self, HostConfigError> {
         validate_absolute_path(store_root)?;
         validate_absolute_path(home)?;
-        Self::load_or_default(store_root, home.join(DEFAULT_MOUNT_RELATIVE))
+        Self::load_or_default(store_root, default_mount_root(home))
     }
 
     /// Resolve configuration for callers that only possess the canonical store root.
     ///
     /// Workspace mounts remain a per-user presentation layer even though the evidence volumes are
-    /// machine-global. The fixed store path cannot reveal the invoking user's home, so the absent
-    /// configuration fallback consults `HOME` only to derive `~/.cowshed/mnt`. Persisted
-    /// configuration is always authoritative and does not depend on process environment.
+    /// machine-global. macOS uses the invoking uid; other platforms derive the default from HOME.
+    /// Explicit fixture stores retain their store-local default. Persisted configuration is always
+    /// authoritative and does not depend on process environment.
     pub fn load_for_store(store_root: &Path) -> Result<Self, HostConfigError> {
         validate_absolute_path(store_root)?;
         let default = if store_root == Path::new(STORE_ROOT) {
-            let home = std::env::var_os("HOME").ok_or(HostConfigError::HomeUnavailable)?;
-            let home = PathBuf::from(home);
-            validate_absolute_path(&home)?;
-            home.join(DEFAULT_MOUNT_RELATIVE)
+            #[cfg(target_os = "macos")]
+            {
+                macos_mount_root(unsafe { libc::getuid() })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let home = std::env::var_os("HOME").ok_or(HostConfigError::HomeUnavailable)?;
+                let home = PathBuf::from(home);
+                validate_absolute_path(&home)?;
+                default_mount_root(&home)
+            }
         } else {
             store_root.join(RETIRED_MOUNT_DIRECTORY)
         };
@@ -691,9 +718,88 @@ mod tests {
         fs::create_dir_all(&store).unwrap();
 
         let config = HostConfig::load(&store, &home).unwrap();
-        assert_eq!(config.mount_root(), home.join(".cowshed/mnt"));
+        assert_eq!(config.mount_root(), default_mount_root(&home));
         assert!(!store.join(HOST_CONFIG_FILE).exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_is_uid_stable_and_keeps_dirhelper_names_above_repo_owners() {
+        let uid = unsafe { libc::getuid() };
+        let expected = PathBuf::from(format!("/private/var/folders/cowshed/{uid}/mnt"));
+        assert_eq!(default_mount_root(Path::new("/Users/first")), expected);
+        assert_eq!(default_mount_root(Path::new("/Users/second")), expected);
+        assert_eq!(
+            macos_mount_root(501),
+            Path::new("/private/var/folders/cowshed/501/mnt")
+        );
+        let store = temp_directory("stable-layout");
+        HostConfig::new(&expected).unwrap().save(&store).unwrap();
+        for owner in ["t", "temporaryitems", "x", "c"] {
+            let repo_id = RepoId::parse(&format!("{owner}/widget")).unwrap();
+            let layout = crate::storage::StorageLayout::new(&store, &repo_id).unwrap();
+            assert_eq!(
+                layout
+                    .workspace_mount(&WorkspaceName::session("raven").unwrap())
+                    .unwrap(),
+                expected.join(owner).join("widget/raven")
+            );
+            let checkout = Path::new("/Users/tester/Dev/widget");
+            assert_eq!(
+                layout
+                    .main_aware_workspace_mount(checkout, &WorkspaceName::new("main").unwrap())
+                    .unwrap(),
+                checkout
+            );
+            let builds = crate::build_volume::BuildVolumeLayout::new(layout.project()).unwrap();
+            assert_eq!(
+                builds.mounts(),
+                expected.join(".build").join(owner).join("widget")
+            );
+        }
+        fs::remove_dir_all(store).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_default_remains_under_home() {
+        assert_eq!(
+            default_mount_root(Path::new("/home/tester")),
+            Path::new("/home/tester/.cowshed/mnt")
+        );
+    }
+
+    #[test]
+    fn explicit_fixture_store_default_remains_store_local() {
+        let store = temp_directory("fixture-default");
+        assert_eq!(
+            HostConfig::load_for_store(&store).unwrap().mount_root(),
+            store.join("mnt")
+        );
+        fs::remove_dir_all(store).unwrap();
+    }
+
+    #[test]
+    fn persisted_legacy_root_remains_authoritative_for_every_loader() {
+        let store = temp_directory("legacy-default");
+        HostConfig::new("/Users/tester/.cowshed/mnt")
+            .unwrap()
+            .save(&store)
+            .unwrap();
+        let before = fs::read(store.join(HOST_CONFIG_FILE)).unwrap();
+        assert_eq!(
+            HostConfig::load(&store, Path::new("/Users/another"))
+                .unwrap()
+                .mount_root(),
+            Path::new("/Users/tester/.cowshed/mnt")
+        );
+        assert_eq!(
+            HostConfig::load_for_store(&store).unwrap().mount_root(),
+            Path::new("/Users/tester/.cowshed/mnt")
+        );
+        assert_eq!(fs::read(store.join(HOST_CONFIG_FILE)).unwrap(), before);
+        fs::remove_dir_all(store).unwrap();
     }
 
     #[test]

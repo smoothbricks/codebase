@@ -52,7 +52,7 @@ import {
  * - A RAM disk belongs to the legacy DiskImages framework: attaching one starts
  *   a `diskimages-helper` that exits on detach, with no AppleDiskImageDevice and
  *   no `diskimagesiod`, so it spends none of the AppleDiskImages2 attach budget
- *   that cowshed's images and tests draw on (specs/cowshed/01_storage.md, "How
+ *   that cowshed's images and tests draw on (specs/cowshed/01a_apfs.md, "How
  *   the APFS host degrades"; measured 2026-10-05).
  * - Attach + format + mount costs ~2 s and is DiskArbitration traffic, so the
  *   volume is created once, lazily, and every task takes a subdirectory.

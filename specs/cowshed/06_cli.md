@@ -14,7 +14,7 @@ make that possible and they are absolute:
    (`cowshed: one administrator authorization will remount cowshed.store at /private/cowshed/store`). A silent
    SecurityAgent dialog behind an unrelated read-only verb is a contract violation, not a platform quirk to tolerate.
    Where the platform permits (fstab-pinned mounts), cowshed prefers designs in which no prompt can occur at all
-   (01_storage.md).
+   (01a_apfs.md).
 4. **Diagnosis is canonical and self-contained.** The same host state yields the same verdict from any directory,
    regardless of unrelated details (a stray file in a mountpoint dir must change the wording, not the verdict). Every
    finding names the observed evidence (which volume, mounted where, expected where, which stub files) and a `next:`
@@ -52,7 +52,7 @@ Two verbs own the host story, both runnable from any directory:
 - **`setup`** is idempotent host repair: provision absent volumes, repair detached or mis-mounted ones,
   FileVault-encrypt unencrypted ones in place and store passphrases in System.keychain, validate markers precisely, pin
   `/etc/fstab`, and install the `dev.cowshed.storage` system LaunchDaemon that unlocks and mounts before login
-  (01_storage.md). It announces an authorization prompt before raising one, then performs everything that can require
+  (01a_apfs.md). It announces an authorization prompt before raising one, then performs everything that can require
   elevation inside that single session. Once storage repair succeeds, it installs the invoking build as the installed
   cowshed — the gateway's binary and the `cowshed` on `PATH` alike — restarting a gateway that runs other bytes, and
   points the first `cowshed` on `PATH` at it when that entry is a symbolic link (05_gateway.md "The installed cowshed").
@@ -236,8 +236,8 @@ never errors).
 | `cowshed controller`                          | — (serves stdin)                                 | One coordinator controller connection for an embedding process, on standard input, which must be a Unix socket (else exit 2 before the project is resolved); exits 0 when the peer closes its end. A program that links cowshed is another build, and the daemon starts supervisors only for its own (11), so it runs its controller as this verb. Reconciles the project's gateway sessions before each exec, shell and checked land, as `exec` and `land --check` do (05).                                                                                                                            |
 | `cowshed gateway run`                         | — (foreground daemon)                            | launchd runs this.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `cowshed gateway status`                      | `--json` status                                  | Cache stats, per-workspace counters, telemetry segment stats.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `cowshed resize <ws\|main> <size>`            | new capacity                                     | Grow the image (01, "Detached growth"); with `--build <size>` instead, grow the workspace's build volume and its seed (16, "Substrate"). The supervisor stops for the resize and restarts after; a held volume refuses before anything changes. `--json`: `ResizeResult { workspace, volume: "workspace"\|"build", previousCapacity, capacity }`.                                                                                                                                                                                                                                                       |
-| `cowshed defrag <ws>`                         | extent count after the rewrite                   | Rewrite the image contiguously (01, "Clone cost follows extents, not size"): detached like `resize`, refused while busy or short of free space, copied without cloning, renamed over, verified, remounted. `--json`: `DefragmentResult { workspace, previousExtents, extents, bytes }`.                                                                                                                                                                                                                                                                                                                 |
+| `cowshed resize <ws\|main> <size>`            | new capacity                                     | Grow the image (01a, "Detached growth"); with `--build <size>` instead, grow the workspace's build volume and its seed (16, "Substrate"). The supervisor stops for the resize and restarts after; a held volume refuses before anything changes. `--json`: `ResizeResult { workspace, volume: "workspace"\|"build", previousCapacity, capacity }`.                                                                                                                                                                                                                                                      |
+| `cowshed defrag <ws>`                         | extent count after the rewrite                   | Rewrite the image contiguously (01a, "Clone cost follows extents, not size"): detached like `resize`, refused while busy or short of free space, copied without cloning, renamed over, verified, remounted. `--json`: `DefragmentResult { workspace, previousExtents, extents, bytes }`.                                                                                                                                                                                                                                                                                                                |
 | `cowshed rekey <ws\|main>`                    | workspace name (`--json`: `RekeyResult`)         | Rebuild the CA identity of a workspace whose companion key is missing or invalid: republish its quarantined sidecar beside the still-in-place image (revision + 1), mint fresh credentials into the live mount, consume the quarantine entry. Invalidates in-flight job certificates.                                                                                                                                                                                                                                                                                                                   |
 | `cowshed gc`                                  | freed bytes                                      | Two-phase exact candidate plan (01); `--dry-run` lists typed candidates and sums bytes with zero mutation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `cowshed doctor`                              | `--json` findings                                | Invariant checks; each finding carries a `fix:` hint.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -278,7 +278,7 @@ Failed forks and superseded seeds use the same reclaim rule (16, "Garbage collec
 Both explicit `gc` and opportunistic collection explain deferrals: job holds, unfinished create/fork work, unreadable
 detached checkouts or records, and release failures name the volume and reason; opportunistic collection counts routine
 detached/still-forming deferrals on one line. A project open likewise says its retained legacy images on one line
-(01_storage.md) and the unfinished lifecycle operations it leaves to other verbs as one count; `doctor` names each. A
+(01a_apfs.md) and the unfinished lifecycle operations it leaves to other verbs as one count; `doctor` names each. A
 refusal on one volume does not hide later candidates. `gc --dry-run` reports candidates and reasons without changing
 mounts, labels or images.
 
@@ -349,11 +349,13 @@ gets no `main` remote (nothing to fetch from); and refuses `cowshed checkpoint` 
 history lives outside its image. Each refusal names the command that resolves it (02).
 
 `--slot <n>` (on `cowshed fork`) mounts the workspace at a stable, recycled path
-(`<mount-root>/<owner>/<repo>/slot@<n>`, default mount root `~/.cowshed/mnt`) instead of a name-derived one. `owner` and
-`repo` are the separately validated and encoded components of the primary `repo_id`, never an unsplit path value.
-Successive workspaces in the same slot inherit each other's **path-keyed** cache warmth (Xcode DerivedData, and whatever
-a build records by absolute path; cargo's own fingerprints are package-relative and need no slot) — opt-in, because it
-trades workspace-path uniqueness for warmth and only one workspace may hold a slot at a time (exit 4 if occupied).
+(`<mount-root>/<owner>/<repo>/slot@<n>`) instead of a name-derived one. The host root defaults to
+`/private/var/folders/cowshed/<uid>/mnt` on macOS and `~/.cowshed/mnt` on Linux; an existing configured root is
+unchanged (01a_apfs.md, "Stable workspace mount root"). `owner` and `repo` are the separately validated and encoded
+components of the primary `repo_id`, never an unsplit path value. Successive workspaces in the same slot inherit each
+other's **path-keyed** cache warmth (Xcode DerivedData, and whatever a build records by absolute path; cargo's own
+fingerprints are package-relative and need no slot) — opt-in, because it trades workspace-path uniqueness for warmth and
+only one workspace may hold a slot at a time (exit 4 if occupied).
 
 ## Self-driving conventions
 
@@ -370,10 +372,10 @@ trades workspace-path uniqueness for warmth and only one workspace may hold a sl
 ### Inferring `<ws>` from the working directory
 
 A command run inside a mounted workspace may omit that workspace's name when the verb infers from cwd. Resolution is
-containment of the canonical cwd in exactly one currently mounted workspace (01_storage.md), which is exact because
-mount identity is keyed off the in-image marker, and which refuses an ambiguous match rather than picking one. An
-explicit argument always wins; inference never overrides what the caller named. Outside any workspace those verbs refuse
-and name both ways out: name one, or run the command from inside one.
+containment of the canonical cwd in exactly one currently mounted workspace (01a_apfs.md), which is exact because mount
+identity is keyed off the in-image marker, and which refuses an ambiguous match rather than picking one. An explicit
+argument always wins; inference never overrides what the caller named. Outside any workspace those verbs refuse and name
+both ways out: name one, or run the command from inside one.
 
 The split is by what the verb does to the workspace, not by convenience:
 

@@ -3,7 +3,7 @@
 //! `setup` is the one command a stranded host can always run. It takes no project, because a host
 //! whose volumes are absent has no adopted checkout to name, and it dispatches beside `gateway`
 //! and `sccache` at the host-service layer rather than through the project runtime bridge
-//! (01_storage.md, "`cowshed setup` owns this transaction").
+//! (01a_apfs.md, "`cowshed setup` owns this transaction").
 //!
 //! The verb is two phases on purpose. The plan is gathered *before* anything is executed so the
 //! authorization announcement required by 06_cli.md rule 3 can be printed before the dialog
@@ -51,7 +51,8 @@ use cowshed_core::storage::bootstrap::{
     plan_host_uninstall,
 };
 use cowshed_core::storage::host_config::{
-    AttachedWorkspace, HostConfigError, execute_mount_root_change, plan_mount_root_change,
+    AttachedWorkspace, HostConfigError, MountRootChangePlan, execute_mount_root_change,
+    plan_mount_root_change,
 };
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
@@ -287,6 +288,8 @@ pub trait HostSetup: Send {
     async fn configure_sccache_client(&mut self) -> Result<ConfigReport>;
     /// Record the host session mount root. Refused while any session workspace is attached.
     async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf>;
+    /// Fence the configuration change before announcing any stable-root provisioning prompt.
+    async fn plan_mount_root(&mut self, mount_root: &Path) -> Result<HostSetupPlan>;
     /// Build the patched sccache from cowshed's own flake, root it, and start its agent.
     ///
     /// Called only for `setup --sccache`; a default run never touches nix. Required rather than
@@ -331,6 +334,23 @@ impl NativeHostSetup {
             home: canonical_home()?,
             downgrade,
         })
+    }
+
+    async fn mount_root_change_plan(&self, mount_root: &Path) -> Result<MountRootChangePlan> {
+        let storage = validate_existing_host_storage(&self.home).await?;
+        let attached = NativeGatewayInventory::new(storage.clone())
+            .all_attached()
+            .await
+            .map_err(|error| {
+                CowshedError::integrity(
+                    format!("could not list attached workspaces: {error}"),
+                    "cowshed doctor --json",
+                )
+            })?
+            .into_iter()
+            .map(|fact| AttachedWorkspace::new(fact.repo_id, fact.workspace))
+            .collect::<Vec<_>>();
+        plan_mount_root_change(storage.store(), mount_root, attached).map_err(host_config_error)
     }
 }
 
@@ -671,23 +691,23 @@ impl HostSetup for NativeHostSetup {
     }
 
     async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf> {
-        let storage = validate_existing_host_storage(&self.home).await?;
-        let attached = NativeGatewayInventory::new(storage.clone())
-            .all_attached()
-            .await
-            .map_err(|error| {
-                CowshedError::integrity(
-                    format!("could not list attached workspaces: {error}"),
-                    "cowshed doctor --json",
-                )
-            })?
-            .into_iter()
-            .map(|fact| AttachedWorkspace::new(fact.repo_id, fact.workspace))
-            .collect::<Vec<_>>();
-        let plan = plan_mount_root_change(storage.store(), mount_root, attached)
-            .map_err(host_config_error)?;
+        let plan = self.mount_root_change_plan(mount_root).await?;
+        #[cfg(target_os = "macos")]
+        cowshed_core::storage::bootstrap::execute_mount_root_provisioning(mount_root).await?;
         let config = execute_mount_root_change(&plan).map_err(host_config_error)?;
         Ok(config.mount_root().to_path_buf())
+    }
+
+    async fn plan_mount_root(&mut self, mount_root: &Path) -> Result<HostSetupPlan> {
+        self.mount_root_change_plan(mount_root).await?;
+        #[cfg(target_os = "macos")]
+        {
+            cowshed_core::storage::bootstrap::plan_mount_root_provisioning(mount_root)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(HostSetupPlan::new(Vec::new(), Vec::new(), false))
+        }
     }
 }
 
@@ -815,6 +835,8 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    let plan = setup.plan_mount_root(mount_root).await?;
+    announce_setup(&plan, output)?;
     let path = setup.configure_mount_root(mount_root).await?;
     if json {
         output.success(EmptyResult {}).map_err(output_error)?;
@@ -1397,6 +1419,10 @@ fn emit<W: Write, E: Write>(escalating: bool, line: &str, output: &mut Output<W,
 /// contract violation rule 3 exists to prevent.
 fn action_intent(action: &HostAction) -> String {
     match action {
+        HostAction::EnsureMountRoot { path, uid, gid } => format!(
+            "workspace mount root {} will be checked and, if needed, created or repaired for uid {uid}, gid {gid}, with private 0700 user directories beneath a root:wheel 0755 prefix",
+            path.display()
+        ),
         HostAction::CreateVolume {
             name,
             container,
@@ -1450,8 +1476,8 @@ fn action_intent(action: &HostAction) -> String {
         HostAction::InstallMountService { label } => format!(
             "system LaunchDaemon {label} will be installed to unlock and mount cowshed volumes before login"
         ),
-        // Named, not counted: 01_storage.md requires reclaimable stubs to be enumerated, because
-        // "3 files will be deleted" is not something a person can agree to.
+        // Named, not counted: 01a_apfs.md ("Dedicated store volume") requires reclaimable stubs to
+        // be enumerated, because "3 files will be deleted" is not something a person can agree to.
         HostAction::ReclaimStubs { paths } => format!(
             "these leftover placeholder files will be removed: {}",
             paths
@@ -1500,10 +1526,19 @@ fn render_repair<W: Write, E: Write>(
     // The per-action outcomes come first and only when there is something to say: they are the
     // answer to "what actually happened to each thing you were told about", and on a run that
     // completed they would only repeat the volume rows below.
-    if report.failure().is_some() {
-        for outcome in &report.action_outcomes {
+    for outcome in &report.action_outcomes {
+        if report.failure().is_some() {
             output
                 .guidance(&action_outcome_row(outcome))
+                .map_err(output_error)?;
+        } else if let (HostAction::EnsureMountRoot { path, .. }, HostActionResult::Done) =
+            (&outcome.action, &outcome.outcome)
+        {
+            output
+                .guidance(&format!(
+                    "workspace mount root is provisioned at {}",
+                    path.display()
+                ))
                 .map_err(output_error)?;
         }
     }
@@ -1814,7 +1849,7 @@ const fn removal_word(outcome: RemovalOutcome) -> &'static str {
 /// `cowshed.store (store): absent -> created`.
 ///
 /// Role as well as name because the name is a mutable label and the role is the identity
-/// (01_storage.md, "Ownership, identity, and the volume label"): a hand-renamed volume still has
+/// (01a_apfs.md, "Ownership, identity, and the volume label"): a hand-renamed volume still has
 /// to read as the store.
 fn volume_row(volume: &VolumeOutcome) -> String {
     format!(

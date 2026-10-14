@@ -1,5 +1,5 @@
 //! A live FSEvents stream and fseventsd's persistent event log, read through CoreServices itself
-//! (01_storage.md, "The event log"). Shared by the test binaries that mount real APFS volumes
+//! (01a_apfs.md, "The event log"). Shared by the test binaries that mount real APFS volumes
 //! (`#[path]`-included, not a crate).
 //!
 //! fseventsd learns of a mount asynchronously, and while it has not, a stream misses the new

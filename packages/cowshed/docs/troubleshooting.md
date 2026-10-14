@@ -142,12 +142,12 @@ not override a pin. Unpin explicitly before expecting GC to remove it.
 ## Disk usage
 
 Images are sparse files that grow with churn; deleting files inside a volume does not shrink the image file. Sparse
-creation reserves no host space for capacity (01_storage.md, "Capacity and allocation"). Guest-freed space is not
-returned automatically: in the RAW measurement, a deleted 1 GiB payload kept its host allocation after guest sync, image
-fsync, clean unmount and detach. `hdiutil compact` does not support RAW. To reclaim the space, run a verified
-re-adoption (`cowshed adopt <checkout> --re-adopt`, 02_workspaces.md): the filesystem is copied into a fresh sparse RAW
-image, verified, and the old image is kept until you remove it after verification. The host frees the old blocks only
-after the retained image and every clone or checkpoint sharing them are released.
+creation reserves no host space for capacity (01a_apfs.md, "Capacity and allocation"). Guest-freed space is not returned
+automatically: in the RAW measurement, a deleted 1 GiB payload kept its host allocation after guest sync, image fsync,
+clean unmount and detach. `hdiutil compact` does not support RAW. To reclaim the space, run a verified re-adoption
+(`cowshed adopt <checkout> --re-adopt`, 02_workspaces.md): the filesystem is copied into a fresh sparse RAW image,
+verified, and the old image is kept until you remove it after verification. The host frees the old blocks only after the
+retained image and every clone or checkpoint sharing them are released.
 
 `cowshed gc` reclaims retired images, removes orphans, and prunes expired checkpoints (`--dry-run` lists each candidate
 first):
@@ -277,7 +277,7 @@ is also why you cannot verify it from a shell that has the project environment l
 
 **The store volume is excluded from backup** — deliberately. Multi-gigabyte images with constant internal churn would
 bloat every backup (and, on the Data volume, every hourly local snapshot — that is why they live on a dedicated volume
-at all; see 01_storage.md). Source follows the durability rules below; the shared tool caches are the tools' own
+at all; see 01a_apfs.md). Source follows the durability rules below; the shared tool caches are the tools' own
 directories in your HOME, rebuildable from their registries and never anything to restore. Protected job content is
 authoritative within its origin incarnation/checkpoint snapshot, but a workspace image is still not an off-machine
 backup.
@@ -437,14 +437,15 @@ disk-image attach pool is spent. A command that meets it fails with `AttachPoolE
 which of two causes spent it.
 
 `disk-image-attach-budget` reports leaked disk-image devices: `AppleDiskImageDevice` and `DIDeviceIOUserClient`
-instances (`ioclasscount`) that no attached image accounts for, which only a reboot frees. It also reports leaked
-`AppleAPFSVolume` and `IOMedia`, which `sudo killall diskarbitrationd` frees, the ceiling at which this host's pool last
-ran out (1024 leaked devices until one is recorded: an observation from one host and boot, not a documented limit), the
-headroom left, and any disk-image command an earlier cowshed killed at its 15-minute hard deadline this boot, each a
-probable leaked device; cowshed no longer kills a disk-image command at all. "attach pool exhausted, reboot required"
-means an attach failed with error code 150 this boot with the leaked devices at the ceiling: reboot. A recorded ceiling
-only moves down and survives reboots; if the lane gate refuses because that ceiling alone is below the attaches it
-needs, and the ceiling no longer holds, `attach-budget --clear` forgets it.
+instances (`ioclasscount`) that no attached image accounts for, which only a reboot frees. It also prints the
+`AppleAPFSVolume` and `IOMedia` counts, whose departed instances take no pool slot (`departed-volume-references`,
+below), the ceiling at which this host's pool last ran out (1024 leaked devices until one is recorded: an observation
+from one host and boot, not a documented limit), the headroom left, and any disk-image command an earlier cowshed killed
+at its 15-minute hard deadline this boot, each a probable leaked device; cowshed no longer kills a disk-image command at
+all. "attach pool exhausted, reboot required" means an attach failed with error code 150 this boot with the leaked
+devices at the ceiling: reboot. A recorded ceiling only moves down and survives reboots; if the lane gate refuses
+because that ceiling alone is below the attaches it needs, and the ceiling no longer holds, `attach-budget --clear`
+forgets it.
 
 The other cause is helpers that outlived their image. Every attached image has its own `diskimagesiod`, which maps 72
 MiB into the kernel; detach does not always end it, and a helper that outlived its image keeps its mapping.
@@ -455,6 +456,25 @@ refuses them, and no reboot is needed for them. While a disk-image tool runs, a 
 is named until a later `cowshed doctor`. Killing orphans frees their mappings, never a leaked device. Once they are
 gone, `attach-budget --clear` (or any successful cowshed attach) ends the recorded exhaustion. cowshed never signals a
 helper itself.
+
+## `cowshed doctor` warns `departed-volume-references`
+
+`departed-volume-references` counts the `AppleAPFSVolume` and `IOMedia` instances that outlive their registry entries:
+departed volumes and media the kernel has not freed. It warns from the first one and never makes the host unhealthy. It
+is not a cause of `error code 150`: a departed volume takes no attach-pool slot, so it neither lowers the headroom
+`disk-image-attach-budget` reports nor refuses an attach, and the finding asks for neither a reboot nor a restart.
+`cowshed doctor` reads the registry first and the instances after, so a disk command in flight between the two reads can
+account for a few.
+
+The count does not say what holds them, and holders have differed: Spotlight's `mds` 2418.6.3.9.400 (arm64e) keeps a
+send right to each mounted `AppleAPFSVolume` it admits, while on one earlier boot `diskarbitrationd` held volumes and
+media alike. Neither is assumed for another build or class; `mds` is not shown to hold `IOMedia`. The hint attributes by
+exact registry ID and changes nothing: as root, count per process the rights in `lsmp -a` whose `AppleAPFSVolume` or
+`IOMedia` ID is absent from `ioreg -r -c IOMedia -d 1 -w0`. A count matching the finding names the holder by exact pid;
+re-read that it still holds those IDs before anything is done to it, and never act on a daemon family (`01a_apfs.md`,
+"Release and device custody"). IDs no process holds are held in the kernel. The defect, the volumes `mds` admits, and
+why neither an unmount nor an indexing exclusion releases a right are specified in `01a_apfs.md`, "Spotlight media
+references".
 
 ## `cowshed path` or `cowshed exec` is slow
 

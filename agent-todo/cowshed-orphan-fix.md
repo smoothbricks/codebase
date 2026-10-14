@@ -16,7 +16,7 @@ base `65597b49a`. Main parks this unit; it is not accepted for landing. No repai
    lines767–768 allow deletion. This is source-traced, not an executed APFS reproduction. The existing alias regression
    at1372–1394 keeps the alias present and does not cover this case. Governing contracts:
    `specs/cowshed/02_workspaces.md` §`cowshed rm <ws>`, lines977–979 (attachment under any alias refuses), and
-   `specs/cowshed/01_storage.md` §Images, lines399–410 (exact image identity and leases).
+   `specs/cowshed/01a_apfs.md` §Mounts, the per-image lease paragraph (exact image identity and leases).
 
 3. **`project_runtime` behavioral proof is outstanding.** The fixer's report (`history://OrphanFix2Opus`) records all
    nine selected tests failing before test code because the exec sandbox denies `/private/tmp`.

@@ -212,7 +212,7 @@ fn allocated_file_bytes(metadata: &fs::Metadata) -> u64 {
 }
 
 /// The workspace a session image names: `<workspace>.dmg`, the only image grammar anything
-/// enumerates (01_storage.md, "Images"). The suffix is peeled exactly as `discover_session_images`
+/// enumerates (01a_apfs.md, "Images"). The suffix is peeled exactly as `discover_session_images`
 /// peels it, so the orphan sweep and enumeration cannot disagree about a name.
 fn session_image_workspace(path: &Path) -> Option<WorkspaceName> {
     if !is_image_path(path) {
@@ -308,7 +308,7 @@ pub(in crate::storage) fn warn_missing_session_sidecar(image: &Path) {
 /// What one read of a project's sessions directory says about its legacy images: the retained
 /// regular files, and each entry that could not be judged with the reason. Both are sorted, so
 /// the report does not depend on the order `readdir` returned. Reading it is the project open's
-/// job, once (01_storage.md, "Ownership, identity, and the volume label"); the enumerators that
+/// job, once (01a_apfs.md, "Ownership, identity, and the volume label"); the enumerators that
 /// list workspaces never say anything about legacy images.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct LegacyImageReport {
@@ -1229,7 +1229,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
             .map_err(Into::into)
     }
 
-    /// Name the volume of `image`, an image under the store, `label` (01_storage.md,
+    /// Name the volume of `image`, an image under the store, `label` (01a_apfs.md,
     /// "Ownership, identity, and the volume label"). The target is the volume device the kernel's
     /// attachment inventory maps the image to, re-proved under the image's lease and a raw pin
     /// when the rename runs, with the mountpoint it was found at held and proven still that

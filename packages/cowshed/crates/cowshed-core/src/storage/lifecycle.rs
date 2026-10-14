@@ -826,7 +826,7 @@ pub struct ResizeOutcome {
 /// How many physically contiguous runs a file's allocated bytes occupy.
 ///
 /// This, not the file's size, is what cloning an image costs: `clonefile` shares the source's
-/// extent map, and the first write to either file copies that map (01_storage.md, "Clone cost
+/// extent map, and the first write to either file copies that map (01a_apfs.md, "Clone cost
 /// follows extents, not size").
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ExtentCount(u64);

@@ -188,7 +188,7 @@ pub type ForkStage = WorkspaceStage;
 ///
 /// It exists for a second image the operation attaches anyway (a fork's build volume, main's
 /// first one): every `diskutil image attach` waits in the host's one `storagekitd` queue
-/// (01_storage.md, "How the APFS host degrades"), and two attaches in flight together wait in it
+/// (01a_apfs.md, "How the APFS host degrades"), and two attaches in flight together wait in it
 /// once, not twice.
 pub struct Alongside<W, D> {
     pub work: W,
@@ -373,7 +373,7 @@ impl From<PublicationError> for ApfsStorageError {
     }
 }
 
-/// How naming an image's volume went (01_storage.md, "Ownership, identity, and the volume
+/// How naming an image's volume went (01a_apfs.md, "Ownership, identity, and the volume
 /// label"). The target is always the volume device the kernel's attachment inventory maps an
 /// image under the store to, never a path; every case but `Renamed` renamed nothing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -410,7 +410,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError>;
     /// Mint `image`, which must not exist, and hand it back checked and mounted at `mount_point`:
     /// one `clonefile` of the store's formatted blank template at `capacity`, then one combined
-    /// Disk Arbitration attach/mount (01_storage.md, "Images"). The canonical name
+    /// Disk Arbitration attach/mount (01a_apfs.md, "Images"). The canonical name
     /// only ever holds a complete, formatted volume; it carries the template's label until the
     /// workspace's supervisor relabels it. A failure leaves no image and no attachment.
     fn create_attached(

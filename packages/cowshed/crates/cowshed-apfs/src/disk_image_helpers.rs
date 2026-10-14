@@ -1,4 +1,4 @@
-//! `diskimagesiod` helpers that outlived their disk image (01_storage.md, "How the APFS host
+//! `diskimagesiod` helpers that outlived their disk image (01a_apfs.md, "How the APFS host
 //! degrades" §2).
 //!
 //! Every attached disk image has its own `diskimagesiod` (launchd job

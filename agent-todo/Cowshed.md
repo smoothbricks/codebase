@@ -88,8 +88,8 @@
 
 - Verify that build volumes keep main's source image on the no-clone fragmentation curve: sample its extent count across
   a week of lands with sessions held and compare it with the single-image baseline (`specs/cowshed/16_build_volumes.md`
-  "Why two volumes", item 1; `specs/cowshed/01_storage.md:193` "Images", its "Clone cost follows extents, not size"
-  bullet). Within the curve, `cowshed defrag main` stays a repair for imports and not a routine operation.
+  "Why two volumes", item 1; `specs/cowshed/01a_apfs.md` "Images", its "Clone cost follows extents, not size" bullet).
+  Within the curve, `cowshed defrag main` stays a repair for imports and not a routine operation.
 
 - Verify how rust-analyzer and editors behave when `target` is a symlink into the build volume
   (`specs/cowshed/16_build_volumes.md` "One link per checkout"). The behavior is unverified.

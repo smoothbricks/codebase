@@ -353,9 +353,9 @@ Disk-changing tools cowshed runs on the host — the CLI's, a supervisor's, the 
 test's — run under a host-wide lease the gateway schedules. One code path takes it: `SystemCommandRunner` reads the
 command's class from its program and arguments and holds that lease around the child; setup uses the same client. An
 attach spends most of its time in StorageKit's `syncAllDisks`, after its device already exists, and that sync does not
-finish while the mount table keeps changing (01_storage.md, "How the APFS host degrades"), so attaches stall beside
-mount churn and stay fast once the two are kept apart. Attaches among themselves only queue on `storagekitd`; so the
-lease is two classes that exclude each other rather than N interchangeable tokens.
+finish while the mount table keeps changing (01a_apfs.md, "How the APFS host degrades"), so attaches stall beside mount
+churn and stay fast once the two are kept apart. Attaches among themselves only queue on `storagekitd`; so the lease is
+two classes that exclude each other rather than N interchangeable tokens.
 
 - **Storage**: `diskutil` except `renameVolume`, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs` and `umount`.
   Read-only operations (`fsck_apfs`, IORegistry reads) and cosmetic `diskutil renameVolume` take no lease.
@@ -375,7 +375,7 @@ lease is two classes that exclude each other rather than N interchangeable token
   command line it asked for. Its command may still be running beside the next phase; a hung `umount` costs that one
   overlap, not every attach on the host. A client's own deadline still kills its child at 120 s, except a disk-image
   command (`diskutil image …`, `diskutil eject`, `hdiutil`), which it warns about from 120 s every 30 s and never kills,
-  because a killed one can leak its device until reboot (01_storage.md, "How the APFS host degrades" §2).
+  because a killed one can leak its device until reboot (01a_apfs.md, "How the APFS host degrades" §2).
 - **Wire.** The client writes `{"op":"disk-lease","class":"storage"|"namespace","command":"<argv>"}`, with
   `"share":"alone"` when it asks for the whole phase, and does not half-close. The gateway answers
   `{"ok":true,"lease":"queued"}` at once and `{"ok":true,"lease":"granted"}` when the command may run; the lease lasts
@@ -582,8 +582,8 @@ opportunistic job admitted in the background band never holds a foreground job's
 The gateway is `RunAtLoad`, so it is the first cowshed process alive after a reboot, and its startup pass is where
 mounts are restored. In order:
 
-1. Validate the host store — both dedicated volumes present, mounted, marked, and with canonical flags (01_storage.md).
-   A store that fails validation stops here and reports; nothing below can be meaningful without it.
+1. Validate the host store — both dedicated volumes present, mounted, marked, and with canonical flags (01a_apfs.md). A
+   store that fails validation stops here and reports; nothing below can be meaningful without it.
 2. Count the recorded projects and list the workspace supervisors still serving from before this daemon, then serve: the
    control socket and the supervisor manager answer from the first moment. Status answers throughout, and so do the
    audit, mirror, and simulator requests, none of which reads a workspace mount.

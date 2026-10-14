@@ -119,7 +119,7 @@ impl Drop for ChurnGuard {
 /// test pays adopt's attaches again: one did, and under host contention stalled past the 30s
 /// default inside adopt.
 ///
-/// It also proves the image contract of specs/cowshed/01_storage.md from the kernel's side: the
+/// It also proves the image contract of specs/cowshed/01a_apfs.md from the kernel's side: the
 /// image adopt creates mounts as case-sensitive APFS whose root the invoking user owns, nothing ran
 /// as root to make it so, and a clone of it is case-sensitive too.
 ///
