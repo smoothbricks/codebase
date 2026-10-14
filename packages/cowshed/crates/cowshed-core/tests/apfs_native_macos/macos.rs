@@ -3132,6 +3132,7 @@ fn published_listing_distinguishes_missing_sessions_from_an_invalid_sessions_pat
 /// has checked its identity and before fsck opens diskN. A pathname check alone loses that race;
 /// the raw volume descriptor must keep the kernel from recycling diskN even for a forced eject.
 struct EjectAtFsck {
+    owned: PathBuf,
     foreign: PathBuf,
     ejected: AtomicUsize,
     release_attempts: AtomicUsize,
@@ -3140,39 +3141,27 @@ struct EjectAtFsck {
 impl EjectAtFsck {
     fn try_recycle(&self, volume: &str) -> Result<(), CommandRunError> {
         let system = SystemCommandRunner;
-        let owned = system
-            .attached_disk_images()
-            .expect("current registry inventory")
-            .into_iter()
-            .find(|image| {
-                image
-                    .media
-                    .iter()
-                    .any(|media| media.device == format!("/dev/{volume}"))
-            })
-            .expect("the pinned volume belongs to a current image");
-        let cowshed_apfs::DiskImageSource::File(image) = owned.source else {
-            panic!("the fixture image is file-backed");
-        };
-        let wholes = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
-            .attached_whole_devices(&image)
-            .expect("exact whole image mapping");
+        let owned = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
+            .existing_attachment(&self.owned)
+            .expect("exact current pinned image mapping")
+            .expect("the recorded pinned fixture image is attached");
+        let volume_device = format!("/dev/{volume}");
         assert_eq!(
-            wholes.len(),
-            1,
-            "the pinned fixture owns exactly one current whole device"
+            owned.volume_device(),
+            volume_device,
+            "the pinned operation must name the recorded fixture image's exact APFS volume"
         );
-        let whole = wholes.into_iter().next().expect("one fixture whole");
+        let whole = owned.whole_device();
         self.release_attempts.fetch_add(1, Ordering::SeqCst);
         let unmounted = system.run(&CommandRequest::new(
             "/usr/sbin/diskutil",
-            ["unmount", "force", &format!("/dev/{volume}")],
+            ["unmount", "force", &volume_device],
         ))?;
         assert!(
             unmounted.succeeded(),
             "exact-volume unmount failed: {unmounted:?}"
         );
-        let eject_request = CommandRequest::new("/usr/bin/hdiutil", ["detach", "-force", &whole]);
+        let eject_request = CommandRequest::new("/usr/bin/hdiutil", ["detach", "-force", whole]);
         let eject = system.run(&eject_request)?;
         if eject.succeeded() {
             self.ejected.store(1, Ordering::SeqCst);
@@ -3274,6 +3263,7 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
     fixture.blank_image(&owned);
     fixture.blank_image(&foreign);
     let runner = EjectAtFsck {
+        owned: owned.clone(),
         foreign: foreign.clone(),
         ejected: AtomicUsize::new(0),
         release_attempts: AtomicUsize::new(0),
@@ -3450,8 +3440,8 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
     assert_eq!(staging, Vec::<PathBuf>::new());
 }
 
-/// Release the owner's first real attachment before cowshed can open its raw volume.
-/// Its next fsck must run only against a fresh owner attachment, never a reused name.
+/// Release the owner's real attachment before cowshed can open its raw volume, then let a
+/// foreign image reuse that volume name. The owner must refuse without another attach or fsck.
 struct EjectAfterAttach {
     owned: PathBuf,
     foreign: PathBuf,
@@ -3486,18 +3476,14 @@ impl CommandRunner for EjectAfterAttach {
             && self.ejected.fetch_add(1, Ordering::SeqCst) == 0
         {
             assert!(output.succeeded(), "owner attach failed: {output:?}");
-            let wholes = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
-                .attached_whole_devices(&self.owned)
-                .expect("exact current owner mapping");
-            assert_eq!(
-                wholes.len(),
-                1,
-                "the attached fixture owns exactly one current whole device"
-            );
-            let whole = wholes.into_iter().next().expect("one fixture whole");
+            let owned = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
+                .existing_attachment(&self.owned)
+                .expect("exact current owner mapping")
+                .expect("the recorded fixture image is attached");
+            let whole = owned.whole_device();
             let ejected = system.run(&CommandRequest::new(
                 "/usr/bin/hdiutil",
-                ["detach", "-force", &whole],
+                ["detach", "-force", whole],
             ))?;
             assert!(
                 ejected.succeeded(),
@@ -3514,6 +3500,15 @@ impl CommandRunner for EjectAfterAttach {
                 ],
             ))?;
             assert!(attached.succeeded(), "foreign mount failed: {attached:?}");
+            let replacement = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
+                .existing_attachment(&self.foreign)
+                .expect("exact current replacement mapping")
+                .expect("the recorded foreign image is attached");
+            assert_eq!(
+                replacement.volume_device(),
+                owned.volume_device(),
+                "the foreign fixture must actually reuse the owner's former volume name"
+            );
         }
         Ok(output)
     }
@@ -3536,8 +3531,8 @@ impl CommandRunner for EjectAfterAttach {
 }
 
 #[test]
-fn real_apfs_lost_attachment_reattaches_without_verifying_foreign_volume() {
-    let fixture = RealFixture::new("reattach-after-reuse");
+fn real_apfs_lost_attachment_refuses_without_verifying_foreign_volume() {
+    let fixture = RealFixture::new("refuse-after-reuse");
     let owned = fixture.root().join("owned.dmg");
     let foreign = fixture.root().join("foreign.dmg");
     fixture.blank_image(&owned);
@@ -3548,18 +3543,30 @@ fn real_apfs_lost_attachment_reattaches_without_verifying_foreign_volume() {
         ejected: AtomicUsize::new(0),
         fscks: AtomicUsize::new(0),
     });
-    let attachment = backend
+    let refusal = backend
         .attach_verified(&owned)
-        .expect("fresh owned attachment");
-    assert_eq!(backend.runner().ejected.load(Ordering::SeqCst), 2);
-    assert_eq!(backend.runner().fscks.load(Ordering::SeqCst), 1);
-    backend
-        .detach(&attachment, DetachIntent::Release)
-        .expect("detach only owned image");
-    assert!(!attached(&owned));
+        .expect_err("a lost owner attachment cannot authorize another attach or a foreign fsck");
     assert!(
-        attached(&foreign),
-        "detaching the owner must leave the foreign mount intact"
+        matches!(&refusal, ApfsError::InvalidAttachmentInventory(detail) if detail.contains("refusing a reused device")),
+        "lost attachment must retain its exact-image ownership refusal: {refusal}"
+    );
+    assert_eq!(backend.runner().ejected.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.runner().fscks.load(Ordering::SeqCst), 0);
+    assert!(
+        !attached(&owned),
+        "the refused attempt must not reattach the owner"
+    );
+    let replacement = cowshed_apfs::MacOsApfsBackend::new(SystemCommandRunner)
+        .existing_attachment(&foreign)
+        .expect("exact current foreign mapping")
+        .expect("the foreign attachment must survive the owner's refusal");
+    assert!(
+        SystemKernelMountSource
+            .mounts()
+            .expect("kernel mount inventory")
+            .iter()
+            .any(|mount| mount.source_device == replacement.volume_device()),
+        "the owner's refusal must leave the foreign mount intact"
     );
 }
 
