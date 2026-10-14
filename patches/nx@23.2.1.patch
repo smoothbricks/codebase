@@ -1319,6 +1319,40 @@ index 66371610921778e1ee3c44055ca6438cc01dc7a9..92b1f00e948ac522fad5a6e6e3e87f41
  // Prepare a serialized project graph result for sending over IPC from the server to the client
  function serializeResult(error, serializedProjectGraph, serializedSourceMaps) {
      // We do not want to repeat work `JSON.stringify`ing an object containing the potentially large project graph so merge as strings
+diff --git a/dist/src/plugins/js/lock-file/bun-parser.js b/dist/src/plugins/js/lock-file/bun-parser.js
+index 169563d598af64c8b74d00ab9815dd651650ec9d..0bd5e1f536b1e0e02843396e01b29dcece8293b0 100644
+--- a/dist/src/plugins/js/lock-file/bun-parser.js
++++ b/dist/src/plugins/js/lock-file/bun-parser.js
+@@ -7,6 +7,7 @@ exports.clearCache = clearCache;
+ exports.getBunTextLockfileNodes = getBunTextLockfileNodes;
+ const node_child_process_1 = require("node:child_process");
+ const node_fs_1 = require("node:fs");
++const node_path_1 = require("node:path");
+ const semver_1 = require("semver");
+ const project_graph_1 = require("../../../config/project-graph");
+ const file_hasher_1 = require("../../../hasher/file-hasher");
+@@ -285,8 +286,7 @@ function buildPackageIndex(lockFile) {
+                 ...workspace.peerDependencies,
+             };
+             for (const [depName, depVersion] of Object.entries(allDeps)) {
+-                if (depVersion.startsWith('workspace:') ||
+-                    depVersion.startsWith('file:')) {
++                if (depVersion.startsWith('workspace:')) {
+                     workspaceNames.add(depName);
+                 }
+             }
+@@ -306,8 +306,9 @@ function buildPackageIndex(lockFile) {
+             if (!name || !version) {
+                 continue;
+             }
+-            // Track workspace packages from packages section
+-            if (protocol === 'workspace' || protocol === 'file') {
++            // File packages belong to a workspace only when their resolved target is an actual workspace path.
++            if (protocol === 'workspace' ||
++                (protocol === 'file' && workspacePaths.has(node_path_1.posix.normalize(version.slice('file:'.length))))) {
+                 workspaceNames.add(name);
+             }
+             // Check if this is a workspace-specific variant (e.g., "@quz/pkg1/lodash")
 diff --git a/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js b/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js
 index 81a6ebea371390c69fc2c3ab3da95d7dbec13a37..5746704ac8457eddfcedfbcd171504f3e36082e1 100644
 --- a/dist/src/plugins/js/project-graph/build-dependencies/build-dependencies.js
