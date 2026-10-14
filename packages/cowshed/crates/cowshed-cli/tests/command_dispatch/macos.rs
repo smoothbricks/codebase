@@ -1845,19 +1845,22 @@ fn land_adoptions(telemetry: &Path) -> Vec<cowshed_core::api::dto::LandAdoptionC
         .collect()
 }
 
-fn assert_land_outcome(telemetry: &Path, build: &cowshed_core::api::dto::LandBuildVolume) {
+fn assert_land_outcome(telemetry: &Path, report: &LandedReport) {
+    let build = &report.build_volume;
     let outcomes = controller_commitments(telemetry)
         .into_iter()
         .filter_map(|value| match value {
             cowshed_core::api::dto::ControllerCommitment::LandOutcome(value) => Some(value),
             _ => None,
         })
+        .filter(|outcome| outcome.landed_head == report.landed_head)
         .collect::<Vec<_>>();
-    // One durable outcome per land; this land's is the latest sealed.
-    let outcome = outcomes
-        .iter()
-        .max_by_key(|outcome| outcome.order)
-        .expect("one durable outcome per land");
+    let [outcome] = outcomes.as_slice() else {
+        panic!(
+            "one durable outcome for landed head {}: {outcomes:?}",
+            report.landed_head
+        );
+    };
     assert_eq!(
         outcome.seeded,
         matches!(build.seed, cowshed_core::api::dto::LandSeed::Frozen)
@@ -2538,7 +2541,7 @@ async fn directory_push_only_preserves_the_validated_head_without_landing_or_ret
     )
     .await;
     assert!(!topic.exists());
-    assert_land_outcome(fixture.storage.telemetry(), &landed.build_volume);
+    assert_land_outcome(fixture.storage.telemetry(), &landed);
     service
         .shutdown()
         .await
@@ -3424,7 +3427,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
         LandSeed::Frozen,
         "a skipped swap still freezes its seed: {report:?}"
     );
-    assert_land_outcome(fixture.storage.telemetry(), &report.build_volume);
+    assert_land_outcome(fixture.storage.telemetry(), &report);
     match report.build_volume.adoption {
         Adoption::Skipped {
             reason:
@@ -3486,7 +3489,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
         LandSeed::Frozen,
         "forks still start from the new seed: {report:?}"
     );
-    assert_land_outcome(fixture.storage.telemetry(), &report.build_volume);
+    assert_land_outcome(fixture.storage.telemetry(), &report);
     match report.build_volume.adoption {
         Adoption::Skipped {
             reason:
