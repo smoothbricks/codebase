@@ -280,11 +280,28 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   2. A cache that exists in both places is merged, never kept twice: for a content-addressed cache (cargo, bun, npm,
      pnpm, uv, Zig, Gradle, Go, sccache) every entry the host lacks moves in and every entry it already holds is dropped
      from the volume, because the same key names the same bytes. Nix's fetcher and state caches are not
-     content-addressed; the host's copy wins and the volume's is deleted.
+     content-addressed; the host's copy wins for the old canonical client cache. The historically nested `nix/nix` tree
+     can hold unique mutable SQLite state and Git packs: it is never host-wins-dropped or merged into the active client
+     cache. Its entire tree is retained under `~/.cache/nix/cowshed-retired/nix-nix`, with its moved bytes and retained
+     destination reported. An existing retained copy is reconciled only by byte equality; different bytes refuse without
+     overwriting or dropping either copy.
   3. Directories the volume held for no detector — the gateway's `mirror/` and `repo-mirrors/`, sccache's store,
      repository-placed caches such as `ttsc/` — move to their HOME location the same way: the gateway's to cowshed's own
      cache directory, sccache's to its default directory, a repository's to the `[caches] home` path that repository
-     declares.
+     declares. Earlier Nix XDG-root wiring also placed Bun's install cache at `nix/.bun/install/cache` and Bun's runtime
+     transpiler cache at `nix/bun`: those move to `~/.bun/install/cache` and `~/.cache/bun`, respectively, not into the
+     Nix client cache.
+
+     A legacy toolchain cache whose current owner instead declares checkout build state is placed with that existing
+     build volume, never made into a new shared HOME cache merely to retire this volume. For `ttsc/`, the managed shell
+     writes `TTSC_CACHE_DIR=<checkout>/.cache/ttsc` and `TTSC_GO_CACHE_DIR` beneath it; main already declares
+     `.cache/ttsc` in `[build] state` (16_build_volumes.md, "Declared build state"). The operator explicitly selects
+     that main and witnesses its existing fixed link before moving the legacy tree with the retirement executor. If
+     several mains declare the same toolchain path, this is a deliberate choice of the main whose build volume will
+     retain the old state, not a global name match: the other mains keep their independently declared caches. No
+     detector, HOME-sharing declaration or configuration knob is added. Writers of the source and destination must be
+     quiet; bytes are preserved, never discarded as a substitute for placement.
+
   4. Under `--retire-caches-volume`, and only once steps 1–3 left the volume holding nothing but its marker, setup
      deletes the volume (or destroys the dataset), removes its `/etc/fstab` pin and drops it from the storage mount
      service, inside the one administrator authorization setup already uses. The flag refuses while anything else is

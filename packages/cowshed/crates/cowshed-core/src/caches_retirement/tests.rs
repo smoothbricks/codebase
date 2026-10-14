@@ -192,6 +192,202 @@ fn nix_state_keeps_the_host_copy() {
     assert!(holds_only_marker(&fixture.volume).unwrap());
 }
 
+/// Older Nix wiring exposed the XDG cache root, so Bun install/runtime state and Nix's
+/// own mutable cache appeared one level deeper. Keep the mutable tree intact, not host-wins.
+#[test]
+fn nested_legacy_nix_caches_reach_their_owners_without_losing_state() {
+    let fixture = Fixture::new();
+    let layout = fixture.layout(&[]);
+    fixture.file(
+        &fixture.volume.join("nix/.bun/install/cache/pkg/index.js"),
+        5,
+    );
+    fixture.file(&fixture.volume.join("nix/bun/@t@/entry.pile"), 7);
+    fixture.file(&fixture.volume.join("nix/nix/fetcher-cache-v4.sqlite"), 11);
+    fixture.file(
+        &fixture
+            .volume
+            .join("nix/nix/tarball-cache-v2/objects/pack/old.pack"),
+        13,
+    );
+    fixture.file(&fixture.home.join(".cache/nix/fetcher-cache-v4.sqlite"), 3);
+
+    let report = fixture.run(&layout);
+    assert!(report.leftovers.is_empty(), "{:?}", report.leftovers);
+    assert_eq!(
+        fs::read(fixture.home.join(".bun/install/cache/pkg/index.js"))
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(
+        fs::read(fixture.home.join(".cache/bun/@t@/entry.pile"))
+            .unwrap()
+            .len(),
+        7
+    );
+    assert_eq!(
+        fs::read(fixture.home.join(".cache/nix/fetcher-cache-v4.sqlite"))
+            .unwrap()
+            .len(),
+        3
+    );
+    let retained = fixture.home.join(".cache/nix/cowshed-retired/nix-nix");
+    assert_eq!(
+        fs::read(retained.join("fetcher-cache-v4.sqlite"))
+            .unwrap()
+            .len(),
+        11
+    );
+    assert_eq!(
+        fs::read(retained.join("tarball-cache-v2/objects/pack/old.pack"))
+            .unwrap()
+            .len(),
+        13
+    );
+    assert_eq!(
+        outcome(&report, "legacy nix fetcher cache (retained)").moved_bytes,
+        24
+    );
+    assert!(report.caches.iter().all(|cache| cache.dropped_bytes == 0));
+    assert!(holds_only_marker(&fixture.volume).unwrap());
+    assert!(fixture.run(&layout).caches.is_empty());
+}
+
+/// Both historical spellings can coexist before the host has either cache. The second move
+/// must merge into the first one's publication rather than treating the original absence as current.
+#[test]
+fn canonical_and_nested_bun_caches_converge_at_one_host_path() {
+    let fixture = Fixture::new();
+    fixture.file(&fixture.volume.join("bun/install/cache/first/index.js"), 2);
+    fixture.file(
+        &fixture
+            .volume
+            .join("nix/.bun/install/cache/second/index.js"),
+        3,
+    );
+    let report = fixture.run(&fixture.layout(&[]));
+    assert!(report.leftovers.is_empty());
+    for package in ["first", "second"] {
+        assert!(
+            fixture
+                .home
+                .join(".bun/install/cache")
+                .join(package)
+                .join("index.js")
+                .is_file()
+        );
+    }
+    assert_eq!(
+        report
+            .caches
+            .iter()
+            .map(|cache| cache.moved_bytes)
+            .sum::<u64>(),
+        5
+    );
+    assert!(holds_only_marker(&fixture.volume).unwrap());
+}
+
+/// A published retained copy left by interruption is resumed only when colliding bytes agree.
+/// A differing mutable entry keeps both copies and names both, including equal-size differences.
+#[test]
+fn retained_mutable_state_resumes_without_overwriting_different_bytes() {
+    let fixture = Fixture::new();
+    let layout = fixture.layout(&[]);
+    let source = fixture.volume.join("nix/nix");
+    let target = fixture.home.join(".cache/nix/cowshed-retired/nix-nix");
+    fixture.file(&source.join("a.sqlite"), 11);
+    fixture.file(&target.join("a.sqlite"), 11);
+    fixture.file(&source.join("objects/new.pack"), 13);
+    symlink("objects/new.pack", source.join("current")).unwrap();
+    symlink("objects/new.pack", target.join("current")).unwrap();
+    let link_bytes = tree_bytes(&source.join("current")).unwrap();
+    let report = fixture.run(&layout);
+    let retained = outcome(&report, "legacy nix fetcher cache (retained)");
+    assert_eq!(retained.moved_bytes, 13);
+    assert_eq!(retained.dropped_bytes, 11 + link_bytes);
+    assert!(holds_only_marker(&fixture.volume).unwrap());
+
+    fixture.file(&source.join("a.sqlite"), 11);
+    fs::write(target.join("a.sqlite"), vec![b'y'; 11]).unwrap();
+    let planned = plan(&layout, &observe(&layout).unwrap());
+    let error = execute(&layout, &planned).unwrap_err().to_string();
+    assert!(error.contains("different entries"), "{error}");
+    assert!(error.contains(&source.display().to_string()), "{error}");
+    assert!(error.contains(&target.display().to_string()), "{error}");
+    assert_eq!(fs::read(source.join("a.sqlite")).unwrap(), vec![b'x'; 11]);
+    assert_eq!(fs::read(target.join("a.sqlite")).unwrap(), vec![b'y'; 11]);
+}
+
+/// Explicit selection follows an existing declared build-state link; no global HOME declaration
+/// or detector is needed, and the unrelated main's independently owned cache stays untouched.
+#[test]
+fn an_explicit_toolchain_placement_preserves_the_selected_build_state() {
+    let fixture = Fixture::new();
+    let selected = fixture.root.join("selected/.cache/ttsc");
+    let build = fixture.root.join("build/declared/.cache/ttsc");
+    fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    fs::create_dir_all(&build).unwrap();
+    symlink(&build, &selected).unwrap();
+    let other = fixture.root.join("other/.cache/ttsc");
+    fixture.file(&other.join("plugins/other/plugin"), 3);
+    let source = fixture.volume.join("ttsc");
+    fixture.file(&source.join("plugins/old/plugin"), 5);
+    fixture.file(&source.join("go-build/aa/old-d"), 7);
+    let bytes = tree_bytes(&source).unwrap();
+    let plan = Plan {
+        steps: vec![Step::Merge {
+            placement: Placement {
+                label: "selected declared ttsc build state".to_owned(),
+                volume: source,
+                host: selected.clone(),
+                merge: Merge::Preserve,
+                owner: None,
+            },
+            bytes,
+        }],
+        leftovers: Vec::new(),
+    };
+    let report = execute(&fixture.layout(&[]), &plan).unwrap();
+    assert_eq!(
+        (report.caches[0].moved_bytes, report.caches[0].dropped_bytes),
+        (12, 0)
+    );
+    assert_eq!(fs::read_link(selected).unwrap(), build);
+    assert!(
+        fixture
+            .root
+            .join("build/declared/.cache/ttsc/plugins/old/plugin")
+            .is_file()
+    );
+    assert!(other.join("plugins/other/plugin").is_file());
+    assert!(!fixture.home.join(".cache/ttsc").exists());
+    assert!(holds_only_marker(&fixture.volume).unwrap());
+}
+
+/// A sealed host cache refuses publication; rebuildability does not authorize losing the
+/// only copy. The source survives the error and the host's permissions are never relaxed.
+#[test]
+fn a_failed_publication_keeps_unique_source_entries() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::new();
+    let layout = fixture.layout(&[]);
+    let source = fixture.volume.join("uv/unique");
+    fixture.file(&source, 7);
+    let host = fixture.home.join(".cache/uv");
+    fs::create_dir_all(&host).unwrap();
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o555)).unwrap();
+    let planned = plan(&layout, &observe(&layout).unwrap());
+    let result = execute(&layout, &planned);
+    let mode = fs::metadata(&host).unwrap().permissions().mode() & 0o777;
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(mode, 0o555);
+    assert_eq!(fs::read(&source).unwrap(), vec![b'x'; 7]);
+    assert!(!host.join("unique").exists());
+}
+
 /// A cargo process holding cargo's package-cache lock delays the run until it lets go; nothing
 /// moves while the lock is held, and the run completes once it is released.
 #[test]

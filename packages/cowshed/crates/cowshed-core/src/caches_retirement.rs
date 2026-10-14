@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -51,6 +51,8 @@ pub enum Merge {
     ContentAddressed,
     /// Not content-addressed (Nix's client state): the host's copy wins whole.
     HostWins,
+    /// A retained mutable tree: only byte-identical collisions may be removed from the source.
+    Preserve,
 }
 
 /// The process that writes a cache while it runs, which must not run while it moves.
@@ -77,6 +79,7 @@ pub struct Placement {
 
 enum Destination {
     Tool(&'static SharedToolHome, Option<&'static str>),
+    Home(&'static str),
     Sccache,
     CowshedCache(fn(&Path) -> PathBuf),
 }
@@ -90,9 +93,9 @@ struct Retired {
 }
 
 /// Every directory the volume held for a detector, the gateway or sccache, where it lived there.
-fn retired() -> [Retired; 16] {
-    use Destination::{CowshedCache, Sccache, Tool};
-    use Merge::{ContentAddressed, HostWins};
+fn retired() -> [Retired; 19] {
+    use Destination::{CowshedCache, Home, Sccache, Tool};
+    use Merge::{ContentAddressed, HostWins, Preserve};
     let tool = |volume, label, home, child, owner| Retired {
         volume,
         label,
@@ -122,6 +125,28 @@ fn retired() -> [Retired; 16] {
             None,
             None,
         ),
+        // Older Nix wiring exposed an XDG root: these are Bun caches, not Nix client state.
+        tool(
+            "nix/.bun/install/cache",
+            "legacy bun install cache",
+            &bun::BUN_HOME,
+            None,
+            None,
+        ),
+        Retired {
+            volume: "nix/bun",
+            label: "legacy bun runtime cache",
+            destination: Home(".cache/bun"),
+            merge: ContentAddressed,
+            owner: None,
+        },
+        Retired {
+            volume: "nix/nix",
+            label: "legacy nix fetcher cache (retained)",
+            destination: Tool(&nix::CACHE_HOME, Some("cowshed-retired/nix-nix")),
+            merge: Preserve,
+            owner: None,
+        },
         tool("npm", "npm cache", &npm::NPM_HOME, None, None),
         tool("pnpm/store", "pnpm store", &pnpm::PNPM_HOME, None, None),
         tool("uv", "uv cache", &uv::UV_HOME, None, None),
@@ -202,6 +227,7 @@ impl RetirementLayout {
                 let host = match retired.destination {
                     Destination::Tool(tool, Some(child)) => tool.host_path(home).join(child),
                     Destination::Tool(tool, None) => tool.host_path(home),
+                    Destination::Home(relative) => home.join(relative),
                     Destination::Sccache => sccache::cache_directory(home),
                     Destination::CowshedCache(path) => path(home),
                 };
@@ -475,11 +501,26 @@ fn place(
         });
         return;
     };
-    let host = observation
-        .hosts
-        .get(&placement.host)
-        .cloned()
-        .unwrap_or(HostState::Absent);
+    // Several historical names can designate one host cache. A prior planned publication
+    // makes that destination a directory even when the original observation found no host copy.
+    let already_placed = plan.steps.iter().any(|step| match step {
+        Step::Move {
+            placement: prior, ..
+        }
+        | Step::Merge {
+            placement: prior, ..
+        } => prior.host == placement.host,
+        Step::CleanStaging(_) | Step::RemoveEmpty(_) => false,
+    });
+    let host = if already_placed {
+        HostState::Directory
+    } else {
+        observation
+            .hosts
+            .get(&placement.host)
+            .cloned()
+            .unwrap_or(HostState::Absent)
+    };
     let bytes = entry.bytes;
     let conflict = |reason: String| Leftover {
         path: placement.volume.clone(),
@@ -711,11 +752,14 @@ pub fn execute(
                 let mut totals = Totals::default();
                 let merged = match placement.merge {
                     Merge::ContentAddressed => {
-                        merge_then_remove(&placement.volume, &placement.host, &mut totals)
+                        merge_then_remove(&placement.volume, &placement.host, &mut totals, false)
                     }
                     Merge::HostWins => {
                         totals.dropped = *bytes;
                         remove_tree(&placement.volume)
+                    }
+                    Merge::Preserve => {
+                        merge_then_remove(&placement.volume, &placement.host, &mut totals, true)
                     }
                 };
                 merged.map(|()| {
@@ -826,7 +870,12 @@ struct Totals {
 
 /// Move every entry the host lacks into it and drop every entry it already holds, recursing
 /// where both hold a directory.
-fn merge_tree(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
+fn merge_tree(
+    from: &Path,
+    to: &Path,
+    totals: &mut Totals,
+    verify_existing: bool,
+) -> io::Result<()> {
     // WHY: tools seal their caches (Go's module cache extracts every directory 0555), so the
     // volume-side tree must be writable by its owner before entries can leave it.
     cowshed_os::fsio::grant_owner_directory_access(from)?;
@@ -845,17 +894,10 @@ fn merge_tree(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
         match fs::symlink_metadata(&destination) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let bytes = tree_bytes(&source)?;
-                match move_directory(&source, &destination, false) {
-                    Ok(()) => totals.moved += bytes,
-                    // A sealed host directory refuses new entries. Every cache that moves here
-                    // is content its tool fetches or rebuilds on a miss, so the volume copy is
-                    // dropped rather than unsealing the host tool's own cache.
-                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                        totals.dropped += bytes;
-                        remove_tree(&source)?;
-                    }
-                    Err(error) => return Err(error),
-                }
+                // A failure to publish is not evidence of a duplicate. Keep the unique source
+                // and report the failure rather than treating rebuildable bytes as disposable.
+                move_directory(&source, &destination, false)?;
+                totals.moved += bytes;
             }
             Err(error) => return Err(error),
             Ok(destination_metadata)
@@ -864,9 +906,16 @@ fn merge_tree(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
                     && !source_metadata.file_type().is_symlink()
                     && !destination_metadata.file_type().is_symlink() =>
             {
-                merge_then_remove(&source, &destination, totals)?;
+                merge_then_remove(&source, &destination, totals, verify_existing)?;
             }
             Ok(_) => {
+                if verify_existing && !same_entry(&source, &destination)? {
+                    return Err(io::Error::other(format!(
+                        "cannot preserve {} at {}: different entries occupy the same retained path; both copies remain",
+                        source.display(),
+                        destination.display()
+                    )));
+                }
                 totals.dropped += tree_bytes(&source)?;
                 remove_tree(&source)?;
             }
@@ -875,15 +924,46 @@ fn merge_tree(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
     Ok(())
 }
 
+/// Retained mutable state may discard a source entry only after proving the destination's bytes.
+fn same_entry(from: &Path, to: &Path) -> io::Result<bool> {
+    let source = fs::symlink_metadata(from)?;
+    let destination = fs::symlink_metadata(to)?;
+    if source.file_type().is_symlink() && destination.file_type().is_symlink() {
+        return Ok(fs::read_link(from)? == fs::read_link(to)?);
+    }
+    if !source.is_file() || !destination.is_file() || source.len() != destination.len() {
+        return Ok(false);
+    }
+    let mut source = fs::File::open(from)?;
+    let mut destination = fs::File::open(to)?;
+    let mut left = [0; 8192];
+    let mut right = [0; 8192];
+    loop {
+        let count = source.read(&mut left)?;
+        if count == 0 {
+            return Ok(destination.read(&mut right[..1])? == 0);
+        }
+        destination.read_exact(&mut right[..count])?;
+        if left[..count] != right[..count] {
+            return Ok(false);
+        }
+    }
+}
+
 /// Merge `from` into `to`, then remove `from`.
 ///
 /// WHY loop: a tool still writing the old location (a job whose environment predates the move,
 /// or a cache daemon that has not restarted onto the host path) can add an entry between the
 /// merge and the removal. Merging again moves it too; every pass moves what it finds, so this
 /// ends once no writer adds anything between the two steps.
-fn merge_then_remove(from: &Path, to: &Path, totals: &mut Totals) -> io::Result<()> {
+fn merge_then_remove(
+    from: &Path,
+    to: &Path,
+    totals: &mut Totals,
+    verify_existing: bool,
+) -> io::Result<()> {
     loop {
-        merge_tree(from, to, totals)?;
+        merge_tree(from, to, totals, verify_existing)?;
         match fs::remove_dir(from) {
             Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => continue,
             removed => return removed,
