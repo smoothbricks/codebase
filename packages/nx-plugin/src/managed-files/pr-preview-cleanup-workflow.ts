@@ -89,7 +89,6 @@ ${setupJobEnv(options)}    steps:
       - name: Checkout
         uses: ${githubActionPins.checkout.ref} # ${githubActionPins.checkout.version}
         with:
-          filter: blob:none
           fetch-depth: 1
           persist-credentials: false
 ${preflightSteps(options)}

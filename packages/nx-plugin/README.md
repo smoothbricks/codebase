@@ -1291,3 +1291,39 @@ and process boundary. There is no separate serialized change plan.
 Files with a `# smoo-local` tail or `# smoo-local-begin` / `# smoo-local-end` blocks retain those sections. Matching
 source symlinks are preserved; conflicting local blocks and broken or external links are reported instead of
 overwritten. The generator does not remove a repository-owned file when a capability is disabled.
+
+### Workflow security and bounded execution
+
+Managed action references use full commit SHAs with their release tags in comments. Read-only jobs explicitly set
+`persist-credentials: false`; checkout includes the required history and blobs so later private historical reads do not
+need credentials left in Git configuration. Jobs that push release or managed-file refs retain credentials explicitly,
+with their reason beside checkout. A platform producer that fetches a private release-candidate ref also requires
+authenticated Git transport; its checkout names that reason.
+
+| Job                                                               | Persist checkout credentials | Reason                                                                                                                                                                                  |
+| ----------------------------------------------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Validate, E2E, cross-test execution, deploy-only, preview cleanup | No                           | Complete history and blobs make historical reads local; these jobs do not push or fetch later private refs.                                                                             |
+| Linux release candidate                                           | No                           | The candidate is versioned locally and transferred as a Git bundle, not pushed.                                                                                                         |
+| macOS / cross-platform release producer                           | Yes                          | `releaseCollectPlatformOutputs` fetches private candidate/repair refs after checkout (`packages/cli/src/release/index.ts:335`); a full initial clone cannot contain refs created later. |
+| Release publisher and pending-release healer                      | Yes                          | Publishing and repair fetch and push release refs.                                                                                                                                      |
+| Managed-file healer                                               | Yes                          | It pushes the regenerated review branch.                                                                                                                                                |
+
+Job timeouts remain generous and finite: Validate and compact release jobs use 45 minutes; Apple/cross-platform
+production and combined platform releases use 90 minutes to accommodate cold native builds; production deployment and
+managed-file healing use 30 minutes; deployed E2E and preview cleanup use 15 minutes. Cross-target test execution uses
+30 minutes. These are job hang bounds, not replacements for package test deadlines.
+
+Forgejo artifact steps use managed local JavaScript actions, not GitHub clients or absolute `uses:` URLs. They fetch and
+verify the pinned GHES-gate-free upstream commit before running its original bundled entry point under the runner's Node
+runtime. This preserves artifact inputs, outputs and execution conditions while allowing the unchanged jactionlint
+default rules to validate the same workflow grammar for both providers.
+
+A configured flattened producer runs its preflight even when no platform family matches. Its declared environment is
+merged directly into every emitted step of its producer job; step-local fields take precedence. Producer names are
+encoded as YAML strings so identifiers such as `TRUE` and `NULL` retain their exact spelling, not scalar coercions.
+Runner-dependent values are evaluated in the valid step-level context, not job env. No producer value is exported
+through `GITHUB_ENV`: GitHub
+[forbids setting `NODE_OPTIONS` through that environment file](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-an-environment-variable).
+If a declaration name cannot be carried, generation fails with that name in the diagnostic instead of silently dropping
+it. Conditional preflight and platform-build steps are numbered from the actual emitted job sequence, so every following
+step anchor remains exact.

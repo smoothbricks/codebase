@@ -1,7 +1,8 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Assertions cover literal GitHub Actions expressions. */
 
 import { describe, expect, it } from 'bun:test';
-import { readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { githubActionPins } from '@smoothbricks/nx-plugin/managed-files/ci-workflow';
 import { formatManagedContent } from '@smoothbricks/nx-plugin/managed-files/managed-format';
@@ -46,6 +47,362 @@ const codebaseWorkflowOptions: PublishWorkflowDefinitionOptions = {
   macosPlatformArchitectures: ['arm64', 'x64'],
   runsOn: [...nixosRunsOn],
 };
+
+type ProducerStep = {
+  name: string;
+  uses?: string;
+  env?: Record<string, string>;
+  run?: string;
+  'working-directory'?: string;
+  with?: { 'persist-credentials'?: boolean };
+};
+type ProducerJob = { env?: Record<string, string>; steps: ProducerStep[] };
+type ProducerWorkflow = { jobs: Record<string, ProducerJob> };
+/** What the preload probe reports from inside the process that ran it; `bun` is null in a real Node. */
+type NodePreloadReport = { pid: number; preloadedBy: number | null; bun: string | null };
+/** One real Node process per distinct env a job renders, with the steps that render it. */
+type NodeConsumer = { env: Record<string, string>; steps: string[] };
+
+const PRODUCER_PREFLIGHT_NAME = 'Check cross-platform toolchain prerequisites';
+const PRODUCER_PREFLIGHT = [
+  'printf "%s" "$SDK_ROOT" > preflight-saw-sdk',
+  'printf "%s" "$MULTILINE" > preflight-saw-multiline',
+  'printf "%s\\n%s\\n%s" "$name" "$delimiter" "$__SMOO_ENV_DELIMITER" > preflight-saw-names',
+].join('\n');
+
+/** What generated steps declare for themselves under names a repository's producer also declares. */
+const OWN_ENV: Record<string, string> = {
+  SMOO_RELEASE_PROJECTS: '${{ inputs.projects }}',
+  PUBLISH_ENV: '${{ secrets.PUBLISH_ENV }}',
+  SOURCE_READ_TOKEN: '${{ secrets.SOURCE_READ_TOKEN }}',
+  SIBLING_READ_TOKEN: '${{ secrets.SIBLING_READ_TOKEN }}',
+};
+
+/**
+ * Values a repository may legitimately declare, plus text a shell would execute if it ever saw it as source.
+ *
+ * NODE_OPTIONS is why the env rides every step and not GITHUB_ENV. The workflow-commands documentation ("Setting an
+ * environment variable") says: "Due to security restrictions, GITHUB_ENV cannot be used to set the NODE_OPTIONS
+ * environment variable." So only a step's own env can put a preload into that step's processes. The quotes around its
+ * path, which contains a space, are how Node itself spells a path it must not split. The names after it are also
+ * declared by generated steps for themselves, and those steps keep their own value.
+ */
+const PRODUCER_ENV: Record<string, string> = {
+  SDK_ROOT: '${{ runner.temp }}/macos sdk',
+  CROSS_FLAGS: '--sysroot "$SDK_ROOT"; touch hostile-marker; $(touch hostile-subst) `touch hostile-tick`',
+  MULTILINE: 'first\nghost<<EOF\nlast',
+  EMPTY: '',
+  APP_CROSS: '1',
+  TRUE: 'upper true identifier',
+  FALSE: 'upper false identifier',
+  NULL: 'upper null identifier',
+  // Names that resemble the retired GITHUB_ENV transfer's scratch variables: plain variables now, kept as declared.
+  name: 'original name',
+  delimiter: 'original delimiter',
+  __SMOO_ENV_DELIMITER: 'former scratch name',
+  __SMOO_ENV_DELIMITER_: 'another former scratch name',
+  NODE_OPTIONS: '--require "${{ runner.temp }}/node preload/probe.cjs"',
+  SMOO_RELEASE_PROJECTS: 'producer-chosen projects',
+  PUBLISH_ENV: 'producer-chosen credential',
+  SOURCE_READ_TOKEN: 'producer-chosen source token',
+  SIBLING_READ_TOKEN: 'producer-chosen sibling token',
+};
+
+/** A real `--require` preload: it marks the process it runs in and leaves a file no output parsing could forge. */
+const NODE_PRELOAD_PROBE = [
+  "const { writeFileSync } = require('node:fs');",
+  "const { join } = require('node:path');",
+  'globalThis.producerPreloadedBy = process.pid;',
+  "writeFileSync(join(__dirname, 'witness-' + process.pid), String(process.pid));",
+].join('\n');
+/** The downstream consumer: a plain process reporting its pid, its runtime, and who, if anyone, preloaded into it. */
+const NODE_PRELOAD_CONSUMER = [
+  'const report = { pid: process.pid, preloadedBy: globalThis.producerPreloadedBy ?? null };',
+  'process.stdout.write(JSON.stringify({ ...report, bun: process.versions.bun ?? null }));',
+].join('\n');
+
+const CARGO_GIT_CREDENTIALS = {
+  gitOrigins: [{ origin: 'https://git.example.net', tokenEnv: 'SOURCE_READ_TOKEN' }],
+};
+const SIBLING_SOURCE_CHECKOUTS = [
+  { path: '../shared', repository: 'https://git.example.net/org/shared.git', tokenEnv: 'SIBLING_READ_TOKEN' },
+];
+
+type ProducerShape = {
+  shape: string;
+  /** The job that owns the preflight, and with it the producer env. */
+  job: string;
+  /** Every other job the shape renders: none of them belongs to the producer. */
+  unrelatedJobs: string[];
+  /** The steps of `job` that declare each OWN_ENV name for themselves; a name no step declares is absent. */
+  owners: Record<string, string[]>;
+  options: PublishWorkflowDefinitionOptions;
+};
+
+const RELEASE_OWNERS: Record<string, string[]> = {
+  SMOO_RELEASE_PROJECTS: ['🧭 Plan release', '🔢 Version release'],
+  PUBLISH_ENV: ['🧯 Repair pending releases', '📦 Publish release (${{ steps.version.outputs.mode }})'],
+};
+
+/** The flattened single job with Apple targets cross-built on its own runner, beside steps with their own env. */
+const flattenedShape: ProducerShape = {
+  shape: 'flattened single job',
+  job: 'publish',
+  unrelatedJobs: [],
+  owners: {
+    ...RELEASE_OWNERS,
+    SOURCE_READ_TOKEN: ['Prepare Cargo credentials'],
+    SIBLING_READ_TOKEN: ['📦 Check out sibling sources'],
+  },
+  options: {
+    repoName: 'acme/app',
+    actionsProvider: 'forgejo',
+    runsOn: ['nixos-latest-x64', 'self-hosted'],
+    platformTargetGlobs: ['*-macos', '*-linux'],
+    macosPlatformArchitectures: ['arm64'],
+    platformProducer: { kind: 'linux-cross', preflight: PRODUCER_PREFLIGHT, env: PRODUCER_ENV },
+    privateNpm: { scope: '@acme', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
+    // Steps that already own an env mapping: the producer env merges into it rather than repeating a key or a header.
+    cargoCredentials: CARGO_GIT_CREDENTIALS,
+    sourceCheckouts: SIBLING_SOURCE_CHECKOUTS,
+  },
+};
+const emptyFamiliesShape: ProducerShape = {
+  shape: 'flattened without platform families',
+  job: 'publish',
+  unrelatedJobs: [],
+  owners: RELEASE_OWNERS,
+  options: {
+    repoName: 'acme/app',
+    actionsProvider: 'forgejo',
+    platformTargetGlobs: [],
+    platformProducer: { kind: 'linux-cross', preflight: PRODUCER_PREFLIGHT, env: PRODUCER_ENV },
+    privateNpm: { scope: '@acme', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
+  },
+};
+const deployOnlyShape: ProducerShape = {
+  shape: 'flattened deploy-only job',
+  job: 'publish',
+  unrelatedJobs: [],
+  // Nothing versions or publishes here, so no step declares any of those names: the producer's values reach every step.
+  owners: {},
+  options: {
+    repoName: 'acme/app',
+    release: false,
+    deploy: true,
+    actionsProvider: 'forgejo',
+    platformTargetGlobs: [],
+    platformProducer: { kind: 'linux-cross', preflight: PRODUCER_PREFLIGHT, env: PRODUCER_ENV },
+    privateNpm: { scope: '@acme', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
+  },
+};
+/** The producer is one of three jobs: the Linux candidate before it and the final publisher after it are not its. */
+const dedicatedShape: ProducerShape = {
+  shape: 'dedicated cross producer job',
+  job: 'cross-platform',
+  unrelatedJobs: ['linux-release-candidate', 'publish-on-linux'],
+  // The publisher credential lives in the final job, which the producer does not own: only the version steps declare.
+  owners: { SMOO_RELEASE_PROJECTS: ['🔢 Version release', '🍎 Build selected macOS and iOS release outputs'] },
+  options: {
+    repoName: '@smoothbricks/codebase',
+    platformTargetGlobs: ['*-macos', '*-linux'],
+    macosPlatformArchitectures: ['arm64'],
+    platformProducer: { kind: 'linux-cross', preflight: PRODUCER_PREFLIGHT, env: PRODUCER_ENV },
+    // GitHub provider, so the final job publishes and its publish step declares PUBLISH_ENV for itself.
+    privateNpm: { scope: '@acme', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
+  },
+};
+const producerShapes: ProducerShape[] = [flattenedShape, emptyFamiliesShape, deployOnlyShape, dedicatedShape];
+
+/** The shape's own declaration with the given env, and no `env` key at all when there is none. */
+function withProducerEnv(
+  options: PublishWorkflowDefinitionOptions,
+  env?: Record<string, string>,
+): PublishWorkflowDefinitionOptions {
+  const { platformProducer } = options;
+  if (platformProducer === undefined) throw new Error('A producer shape declares platformProducer.');
+  const { kind, preflight } = platformProducer;
+  return { ...options, platformProducer: { kind, preflight, ...(env === undefined ? {} : { env }) } };
+}
+
+function jobSteps(workflow: ProducerWorkflow, job: string): ProducerStep[] {
+  const steps = workflow.jobs[job]?.steps;
+  if (steps === undefined) throw new Error(`The workflow renders no ${job} job.`);
+  return steps;
+}
+
+/** One job's raw lines under `jobs:`, from its key to the next job's key. */
+function jobSection(rendered: string, job: string): string {
+  const lines = rendered.split('\n');
+  const start = lines.indexOf(`  ${job}:`);
+  if (start === -1) throw new Error(`The workflow renders no ${job} job.`);
+  const next = lines.findIndex((line, index) => index > start && /^ {2}[A-Za-z0-9_-]+:$/.test(line));
+  return lines.slice(start, next === -1 ? undefined : next).join('\n');
+}
+
+/** A top-level step's raw lines with the `# Step N` anchor GitHub deeplinks resolve to. */
+type StepBlock = { anchor: number | undefined; name: string; lines: string[] };
+
+function stepBlocks(job: string): StepBlock[] {
+  const blocks: StepBlock[] = [];
+  let anchor: number | undefined;
+  for (const line of job.split('\n')) {
+    const anchored = /^ {6}# Step (\d+)/.exec(line)?.[1];
+    if (anchored !== undefined) anchor = Number(anchored);
+    const name = /^ {6}- name: (.*)$/.exec(line)?.[1];
+    if (name !== undefined) {
+      blocks.push({ anchor, name, lines: [line] });
+      anchor = undefined;
+    } else {
+      blocks[blocks.length - 1]?.lines.push(line);
+    }
+  }
+  return blocks;
+}
+
+/** The keys of every `env:` mapping in one step's raw lines, one list per mapping. */
+function envMappingKeys(lines: readonly string[]): string[][] {
+  const mappings: string[][] = [];
+  let open: string[] | undefined;
+  for (const line of lines) {
+    if (line === '        env:') {
+      open = [];
+      mappings.push(open);
+    } else if (open !== undefined) {
+      const key = /^ {10}"?([A-Za-z_][A-Za-z0-9_]*)"?:/.exec(line)?.[1];
+      if (key !== undefined) {
+        open.push(key);
+      } else if (/^ {0,9}\S/.test(line)) {
+        open = undefined;
+      }
+    }
+  }
+  return mappings;
+}
+
+/** The first line of `expected` that `actual` does not contain after the lines already matched, if any. */
+function firstLineMissingInOrder(expected: readonly string[], actual: readonly string[]): string | undefined {
+  let from = 0;
+  for (const line of expected) {
+    const found = actual.indexOf(line, from);
+    if (found === -1) return line;
+    from = found + 1;
+  }
+  return undefined;
+}
+
+/** The diagnostic a render raises when it must fail. */
+function renderFailure(options: PublishWorkflowDefinitionOptions): string {
+  try {
+    renderPublishWorkflowYaml(options);
+  } catch (error) {
+    if (error instanceof Error) return error.message;
+    throw error;
+  }
+  throw new Error('The workflow rendered although its producer env cannot be carried.');
+}
+
+/** Runs the preflight's script in a real shell under the env its own step renders, as the runner would. */
+async function runPreflight(shape: string, preflight: ProducerStep | undefined): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), 'producer-preflight-'));
+  try {
+    const githubEnv = join(directory, 'github-env');
+    const script = join(directory, 'step.sh');
+    await writeFile(githubEnv, '');
+    await writeFile(script, preflight?.run ?? '');
+    // The runner resolves `runner.temp` before the shell starts, and gives every step a GITHUB_ENV file.
+    const stepEnv = Object.fromEntries(
+      Object.entries(preflight?.env ?? {}).map(([name, value]) => [
+        name,
+        value.replaceAll('${{ runner.temp }}', directory),
+      ]),
+    );
+    const proc = Bun.spawn(['bash', '-e', script], {
+      cwd: directory,
+      env: { PATH: process.env.PATH ?? '', ...stepEnv, GITHUB_ENV: githubEnv },
+      stdout: 'ignore',
+      stderr: 'pipe',
+    });
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    expect({ shape, stderr, exitCode }).toEqual({ shape, stderr: '', exitCode: 0 });
+
+    // The runner would hand whatever the step appended there to every later step: the producer appended nothing.
+    await expect(readFile(githubEnv, 'utf8')).resolves.toBe('');
+    // The preflight saw the declared values through the env of its own step.
+    await expect(readFile(join(directory, 'preflight-saw-sdk'), 'utf8')).resolves.toBe(`${directory}/macos sdk`);
+    await expect(readFile(join(directory, 'preflight-saw-multiline'), 'utf8')).resolves.toBe('first\nghost<<EOF\nlast');
+    await expect(readFile(join(directory, 'preflight-saw-names'), 'utf8')).resolves.toBe(
+      'original name\noriginal delimiter\nformer scratch name',
+    );
+    // Hostile values were data end to end: nothing executed them.
+    expect((await readdir(directory)).sort()).toEqual([
+      'github-env',
+      'preflight-saw-multiline',
+      'preflight-saw-names',
+      'preflight-saw-sdk',
+      'step.sh',
+    ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+/** Spawns a real Node under every distinct env the steps render and proves the NODE_OPTIONS preload ran in each. */
+async function runNodeConsumers(shape: string, steps: ProducerStep[]): Promise<void> {
+  const node = Bun.which('node');
+  if (node === null) throw new Error('This proof needs a real node on PATH.');
+  const runnerTemp = await mkdtemp(join(tmpdir(), 'producer-node-'));
+  try {
+    const preloads = join(runnerTemp, 'node preload');
+    await mkdir(preloads);
+    await writeFile(join(preloads, 'probe.cjs'), NODE_PRELOAD_PROBE);
+
+    // The Node command, cwd and probe are fixed; run each distinct rendered step env through that same boundary.
+    const consumers = new Map<string, NodeConsumer>();
+    for (const step of steps) {
+      // The runner resolves `runner.temp`; every other expression stays text, as nothing here evaluates one.
+      const env = Object.fromEntries(
+        Object.entries(step.env ?? {}).map(([name, value]) => [
+          name,
+          value.replaceAll('${{ runner.temp }}', runnerTemp),
+        ]),
+      );
+      const key = JSON.stringify(Object.entries(env).sort(([a], [b]) => a.localeCompare(b)));
+      const consumer: NodeConsumer = consumers.get(key) ?? { env, steps: [] };
+      consumer.steps.push(step.name);
+      consumers.set(key, consumer);
+    }
+
+    for (const { env, steps: consumerSteps } of consumers.values()) {
+      // The child gets exactly the env its rendered step declares: nothing of the producer's own configuration.
+      const proc = Bun.spawn([node, '-e', NODE_PRELOAD_CONSUMER], {
+        cwd: runnerTemp,
+        env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      const who = { shape, steps: consumerSteps };
+      expect({ ...who, stderr, exitCode }).toEqual({ ...who, stderr: '', exitCode: 0 });
+
+      // A real Node, not a shim to Bun: the preload ran inside the consumer's own process, and left a file no output
+      // parsing could forge.
+      const report = typia.assert<NodePreloadReport>(JSON.parse(stdout));
+      expect({ ...who, bun: report.bun, preloadedBy: report.preloadedBy }).toEqual({
+        ...who,
+        bun: null,
+        preloadedBy: report.pid,
+      });
+      await expect(readFile(join(preloads, `witness-${report.pid}`), 'utf8')).resolves.toBe(String(report.pid));
+    }
+  } finally {
+    await rm(runnerTemp, { recursive: true, force: true });
+  }
+}
 
 describe('publish workflow definition', () => {
   it('renders the checked-in local publish workflow copy', async () => {
@@ -190,11 +547,36 @@ describe('publish workflow definition', () => {
     // It still builds the Apple targets, with the producer's toolchain env and
     // its preflight ahead of setup.
     expect(rendered).toContain('--targets "*-macos"');
-    expect(rendered).toMatch(/^ {6}APP_CROSS: ['"]1['"]$/m);
+    expect(rendered).not.toMatch(/^ {6}"?APP_CROSS"?:/m);
+    expect(rendered).toMatch(/^ {10}"APP_CROSS": ['"]1['"]$/m);
     expect(rendered).toContain('Check cross-platform toolchain prerequisites');
     expect(rendered.indexOf('Check cross-platform toolchain prerequisites')).toBeLessThan(
       rendered.indexOf('Setup Nix/devenv'),
     );
+  });
+
+  it('runs and numbers a declared flattened producer even when no platform family matches', () => {
+    for (const platformTargetGlobs of [[], ['*-linux']]) {
+      const rendered = renderPublishWorkflowYaml({
+        repoName: 'acme/app',
+        actionsProvider: 'forgejo',
+        platformTargetGlobs,
+        privateNpm: { scope: '@acme', readTokenEnv: 'READ_ENV', publishTokenEnv: 'PUBLISH_ENV' },
+        platformProducer: { kind: 'linux-cross', preflight: 'sh scripts/prepare.sh', env: { APP_CROSS: '1' } },
+      });
+      const workflow = typia.assert<ProducerWorkflow>(Bun.YAML.parse(rendered));
+      const steps = workflow.jobs.publish?.steps ?? [];
+      expect(rendered).toContain('# Step 3\n      - name: Check cross-platform toolchain prerequisites');
+      expect(rendered).toContain('# Step 4. Composite action internals');
+      expect(stepAnchorNumbers(rendered)).toEqual(Array.from({ length: steps.length + 1 }, (_, index) => index + 1));
+      expect(rendered).toMatch(/^ {10}"APP_CROSS": ['"]1['"]$/m);
+      expect(rendered).not.toMatch(/^ {6}"?APP_CROSS"?:/m);
+      expect(rendered.indexOf('Check cross-platform toolchain prerequisites')).toBeLessThan(
+        rendered.indexOf('Setup Nix/devenv'),
+      );
+      expect(rendered).toContain('sh scripts/prepare.sh');
+      if (platformTargetGlobs.length === 0) expect(rendered).not.toContain('Build supplemental Linux targets');
+    }
   });
 
   it('keeps the publishing hand-off when provenance needs the hosted runner', () => {
@@ -518,8 +900,11 @@ describe('publish workflow definition', () => {
       expect(workflow.jobs[job]['timeout-minutes']).toBe(minutes);
     }
     const expectedPersist: Record<string, boolean> = {
-      'linux-release-candidate': true,
+      // The candidate reads and writes no remote: the clone is complete.
+      'linux-release-candidate': false,
+      // build-platform-outputs fetches origin's release branch and tags, which a private origin refuses anonymously.
       'macos-platform': true,
+      // smoo publish and pending-release repair push release refs.
       'publish-on-linux': true,
     };
     for (const [job, persist] of Object.entries(expectedPersist)) {
@@ -530,7 +915,8 @@ describe('publish workflow definition', () => {
         expect(step.with?.['persist-credentials']).toBe(persist);
       }
     }
-    expect(rendered).toContain('# release version lazily fetches historical package manifests from the partial clone');
+    expect(rendered).not.toContain('blob:none');
+    expect(rendered).toContain('# No remote is read or written from this job: the clone is complete and the');
     expect(rendered).toContain('# build-platform-outputs fetches the release branch and tags from origin');
     expect(rendered).toContain('# smoo publish and pending-release repair push release refs.');
     const steps = Object.values(workflow.jobs).flatMap((job) => job.steps);
@@ -581,6 +967,175 @@ describe('publish workflow definition', () => {
     expect(singleReleaseWithPlatforms.jobs.publish['timeout-minutes']).toBe(90);
   });
 
+  it('keeps every checkout a full clone with an explicit credential decision', () => {
+    const decisions: Array<[string, PublishWorkflowDefinitionOptions, boolean]> = [
+      ['single release job pushes', { repoName: '@smoothbricks/codebase' }, true],
+      [
+        'single release job with platforms pushes',
+        { repoName: '@smoothbricks/codebase', platformTargetGlobs: LINUX_PLATFORM_TARGET_GLOBS },
+        true,
+      ],
+      ['release:false never pushes', { repoName: '@smoothbricks/codebase', release: false }, false],
+    ];
+    for (const [shape, options, persist] of decisions) {
+      const rendered = renderPublishWorkflowYaml(options);
+      expect(rendered).not.toContain('blob:none');
+      const workflow = typia.assert<ProducerWorkflow>(Bun.YAML.parse(rendered));
+      const checkouts = workflow.jobs.publish?.steps.filter((step) => step.uses?.startsWith('actions/checkout@')) ?? [];
+      expect({ shape, checkouts: checkouts.length }).toEqual({ shape, checkouts: 1 });
+      expect({ shape, persist: checkouts[0]?.with?.['persist-credentials'] }).toEqual({ shape, persist });
+      expect(rendered).toContain('fetch-depth: 0');
+    }
+  });
+
+  it('walks each producer shape once: the env rides every step of its job, in no other, and into real processes', async () => {
+    for (const { shape, job, unrelatedJobs, owners, options } of producerShapes) {
+      const rendered = renderPublishWorkflowYaml(options);
+      const bare = renderPublishWorkflowYaml(withProducerEnv(options));
+      const workflow = typia.assert<ProducerWorkflow>(Bun.YAML.parse(rendered));
+      const bareWorkflow = typia.assert<ProducerWorkflow>(Bun.YAML.parse(bare));
+      const steps = jobSteps(workflow, job);
+      const bareSteps = jobSteps(bareWorkflow, job);
+      const section = jobSection(rendered, job);
+      const blocks = stepBlocks(section);
+
+      // The declaration adds environment and nothing else: the workflow rendered without it survives line for line,
+      // in order, so no command, comment or `# Step N` anchor was rewritten. An empty declaration adds nothing at all.
+      const missing = firstLineMissingInOrder(bare.split('\n'), rendered.split('\n'));
+      expect({ shape, missing }).toEqual({ shape, missing: undefined });
+      expect(renderPublishWorkflowYaml(withProducerEnv(options, {}))).toBe(bare);
+      expect(Object.keys(workflow.jobs).sort()).toEqual([job, ...unrelatedJobs].sort());
+      expect({ shape, names: steps.map((step) => step.name) }).toEqual({
+        shape,
+        names: bareSteps.map((step) => step.name),
+      });
+
+      // Every emitted step carries every producer name, under whatever the step declares for itself.
+      for (const [index, step] of steps.entries()) {
+        const env = { ...PRODUCER_ENV, ...bareSteps[index]?.env };
+        expect({ shape, step: step.name, env: step.env }).toEqual({ shape, step: step.name, env });
+      }
+
+      // A step's own value wins over a colliding producer value, and only there: the steps that render their own
+      // expression are exactly the table's owners, and every other step keeps the producer's value.
+      for (const [name, own] of Object.entries(OWN_ENV)) {
+        const declaring = steps.filter((step) => step.env?.[name] === own).map((step) => step.name);
+        expect({ shape, name, declaring }).toEqual({ shape, name, declaring: owners[name] ?? [] });
+        for (const step of steps) {
+          const who = { shape, name, step: step.name };
+          const expected = declaring.includes(step.name) ? own : PRODUCER_ENV[name];
+          expect({ ...who, carried: step.env?.[name] }).toEqual({ ...who, carried: expected });
+        }
+      }
+      // Source selectors reach shell only as step env, so a hostile projects input is data.
+      expect(steps.some((step) => (step.run ?? '').includes('inputs.projects'))).toBe(false);
+
+      // The runner context exists for steps, not for a job's env, so no job may carry the declaration.
+      for (const [name, definition] of Object.entries(workflow.jobs)) {
+        const runnerContext = Object.values(definition.env ?? {}).some((value) => value.includes('runner.'));
+        expect({ shape, name, runnerContext }).toEqual({ shape, name, runnerContext: false });
+        expect({ shape, name, env: definition.env }).toEqual({ shape, name, env: bareWorkflow.jobs[name]?.env });
+      }
+
+      // Jobs that are not the producer's render byte for byte as they do without the declaration: none of its names
+      // reached a step there, and a name a step declares for itself keeps that step's value. Each declares one, so
+      // the producer's colliding value had a place to leak.
+      for (const name of unrelatedJobs) {
+        expect(jobSection(rendered, name)).toBe(jobSection(bare, name));
+        let declaring = 0;
+        for (const step of jobSteps(workflow, name)) {
+          const who = { shape, job: name, step: step.name };
+          const present = Object.keys(PRODUCER_ENV).filter((producerName) => step.env?.[producerName] !== undefined);
+          const leaked = present.filter((producerName) => step.env?.[producerName] !== OWN_ENV[producerName]);
+          expect({ ...who, leaked }).toEqual({ ...who, leaked: [] });
+          declaring += present.length;
+        }
+        expect({ shape, job: name, declaring: declaring > 0 }).toEqual({ shape, job: name, declaring: true });
+      }
+
+      // GitHub rejects a repeated `env` or a repeated key, and the YAML parser here keeps the last without a word,
+      // so only the raw lines can show that every step has one mapping with each name once.
+      for (const block of blocks) {
+        const who = { shape, step: block.name };
+        const mappings = envMappingKeys(block.lines);
+        const keys = mappings[0] ?? [];
+        const repeated = keys.filter((key, index) => keys.indexOf(key) !== index);
+        expect({ ...who, mappings: mappings.length, repeated }).toEqual({ ...who, mappings: 1, repeated: [] });
+      }
+
+      // `# Step 1` is GitHub's automatic "Set up job"; every emitted step then owns the next number, in order, and
+      // the preflight follows the checkout.
+      expect({ shape, numbers: stepAnchorNumbers(section) }).toEqual({
+        shape,
+        numbers: Array.from({ length: steps.length + 1 }, (_, index) => index + 1),
+      });
+      const anchored = blocks.map(({ anchor, name }) => ({ anchor, name }));
+      expect({ shape, anchored }).toEqual({
+        shape,
+        anchored: steps.map((step, index) => ({ anchor: index + 2, name: step.name })),
+      });
+      expect({ shape, preflight: anchored[1] }).toEqual({
+        shape,
+        preflight: { anchor: 3, name: PRODUCER_PREFLIGHT_NAME },
+      });
+
+      // The preflight runs ahead of devenv resolving anything. It is the declared command behind at most the
+      // shell-strictness line: no export loop, no random delimiter, no scratch assignment, no GITHUB_ENV append.
+      const names = steps.map((step) => step.name);
+      const preflight = steps[1];
+      expect({ shape, uses: steps[0]?.uses?.startsWith('actions/checkout@') }).toEqual({ shape, uses: true });
+      expect(names.filter((name) => name === PRODUCER_PREFLIGHT_NAME)).toHaveLength(1);
+      expect(rendered.match(/Check cross-platform toolchain prerequisites/g)).toHaveLength(1);
+      const devenv = names.findIndex((name) => name?.includes('Setup Nix/devenv'));
+      expect(names.indexOf(PRODUCER_PREFLIGHT_NAME)).toBeLessThan(devenv);
+      expect(preflight?.['working-directory']).toBe('.');
+      const run = preflight?.run ?? '';
+      const lines = run.trimEnd().split('\n');
+      const command = lines[0] === 'set -euo pipefail' ? lines.slice(1) : lines;
+      expect({ shape, command }).toEqual({ shape, command: PRODUCER_PREFLIGHT.split('\n') });
+      for (const machinery of ['GITHUB_ENV', '/dev/urandom', 'smoo_env_']) {
+        expect({ shape, machinery, emitted: run.includes(machinery) }).toEqual({ shape, machinery, emitted: false });
+      }
+      // Only the independent Cargo credential helper, a different mechanism, may write GITHUB_ENV in this job.
+      const writers = steps.filter((step) => step.run?.includes('GITHUB_ENV')).map((step) => step.name);
+      const helper = (options.cargoCredentials?.gitOrigins?.length ?? 0) > 0 ? ['Prepare Cargo credentials'] : [];
+      expect({ shape, writers }).toEqual({ shape, writers: helper });
+
+      // The preflight really runs in a shell under its own step env, and real Node processes honor the NODE_OPTIONS
+      // preload under every env the job renders.
+      await runPreflight(shape, preflight);
+      await runNodeConsumers(shape, steps);
+    }
+  });
+
+  it('refuses a producer env it cannot carry, naming each rejected name and the step that blocks it', () => {
+    const invalid = ['BAD NAME', '1LEADING', 'X\n        run: evil', 'A;touch hostile', ''];
+    // Not identifiers; two names GitHub reads as one key, whichever comes first.
+    const refusals = [
+      ...invalid.map((name) => ({
+        env: { APP_CROSS: '1', [name]: '1' },
+        named: [name],
+        reason: 'is not a valid environment variable name',
+      })),
+      { env: { FOO: 'upper', foo: 'lower' }, named: ['FOO', 'foo'], reason: 'only by case' },
+      { env: { foo: 'lower', FOO: 'upper' }, named: ['foo', 'FOO'], reason: 'only by case' },
+    ];
+    for (const { shape, owners, options } of producerShapes) {
+      // A name that differs only by case from one a step declares for itself can be neither overridden nor repeated
+      // there; an exact-case collision is the approved override and renders (the walk above).
+      const collisions = Object.entries(owners).map(([own, declaring]) => ({
+        env: { [own.toLowerCase()]: 'producer-chosen' },
+        named: [own.toLowerCase(), declaring[0] ?? '', own],
+        reason: 'only by case',
+      }));
+      for (const { env, named, reason } of [...refusals, ...collisions]) {
+        const message = renderFailure(withProducerEnv(options, env));
+        expect({ shape, env, reason: message.includes(reason) }).toEqual({ shape, env, reason: true });
+        for (const name of named) expect(message, shape).toContain(JSON.stringify(name));
+      }
+    }
+  });
+
   it('emits only the selected provider action references before evaluating artifact step eligibility', () => {
     const providers: Array<PublishWorkflowDefinitionOptions['actionsProvider']> = [undefined, 'github', 'forgejo'];
     for (const actionsProvider of providers) {
@@ -602,7 +1157,7 @@ describe('publish workflow definition', () => {
       // Runners resolve actions before evaluating if: even an ineligible
       // foreign action reference would prevent the whole workflow from starting.
       for (const step of artifacts) {
-        expect(step.uses?.startsWith('https://code.forgejo.org/')).toBe(actionsProvider === 'forgejo');
+        expect(step.uses?.startsWith('./.github/actions/forgejo-')).toBe(actionsProvider === 'forgejo');
         expect(step.uses?.startsWith('actions/')).toBe(actionsProvider !== 'forgejo');
       }
       const uploads = artifacts.filter((step) => step.uses?.includes('upload-artifact'));
@@ -1393,10 +1948,6 @@ it('runs macOS platform legs on smoo.github.macosRunsOn; default stays macos-lat
     jobs: { 'macos-platform': { 'runs-on': 'macos-latest' } },
   });
 });
-
-const CARGO_GIT_CREDENTIALS = {
-  gitOrigins: [{ origin: 'https://git.example.net', tokenEnv: 'SOURCE_READ_TOKEN' }],
-};
 
 it('installs the Cargo credential helper in every job that fetches crates', () => {
   const rendered = renderPublishWorkflowYaml({
