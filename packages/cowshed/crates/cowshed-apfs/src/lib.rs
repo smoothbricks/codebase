@@ -2043,7 +2043,6 @@ impl<R: CommandRunner, S: Sleeper> MountLease<'_, R, S> {
                 timed_apfs_step(apfs_step_leg(&attachment.image), "event-log", || {
                     backend.opt_out_of_event_log(attachment, mount_point, options)
                 })
-                .inspect(|()| report_spotlight_opt_out(mount_point))
             }
             _ => Ok(()),
         };

@@ -6352,10 +6352,6 @@ async fn a_foreground_nx_keeper_does_not_count_as_user_work_and_quiescence_drain
         ProcessObservation::StdinClosed(keeper.request.job_id),
         "empty stdin closes before lifecycle signalling"
     );
-    assert!(
-        !h.handle.active().await.unwrap(),
-        "maintenance is not user activity"
-    );
     let handle = h.handle.clone();
     let quiesce = tokio::spawn(async move { handle.quiesce_if_idle().await });
     assert_eq!(
@@ -6367,7 +6363,10 @@ async fn a_foreground_nx_keeper_does_not_count_as_user_work_and_quiescence_drain
         "quiescence waits for the real keeper conclusion"
     );
     complete(&keeper, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    quiesce.await.unwrap().unwrap();
+    quiesce
+        .await
+        .unwrap()
+        .expect("maintenance is not user activity and must not refuse idle quiescence");
     assert!(
         h.spawned.try_recv().is_err(),
         "quiescence admits no replacement keeper"
