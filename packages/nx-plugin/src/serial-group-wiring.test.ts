@@ -126,7 +126,8 @@ describe('the real-APFS serial groups of this repository', () => {
         expect(target?.executor, name).toBe('@smoothbricks/nx-plugin:bounded-exec');
         expect(target?.options?.command, name).toContain('nextest run');
       } else {
-        expect(target?.executor, name).toBeUndefined();
+        // Nx normalizes the package-declared placeholder to a no-op, never an APFS runner.
+        expect(target?.executor, name).toBe('nx:noop');
         expect(target?.options?.command, name).toBeUndefined();
       }
     }
