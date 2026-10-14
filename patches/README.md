@@ -35,7 +35,9 @@ registry archive against `bun.lock`, indexes that package in an isolated tempora
 package against that index. It preserves full deletion hunks and package-relative paths, excludes only Bun's install
 markers and dependency directory, and writes the root patch and its byte-identical managed consumer copy. Its temporary
 root is retired on success or failure. `tooling/test_nx_patch.py` guards deletions, additions, installer metadata and
-archive/package identity.
+archive/package identity. The generator supports Python 3.9 and newer. Extraction explicitly uses `filter="data"` on
+Python 3.12+; older interpreters omit only that unsupported keyword. Every version verifies the archive's lock-selected
+SHA-512 before extracting it.
 
 Do not use `bun patch --commit` for this carried patch with Bun 1.4.2: it emits absolute registry-cache paths and
 discards the bodies of deleted-file hunks, and includes a `.bun-tag-*` installer marker. Nor hand-edit the generated
