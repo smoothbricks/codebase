@@ -115,11 +115,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
             } else {
-                let attachment = host.backend().attach_verified(&image)?;
-                if mode != "unmounted" {
+                let attachment = if mode == "unmounted" {
+                    host.backend().attach_verified(&image)?
+                } else {
                     host.backend()
-                        .mount(&attachment, &mount, MountAccess::ReadWrite, false)?;
-                }
+                        .attach_mounted(&image, &mount, MountAccess::ReadWrite, false)?
+                };
                 let device = attachment.whole_device().to_owned();
                 // Release the raw pin before the deliberately independent eject comparison.
                 drop(attachment);

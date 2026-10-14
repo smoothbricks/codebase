@@ -1061,14 +1061,16 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             .collect()
     }
 
-    /// A new empty payload directory at `image`, held but not bound. A directory has no
+    /// A new empty payload directory at `image`, bound to `mount_point`. A directory has no
     /// capacity: it grows within its filesystem, so `capacity` describes nothing here.
     fn create_attached(
         &self,
         _capacity: ImageCapacity,
         image: &Path,
+        mount_point: &Path,
     ) -> Result<Self::Attachment, ApfsStorageError> {
         self.require_store_image(image)?;
+        self.verify_controller_path(mount_point)?;
         validate_image(image)?;
         if path_exists(image)? {
             return Err(ApfsStorageError::Host(format!(
@@ -1079,7 +1081,9 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         ensure_parent(image)?;
         fs::create_dir(image).map_err(|error| io_error("create payload", image, error))?;
         sync_parent_path(image)?;
-        Ok(DirectoryAttachment::new(image.to_owned()))
+        let attachment = DirectoryAttachment::new(image.to_owned());
+        self.mount(&attachment, mount_point, MountAccess::ReadWrite, false)?;
+        Ok(attachment)
     }
 
     /// The payload never moves while bound, so the source's tree is `source` itself whether or
@@ -1287,6 +1291,18 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         }
         payload_root(image)?;
         Ok(DirectoryAttachment::new(image.to_owned()))
+    }
+
+    fn attach_mounted(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        access: MountAccess,
+        browse: bool,
+    ) -> Result<Self::Attachment, ApfsStorageError> {
+        let attachment = self.attach_verified(image)?;
+        self.mount(&attachment, mount_point, access, browse)?;
+        Ok(attachment)
     }
 
     /// Mount the attachment's payload at `mount_point` by moving it there. A directory cannot be

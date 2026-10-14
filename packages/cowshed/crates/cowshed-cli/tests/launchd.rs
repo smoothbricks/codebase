@@ -21,7 +21,7 @@ use cowshed_cli::launchd::{
 #[cfg(target_os = "macos")]
 use cowshed_apfs::{
     CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
-    mounts::kernel_mounts, store_lock::verify_no_symlinks,
+    store_lock::verify_no_symlinks,
 };
 
 #[cfg(target_os = "macos")]

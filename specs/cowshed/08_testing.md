@@ -213,22 +213,22 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 
 Parametrized over the substrate the host provides, and never gated off on it: a missing capability is a failure, not a
 skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small `.dmg` images (1 GiB caps) under
-`/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the production host — real `diskutil`/`hdiutil`/`mount_apfs`,
-the live kernel mount table. A mount state a test needs (wrong flags, an impostor volume, a busy holder) is produced on
-a real volume, never by a substitute mount source. Every scratch root selects its backing image paths, then calls the
-same production owned-attachment cleanup used by normal removal, recovery-marker reads, reverse-order teardown,
-duplicate-attachment rejection, and staging GC. Each cleanup rereads image/whole-device/volume identity, pins the raw
-IOMedia for native unmount, and releases the image under the image's lease; a previously cached disk number or
-mountpoint never authorizes a detach. A failed release keeps the scratch tree intact for the next run, rather than
-deleting a still-attached image's backing files. Before any release, a scratch root ends every process working in its
-tree, selected by the working directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a
-deleted directory): `SIGTERM`, as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a
-fixture started detaches from its starter, so a failed test's unwinding otherwise never reached it and it kept running
-in the deleted root. Successful cleanup removes the root, and every run first ends the processes working under, then
-reclaims the roots and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file
-vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also exercises
-`cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
-same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+`/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the production host — real `diskutil`/`hdiutil` and Disk
+Arbitration mounts, the live kernel mount table. A mount state a test needs (wrong flags, an impostor volume, a busy
+holder) is produced on a real volume, never by a substitute mount source. Every scratch root selects its backing image
+paths, then calls the same production owned-attachment cleanup used by normal removal, recovery-marker reads,
+reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup rereads image/whole-device/volume
+identity and issues a DA eject under the image's lease; a previously cached disk number or mountpoint never authorizes a
+detach. A failed release keeps the scratch tree intact for the next run, rather than deleting a still-attached image's
+backing files. Before any release, a scratch root ends every process working in its tree, selected by the working
+directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a deleted directory): `SIGTERM`,
+as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a fixture started detaches from its
+starter, so a failed test's unwinding otherwise never reached it and it kept running in the deleted root. Successful
+cleanup removes the root, and every run first ends the processes working under, then reclaims the roots and attachments
+of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with
+datasets destroyed and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the
+Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
+both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
 line-start image records (RAW, then retained ASIF) and the worker record; neither a sibling's output nor a host
@@ -541,17 +541,19 @@ Covered flows:
   completes under N, an inner per-command profile can only narrow N and cannot broaden it, the next exec observes N+1,
   and reconnecting a named session bound to N returns the documented stale-session conflict rather than silently
   rebinding. Repeat for both grant and revoke.
-- **attach `-nomount` → fsck device → mount** ordering on APFS (the clone is verified as a block device _before_ it is
-  mounted, per 02) — asserts the sequence and that a structurally-bad clone is caught before mount, not after;
+- **One-call DA attach and mount** on APFS: assert the requested mountpoint, read-only/visibility/ownership/noatime
+  flags and plist parsing, then the kernel image/device and held mount-root identity before publication. A malformed
+  reply or refused/wrong mount releases the owned attachment or names the cleanup refusal. No manual mount fallback or
+  live fsck is permitted. Detached verification/resize and unformatted RAW retain intentional unmounted fixtures;
 - **Live source capture stays mounted; build seeds are sealed**: a live capture (`fork`, `checkpoint`) flushes the
   source volume and backing file, descriptor-clones the live RAW image, and asserts that the source's attachment and
-  mount flags are unchanged (01_storage.md, "Images"). `fork` verifies the clone with `fsck_apfs` before its first
-  mount; a failed verification deletes the clone and retries once from a fresh live capture, and a second failure
-  refuses publication (02_workspaces.md, fork step 4). `restore` verifies a checkpoint clone before its first mount. A
-  build seed is the exception (16_build_volumes.md): the sealed capture detaches its source without force, clones
-  through its held inode, and restores identical access/visibility and an updated registry after both success and
-  failure; busy-source refusal names visible holders and leaves source bytes and mounts intact. RAW has no outer
-  allocation map for a live capture to split (02_workspaces.md, fork step 2).
+  mount flags are unchanged (01_storage.md, "Images"). `fork` and `restore` pass a formatted clone to the DA
+  attach-and-mount transaction and verify the resulting mount identity. A failed transaction refuses publication and
+  cleans up only the destination, never the live source (02_workspaces.md, fork step 4). A build seed is the exception
+  (16_build_volumes.md): the sealed capture detaches its source without force, clones through its held inode, and
+  restores identical access/visibility and an updated registry after both success and failure; busy-source refusal names
+  visible holders and leaves source bytes and mounts intact. RAW has no outer allocation map for a live capture to split
+  (02_workspaces.md, fork step 2).
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
@@ -684,7 +686,7 @@ fork argument, and the API rejects a ref with `clean: false`.
 
 | Operation                | Budget (median, local)  | Basis                                                        |
 | ------------------------ | ----------------------- | ------------------------------------------------------------ |
-| `cowshed fork` cold      | ≤ 1 s                   | clonefile + first write + attach + `fsck_apfs -q` + mount    |
+| `cowshed fork` cold      | ≤ 1 s                   | clonefile + first write + DA attach-and-mount                |
 | `cowshed rm` (perceived) | ≤ 100 ms to return      | rename + grant-file unlink; detach is background             |
 | `cowshed checkpoint`     | ≤ 1 s                   | descriptor-clone path                                        |
 | `cowshed path` / `ls`    | ≤ 50 ms                 | readdir + getmntinfo only — proves the no-state-store design |

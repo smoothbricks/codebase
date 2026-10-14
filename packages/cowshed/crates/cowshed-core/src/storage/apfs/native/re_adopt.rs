@@ -310,22 +310,7 @@ where
             ))?;
             fs::create_dir_all(directory)
                 .map_err(|error| io_error("create the staged image directory", directory, error))?;
-            let attachment = self.mint(ImageCapacity::from_bytes(capacity_bytes), image)?;
-            if let Err(primary) =
-                self.backend
-                    .mount(&attachment, mount, MountAccess::ReadWrite, false)
-            {
-                return Err(
-                    match self.backend.detach(&attachment, DetachIntent::WhenIdle) {
-                        Ok(()) => primary.into(),
-                        Err(cleanup) => ApfsStorageError::Cleanup {
-                            operation: "mount a replacement image",
-                            primary: Box::new(primary.into()),
-                            cleanup: Box::new(cleanup.into()),
-                        },
-                    },
-                );
-            }
+            self.mint(ImageCapacity::from_bytes(capacity_bytes), image, mount)?;
         }
         // Per-file hole preservation is the copy verifier's to prove, in the walk it already
         // makes; here only the image as a whole is checked against its nominal capacity.
@@ -741,33 +726,28 @@ where
                         ));
                     }
                     self.backend.unmount_retained_when_idle(&attachment)?;
-                    self.backend.detach_retained_when_idle(&attachment)?;
                 }
                 Some(_) => {
                     return Err(ApfsStorageError::InvalidPlan(
                         "a retained source is mounted somewhere other than its recorded read-only staging mount",
                     ));
                 }
-                None => self.backend.detach_retained_when_idle(&attachment)?,
+                None => {}
             }
+            return self
+                .backend
+                .mount_retained_read_only(&attachment, mount)
+                .map_err(Into::into);
         }
-        let attachment = self.backend.attach_retained_verified(&input)?;
-        if let Err(primary) = self.backend.mount_retained_read_only(&attachment, mount) {
-            return Err(match self.backend.detach_retained_when_idle(&attachment) {
-                Ok(()) => primary.into(),
-                Err(cleanup) => ApfsStorageError::Cleanup {
-                    operation: "mount a retained source read-only",
-                    primary: Box::new(primary.into()),
-                    cleanup: Box::new(cleanup.into()),
-                },
-            });
-        }
-        Ok(())
+        self.backend
+            .attach_retained_mounted(&input, mount)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     /// Mount `image` at `mount` with `access`, attaching and verifying it first. An image
     /// already mounted exactly there with that access is left as it is; one attached without a
-    /// mount (a crash between attach and mount) is detached and verified afresh.
+    /// mount is checked and mounted by Disk Arbitration without detach/reattach churn.
     fn mount_staged(
         &self,
         image: &Path,
@@ -790,23 +770,17 @@ where
                         "a re-adoption staged image is mounted somewhere other than its recorded staging mount",
                     ));
                 }
-                // Attached without a mount: a replay finds the attach a crash left, verified
-                // afresh rather than trusted.
-                None => self.backend.detach(&attachment, DetachIntent::WhenIdle)?,
+                None => {}
             }
+            return self
+                .backend
+                .mount(&attachment, mount, access, false)
+                .map_err(Into::into);
         }
-        let attachment = self.backend.attach_verified(image)?;
-        if let Err(primary) = self.backend.mount(&attachment, mount, access, false) {
-            return match self.backend.detach(&attachment, DetachIntent::WhenIdle) {
-                Ok(()) => Err(primary.into()),
-                Err(cleanup) => Err(ApfsStorageError::Cleanup {
-                    operation: "mount a re-adoption staged image",
-                    primary: Box::new(primary.into()),
-                    cleanup: Box::new(cleanup.into()),
-                }),
-            };
-        }
-        Ok(())
+        self.backend
+            .attach_mounted(image, mount, access, false)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 }
 

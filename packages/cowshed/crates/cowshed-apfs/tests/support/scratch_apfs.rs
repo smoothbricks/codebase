@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use super::{
     CommandRunner, DetachIntent, DiskImageSource, MacOsApfsBackend, SystemCommandRunner,
-    kernel_mounts, verify_no_symlinks,
+    verify_no_symlinks,
 };
 
 #[path = "scratch_reclaim.rs"]
@@ -335,20 +335,15 @@ fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<BTreeSet<Pat
 }
 
 /// Release every attachment the kernel holds for `image` as the store host releases an image
-/// under its root: refuse a path a symlink redirects, read the kernel's mount sources now, then
-/// the production backend unmounts each mounted volume through its pinned identity and detaches
-/// each whole device once.
+/// under its root: refuse a path a symlink redirects, then the production backend ejects each
+/// whole device once through Disk Arbitration, taking its mounted volumes with it.
 pub(crate) fn release_image(image: &Path) -> std::io::Result<()> {
     let root = Path::new("/private/tmp");
     if image.starts_with(root) {
         verify_no_symlinks(root, image).map_err(std::io::Error::other)?;
     }
-    let mounted = kernel_mounts()?
-        .into_iter()
-        .map(|mount| mount.source_device)
-        .collect();
     MacOsApfsBackend::new(SystemCommandRunner)
-        .release_image(image, &mounted, DetachIntent::Release)
+        .release_image(image, DetachIntent::Release)
         .map_err(std::io::Error::other)
 }
 

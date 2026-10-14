@@ -1,11 +1,11 @@
 use cowshed_apfs::attach_budget;
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::{blank_template, blank_template_path};
 use cowshed_apfs::{
     ApfsBackend, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     SystemCommandRunner,
 };
-use cowshed_apfs::{mounts::kernel_mounts, store_lock::verify_no_symlinks};
 use cowshed_cli::args::parse_args;
 use cowshed_cli::output::Output;
 use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
@@ -3832,20 +3832,26 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
             .find(|mount| mount.mount_point == *from)
             .expect("the recorded retained fixture input is mounted")
             .source_device;
-        let unmount =
-            cowshed_apfs::CommandRequest::new("/sbin/umount", [from.as_os_str().to_os_string()]);
+        let unmount = cowshed_apfs::CommandRequest::new(
+            "/usr/sbin/diskutil",
+            [OsString::from("unmount"), OsString::from(device)],
+        );
         let result = SystemCommandRunner.run(&unmount).unwrap();
         assert!(
             result.succeeded(),
             "normal own retained-input unmount: {result:?}"
         );
         let remount = cowshed_apfs::CommandRequest::new(
-            "/sbin/mount_apfs",
+            "/usr/sbin/diskutil",
             [
-                OsString::from("-o"),
-                OsString::from("rdonly,nobrowse,owners"),
-                OsString::from(device),
+                OsString::from("mount"),
+                OsString::from("readOnly"),
+                OsString::from("nobrowse"),
+                OsString::from("-mountOptions"),
+                OsString::from("owners"),
+                OsString::from("-mountPoint"),
                 to.as_os_str().to_os_string(),
+                OsString::from(device),
             ],
         );
         let result = SystemCommandRunner.run(&remount).unwrap();

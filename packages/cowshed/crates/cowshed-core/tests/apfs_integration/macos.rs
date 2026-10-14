@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 
 use cowshed_apfs::attach_budget;
 use cowshed_apfs::image::ImageCapacity;
+use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::{
     BLANK_TEMPLATE_LABEL, blank_template, blank_template_path, blank_template_staged_stem,
 };
 use cowshed_apfs::{
     ApfsBackend, AttachedImage, CommandRunner, CreateImageRequest, DetachIntent, DiskImageSource,
-    ImageCapture, MacOsApfsBackend, MountAccess, SystemCommandRunner, volume_name,
+    ImageCapture, MacOsApfsBackend, SystemCommandRunner, volume_name,
 };
-use cowshed_apfs::{mounts::kernel_mounts, store_lock::verify_no_symlinks};
 use cowshed_core::metadata::{
     GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, PortBlock, WorkspaceIncarnation, WorkspaceName,
     WorkspaceRole,
@@ -627,11 +627,13 @@ impl KillWindow {
         Ok(())
     }
 
-    /// The fence and the image behind it, attached once, handed back as the killed process held
-    /// it: dropping the handle leaves the kernel's attachment exactly where it was.
+    /// The fence and image behind it, attached and mounted once at staging. Dropping the handle
+    /// leaves the kernel attachment and mount exactly where the killed process left them.
     fn fenced_image(&self) -> Result<AttachedImage, Box<dyn Error>> {
         self.fence()?;
-        Ok(self.host().create_attached(CAPACITY, &self.image)?)
+        Ok(self
+            .host()
+            .create_attached(CAPACITY, &self.image, &self.staging)?)
     }
 
     /// Everything adoption does before the checkout changes hands, killed after activation and
@@ -640,7 +642,6 @@ impl KillWindow {
     fn published(&self) -> Result<(), Box<dyn Error>> {
         let host = self.host();
         let attachment = self.fenced_image()?;
-        host.mount(&attachment, &self.staging, MountAccess::ReadWrite, false)?;
         host.copy_tree(&self.checkout, &self.staging)?;
         host.mint_workspace_credentials(
             &self.main,
@@ -802,17 +803,24 @@ fn real_apfs_adopt_mints_a_template_over_the_one_a_killed_minter_left_attached()
     );
 }
 
-/// Killed after the image's one attach and before its staging mount: the next adopt settles the
-/// unmounted attachment, verifies the volume afresh, and resumes the same incarnation.
+/// An interrupted OS attachment can leave an unmounted device. Plant that state by unmounting
+/// the completed transaction, then prove adoption checks and mounts the same attachment.
 #[test]
 fn real_apfs_adopt_resumes_a_fenced_image_killed_between_attach_and_mount() {
     let world = KillWindow::new("adopt-kill-attached").expect("kill window");
-    drop(world.fenced_image().expect("attached fenced image"));
+    let attachment = world.fenced_image().expect("attached fenced image");
+    world
+        .host()
+        .unmount_attachment(&attachment)
+        .expect("plant the unmounted crash state");
+    let device = attachment.volume_device().to_owned();
+    drop(attachment);
 
     let adopted = world.adopt().expect("adopt resumes");
 
     assert_eq!(adopted.incarnation(), world.main.incarnation());
     world.assert_adopted().expect("adopted");
+    assert_eq!(world.mounted_device().expect("mounts"), Some(device));
 }
 
 /// Killed mid-copy: the staging mount survived its process, and the next adopt resumes on that
@@ -822,10 +830,7 @@ fn real_apfs_adopt_resumes_a_fenced_image_killed_between_attach_and_mount() {
 fn real_apfs_adopt_resumes_a_fenced_image_killed_mid_copy_on_its_surviving_attachment() {
     let world = KillWindow::new("adopt-kill-copy").expect("kill window");
     let attachment = world.fenced_image().expect("attached fenced image");
-    world
-        .host()
-        .mount(&attachment, &world.staging, MountAccess::ReadWrite, false)
-        .expect("staging mount");
+    // The formatted mint already completed its staging mount in the attachment transaction.
     fs::write(world.staging.join("half-copied"), b"stale").expect("partial copy");
     let device = attachment.volume_device().to_owned();
     drop(attachment);

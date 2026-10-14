@@ -1088,6 +1088,19 @@ pub struct MacOsApfsExecutionHost<R> {
 }
 
 impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
+    fn verify_attachable_image(&self, image: &Path) -> Result<(), ApfsStorageError> {
+        self.verify_controller_path(image)?;
+        let metadata = DetachedWorkspaceMetadata::read_for_image(image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if metadata.publication_state == PublicationState::PendingFence
+            && !image
+                .components()
+                .any(|component| component.as_os_str() == super::STAGING_NAMESPACE)
+        {
+            return Err(ApfsStorageError::PendingPublication(image.to_owned()));
+        }
+        Ok(())
+    }
     pub fn new(runner: R, config: ApfsSubstrateConfig) -> Result<Self, ApfsStorageError> {
         Self::with_mount_source(runner, config, SystemKernelMountSource)
     }
@@ -1196,13 +1209,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         attachment: &AttachedImage,
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
-        self.unmount_attached(attachment, intent)?;
         self.backend.detach(attachment, intent).map_err(Into::into)
     }
 
     /// Release a controller-owned image from every attachment the kernel holds for it now, not
-    /// from a cached diskN: each mounted volume of each attachment's container is unmounted
-    /// through its own pinned identity, then every whole device is detached once. A path held
+    /// from a cached diskN: Disk Arbitration ejects each owned whole device once, including all
+    /// its mounted volumes, under fresh image/device identity checks. A path held
     /// twice — a dead process's attach that landed after its file was replaced — is released
     /// twice rather than refused as ambiguous, and a container holding a volume something added
     /// beside the image's own is released with it.
@@ -1212,14 +1224,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
-        let mounted: std::collections::BTreeSet<String> = self
-            .mount_source
-            .mounts()?
-            .into_iter()
-            .map(|mount| mount.source_device)
-            .collect();
         self.backend
-            .release_image(image, &mounted, intent)
+            .release_image(image, intent)
             .map_err(Into::into)
     }
 
@@ -1702,14 +1708,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         }
         fs::create_dir_all(mount_point)
             .map_err(|error| io_error("create recovery mount", mount_point, error))?;
-        let attachment = self.backend.attach_verified(image)?;
-        if let Err(primary) =
+        let attachment =
             self.backend
-                .mount(&attachment, mount_point, MountAccess::ReadOnly, false)
-        {
-            let cleanup = self.detach_attachment(&attachment, DetachIntent::Release);
-            return super::combine_cleanup("recovery marker mount", primary.into(), cleanup);
-        }
+                .attach_mounted(image, mount_point, MountAccess::ReadOnly, false)?;
         let incarnation = WorkspaceMarker::read_from(&mount_point.join(WORKSPACE_MARKER_PATH))
             .map(|marker| marker.workspace_incarnation.to_string())
             .map_err(|error| ApfsStorageError::Host(error.to_string()));
@@ -3542,10 +3543,26 @@ where
         self.retain_mounted(workspace, attachment).map(|_| ())
     }
 
+    fn retain_checked_mount(
+        &self,
+        workspace: &LifecycleWorkspace,
+        attachment: AttachedImage,
+        mount_point: &Path,
+        operation: &'static str,
+    ) -> Result<(), ApfsStorageError> {
+        if let Err(primary) = self.validate_marker(
+            mount_point,
+            &MarkerExpectation::owned(&self.config, workspace),
+        ) {
+            return Err(self.abandon_attachment(attachment, primary, operation));
+        }
+        self.retain_mounted(workspace, attachment).map(|_| ())
+    }
+
     /// Put back on its mount a workspace a failed step detached, reporting the step's failure.
     ///
     /// The step must have left the image an image — untouched, or grown whole — and the verified
-    /// attach (fsck included) is what proves it mounts again. A remount that fails is reported
+    /// Disk Arbitration mount is what checks its filesystem again. A failed remount is reported
     /// beside the step's failure, never in place of it.
     fn remount_after_failure(
         &self,
@@ -3558,10 +3575,10 @@ where
     ) -> ApfsStorageError {
         match self
             .backend
-            .attach_verified(image)
+            .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
             .map_err(ApfsStorageError::from)
             .and_then(|attachment| {
-                self.hand_back_attachment(workspace, attachment, mount_point, true, cleanup)
+                self.retain_checked_mount(workspace, attachment, mount_point, cleanup)
             }) {
             Ok(()) => primary,
             Err(remount) => ApfsStorageError::Cleanup {
@@ -3747,7 +3764,11 @@ where
     ) -> Result<(), ApfsStorageError> {
         let attachment = match self.backend.existing_attachment(source)? {
             Some(attachment) => attachment,
-            None => self.backend.attach_verified(source)?,
+            None => {
+                self.backend
+                    .attach_mounted(source, mount_point, access, browse)?;
+                return Ok(());
+            }
         };
         match self.mounted_at(mount_point)? {
             Some(device) if device == attachment.volume_device() => {}
@@ -3958,6 +3979,7 @@ where
         &self,
         capacity: ImageCapacity,
         image: &Path,
+        mount_point: &Path,
     ) -> Result<Self::Attachment, ApfsStorageError> {
         self.verify_controller_path(image)?;
         crate::metadata::validate_image_path(image)
@@ -3968,7 +3990,8 @@ where
                 image.display()
             )));
         }
-        self.mint(capacity, image)
+        self.verify_controller_path(mount_point)?;
+        self.mint(capacity, image, mount_point)
     }
 
     fn clone_image(
@@ -4167,12 +4190,11 @@ where
     ) -> Result<Option<Self::Attachment>, ApfsStorageError> {
         self.verify_controller_path(image)?;
         // The canonical name only ever holds a clone of a formatted template, so the payload is
-        // an APFS volume from the moment it exists; one that does not verify is replaced.
+        // an APFS volume from the moment it exists. A legacy unformatted payload is replaced;
+        // Disk Arbitration mount/check failures remain authoritative.
         match self.attach_and_mount_resumable(image, mount_point, workspace) {
             Ok(attachment) => Ok(Some(attachment)),
-            Err(ApfsStorageError::Apfs(
-                ApfsError::NoApfsVolume | ApfsError::VerificationFailed { .. },
-            )) => Ok(None),
+            Err(ApfsStorageError::Apfs(ApfsError::NoApfsVolume)) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -4195,17 +4217,22 @@ where
     }
 
     fn attach_verified(&self, image: &Path) -> Result<Self::Attachment, ApfsStorageError> {
-        self.verify_controller_path(image)?;
-        let metadata = DetachedWorkspaceMetadata::read_for_image(image)
-            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
-        if metadata.publication_state == PublicationState::PendingFence
-            && !image
-                .components()
-                .any(|component| component.as_os_str() == super::STAGING_NAMESPACE)
-        {
-            return Err(ApfsStorageError::PendingPublication(image.to_owned()));
-        }
+        self.verify_attachable_image(image)?;
         self.backend.attach_verified(image).map_err(Into::into)
+    }
+
+    fn attach_mounted(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        access: MountAccess,
+        browse: bool,
+    ) -> Result<Self::Attachment, ApfsStorageError> {
+        self.verify_attachable_image(image)?;
+        self.verify_controller_path(mount_point)?;
+        self.backend
+            .attach_mounted(image, mount_point, access, browse)
+            .map_err(Into::into)
     }
 
     fn mount(
@@ -4258,16 +4285,14 @@ where
             return Ok(attachment);
         }
 
-        if let Some(attachment) = existing {
-            // A kill between attach and mount may also precede fsck. Reusing that unmounted device
-            // would silently skip verification, so settle it out and take the ordinary verified
-            // attach path again. This churn exists only during crash recovery, never the hot path.
-            self.detach_attachment(&attachment, DetachIntent::Release)?;
-        }
-        let attachment = self
-            .backend
-            .attach_verified(image)
-            .map_err(ApfsStorageError::from)?;
+        let Some(attachment) = existing else {
+            return self
+                .backend
+                .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
+                .map_err(Into::into);
+        };
+        // Disk Arbitration checks the existing filesystem as part of its mount transaction.
+        // Keep the crash-left attachment: no detach and second attach are needed.
         match self.mount(&attachment, mount_point, MountAccess::ReadWrite, false) {
             Ok(()) => Ok(attachment),
             Err(primary) => match self.detach(attachment, DetachIntent::Release) {
@@ -4740,14 +4765,15 @@ where
             Err(primary) => return Err(primary),
         };
 
-        let attachment = self.backend.attach_verified(image)?;
-        self.hand_back_attachment(
-            workspace,
-            attachment,
-            mount_point,
-            was_mounted,
-            DEFRAGMENT_CLEANUP,
-        )?;
+        if was_mounted {
+            let attachment =
+                self.backend
+                    .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)?;
+            self.retain_checked_mount(workspace, attachment, mount_point, DEFRAGMENT_CLEANUP)?;
+        } else {
+            let attachment = self.backend.attach_verified(image)?;
+            self.detach_attachment(&attachment, DetachIntent::Release)?;
+        }
         Ok(DefragmentOutcome {
             previous,
             extents: extents::count_extents(image)?,
@@ -7541,7 +7567,7 @@ mod tests {
                 .lock()
                 .expect("recorded commands")
                 .iter()
-                .any(|request| request.args.first().is_some_and(|arg| arg == "detach"));
+                .any(|request| request.args.first().is_some_and(|arg| arg == "eject"));
             Ok(if detached {
                 Vec::new()
             } else {
@@ -7571,9 +7597,8 @@ mod tests {
         }
     }
 
-    /// Detaching an existing image unmounts exactly the volumes the kernel mount table names, here
-    /// the added sibling and not the unmounted image volume, then detaches the image's physical
-    /// device (`disk4`, not its synthesized container `disk5`) once.
+    /// Disk Arbitration owns mounted release: eject the image's physical whole device
+    /// (`disk4`, not its synthesized container `disk5`) once, with no preliminary unmount.
     #[test]
     fn detaching_an_existing_image_unmounts_only_its_mounted_volumes_then_detaches_it_once() {
         let root = std::env::temp_dir().join(format!(
@@ -7604,10 +7629,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             host.backend().runner().argv(),
-            [
-                vec!["/dev/disk5s2".to_owned()],
-                vec!["detach".into(), "-verbose".into(), "/dev/disk4".into()],
-            ]
+            [vec!["eject".into(), "/dev/disk4".into()]]
         );
         fs::remove_dir_all(root).unwrap();
     }

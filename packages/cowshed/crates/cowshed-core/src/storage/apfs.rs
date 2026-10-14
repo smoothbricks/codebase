@@ -408,15 +408,16 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     type Attachment: Send + 'static;
 
     fn observe(&self, expected: &[LifecycleFact]) -> Result<Vec<LifecycleFact>, ApfsStorageError>;
-    /// Mint `image`, which must not exist, and hand it back attached and verified but not
-    /// mounted: one `clonefile` of the store's formatted blank template at `capacity`, then one
-    /// attach (01_storage.md, "Images"). The clone takes the canonical name whole, so the name
+    /// Mint `image`, which must not exist, and hand it back checked and mounted at `mount_point`:
+    /// one `clonefile` of the store's formatted blank template at `capacity`, then one combined
+    /// Disk Arbitration attach/mount (01_storage.md, "Images"). The canonical name
     /// only ever holds a complete, formatted volume; it carries the template's label until the
     /// workspace's supervisor relabels it. A failure leaves no image and no attachment.
     fn create_attached(
         &self,
         capacity: ImageCapacity,
         image: &Path,
+        mount_point: &Path,
     ) -> Result<Self::Attachment, ApfsStorageError>;
     /// Clone `source` to `destination` with the source's latest writes in it. `source_mount` is
     /// where the source is mounted when it is a live workspace — its volume is what gets flushed
@@ -459,9 +460,9 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         repo: &RepoId,
     ) -> Result<Option<PendingAdoption>, ApfsStorageError>;
     /// Attach and mount an unfinished adoption's canonical image at its staging mountpoint the
-    /// way [`Self::attach_and_mount_resumable`] does, or answer `None` when its payload never
-    /// became a verified APFS volume (creation died before formatting finished, or `fsck_apfs`
-    /// refuses it); whatever the attempt attached is released first.
+    /// way [`Self::attach_and_mount_resumable`] does, or answer `None` when its legacy payload
+    /// never became an APFS volume. Disk Arbitration filesystem-check failures are returned;
+    /// whatever a refused fresh attachment produced is released first.
     fn resume_pending_adopt(
         &self,
         image: &Path,
@@ -479,6 +480,14 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     fn unmount_attachment(&self, attachment: &Self::Attachment) -> Result<(), ApfsStorageError>;
     fn copy_tree(&self, source: &Path, destination: &Path) -> Result<(), ApfsStorageError>;
     fn attach_verified(&self, image: &Path) -> Result<Self::Attachment, ApfsStorageError>;
+    /// Attach a formatted image and mount it in the same checked Disk Arbitration transaction.
+    fn attach_mounted(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        access: MountAccess,
+        browse: bool,
+    ) -> Result<Self::Attachment, ApfsStorageError>;
     fn mount(
         &self,
         attachment: &Self::Attachment,
@@ -486,27 +495,16 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         access: MountAccess,
         browse: bool,
     ) -> Result<(), ApfsStorageError>;
-    /// Attach and mount a pending canonical image, reusing an exact surviving kernel mount and
-    /// otherwise replacing an unmounted crash-left attachment before mounting. Implementations
-    /// own cleanup when either the mount or replacement attach fails.
+    /// Attach and mount a pending canonical image, reusing an exact surviving kernel mount or
+    /// checking and mounting its unmounted crash-left attachment through Disk Arbitration.
+    /// Implementations own cleanup when attachment or mounting fails.
     fn attach_and_mount_resumable(
         &self,
         image: &Path,
         mount_point: &Path,
         _workspace: &LifecycleWorkspace,
     ) -> Result<Self::Attachment, ApfsStorageError> {
-        let attachment = self.attach_verified(image)?;
-        match self.mount(&attachment, mount_point, MountAccess::ReadWrite, false) {
-            Ok(()) => Ok(attachment),
-            Err(primary) => match self.detach(attachment, DetachIntent::Release) {
-                Ok(()) => Err(primary),
-                Err(cleanup) => Err(ApfsStorageError::Cleanup {
-                    operation: "pending clone mount",
-                    primary: Box::new(primary),
-                    cleanup: Box::new(cleanup),
-                }),
-            },
-        }
+        self.attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
     }
     /// Rename the volume of `attachment`, a verified attachment of an image under the store
     /// mounted at `mount_point`, through its device: never a path, which names whatever volume
@@ -1903,20 +1901,14 @@ where
                 return Ok(mount_point);
             }
             let canonical = canonical_image_path(&config, &workspace)?;
-            let attachment = host.attach_verified(&canonical)?;
-            if let Err(primary) = host
-                .mount(
-                    &attachment,
-                    &mount_point,
-                    MountAccess::ReadWrite,
-                    intent.browse,
-                )
-                .and_then(|()| {
-                    host.validate_marker(
-                        &mount_point,
-                        &MarkerExpectation::owned(&config, &workspace),
-                    )
-                })
+            let attachment = host.attach_mounted(
+                &canonical,
+                &mount_point,
+                MountAccess::ReadWrite,
+                intent.browse,
+            )?;
+            if let Err(primary) =
+                host.validate_marker(&mount_point, &MarkerExpectation::owned(&config, &workspace))
             {
                 return detach_after_failure(host.as_ref(), attachment, primary, "mount workspace");
             }
@@ -2425,7 +2417,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
                     host.reclaim_image(&image),
                 );
             }
-            let attachment = match host.create_attached(capacity, &image) {
+            let attachment = match host.create_attached(capacity, &image, &staging) {
                 Ok(attachment) => attachment,
                 // Creation releases what it attached; anything it could not is released here,
                 // before the image beneath it is removed.
@@ -2437,13 +2429,7 @@ fn prepare_adopt_stage<H: ApfsExecutionHost>(
                     );
                 }
             };
-            if let Err(primary) = host.mount(&attachment, &staging, MountAccess::ReadWrite, false) {
-                return combine_cleanup(
-                    "adopt staging mount",
-                    primary,
-                    detach_and_reclaim(host, attachment, &image, "adopt detach"),
-                );
-            }
+            // Creation already completed the checked staging mount in its attachment transaction.
             (workspace, requested.clone(), attachment, staging, false)
         }
     };
@@ -2991,12 +2977,14 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
     let checkpoint_image = checkpoint_image(config, &current, label)?;
     if mode == RestoreMode::VerifyOnly {
         let mount_point = staging_mount(config, &current)?;
-        let attachment = host.attach_verified(&checkpoint_image)?;
-        let mounted = host
-            .mount(&attachment, &mount_point, MountAccess::ReadOnly, false)
-            .and_then(|()| {
-                host.validate_marker(&mount_point, &MarkerExpectation::owned(config, &current))
-            });
+        let attachment = host.attach_mounted(
+            &checkpoint_image,
+            &mount_point,
+            MountAccess::ReadOnly,
+            false,
+        )?;
+        let mounted =
+            host.validate_marker(&mount_point, &MarkerExpectation::owned(config, &current));
         if let Err(primary) = mounted {
             return detach_after_failure(host, attachment, primary, "restore verification mount");
         }
@@ -3042,40 +3030,39 @@ fn prepare_restore_stage<H: ApfsExecutionHost>(
             host.reclaim_image(&staged_image),
         );
     }
-    let attachment = match host.attach_verified(&staged_image) {
-        Ok(attachment) => attachment,
-        Err(primary) => {
-            return combine_cleanup(
-                "restore staging attachment",
-                primary,
-                host.reclaim_image(&staged_image),
-            );
-        }
-    };
-    let prepared = host
-        .mount(&attachment, &staging_mount, MountAccess::ReadWrite, false)
-        .and_then(|()| {
-            // The volume label is human-facing only (`volume_label`); a host without
-            // physical volumes has no label to set, and nothing reads one.
-            if H::HAS_PHYSICAL_VOLUMES {
-                host.rename_volume(
-                    &attachment,
-                    &staging_mount,
-                    &volume_label(replacement.repo(), replacement.name()),
-                )?;
+    let attachment =
+        match host.attach_mounted(&staged_image, &staging_mount, MountAccess::ReadWrite, false) {
+            Ok(attachment) => attachment,
+            Err(primary) => {
+                return combine_cleanup(
+                    "restore staging attachment",
+                    primary,
+                    host.reclaim_image(&staged_image),
+                );
             }
-            host.mint_workspace_credentials(
-                &replacement,
-                &staged_image,
+        };
+    let prepared = (|| {
+        // The volume label is human-facing only (`volume_label`); a host without
+        // physical volumes has no label to set, and nothing reads one.
+        if H::HAS_PHYSICAL_VOLUMES {
+            host.rename_volume(
+                &attachment,
                 &staging_mount,
-                &staged_companion,
+                &volume_label(replacement.repo(), replacement.name()),
             )?;
-            host.write_marker(&staging_mount, &replacement, None, identity)?;
-            host.validate_marker(
-                &staging_mount,
-                &MarkerExpectation::freshly_stamped(&replacement),
-            )
-        });
+        }
+        host.mint_workspace_credentials(
+            &replacement,
+            &staged_image,
+            &staging_mount,
+            &staged_companion,
+        )?;
+        host.write_marker(&staging_mount, &replacement, None, identity)?;
+        host.validate_marker(
+            &staging_mount,
+            &MarkerExpectation::freshly_stamped(&replacement),
+        )
+    })();
     if let Err(primary) = prepared {
         return combine_cleanup(
             "restore preparation",
@@ -3274,15 +3261,10 @@ fn mount_canonical<H: ApfsExecutionHost>(
     mount_point: &Path,
     workspace: &LifecycleWorkspace,
 ) -> Result<(), ApfsStorageError> {
-    let attachment = host.attach_verified(image)?;
-    if let Err(primary) = host
-        .mount(&attachment, mount_point, MountAccess::ReadWrite, false)
-        .and_then(|()| {
-            timed_apfs_step("canonical", "validate", || {
-                host.validate_marker(mount_point, &MarkerExpectation::owned(config, workspace))
-            })
-        })
-    {
+    let attachment = host.attach_mounted(image, mount_point, MountAccess::ReadWrite, false)?;
+    if let Err(primary) = timed_apfs_step("canonical", "validate", || {
+        host.validate_marker(mount_point, &MarkerExpectation::owned(config, workspace))
+    }) {
         return detach_after_failure(host, attachment, primary, "canonical validation");
     }
     timed_apfs_step("canonical", "retain", || {

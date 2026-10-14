@@ -194,7 +194,29 @@ impl CommandRunner for RecordingRunner {
                 &volume_name,
             )))
         } else {
-            Ok(self.inventory.respond(request))
+            let output = self.inventory.respond(request);
+            if request.program == Path::new("/usr/sbin/diskutil")
+                && let Some(pair) = request
+                    .args
+                    .windows(2)
+                    .find(|pair| pair[0] == "--mountPoint" || pair[0] == "-mountPoint")
+            {
+                let device = if request.args.first().is_some_and(|arg| arg == "image") {
+                    "/dev/disk10s1".to_owned()
+                } else {
+                    request
+                        .args
+                        .last()
+                        .expect("mounted device")
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                self.mounted
+                    .lock()
+                    .expect("mounts")
+                    .insert(PathBuf::from(&pair[1]), device);
+            }
+            Ok(output)
         }
     }
     fn image_lease(&self, _: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
@@ -393,7 +415,7 @@ impl RealFixture {
     }
 
     /// Attach `image` and mount its volume at `mount_point` with exactly `options` (as
-    /// `mount_apfs -o` takes them), the way an earlier process left it: the hosts under test
+    /// Disk Arbitration takes them), the way an earlier process left it: the hosts under test
     /// learn of the mount from the kernel alone.
     fn mount_left_behind(&self, image: &Path, mount_point: &Path, options: &str) -> AttachedImage {
         let attachment = self
@@ -410,18 +432,20 @@ impl RealFixture {
         std::fs::create_dir_all(mount_point).expect("mount point");
         let mounted = SystemCommandRunner
             .run(&CommandRequest::new(
-                "/sbin/mount_apfs",
+                "/usr/sbin/diskutil",
                 [
-                    "-o".as_ref(),
+                    "mount".as_ref(),
+                    "-mountOptions".as_ref(),
                     options.as_ref(),
-                    volume_device.as_ref(),
+                    "-mountPoint".as_ref(),
                     mount_point.as_os_str(),
+                    volume_device.as_ref(),
                 ],
             ))
-            .expect("run mount_apfs");
+            .expect("run Disk Arbitration mount");
         assert!(
             mounted.succeeded(),
-            "mount_apfs -o {options} {volume_device} {}: {}",
+            "diskutil mount -mountOptions {options} -mountPoint {} {volume_device}: {}",
             mount_point.display(),
             String::from_utf8_lossy(&mounted.stderr)
         );
@@ -437,11 +461,14 @@ impl RealFixture {
 
 fn unmount(mount: &Path) {
     let unmounted = SystemCommandRunner
-        .run(&CommandRequest::new("/sbin/umount", [mount]))
-        .expect("umount");
+        .run(&CommandRequest::new(
+            "/usr/sbin/diskutil",
+            ["unmount".as_ref(), mount.as_os_str()],
+        ))
+        .expect("Disk Arbitration unmount");
     assert!(
         unmounted.succeeded(),
-        "umount {}: {}",
+        "diskutil unmount {}: {}",
         mount.display(),
         String::from_utf8_lossy(&unmounted.stderr)
     );
@@ -872,6 +899,38 @@ fn a_clone_into_a_path_that_is_not_a_dmg_image_fails_before_any_command() {
     );
     assert!(!bad_destination.exists());
     assert_eq!(runner.calls(), 0);
+}
+
+#[test]
+fn recovering_an_unmounted_attachment_uses_da_mount_without_reattaching() {
+    let fixture = Fixture::new("recover-da-mount");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let image = layout.main_image().expect("image");
+    create_image(image.image());
+    let runner = RecordingRunner::default();
+    attach(&runner, image.image());
+    let host = native_host(&fixture, runner.clone());
+    let mount = fixture.root.join("recovered-mount");
+
+    let attachment = host
+        .attach_and_mount_resumable(image.image(), &mount, &workspace())
+        .expect("reuse the existing attachment");
+
+    assert_eq!(attachment.volume_device(), "/dev/disk10s1");
+    assert_eq!(
+        runner.requests(),
+        [CommandRequest::new(
+            "/usr/sbin/diskutil",
+            [
+                std::ffi::OsString::from("mount"),
+                std::ffi::OsString::from("-mountOptions"),
+                std::ffi::OsString::from("nobrowse,owners,noatime"),
+                std::ffi::OsString::from("-mountPoint"),
+                mount.as_os_str().to_owned(),
+                std::ffi::OsString::from("/dev/disk10s1"),
+            ],
+        )]
+    );
 }
 
 #[test]
@@ -3108,10 +3167,15 @@ impl CommandRunner for EjectAtFsck {
                 .last()
                 .and_then(|raw| raw.to_str())
                 .and_then(|raw| raw.strip_prefix("/dev/r"))
-        } else if request.program == Path::new("/sbin/mount_apfs") {
+        } else if request.program == Path::new("/usr/sbin/diskutil")
+            && request
+                .args
+                .first()
+                .is_some_and(|argument| argument == "mount")
+        {
             request
                 .args
-                .get(2)
+                .last()
                 .and_then(|device| device.to_str())
                 .and_then(|device| device.strip_prefix("/dev/"))
         } else {
@@ -3295,7 +3359,7 @@ fn hold_twice(fixture: &RealFixture, image: &Path) {
 /// attachment stays. A path the kernel holds twice wedged every real-APFS run on the host: each
 /// lookup refused it as `matching image has multiple inventory entries`, the sweep included.
 /// Cowshed never adds a third attachment to such a path. The next mint releases every attachment
-/// of both leftovers through `release_every_attachment`, the release every image detach ends in,
+/// of both leftovers through `release_image`, the release every image detach ends in,
 /// removes their files, and mints the template, which it leaves detached under its name.
 #[test]
 fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
@@ -5655,8 +5719,12 @@ fn lock_and_command_targets_reject_intermediate_symlink_ancestors_without_effect
         "dirfd traversal must reject a symlinked owner"
     );
     assert!(
-        host.create_attached(ImageCapacity::from_gibibytes(1), canonical.image())
-            .is_err(),
+        host.create_attached(
+            ImageCapacity::from_gibibytes(1),
+            canonical.image(),
+            &fixture.root.join("mounted-main"),
+        )
+        .is_err(),
         "command target validation must reject the same ancestor"
     );
     assert!(runner.requests().is_empty(), "no APFS command may spawn");

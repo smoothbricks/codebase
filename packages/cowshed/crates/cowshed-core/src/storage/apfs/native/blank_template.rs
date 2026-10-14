@@ -7,18 +7,20 @@ use crate::storage::apfs::ApfsStorageError;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::template::blank_template;
 use cowshed_apfs::{
-    ApfsBackend, ApfsError, AttachedImage, CommandRunner, apfs_step_leg, timed_apfs_step,
+    ApfsBackend, ApfsError, AttachedImage, CommandRunner, MountAccess, apfs_step_leg,
+    timed_apfs_step,
 };
 
 impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// Mint `image`, which must not exist: one `clonefile` of the store's template at `capacity`
-    /// and one attach, handed back verified and pinned but not mounted. The clone shares the
+    /// and one checked Disk Arbitration attach/mount. The clone shares the
     /// template's volume and container UUIDs, as every clone shares its source's, and carries its
-    /// label. A failed attach removes the clone.
+    /// label. A failed attach removes the clone only after its attachment was released.
     pub(super) fn mint(
         &self,
         capacity: ImageCapacity,
         image: &Path,
+        mount_point: &Path,
     ) -> Result<AttachedImage, ApfsStorageError> {
         let leg = apfs_step_leg(image);
         timed_apfs_step(leg, "mint", || {
@@ -29,13 +31,21 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     .map_err(ApfsError::from)
             })?;
             sync_parent_path(image)?;
-            self.backend.attach_verified(image).or_else(|primary| {
-                super::super::combine_cleanup(
+            match self
+                .backend
+                .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
+            {
+                Ok(attachment) => Ok(attachment),
+                Err(
+                    primary @ (ApfsError::AttachmentCleanupFailed { .. }
+                    | ApfsError::VerificationAndDetachFailed { .. }),
+                ) => Err(primary.into()),
+                Err(primary) => super::super::combine_cleanup(
                     "attach minted image",
                     primary.into(),
                     self.backend.delete_image(image).map_err(Into::into),
-                )
-            })
+                ),
+            }
         })
     }
 }

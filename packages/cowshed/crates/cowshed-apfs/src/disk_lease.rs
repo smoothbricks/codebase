@@ -31,7 +31,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cowshed_gateway_types::{DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState, PhaseShare};
 
 use crate::device::DISKUTIL;
-use crate::{DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS, UMOUNT};
+use crate::{DISK_CHILD_DEADLINE, HDIUTIL, NEWFS_APFS};
+
+// External/manual mounts and unmounts must still exclude StorageKit image transactions; cowshed
+// itself mounts and unmounts through `diskutil`.
+const MOUNT_APFS: &str = "/sbin/mount_apfs";
+const UMOUNT: &str = "/sbin/umount";
 
 /// Classify disk-changing commands, not cosmetic labels. `diskutil renameVolume` changes
 /// neither the mount table nor st_dev; concurrent renames did not slow five attach or
@@ -359,7 +364,7 @@ static COMMAND_RECORD: LazyLock<Option<CommandRecord>> = LazyLock::new(|| {
 
 /// The file every disk command [`leased`] runs is appended to, one line per command, before it
 /// runs: `<class> <program> <args…>`, as the lease names it. A run's attaches are its lines of
-/// `diskutil image attach`, its mounts its lines of `mount_apfs`.
+/// `diskutil image attach` (normally also mounting), and recovered mounts use `diskutil mount`.
 #[derive(Debug)]
 struct CommandRecord {
     path: PathBuf,
