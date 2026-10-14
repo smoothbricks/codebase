@@ -7627,10 +7627,7 @@ mod tests {
         .unwrap();
         host.detach_existing_image(&image, DetachIntent::Release)
             .unwrap();
-        assert_eq!(
-            host.backend().runner().argv(),
-            [vec!["eject".into(), "/dev/disk4".into()]]
-        );
+        assert_eq!(host.backend().runner().argv(), [["eject", "/dev/disk4"]]);
         fs::remove_dir_all(root).unwrap();
     }
 }
