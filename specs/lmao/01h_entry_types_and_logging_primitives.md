@@ -39,7 +39,7 @@ SpanBuffer row layout:
 Span completion entry types (all written to row 1):
   - span-ok (2):        Success, written by ok()
   - span-err (3):       Expected business error, written by err()
-  - span-exception (4): Uncaught exception, pre-initialized at row 1
+  - span-exception (4): Uncaught exception, pre-initialized at row 1; records the thrown value
 ```
 
 - **`span-start`** - Beginning of a work unit (span) - **Always row 0**
@@ -64,7 +64,36 @@ Span completion entry types (all written to row 1):
 - **`span-exception`** - Span threw unexpected exception - **Always row 1**
   - Pre-initialized at span creation (row 1 defaults to this)
   - Remains if exception bypassed normal `ok()`/`err()` flow
-  - Contains exception details in the `message` column (see "The `message` Column" below)
+  - Records the thrown value, because a thrown value is arbitrary: an `Error` whose outer message is empty and whose
+    meaning sits in its `cause`, an `AggregateError` whose meaning sits in its `errors`, an `Error` from another realm,
+    or no `Error` at all. A value is an `Error` when `Error.isError` says so (its `[[ErrorData]]` brand, which holds
+    across realms and which neither a `Symbol.toStringTag` nor a proxy can claim) or when it is an instance of the
+    host's `DOMException`: some hosts (bun) answer `Error.isError` false for a `DOMException`, and an `AbortError` or
+    `TimeoutError` must keep its name, message, code and stack. Recording requires a host with `Error.isError`. A value
+    is an `AggregateError` when it is an instance of this realm's `AggregateError`, so another realm's `AggregateError`
+    is recorded as an `Error` without its `errors`. `message` holds the outer `Error` message, or a non-`Error` value as
+    `<typeof>: <String(value)>`, each bounded to 4096 characters with the cut counted; in `exception_stack` each link's
+    `name` and `message` carry the same bound, so a long message leaves room for its stack. The `exception_stack` column
+    holds, for each `Error` link, `name: message`, then `[code]: <code>` when the link has a string or number `code`,
+    then `[stack]: <stack>`; for an `AggregateError`, each of its `errors` as a chain of its own after
+    `\n[errors <i>]: `; then every `cause` link after `\n[cause]: `. An object recorded earlier in the same value is
+    written as `[already recorded]` and ends its chain; primitives are recorded each time. A non-`Error` link is
+    recorded like a non-`Error` value and ends its chain.
+  - The whole evidence has one budget: at most 64 links (the thrown value, every cause and every aggregated error) and
+    16384 characters. Every recorded string, marker included, is cut to what the budget has left; what it cannot hold is
+    never walked but marked in place (`[<part> not recorded]` for a link, `[<n> more errors not recorded]` for an
+    `AggregateError`'s remaining errors). Two closing lines count what was left out:
+    `[evidence budget spent: <n> links not walked]` (a stopped cause chain and each unwalked `errors` entry count as
+    one, whatever lies beneath them) and `[<n> more characters not recorded]`. A thrown value can be any size, and a
+    getter or proxy can mint a new link on every read, so only the budget bounds the work.
+  - No other own field of the thrown value is read (an `AggregateError`'s `errors` aside), and no non-`Error` value is
+    serialized beyond its own bounded `String()`: an error's fields can carry request configuration or credentials, and
+    values reach traces only when explicitly logged ([Security by Default](./01a_trace_schema_system.md)). Log what a
+    failure needs explicitly.
+  - Recording never throws, so it cannot replace the exception it records. A part that cannot be read (a throwing
+    getter, a revoked proxy as the value, a cause, an `errors` entry or the `errors` list) is written as
+    `[unreadable <part>: <reason>]` in its place, and the rest of the value is still recorded; the original value is
+    rethrown unchanged.
   - Indicates truly exceptional circumstances
   - Duration still valid: `timestamps[1] - timestamps[0]`
 
@@ -1256,7 +1285,8 @@ The system enforces entry type constraints at the API level:
 ### Required Columns by Entry Type <a id="smoo/lmao!n/lmao-entry-required-columns-by-entry-type"></a>
 
 - **All entry types**: `timestamp`, `trace_id`, `thread_id`, `span_id`, `entry_type`, `module`, `message`
-- **Span lifecycle** (`span-start`, `span-ok`, `span-err`, `span-exception`): `message` contains span name
+- **Span lifecycle** (`span-start`, `span-ok`, `span-err`): `message` contains span name; `span-exception` row 1 holds
+  the thrown value's message (see `span-exception` above)
 - **Operational log types** (`info`, `warn`, `error`): `message` identifies a literal template (never interpolated)
 - **Diagnostic log types** (`debug`, `trace`): `message` identifies a literal template or an allowed raw dynamic string
 - **Feature flag types** (`ff-access`, `ff-usage`): `message` contains flag name, `ff_value` contains the evaluated
@@ -1268,14 +1298,15 @@ The system enforces entry type constraints at the API level:
 
 ### The `message` Column by Entry Type <a id="smoo/lmao!n/lmao-entry-the-message-column-by-entry-type"></a>
 
-| Entry Type                                            | `message` Contains                                             |
-| ----------------------------------------------------- | -------------------------------------------------------------- |
-| `span-start`, `span-ok`, `span-err`, `span-exception` | Span name (e.g., `'create-user'`)                              |
-| `info`, `warn`, `error`                               | Literal operational template (e.g., `'User {userId} created'`) |
-| `debug`, `trace`                                      | Literal template or allowed raw dynamic diagnostic string      |
-| `ff-access`, `ff-usage`                               | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)         |
-| `op-*` (all 8 op metric types)                        | Op name (e.g., `'GET'`, `'createUser'`)                        |
-| `period-start`, `buffer-*` (4 types)                  | unused (null)                                                  |
+| Entry Type                           | `message` Contains                                             |
+| ------------------------------------ | -------------------------------------------------------------- |
+| `span-start`, `span-ok`, `span-err`  | Span name (e.g., `'create-user'`)                              |
+| `span-exception`                     | Outer `Error` message, or `<typeof>: <String(value)>`, bounded |
+| `info`, `warn`, `error`              | Literal operational template (e.g., `'User {userId} created'`) |
+| `debug`, `trace`                     | Literal template or allowed raw dynamic diagnostic string      |
+| `ff-access`, `ff-usage`              | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)         |
+| `op-*` (all 8 op metric types)       | Op name (e.g., `'GET'`, `'createUser'`)                        |
+| `period-start`, `buffer-*` (4 types) | unused (null)                                                  |
 
 ### Fixed Row Constraints <a id="smoo/lmao!n/lmao-entry-fixed-row-constraints"></a>
 
