@@ -11,6 +11,13 @@ if (!devenvRoot) {
 const projectRoot = path.resolve(devenvRoot, '../..');
 process.chdir(projectRoot);
 
+/**
+ * What a rebuilt plugin invalidates in `.nx/workspace-data`, by pinned Nx 23.2.1's own names: the daemon's directory
+ * (`daemon/tmp-dir.js`), whose record names the daemon that loaded the old plugin, which exits once the record is gone;
+ * and the project graph that plugin computed (`project-graph/nx-deps-cache.js`).
+ */
+const pluginDerivedNxState = ['d', 'project-graph.json', 'file-map.json', 'source-maps.json'] as const;
+
 // devenv runs this hook twice per shell entry. First it captures the shell's environment: a pass that runs the shell
 // hook to read what the prologue exports, marked DEVENV_SKIP_TASKS (`capture_shell_environment` in cachix/devenv sets
 // it on that subprocess alone), and that runs BEFORE the tasks ordered ahead of devenv:enterShell (smoo:install,
@@ -87,9 +94,8 @@ async function rebuildNxPluginIfStale(): Promise<void> {
 }
 
 async function clearNxDaemonState(): Promise<void> {
-  // Only `.nx/workspace-data` — the daemon socket and project-graph files, which
-  // are the state a rebuilt plugin actually invalidates. NOT `.nx/cache`, and NOT
-  // the task database beside the graph files.
+  // Only what a rebuilt plugin invalidates (`pluginDerivedNxState`). NOT
+  // `.nx/cache`, and NOT anything else in `.nx/workspace-data`.
   //
   // `.nx/cache` holds task results and the `terminalOutputs/<hash>` files the task
   // orchestrator writes when a task exits. Deleting it here raced every concurrent
@@ -114,42 +120,29 @@ async function clearNxDaemonState(): Promise<void> {
   // so every rebase onto main carried nothing (specs/cowshed/16_build_volumes.md,
   // "Every checkout has exactly one Nx state").
   //
+  // Nothing else there is the old plugin's output either. Nx's locks and its
+  // lockfile and file-hash caches do not depend on it, and the plugin's own state
+  // (`cargo-resolve/`, `bounded-exec/`, producer receipts) is content-keyed, so a
+  // rebuilt plugin finds it unreachable rather than wrong. A concurrent Nx process
+  // writes that state under its own lock: emptying the directory raced it as
+  // deleting `.nx/cache` did. A rebase's task-hash probe held its Cargo resolution
+  // lock in `cargo-resolve/<id>/` when the Nx daemon job started beside it entered
+  // a fresh shell over the just-rebased plugin and deleted the directory, and the
+  // probe died `ENOENT` opening its cache entry's temporary file.
+  //
   // Deliberately the workspace-local path, NOT NX_WORKSPACE_DATA_DIRECTORY. Host
   // CI runners redirect that to a shared per-lane tree which also holds the cache
   // provenance DB, and a fresh checkout has no build marker, so this runs on every
-  // job: following the variable would delete that DB every time and the shared
-  // cache could never be warm. Nx's own graph cache accounts for changed plugin
-  // files, so the redirected case needs no help from here.
+  // job: following the variable would clear that shared tree under every other job
+  // of the lane. Nx's own graph cache accounts for changed plugin files, so the
+  // redirected case needs no help from here.
   //
-  // What is inside it, never the path itself: in a cowshed checkout the path is a
-  // link onto the checkout's build volume, and removing it (as `rm -rf` of the
-  // path did) left the next Nx run to make a real directory in its place, off the
+  // Through it, never the path itself: in a cowshed checkout the path is a link
+  // onto the checkout's build volume, and removing it (as `rm -rf` of the path
+  // did) left the next Nx run to make a real directory in its place, off the
   // volume, until cowshed's next refresh discarded it.
   const data = path.join(projectRoot, '.nx/workspace-data');
-  const entries = await readdir(data).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === 'ENOENT') return [];
-    throw error;
-  });
-  const kept = taskDatabaseEntries(entries);
-  await Promise.all(
-    entries
-      .filter((entry) => !kept.has(entry))
-      .map((entry) => rm(path.join(data, entry), { recursive: true, force: true })),
-  );
-}
-
-/** Nx's task databases in `entries`, with their SQLite sidecars and the `.lock` Nx opens each under. */
-function taskDatabaseEntries(entries: readonly string[]): ReadonlySet<string> {
-  const databases = entries.filter((entry) => entry.endsWith('.db')).map((entry) => entry.slice(0, -'.db'.length));
-  return new Set(
-    databases.flatMap((stem) => [
-      `${stem}.db`,
-      `${stem}.db-wal`,
-      `${stem}.db-shm`,
-      `${stem}.db-journal`,
-      `${stem}.lock`,
-    ]),
-  );
+  await Promise.all(pluginDerivedNxState.map((entry) => rm(path.join(data, entry), { recursive: true, force: true })));
 }
 
 async function runQuietly(command: string, args: readonly string[], cwd: string): Promise<void> {

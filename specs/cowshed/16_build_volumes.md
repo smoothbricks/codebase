@@ -913,7 +913,8 @@ plugin) keeps the task database: it is the cache's only index, so the cache with
   Nx 23.2.1 otherwise moves both to a per-user `~/.nx/<id>` unless `nx.json` names `cacheDirectory`. Smoo's workspace
   policy writes `"cacheDirectory": ".nx/cache"` into every managed `nx.json` (`smoo monorepo update`), and
   `smoo monorepo check` and `smoo monorepo validate` fail on an `nx.json` without it; and a shell-entry test in which a
-  stale plugin rebuild empties `.nx/workspace-data` but for the task database, its SQLite sidecars and its lock.
+  stale plugin rebuild removes Nx's daemon record and persisted project graph through the link and keeps every other
+  entry, including a Cargo resolution a concurrent Nx process holds mid-flight, which then publishes.
 - The capability publishes `NX_MAX_CACHE_SIZE` as the caller-overridable default defined in
   [03_caches.md §Wiring](./03_caches.md#wiring), independent of whichever filesystem a client happens to discover. The
   hosted CI action's separate bound is `20GB`.
