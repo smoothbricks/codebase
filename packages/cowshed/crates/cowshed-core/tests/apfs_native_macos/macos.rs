@@ -7099,8 +7099,8 @@ fn recovering_an_unmounted_attachment_mounts_its_pinned_volume_without_reattachi
 
 mod build_mount_races {
     use super::*;
-    use cowshed_core::apfs::ProcessStatus;
     use cowshed_core::build_volume::{BuildVolumeId, BuildVolumeLayout};
+    use cowshed_os::process::ProcessStatus;
     use parking_lot::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;

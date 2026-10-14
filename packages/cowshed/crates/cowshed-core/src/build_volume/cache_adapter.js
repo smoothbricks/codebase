@@ -1,5 +1,6 @@
 // One version-sensitive boundary for the checkout's own Nx cache (16_build_volumes.md, Carry).
 // DbCache and its native cache field are INTERNAL Nx 23.2.1 APIs, not a public stable adapter.
+// biome-ignore lint/correctness/noUnusedVariables: invoked by the Rust-embedded INITIALIZE prologue (cache_adapter.rs), not from this file.
 function openNxCache(root) {
   const path = require('node:path');
   const { createRequire } = require('node:module');

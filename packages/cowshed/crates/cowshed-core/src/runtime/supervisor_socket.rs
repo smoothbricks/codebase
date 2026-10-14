@@ -710,7 +710,7 @@ fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
         std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
     };
-    cowshed_os::fsio::rename_noreplace(libc::AT_FDCWD, &native(from)?, &native(to)?)
+    cowshed_os::fsio::rename_noreplace(libc::AT_FDCWD, &native(from)?, libc::AT_FDCWD, &native(to)?)
 }
 
 fn socket_error(path: &Path, what: &str, error: io::Error) -> CowshedError {

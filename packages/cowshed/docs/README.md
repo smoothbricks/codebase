@@ -144,6 +144,11 @@ cowshed fork raven --project <project-root>
 For the complete repository-selection model, multi-repository examples, agent loop, JSON contract, and safe cleanup
 rules, start with [usage.md](usage.md).
 
+`cowshed mv <workspace> <new-name>` preserves the branch, staged index, uncommitted files and ignored warm state. An
+unfinished rename owns both names until it completes. Removing its source discards a prepared rename only when nothing
+was published; once it has mutated, removal refuses and names `cowshed rm <new-name> --force` as the cancellation that
+keeps the source.
+
 ## Where things live
 
 | What                                                                                             | Where                                                                                                 |

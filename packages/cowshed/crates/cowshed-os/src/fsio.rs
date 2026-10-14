@@ -26,7 +26,6 @@ impl AnchoredDirectory {
     }
 
     /// Hold an existing canonical chain without creating a component or following a link.
-    #[cfg(target_os = "macos")]
     pub fn open(path: &Path) -> io::Result<Self> {
         Self::open_chain(path, false)
     }
@@ -113,7 +112,6 @@ impl AnchoredDirectory {
     }
 
     /// The entry itself, never a symlink's target. No permission on the child is needed.
-    #[cfg(target_os = "macos")]
     pub fn stat_child(&self, name: &CStr) -> io::Result<Option<libc::stat>> {
         validate_directory_leaf(name)?;
         let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -212,7 +210,7 @@ impl AnchoredDirectory {
 
     /// Make the entries this held directory changed durable. Callers issue it once after their
     /// last change in the directory, not once per entry.
-    pub(crate) fn sync(&self) -> io::Result<()> {
+    pub fn sync(&self) -> io::Result<()> {
         full_sync(&self.0)
     }
 
@@ -277,7 +275,7 @@ impl AnchoredDirectory {
     /// Restore one developer alias through held parents, never through a job-mutated path.
     /// A replaced registry directory joins the existing discard lifecycle without overwriting it.
     /// The caller syncs this held directory once after its last restore in it, see [`Self::sync`].
-    pub(crate) fn restore_symlink(
+    pub fn restore_symlink(
         &self,
         name: &CStr,
         target: &Path,
@@ -455,7 +453,7 @@ impl AnchoredDirectory {
 
     /// Read the target of the symlink `name` through the held directory into `buffer`, returning
     /// the borrowed prefix. A target filling the whole buffer is refused, never truncated.
-    pub(crate) fn read_link<'a>(&self, name: &CStr, buffer: &'a mut [u8]) -> io::Result<&'a [u8]> {
+    pub fn read_link<'a>(&self, name: &CStr, buffer: &'a mut [u8]) -> io::Result<&'a [u8]> {
         validate_directory_leaf(name)?;
         // SAFETY: the held directory fd and the NUL-terminated leaf are live, and readlinkat writes
         // at most `buffer.len()` bytes into the writable buffer.
@@ -485,7 +483,7 @@ impl AnchoredDirectory {
     /// renamed over `name`, so the old entry is never removed first. A directory at `name`
     /// refuses the rename. The rename is not synced here: a caller that changed links in this
     /// directory issues one [`Self::sync`] after its last change, before any durable write.
-    pub(crate) fn exact_symlink(&self, name: &CStr, target: &Path) -> io::Result<bool> {
+    pub fn exact_symlink(&self, name: &CStr, target: &Path) -> io::Result<bool> {
         let mut buffer = [0u8; 4096];
         match self.read_link(name, &mut buffer) {
             Ok(bytes) if bytes == target.as_os_str().as_bytes() => return Ok(false),
@@ -1122,6 +1120,48 @@ impl Drop for TempCleanup {
 mod tests {
     use super::*;
 
+    /// A test's private directory under the canonical `/tmp` parent, removed on drop —
+    /// the same protocol as cowshed-core's test-support TempRoot, kept local because
+    /// this crate cannot depend on core's test support.
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new_in(parent: &Path, prefix: &str) -> Self {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let path = parent.join(format!("{prefix}-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .unwrap_or_else(|error| panic!("create test root {}: {error}", path.display()));
+            Self(path)
+        }
+    }
+
+    impl std::ops::Deref for TempRoot {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if std::thread::panicking() => {
+                    eprintln!("remove test root {}: {error}", self.0.display());
+                }
+                Err(error) => panic!("remove test root {}: {error}", self.0.display()),
+            }
+        }
+    }
+
+    fn canonical_parent() -> PathBuf {
+        std::fs::canonicalize("/tmp").unwrap_or_else(|error| panic!("canonical /tmp: {error}"))
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn read_only_directory_capability_never_creates_or_follows_a_link() {
@@ -1515,7 +1555,7 @@ mod tests {
 
     #[test]
     fn a_held_parent_swapped_for_a_link_never_writes_through_the_foreign_directory() {
-        let scratch = crate::temp_root::TempRoot::new("fsio-held-parent-swap");
+        let scratch = TempRoot::new_in(&canonical_parent(), "fsio-held-parent-swap");
         let parent = scratch.join("parent");
         let held = AnchoredDirectory::create(&parent).unwrap();
         fs::create_dir(parent.join("alias")).unwrap();
@@ -1541,7 +1581,7 @@ mod tests {
 
     #[test]
     fn a_discard_leaf_already_occupied_refuses_the_replaced_directory_untouched() {
-        let scratch = crate::temp_root::TempRoot::new("fsio-occupied-discard");
+        let scratch = TempRoot::new_in(&canonical_parent(), "fsio-occupied-discard");
         let links = AnchoredDirectory::create(&scratch.join("links")).unwrap();
         let discard = AnchoredDirectory::create(&scratch.join("discard")).unwrap();
         fs::create_dir(scratch.join("links/alias")).unwrap();
@@ -1567,7 +1607,7 @@ mod tests {
 
     #[test]
     fn exact_symlink_replaces_a_wrong_link_atomically_and_refuses_a_nul_target_untouched() {
-        let scratch = crate::temp_root::TempRoot::new("fsio-exact-symlink");
+        let scratch = TempRoot::new_in(&canonical_parent(), "fsio-exact-symlink");
         let held = AnchoredDirectory::create(&scratch.join("links")).unwrap();
         std::os::unix::fs::symlink(scratch.join("old"), scratch.join("links/alias")).unwrap();
         assert!(held.exact_symlink(c"alias", &scratch.join("new")).unwrap());
@@ -1590,7 +1630,7 @@ mod tests {
 
     #[test]
     fn exact_symlink_refuses_a_directory_at_the_name_without_removing_it() {
-        let scratch = crate::temp_root::TempRoot::new("fsio-exact-symlink-dir");
+        let scratch = TempRoot::new_in(&canonical_parent(), "fsio-exact-symlink-dir");
         let held = AnchoredDirectory::create(&scratch.join("links")).unwrap();
         fs::create_dir(scratch.join("links/alias")).unwrap();
         fs::write(scratch.join("links/alias/keep"), "real\n").unwrap();
@@ -1606,7 +1646,7 @@ mod tests {
     /// barrier its caller issues, and a link that already matches costs none.
     #[test]
     fn exact_symlink_defers_its_directory_sync_to_the_caller() {
-        let scratch = crate::temp_root::TempRoot::new("fsio-deferred-sync");
+        let scratch = TempRoot::new_in(&canonical_parent(), "fsio-deferred-sync");
         let held = AnchoredDirectory::create(&scratch.join("links")).unwrap();
         take_syncs();
         assert!(held.exact_symlink(c"one", &scratch.join("a")).unwrap());

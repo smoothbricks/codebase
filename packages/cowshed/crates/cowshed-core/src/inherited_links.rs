@@ -39,10 +39,10 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use crate::error::{CowshedError, Result};
-use crate::fsio::AnchoredDirectory;
 use crate::metadata::{OWNED_LINKS_REVISION, WorkspaceIncarnation, WorkspaceMarker, write_json};
 use crate::repository::RepoId;
 use crate::storage::WORKSPACE_MARKER_PATH;
+use cowshed_os::fsio::AnchoredDirectory;
 
 /// What a symlink's recorded target means once its tree moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -559,7 +559,7 @@ pub fn migrate_owned_links(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsio::{Syncs, take_syncs};
+    use cowshed_os::fsio::{Syncs, take_syncs};
     use std::os::unix::fs::symlink;
 
     /// A scratch tree removed when dropped, so a failed assertion — or the deliberate panic one

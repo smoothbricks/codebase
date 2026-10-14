@@ -9995,7 +9995,16 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     || fresh_work != fenced_work
                 {
                     return Err(CowshedError::conflict(
-                        format!("the source {source} was not retired: {destination} does not yet hold its HEAD and work"),
+                        format!(
+                            "the source {source} was not retired: {destination} does not yet hold its HEAD and work \
+                             (destination HEAD matches: {}; destination work matches: {}; destination index matches: {}; \
+                             source work matches: {}; source index matches: {})",
+                            destination_head == head,
+                            destination_work.work == fenced_work.work,
+                            destination_work.index == fenced_work.index,
+                            fresh_work.work == fenced_work.work,
+                            fresh_work.index == fenced_work.index,
+                        ),
                         format!(
                             "inspect both workspaces; the source was not retired; cowshed mv {source} {destination} only after preservation matches, or cancel with cowshed rm {destination} --force, which keeps the source (a commit no branch holds may still need --abandon)"
                         ),

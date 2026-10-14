@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::Arc;
 
-use cowshed_core::fork_lock::RunAsync as _;
 use cowshed_gateway::{NxCacheBackend, NxCacheServiceConfig, NxPublication};
 use cowshed_gateway_types::WorkspacePolicy;
+use cowshed_os::fork_lock::RunAsync as _;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;

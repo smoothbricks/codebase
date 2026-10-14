@@ -3,7 +3,7 @@
 //! process integration only; no archive restore, cutover, or publication claim.
 use super::*;
 
-use cowshed_core::fork_lock::{Run as _, RunAsync as _, Spawn as _};
+use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};

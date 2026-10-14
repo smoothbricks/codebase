@@ -11,6 +11,14 @@ use std::path::{Path, PathBuf};
 pub(crate) struct TempRoot(PathBuf);
 
 impl TempRoot {
+    /// Creates one private child under the canonical `/tmp` parent.
+    #[allow(dead_code)]
+    pub(crate) fn new(prefix: &str) -> Self {
+        let parent =
+            std::fs::canonicalize("/tmp").unwrap_or_else(|error| panic!("canonical /tmp: {error}"));
+        Self::new_in(&parent, prefix)
+    }
+
     /// Creates one private child within the caller's granted parent, preserving any runtime alias.
     pub(crate) fn new_in(parent: &Path, prefix: &str) -> Self {
         use std::os::unix::fs::DirBuilderExt as _;
