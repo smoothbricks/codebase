@@ -626,10 +626,11 @@ Concrete targets come from concrete files:
   hashes that file as an input, so changing it reruns the group (`specs/cowshed/08_testing.md`, "Integration tests (real
   substrate)").
 - `cargo-test` is the ordinary suite alone: it depends on the crate pieces and never on a serial group, so a run of it
-  never reaches a group's real-image tests. The inferred `test`, the gate of the cargo workspace root and of every
-  project that owns crates, depends on `cargo-test` alone. No target depends on a serial group's runner: a group runs
-  only as its own target, which a gate names (`nx run-many -t … cargo-test-group-<group>`), and replays from the cache
-  unless its own inputs changed.
+  never reaches a group's real-image tests. The inferred `test` of the cargo workspace root and of every project that
+  owns crates depends on `cargo-test` alone. Explicit repository config owns host coverage: this repository's root
+  `host-e2e` depends on both real-APFS groups, and `gate` depends on `host-e2e` plus every project's `lint`, `test` and
+  `build`. `nx run-many -t gate` therefore covers the host boundary without pulling it into ordinary `test`; each group
+  replays from cache unless its own inputs changed.
 - A group's runner hashes only the crates its filter can select tests from, with everything they link, every member
   manifest and the repository's nextest config, so a change to an unrelated crate leaves it cached. The filter is read
   as nextest reads it (its precedence, blanks and predicate arguments; `filterScope`): a plain `package(<name>)` or
@@ -1182,11 +1183,14 @@ runner, or with two (they would write one report), is judged by its exit alone.
 `smoo-nx-bound-failures` reads the workspace's last Nx run (`run.json` in Nx's `cacheDir`, the directory
 `StoreRunInformationLifeCycle` writes: the checkout's own `.nx/cache` under smoo's workspace policy) against those
 records and prints one line per failed task. It exits 0 only when the run failed and every failed task's record, for
-that task's hash, is a `bound`; a failed task without one is not. A merge queue uses it to re-run a gate that a loaded
-host failed, and to stop on anything else. The file holds whichever Nx run of the checkout finished last, so this
-repository's merge queue, `tooling/land-host.sh`, judges the failed tasks its own gate run names in its output against
-the same records, refuses a timeout behind a panic or failed assertion, and lands a bound only once every test of the
-task ran (`tooling/land-judge.ts`).
+that task's hash, is a `bound`; a failed task without one is not. This diagnostic is not land acceptance. The land
+wrapper, `tooling/land-host.sh`, requires `nx run-many -t gate` to exit zero: bounds, assertions and infrastructure
+failures all stop the land without a retry or waiver. `smoo-nx-failures OUTPUT` reports unique failing tasks and
+deduplicated exact diagnostics from that invocation's retained output, not a shared last-run record. The portable
+`@smoothbricks/nx-plugin/failure-summary` export owns `summarizeFailures(output)` and `runFailureSummary(args)`;
+repository entrypoints such as `tooling/land-summary.ts` call that owner without copying the parser. Its zero exit means
+reporting succeeded, never that the failed gate may land. Known diagnostic sections omit fixture progress and daemon
+debug dumps while preserving multiline assertions and source locations; unknown formats retain their output.
 
 The shared policy API is exported from `@smoothbricks/nx-plugin/bounded-test-policy` for generators or other workspace
 tools that need to normalize package JSON consistently.

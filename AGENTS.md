@@ -9,10 +9,11 @@
 2. **Use the cheapest sufficient proof: mount less; wait for the event.** Reuse valid proof until its relevant inputs
    change. Use a directory or owned fixture instead of an image when it proves the same contract. Tests advance on
    readiness, completion and progress, not sleeps or arbitrary total wall-clock ceilings; inject time for time behavior.
-   Keep expensive host fixtures out of ordinary gate dependencies; run their dedicated proof when that boundary or its
-   dependency, fixture, environment or toolchain inputs change. Keep caches warm and fix unexplained misses where found.
-   **`--skip-nx-cache` is forbidden, including for diagnosis.** Repair inputs, outputs or dependencies; never raise a
-   bound or bypass a cache to manufacture a pass. Clean up physically owned fixtures on every exit path.
+   Keep expensive host fixtures out of ordinary test dependencies; the explicit land gate reaches their dedicated proof
+   when that boundary or its dependency, fixture, environment or toolchain inputs change. Keep caches warm and fix
+   unexplained misses where found. **`--skip-nx-cache` is forbidden, including for diagnosis.** Repair inputs, outputs
+   or dependencies; never raise a bound or bypass a cache to manufacture a pass. Clean up physically owned fixtures on
+   every exit path.
 3. **Inspect evidence before expensive work; stop obsolete work.** Read trace sinks, task history and prior verdicts
    before rerunning. Cancel an owned run whose result is already obsolete or doomed, preserve its evidence, fix the
    cause and run the relevant proof. Do not kill a peer's useful independent work or conceal a real failure.

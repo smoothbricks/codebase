@@ -23,6 +23,12 @@
       "import": "./dist/eslint-file-set.js",
       "default": "./dist/eslint-file-set.js"
     },
+    "./failure-summary": {
+      "types": "./dist/failure-summary.d.ts",
+      "development": "./src/failure-summary.ts",
+      "import": "./dist/failure-summary.js",
+      "default": "./dist/failure-summary.js"
+    },
     "./bounded-test-policy": {
       "types": "./dist/bounded-test-policy.d.ts",
       "import": "./dist/bounded-test-policy.js",
@@ -194,6 +200,7 @@
     "smoo-nx-cargo-hash": "./dist/bin/smoo-nx-cargo-hash.js",
     "smoo-nx-nextest-extract": "./dist/bin/smoo-nx-nextest-extract.js",
     "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
+    "smoo-nx-failures": "./dist/bin/smoo-nx-failures.js",
     "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js"
   },
   "generators": "./generators.json",

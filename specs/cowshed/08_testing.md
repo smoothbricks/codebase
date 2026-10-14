@@ -342,11 +342,19 @@ Native-host integration whose subject combines physical images with core lifecyc
 assertions, image resizing, legacy-image re-adoption and native recovery boundaries. The host target depends on the
 disk-image target: the two groups never run concurrently. Each nextest group declares `max-threads = 1`.
 `.config/nextest.toml` owns their package-scoped selection filters, and the code-time wrapper rules select the same
-tests. Ordinary and exceptions shards exclude those filters. No target depends on either group but the host group's edge
-to the device group: a group runs only as its own target, named by the land gate, and only when its own inputs change.
-Every test has one runner. Non-macOS planning creates neither executable APFS runner; the static placeholder target
-names in root `package.json` remain graph nodes, not executable group coverage (`packages/nx-plugin/README.md`, serial
-test-group inference).
+tests. Ordinary and exceptions shards exclude those filters. The root `host-e2e` target depends on both groups; the root
+`gate` target depends on every project's `lint`, `test` and `build` plus `host-e2e`. The land wrapper
+(`tooling/land-host.sh`) runs `nx run-many -t gate` after rebasing and stopping the workspace's daemon. This reaches the
+same checks as naming the ordinary targets and both host groups explicitly, but Nx owns the target list. Ordinary `test`
+remains free of the expensive host groups: Rule 2 keeps the inner loop cheap, while the explicit land gate includes host
+coverage and each group replays from cache unless its own inputs changed. `nx run-many -t host-e2e` is the focused host
+proof. Every test has one runner, and non-macOS inference creates neither APFS group.
+
+The land gate uses `--outputStyle=static-failures-only` and must exit zero before the expected-tip fast-forward and
+workspace retirement. Any failed task, timeout or infrastructure failure stops the land: there is no bound-only retry,
+acceptance judge, tolerated-failure ledger or baseline-acceptance route. A separate reporter lists unique failing tasks
+and deduplicated exact diagnostics, retaining the complete output for context; reporting cannot turn a failed gate
+green. The pre-rewrite ancestry cutoff remains a separate guard before rebase.
 
 Every test target, the groups included, is bounded by progress alone: the run ends when no test has finished for 180s,
 the hang backstop, and names the tests still running; it has no wall-clock ceiling, and no per-test bound kills a test
@@ -766,7 +774,7 @@ established before the Linux leg gates.
   Tests and Browser Tests through `smoo github-ci nx-smart`, on Linux only — the self-hosted `nixos-latest-x64` runner
   for the repository's own branches, `ubuntu-latest` for pull requests from forks. There are no macOS runners, no
   Linux+ZFS runner, and no nightly run, so every macOS-only test (APFS, Seatbelt, launchd, the escape tests) runs only
-  where a developer runs the gate: `bun nx run-many -t lint test build -p cowshed` on a Mac, with `bun run check:linux`
-  cross-linting the Linux target.
+  where a developer runs the gate: `bun nx run-many -t gate` on a Mac, with `bun run check:linux` cross-linting the
+  Linux target.
 - Lint is `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --config 'build.warnings="deny"'` (repo
   rule: fix everything you see — no pre-existing-failure waivers).

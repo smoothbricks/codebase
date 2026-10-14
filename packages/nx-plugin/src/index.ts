@@ -1543,8 +1543,8 @@ async function createProjectTargets(
       workspaceRoot,
       cargoWorkspace,
     );
-    // A serial group's runner belongs to the workspace root and is reached by nothing: it runs only as its own
-    // target, so a gate names it (tooling/land-host.sh), and only when its own inputs change does it run at all.
+    // Serial-group runners belong to the workspace root, outside inferred ordinary tests. Explicit repository
+    // aggregates can reach them; their own inputs decide whether each runner executes or replays from cache.
     if (!isCargoWorkspaceRoot) {
       targets[CARGO_TEST_TARGET] = {
         executor: 'nx:noop',
@@ -1573,7 +1573,7 @@ async function createProjectTargets(
       targets.test = {
         executor: 'nx:noop',
         cache: true,
-        // The gate: the ordinary suite. The serial groups are their own targets, which no target depends on.
+        // Ordinary tests never infer an edge to a serial group; host aggregates are explicit repository config.
         dependsOn: [CARGO_TEST_TARGET],
       };
     }

@@ -2235,7 +2235,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           `-E 'package(big) and (${exceptional}) and not ((test(/real_apfs_/)))' --partition hash:${index}/3 --no-fail-fast --no-tests=pass`,
         );
       }
-      // `cargo-test` and the gate (`test`) are the ordinary suite alone: no target depends on the group.
+      // `cargo-test` and `test` are the ordinary suite alone: neither infers an edge to the group.
       expect(macos['cargo-test']?.dependsOn).not.toContain('cargo-test-group-real-apfs');
       expect(macos.test?.dependsOn).toEqual(['cargo-test']);
 
@@ -2388,8 +2388,8 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       ]);
       expect(lmao['cargo-test']?.dependsOn).toEqual(['cargo-test-lmao-core']);
 
-      // The gate is the ordinary suite alone, at the root that owns the groups and at every member: a serial group is
-      // its own target, which a gate names, and nothing depends on it.
+      // Ordinary test inference excludes serial groups at both the root and every member. Explicit repository
+      // host aggregates, not inference, own those edges.
       for (const targets of [root, cowshed, lmao]) {
         expect(targets.test?.dependsOn).toEqual(['cargo-test']);
       }
@@ -2491,7 +2491,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         expect(groupsReached(gate.dependencies, task(project, 'test'))).toEqual([]);
       }
 
-      // A gate names the groups: the host group starts only once the device group is done, so two real-image
+      // When a run selects both groups, the host starts only once the device group is done, so two real-image
       // runners never overlap, and the device group waits on no other group.
       const named = createTaskGraph(
         graph,
