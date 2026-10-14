@@ -4738,17 +4738,25 @@ mod io_registry {
         project_registered_apfs(&media, volumes)
     }
 
-    /// The `IOUserClientCreator` of every `DIDeviceIOUserClient` an attached image's
-    /// `AppleDiskImageDevice` holds, `pid N, diskimagesiod`: the helper serving the image's IO.
-    /// User clients are never registered, so they are reached as each device's children rather
-    /// than matched. A device or client the kernel finalizes mid-walk is departing and names no
-    /// helper. A client that names no creator fails the read: its helper would pass for an
-    /// orphan.
-    pub(crate) fn disk_image_user_client_creators() -> io::Result<Vec<String>> {
-        let key = key("IOUserClientCreator")?;
+    pub(crate) fn disk_image_user_client_creators(
+        image: Option<&std::path::Path>,
+    ) -> io::Result<Vec<String>> {
+        let creator_key = key("IOUserClientCreator")?;
+        let image_key = image.map(|_| key("DiskImageURL")).transpose()?;
         let mut creators = Vec::new();
         for device in registered(c"AppleDiskImageDevice")? {
-            settle(record_user_client_creators(&mut creators, &device, &key))?;
+            settle((|| {
+                if let (Some(image), Some(image_key)) = (image, image_key.as_ref()) {
+                    let Some(url) = string_property(&device, image_key, "DiskImageURL")? else {
+                        return Err(invalid("a disk image device registers no DiskImageURL").into());
+                    };
+                    if !matches!(DiskImageSource::from_url(&url), DiskImageSource::File(path) if path == image)
+                    {
+                        return Ok(());
+                    }
+                }
+                record_user_client_creators(&mut creators, &device, &creator_key)
+            })())?;
         }
         Ok(creators)
     }
@@ -4761,7 +4769,7 @@ mod io_registry {
         use crate::attach_budget::{ClassCount, KernelReading};
         let registered = [
             registered_exactly(c"AppleDiskImageDevice")?,
-            u64::try_from(disk_image_user_client_creators()?.len())
+            u64::try_from(disk_image_user_client_creators(None)?.len())
                 .map_err(|_| invalid("more user clients than a u64 counts"))?,
             registered_exactly(c"AppleAPFSVolume")?,
             registered_exactly(c"IOMedia")?,

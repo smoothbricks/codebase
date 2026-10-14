@@ -12,13 +12,13 @@ use cowshed_apfs::attach_budget;
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_apfs::mounts::KernelMountSnapshot;
 use cowshed_apfs::store_lock::LockMode;
+use cowshed_apfs::store_lock::verify_no_symlinks;
 use cowshed_apfs::template::{blank_template, blank_template_path, blank_template_staged_stem};
 use cowshed_apfs::{
     ApfsBackend, ApfsError, AttachedDiskImage, AttachedImage, CommandOutput, CommandRequest,
     CommandRunError, CommandRunner, DetachIntent, DiskImageSource, ImageCapture, MacOsApfsBackend,
     MountAccess, SystemCommandRunner,
 };
-use cowshed_apfs::{mounts::kernel_mounts, store_lock::verify_no_symlinks};
 use cowshed_core::metadata::{
     DetachedWorkspaceMetadata, GrantSet, MACOS_PORT_MIN, NEW_PORT_BLOCK_SIZE, Platform, PortBlock,
     PublicationState, SIDECAR_VERSION, WorkspaceIncarnation, WorkspaceInfoSnapshot, WorkspaceName,

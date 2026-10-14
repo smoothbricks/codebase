@@ -83,6 +83,34 @@ impl OrphanedHelpers {
         Ok(HelperReading::from_reads(first, second))
     }
 
+    /// Read only helpers previously joined to the caller's exact images. The caller must
+    /// finish those images' attach/release operations first; unrelated disk tools cannot
+    /// turn this owned reading into an unavailable host-wide census.
+    #[cfg(target_os = "macos")]
+    pub fn read_owned(owned: &BTreeSet<libc::pid_t>) -> io::Result<Self> {
+        let read = || -> io::Result<Self> {
+            let scan = scan_processes()?;
+            let creators = creator_pids(None)?;
+            Ok(Self::among_owned(&scan.helpers, &creators, owned))
+        };
+        Ok(read()?.confirmed(&read()?))
+    }
+
+    /// Keep orphan attribution within the helpers the caller actually created.
+    pub fn among_owned(
+        helpers: &BTreeSet<libc::pid_t>,
+        creators: &BTreeSet<libc::pid_t>,
+        owned: &BTreeSet<libc::pid_t>,
+    ) -> Self {
+        Self {
+            pids: helpers
+                .intersection(owned)
+                .filter(|pid| !creators.contains(pid))
+                .copied()
+                .collect(),
+        }
+    }
+
     /// Every running helper whose pid created no live device's user client.
     pub fn among(helpers: &BTreeSet<libc::pid_t>, creators: &BTreeSet<libc::pid_t>) -> Self {
         Self {
@@ -149,6 +177,21 @@ impl fmt::Display for OrphanedHelpers {
     }
 }
 
+/// The helper PIDs the kernel joins to this exact backing image while it is attached.
+/// Missing image/client evidence returns an empty set, never unrelated helpers.
+#[cfg(target_os = "macos")]
+pub fn image_helper_pids(image: &std::path::Path) -> io::Result<BTreeSet<libc::pid_t>> {
+    creator_pids(Some(&std::path::absolute(image)?))
+}
+
+#[cfg(target_os = "macos")]
+fn creator_pids(image: Option<&std::path::Path>) -> io::Result<BTreeSet<libc::pid_t>> {
+    crate::disk_image_user_client_creators(image)?
+        .iter()
+        .map(|creator| creator_pid(creator))
+        .collect()
+}
+
 /// The pid an `IOUserClientCreator` names: `pid N, <process name>`.
 pub fn creator_pid(creator: &str) -> io::Result<libc::pid_t> {
     creator
@@ -169,10 +212,7 @@ fn read_orphans() -> io::Result<(OrphanedHelpers, bool)> {
     // Helpers first: a helper must already run to be named, and its device must be missing at
     // the later registry read, so a helper that exits with its image is not caught midway.
     let scan = scan_processes()?;
-    let creators = crate::disk_image_user_client_creators()?
-        .iter()
-        .map(|creator| creator_pid(creator))
-        .collect::<io::Result<BTreeSet<_>>>()?;
+    let creators = creator_pids(None)?;
     let busy = scan.disk_tools || scan_processes()?.disk_tools;
     Ok((OrphanedHelpers::among(&scan.helpers, &creators), busy))
 }
@@ -287,6 +327,28 @@ mod tests {
         assert_eq!(orphans.remedy(), "sudo kill -9 4353 75251 90001");
     }
 
+    #[test]
+    fn an_unrelated_orphan_cannot_fail_an_owned_image_reading() {
+        let helpers = pids(&[100, 200]);
+        let creators = pids(&[100]);
+        let owned = pids(&[100]);
+        assert_eq!(OrphanedHelpers::among(&helpers, &creators).pids(), [200]);
+        let first = OrphanedHelpers::among_owned(&helpers, &creators, &owned);
+        let second = OrphanedHelpers::among_owned(&helpers, &creators, &owned);
+        assert!(first.confirmed(&second).is_empty());
+    }
+
+    #[test]
+    fn an_owned_orphan_remains_a_failure_after_two_reads() {
+        let helpers = pids(&[100, 200]);
+        let owned = pids(&[100]);
+        assert!(OrphanedHelpers::among_owned(&helpers, &helpers, &owned).is_empty());
+        let creators = pids(&[200]);
+        let first = OrphanedHelpers::among_owned(&helpers, &creators, &owned);
+        let second = OrphanedHelpers::among_owned(&helpers, &creators, &owned);
+        assert_eq!(first.confirmed(&second).pids(), [100]);
+    }
+
     /// A client created by a process that is not a running helper (one that exited after the
     /// listing, or another opener) clears no helper and invents no orphan.
     #[test]
@@ -359,7 +421,7 @@ mod tests {
     #[test]
     fn the_live_helpers_and_creators_are_readable() {
         let creators = || {
-            crate::disk_image_user_client_creators()
+            crate::disk_image_user_client_creators(None)
                 .expect("read disk image user client creators")
                 .iter()
                 .map(|creator| creator_pid(creator).expect("creator pid"))

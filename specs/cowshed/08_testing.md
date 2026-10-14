@@ -240,6 +240,12 @@ the single-threaded pretty harness from prefixing the first record with `test <n
 inherited `RUST_TEST_THREADS=1`, even while independent parent tests run in parallel. The strict two-record assertion
 and exact-root teardown remain unchanged; no delay, retry, dropped assertion or broad sweep repairs a framing failure.
 
+The killed-caller attach fixture captures helper PIDs from the existing I/O Registry creator walker, joined to its exact
+backing image before release. After its own attach/release operations finish, two reads must find no orphan among those
+captured PIDs; unrelated helpers and disk tools do not decide this owned verdict. Pure controls prove both that a
+foreign orphan is excluded and that an owned helper whose user client disappeared still fails. The host-wide helper
+census remains a doctor/host-limit observation, never this fixture's acceptance oracle.
+
 The manual macOS example `cargo run -p cowshed-cli --example stable_mount_root -- <new-receipt-directory>` exercises
 setup's production mount-root authorization transaction, then the real CLI parser/dispatcher and APFS controller on an
 isolated scratch host: adopt, doctor, fork, rm, doctor. It requires operator approval and a quiet native-fixture window,

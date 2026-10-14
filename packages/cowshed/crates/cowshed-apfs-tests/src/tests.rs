@@ -542,12 +542,6 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let backend = MacOsApfsBackend::new(SystemCommandRunner);
-    let orphans_before: std::collections::BTreeSet<libc::pid_t> =
-        crate::disk_image_helpers::OrphanedHelpers::read()
-            .expect("helper reading before")
-            .orphans()
-            .map(|orphans| orphans.pids().iter().copied().collect())
-            .unwrap_or_default();
     let root = ScratchRoot::new_owned("fixture-kill").expect("owned scratch root");
     let image = root.path().join("attach.dmg");
     // Releases and deletes the image if the test fails before it does.
@@ -627,6 +621,12 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
             .is_empty(),
         "the killed caller's attach (diskutil {attach}) did not complete"
     );
+    let image_helpers = crate::disk_image_helpers::image_helper_pids(&image)
+        .expect("join this attached image to its helper PIDs");
+    assert!(
+        !image_helpers.is_empty(),
+        "the fixture's attached image names no helper"
+    );
     backend
         .release_image(&image, DetachIntent::Release)
         .expect("release the attach the dead caller finished");
@@ -652,18 +652,13 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
         [],
         "a process outlived the released image in its root"
     );
-    let orphans_after: std::collections::BTreeSet<libc::pid_t> =
-        crate::disk_image_helpers::OrphanedHelpers::read()
-            .expect("helper reading after")
-            .orphans()
-            .map(|orphans| orphans.pids().iter().copied().collect())
-            .unwrap_or_default();
+    let orphans = crate::disk_image_helpers::OrphanedHelpers::read_owned(&image_helpers)
+        .expect("read the fixture image's helpers after release");
     assert!(
-        orphans_after.is_subset(&orphans_before),
-        "new orphaned diskimagesiod helpers: {:?}",
-        orphans_after
-            .difference(&orphans_before)
-            .collect::<Vec<_>>()
+        orphans.is_empty(),
+        "orphaned diskimagesiod helpers created for {}: {:?}",
+        image.display(),
+        orphans.pids()
     );
 }
 
