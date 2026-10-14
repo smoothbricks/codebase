@@ -1,13 +1,29 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import { WorkspaceContext } from 'nx/src/native';
+import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory';
 import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
+import typia from 'typia';
 import {
   type GraphWitness,
   graphInstallationIdentity,
+  type NodeWitness,
   nodesUnchanged,
   readGraphWitness,
   reusableGraph,
@@ -132,7 +148,46 @@ describe('authoritative graph witness', () => {
   });
 });
 
+describe('runtime graph witness storage', () => {
+  it.each(['relative', 'absolute'])(
+    'uses the %s workspace-data binding for missing and unreadable witnesses',
+    async (kind) => {
+      const inherited = process.env.NX_WORKSPACE_DATA_DIRECTORY;
+      process.env.NX_WORKSPACE_DATA_DIRECTORY =
+        kind === 'relative' ? '.nx/runtime-data' : join(root, '.nx', 'runtime-data');
+      try {
+        const directory = workspaceDataDirectoryForWorkspace(root);
+        await mkdir(directory, { recursive: true });
+        const original = witness();
+        writeWitness(join(directory, 'ensure-built-graph.json'), original);
+        expect(directory).toBe(join(root, '.nx', 'runtime-data'));
+        const path = join(directory, 'ensure-built-graph.json');
+        await chmod(path, 0);
+        try {
+          expect(readGraphWitness(path)).toBeNull();
+        } finally {
+          await chmod(path, 0o600);
+        }
+        expect(readGraphWitness(path)).toEqual(original);
+        await rm(path);
+        expect(readGraphWitness(path)).toBeNull();
+        writeWitness(path, original);
+        expect(readGraphWitness(path)).toEqual(original);
+      } finally {
+        if (inherited === undefined) delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
+        else process.env.NX_WORKSPACE_DATA_DIRECTORY = inherited;
+      }
+    },
+  );
+});
+
 describe('installed graph input identity', () => {
+  const parseInstallation = typia.json.createAssertParse<{
+    resolutions: [string, string, string | null][];
+    nodes: NodeWitness[];
+    files: { path: string; sha256: string }[];
+  }>();
+  const parsed = (identity: string | null) => parseInstallation(typia.assert<string>(identity));
   async function packages() {
     const nx = join(root, 'installed-nx');
     const plugin = join(root, 'installed-plugin');
@@ -161,13 +216,37 @@ describe('installed graph input identity', () => {
   }
 
   it('binds public plugin bytes, package resolution metadata, dependency alias targets and tree membership', async () => {
-    const { plugin, dependency, resolver } = await packages();
+    const { nx, plugin, dependency, resolver } = await packages();
+    const output = join(plugin, 'dist', 'index.js');
+    await utimes(output, 1_600_000_000, 1_600_000_000);
     const identity = () => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver);
     const original = identity();
     expect(original).not.toBeNull();
     expect(identity()).toBe(original);
-    await writeFile(join(plugin, 'dist', 'index.js'), 'exports.value = 2;');
-    expect(identity()).not.toBe(original);
+    const files = parsed(original).files;
+    expect(files.map(({ path }) => path).sort()).toEqual(
+      [nx, plugin, dependency].flatMap((path) => [join(path, 'dist', 'index.js'), join(path, 'package.json')]).sort(),
+    );
+    for (const file of files) {
+      expect(file.sha256, file.path).toBe(
+        createHash('sha256')
+          .update(await readFile(file.path))
+          .digest('hex'),
+      );
+    }
+    const before = await stat(output);
+    await writeFile(output, 'exports.value = 2;');
+    await utimes(output, before.atime, before.mtime);
+    expect((await stat(output)).size).toBe(before.size);
+    expect((await stat(output)).mtimeMs).toBe(before.mtimeMs);
+    const changed = identity();
+    expect(changed).not.toBe(original);
+    expect(parsed(changed).files.find(({ path }) => path === output)?.sha256).toBe(
+      createHash('sha256').update('exports.value = 2;').digest('hex'),
+    );
+    expect(parsed(changed).files.find(({ path }) => path === output)?.sha256).not.toBe(
+      files.find(({ path }) => path === output)?.sha256,
+    );
     const emitted = identity();
     await writeFile(join(plugin, 'package.json'), '{"name":"renamed","version":"2","exports":"./other.js"}');
     expect(identity()).not.toBe(emitted);
@@ -179,6 +258,30 @@ describe('installed graph input identity', () => {
     expect(identity()).not.toBe(member);
   });
 
+  it('streams every byte across multiple buffer fills, including the final partial fill', async () => {
+    const { dependency, resolver } = await packages();
+    const output = join(dependency, 'dist', 'payload.bin');
+    const bytes = Buffer.alloc(2 * 64 * 1024 + 17, 0x61);
+    await writeFile(output, bytes);
+    const identity = () => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver);
+    const original = parsed(identity());
+    expect(original.files.find(({ path }) => path === output)?.sha256).toBe(
+      createHash('sha256').update(bytes).digest('hex'),
+    );
+    const before = await stat(output);
+    bytes[64 * 1024] = 0x62;
+    bytes[bytes.length - 1] = 0x63;
+    await writeFile(output, bytes);
+    await utimes(output, before.atime, before.mtime);
+    expect((await stat(output)).size).toBe(before.size);
+    const changed = parsed(identity());
+    expect(changed.files.find(({ path }) => path === output)?.sha256).toBe(
+      createHash('sha256').update(bytes).digest('hex'),
+    );
+    expect(changed.files.find(({ path }) => path === output)?.sha256).not.toBe(
+      original.files.find(({ path }) => path === output)?.sha256,
+    );
+  });
   it('proves a declared dist link by its physical output tree and rejects changed public bytes', async () => {
     const { plugin, resolver } = await packages();
     const published = join(root, 'published-build-volume');
@@ -188,8 +291,15 @@ describe('installed graph input identity', () => {
     const original = identity();
     expect(original).not.toBeNull();
     expect(identity()).toBe(original);
-    await writeFile(join(published, 'index.js'), 'exports.value = 2;');
-    expect(identity()).not.toBe(original);
+    const output = join(published, 'index.js');
+    const before = await stat(output);
+    await writeFile(output, 'exports.value = 2;');
+    await utimes(output, before.atime, before.mtime);
+    const changed = identity();
+    expect(changed).not.toBe(original);
+    expect(parsed(changed).files.find(({ path }) => path === output)?.sha256).toBe(
+      createHash('sha256').update('exports.value = 2;').digest('hex'),
+    );
   });
 
   it('binds an alias to its physical resolution target, not just its package name', async () => {
