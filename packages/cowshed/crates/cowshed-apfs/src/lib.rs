@@ -2577,46 +2577,21 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         let leg = apfs_step_leg(image);
         let (mut attachment, request, output, pin) = {
             let _lease = self.image_lease(image)?;
-            let mut retried_lost_device = false;
-            loop {
-                let attachment = timed_apfs_step(leg, "attach", || {
-                    self.attach_without_mounting(image, access, cleanup)
-                })?;
-                // A raw descriptor pins the actual IOMedia from identity verification
-                // through fsck; its ownership is handed to the attachment until mount.
-                let pin = match self.pin_attached_volume(&attachment) {
-                    Ok(pin) => pin,
-                    Err(error)
-                        if !retried_lost_device
-                            && matches!(
-                                &error,
-                                ApfsError::InvalidAttachmentInventory(_)
-                                    | ApfsError::FileOperation {
-                                        operation: "pin attached APFS volume against device reuse",
-                                        ..
-                                    }
-                            )
-                            && self.attached_whole_devices(image)?.is_empty() =>
-                    {
-                        retried_lost_device = true;
-                        eprintln!(
-                            "cowshed: apfs {} lost its reported device before verification ({error}); attaching once more",
-                            image.display()
-                        );
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                let request = CommandRequest::new(
-                    FSCK_APFS,
-                    [
-                        OsString::from("-q"),
-                        OsString::from(raw_device_from(&attachment.volume_device)),
-                    ],
-                );
-                let output = timed_apfs_step(leg, "fsck", || self.runner.run(&request.clone()))?;
-                break (attachment, request, output, pin);
-            }
+            let attachment = timed_apfs_step(leg, "attach", || {
+                self.attach_without_mounting(image, access, cleanup)
+            })?;
+            // The same raw descriptor carries the exact-image proof from fsck through mount.
+            // Losing the reported device refuses this attempt; it never authorizes another attach.
+            let pin = self.pin_attached_volume(&attachment)?;
+            let request = CommandRequest::new(
+                FSCK_APFS,
+                [
+                    OsString::from("-q"),
+                    OsString::from(raw_device_from(&attachment.volume_device)),
+                ],
+            );
+            let output = timed_apfs_step(leg, "fsck", || self.runner.run(&request))?;
+            (attachment, request, output, pin)
         };
         if output.succeeded() {
             *attachment
@@ -9651,6 +9626,24 @@ mod tests {
             fs::remove_dir(mount).unwrap();
         }
     }
+    #[test]
+    fn a_reported_device_lost_before_verification_never_authorizes_a_second_attach() {
+        let image = temp_path("lost-device-no-reattach", IMAGE_EXTENSION);
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([
+            no_images(),
+            ok(ATTACH_PLIST),
+            no_images(),
+        ]));
+        assert!(matches!(
+            backend.attach_verified(&image),
+            Err(ApfsError::InvalidAttachmentInventory(_))
+        ));
+        let commands = backend.runner().requests();
+        assert_eq!(commands.len(), 1);
+        assert!(is_image_attach(&commands[0]));
+        assert!(argv(&commands[0]).iter().any(|arg| arg == "--noMount"));
+    }
+
     /// What attaches, verifies or looks up one attachment still refuses a container with two
     /// volumes: the attach report, the single-attachment lookup and the unmount identity check.
     #[test]

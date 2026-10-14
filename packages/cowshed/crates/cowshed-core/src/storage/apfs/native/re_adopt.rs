@@ -739,10 +739,18 @@ where
                 .mount_retained_read_only(&attachment, mount)
                 .map_err(Into::into);
         }
-        self.backend
-            .attach_retained_mounted(&input, mount)
-            .map(|_| ())
-            .map_err(Into::into)
+        let attachment = self.backend.attach_retained_verified(&input)?;
+        match self.backend.mount_retained_read_only(&attachment, mount) {
+            Ok(()) => Ok(()),
+            Err(primary) => super::super::combine_cleanup(
+                "mount retained re-adoption input",
+                primary.into(),
+                self.backend
+                    .unmount_retained_when_idle(&attachment)
+                    .and_then(|()| self.backend.detach_retained_when_idle(&attachment))
+                    .map_err(Into::into),
+            ),
+        }
     }
 
     /// Mount `image` at `mount` with `access`, attaching and verifying it first. An image

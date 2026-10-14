@@ -352,12 +352,12 @@ Every request is one line. A one-shot request is followed by the client's EOF an
 Disk-changing tools cowshed runs on the host — the CLI's, a supervisor's, the gateway's own startup pass, and every
 test's — run under a host-wide lease the gateway schedules. One client path takes it: `SystemCommandRunner` reads the
 command's class from its program and arguments and holds the lease around the actual child; setup uses the same client.
-Guarded mount, unmount and detach commands recheck positive exact-image/device registry ownership after the lease wait,
-immediately before spawning, including when a command must run unleased. An attach spends most of its time in
-StorageKit's `syncAllDisks`, after its device already exists, and that sync does not finish while the mount table keeps
-changing (01a_apfs.md, "How the APFS host degrades"), so attaches stall beside mount churn and stay fast once the two
-are kept apart. Attaches among themselves only queue on `storagekitd`; so the lease is two classes that exclude each
-other rather than N interchangeable tokens.
+Mount and unmount retain a registry-proven raw device pin across their lease wait and command. Unpinned detach commands
+recheck positive exact-image/device registry ownership after the lease wait, immediately before spawning, including when
+a command must run unleased. An attach spends most of its time in StorageKit's `syncAllDisks`, after its device already
+exists, and that sync does not finish while the mount table keeps changing (01a_apfs.md, "How the APFS host degrades"),
+so attaches stall beside mount churn and stay fast once the two are kept apart. Attaches among themselves only queue on
+`storagekitd`; so the lease is two classes that exclude each other rather than N interchangeable tokens.
 
 - **Storage**: `diskutil` except `renameVolume`, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs` and `umount`.
   Exact-volume `diskutil unmount` is storage; the image's `mount_apfs` is namespace. Read-only operations (`fsck_apfs`,
