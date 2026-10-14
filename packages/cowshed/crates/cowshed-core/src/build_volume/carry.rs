@@ -378,27 +378,6 @@ fn selection<'a>(
     }
 }
 
-/// Write a consistent copy of the SQLite database `from` at `into` (`VACUUM INTO`, which reads
-/// one snapshot of a database another process may be writing, its write-ahead log included),
-/// built beside `into` and renamed onto it, so `into` is either absent or whole.
-fn snapshot(from: &Path, into: &Path) -> io::Result<()> {
-    let mut partial = into.as_os_str().to_owned();
-    partial.push(".carry");
-    let partial = PathBuf::from(partial);
-    remove(&partial)?;
-    if let Some(parent) = into.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let result = (|| {
-        Connection::open(from)?.execute("VACUUM INTO ?1", &[&partial.to_string_lossy()])?;
-        fs::rename(&partial, into)
-    })();
-    if result.is_err() {
-        remove(&partial)?;
-    }
-    result
-}
-
 /// Phase 2, once nothing holds the target's task database: move each staged entry whose row is
 /// unchanged into place, copy what the target indexed since phase 1, and index it all.
 pub fn commit(mut staged: Staged, into: &Path) -> Carried {
