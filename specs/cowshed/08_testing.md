@@ -678,10 +678,11 @@ Ordered scenarios reuse a step's resulting state instead of adopting another ide
 ownership, seed identity, previous-volume reclamation, labels and linked mounts before main writes again, reseeds and
 forks. Link displacement, doctor findings and exec relinking precede a workspace's fork/reseed walk. Database-opening
 refusal precedes release of the opener, a new topic commit and database-holder refusal on the same warm main and topic;
-both distinct refusal variants, process identities and unchanged target volume are asserted. The successful first-touch
-volume also supplies the existing-link-wins case, whose unused competing mint is still released. These sequences remove
-duplicate setup, not real transitions: each crash-injection state and source/target isolation witness keeps its own
-assertions.
+both distinct refusal variants, process identities and unchanged target volume are asserted. Each land must seal exactly
+one durable outcome for its reported landed head, with the same seed and refusal as its report; the later land retains
+the earlier head's outcome rather than replacing it. The successful first-touch volume also supplies the
+existing-link-wins case, whose unused competing mint is still released. These sequences remove duplicate setup, not real
+transitions: each crash-injection state and source/target isolation witness keeps its own assertions.
 
 Staging GC derives backing-image and mountpoint paths in one preallocated buffer each. Both orphan branches borrow the
 parsed workspace for the deletion record rather than allocating a second name; mount GC also retains its parsed stem.
