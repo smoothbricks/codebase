@@ -34,6 +34,8 @@
    re-prove OS internals. Exercise our real OS/process/network integration where that behavior matters; use real
    in-memory implementations for logic, never fake echoes. Choose an oracle that can fail. Missing tests, infrastructure
    errors and timeouts are not intended red. Measure performance claims in comparable regimes and retain the witness.
+   Never assert a tautology: a test that the OS behaves like the OS, or Nx like Nx, proves nothing - test our contract
+   at the boundary that can actually fail.
 9. **Preserve inference.** Thread precise public types and generics from input through storage to returned values; fix
    source APIs instead of adding cast bridges or test-only wrappers. No `as any`, `as unknown as`, or
    `JSON.parse(...) as T` as validation. `as const` and `satisfies` preserve information. An `unknown` generic default
