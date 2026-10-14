@@ -175,11 +175,6 @@ export interface EnsureBuiltOptions {
   readonly onMiss?: 'stream';
 }
 
-/** A read-only build probe: no task runner or producer output write is permitted. */
-export interface EnsureBuiltProbeOptions extends Omit<EnsureBuiltOptions, 'onMiss'> {
-  readonly onMiss: 'refuse';
-}
-
 export type EnsureBuiltOutputReceipt =
   | { readonly path: string; readonly type: 'file'; readonly mode: number; readonly sha256: string }
   | { readonly path: string; readonly type: 'symlink'; readonly mode: number; readonly linkText: string }
@@ -400,27 +395,30 @@ export function unvouched<Entry>(entries: readonly Entry[], verdicts: readonly b
  * output hashes to check the working tree against — so the target is handed to
  * the workspace's own `nx` CLI unconditionally.
  */
-export function ensureBuilt(options: EnsureBuiltProbeOptions): Promise<EnsureBuiltProbeResult>;
-export function ensureBuilt(options: EnsureBuiltOptions): Promise<EnsureBuiltResult>;
-export async function ensureBuilt(
-  options: EnsureBuiltOptions | EnsureBuiltProbeOptions,
-): Promise<EnsureBuiltResult | EnsureBuiltProbeResult> {
+export async function ensureBuilt(options: EnsureBuiltOptions): Promise<EnsureBuiltResult> {
+  return withWorkspaceBinding(options, ensureBuiltInWorkspace);
+}
+
+/** Read current producer evidence without running tasks or writing producer outputs. */
+export async function probeBuilt(options: Pick<EnsureBuiltOptions, 'target' | 'cwd'>): Promise<EnsureBuiltProbeResult> {
+  return withWorkspaceBinding(options, probeBuiltInWorkspace);
+}
+
+async function withWorkspaceBinding<Result>(
+  options: Pick<EnsureBuiltOptions, 'target' | 'cwd'>,
+  operation: (workspaceRoot: string, selector: TargetSelector) => Promise<Result>,
+): Promise<Result | WorkspaceSocketRefusal> {
   const selector = parseTargetSelector(options.target);
   if (!selector) {
     throw new Error(`ensureBuilt: '${options.target}' is not a project:target[:configuration] selector`);
   }
-  // Resolved before the chdir below, so a relative `cwd` still means what the
-  // caller meant.
+  // Resolve before chdir so a relative cwd still means what the caller meant.
   const workspaceRoot = resolve(options.cwd);
   const callerCwd = process.cwd();
   const callerEnv = { ...process.env };
-  // Decided before the chdir and the rebinding below.
   const callerOwnsRoot = callerOwnsWorkspace(callerEnv, callerCwd, workspaceRoot);
   try {
-    // `cd <root> && nx run ...` is the invocation whose hashes are in the
-    // cache. Everything below — plugin hooks, `runtime` inputs, and the hasher,
-    // which keys against `process.cwd()` — has to see the same directory or the
-    // probe keys differently from the CLI and never hits.
+    // Nx's hooks, runtime inputs and hasher see the provider's own workspace.
     process.chdir(workspaceRoot);
     const environment = workspaceEnvironment(callerEnv, workspaceRoot, callerOwnsRoot);
     if (!callerOwnsRoot) {
@@ -434,13 +432,10 @@ export async function ensureBuilt(
       }
     }
     assignEnvironment(process.env, environment);
-    return await ensureBuiltInWorkspace(workspaceRoot, selector, options.onMiss ?? 'stream');
+    return await operation(workspaceRoot, selector);
   } finally {
-    // Nx configures itself through the environment and this function runs
-    // in-process, so without this the caller — and anything it goes on to exec
-    // — would inherit NX_WORKSPACE_ROOT_PATH, the stream/prefix flags, and
-    // whatever a plugin's preTasksExecution hook injected. The wrapper this
-    // replaces got that isolation for free by running Nx in a child.
+    // Never lend this provider's cwd, Nx binding or hook-injected environment
+    // to the caller or whatever it executes after this operation.
     process.chdir(callerCwd);
     assignEnvironment(process.env, callerEnv);
   }
@@ -674,29 +669,33 @@ export function missBeforeProbe(env: Readonly<NodeJS.ProcessEnv>, taskId: string
   return null;
 }
 
-async function ensureBuiltInWorkspace(
-  workspaceRoot: string,
-  selector: TargetSelector,
-  onMiss: 'stream' | 'refuse',
-): Promise<EnsureBuiltResult | EnsureBuiltProbeResult> {
+interface ReadyWorkspaceProbe {
+  readonly kind: 'ready';
+  readonly nxJson: NxJsonConfiguration;
+  readonly nxArgs: NxArgs;
+  readonly projectGraph: ProjectGraph;
+  readonly taskGraph: TaskGraph;
+  readonly tasks: Task[];
+  readonly requireNx: WorkspaceNxRequire;
+}
+
+type PreparedWorkspaceProbe =
+  | ReadyWorkspaceProbe
+  | { readonly kind: 'no-daemon'; readonly reason: Extract<MissReason, { kind: 'no-daemon' }> };
+
+async function prepareWorkspaceProbe(workspaceRoot: string, selector: TargetSelector): Promise<PreparedWorkspaceProbe> {
   const taskId = selectorTaskId(selector);
-  // The environment has precedence over nx.json. Avoid loading Nx at all on
-  // this explicit fallback path, which also lets a deliberately minimal
-  // checkout-local CLI stand in for Nx.
+  // This explicit fallback path loads no Nx. The build operation may run the
+  // checkout-local CLI; the read-only operation can only report the miss.
   if (process.env.NX_DAEMON === 'false') {
-    const reason: MissReason = { kind: 'no-daemon', taskId };
-    return onMiss === 'refuse' ? { disposition: 'miss', reason } : runViaCli(workspaceRoot, selector, reason);
+    return { kind: 'no-daemon', reason: { kind: 'no-daemon', taskId } };
   }
-  // Nx rejects daemon access when the client package's version differs from
-  // the workspace's running daemon. Resolve every runtime module from the
-  // target checkout rather than this package's own dependency: a reusable
-  // wrapper must keep using the daemon after the workspace takes an Nx patch.
+  // Runtime modules always belong to the provider's installed Nx version.
   const requireNx = createWorkspaceNxRequire(workspaceRoot);
   bindWorkspaceRoot(workspaceRoot, requireNx);
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
   if (!daemonClient.enabled()) {
-    const reason: MissReason = { kind: 'no-daemon', taskId };
-    return onMiss === 'refuse' ? { disposition: 'miss', reason } : runViaCli(workspaceRoot, selector, reason);
+    return { kind: 'no-daemon', reason: { kind: 'no-daemon', taskId } };
   }
   assignEnvironment(process.env, withoutOuterTaskCacheBypass(process.env));
 
@@ -704,13 +703,8 @@ async function ensureBuiltInWorkspace(
   const { splitArgsIntoNxArgsAndOverrides } = requireNx('nx/src/utils/command-line-utils');
   const { setEnvVarsBasedOnArgs } = requireNx('nx/src/tasks-runner/run-command');
   const { createTaskGraph } = requireNx('nx/src/tasks-runner/create-task-graph');
-  const hooks = requireNx('nx/src/project-graph/plugins/tasks-execution-hooks');
-
   let nxJson = readNxJson();
-  // Reproduce `nx run <selector> --outputStyle=<style>` exactly. Task hashes
-  // are derived from these arguments, so anything hand-rolled here instead of
-  // routed through Nx's own argument normalization would key the cache
-  // differently from the CLI and turn every probe into a miss.
+  // Both operations key exactly like nx run <selector> --outputStyle=stream.
   const { nxArgs, overrides } = splitArgsIntoNxArgsAndOverrides(
     { targets: [selector.target], configuration: selector.configuration, outputStyle: 'stream' },
     'run-one',
@@ -718,9 +712,6 @@ async function ensureBuiltInWorkspace(
     nxJson,
   );
   const loadDotEnvFiles = process.env.NX_LOAD_DOT_ENV_FILES !== 'false';
-  // Sets NX_LOAD_DOT_ENV_FILES and the stream/prefix flags, which the hasher
-  // reads through each task's environment. It has to happen before hashing or
-  // the probe keys differently from the CLI.
   setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
 
   performance.mark('ensureBuilt:graph:start');
@@ -738,71 +729,100 @@ async function ensureBuiltInWorkspace(
   );
   const tasks = Object.values(taskGraph.tasks);
   performance.measure('ensureBuilt:graph', 'ensureBuilt:graph:start');
-  const probeSource = onMiss === 'refuse' ? captureProbeSource(workspaceRoot, requireNx) : undefined;
+  return { kind: 'ready', nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx };
+}
 
+async function withTaskHooks<Result>(
+  workspaceRoot: string,
+  selector: TargetSelector,
+  prepared: ReadyWorkspaceProbe,
+  operation: (workspaceRoot: string, selector: TargetSelector, prepared: ReadyWorkspaceProbe) => Promise<Result>,
+): Promise<Result> {
+  const hooks = prepared.requireNx('nx/src/project-graph/plugins/tasks-execution-hooks');
   const runId = randomUUID();
   const startTime = Date.now();
-  // Plugin `preTasksExecution` hooks inject environment variables, and declared
-  // `env` inputs hash against them. Skipping the hook would not merely cost
-  // hits: the run below would then execute with a different environment than
-  // the CLI does, record a hash the CLI never looks up, and thrash the cache.
+  // Hook-injected env participates in hashing for both real operations.
   await hooks.runPreTasksExecution({
     id: runId,
     workspaceRoot,
-    nxJsonConfiguration: nxJson,
+    nxJsonConfiguration: prepared.nxJson,
     argv: process.argv,
   });
-
-  performance.mark('ensureBuilt:probe:start');
-  const reason =
-    missBeforeProbe(process.env, taskId) ??
-    (await probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx, onMiss === 'refuse'));
-  performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
-  // The CLI runs the hooks around its own run, under its own id. This process
-  // ran none of the tasks, so it reports none for the id it opened.
-  let result: EnsureBuiltResult | EnsureBuiltProbeResult =
-    onMiss === 'refuse'
-      ? reason === null
-        ? providerReceipt(
-            workspaceRoot,
-            taskId,
-            tasks,
-            providerInputProof(workspaceRoot, nxJson, projectGraph, taskGraph, requireNx),
-            requireNx('nx/src/native').expandOutputs,
-          )
-        : ({ disposition: 'miss', reason } satisfies EnsureBuiltProbeResult)
-      : reason === null
-        ? HIT
-        : await runViaCli(workspaceRoot, selector, reason);
-  if (probeSource !== undefined && result.disposition === 'hit') {
-    const after = captureProbeSource(workspaceRoot, requireNx);
-    if (!snapshotsEqual(probeSource, after) || !nodesUnchanged(probeSource.nodes)) {
-      result = {
-        disposition: 'failed',
-        reason: {
-          kind: 'provider-proof',
-          taskId,
-          workspaceRoot,
-          detail: 'Provider source nodes or membership moved across Nx hashing/receipt capture',
-        },
-        exitCode: 1,
-        signal: null,
-      };
-    }
-  }
-  if (result.disposition === 'failed' && result.reason.kind === 'provider-proof') {
-    process.stderr.write(`ensureBuilt: ${result.reason.workspaceRoot}: ${result.reason.detail}\n`);
-  }
+  const result = await operation(workspaceRoot, selector, prepared);
+  // Any runner owns its own hook id; this process executed no tasks.
   await hooks.runPostTasksExecution({
     id: runId,
     taskResults: NO_TASK_RESULTS,
     workspaceRoot,
-    nxJsonConfiguration: nxJson,
+    nxJsonConfiguration: prepared.nxJson,
     argv: process.argv,
     startTime,
     endTime: Date.now(),
   });
   return result;
+}
+
+async function ensureBuiltInWorkspace(workspaceRoot: string, selector: TargetSelector): Promise<EnsureBuiltResult> {
+  const prepared = await prepareWorkspaceProbe(workspaceRoot, selector);
+  if (prepared.kind === 'no-daemon') return runViaCli(workspaceRoot, selector, prepared.reason);
+  return withTaskHooks(workspaceRoot, selector, prepared, buildPreparedTarget);
+}
+
+async function buildPreparedTarget(
+  workspaceRoot: string,
+  selector: TargetSelector,
+  prepared: ReadyWorkspaceProbe,
+): Promise<EnsureBuiltResult> {
+  const { nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx } = prepared;
+  performance.mark('ensureBuilt:probe:start');
+  const reason =
+    missBeforeProbe(process.env, selectorTaskId(selector)) ??
+    (await probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx));
+  performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
+  return reason === null ? HIT : runViaCli(workspaceRoot, selector, reason);
+}
+
+async function probeBuiltInWorkspace(workspaceRoot: string, selector: TargetSelector): Promise<EnsureBuiltProbeResult> {
+  const prepared = await prepareWorkspaceProbe(workspaceRoot, selector);
+  if (prepared.kind === 'no-daemon') return { disposition: 'miss', reason: prepared.reason };
+  const probeSource = captureProbeSource(workspaceRoot, prepared.requireNx);
+  return withTaskHooks(workspaceRoot, selector, prepared, async (root, selected, current) => {
+    const { nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx } = current;
+    const taskId = selectorTaskId(selected);
+    performance.mark('ensureBuilt:probe:start');
+    const reason =
+      missBeforeProbe(process.env, taskId) ??
+      (await probe(root, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx, true));
+    performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
+    if (reason !== null) return { disposition: 'miss', reason } satisfies EnsureBuiltProbeResult;
+    let result = providerReceipt(
+      root,
+      taskId,
+      tasks,
+      providerInputProof(root, nxJson, projectGraph, taskGraph, requireNx),
+      requireNx('nx/src/native').expandOutputs,
+    );
+    if (result.disposition === 'hit') {
+      const after = captureProbeSource(root, requireNx);
+      if (!snapshotsEqual(probeSource, after) || !nodesUnchanged(probeSource.nodes)) {
+        result = {
+          disposition: 'failed',
+          reason: {
+            kind: 'provider-proof',
+            taskId,
+            workspaceRoot: root,
+            detail: 'Provider source nodes or membership moved across Nx hashing/receipt capture',
+          },
+          exitCode: 1,
+          signal: null,
+        };
+      }
+    }
+    if (result.disposition === 'failed') {
+      process.stderr.write(`probeBuilt: ${result.reason.workspaceRoot}: ${result.reason.detail}\n`);
+    }
+    return result;
+  });
 }
 
 function captureProbeSource(

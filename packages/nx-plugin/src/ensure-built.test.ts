@@ -916,22 +916,22 @@ describe('smoo-nx-exec with a fresh daemon', () => {
             `
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
 const output = join(process.cwd(), 'packages/app/dist/marker.txt');
 const source = join(process.cwd(), 'packages/lib/source.txt');
 const originalOutput = await readFile(output, 'utf8');
 const originalSource = await readFile(source, 'utf8');
 const before = await stat(output, { bigint: true });
-const hit = await ensureBuilt({ target: 'app:build', cwd: process.cwd(), onMiss: 'refuse' });
+const hit = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 const after = await stat(output, { bigint: true });
 process.env.NX_DAEMON = 'false';
-const daemonless = await ensureBuilt({ target: 'app:build', cwd: process.cwd(), onMiss: 'refuse' });
+const daemonless = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 process.env.NX_DAEMON = 'true';
 await writeFile(output, 'tampered');
-const stale = await ensureBuilt({ target: 'app:build', cwd: process.cwd(), onMiss: 'refuse' });
+const stale = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 await writeFile(output, originalOutput);
 await writeFile(source, 'new uncached source');
-const uncached = await ensureBuilt({ target: 'app:build', cwd: process.cwd(), onMiss: 'refuse' });
+const uncached = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
 const outputAfterMiss = await readFile(output, 'utf8');
 await writeFile(source, originalSource);
 console.log(JSON.stringify({ hit, daemonless, stale, uncached, outputUnwritten: before.ino === after.ino && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs, outputAfterMiss }));
@@ -981,7 +981,7 @@ console.log(JSON.stringify({ hit, daemonless, stale, uncached, outputUnwritten: 
 import { createRequire } from 'node:module';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
 const source = join(process.cwd(), 'packages/lib/source.txt');
 const text = await readFile(source, 'utf8');
 const { daemonClient } = createRequire(process.cwd() + '/package.json')('nx/src/daemon/client/client');
@@ -992,7 +992,7 @@ daemonClient.hashTasks = async (...args) => {
   await writeFile(source, text);
   return result;
 };
-console.log(JSON.stringify(await ensureBuilt({ target: 'app:build', cwd: process.cwd(), onMiss: 'refuse' })));
+console.log(JSON.stringify(await probeBuilt({ target: 'app:build', cwd: process.cwd() })));
 `,
           );
           const sourceRace = await run('bun', sourceRaceEntry, workspace, [], {

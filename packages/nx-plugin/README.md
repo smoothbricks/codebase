@@ -739,12 +739,14 @@ for all those nodes. It is evidence of the same previously compared bytes, never
 rule. Missing/unreadable evidence or moved nodes require a full comparison; mutations to either the cache or working
 tree, parent symlink replacement, and directory membership changes cannot borrow an old equality verdict.
 
-`ensureBuilt({ target, cwd, onMiss: 'refuse' })` is a typed read-only provider probe. It returns
-`EnsureBuiltProbeResult`: a `miss` with its `MissReason` without starting Nx's runner or writing producer outputs; the
-existing operational socket failure; a loud `provider-proof` failure; or a `hit` with `EnsureBuiltReceipt`. The default
-stream overload and its CLI callers retain the existing hit/built/failed result. With the daemon disabled, refuse mode
-returns a no-daemon miss instead of running the target. It still preserves Nx argument normalization, hooks, per-task
-environments, local cache parity and exact-cache artifact equality.
+`probeBuilt({ target, cwd })` is the distinct typed read-only provider operation. It returns `EnsureBuiltProbeResult`: a
+`miss` with its `MissReason` without starting Nx's runner or writing producer outputs; the existing operational socket
+failure; a loud `provider-proof` failure; or a `hit` with `EnsureBuiltReceipt`. `ensureBuilt` is build/stream-only and
+its CLI callers retain the existing hit/built/failed result. With the daemon disabled, `probeBuilt` returns a no-daemon
+miss instead of running the target. Both operations preserve Nx argument normalization, hooks, per-task environments and
+local cache parity; the read-only operation additionally requires exact-cache artifact equality. A managed consumer
+requires the installed module's `probeBuilt` function before making any producer call; a missing operation refuses
+loudly without falling back to `ensureBuilt` or writing provider outputs.
 
 A probe receipt names the real provider workspace, Git HEAD and HEAD's tree, every task id/current Nx hash in the
 selected target's dependency graph, and an independently read census of every Nx-expanded public output. Files carry
