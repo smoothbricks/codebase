@@ -246,17 +246,19 @@ Owned-image command-boundary controls pin current provider-tree projection, excl
 descendant before any command effect, and retain moved/reused-device refusals. Fixture injectors resolve their recorded
 backing image through the typed attachment projection: its physical whole device and synthesized container are distinct,
 not two attachments. A lost pre-pin attachment must refuse after one attach with zero fscks while the foreign
-replacement remains mounted. Mount requires the exact single owned APFS volume, pinned fsck before the first mount and
-that proven raw pin held across the host lease wait; a failed fsck or mount never earns release grace or retry. Option
-controls retain read-only/visibility/owners/noatime and the separate event-store-repair `nobrowse,noowners` state.
-Release controls retain exact-volume `diskutil unmount`, exact physical-device `hdiutil detach`, post-grant guards and
-the unchanged named-dissenter/busy parsers; permission, general and unrecognized refusals remain errors. Real image
-teardown still proves the complete mounted RAW plus unmounted retained-ASIF panic/kill walk. An isolated pass after
-operator cleanup is not a repair verdict when the unchanged full gate repeats the failure; preserve both historical
-witnesses and exercise the real command cutover. The lease overlap fixture also drops B's returned handle before cleanup
-to prove exact-image recovery. A no-device cleanup control holds the backing-file lock: unlink refuses and preserves its
-bytes until an exclusive no-follow open proves it unlocked, then cleanup accepts both that file and an already-absent
-file without spending an image attach.
+replacement remains mounted. Raw-pin attacks prove the deliberate pre-fsck/pre-mount state from the kernel mount table,
+then require exact-physical forced detach to refuse Busy; they do not ask an already-unmounted volume to unmount. Mount
+requires the exact single owned APFS volume, pinned fsck before the first mount and that proven raw pin held across the
+host lease wait; a failed fsck or mount never earns release grace or retry. Option controls retain
+read-only/visibility/owners/noatime and the separate event-store-repair `nobrowse,noowners` state. Release controls
+retain exact-volume `diskutil unmount`, exact physical-device `hdiutil detach`, post-grant guards and the unchanged
+named-dissenter/busy parsers; permission, general and unrecognized refusals remain errors. Real image teardown still
+proves the complete mounted RAW plus unmounted retained-ASIF panic/kill walk. An isolated pass after operator cleanup is
+not a repair verdict when the unchanged full gate repeats the failure; preserve both historical witnesses and exercise
+the real command cutover. The lease overlap fixture also drops B's returned handle before cleanup to prove exact-image
+recovery. A no-device cleanup control holds the backing-file lock: unlink refuses and preserves its bytes until an
+exclusive no-follow open proves it unlocked, then cleanup accepts both that file and an already-absent file without
+spending an image attach.
 
 The killed-caller attach fixture captures helper PIDs from the existing I/O Registry creator walker, joined to its exact
 backing image before release. After its own attach/release operations finish, two reads must find no orphan among those
