@@ -230,6 +230,13 @@ vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on te
 `cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
 same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
+The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
+line-start image records (RAW, then retained ASIF) and the worker record; neither a sibling's output nor a host
+inventory count substitutes for either record. The child runs libtest with `--nocapture --quiet`: terse output prevents
+the single-threaded pretty harness from prefixing the first record with `test <name> ... `. This matters under nextest's
+inherited `RUST_TEST_THREADS=1`, even while independent parent tests run in parallel. The strict two-record assertion
+and exact-root teardown remain unchanged; no delay, retry, dropped assertion or broad sweep repairs a framing failure.
+
 Lifecycle integration that does not assert a physical-volume property uses the same project controller and lifecycle
 executor with `DirectoryExecutionHost`. Its workspaces and build volumes are real directory payloads, cloned through the
 production tree-copy path; atomic filesystem bindings expose them at checkout and build paths. Git, Nx, gateway
