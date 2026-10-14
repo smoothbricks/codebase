@@ -336,14 +336,21 @@ fn detach_images(select: impl Fn(&Path) -> bool) -> std::io::Result<BTreeSet<Pat
 
 /// Release every attachment the kernel holds for `image` as the store host releases an image
 /// under its root: refuse a path a symlink redirects, then the production backend ejects each
-/// whole device once through Disk Arbitration, taking its mounted volumes with it.
+/// exact mounted volume through diskutil, then its physical whole device through hdiutil.
 pub(crate) fn release_image(image: &Path) -> std::io::Result<()> {
     let root = Path::new("/private/tmp");
     if image.starts_with(root) {
         verify_no_symlinks(root, image).map_err(std::io::Error::other)?;
     }
     MacOsApfsBackend::new(SystemCommandRunner)
-        .release_image(image, DetachIntent::Release)
+        .release_image(
+            image,
+            &cowshed_apfs::mounts::kernel_mounts()?
+                .into_iter()
+                .map(|mount| mount.source_device)
+                .collect(),
+            DetachIntent::Release,
+        )
         .map_err(std::io::Error::other)
 }
 

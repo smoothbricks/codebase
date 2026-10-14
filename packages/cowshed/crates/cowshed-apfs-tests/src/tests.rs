@@ -69,12 +69,28 @@ impl<'a> RealImageCleanup<'a> {
 
     fn release_attachment(&self) -> Result<(), ApfsError> {
         if let Some(attachment) = self.attachment.as_ref() {
+            let mounts =
+                cowshed_apfs::mounts::kernel_mounts().map_err(ApfsError::KernelInventory)?;
+            if mounts
+                .iter()
+                .any(|mount| mount.source_device == attachment.volume_device())
+            {
+                self.backend
+                    .unmount_verified(attachment, DetachIntent::Release)?;
+            }
             return self.backend.detach(attachment, DetachIntent::Release);
         }
         // Creation can fail after attach but before the caller receives an AttachedImage.
         // Recover and release the exact image; no returned handle grants no unlink authority.
-        self.backend
-            .release_image(&self.image, DetachIntent::Release)
+        self.backend.release_image(
+            &self.image,
+            &cowshed_apfs::mounts::kernel_mounts()
+                .map_err(ApfsError::KernelInventory)?
+                .into_iter()
+                .map(|mount| mount.source_device)
+                .collect(),
+            DetachIntent::Release,
+        )
     }
 
     fn delete_released_backing_file(&self) -> Result<(), ApfsError> {
@@ -320,7 +336,11 @@ fn real_apfs_image_leases_overlap_across_images_and_exclude_within_one() {
                 alias.display()
             );
             // Releases only the alias's own (empty) inventory, never A's device.
-            backend.release_image(alias, DetachIntent::Release)?;
+            backend.release_image(
+                alias,
+                &std::collections::BTreeSet::new(),
+                DetachIntent::Release,
+            )?;
             match backend.recovered_image_attachment(&image_a)? {
                 Some(RecoveredImageAttachment::Apfs(still)) => assert_eq!(
                     (still.whole_device(), still.volume_device()),
@@ -680,7 +700,11 @@ fn real_apfs_a_disk_image_attach_survives_its_callers_kill() {
         "the fixture's attached image names no helper"
     );
     backend
-        .release_image(&image, DetachIntent::Release)
+        .release_image(
+            &image,
+            &std::collections::BTreeSet::new(),
+            DetachIntent::Release,
+        )
         .expect("release the attach the dead caller finished");
     assert!(
         backend
@@ -729,7 +753,7 @@ fn real_apfs_disk_image_attach_outliving_a_killed_caller() {
     let image = root.join("attach.dmg");
     crate::blank_image::blank_image(&image);
     // Announce only the attaching diskutil while attach is in flight, so the parent kills
-    // mid-attach rather than during inventory reads or the native DA release afterward.
+    // mid-attach rather than during inventory reads or the exact-device release afterward.
     // Release starts only after attach returned and the attaching flag has been cleared.
     let watched = root.clone();
     let attaching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

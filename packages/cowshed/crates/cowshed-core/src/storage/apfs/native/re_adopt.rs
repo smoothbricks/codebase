@@ -747,7 +747,7 @@ where
 
     /// Mount `image` at `mount` with `access`, attaching and verifying it first. An image
     /// already mounted exactly there with that access is left as it is; one attached without a
-    /// mount is checked and mounted by Disk Arbitration without detach/reattach churn.
+    /// mount is mounted through its pinned exact volume without detach/reattach churn.
     fn mount_staged(
         &self,
         image: &Path,
@@ -898,35 +898,6 @@ mod tests {
     }
 
     impl CommandRunner for RefuseFirstMount {
-        fn mount(
-            &self,
-            image: &Path,
-            whole_device: &str,
-            volume_device: &str,
-            mount_point: &Path,
-            policy: cowshed_apfs::MountPolicy,
-        ) -> Result<(), cowshed_apfs::ApfsError> {
-            panic!(
-                "the refused attach has no volume to mount: {} {whole_device}/{volume_device} at {} {policy:?}",
-                image.display(),
-                mount_point.display()
-            );
-        }
-
-        fn eject(
-            &self,
-            image: &Path,
-            whole_device: &str,
-            force: bool,
-        ) -> Result<bool, cowshed_apfs::ApfsError> {
-            let _ = (image, whole_device, force);
-            assert!(
-                self.attached_disk_images()
-                    .map_err(cowshed_apfs::ApfsError::KernelInventory)?
-                    .is_empty()
-            );
-            Ok(false)
-        }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
             assert_eq!(request.program, Path::new("/usr/sbin/diskutil"));
             assert_eq!(request.args[0], "image");

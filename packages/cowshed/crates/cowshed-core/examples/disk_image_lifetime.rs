@@ -125,11 +125,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Release the raw pin before the deliberately independent eject comparison.
                 drop(attachment);
                 if mode == "eject" {
-                    let _lease = host.backend().image_lease(&image)?;
-                    if !SystemCommandRunner.eject(&image, &device, false)? {
+                    let output = SystemCommandRunner.run(&CommandRequest::new(
+                        "/usr/sbin/diskutil",
+                        ["eject", &device],
+                    ))?;
+                    if !output.succeeded() {
                         return Err(format!(
-                            "{} departed before the native eject comparison",
-                            image.display()
+                            "eject {device}: {}",
+                            String::from_utf8_lossy(&output.stderr)
                         )
                         .into());
                     }
