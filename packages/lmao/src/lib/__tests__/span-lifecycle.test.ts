@@ -1074,6 +1074,75 @@ describe('Fixed Row Layout', () => {
     expect(buffer.exception_stack_values[1]).toStartWith('AbortError: aborted\n[code]: 20');
   });
 
+  /** A stackless AggregateError with a cause, whose `errors` is a proxy answering `length` with `length`. */
+  function aggregateClaiming(length: unknown): AggregateError {
+    const listed = new Proxy([], {
+      get(target, key, receiver) {
+        return key === 'length' ? length : Reflect.get(target, key, receiver);
+      },
+    });
+    const thrown = stackless(new AggregateError([], 'agg', { cause: stackless(new Error('agg cause')) }));
+    Object.defineProperty(thrown, 'errors', { value: listed });
+    return thrown;
+  }
+
+  it('records an errors list whose length is not a count in its place and still records the cause', async () => {
+    const refusing = {
+      valueOf(): number {
+        throw new Error('valueOf refused');
+      },
+    };
+    for (const [length, kind] of [
+      [Symbol('length'), 'symbol'],
+      [refusing, 'object'],
+      [100n, 'bigint'],
+      [Number.POSITIVE_INFINITY, 'number'],
+      [-1, 'number'],
+      [1.5, 'number'],
+    ] as const) {
+      const evidence = (await exceptionRow(stackless(new Error('outer', { cause: aggregateClaiming(length) }))))
+        .exception_stack_values[1];
+      expect(evidence).toBe(
+        `Error: outer\n[cause]: AggregateError: agg\n[errors]: [unreadable errors: a list whose length is not a count (${kind})]\n[cause]: Error: agg cause`,
+      );
+    }
+  });
+
+  it('spends a link on every unreadable errors entry, so reads stay within the link budget', async () => {
+    let reads = 0;
+    const listed = new Proxy([], {
+      get(target, key, receiver) {
+        if (key === 'length') return 1_000_000;
+        if (typeof key === 'string' && /^\d+$/.test(key)) {
+          reads++;
+          throw new Error('refused');
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const thrown = stackless(new AggregateError([], 'refusing'));
+    Object.defineProperty(thrown, 'errors', { value: listed });
+
+    const evidence = (await exceptionRow(thrown)).exception_stack_values[1];
+
+    expect(reads).toBe(EVIDENCE_LINKS_LIMIT - 1);
+    expect(evidence).toEndWith(`\n[evidence budget spent: ${1_000_000 - reads} links not walked]`);
+  });
+
+  it('recognizes a DOMException by its own brand, not by its prototype', async () => {
+    const posing = Object.create(DOMException.prototype);
+    Object.defineProperties(posing, {
+      stack: { value: 'planted-stack' },
+      cause: { value: 'planted-cause' },
+    });
+
+    const evidence = (await exceptionRow(posing)).exception_stack_values[1];
+
+    expect(evidence).not.toContain('planted-stack');
+    expect(evidence).not.toContain('planted-cause');
+    expect(evidence).toStartWith('object: ');
+  });
+
   it('should start writeIndex at 2 after span-start is written', async () => {
     const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
     const result = await tracer.trace('test', async (ctx) => {

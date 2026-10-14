@@ -10,7 +10,7 @@ describe('package export contract', () => {
 
     expect(manifest.name).toBe('@smoothbricks/lmao-inspector');
     expect(manifest.exports['./package.json']).toBe('./package.json');
-    expect(rootConditions.development).toBe('./src/index.ts');
+    expect(rootConditions.development).toBeUndefined();
     expect(rootConditions.types).toBe('./src/index.ts');
     expect(rootConditions.import).toBe('./src/index.ts');
     expect(rootConditions.default).toBe('./src/index.ts');

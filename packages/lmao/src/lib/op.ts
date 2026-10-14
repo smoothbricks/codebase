@@ -164,4 +164,12 @@ export class Op<
     this._opContextBinding = opContextBinding;
   }
 }
+
+/**
+ * The type every Op of `Ctx` is assignable to, whatever its arguments. `Args` is `never` because
+ * `fn`'s parameters are contravariant: `(ctx, url: string) => R` is assignable to
+ * `(ctx, ...args: never) => R`, but not to `(ctx, ...args: unknown[]) => R`. Unlike `never[]`, which
+ * accepts the empty tuple, `never` admits no call, so a widened Op cannot be invoked with missing arguments.
+ */
+export type AnyOp<Ctx extends OpContext> = Op<Ctx, never, unknown, unknown>;
 //#endregion smoo/lmao!n/op-class

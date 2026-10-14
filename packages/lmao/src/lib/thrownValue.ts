@@ -16,10 +16,10 @@
  * the budget cannot hold is counted, never walked. Rendering never throws,
  * because a throw here would replace the exception being recorded: a part that
  * cannot be read is written as `[unreadable <part>: <reason>]` in its place and
- * the rest of the value is still recorded. Every operation that could reach a
- * proxy trap (`instanceof`, a property read, `Array.isArray`, `String()`) runs
- * inside a guarded read, and a read's answer is told apart by its own tag, never
- * by asking the user's value.
+ * the rest of the value is still recorded. Every operation that can reach user
+ * code (a property read, `instanceof AggregateError`, `Array.isArray`, a list's
+ * `length`, `String()`) runs inside a guarded read, and a read's answer is told
+ * apart by its own tag, never by asking the user's value.
  */
 
 /** The most characters one message or non-`Error` value contributes. */
@@ -46,7 +46,7 @@ type Read<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; 
 /** Row 1's `message`: the outer `Error` message, or the non-`Error` value, each bounded. */
 export function thrownMessage(value: unknown): string {
   try {
-    // `instanceof DOMException` walks the prototype trap a revoked proxy refuses.
+    // Classification reads nothing of the value, but a host without `Error.isError` fails here, not in the caller.
     const error = readPart((): Error | undefined => (isError(value) ? value : undefined));
     if (!error.ok) return `${typeof value}: ${unreadable('value', error.failure)}`;
     const outer = error.value;
@@ -76,7 +76,7 @@ export function thrownEvidence(value: unknown): string {
   try {
     renderChain(value, 'value', render);
   } catch (failure) {
-    render.text += `\n${unreadable('value', failure)}`;
+    write(render, `\n${unreadable('value', failure)}`);
   }
   const skipped = render.skippedLinks === 0 ? '' : `\n[evidence budget spent: ${render.skippedLinks} links not walked]`;
   const cut = render.omittedChars === 0 ? '' : `\n[${render.omittedChars} more characters not recorded]`;
@@ -114,8 +114,8 @@ function renderChain(value: unknown, part: string, render: Render): void {
       render.seen.add(link);
     }
     const current = link;
-    // `instanceof DOMException` walks the prototype trap a revoked proxy refuses; that link is recorded in its
-    // place, not over the whole value.
+    // Classification reads nothing of the value, but a host without `Error.isError` fails here; that link is recorded
+    // in its place, not over the whole value.
     const error = readPart((): Error | undefined => (isError(current) ? current : undefined));
     if (!error.ok) {
       write(render, `${typeof current}: ${unreadable(linkPart, error.failure)}`);
@@ -157,15 +157,24 @@ function renderLink(error: Error, render: Render): void {
 
 /** An `AggregateError`'s own `errors`, each as a chain of its own, while the budget lasts. */
 function renderAggregated(error: Error, render: Render): void {
-  const listed = readPart((): { readonly errors: readonly unknown[]; readonly length: number } | undefined => {
+  const listed = readPart((): { readonly errors: readonly unknown[]; readonly length: number } | string | undefined => {
     const errors: unknown = Object.hasOwn(error, 'errors') ? Reflect.get(error, 'errors') : undefined;
-    return Array.isArray(errors) ? { errors, length: errors.length } : undefined;
+    if (!Array.isArray(errors)) return undefined;
+    // A proxy's `length` trap may answer anything; only a real count reaches the loop's arithmetic.
+    const length: unknown = Reflect.get(errors, 'length');
+    return typeof length === 'number' && Number.isSafeInteger(length) && length >= 0
+      ? { errors, length }
+      : `a list whose length is not a count (${typeof length})`;
   });
   if (!listed.ok) {
     write(render, `\n[errors]: ${unreadable('errors', listed.failure)}`);
     return;
   }
   if (listed.value === undefined) return;
+  if (typeof listed.value === 'string') {
+    write(render, `\n[errors]: [unreadable errors: ${listed.value}]`);
+    return;
+  }
   const { errors, length } = listed.value;
   for (let index = 0; index < length; index++) {
     if (render.linksLeft === 0 || render.charsLeft === 0) {
@@ -176,17 +185,34 @@ function renderAggregated(error: Error, render: Render): void {
     write(render, `\n[errors ${index}]: `);
     const entry = readPart((): unknown => errors[index]);
     if (entry.ok) renderChain(entry.value, `errors ${index}`, render);
-    else write(render, unreadable(`errors ${index}`, entry.failure));
+    else {
+      // An unreadable entry is still one aggregated error: it spends a link, so the reads stay within the budget.
+      render.linksLeft--;
+      write(render, unreadable(`errors ${index}`, entry.failure));
+    }
   }
 }
 
+/** The host's `DOMException.prototype.code` getter: a brand check that throws for anything but a real `DOMException`. */
+const DOM_EXCEPTION_CODE =
+  typeof DOMException === 'function' ? Object.getOwnPropertyDescriptor(DOMException.prototype, 'code')?.get : undefined;
+
 /**
- * An `Error` by its `[[ErrorData]]` brand, or a `DOMException`: some hosts (bun) answer `Error.isError` false for a
- * `DOMException`, whose `AbortError`/`TimeoutError` must still keep their name, message, code and stack. The
- * `instanceof` can throw on a proxy, so every caller runs this inside a guarded read.
+ * An `Error` by its `[[ErrorData]]` brand, or a `DOMException` by its own brand: some hosts (bun) answer
+ * `Error.isError` false for a `DOMException`, whose `AbortError`/`TimeoutError` must still keep their name, message,
+ * code and stack. The `DOMException` brand is the `code` getter's own receiver check, so neither an object made from
+ * `DOMException.prototype` nor a proxy over a `DOMException` can claim it, and no prototype chain is walked.
  */
 function isError(value: unknown): value is Error {
-  return Error.isError(value) || (typeof DOMException === 'function' && value instanceof DOMException);
+  if (Error.isError(value)) return true;
+  if (DOM_EXCEPTION_CODE === undefined || typeof value !== 'object' || value === null) return false;
+  try {
+    Reflect.apply(DOM_EXCEPTION_CODE, value, []);
+    return true;
+  } catch {
+    // The getter's receiver check refused: that refusal is the answer "not a DOMException", not a failure to record.
+    return false;
+  }
 }
 
 /** A non-`Error` value: its type and its own `String()`, bounded. */

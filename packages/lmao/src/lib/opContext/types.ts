@@ -52,7 +52,7 @@ export type {
   UnionToIntersection,
 } from './opGroupTypes.js';
 // Op types (metadata, function signature, instance)
-export type { Op, OpCompileMetadata, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
+export type { AnyOp, Op, OpCompileMetadata, OpDefinition, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
 // SpanContext types (tag writer, logger, span function, full context)
 export type { FluentLogEntry, SpanContext, SpanFn, SpanLogger, SpanSyncFn, TagWriter } from './spanContextTypes.js';
 
@@ -121,7 +121,7 @@ import type { SchemaFields } from '../schema/types.js';
 import type { ValidateUserContext } from './contextTypes.js';
 import type { FeatureFlagSchema } from './featureFlagTypes.js';
 import type { DepsConfig, OpGroup } from './opGroupTypes.js';
-import type { Op, OpCompileMetadata, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
+import type { Op, OpCompileMetadata, OpDefinition, OpMetadata, OpsFromRecord } from './opTypes.js';
 import type { SpanContext } from './spanContextTypes.js';
 
 /**
@@ -400,13 +400,7 @@ export interface OpContextFactory<
    * await ctx.span('create-user', userOps.createUser, userData);
    * ```
    */
-  defineOps<
-    Defs extends Record<
-      string,
-      | OpFn<OpContext<T, FF, Deps, UserCtx>, unknown[], unknown, unknown>
-      | Op<OpContext<T, FF, Deps, UserCtx>, unknown[], unknown, unknown>
-    >,
-  >(
+  defineOps<Defs extends Record<string, OpDefinition<OpContext<T, FF, Deps, UserCtx>>>>(
     definitions: Defs,
     compileMetadataByKey?: Partial<Record<keyof Defs, OpCompileMetadata>>,
   ): OpGroup<OpContext<T, FF, Deps, UserCtx>, OpsFromRecord<OpContext<T, FF, Deps, UserCtx>, Defs>>;

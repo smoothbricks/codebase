@@ -24,7 +24,7 @@ import type { OpContext } from './types.js';
 // Re-export the Op class and OpMetadata from op.ts - single source of truth
 // The class is defined in op.ts to be the canonical type used by both
 // defineOp (creates instances) and Tracer (checks instanceof)
-export { Op, type OpCompileMetadata, type OpMetadata } from '../op.js';
+export { type AnyOp, Op, type OpCompileMetadata, type OpMetadata } from '../op.js';
 
 // =============================================================================
 // OP FUNCTION TYPE
@@ -46,12 +46,15 @@ export type OpFn<Ctx extends OpContext, Args extends unknown[], S, E> = (
   ...args: Args
 ) => Result<S, E> | Promise<Result<S, E>>;
 
+/** What defineOps accepts for each key: an existing Op or an op function, with any arguments and no widened call. */
+export type OpDefinition<Ctx extends OpContext> = AnyOp<Ctx> | OpFn<Ctx, never, unknown, unknown>;
+
 // =============================================================================
 // OP RECORD TRANSFORMATION
 // =============================================================================
 
 // Import Op class for use in OpsFromRecord type
-import type { Op } from '../op.js';
+import type { AnyOp, Op } from '../op.js';
 
 /**
  * Convert a single definition (Op or OpFn) to an Op type.
@@ -76,9 +79,6 @@ type DefToOp<Ctx extends OpContext, Def> =
  * @template Ctx - Bundled OpContext (logSchema, flags, deps, userCtx)
  * @template Defs - Record of Op definitions (functions or existing Ops)
  */
-export type OpsFromRecord<
-  Ctx extends OpContext,
-  Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>,
-> = {
+export type OpsFromRecord<Ctx extends OpContext, Defs extends Record<string, OpDefinition<Ctx>>> = {
   [K in keyof Defs]: DefToOp<Ctx, Defs[K]>;
 };
