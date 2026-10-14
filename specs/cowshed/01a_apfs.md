@@ -246,18 +246,45 @@ censuses, AppleAPFSVolume instances/registered/departed were **527/79/448 -> 528
 object **0x100081ffa**, either while mounted or after removal. The live host configuration remained byte-identical; only
 the scratch host selected the new default, and all owned scratch images/mounts were released.
 
-This proves the session-root APFS prevention, not a repair of every image-lifecycle leak. The same cycle left one
-additional departed AppleDiskImageDevice (**528 -> 529**) and DIDeviceIOUserClient (**524 -> 525**), so the manual
-example correctly failed its unchanged four-class oracle. The owned attach registered device **0x100081fe4** and client
-**0x100081fe5**, created by diskimagesiod PID **38849**; rm removed both registry entries and restored the entire
-before-fork registry sets. The helper subsequently was absent, and a root all-process Mach-port census found neither ID.
-There was no remaining owned mount or registered device to eject. Class counts alone cannot expose the identity or
-retaining kernel reference of a departed object: this is a separate, unresolved DI2 ownership finding, not evidence for
-reaping an arbitrary helper. Other pre-existing build jobs were not cancelled; this receipt does not claim host-wide
-idleness. Earlier DA and manual-unmount controls registered different device/client pairs (**0x10007e3dc/dd** and
-**0x10007e3b4/b5**) and each added one departed instance per class; the current fork did not reuse those old entries.
+This proves the session-root APFS prevention, not that every class counter returned to baseline. The DI2
+instances-minus-registered readings increased for AppleDiskImageDevice (**528 -> 529**) and DIDeviceIOUserClient (**524
+-> 525**), so the manual example failed its unchanged four-class oracle. That failure remains a measured fact; it does
+not by itself identify a surviving object or an uncompleted release. The subsequent trace below closes the operational
+release question. Other pre-existing build jobs were not cancelled; this receipt does not claim host-wide idleness.
 
 ### Release and device custody
+
+The 2026-10-14 **15:43:32–15:43:45 +04:00** scratch-host trace observed release, not merely absence from inventory. DA
+received eject for each owned whole device and logged **eject ongoing -> removed whole device -> removed APFS container
+-> removed APFS volume -> ejected success**. This covered the blank template and adopted main on
+**disk37/disk38/disk38s1**, then the fork on **disk39/disk40/disk40s1**. Each attachment had a fresh diskimagesiod
+instance: PIDs **2329**, **3391** and **4276**. Each logged file-descriptor unlock, its exact-device termination
+callback, zero remaining client connections, **signal_terminate** cancelling Mach ports and waiting for its barrier,
+**DIIOManager::~DIIOManager(): Closing IO user client**, and **Shutdown is complete**. The fork published in **1.503 s**
+and rm completed in **1.541 s**.
+
+The traced fork registered device **0x1000825b6** and client **0x1000825b7** under helper **4276**, a different pair
+from the earlier proof (**0x100081fe4/0x100081fe5**, helper **38849**). Both pairs left the registry. The earlier helper
+was absent and a root all-process Mach-port census found neither earlier ID; owned mount and scratch teardown checks
+passed. The trace therefore establishes successful supported eject and helper shutdown, with no remaining operational
+device, owned mount or identified holder. A missing cowshed teardown call or surviving helper is not an open item for
+this proof, and no additional eject or watchdog reap is justified by these counts.
+
+The traced cycle still increased the DI2 instance totals by one each while registered counts returned to baseline:
+AppleDiskImageDevice **591/60 -> 592/61 -> 592/60**, and DIDeviceIOUserClient **587/60 -> 588/61 -> 588/60**.
+AppleAPFSVolume and IOMedia returned to their before-fork counts with the same mds process. The unchanged strict manual
+oracle consequently failed again. These counters do not decrement in this measured cycle; that observation alone is not
+proof of a leaked object. Registry removal, successful eject and helper termination do not observe kernel allocation
+destruction or heap release, and this evidence does not claim either. A failed eject or a positively identified
+remaining device/holder would be a distinct operational finding.
+
+The generic kernel-allocation leak oracle pairs **sudo ioclasscount** (per-class IOKit instance counts) with **sudo
+zprint** (kernel-zone elements): snapshot both, run one owned cycle, snapshot both again, then diff the raw readings.
+Retain the corresponding registered-ID sets and release trace; record concurrent host activity rather than attributing
+every host-wide change to the fixture. DI2 instance counts climbing while registry sets return to baseline is precisely
+the accounting case this class-and-zone comparison must distinguish from an operational device left attached. No zprint
+before/after delta was captured for the trace above, so it is not a completed kernel-allocation proof. Neither a counter
+delta alone nor a successful eject alone proves kernel heap retention or release.
 
 Owned-image release is one `diskutil eject <whole-device>`; DA unmounts the image's volumes and ejects the device. There
 is no preliminary kernel unmount or automatic `hdiutil` fallback. `WhenIdle` returns a measured DA dissenter refusal
