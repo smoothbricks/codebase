@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import { runInNewContext } from 'node:vm';
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
@@ -19,6 +20,7 @@ import {
   ENTRY_TYPE_SPAN_START,
 } from '../schema/systemSchema.js';
 import { createSpanBuffer } from '../spanBuffer.js';
+import { EVIDENCE_CHARS_LIMIT, EVIDENCE_LINKS_LIMIT } from '../thrownValue.js';
 import { createTraceId } from '../traceId.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import { iterateSpanChildren } from '../traceTopology.js';
@@ -731,6 +733,340 @@ describe('Fixed Row Layout', () => {
     expect(capturedBuffer).toBeDefined();
     expect(capturedBuffer ? resolveEntryType(capturedBuffer, 0) : undefined).toBe(ENTRY_TYPE_SPAN_START);
     expect(capturedBuffer ? resolveEntryType(capturedBuffer, 1) : undefined).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+  });
+
+  /** Throws `thrown` from a traced callback and returns its buffer once trace() rejected with that same value. */
+  async function exceptionRow(thrown: unknown): Promise<AnySpanBuffer> {
+    let capturedBuffer: AnySpanBuffer | undefined;
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
+    await expect(
+      trace('test', async (ctx) => {
+        capturedBuffer = ctx.buffer;
+        throw thrown;
+      }),
+    ).rejects.toBe(thrown);
+    if (!capturedBuffer) throw new Error('the traced callback never ran');
+    expect(resolveEntryType(capturedBuffer, 1)).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+    return capturedBuffer;
+  }
+
+  it('records each Error link and its whole cause chain at row 1, never its other own fields', async () => {
+    const secret = 'Bearer planted-credential';
+    const cause = Object.assign(new Error('lowering refused'), {
+      code: 'planted_failure',
+      config: { headers: { Authorization: secret } },
+    });
+    const thrown = Object.assign(new Error('', { cause }), { stage: 'planted-stage', token: secret });
+
+    const buffer = await exceptionRow(thrown);
+
+    expect(resolveMessage(buffer, 1)).toBe('');
+    const evidence = buffer.exception_stack_values[1];
+    expect(evidence.startsWith('Error: \n[stack]: Error\n')).toBe(true);
+    expect(evidence).toContain('span-lifecycle.test');
+    expect(evidence).toContain(
+      '\n[cause]: Error: lowering refused\n[code]: planted_failure\n[stack]: Error: lowering refused\n',
+    );
+    expect(evidence).not.toContain('planted-credential');
+    expect(evidence).not.toContain('planted-stage');
+  });
+
+  it('records a thrown non-Error value as its type and its own text, not its fields', async () => {
+    const buffer = await exceptionRow({ code: 'not-an-error', path: '/planted' });
+
+    expect(resolveMessage(buffer, 1)).toBe('object: [object Object]');
+    expect(buffer.exception_stack_values[1]).toBe('object: [object Object]');
+  });
+
+  it('bounds the text a thrown non-Error value contributes', async () => {
+    const buffer = await exceptionRow('x'.repeat(10_000));
+
+    const bounded = `string: ${'x'.repeat(4096)}… [5904 more characters]`;
+    expect(resolveMessage(buffer, 1)).toBe(bounded);
+    expect(buffer.exception_stack_values[1]).toBe(bounded);
+  });
+
+  it('records every Error cause link and stops at a link already recorded', async () => {
+    const inner = new Error('inner failure');
+    const outer = new Error('outer failure', { cause: inner });
+    Object.defineProperty(inner, 'cause', { value: outer, enumerable: false });
+
+    const buffer = await exceptionRow(outer);
+
+    expect(resolveMessage(buffer, 1)).toBe('outer failure');
+    const evidence = buffer.exception_stack_values[1];
+    expect(evidence.indexOf('Error: outer failure\n[stack]: ')).toBe(0);
+    expect(evidence).toContain('\n[cause]: Error: inner failure\n[stack]: ');
+    expect(evidence.endsWith('\n[cause]: [already recorded]')).toBe(true);
+  });
+
+  it('ends at an Error that is its own cause', async () => {
+    const self = new Error('self failure');
+    Object.defineProperty(self, 'cause', { value: self, enumerable: false });
+
+    const evidence = (await exceptionRow(self)).exception_stack_values[1];
+
+    expect(evidence.indexOf('Error: self failure\n[stack]: ')).toBe(0);
+    expect(evidence.endsWith('\n[cause]: [already recorded]')).toBe(true);
+    expect(evidence.split('\n[cause]: ')).toHaveLength(2);
+  });
+
+  it('never walks a cycle through an own field or a thrown value', async () => {
+    const looped = Object.assign(new Error('field cycle'), { context: {} });
+    Object.assign(looped.context, { error: looped });
+    Object.assign(looped, { self: looped });
+    const fieldEvidence = (await exceptionRow(looped)).exception_stack_values[1];
+    expect(fieldEvidence.indexOf('Error: field cycle\n[stack]: ')).toBe(0);
+    expect(fieldEvidence).not.toContain('[cause]');
+
+    const holder: { error?: Error } = {};
+    const held = new Error('held failure', { cause: holder });
+    holder.error = held;
+    const buffer = await exceptionRow(holder);
+    expect(resolveMessage(buffer, 1)).toBe('object: [object Object]');
+    expect(buffer.exception_stack_values[1]).toBe('object: [object Object]');
+  });
+
+  it('records a part that cannot be read and still rethrows the original value', async () => {
+    const thrown = new Error('getter failure');
+    Object.defineProperty(thrown, 'stack', {
+      get() {
+        throw new Error('stack getter refused');
+      },
+    });
+
+    const evidence = (await exceptionRow(thrown)).exception_stack_values[1];
+
+    expect(evidence).toBe('Error: getter failure\n[stack]: [unreadable stack: stack getter refused]');
+  });
+
+  it('records a failure whose own text cannot be read', async () => {
+    const { proxy: unreadableFailure, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const thrown = new Error('getter failure');
+    Object.defineProperty(thrown, 'stack', {
+      get() {
+        throw unreadableFailure;
+      },
+    });
+
+    const evidence = (await exceptionRow(thrown)).exception_stack_values[1];
+
+    expect(evidence).toBe(
+      'Error: getter failure\n[stack]: [unreadable stack: object failure whose text cannot be read]',
+    );
+  });
+
+  it('records a thrown value that cannot even be classified and still rethrows it', async () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+
+    const buffer = await exceptionRow(proxy);
+
+    expect(resolveMessage(buffer, 1)).toStartWith('object: [unreadable value: ');
+    expect(buffer.exception_stack_values[1]).toStartWith('object: [unreadable value: ');
+  });
+
+  it('records an Error from another realm by its brand', async () => {
+    const foreign: unknown = runInNewContext(
+      'new Error("other realm failure", { cause: new Error("other realm cause") })',
+    );
+
+    const buffer = await exceptionRow(foreign);
+
+    expect(resolveMessage(buffer, 1)).toBe('other realm failure');
+    const evidence = buffer.exception_stack_values[1];
+    expect(evidence.indexOf('Error: other realm failure\n[stack]: ')).toBe(0);
+    expect(evidence).toContain('\n[cause]: Error: other realm cause\n[stack]: ');
+  });
+
+  it("records an AggregateError's errors before its cause", async () => {
+    const first = new Error('first failure');
+    const thrown = new AggregateError([first, 'second failure', first], 'all failed', {
+      cause: new Error('aggregate cause'),
+    });
+
+    const buffer = await exceptionRow(thrown);
+
+    expect(resolveMessage(buffer, 1)).toBe('all failed');
+    const evidence = buffer.exception_stack_values[1];
+    expect(evidence.indexOf('AggregateError: all failed\n[stack]: ')).toBe(0);
+    const first0 = evidence.indexOf('\n[errors 0]: Error: first failure\n[stack]: ');
+    const second1 = evidence.indexOf('\n[errors 1]: string: second failure');
+    const repeated2 = evidence.indexOf('\n[errors 2]: [already recorded]');
+    const cause = evidence.indexOf('\n[cause]: Error: aggregate cause\n[stack]: ');
+    expect(first0).toBeGreaterThan(0);
+    expect(second1).toBeGreaterThan(first0);
+    expect(repeated2).toBeGreaterThan(second1);
+    expect(cause).toBeGreaterThan(repeated2);
+  });
+
+  it('stops a long cause chain at the evidence budget', async () => {
+    let chain = new Error('link 0');
+    for (let index = 1; index < 200; index++) chain = new Error(`link ${index}`, { cause: chain });
+
+    const evidence = (await exceptionRow(chain)).exception_stack_values[1];
+
+    expect(evidence.indexOf('Error: link 199\n[stack]: ')).toBe(0);
+    expect(evidence).toContain('\n[evidence budget spent: 1 links not walked]');
+    expect(evidence).not.toContain('Error: link 0\n');
+    expect(evidence.length).toBeLessThanOrEqual(EVIDENCE_CHARS_LIMIT + 120);
+  });
+
+  it('stops an exponential AggregateError tree at the evidence budget', async () => {
+    const tree = (depth: number): Error =>
+      depth === 0
+        ? new Error('leaf')
+        : new AggregateError(
+            Array.from({ length: 32 }, () => tree(depth - 1)),
+            `level ${depth}`,
+          );
+
+    const evidence = (await exceptionRow(tree(3))).exception_stack_values[1];
+
+    expect(evidence.indexOf('AggregateError: level 3\n[stack]: ')).toBe(0);
+    expect(evidence).toMatch(/\n\[evidence budget spent: \d+ links not walked\]/);
+    expect(evidence.length).toBeLessThanOrEqual(EVIDENCE_CHARS_LIMIT + 120);
+  });
+
+  it('stops a cause getter that mints a new Error on every read', async () => {
+    let minted = 0;
+    const mint = (): Error => {
+      minted++;
+      const error = new Error(`minted ${minted}`);
+      Object.defineProperty(error, 'cause', { get: mint });
+      return error;
+    };
+
+    const evidence = (await exceptionRow(mint())).exception_stack_values[1];
+
+    expect(evidence).toContain('\n[evidence budget spent: 1 links not walked]');
+    expect(minted).toBeLessThanOrEqual(EVIDENCE_LINKS_LIMIT + 1);
+  });
+
+  it('cuts one huge message to the value limit and the evidence to its budget, counting both cuts', async () => {
+    const buffer = await exceptionRow(new Error('m'.repeat(100_000)));
+
+    expect(resolveMessage(buffer, 1)).toBe(`${'m'.repeat(4096)}… [95904 more characters]`);
+    const evidence = buffer.exception_stack_values[1];
+    expect(evidence).toMatch(/\n\[\d+ more characters not recorded\]$/);
+    expect(evidence).toContain('\n[stack]: Error: m');
+    expect(evidence.length).toBeLessThanOrEqual(EVIDENCE_CHARS_LIMIT + 120);
+  });
+
+  it('records a revoked proxy cause as unreadable and keeps the readable outer Error', async () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+
+    const evidence = (await exceptionRow(new Error('outer meaning', { cause: proxy }))).exception_stack_values[1];
+
+    expect(evidence.indexOf('Error: outer meaning\n[stack]: ')).toBe(0);
+    expect(evidence).toContain('\n[cause]: object: [unreadable cause: ');
+  });
+
+  it('records a revoked errors entry and a revoked errors list as unreadable parts', async () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+
+    const entryEvidence = (await exceptionRow(new AggregateError([new Error('readable one'), proxy], 'some failed')))
+      .exception_stack_values[1];
+    expect(entryEvidence).toContain('\n[errors 0]: Error: readable one\n[stack]: ');
+    expect(entryEvidence).toContain('\n[errors 1]: object: [unreadable errors 1: ');
+
+    const listed = new AggregateError([], 'list unreadable');
+    Object.defineProperty(listed, 'errors', { value: proxy });
+    const listEvidence = (await exceptionRow(listed)).exception_stack_values[1];
+    expect(listEvidence.indexOf('AggregateError: list unreadable\n[stack]: ')).toBe(0);
+    expect(listEvidence).toContain('\n[errors]: [unreadable errors: ');
+  });
+
+  it('recognizes an Error by its brand, not a toStringTag, and an AggregateError by what it is, not its name', async () => {
+    const posing = { [Symbol.toStringTag]: 'Error', name: 'Posing', message: 'm', stack: 'planted-stack-text' };
+    const posingBuffer = await exceptionRow(posing);
+    expect(resolveMessage(posingBuffer, 1)).toBe('object: [object Error]');
+    expect(posingBuffer.exception_stack_values[1]).toBe('object: [object Error]');
+
+    const named = Object.assign(new Error('named only'), { name: 'AggregateError', errors: ['planted-entry'] });
+    const namedEvidence = (await exceptionRow(named)).exception_stack_values[1];
+    expect(namedEvidence.indexOf('AggregateError: named only\n[stack]: ')).toBe(0);
+    expect(namedEvidence).not.toContain('planted-entry');
+  });
+
+  it('records repeated primitive errors each time', async () => {
+    const evidence = (await exceptionRow(new AggregateError(['ECONNRESET', 'ECONNRESET'], 'resets')))
+      .exception_stack_values[1];
+
+    expect(evidence).toContain('\n[errors 0]: string: ECONNRESET\n[errors 1]: string: ECONNRESET');
+  });
+
+  /** No stack, so the link budget, not the character budget, runs out first. */
+  function stackless<E extends Error>(error: E): E {
+    Object.defineProperty(error, 'stack', { value: undefined });
+    return error;
+  }
+
+  it('records exactly the link budget of a stackless cause chain and marks the rest in place', async () => {
+    let chain = stackless(new Error('b0'));
+    for (let index = 1; index < 200; index++) chain = stackless(new Error(`b${index}`, { cause: chain }));
+
+    const evidence = (await exceptionRow(chain)).exception_stack_values[1];
+
+    const recorded = Array.from({ length: EVIDENCE_LINKS_LIMIT }, (_, index) => `Error: b${199 - index}`);
+    expect(evidence).toBe(
+      `${recorded.join('\n[cause]: ')}\n[cause]: [cause not recorded]\n[evidence budget spent: 1 links not walked]`,
+    );
+  });
+
+  it('reads at most the link budget of a huge errors list and counts the rest exactly', async () => {
+    const claimed = 1_000_000;
+    let reads = 0;
+    const listed = new Proxy([], {
+      get(target, key, receiver) {
+        if (key === 'length') return claimed;
+        if (typeof key === 'string' && /^\d+$/.test(key)) {
+          reads++;
+          return stackless(new Error(`e${key}`));
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const thrown = stackless(new AggregateError([], 'huge'));
+    Object.defineProperty(thrown, 'errors', { value: listed });
+
+    const evidence = (await exceptionRow(thrown)).exception_stack_values[1];
+
+    const walked = EVIDENCE_LINKS_LIMIT - 1;
+    expect(reads).toBe(walked);
+    const entries = Array.from({ length: walked }, (_, index) => `\n[errors ${index}]: Error: e${index}`).join('');
+    const rest = claimed - walked;
+    expect(evidence).toBe(
+      `AggregateError: huge${entries}\n[${rest} more errors not recorded]\n[evidence budget spent: ${rest} links not walked]`,
+    );
+  });
+
+  it('records an errors entry whose read throws in its own place', async () => {
+    const listed = new Proxy([], {
+      get(target, key, receiver) {
+        if (key === 'length') return 2;
+        if (typeof key === 'string' && /^\d+$/.test(key)) throw new Error(`index ${key} refused`);
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const thrown = stackless(new AggregateError([], 'some refused'));
+    Object.defineProperty(thrown, 'errors', { value: listed });
+
+    const evidence = (await exceptionRow(thrown)).exception_stack_values[1];
+
+    expect(evidence).toBe(
+      'AggregateError: some refused\n[errors 0]: [unreadable errors 0: index 0 refused]\n[errors 1]: [unreadable errors 1: index 1 refused]',
+    );
+  });
+
+  it('records a DOMException as an Error even where Error.isError answers false for it', async () => {
+    const buffer = await exceptionRow(new DOMException('aborted', 'AbortError'));
+
+    expect(resolveMessage(buffer, 1)).toBe('aborted');
+    expect(buffer.exception_stack_values[1]).toStartWith('AbortError: aborted\n[code]: 20');
   });
 
   it('should start writeIndex at 2 after span-start is written', async () => {

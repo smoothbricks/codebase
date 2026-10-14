@@ -442,12 +442,16 @@ try {
   return result;
 } catch (error) {
   // Thrown errors, and the TypeError raised for a non-Result return or an Ok/Err owned by another context
-  ctx._spanException(buffer, error); // span-exception, message, and exception_stack to row 1
+  ctx._spanException(buffer, error); // span-exception and the bounded thrown-value evidence from 01h to row 1
   throw error;
 } finally {
   tracer.onSpanEnd(buffer);
 }
 ```
+
+The exception writer uses `thrownMessage(error)` for row 1's outer message and `thrownEvidence(error)` for its names,
+messages, codes, stacks, aggregated errors and cause chain, as specified by 01h's span-exception contract. It reads no
+other fields, never replaces the original thrown value, and leaves the result-ownership check and end hook unchanged.
 
 ### Why This Design
 

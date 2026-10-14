@@ -63,6 +63,7 @@ import {
   ENTRY_TYPE_SPAN_RETRY,
 } from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
+import { thrownEvidence, thrownMessage } from './thrownValue.js';
 import type { AnySpanBuffer, LogBinding, SpanBuffer } from './types.js';
 import { isThreadSpanView } from './wasm/threadSpanView.js';
 
@@ -1219,17 +1220,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     //#region smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.exception
     /**
-     * Handle span exception - writes exception details to row 1.
+     * Handle span exception - writes the thrown value to row 1 (01h): the outer
+     * message and, in `exception_stack`, each link's name, message, code and stack along its cause chain.
      * Called in catch blocks of span methods.
      */
     _spanException(childBuffer: SpanBuffer<Ctx['logSchema']>, error: unknown): void {
       writeSpanEndEntry(childBuffer, ENTRY_TYPE_SPAN_EXCEPTION);
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const errorStack = error instanceof Error ? error.stack : undefined;
-      childBuffer.message(1, errorMessage);
-      if (errorStack) {
-        childBuffer.exception_stack(1, errorStack);
-      }
+      childBuffer.message(1, thrownMessage(error));
+      childBuffer.exception_stack(1, thrownEvidence(error));
     }
     //#endregion smoo/lmao!n/lmao-entry-span-lifecycle-entry-types.exception
 
