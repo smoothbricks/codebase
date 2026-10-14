@@ -45,8 +45,10 @@ same sources, the test declaration and its existing `extends` chain are explicit
 files in Nx's workspace file index (.gitignore and .nxignore applied), so a gitignored generated module that a build
 left on disk is neither linted nor keyed, and the lint target is the same in every checkout of one tree. Rust-only
 source trees keep their Cargo validation and manifest checks without invoking ESLint on nonexistent JavaScript inputs.
-Adding JavaScript/TypeScript sources or changing the declared test program updates lint coverage automatically. The
-target's `metadata.eslintFileSet` retains that exact command and workspace-relative file list for cache inspectors.
+Test-config diagnostics retain TypeScript's parsed-command-line types through bootstrap emit; invalid declarations fail
+with their diagnostic code and message, while an empty test program (TS18003) contributes no test files. Adding
+JavaScript/TypeScript sources or changing the declared test program updates lint coverage automatically. The target's
+`metadata.eslintFileSet` retains that exact command and workspace-relative file list for cache inspectors.
 `@smoothbricks/nx-plugin/eslint-file-set` owns its type and generated validator; an inspector can resolve each file's
 actual ESLint parser program instead of guessing from the project or target name.
 
@@ -987,6 +989,10 @@ died is reclaimed by the next task, unless an image is still attached from a fil
 those belong to whoever attached them, so the lease and the volume are kept and every new task names them. A target's
 own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task
 keeps its inherited `TMPDIR` and says so once. A failed task that left the volume nearly full names the volume.
+
+Outside macOS, the executor never provisions an APFS RAM disk: it keeps the inherited `TMPDIR`, or uses the target's
+`env.TMPDIR` override, without reclaiming either directory. The host temp-directory proof runs the real default executor
+for that contract on Linux; on macOS it exercises RAM-volume recovery, shared leases and final detach.
 
 The volume's kernel `O_EXLOCK` admits ledger mutations and releases on process death. It is held only for cheap lease
 and operation claims and their publication: host-wide process and disk-inventory probes, directory cleanup, provisioning
