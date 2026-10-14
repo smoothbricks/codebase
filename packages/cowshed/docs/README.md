@@ -86,6 +86,10 @@ installed, and the daemon refuses another build's commands. The default `cli-*` 
 profile, which is for tests and local iteration, and setup refuses to install it; setup also refuses a build of an older
 commit than the installed one unless you pass `--downgrade`.
 
+A daemon/caller “the cowshed daemon is build X; this cowshed is build Y” refusal (exit 4) is a build-identity conflict,
+not workspace corruption; install the intended build with its own setup before retrying
+([05 Gateway](../../../specs/cowshed/05_gateway.md), “One artifact”).
+
 ### The agent skill
 
 `cowshed skill install` writes the bundled skill into every agent harness detected on the host, and
