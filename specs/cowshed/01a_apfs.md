@@ -313,6 +313,30 @@ lease wait is not authority afterward: the image may have departed and another a
 have reused its `diskN`. Confirmed image absence needs no child; a positive conflicting mapping or unreadable inventory
 refuses the mutation. A release deduplicates whole-device views, so the same attachment is never detached twice.
 
+### Owned-registry release boundary
+
+The release owner selects the exact backing image, its registered whole device and that device's current provider-tree
+descendants. Only those identities authorize release: a foreign or stale StorageKit cached descendant must neither be
+selected for unmount/eject nor veto release of the owned tree. A reused BSD spelling is not ownership. The owner-layer
+adapter must preserve this boundary through the actual DA request, not merely validate the command's top-level argv. An
+unrelated refusal remains an error; the boundary is not permission to broaden the dissent parser, force a foreign
+volume, add an automatic command fallback, or weaken a fixture's complete cleanup expectation.
+
+On 2026-10-14 at **20:07:36 +04:00**, the real panic/kill cleanup fixture's retained `second.asif` was joined by the I/O
+Registry to driver **0x100089e2a**, helper **36162**, physical **disk177**, container **disk179** and unmounted,
+read-only volume **disk179s1** (volume UUID **02E5E265-1B57-4996-A2FE-E5B750FBC630**). Root `lsof` found no holder of
+those raw device nodes. Nevertheless, `diskutil eject disk177` caused StorageKit/DA to request unmount of cached
+**disk177s1**, marked mounted with the different UUID **73578864-29ED-47A4-BEF1-63916CA00560**, outside the image's
+registered tree. Three actual requests returned only
+`Unmount of disk177 failed: at least one volume could not be unmounted`, with no dissenter PID. The existing
+no-dissenter refusal correctly retained the image and root; this was not the `Release` grace/force case.
+
+Operator-authorized, exact-device `hdiutil detach` subsequently ejected that owned, unmounted image. The unchanged
+cleanup case then passed **1/1 in 2.626 s**, nextest run **179547fa-7894-4cd8-a2af-31537ecf17a8**. This separates the
+fixture's real expectation from stale framework routing. It proves neither a permanent repair of StorageKit nor that the
+current `diskutil` delegation satisfies the stale-descendant boundary above; that owner-layer gap is explicit. The
+operator action is not an automatic runtime fallback, and the ordinary DA release/dissent policy remains unchanged.
+
 **An absent registered device does not prove the backing file is unlocked.** On 2026-10-14, a 100 GiB RAW build image
 remained locked by an orphan `diskimagesiod`: PID **28160**, born **11:58:37 +04:00**, fd **4u**, device **1,20**, inode
 **53550146**. Root `lsof` named that exact current fd; the original and later attach clients/controllers were gone,
