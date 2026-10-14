@@ -45,7 +45,16 @@ function inventory(root, directory, outputs) {
 export function receiptOf(root, target) {
   const outputs = [];
   for (const directory of OUTPUTS[target] ?? []) inventory(root, join(root, directory), outputs);
-  return { workspaceRoot: root, head: git(root, 'rev-parse', 'HEAD'), headTree: git(root, 'rev-parse', 'HEAD^{tree}'), fileInputProvenance: 'exact-file-inputs', runtimeEnvironmentProvenance: 'nx-task-hash-only', tasks: [{ id: target, hash: target + ':' + git(root, 'rev-parse', 'HEAD'), outputs }] };
+  const head = git(root, 'rev-parse', 'HEAD');
+  const tasks = [{ id: target, hash: target + ':' + head, outputs }];
+  // A boundary control: the producer record a plugin publishes, shaped as its contract names it. The real-Nx
+  // control in nx-plugin (linked-snapshots.nx.test.ts) proves the actual publication.
+  const producer = {
+    version: 1, target, argv: ['nx', 'run', target], trackedTreeClean: true, environmentIdentity: 'fixture-environment',
+    inputs: [{ taskId: target, overrides: {}, declared: [], expanded: {}, hashDetails: { command: target, nodes: {}, runtime: {} }, files: [] }],
+    tools: [], outputSha256: createHash('sha256').update(JSON.stringify(tasks)).digest('hex'), wallTimeMs: 1,
+  };
+  return { workspaceRoot: root, head, headTree: git(root, 'rev-parse', 'HEAD^{tree}'), fileInputProvenance: 'exact-file-inputs', runtimeEnvironmentProvenance: 'nx-task-hash-only', tasks, producer };
 }
 const OUTPUTS = { 'api:build': ['packages/api/dist', 'packages/leaf/dist'], 'api:native': ['.cache/native'] };
 `;
@@ -54,10 +63,14 @@ const CAPTURE = `
 ${PROBE}
 const snapshots = await import(Bun.argv[1]);
 const [root, source, declaration, mode, frozen] = JSON.parse(Bun.argv[2]);
-const probe = async (target, providerRoot) =>
-  mode === 'miss'
-    ? { disposition: 'miss', reason: { kind: 'stale-outputs', taskId: target } }
-    : { disposition: 'hit', receipt: frozen?.[target] ?? receiptOf(providerRoot, target) };
+const probe = async (target, providerRoot) => {
+  if (mode === 'miss') return { disposition: 'miss', reason: { kind: 'stale-outputs', taskId: target } };
+  const receipt = structuredClone(frozen?.[target] ?? receiptOf(providerRoot, target));
+  if (mode === 'no-producer') delete receipt.producer;
+  if (mode === 'producer-v2') receipt.producer.version = 2;
+  if (mode === 'other-argv') receipt.producer.argv = [...receipt.producer.argv, '--skip-nx-cache'];
+  return { disposition: 'hit', receipt };
+};
 const binding = await snapshots.snapshotBinding(root, 'linked-api', source, declaration, probe);
 const verified = binding.kind === 'snapshot' ? snapshots.verifySnapshot(join(binding.directory, '..', '..')).id : null;
 process.stdout.write(JSON.stringify({ binding, verified }));
@@ -80,9 +93,10 @@ function write(file: string, content: string): void {
   writeFileSync(file, content);
 }
 
-function git(root: string, ...args: string[]): void {
+function git(root: string, ...args: string[]): string {
   const run = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
   if (run.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${run.stderr}`);
+  return run.stdout.trim();
 }
 
 interface Fixture {
@@ -175,7 +189,7 @@ function run(script: string, args: string[]): unknown {
 
 function capture(
   { consumer, source }: Fixture,
-  mode: 'hit' | 'miss' = 'hit',
+  mode: 'hit' | 'miss' | 'no-producer' | 'producer-v2' | 'other-argv' = 'hit',
   frozen: unknown = null,
 ): { readonly binding: SnapshotBinding; readonly verified: string | null } {
   const result = run(CAPTURE, [RAW, JSON.stringify([consumer, source, DECLARATION, mode, frozen])]);
@@ -226,9 +240,10 @@ describe('linked package snapshots', () => {
     expect(snapshotOf(capture(checkout)).id).toBe(snapshot.id);
   });
 
-  it('names the same bytes anew under another provider commit or task hash', () => {
+  it('reuses a same-tree receipt and names a distinct producer or task identity', () => {
     const checkout = fixture();
     const first = snapshotOf(capture(checkout));
+    const originalBasis = git(checkout.provider, 'rev-parse', 'HEAD');
     const frozen = run(FREEZE, [checkout.provider]);
     const rehashed: unknown = JSON.parse(
       JSON.stringify(frozen).replaceAll('"hash":"api:build:', '"hash":"api:build-rehashed:'),
@@ -245,6 +260,15 @@ describe('linked package snapshots', () => {
       'same tree',
       '--allow-empty',
     );
+    const sameTree = snapshotOf(capture(checkout, 'hit', frozen));
+    expect(sameTree.id).toBe(first.id);
+    expect(
+      run(
+        'const s = await import(Bun.argv[1]); process.stdout.write(JSON.stringify(s.verifySnapshot(Bun.argv[2]).provenance.producers.map(({ basis }) => basis)));',
+        [RAW, join(sameTree.directory, '..', '..')],
+      ),
+    ).toEqual(DECLARATION.targets.map(() => originalBasis));
+    // This unfrozen boundary simulates an actual new publication, not a consumer rewriting the old basis.
     const otherCommit = snapshotOf(capture(checkout));
     expect(new Set([first.id, otherHash.id, otherCommit.id]).size).toBe(3);
     // Each name verifies against its own census and receipt; the bytes are equal.
@@ -298,13 +322,58 @@ describe('linked package snapshots', () => {
     expect(refusalOf(capture(checkout, 'hit', frozen))).toContain('is not the bytes Nx recorded');
   });
 
-  it('refuses source that is not the provider HEAD', () => {
+  it('refuses copied source that is not the attested committed tree', () => {
     const checkout = fixture();
     write(join(checkout.source, 'src/index.js'), 'export const edited = true;\n');
-    expect(refusalOf(capture(checkout))).toContain('differs from HEAD');
+    expect(refusalOf(capture(checkout))).toContain('differs from tree');
     write(join(checkout.source, 'src/extra.js'), 'export {};\n');
     git(checkout.provider, 'checkout', '--', 'packages/api/src/index.js');
-    expect(refusalOf(capture(checkout))).toMatch(/neither tracked at HEAD [0-9a-f]+ nor an output/);
+    expect(refusalOf(capture(checkout))).toMatch(
+      /neither tracked at tree [0-9a-f]+ \(producer basis [0-9a-f]+\) nor an output/,
+    );
+  });
+
+  it('retains each original producer basis when targets share a tree across empty commits', () => {
+    const checkout = fixture();
+    const originalBasis = git(checkout.provider, 'rev-parse', 'HEAD');
+    const earlier = run(FREEZE, [checkout.provider]);
+    git(
+      checkout.provider,
+      '-c',
+      'user.email=fixture@example.invalid',
+      '-c',
+      'user.name=fixture',
+      'commit',
+      '-qm',
+      'same tree',
+      '--allow-empty',
+    );
+    const newerBasis = git(checkout.provider, 'rev-parse', 'HEAD');
+    const later = run(FREEZE, [checkout.provider]);
+    if (typeof earlier !== 'object' || earlier === null || typeof later !== 'object' || later === null)
+      throw new Error('the producer fixture omitted its receipts');
+    const mixed = { 'api:build': Reflect.get(earlier, 'api:build'), 'api:native': Reflect.get(later, 'api:native') };
+    const snapshot = snapshotOf(capture(checkout, 'hit', mixed));
+    const bases = run(
+      'const s = await import(Bun.argv[1]); process.stdout.write(JSON.stringify(s.verifySnapshot(Bun.argv[2]).provenance.producers.map(({ basis }) => basis)));',
+      [RAW, join(snapshot.directory, '..', '..')],
+    );
+    expect(bases).toEqual([originalBasis, newerBasis]);
+  });
+  it('refuses a cache hit with no producer completion receipt, or one of an unknown version', () => {
+    const checkout = fixture();
+    expect(refusalOf(capture(checkout, 'no-producer'))).toContain('has no producer completion receipt');
+    expect(refusalOf(capture(checkout, 'producer-v2'))).toContain('producer receipt of unknown version 2');
+  });
+
+  it('names the same bytes anew under another production of them', () => {
+    const checkout = fixture();
+    const first = snapshotOf(capture(checkout));
+    const other = snapshotOf(capture(checkout, 'other-argv'));
+    expect(other.id).not.toBe(first.id);
+    expect(readFileSync(join(other.directory, 'dist/index.js'), 'utf8')).toBe(
+      readFileSync(join(first.directory, 'dist/index.js'), 'utf8'),
+    );
   });
 
   it('refuses a target that is not current, naming the run that makes it so', () => {

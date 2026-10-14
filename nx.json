@@ -66,7 +66,12 @@
       "options": { "env": { "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed" } }
     }
   },
-  "plugins": ["@smoothbricks/nx-plugin"],
+  "plugins": [
+    {
+      "plugin": "@smoothbricks/nx-plugin",
+      "options": { "producerReceipts": { "targets": ["lmao:build", "lmao:cargo-thread-ffi"] } }
+    }
+  ],
   "release": {
     "projects": ["tag:npm:public"],
     "projectsRelationship": "independent",

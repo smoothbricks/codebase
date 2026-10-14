@@ -316,6 +316,27 @@ describe('installed graph input identity', () => {
     expect(dependency).not.toBe(alternative);
   });
 
+  it('binds an installed dependency exposing only public subpaths, without inventing a main entry', async () => {
+    const { plugin, dependency, resolver } = await packages();
+    await mkdir(join(plugin, 'node_modules'), { recursive: true });
+    await symlink(dependency, join(plugin, 'node_modules/alias'), 'dir');
+    await writeFile(
+      join(dependency, 'package.json'),
+      JSON.stringify({ name: 'owned', version: '1', exports: { './data': './data.json' } }),
+    );
+    await writeFile(join(dependency, 'data.json'), '{"value":1}');
+    const subpaths: typeof resolver = (name, paths) => {
+      if (name === 'alias')
+        throw Object.assign(new Error('No exports main defined'), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' });
+      return resolver(name, paths);
+    };
+    const identity = () => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, subpaths, null);
+    const original = identity();
+    expect(original).not.toBeNull();
+    await writeFile(join(dependency, 'data.json'), '{"value":2}');
+    expect(identity()).not.toBe(original);
+  });
+
   it('fails loudly for unreadable required module bytes rather than publishing an installation witness', async () => {
     const { plugin, resolver } = await packages();
     const output = join(plugin, 'dist/index.js');

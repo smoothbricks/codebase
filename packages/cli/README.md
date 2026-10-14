@@ -716,16 +716,25 @@ never change a file a running consumer task resolves:
 `tooling/direnv/linked-snapshots.ts` copies the package, every provider workspace package its links reach (manifest,
 `files`, `tsconfig.json` and its relative `extends`), the provider root manifest, each native library an artifact
 module's `nativeArtifactPath({})` names, and the provider-local `node_modules/.bun` entries those packages link; links
-into Bun's global cache stay links. It refuses any other link target. Each target is probed with the read-only
-`probeBuilt`, which builds nothing, and every copied provider file must be HEAD's tracked blob or an output the probe's
-receipt inventories with the same bytes. A target that is not current, a modified or untracked source, stale output or a
-provider written to during the copy refuses with its cause, and every alias keeps its current binding. The snapshot is
-named by one SHA-256 over its census (each entry's path, type, executable bit, and bytes or link text) and its producer
-receipt (provider root, HEAD, its tree, file-input provenance, every task id and hash), sealed read-only under
+into Bun's global cache stay links. It refuses any other link target. Each target's read-only `probeBuilt` hit is a
+published canonical producer completion receipt, not a cache re-probe under the consumer's environment. The provider
+enables `producerReceipts.targets` in its Nx plugin options; actual pre/post task evidence binds committed HEAD/tree,
+clean tracked source, successful task identities including uncached prerequisites, argv, declared environment/tool
+identity, independent product output SHA-256 and wall time. The consumer validates the receipt against its declaration;
+a missing, mismatched or unbound receipt takes the graph RPC path and refuses loudly without a build. Old receipts
+without the producer contract refuse too. Every copied file must be HEAD's tracked blob or an attested public output
+with the same bytes. A modified captured source, untracked actual input, stale output or provider write during copying
+refuses and retains every alias's current binding; an unrelated untracked user file does not decide the committed tree.
+The snapshot is named by one SHA-256 over its census (path, type, executable bit and bytes or link text), producer
+root/HEAD/tree, file-input provenance, every task id/hash and the bound producer identity, sealed read-only under
 `.cache/linked-snapshots/<id>`, and never changes; a new provider state is a new snapshot. A cowshed checkout declares
 `.cache/linked-snapshots` as `[build] state`, so snapshots live on its build volume; until a refresh has linked that
 path, capture refuses and names `cowshed exec`. An unrecorded alias that already links the live checkout is reported,
 not claimed: remove it and install once to bind the snapshot.
+
+An empty commit with the same tree retains the published receipt and its original producer basis. A changed tree
+requires a new production. Multiple targets may have different basis commits for the same tree; the snapshot retains
+each actual basis rather than rewriting it to the provider's current HEAD.
 
 Declarations are applied at the end of every install. smoo's root script policy sets the root `postinstall` to
 `bun tooling/direnv/developer-links.ts`, and Bun runs root lifecycle scripts after it re-points the dependencies,

@@ -25,6 +25,7 @@ import type * as NxTaskHasher from 'nx/src/hasher/task-hasher';
 import type * as NxNative from 'nx/src/native';
 import type * as NxTransformObjects from 'nx/src/native/transform-objects';
 import type * as NxExecutionHooks from 'nx/src/project-graph/plugins/tasks-execution-hooks';
+import type * as NxProjectGraphRuntime from 'nx/src/project-graph/project-graph';
 import type * as NxProjectRootMappings from 'nx/src/project-graph/utils/find-project-for-path';
 import type * as NxCache from 'nx/src/tasks-runner/cache';
 import type * as NxCreateTaskGraph from 'nx/src/tasks-runner/create-task-graph';
@@ -38,7 +39,7 @@ import type { NxArgs } from 'nx/src/utils/command-line-utils';
 import type * as NxPackageJson from 'nx/src/utils/package-json';
 import type * as NxPerfLogging from 'nx/src/utils/perf-logging';
 import type * as NxWorkspaceRoot from 'nx/src/utils/workspace-root';
-import { boundedReceiptRuntimes, type ProviderInputProof, providerReceipt } from './ensure-built-receipt.js';
+import { boundedReceiptRuntimes, type ProviderInputProof } from './ensure-built-receipt.js';
 import {
   type ArtifactWitness,
   type GraphWitness,
@@ -54,6 +55,7 @@ import {
 } from './ensure-built-witness.js';
 import { graphInputContractIdentity } from './graph-input-contract.js';
 import { managedAssetsRoot } from './managed-assets.js';
+import { readProducerReceipt } from './producer-receipts.js';
 
 interface NxRuntimeModules {
   readonly 'nx/src/config/nx-json': typeof NxConfiguration;
@@ -63,6 +65,7 @@ interface NxRuntimeModules {
   readonly 'nx/src/native': typeof NxNative;
   readonly 'nx/src/native/transform-objects': typeof NxTransformObjects;
   readonly 'nx/src/project-graph/utils/find-project-for-path': typeof NxProjectRootMappings;
+  readonly 'nx/src/project-graph/project-graph': typeof NxProjectGraphRuntime;
   readonly 'nx/src/utils/package-json': typeof NxPackageJson;
   readonly 'nx/src/project-graph/plugins/tasks-execution-hooks': typeof NxExecutionHooks;
   readonly 'nx/src/tasks-runner/cache': typeof NxCache;
@@ -80,7 +83,7 @@ type WorkspaceNxRequire = <Specifier extends keyof NxRuntimeModules>(
   specifier: Specifier,
 ) => NxRuntimeModules[Specifier];
 
-function createWorkspaceNxRequire(workspaceRoot: string): WorkspaceNxRequire {
+export function createWorkspaceNxRequire(workspaceRoot: string): WorkspaceNxRequire {
   const requireFromWorkspace = createRequire(join(workspaceRoot, 'package.json'));
   return function requireNx<Specifier extends keyof NxRuntimeModules>(
     specifier: Specifier,
@@ -187,6 +190,50 @@ export type EnsureBuiltOutputReceipt =
       readonly sha256: string;
     };
 
+export type EnsureBuiltProducerExpandedInputs = {
+  readonly [Key in keyof NxNative.HashInputs]: readonly NxNative.HashInputs[Key][number][];
+};
+export interface EnsureBuiltProducerFileInput {
+  readonly path: string;
+  readonly mode: number;
+  readonly gitBlob: string;
+  readonly sha256: string;
+}
+export interface EnsureBuiltProducerTaskInputs {
+  readonly taskId: string;
+  readonly overrides: Readonly<Task['overrides']>;
+  readonly declared: readonly NonNullable<
+    NonNullable<ProjectGraphProjectNode['data']['targets']>[string]['inputs']
+  >[number][];
+  readonly expanded: EnsureBuiltProducerExpandedInputs;
+  readonly hashDetails: Readonly<NxNative.TaskHashDetails>;
+  readonly files: readonly EnsureBuiltProducerFileInput[];
+}
+export interface EnsureBuiltProducerTool {
+  readonly kind: 'module' | 'executable';
+  readonly name: string;
+  readonly from: string;
+  readonly path: string;
+  readonly physicalPath: string;
+  readonly missing: readonly string[];
+  readonly resolutions: readonly { readonly name: string; readonly from: string; readonly target: string | null }[];
+  /** Absolute node paths bind the physical closure, including package-owned build-volume aliases. */
+  readonly nodes: readonly EnsureBuiltOutputReceipt[];
+  readonly sha256: string;
+}
+export interface EnsureBuiltProducerReceipt {
+  readonly version: 1;
+  readonly target: string;
+  readonly argv: readonly string[];
+  readonly trackedTreeClean: true;
+  /** Declared runtime/environment identity from actual Nx completion hashes, never a consumer environment hash. */
+  readonly environmentIdentity: string;
+  readonly inputs: readonly EnsureBuiltProducerTaskInputs[];
+  readonly tools: readonly EnsureBuiltProducerTool[];
+  /** SHA-256 of the independently censused task/public-output records, never terminal output. */
+  readonly outputSha256: string;
+  readonly wallTimeMs: number;
+}
 /** Git provenance covers file inputs only; runtime/env identity remains Nx's current task hash. */
 export interface EnsureBuiltReceipt {
   readonly workspaceRoot: string;
@@ -194,6 +241,7 @@ export interface EnsureBuiltReceipt {
   readonly headTree: string;
   readonly fileInputProvenance: 'exact-file-inputs' | 'conservative-provider-source';
   readonly runtimeEnvironmentProvenance: 'nx-task-hash-only';
+  readonly producer: EnsureBuiltProducerReceipt;
   readonly tasks: readonly {
     readonly id: string;
     readonly hash: string;
@@ -684,7 +732,11 @@ type PreparedWorkspaceProbe =
   | ReadyWorkspaceProbe
   | { readonly kind: 'no-daemon'; readonly reason: Extract<MissReason, { kind: 'no-daemon' }> };
 
-async function prepareWorkspaceProbe(workspaceRoot: string, selector: TargetSelector): Promise<PreparedWorkspaceProbe> {
+async function prepareWorkspaceProbe(
+  workspaceRoot: string,
+  selector: TargetSelector,
+  forceGraphRpc = false,
+): Promise<PreparedWorkspaceProbe> {
   const taskId = selectorTaskId(selector);
   // This explicit fallback path loads no Nx. The build operation may run the
   // checkout-local CLI; the read-only operation can only report the miss.
@@ -716,7 +768,7 @@ async function prepareWorkspaceProbe(workspaceRoot: string, selector: TargetSele
   setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
 
   performance.mark('ensureBuilt:graph:start');
-  const projectGraph = await currentProjectGraph(workspaceRoot, nxJson, requireNx);
+  const projectGraph = await currentProjectGraph(workspaceRoot, nxJson, requireNx, forceGraphRpc);
   nxJson = readNxJson();
   requireProject(projectGraph, selector.project);
   const taskGraph = createTaskGraph(
@@ -784,64 +836,31 @@ async function buildPreparedTarget(
 }
 
 async function probeBuiltInWorkspace(workspaceRoot: string, selector: TargetSelector): Promise<EnsureBuiltProbeResult> {
-  const prepared = await prepareWorkspaceProbe(workspaceRoot, selector);
-  if (prepared.kind === 'no-daemon') return { disposition: 'miss', reason: prepared.reason };
-  const probeSource = captureProbeSource(workspaceRoot, prepared.requireNx);
-  return withTaskHooks(workspaceRoot, selector, prepared, async (root, selected, current) => {
-    const { nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx } = current;
-    const taskId = selectorTaskId(selected);
-    performance.mark('ensureBuilt:probe:start');
-    const reason =
-      missBeforeProbe(process.env, taskId) ??
-      (await probe(root, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx, true));
-    performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
-    if (reason !== null) return { disposition: 'miss', reason } satisfies EnsureBuiltProbeResult;
-    let result = providerReceipt(
-      root,
-      taskId,
-      tasks,
-      providerInputProof(root, nxJson, projectGraph, taskGraph, requireNx),
-      requireNx('nx/src/native').expandOutputs,
-    );
-    if (result.disposition === 'hit') {
-      const after = captureProbeSource(root, requireNx);
-      if (!snapshotsEqual(probeSource, after) || !nodesUnchanged(probeSource.nodes)) {
-        result = {
-          disposition: 'failed',
-          reason: {
-            kind: 'provider-proof',
-            taskId,
-            workspaceRoot: root,
-            detail: 'Provider source nodes or membership moved across Nx hashing/receipt capture',
-          },
-          exitCode: 1,
-          signal: null,
-        };
-      }
-    }
-    if (result.disposition === 'failed') {
-      process.stderr.write(`probeBuilt: ${result.reason.workspaceRoot}: ${result.reason.detail}\n`);
-    }
-    return result;
-  });
+  const taskId = selectorTaskId(selector);
+  const receipt = readProducerReceipt(workspaceRoot, taskId);
+  if (receipt.ok) return { disposition: 'hit', receipt: receipt.value };
+  // A failed publication proof asks Nx for the authoritative generation, but
+  // never hashes against the consumer environment or starts a provider runner.
+  const prepared = await prepareWorkspaceProbe(workspaceRoot, selector, true);
+  const detail =
+    prepared.kind === 'no-daemon'
+      ? `${receipt.detail}; authoritative graph unavailable: ${describeMiss(prepared.reason)}`
+      : receipt.detail;
+  process.stderr.write(`probeBuilt: ${workspaceRoot}: ${taskId}: ${detail}\n`);
+  return {
+    disposition: 'failed',
+    reason: { kind: 'provider-proof', taskId, workspaceRoot, detail },
+    exitCode: 1,
+    signal: null,
+  };
 }
 
-function captureProbeSource(
-  workspaceRoot: string,
-  requireNx: WorkspaceNxRequire,
-): ReturnType<typeof workspaceSnapshot> {
-  const { WorkspaceContext } = requireNx('nx/src/native');
-  const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
-  const data = workspaceDataDirectoryForWorkspace(workspaceRoot);
-  const previous = readGraphWitness(join(data, 'ensure-built-graph.json'));
-  return workspaceSnapshot(workspaceRoot, new WorkspaceContext(workspaceRoot, data), previous?.snapshot);
-}
 /** Nx's native plan is the FILE selection oracle, not a second glob planner.
  * Config identities skipped by the inspector are included explicitly. A
  * runtime identity is bounded only by the owning toolchain recipe + a declared
  * pin; opaque commands and unavailable native proof categorically refuse.
  */
-function providerInputProof(
+export function providerInputProof(
   workspaceRoot: string,
   nxJson: NxJsonConfiguration,
   projectGraph: ProjectGraph,
@@ -1002,6 +1021,7 @@ async function currentProjectGraph(
   workspaceRoot: string,
   nxJson: NxJsonConfiguration,
   requireNx: WorkspaceNxRequire,
+  forceGraphRpc: boolean,
 ): Promise<ProjectGraph> {
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
   const { WorkspaceContext } = requireNx('nx/src/native');
@@ -1032,7 +1052,7 @@ async function currentProjectGraph(
   const cached = nodesUnchanged(before.nodes)
     ? reusableGraph(witness, workspaceRoot, environment, installation, before)
     : null;
-  if (cached !== null) return cached;
+  if (!forceGraphRpc && cached !== null) return cached;
   const { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
   const after = workspaceSnapshot(workspaceRoot, new WorkspaceContext(workspaceRoot, data), before);
   const finalInstallation = graphInstallationIdentity(

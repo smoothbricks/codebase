@@ -12,13 +12,19 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { FileData, WorkspaceContext } from 'nx/src/native';
-import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
+import type { PackageJson, readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
 import typia from 'typia';
 import type { GraphInputContractProof } from './graph-input-contract.js';
+
+interface InstalledPackageManifest {
+  readonly path: string;
+  readonly packageJson: PackageJson;
+}
 
 /** Identity of a previously read node, not a timestamp freshness threshold. */
 export function nodeStamp(stats: BigIntStats): string {
@@ -152,10 +158,16 @@ export function graphInstallationIdentity(
   nxJson: NxJsonConfiguration,
   resolvePackage: typeof readModulePackageJsonWithoutFallbacks,
   localInputs: GraphInputContractProof | null,
+  onUnproved?: (detail: string) => void,
 ): string | null {
   const plugins = (nxJson.plugins ?? []).map((plugin) => (typeof plugin === 'string' ? plugin : plugin.plugin));
-  if (plugins.some((plugin) => plugin !== '@smoothbricks/nx-plugin' && !localInputs?.plugins.includes(plugin)))
+  const unproved = plugins.filter(
+    (plugin) => plugin !== '@smoothbricks/nx-plugin' && !localInputs?.plugins.includes(plugin),
+  );
+  if (unproved.length > 0) {
+    onUnproved?.(`Unproved configured graph plugins: ${unproved.join(', ')}`);
     return null;
+  }
   const nodes: NodeWitness[] = [];
   const files: { path: string; sha256: string }[] = [];
   const buffer = Buffer.allocUnsafe(64 * 1024);
@@ -190,10 +202,29 @@ export function graphInstallationIdentity(
       files.push({ path, sha256: hash.digest('hex') });
     }
   }
-  function visit(name: string, from: string, optional: boolean): void {
-    let resolved: ReturnType<typeof readModulePackageJsonWithoutFallbacks>;
+  function installedManifest(name: string, from: string): InstalledPackageManifest {
     try {
-      resolved = resolvePackage(name, [from]);
+      return resolvePackage(name, [from]);
+    } catch (original) {
+      if (systemError(original) && ['EACCES', 'EPERM', 'EIO'].includes(original.code)) throw original;
+      // A package may expose only subpaths: its dependency declaration still owns its installed manifest and files.
+      for (const directory of createRequire(join(from, 'package.json')).resolve.paths(name) ?? []) {
+        const path = join(directory, name, 'package.json');
+        try {
+          const packageJson = typia.json.assertParse<PackageJson>(readFileSync(path, 'utf8'));
+          return { path, packageJson };
+        } catch (error) {
+          if (systemError(error) && ['ENOENT', 'ENOTDIR'].includes(error.code)) continue;
+          throw error;
+        }
+      }
+      throw original;
+    }
+  }
+  function visit(name: string, from: string, optional: boolean): void {
+    let resolved: InstalledPackageManifest;
+    try {
+      resolved = installedManifest(name, from);
     } catch (error) {
       if (optional && systemError(error) && error.code === 'MODULE_NOT_FOUND') {
         resolutions.push([from, name, null]);
@@ -226,14 +257,19 @@ export function graphInstallationIdentity(
       visit(name, workspaceRoot, false);
     for (const input of localInputs?.packages ?? []) visit(input.name, input.from, false);
     visit('typescript', workspaceRoot, true);
-    return nodesUnchanged(nodes)
-      ? JSON.stringify({ resolutions, nodes, files, localInputs: localInputs?.identity ?? null })
-      : null;
+    if (!nodesUnchanged(nodes)) {
+      onUnproved?.('Installed module nodes changed during inspection');
+      return null;
+    }
+    return JSON.stringify({ resolutions, nodes, files, localInputs: localInputs?.identity ?? null });
   } catch (error) {
     if (systemError(error) && ['EACCES', 'EPERM', 'EIO'].includes(error.code)) throw error;
     // Installation uncertainty disables only graph reuse. Nx's authoritative
     // RPC remains responsible for diagnosing invalid plugin installations.
-    if (error instanceof Error) return null;
+    if (error instanceof Error) {
+      onUnproved?.(error.message);
+      return null;
+    }
     throw error;
   }
 }
