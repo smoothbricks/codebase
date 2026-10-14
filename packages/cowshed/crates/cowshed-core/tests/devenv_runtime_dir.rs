@@ -234,10 +234,16 @@ async fn host_controller_shell_activation_owns_a_runtime_directory_the_profile_l
 }
 
 fn install_real_tool(sandbox: &SandboxConfig, name: &str) {
-    let installed = std::env::split_paths(&std::env::var_os("PATH").expect("host PATH"))
-        .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
-        .unwrap_or_else(|| panic!("required runtime tool `{name}` is not on PATH"));
+    // PATH may start with the jobserver launcher; CARGO names the real driver.
+    let installed = match name {
+        "cargo" => PathBuf::from(
+            std::env::var_os("CARGO").expect("Cargo publishes its real compiler driver"),
+        ),
+        _ => std::env::split_paths(&std::env::var_os("PATH").expect("host PATH"))
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("required runtime tool `{name}` is not on PATH")),
+    };
     let installed = std::fs::canonicalize(installed).expect("resolve runtime tool");
     std::os::unix::fs::symlink(
         installed,
