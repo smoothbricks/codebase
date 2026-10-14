@@ -240,6 +240,20 @@ physical resizing, read-only mounts and legacy-image conversion remain native-ho
 `/private/tmp/cowshed-dtest-<pid>-<n>-<label>` and share process cleanup with the image fixtures, but neither their
 setup nor their cleanup enumerates or releases disk images.
 
+Cargo lifecycle fixtures discover the real toolchain behind the installed launcher using its absolute executable PATH
+entries and canonical-identity exclusion (03_caches.md, "The `cargo` jobserver launcher"; 05_gateway.md, "The installed
+cowshed"). The compiler belongs beside that real Cargo, never beside the cowshed wrapper. Cargo lock fixtures still
+invoke ambient `cargo`: after build-script readiness they independently report its parent PID and Cargo executable,
+check those against the kernel executable/argv and launcher parent edge, retain its kernel process group, and match the
+lock refusal to that actual Cargo process, not the entry launcher's PID. An observed FIFO is checked as a live kernel
+FIFO. A direct test-binary run outside inherited budget variables additionally compares the fixture checkout's actual
+held gateway grant with its reported count, then proves the FIFO and checkout grant are released when Cargo ends; an
+inherited count alone is never a grant claim (05_gateway.md, "Host CPU budget", "The jobserver run"). Existing profile
+locks, the newly-created-profile control, seed preservation and native/Directory lifecycle oracles remain unchanged
+(16_build_volumes.md, "Targets and seeds"). The native build-volume holder subprocess uses `--nocapture --quiet` so
+inherited single-thread libtest formatting cannot prefix its actual-PID record. Its kernel-holder, forced-release
+diagnostics, checkout-label ownership and reclamation assertions remain exact.
+
 Directory build-state freshness uses observed filesystem change times, not synthetic wall-clock marks. If a listed child
 or subtree disappears during a live scan, the nearest surviving ancestor records that removal; the root uses its
 modification time so binding renames do not count as build writes. A missing root still refuses, and other I/O errors
