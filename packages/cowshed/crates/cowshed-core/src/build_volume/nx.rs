@@ -1574,7 +1574,7 @@ mod tests {
         let sub = root.join("checkout/sub");
         fs::create_dir_all(&sub).unwrap();
         let sibling = scratch("tree-holders-sibling");
-        let mut child = std::process::Command::new("/bin/sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("30")
             .current_dir(&sub)
             .spawn_locked()
