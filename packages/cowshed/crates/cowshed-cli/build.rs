@@ -18,7 +18,10 @@ fn main() {
     );
     // `logs/HEAD` grows with every commit, checkout and rebase, which the symbolic `HEAD` file
     // does not: a release build is remade when the commit it records changes.
-    if let Some(git_directory) = git(&manifest_directory, &["rev-parse", "--absolute-git-dir"]) {
+    if let Some(git_directory) = git(
+        &manifest_directory,
+        &["rev-parse", "--path-format=relative", "--git-dir"],
+    ) {
         println!("cargo:rerun-if-changed={git_directory}/HEAD");
         println!("cargo:rerun-if-changed={git_directory}/logs/HEAD");
     }

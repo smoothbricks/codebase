@@ -149,20 +149,23 @@ jobs need from the path it started from. A failed prune is reported on stderr an
 
 **Build records and downgrades.** A release build records the commit `HEAD` names and that commit's committer time
 (`build.rs`: `COWSHED_BUILD_COMMIT`, `COWSHED_BUILD_COMMIT_TIME`); the time is read from that one commit, so a shallow
-clone records it too. A debug build, and a build made where git cannot answer (a source archive, a nix build), records
-nothing. The installing build writes its record beside its stored copy, so the installed build's record is read from a
-file and nothing is executed to learn it; a record that cannot be written is said on stderr and does not fail the
-install. An install that would replace the installed build is refused when the installed build has a record and the
-candidate's commit time is older, or the candidate records nothing (it cannot show it is not older). Equal commit times
-are not ordered, so neither is older; the same bytes are never a downgrade of themselves; an installed build with no
-record — installed before records existed, or the plain binary of the old layout — is never an obstacle. The refusal is
-`Conflict` naming the binary it would have installed and both builds (`commit <12 hex>, committed <RFC 3339 UTC>`), with
-the hint "run `cowshed setup` from a build of a newer commit; `cowshed setup --downgrade` from this build installs it
-anyway". `setup` reports it once for the gateway and the CLI, repairs everything else, and exits non-zero with that
-`Conflict`; `gateway start` refuses before it installs anything. `setup --downgrade` installs the invoking build anyway,
-and is valid only for a run that installs: not with `--uninstall`, `--force` or `--mount-root`. An unreadable installed
-record is `Integrity`. This exists because twice a `cowshed setup` run through a launcher that resolved to a stale
-checkout build put back a gateway without a landed feature, and nothing said so.
+clone records it too. Its Git HEAD/reflog watch paths are emitted relative to the build-script manifest directory, so a
+warm Cargo target clone follows its own repository rather than retaining an absolute watch on its donor. The owner
+script directive control and a real warm Cargo clone pin this boundary. A debug build, and a build made where git cannot
+answer (a source archive, a nix build), records nothing. The installing build writes its record beside its stored copy,
+so the installed build's record is read from a file and nothing is executed to learn it; a record that cannot be written
+is said on stderr and does not fail the install. An install that would replace the installed build is refused when the
+installed build has a record and the candidate's commit time is older, or the candidate records nothing (it cannot show
+it is not older). Equal commit times are not ordered, so neither is older; the same bytes are never a downgrade of
+themselves; an installed build with no record — installed before records existed, or the plain binary of the old layout
+— is never an obstacle. The refusal is `Conflict` naming the binary it would have installed and both builds
+(`commit <12 hex>, committed <RFC 3339 UTC>`), with the hint "run `cowshed setup` from a build of a newer commit;
+`cowshed setup --downgrade` from this build installs it anyway". `setup` reports it once for the gateway and the CLI,
+repairs everything else, and exits non-zero with that `Conflict`; `gateway start` refuses before it installs anything.
+`setup --downgrade` installs the invoking build anyway, and is valid only for a run that installs: not with
+`--uninstall`, `--force` or `--mount-root`. An unreadable installed record is `Integrity`. This exists because twice a
+`cowshed setup` run through a launcher that resolved to a stale checkout build put back a gateway without a landed
+feature, and nothing said so.
 
 **Uninstall.** `setup --uninstall` and `gateway stop --purge` remove, after the agent is gone, the stable name first (so
 nothing launchd could start dangles), then every stored copy with its `.build` record, and every `cowshed` on `PATH`
