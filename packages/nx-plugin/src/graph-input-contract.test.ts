@@ -8,6 +8,7 @@ import {
   mkdtemp,
   readFile,
   realpath,
+  rename,
   rm,
   stat,
   symlink,
@@ -17,7 +18,7 @@ import {
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { WorkspaceContext } from 'nx/src/native';
+import { expandOutputs, WorkspaceContext } from 'nx/src/native';
 import { graphInstallationIdentity, workspaceSnapshot } from './ensure-built-witness.js';
 import {
   type GraphInputContract,
@@ -141,8 +142,8 @@ describe('owner-approved local graph contracts', () => {
   it('feeds the complete proof into installed package/alias identity and rejects a missing local proof', () => {
     const proof = identity();
     const resolver = () => ({ path: join(root, 'package.json'), packageJson: { name: 'fixture', version: '1' } });
-    expect(graphInstallationIdentity(root, configured(), resolver, null)).toBeNull();
-    expect(graphInstallationIdentity(root, configured(), resolver, proof)).not.toBeNull();
+    expect(graphInstallationIdentity(root, configured(), resolver, expandOutputs, null)).toBeNull();
+    expect(graphInstallationIdentity(root, configured(), resolver, expandOutputs, proof)).not.toBeNull();
   });
 });
 
@@ -175,6 +176,44 @@ describe('owning-reader external input byproducts', () => {
     const native = reader();
     native.finish();
     await writeFile(join(root, 'new-project.json'), '{}');
+    expect(identity('tsconfig-extends')).toBeNull();
+  });
+  it('keeps unrelated sibling writes outside both scopes and upgrades a read directory to namespace evidence', async () => {
+    const probe = reader();
+    const path = join(external, 'base.json');
+    probe.read(path, () => '{"include":["src"]}');
+    // The prior file read saw this directory only as an ancestor; traversal upgrades it.
+    probe.namespace(external);
+    expect(probe.finish().status).toBe('complete');
+    const before = identity('tsconfig-extends');
+    expect(before).not.toBeNull();
+    const sibling = `${root}-unrelated`;
+    try {
+      await writeFile(sibling, 'outside both the workspace and the external read scope');
+      expect(identity('tsconfig-extends')).toEqual(before);
+      await writeFile(join(external, 'new-member.json'), '{}');
+      expect(identity('tsconfig-extends')).toBeNull();
+    } finally {
+      await rm(sibling, { force: true });
+    }
+  });
+  it('revokes replacement of a real ancestor even when its hardlinked leaf stays identical', async () => {
+    const first = join(external, 'first');
+    const second = join(external, 'second');
+    await mkdir(first);
+    await mkdir(second);
+    const path = join(first, 'base.json');
+    await writeFile(path, '{}');
+    await link(path, join(second, 'base.json'));
+    const probe = reader();
+    probe.read(path, () => '{}');
+    expect(probe.finish().status).toBe('complete');
+    expect(identity('tsconfig-extends')).not.toBeNull();
+    const before = await stat(path);
+    await rename(first, join(external, 'old-first'));
+    await rename(second, first);
+    expect((await stat(path)).ino).toBe(before.ino);
+    expect(await readFile(path, 'utf8')).toBe('{}');
     expect(identity('tsconfig-extends')).toBeNull();
   });
   it('does not re-arm an old trace after a write/revert or an explicitly unproved reader', async () => {

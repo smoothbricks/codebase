@@ -66,7 +66,7 @@ export type GraphInputReadWitness =
       readonly status: 'complete';
       readonly nativeIdentity: string;
       readonly nativeNodes: readonly NodeWitness[];
-      readonly nodes: readonly NodeWitness[];
+      readonly nodes: readonly GraphInputNodeWitness[];
       readonly missing: readonly string[];
       readonly resolutions: readonly ResolutionWitness[];
       readonly tools: readonly ToolWitness[];
@@ -93,6 +93,28 @@ function nativeIdentity(files: readonly FileData[]): string {
     ),
   );
 }
+/** Ancestors prove path binding; only a read directory's membership belongs to the input closure. */
+interface GraphInputNodeWitness extends NodeWitness {
+  readonly scope: 'path' | 'node';
+}
+
+function pathStamp(stats: BigIntStats): string {
+  return `${stats.dev}:${stats.ino}:${stats.mode}`;
+}
+
+function readNodesUnchanged(nodes: readonly GraphInputNodeWitness[]): boolean {
+  for (const node of nodes) {
+    try {
+      const stats = lstatSync(node.path, { bigint: true });
+      if ((node.scope === 'path' ? pathStamp(stats) : nodeStamp(stats)) !== node.stamp) return false;
+    } catch (error) {
+      if (systemError(error)) return false;
+      throw error;
+    }
+  }
+  return true;
+}
+
 function workspaceRequire(root: string): NodeRequire {
   return createRequire(join(root, 'package.json'));
 }
@@ -145,7 +167,7 @@ export class GraphInputReadCollector {
   private readonly contract: GraphInputContract | null;
   private readonly before: WorkspaceSnapshot | undefined;
   private readonly environment: string | undefined;
-  private readonly nodes = new Map<string, NodeWitness>();
+  private readonly nodes = new Map<string, GraphInputNodeWitness>();
   private readonly missing = new Set<string>();
   private readonly resolutions: ResolutionWitness[] = [];
   private readonly tools = new Map<ToolWitness['name'], ToolWitness>();
@@ -193,8 +215,8 @@ export class GraphInputReadCollector {
   file(path: string): void {
     this.protect(() => this.observe(resolve(path)));
   }
-  private observe(path: string): void {
-    // A retargeted ancestor can preserve the leaf inode and bytes; bind the resolution namespace first.
+  private observe(path: string, membership = false): void {
+    // Every ancestor binds the path, without treating unrelated siblings as reads.
     const parent = dirname(path);
     if (parent !== path && !this.nodes.has(parent) && !this.missing.has(parent)) this.observe(parent);
     let stats: BigIntStats;
@@ -207,11 +229,13 @@ export class GraphInputReadCollector {
       }
       throw error;
     }
-    const stamp = nodeStamp(stats);
     const previous = this.nodes.get(path);
-    if (previous !== undefined && previous.stamp !== stamp) this.refuse(`input changed during read: ${path}`);
-    this.nodes.set(path, { path, stamp });
-    if (stats.isSymbolicLink()) this.observe(realpathSync(path));
+    const scope = previous?.scope === 'node' || !stats.isDirectory() || membership ? 'node' : 'path';
+    const stamp = scope === 'path' ? pathStamp(stats) : nodeStamp(stats);
+    if (previous !== undefined && previous.stamp !== (previous.scope === scope ? stamp : pathStamp(stats)))
+      this.refuse(`input changed during read: ${path}`);
+    if (previous === undefined || previous.scope !== scope) this.nodes.set(path, { path, scope, stamp });
+    if (stats.isSymbolicLink()) this.observe(realpathSync(path), membership);
     else if (stats.isFile()) accessSync(path, constants.R_OK);
     else if (!stats.isDirectory()) this.refuse(`unproved filesystem node: ${path}`);
   }
@@ -226,7 +250,7 @@ export class GraphInputReadCollector {
   /** The whole immediate candidate directory, including absent/alternative extensions and alias nodes. */
   directory(path: string): void {
     this.protect(() => {
-      this.observe(resolve(path));
+      this.observe(resolve(path), true);
       if (this.missing.has(resolve(path))) return;
       for (const name of readdirSync(path).sort()) this.observe(join(path, name));
     });
@@ -236,7 +260,7 @@ export class GraphInputReadCollector {
     this.protect(() => this.walk(resolve(path)));
   }
   private walk(path: string): void {
-    this.observe(path);
+    this.observe(path, true);
     if (this.missing.has(path)) return;
     const physical = realpathSync(path);
     if (this.scanned.has(physical)) return;
@@ -388,7 +412,7 @@ export class GraphInputReadCollector {
         !after.stable ||
         nativeIdentity(after.files) !== nativeIdentity(this.before.files) ||
         !nodesUnchanged(this.before.nodes) ||
-        !nodesUnchanged([...this.nodes.values()])
+        !readNodesUnchanged([...this.nodes.values()])
       )
         this.refuse('graph inputs changed during the owning reader');
       if (environmentIdentity(this.workspaceRoot) !== this.environment)
@@ -520,7 +544,7 @@ export function graphInputContractIdentity(
           witness.nativeIdentity !== nativeIdentity(snapshot.files) ||
           witness.environmentIdentity !== environmentIdentity(root) ||
           !nodesUnchanged(witness.nativeNodes) ||
-          !nodesUnchanged(witness.nodes) ||
+          !readNodesUnchanged(witness.nodes) ||
           !missingStillMissing(witness.missing)
         )
           return null;
@@ -563,7 +587,7 @@ export function graphInputContractIdentity(
         }
         if (
           !nodesUnchanged(witness.nativeNodes) ||
-          !nodesUnchanged(witness.nodes) ||
+          !readNodesUnchanged(witness.nodes) ||
           !missingStillMissing(witness.missing)
         )
           return null;

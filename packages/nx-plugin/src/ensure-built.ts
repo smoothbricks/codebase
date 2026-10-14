@@ -957,6 +957,7 @@ export function providerInputProof(
     workspaceRoot,
     nxJson,
     requireNx('nx/src/utils/package-json').readModulePackageJson,
+    requireNx('nx/src/native').expandOutputs,
     graphInputContractIdentity(
       workspaceRoot,
       nxJson,
@@ -1024,7 +1025,7 @@ async function currentProjectGraph(
   forceGraphRpc: boolean,
 ): Promise<ProjectGraph> {
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
-  const { WorkspaceContext } = requireNx('nx/src/native');
+  const { WorkspaceContext, expandOutputs } = requireNx('nx/src/native');
   const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
   const packageResolution = requireNx('nx/src/utils/package-json');
   const data = workspaceDataDirectoryForWorkspace(workspaceRoot);
@@ -1047,6 +1048,7 @@ async function currentProjectGraph(
     workspaceRoot,
     nxJson,
     packageResolution.readModulePackageJson,
+    expandOutputs,
     graphInputContractIdentity(workspaceRoot, nxJson, before),
   );
   const cached = nodesUnchanged(before.nodes)
@@ -1059,6 +1061,7 @@ async function currentProjectGraph(
     workspaceRoot,
     nxJson,
     packageResolution.readModulePackageJson,
+    expandOutputs,
     graphInputContractIdentity(workspaceRoot, nxJson, after),
   );
   const stableGeneration = snapshotsEqual(before, after) && nodesUnchanged(before.nodes);

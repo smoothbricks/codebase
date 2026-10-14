@@ -13,10 +13,10 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
-import type { FileData, WorkspaceContext } from 'nx/src/native';
+import type { expandOutputs, FileData, WorkspaceContext } from 'nx/src/native';
 import type { PackageJson, readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
 import typia from 'typia';
 import type { GraphInputContractProof } from './graph-input-contract.js';
@@ -157,6 +157,7 @@ export function graphInstallationIdentity(
   workspaceRoot: string,
   nxJson: NxJsonConfiguration,
   resolvePackage: typeof readModulePackageJsonWithoutFallbacks,
+  expand: typeof expandOutputs,
   localInputs: GraphInputContractProof | null,
   onUnproved?: (detail: string) => void,
 ): string | null {
@@ -174,7 +175,8 @@ export function graphInstallationIdentity(
   const resolutions: [string, string, string | null][] = [];
   const visited = new Set<string>();
   const declaredDirectoryLinks = new Set<string>();
-  function walk(path: string): void {
+  const expandedRoots = new Set<string>();
+  function walk(path: string, selected?: ReadonlySet<string>): void {
     const stats = lstatSync(path, { bigint: true });
     nodes.push({ path, stamp: nodeStamp(stats) });
     if (stats.isSymbolicLink()) {
@@ -184,8 +186,16 @@ export function graphInstallationIdentity(
       }
       walk(physical);
     } else if (stats.isDirectory()) {
+      const visible = expandedRoots.has(path) ? undefined : selected;
       for (const name of readdirSync(path).sort()) {
-        if (name !== 'node_modules' && name !== '.git' && name !== '.nx') walk(join(path, name));
+        const child = join(path, name);
+        if (
+          name !== 'node_modules' &&
+          name !== '.git' &&
+          name !== '.nx' &&
+          (visible === undefined || visible.has(child))
+        )
+          walk(child, visible);
       }
     } else if (!stats.isFile()) {
       throw new Error(`Unproved graph package node: ${path}`);
@@ -238,10 +248,59 @@ export function graphInstallationIdentity(
     visited.add(physical);
     const packageRoot = dirname(physical);
     const manifest = resolved.packageJson;
-    // A package-owned published dist lane may live on its build volume. Its
-    // link node and every physical target node remain part of this proof.
-    if (manifest.files?.includes('dist')) declaredDirectoryLinks.add(join(packageRoot, 'dist'));
-    walk(packageRoot);
+    // Explicit publication owns this tree; unknown declarations keep the conservative full census.
+    if (manifest.files !== undefined && manifest.files.length > 0) {
+      const patterns = manifest.files.map((pattern) => {
+        const negative = pattern.startsWith('!');
+        const relativePattern = (negative ? pattern.slice(1) : pattern).replace(/^\/+/u, '') || '.';
+        return negative ? `!${relativePattern}` : relativePattern;
+      });
+      const declared = new Set<string>();
+      const literal = (pattern: string) => !/[*?[\]{}]/u.test(pattern);
+      const validate = (entry: string) => {
+        if (isAbsolute(entry) || entry.split(/[\\/]/u).includes('..'))
+          throw new Error(`Published graph package path escapes its owner: ${entry}`);
+      };
+      const addDeclaration = (entry: string) => {
+        validate(entry);
+        if (literal(entry)) {
+          const absolute = resolve(packageRoot, entry);
+          declared.add(absolute);
+          declaredDirectoryLinks.add(absolute);
+        }
+      };
+      for (const pattern of patterns) {
+        validate(pattern.startsWith('!') ? pattern.slice(1) : pattern);
+        if (!pattern.startsWith('!')) addDeclaration(pattern);
+      }
+      const exported = (value: unknown): void => {
+        if (typeof value === 'string') {
+          if (value.startsWith('./')) {
+            patterns.push(value);
+            addDeclaration(value);
+          }
+        } else if (Array.isArray(value)) {
+          for (const entry of value) exported(entry);
+        } else if (typeof value === 'object' && value !== null) {
+          for (const entry of Object.values(value)) exported(entry);
+        }
+      };
+      exported(manifest.exports);
+      const selected = new Set<string>([packageRoot]);
+      const select = (entry: string) => {
+        validate(entry);
+        for (let path = resolve(packageRoot, entry); path !== packageRoot; path = dirname(path)) selected.add(path);
+      };
+      select('package.json');
+      for (const path of declared) select(relative(packageRoot, path));
+      for (const path of expand(packageRoot, patterns)) {
+        select(path);
+        expandedRoots.add(resolve(packageRoot, path));
+      }
+      walk(packageRoot, selected);
+    } else {
+      walk(packageRoot);
+    }
     const dependencies = { ...manifest.peerDependencies, ...manifest.dependencies, ...manifest.optionalDependencies };
     for (const dependency of Object.keys(dependencies).sort()) {
       visit(
@@ -257,9 +316,11 @@ export function graphInstallationIdentity(
       visit(name, workspaceRoot, false);
     for (const input of localInputs?.packages ?? []) visit(input.name, input.from, false);
     visit('typescript', workspaceRoot, true);
-    if (!nodesUnchanged(nodes)) {
-      onUnproved?.('Installed module nodes changed during inspection');
-      return null;
+    for (const node of nodes) {
+      if (nodeStamp(lstatSync(node.path, { bigint: true })) !== node.stamp) {
+        onUnproved?.(`Installed module node changed during inspection: ${node.path}`);
+        return null;
+      }
     }
     return JSON.stringify({ resolutions, nodes, files, localInputs: localInputs?.identity ?? null });
   } catch (error) {

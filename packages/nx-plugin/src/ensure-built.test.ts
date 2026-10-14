@@ -720,7 +720,7 @@ describe('smoo-nx-exec without a daemon', () => {
 const FIXTURE_NX_JSON = {
   useDaemonProcess: true,
   cacheDirectory: '.nx/cache',
-  plugins: [{ plugin: '@smoothbricks/nx-plugin', options: { producerReceipts: { targets: ['app:build'] } } }],
+  plugins: ['@smoothbricks/nx-plugin'],
 };
 
 /**
@@ -731,7 +731,7 @@ const FIXTURE_NX_JSON = {
  * outside the workspace: a log inside it would be an undeclared output the
  * snapshot diff rightly reports as a changed input.
  */
-async function writeTwoProjectWorkspace(workspace: string, builds: string): Promise<void> {
+async function writeTwoProjectWorkspace(workspace: string, builds: string, publishReceipts = false): Promise<void> {
   // Cowshed's scratch is ignored by its enclosing Git checkout. This is an
   // independent Nx workspace: its own Git boundary keeps the daemon's
   // ignore-aware watcher from dropping all of its source changes.
@@ -741,7 +741,13 @@ async function writeTwoProjectWorkspace(workspace: string, builds: string): Prom
   await mkdir(join(workspace, 'packages', 'lib'), { recursive: true });
   // The repository's own node_modules, so the fixture resolves the Nx this package is written against.
   await symlink(join(repoRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
-  await writeFile(join(workspace, 'nx.json'), JSON.stringify(FIXTURE_NX_JSON));
+  const nxJson = publishReceipts
+    ? {
+        ...FIXTURE_NX_JSON,
+        plugins: [{ plugin: '@smoothbricks/nx-plugin', options: { producerReceipts: { targets: ['app:build'] } } }],
+      }
+    : FIXTURE_NX_JSON;
+  await writeFile(join(workspace, 'nx.json'), JSON.stringify(nxJson));
   await writeFile(
     join(workspace, 'packages', 'lib', 'project.json'),
     JSON.stringify({
@@ -938,28 +944,18 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
     );
   });
 
-  it('replays current outputs and refreshes stale snapshots without running unrelated edits', async () => {
-    // A socket path has a 95 character budget and macOS's temp directory spends most of it, so the
-    // socket directory is made in the short socket namespace the sandbox admits.
-    const socketDir = await ownedSocketDirectory('eb-sock-', NX_LONGEST_SOCKET_NAME);
-    let root = '';
-    let failure: { readonly error: unknown } | null = null;
-    const providerDirectories: string[] = [];
+  // Publication is opt-in only for the receipt case. Graph/exec probes below
+  // keep ordinary plugin hooks but have no producer source/tool prepass.
+  it('publishes real completion receipts and reuses their original basis for the same tree', async () => {
+    let providerSockets: string | null = null;
     try {
       await withNxFixture(
-        'ensure-built-daemon-',
-        async (fixture) => {
-          root = fixture.root;
-          const { workspace } = fixture;
+        'ensure-built-producer-',
+        async ({ root, workspace }) => {
           const builds = join(root, 'lib-builds.log');
-          await writeTwoProjectWorkspace(workspace, builds);
-          // What the provider binds for this workspace when the call is entered from another one's shell.
-          const providerSockets = providerSocketDirectory(workspace);
-          if (providerSockets !== null) providerDirectories.push(providerSockets);
+          await writeTwoProjectWorkspace(workspace, builds, true);
+          providerSockets = providerSocketDirectory(workspace);
           const ownEnv: Record<string, string> = providerSockets === null ? {} : { NX_SOCKET_DIR: providerSockets };
-
-          // Built by daemonless Nx, as CI or a restarted daemon leaves a tree:
-          // cached and on disk, recorded by no daemon.
           const built = await run(
             'node',
             nxEntry,
@@ -969,43 +965,6 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
           );
           expect(built.code, built.stdout + built.stderr).toBe(0);
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
-
-          // Entered from outside the root by a shell set up for another
-          // workspace, as a managed devenv's is: its socket directory belongs to
-          // that workspace's daemon, and a second daemon listening there would
-          // take the socket from it.
-          const caller = join(root, 'caller');
-          await mkdir(caller);
-          const hit = await run(
-            'bun',
-            binEntry,
-            caller,
-            ['app:build', '--workspace-root', workspace, '--', join(workspace, 'report')],
-            { NX_DAEMON: 'true', NX_USE_LOCAL: 'true', NX_SOCKET_DIR: socketDir },
-          );
-          expect(hit.code, hit.stdout + hit.stderr).toBe(0);
-          expect(hit.stderr).toBe('');
-          expect(hit.stdout.split('\n')[0], hit.stdout).toBe(MARKER);
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
-          expect(await readdir(socketDir)).toEqual([]);
-          const record = await readFile(join(workspace, '.nx', 'workspace-data', 'd', 'server-process.json'), 'utf-8');
-          expect(record).not.toContain(socketDir);
-          // The daemon it started binds in the directory the provider named, not the caller's nor Nx's default.
-          const daemon = typia.json.assertParse<DaemonProcessJson>(record);
-          if (providerSockets !== null) {
-            expect(daemon.socketPath.startsWith(`${providerSockets}/`), record).toBe(true);
-          }
-
-          // That hit re-armed the daemon's records. The emitted wrapper, under
-          // Node and with nothing to exec, is as silent.
-          const again = await run('node', builtBinEntry, workspace, ['app:build'], {
-            NX_DAEMON: 'true',
-            NX_USE_LOCAL: 'true',
-            ...ownEnv,
-          });
-          expect(again).toEqual({ code: 0, signal: null, stdout: '', stderr: '' });
-          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
-
           // Probe-only receipts use the real Nx keys/cache and independently
           // census public output bytes without starting a task runner.
           const committed = spawnSync(
@@ -1046,11 +1005,7 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
             nxEntry,
             workspace,
             ['run', 'app:build', '--outputStyle=static-failures-only'],
-            {
-              NX_DAEMON: 'true',
-              NX_WORKSPACE_ROOT_PATH: workspace,
-              ...ownEnv,
-            },
+            { NX_DAEMON: 'true', NX_WORKSPACE_ROOT_PATH: workspace, ...ownEnv },
           );
           expect(published.code, published.stdout + published.stderr).toBe(0);
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
@@ -1142,6 +1097,86 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
           }>(producerEnvironment.stdout);
           expect(environmentResults.first.disposition, producerEnvironment.stderr).toBe('hit');
           expect(environmentResults.sameTree).toEqual(environmentResults.first);
+          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+        },
+        'workspace',
+      );
+    } finally {
+      if (providerSockets !== null) await rm(providerSockets, { recursive: true, force: true });
+    }
+  });
+
+  // The graph/exec case runs real Nx because its subject is the daemon:
+  // the daemon a probe starts holds no output records, so every output must be
+  // vouched for by comparing the working tree with Nx's cache artifact. The
+  // daemon it starts is also the one whose socket is in question, so the same
+  // lifetime answers where a root entered from another workspace's shell binds.
+  it('replays current outputs and refreshes stale snapshots without running unrelated edits', async () => {
+    // A socket path has a 95 character budget and macOS's temp directory spends most of it, so the
+    // socket directory is made in the short socket namespace the sandbox admits.
+    const socketDir = await ownedSocketDirectory('eb-sock-', NX_LONGEST_SOCKET_NAME);
+    let root = '';
+    let failure: { readonly error: unknown } | null = null;
+    const providerDirectories: string[] = [];
+    try {
+      await withNxFixture(
+        'ensure-built-daemon-',
+        async (fixture) => {
+          root = fixture.root;
+          const { workspace } = fixture;
+          const builds = join(root, 'lib-builds.log');
+          await writeTwoProjectWorkspace(workspace, builds);
+          // What the provider binds for this workspace when the call is entered from another one's shell.
+          const providerSockets = providerSocketDirectory(workspace);
+          if (providerSockets !== null) providerDirectories.push(providerSockets);
+          const ownEnv: Record<string, string> = providerSockets === null ? {} : { NX_SOCKET_DIR: providerSockets };
+
+          // Built by daemonless Nx, as CI or a restarted daemon leaves a tree:
+          // cached and on disk, recorded by no daemon.
+          const built = await run(
+            'node',
+            nxEntry,
+            workspace,
+            ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
+            { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace },
+          );
+          expect(built.code, built.stdout + built.stderr).toBe(0);
+          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+
+          // Entered from outside the root by a shell set up for another
+          // workspace, as a managed devenv's is: its socket directory belongs to
+          // that workspace's daemon, and a second daemon listening there would
+          // take the socket from it.
+          const caller = join(root, 'caller');
+          await mkdir(caller);
+          const hit = await run(
+            'bun',
+            binEntry,
+            caller,
+            ['app:build', '--workspace-root', workspace, '--', join(workspace, 'report')],
+            { NX_DAEMON: 'true', NX_USE_LOCAL: 'true', NX_SOCKET_DIR: socketDir },
+          );
+          expect(hit.code, hit.stdout + hit.stderr).toBe(0);
+          expect(hit.stderr).toBe('');
+          expect(hit.stdout.split('\n')[0], hit.stdout).toBe(MARKER);
+          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+          expect(await readdir(socketDir)).toEqual([]);
+          const record = await readFile(join(workspace, '.nx', 'workspace-data', 'd', 'server-process.json'), 'utf-8');
+          expect(record).not.toContain(socketDir);
+          // The daemon it started binds in the directory the provider named, not the caller's nor Nx's default.
+          const daemon = typia.json.assertParse<DaemonProcessJson>(record);
+          if (providerSockets !== null) {
+            expect(daemon.socketPath.startsWith(`${providerSockets}/`), record).toBe(true);
+          }
+
+          // That hit re-armed the daemon's records. The emitted wrapper, under
+          // Node and with nothing to exec, is as silent.
+          const again = await run('node', builtBinEntry, workspace, ['app:build'], {
+            NX_DAEMON: 'true',
+            NX_USE_LOCAL: 'true',
+            ...ownEnv,
+          });
+          expect(again).toEqual({ code: 0, signal: null, stdout: '', stderr: '' });
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
 
           // An awaited daemon graph can see B while both disk snapshots see

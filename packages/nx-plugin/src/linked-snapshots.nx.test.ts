@@ -205,6 +205,9 @@ describe('linked snapshots vouched for by the provider’s real Nx', () => {
         expect(await readFile(join(second.binding.directory ?? '', 'dist/index.js'), 'utf8')).toBe(
           'export const value = "second";\n',
         );
+        expect(await readFile(join(first.binding.directory ?? '', 'dist/index.js'), 'utf8')).toBe(
+          'export const value = "first";\n',
+        );
 
         // Output the producer did not record: refused as not current, and the provider's dist is left as it was.
         const output = join(source, 'dist/index.js');

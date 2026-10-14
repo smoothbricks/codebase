@@ -815,6 +815,13 @@ and unknown loaders, dynamic configuration or unbounded reads make the proof unp
 authoritative graph RPC. A declared kind alone is never admission, and this witness never replaces current Nx task
 hashing or artifact comparison.
 
+The installed-package census expands each declared `files` set and relative export targets through that workspace's Nx
+native output authority, always retaining the manifest, directory/alias namespace evidence and every resolution edge;
+without a file declaration it conservatively retains the whole package tree.
+
+Ancestor directories bind device/inode/type/mode path identity; files and symlinks retain their full stamps, and a
+directory is upgraded to a full nanosecond node/namespace stamp when its membership is actually read.
+
 A physically missing required factory after the clean cutover is an invalid installation and fails loudly; it is not a
 proof miss that can fall back to the graph RPC. Consumers adopt the normal static import only after the public producer
 is available.

@@ -183,6 +183,7 @@ function toolsFor(
       root,
       nxJson,
       load('nx/src/utils/package-json').readModulePackageJson,
+      load('nx/src/native').expandOutputs,
       local === null
         ? { plugins: [], packages, identity: '[]' }
         : { ...local, packages: [...local.packages, ...packages] },

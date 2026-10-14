@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
 import {
   chmod,
   mkdir,
@@ -16,7 +17,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
-import { WorkspaceContext } from 'nx/src/native';
+import { expandOutputs, WorkspaceContext } from 'nx/src/native';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory';
 import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
 import typia from 'typia';
@@ -219,7 +220,8 @@ describe('installed graph input identity', () => {
     const { nx, plugin, dependency, resolver } = await packages();
     const output = join(plugin, 'dist', 'index.js');
     await utimes(output, 1_600_000_000, 1_600_000_000);
-    const identity = () => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, null);
+    const identity = () =>
+      graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, expandOutputs, null);
     const original = identity();
     expect(original).not.toBeNull();
     expect(identity()).toBe(original);
@@ -263,7 +265,8 @@ describe('installed graph input identity', () => {
     const output = join(dependency, 'dist', 'payload.bin');
     const bytes = Buffer.alloc(2 * 64 * 1024 + 17, 0x61);
     await writeFile(output, bytes);
-    const identity = () => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, null);
+    const identity = () =>
+      graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, expandOutputs, null);
     const original = parsed(identity());
     expect(original.files.find(({ path }) => path === output)?.sha256).toBe(
       createHash('sha256').update(bytes).digest('hex'),
@@ -287,7 +290,8 @@ describe('installed graph input identity', () => {
     const published = join(root, 'published-build-volume');
     await rename(join(plugin, 'dist'), published);
     await symlink(published, join(plugin, 'dist'), 'dir');
-    const identity = () => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, null);
+    const identity = () =>
+      graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, expandOutputs, null);
     const original = identity();
     expect(original).not.toBeNull();
     expect(identity()).toBe(original);
@@ -307,12 +311,20 @@ describe('installed graph input identity', () => {
     const alternative = join(root, 'alternative-dependency');
     await mkdir(alternative);
     await writeFile(join(alternative, 'package.json'), '{"name":"owned","version":"1"}');
-    const original = graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, null);
+    const original = graphInstallationIdentity(
+      root,
+      { plugins: ['@smoothbricks/nx-plugin'] },
+      resolver,
+      expandOutputs,
+      null,
+    );
     const changed: typeof resolver = (name, from) => {
       const result = resolver(name, from);
       return name === 'alias' ? { ...result, path: join(alternative, 'package.json') } : result;
     };
-    expect(graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, changed, null)).not.toBe(original);
+    expect(
+      graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, changed, expandOutputs, null),
+    ).not.toBe(original);
     expect(dependency).not.toBe(alternative);
   });
 
@@ -330,11 +342,102 @@ describe('installed graph input identity', () => {
         throw Object.assign(new Error('No exports main defined'), { code: 'ERR_PACKAGE_PATH_NOT_EXPORTED' });
       return resolver(name, paths);
     };
-    const identity = () => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, subpaths, null);
+    const identity = () =>
+      graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, subpaths, expandOutputs, null);
     const original = identity();
     expect(original).not.toBeNull();
     await writeFile(join(dependency, 'data.json'), '{"value":2}');
     expect(identity()).not.toBe(original);
+  });
+
+  it('uses package-root anchored publication patterns and Nx exclusions without dropping directory members', async () => {
+    const { plugin, resolver } = await packages();
+    const excluded = join(plugin, 'dist', 'state.tsbuildinfo');
+    await writeFile(excluded, 'before');
+    const anchored: typeof resolver = (name, paths) => {
+      const resolved = resolver(name, paths);
+      return { ...resolved, packageJson: { ...resolved.packageJson, files: ['/dist', '!**/*.tsbuildinfo'] } };
+    };
+    const identity = () =>
+      graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, anchored, expandOutputs, null);
+    const original = identity();
+    expect(original).not.toBeNull();
+    await writeFile(excluded, 'after');
+    expect(identity()).toBe(original);
+    await writeFile(join(plugin, 'dist', 'index.js'), 'exports.value = 2;');
+    expect(identity()).not.toBe(original);
+  });
+
+  it('does not bind an unpublished cache marker but names a public marker changed during census', async () => {
+    const { plugin, resolver } = await packages();
+    await mkdir(join(plugin, '.cache'));
+    const privateMarker = join(plugin, '.cache', 'marker');
+    const publicMarker = join(plugin, 'dist', 'index.js');
+    await writeFile(privateMarker, 'before');
+    const during = (marker: string) => {
+      let changed = false;
+      let detail = '';
+      const mutate: typeof resolver = (name, paths) => {
+        const resolved = resolver(name, paths);
+        if (name === 'alias' && !changed) {
+          writeFileSync(marker, 'after');
+          changed = true;
+        }
+        return resolved;
+      };
+      const proof = graphInstallationIdentity(
+        root,
+        { plugins: ['@smoothbricks/nx-plugin'] },
+        mutate,
+        expandOutputs,
+        null,
+        (reason) => {
+          detail = reason;
+        },
+      );
+      return { proof, changed, detail };
+    };
+    const unrelated = during(privateMarker);
+    expect(unrelated.changed).toBe(true);
+    expect(unrelated.proof).not.toBeNull();
+    expect(unrelated.detail).toBe('');
+    const changed = during(publicMarker);
+    expect(changed.changed).toBe(true);
+    expect(changed.proof).toBeNull();
+    expect(changed.detail).toContain(publicMarker);
+  });
+
+  it('retains the full tree without a publication declaration and names its changed marker', async () => {
+    const { plugin, resolver } = await packages();
+    await mkdir(join(plugin, '.cache'));
+    const marker = join(plugin, '.cache', 'marker');
+    await writeFile(marker, 'before');
+    let changed = false;
+    let detail = '';
+    const undeclared: typeof resolver = (name, paths) => {
+      const resolved = resolver(name, paths);
+      if (name === 'alias' && !changed) {
+        writeFileSync(marker, 'after');
+        changed = true;
+      }
+      const { files, ...packageJson } = resolved.packageJson;
+      expect(files).toEqual(['dist']);
+      return { ...resolved, packageJson };
+    };
+    expect(
+      graphInstallationIdentity(
+        root,
+        { plugins: ['@smoothbricks/nx-plugin'] },
+        undeclared,
+        expandOutputs,
+        null,
+        (reason) => {
+          detail = reason;
+        },
+      ),
+    ).toBeNull();
+    expect(changed).toBe(true);
+    expect(detail).toContain(marker);
   });
 
   it('fails loudly for unreadable required module bytes rather than publishing an installation witness', async () => {
@@ -342,14 +445,16 @@ describe('installed graph input identity', () => {
     const output = join(plugin, 'dist/index.js');
     await chmod(output, 0);
     try {
-      expect(() => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, null)).toThrow();
+      expect(() =>
+        graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, expandOutputs, null),
+      ).toThrow();
     } finally {
       await chmod(output, 0o600);
     }
   });
   it('does not invent an input contract for unknown plugins or unresolved required dependencies', async () => {
     const { resolver } = await packages();
-    expect(graphInstallationIdentity(root, { plugins: ['opaque-plugin'] }, resolver, null)).toBeNull();
+    expect(graphInstallationIdentity(root, { plugins: ['opaque-plugin'] }, resolver, expandOutputs, null)).toBeNull();
     expect(
       graphInstallationIdentity(
         root,
@@ -357,6 +462,7 @@ describe('installed graph input identity', () => {
         () => {
           throw Object.assign(new Error('missing'), { code: 'MODULE_NOT_FOUND' });
         },
+        expandOutputs,
         null,
       ),
     ).toBeNull();
@@ -364,7 +470,9 @@ describe('installed graph input identity', () => {
 
   it('refuses an unproved directory link instead of overlooking external plugin files', async () => {
     const { plugin, dependency, resolver } = await packages();
-    await symlink(dependency, join(plugin, 'external'), 'dir');
-    expect(graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, null)).toBeNull();
+    await symlink(dependency, join(plugin, 'dist/external'), 'dir');
+    expect(
+      graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, expandOutputs, null),
+    ).toBeNull();
   });
 });
