@@ -332,24 +332,42 @@ fn cargo_lock_holders(home: &Path) -> String {
     }
 }
 
+/// Bound child processes independently of the number of tracked manifests. The existing
+/// manifest fingerprint caches discovery across refreshes; a cold batch pays one shell
+/// activation and at most this many Cargo queries at once.
+const CARGO_QUERY_PARALLELISM: usize = 4;
+
 /// Runs each query's Cargo in its own directory and frames each answer for
 /// [`driver_answers`]: exit status, stdout, stderr, each NUL-terminated. Cargo prints no NUL.
+/// Each worker owns its files; the parent drains them in query order after waiting, so
+/// interleaved completions cannot associate an answer or failure with another manifest.
 const DRIVER: &str = r#"set -u
-count=$1
-shift
+parallel=$1
+count=$2
+shift 2
 query=("${@:1:count}")
 shift "$count"
-stderr=$(/usr/bin/mktemp) || exit 70
-trap '/bin/rm -f -- "$stderr"' EXIT
+work=$(/usr/bin/mktemp -d) || exit 70
+trap '/bin/rm -rf -- "$work"' EXIT
 while (($# >= 2)); do
-  directory=$1
-  manifest=$2
-  shift 2
-  stdout=$({ cd -- "$directory" && exec cargo "${query[@]}" --manifest-path "$manifest"; } 2>"$stderr")
-  status=$?
-  printf '%s\0%s\0' "$status" "$stdout"
-  /bin/cat -- "$stderr"
-  printf '\0'
+  pids=()
+  for ((slot=0; slot<parallel && $#>=2; slot++)); do
+    directory=$1
+    manifest=$2
+    shift 2
+    (
+      stdout=$({ cd -- "$directory" && exec cargo "${query[@]}" --manifest-path "$manifest"; } 2>"$work/$slot.stderr")
+      status=$?
+      printf '%s\0%s\0' "$status" "$stdout"
+      /bin/cat -- "$work/$slot.stderr"
+      printf '\0'
+    ) >"$work/$slot.answer" &
+    pids+=("$!")
+  done
+  for ((slot=0; slot<${#pids[@]}; slot++)); do
+    wait "${pids[$slot]}" || exit $?
+    /bin/cat -- "$work/$slot.answer" || exit 70
+  done
 done
 "#;
 
@@ -359,6 +377,7 @@ fn driver_argv(args: &[&str], queries: &[&CargoQuery]) -> Vec<OsString> {
         "-c".into(),
         DRIVER.into(),
         "cowshed-cargo-discovery".into(),
+        CARGO_QUERY_PARALLELISM.to_string().into(),
         args.len().to_string().into(),
     ];
     argv.extend(args.iter().map(OsString::from));
@@ -1167,6 +1186,81 @@ mod tests {
             "{:?}",
             state.findings
         );
+    }
+
+    #[test]
+    fn cargo_driver_bounds_parallelism_and_keeps_answers_in_manifest_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let directory = fixture.root.join("directory with spaces");
+        fs::create_dir(&directory).unwrap();
+        write(
+            &fixture,
+            "bin/cargo",
+            r#"#!/bin/bash
+set -eu
+index=$3
+first=$((index / 4 * 4))
+end=$((first + 4))
+((end <= 9)) || end=9
+# A new wave must not start before every member of the previous wave ended.
+for ((previous=0; previous<first; previous++)); do
+  [[ -f "$PROBE_ROOT/done-$previous" ]] || { echo "unbounded query $index" >&2; exit 90; }
+done
+: >"$PROBE_ROOT/started-$index"
+# Four-way rendezvous: a serial or under-filled wave fails rather than hanging.
+started=$SECONDS
+for ((peer=first; peer<end; peer++)); do
+  while [[ ! -f "$PROBE_ROOT/started-$peer" ]]; do
+    ((SECONDS - started < 5)) || { echo "query $index did not overlap $peer" >&2; exit 91; }
+    /bin/sleep 0.01
+  done
+done
+# Force a later query to finish first, exercising ordered output framing.
+if ((index == first && end - first > 1)); then
+  while [[ ! -f "$PROBE_ROOT/done-$((end - 1))" ]]; do
+    ((SECONDS - started < 5)) || { echo "last query did not finish" >&2; exit 92; }
+    /bin/sleep 0.01
+  done
+fi
+: >"$PROBE_ROOT/done-$index"
+if ((index == 2)); then
+  echo "refused manifest $index" >&2
+  exit 101
+fi
+printf '%s:%s\n' "$index" "$PWD"
+"#,
+        );
+        let cargo = fixture.root.join("bin/cargo");
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let queries: Vec<CargoQuery> = (0..9)
+            .map(|index| CargoQuery {
+                directory: directory.clone(),
+                manifest: index.to_string().into(),
+            })
+            .collect();
+        let argv = driver_argv(&["locate-project"], &queries.iter().collect::<Vec<_>>());
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("PATH", fixture.root.join("bin"))
+            .env("PROBE_ROOT", &fixture.root)
+            .output_locked()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let expected: Vec<CargoAnswer> = (0..9)
+            .map(|index| {
+                if index == 2 {
+                    Err("Cargo exit status 101: refused manifest 2".to_owned())
+                } else {
+                    Ok(format!("{index}:{}", directory.display()).into_bytes())
+                }
+            })
+            .collect();
+        assert_eq!(driver_answers(&output, queries.len()), expected);
+        for index in 0..9 {
+            assert!(fixture.root.join(format!("done-{index}")).is_file());
+        }
     }
 
     #[test]
