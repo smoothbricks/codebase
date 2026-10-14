@@ -1022,7 +1022,7 @@ fn one_shot_plan(
     Ok(plan)
 }
 
-/// Tool commands are exact private-bin links; no host profile joins PATH.
+/// The installed cargo launcher leads exact private-bin tool links; no host tool profile joins PATH.
 fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
     let tools = match sandbox.mode {
         crate::sandbox::RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.join("tools/bin"),
@@ -1030,7 +1030,10 @@ fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
             sandbox.workspace_mount.join(".cowshed/tools/bin")
         }
     };
-    let mut paths = vec![tools];
+    let mut paths = vec![
+        crate::host_dirs::installed_binary_directory(&sandbox.home),
+        tools,
+    ];
     paths.push(sandbox.workspace_mount.join(".cowshed/bin"));
     if let Some(path) = developer_directory().map(|directory| directory.join("usr/bin"))
         && !paths.contains(&path)
@@ -2742,6 +2745,7 @@ impl WorkspaceSupervisor {
         crate::workspace_credentials::publish_workspace_environment(
             crate::workspace_environment::EnvironmentMount::Served {
                 workspace_mount: &config.sandbox.workspace_mount,
+                host_home: &config.sandbox.home,
                 temp_dir: &config.sandbox.exec_temp_dir,
                 capability_env: &config.sandbox.capabilities.contribution,
             },
@@ -6623,6 +6627,7 @@ mod workspace_toolchain_tests {
                 crate::workspace_environment::EnvironmentMount::Served {
                     workspace_mount: &mount,
                     temp_dir: &configured.exec_temp_dir,
+                    host_home: &configured.home,
                     capability_env: &configured.capabilities.contribution,
                 },
                 crate::metadata::Platform::Macos,
@@ -7015,6 +7020,7 @@ mod workspace_toolchain_tests {
 
             let path = bootstrap_path(&sandbox).expect("bootstrap PATH");
             let mut expected = vec![
+                crate::host_dirs::installed_binary_directory(&sandbox.home),
                 environment_root.join("tools/bin"),
                 mount.join(".cowshed/bin"),
             ];
@@ -7022,7 +7028,7 @@ mod workspace_toolchain_tests {
             assert_eq!(
                 std::env::split_paths(&path).collect::<Vec<_>>(),
                 expected,
-                "{mode:?}: the tools bin leads, then the workspace bin, then the platform"
+                "{mode:?}: the installed launcher leads, then private tools, workspace bin and platform"
             );
 
             prepare_private_environment(

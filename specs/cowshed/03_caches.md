@@ -151,15 +151,18 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   gateway's `/sim/` endpoint (05_gateway.md) under the `sim` grant axis (04_sandbox.md). Tools that hardcode
   `/usr/bin/xcrun` bypass the shim and degrade to dev-local simulators — the safe default.
 - **The `cargo` jobserver launcher** is first on `PATH` in the managed environment, ahead of every directory that can
-  hold a real `cargo` (the private `tools/bin`, `.cowshed/bin/` tool links, shell activation's entries). It runs the
-  next `cargo` on `PATH` sized to the host CPU budget (05_gateway.md "Host CPU budget", Outside `bounded-exec`). Under
-  an inherited jobserver (`CARGO_MAKEFLAGS` names a live one, as for a `cargo` a build script starts) it runs that
-  `cargo` as asked. Under a `bounded-exec` grant (`BOUNDED_EXEC_CPU_TOKENS` set) it takes no second grant and sets
-  `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` to that count where they are unset. A subcommand
-  classified as non-compiling by [05 Gateway, Host CPU budget](05_gateway.md#host-cpu-budget) runs directly. Any other
-  takes a jobserver grant of `g` tokens and runs with the grant's fifo, and with `RUST_TEST_THREADS`,
-  `NEXTEST_TEST_THREADS` and `BOUNDED_EXEC_CPU_TOKENS` set to `g` where they are unset. With no gateway listening it
-  runs `cargo` unbudgeted, as `bounded-exec` does.
+  hold a real `cargo` (the private `tools/bin`, `.cowshed/bin/` tool links, shell activation's entries). Its install
+  path comes from the controller-selected host identity, never from the job's rebound private `HOME`. The served
+  `.cowshed/env` publishes that literal PATH prefix, and managed activation reapplies the same writer after project PATH
+  hooks; the child bootstrap uses the same host identity. It runs the next `cargo` on `PATH` sized to the host CPU
+  budget (05_gateway.md "Host CPU budget", Outside `bounded-exec`). Under an inherited jobserver (`CARGO_MAKEFLAGS`
+  names a live one, as for a `cargo` a build script starts) it runs that `cargo` as asked. Under a `bounded-exec` grant
+  (`BOUNDED_EXEC_CPU_TOKENS` set) it takes no second grant and sets `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and
+  `NEXTEST_TEST_THREADS` to that count where they are unset. A subcommand classified as non-compiling by
+  [05 Gateway, Host CPU budget](05_gateway.md#host-cpu-budget) runs directly. Any other takes a jobserver grant of `g`
+  tokens and runs with the grant's fifo, and with `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` and
+  `BOUNDED_EXEC_CPU_TOKENS` set to `g` where they are unset. With no gateway listening it runs `cargo` unbudgeted, as
+  `bounded-exec` does.
 - **Tool homes stay where the tool keeps them.** Every layer-3 cache lives at its tool's own default location in the
   host user's HOME, the one place the host's own tools already use without configuration, and cowshed shares that exact
   path into the sandbox of every project whose detector names the tool (15_capabilities.md). There is no cache volume,

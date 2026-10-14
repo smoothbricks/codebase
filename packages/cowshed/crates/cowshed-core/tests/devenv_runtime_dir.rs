@@ -2280,3 +2280,152 @@ bun -e 'if (require("install-probe-dependency") !== 7) process.exit(1)'
         );
     }
 }
+
+/// The managed PATH helper runs after project hooks under the real child profile.
+/// HOME stays private; only the current installed CLI copy is readable/executable.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_managed_cargo_path_uses_the_installed_binary_with_private_home() {
+    use cowshed_core::workspace_environment::EnvironmentMount;
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let root = PathBuf::from("/private/tmp").join(format!(
+        "cowshed-managed-cargo-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir(&root).expect("host-controller fixture root");
+    let sandbox = workspace(&root, 41_136);
+    let mount = &sandbox.workspace_mount;
+    install_real_tool(&sandbox, "direnv");
+    std::fs::set_permissions(
+        mount.join(WORKSPACE_TOKEN_PATH),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("private token");
+    let manifest =
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("runtime manifest root"));
+    let package = manifest
+        .parent()
+        .and_then(Path::parent)
+        .expect("owning cowshed package");
+    let checkout = package
+        .parent()
+        .and_then(Path::parent)
+        .expect("owning checkout");
+    let platform = match std::env::consts::ARCH {
+        "aarch64" => "darwin-arm64",
+        "x86_64" => "darwin-x64",
+        arch => panic!("unsupported macOS CLI architecture: {arch}"),
+    };
+    let binary = package.join("dist/bin").join(platform).join("cowshed");
+    let mut input = std::fs::File::open(&binary)
+        .expect("the owning host-controller build produces the CLI before this test");
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = input.read(&mut buffer).expect("hash the CLI artifact");
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = cowshed_core::api::Sha256Digest::from_bytes(hasher.finalize().into());
+    let bin = cowshed_core::host_dirs::installed_binary_directory(&sandbox.home);
+    std::fs::create_dir_all(&bin).expect("fixture installed bin");
+    let installed = bin.join(format!("cowshed-{digest}"));
+    std::fs::copy(&binary, &installed).expect("install the real CLI artifact in the fixture");
+    std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755))
+        .expect("installed executable mode");
+    std::os::unix::fs::symlink(
+        installed.file_name().expect("stored name"),
+        bin.join("cowshed"),
+    )
+    .expect("stable name");
+    std::os::unix::fs::symlink("cowshed", bin.join("cargo")).expect("launcher name");
+    let unrelated = bin.join("unrelated-record");
+    std::fs::write(&unrelated, "controller-only record").expect("unrelated installed record");
+    let source_record =
+        cowshed_core::host_dirs::support_directory(&sandbox.home).join("cowshed-source");
+    std::fs::write(&source_record, "controller-only source").expect("controller source record");
+    let real_cargo = std::fs::canonicalize(
+        std::env::var_os("CARGO").expect("Cargo publishes its real compiler driver"),
+    )
+    .expect("real Cargo driver");
+    let toolchain = mount.join("toolchain/bin");
+    std::fs::create_dir_all(&toolchain).expect("project toolchain bin");
+    std::os::unix::fs::symlink(real_cargo, toolchain.join("cargo")).expect("real Cargo command");
+    let tooling = mount.join("tooling/direnv");
+    std::fs::create_dir_all(&tooling).expect("managed tooling directory");
+    let helper = tooling.join("repo-path");
+    std::fs::copy(
+        checkout.join("packages/nx-plugin/managed/raw/tooling/direnv/repo-path"),
+        &helper,
+    )
+    .expect("use the actual managed PATH writer");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+        .expect("managed writer executable");
+    cowshed_core::workspace_credentials::publish_workspace_environment(
+        EnvironmentMount::Served {
+            workspace_mount: mount,
+            host_home: &sandbox.home,
+            temp_dir: &sandbox.exec_temp_dir,
+            capability_env: &sandbox.capabilities.contribution,
+        },
+        cowshed_core::metadata::Platform::Macos,
+        Some(sandbox.port_block),
+    )
+    .expect("publish the controller's served environment");
+    std::fs::write(
+        mount.join(".envrc"),
+        "PATH_add \"$PWD/toolchain/bin\"\nexport PATH=\"$(\"$PWD/tooling/direnv/repo-path\")\"\n",
+    )
+    .expect("real direnv activation with a PATH-changing project hook");
+    let script = r#"set -eu
+expected=$1
+installed=$2
+unrelated=$3
+bin=$4
+source_record=$5
+private_home=$6
+test "$HOME" = "$private_home"
+test "$(command -v cargo)" = "$expected"
+cargo --version
+/usr/bin/od -An -tx1 -N4 "$installed"
+if /bin/cat "$unrelated"; then exit 91; fi
+if /bin/cat "$source_record"; then exit 92; fi
+if /bin/ls "$bin"; then exit 93; fi
+if printf 'must stay immutable' >> "$installed"; then exit 94; fi
+if /bin/mkdir "$bin/new-entry"; then exit 95; fi
+printf 'installed-launcher-first;private-home;single-binary-read-only\n'
+"#;
+    let (exit, stdout, stderr) = run_in_sandbox(
+        &sandbox,
+        mount,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            script.into(),
+            "managed-cargo".into(),
+            bin.join("cargo").into_os_string(),
+            installed.into_os_string(),
+            unrelated.into_os_string(),
+            bin.into_os_string(),
+            source_record.into_os_string(),
+            mount.join(".cowshed/home").into_os_string(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let stdout = String::from_utf8(stdout).expect("text observations");
+    assert!(stdout.contains("cargo "), "{stdout}");
+    assert!(
+        stdout.contains("installed-launcher-first;private-home;single-binary-read-only"),
+        "{stdout}"
+    );
+    std::fs::remove_dir_all(root).expect("remove the completed fixture");
+}

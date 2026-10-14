@@ -463,7 +463,8 @@ fn map_sandbox_error(error: SandboxError) -> ExecError {
         },
         SandboxError::InvalidPortBlock { .. }
         | SandboxError::InvalidPath { .. }
-        | SandboxError::DenyResolution { .. } => ExecError::WrapperFailure {
+        | SandboxError::DenyResolution { .. }
+        | SandboxError::InstalledCargo { .. } => ExecError::WrapperFailure {
             stage: WrapperStage::ValidateProfile,
             message: error.to_string(),
             source: None,

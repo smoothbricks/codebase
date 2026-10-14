@@ -129,7 +129,16 @@ Shape:
 ;; No cache lives under the cowshed tree, so nothing here is carved back for one.
 ;; sccache's store is daemon-write-only (03_caches.md) — clients speak to the host
 ;; daemon over the socket above and never touch the store directly.
-;; HOME carve-backs come only from detected capabilities' contributions
+;; The installed Cargo launcher is the one host-install exception (03_caches.md):
+;; derive its absolute identity from the trusted controller HOME, resolve cargo
+;; through the stable cowshed name, and allow read/exec of ONLY that installed
+;; binary. Alias and ancestor metadata allow lookup; the bin directory cannot
+;; be listed or written, unrelated install records remain unreadable, and no
+;; rule opens gateway.sock. Shell HOME remains the private workspace HOME.
+(allow file-read* file-read-data (literal "<actual installed cowshed binary>"))
+(allow process-exec (literal "<actual installed cowshed binary>"))
+(allow file-read-metadata … exact launcher aliases and ancestor literals …)
+;; All other HOME carve-backs come only from detected capabilities' contributions
 ;; (15_capabilities.md), which the capability merge collects in one place. A
 ;; shared cache is strictly beneath HOME and never intersects a protected path or
 ;; cowshed's controller state (~/Library/Application Support/dev.cowshed,
