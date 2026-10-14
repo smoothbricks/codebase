@@ -1,11 +1,12 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
 import {
-  accessSync,
-  constants,
+  closeSync,
   lstatSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -141,9 +142,9 @@ export function reusableGraph(
 /** Plugins with opaque external graph inputs cannot borrow this proof.
  * For the repository plugin and Nx, bind the entire owned module/file tree
  * and its dependency/optional/peer resolution closure, including each alias,
- * physical target and package manifest. The manifest's node stamp binds its
- * name, version, exports and declared dependency membership to the bytes the
- * awaited graph consumed. A missing optional dependency is recorded too.
+ * physical target and package manifest. SHA-256 binds every regular file's
+ * bytes, including manifest metadata; pre/post node stamps still reject a
+ * tree that moved while reading. A missing optional dependency is recorded too.
  */
 export function graphInstallationIdentity(
   workspaceRoot: string,
@@ -153,6 +154,8 @@ export function graphInstallationIdentity(
   const plugins = (nxJson.plugins ?? []).map((plugin) => (typeof plugin === 'string' ? plugin : plugin.plugin));
   if (plugins.some((plugin) => plugin !== '@smoothbricks/nx-plugin')) return null;
   const nodes: NodeWitness[] = [];
+  const files: { path: string; sha256: string }[] = [];
+  const buffer = Buffer.allocUnsafe(64 * 1024);
   const resolutions: [string, string, string | null][] = [];
   const visited = new Set<string>();
   const declaredDirectoryLinks = new Set<string>();
@@ -172,7 +175,16 @@ export function graphInstallationIdentity(
     } else if (!stats.isFile()) {
       throw new Error(`Unproved graph package node: ${path}`);
     } else {
-      accessSync(path, constants.R_OK);
+      const hash = createHash('sha256');
+      const fd = openSync(path, 'r');
+      try {
+        for (let count = readSync(fd, buffer); count > 0; count = readSync(fd, buffer)) {
+          hash.update(buffer.subarray(0, count));
+        }
+      } finally {
+        closeSync(fd);
+      }
+      files.push({ path, sha256: hash.digest('hex') });
     }
   }
   function visit(name: string, from: string, optional: boolean): void {
@@ -209,7 +221,7 @@ export function graphInstallationIdentity(
   try {
     for (const name of ['nx', ...plugins]) visit(name, workspaceRoot, false);
     visit('typescript', workspaceRoot, true);
-    return nodesUnchanged(nodes) ? JSON.stringify({ resolutions, nodes }) : null;
+    return nodesUnchanged(nodes) ? JSON.stringify({ resolutions, nodes, files }) : null;
   } catch (error) {
     if (systemError(error) && ['EACCES', 'EPERM', 'EIO'].includes(error.code)) throw error;
     // Installation uncertainty disables only graph reuse. Nx's authoritative
