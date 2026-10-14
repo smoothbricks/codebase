@@ -24,7 +24,11 @@ import {
   indexedCargoManifests,
   resolveCargoClosureSource,
 } from './cargo-closure-input.js';
-import { CARGO_TOOLCHAIN_NAMED_INPUT, CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
+import {
+  CARGO_TOOLCHAIN_NAMED_INPUT,
+  CARGO_TOOLCHAIN_PIN_INPUTS,
+  cargoRuntimeInput,
+} from './cargo-toolchain-policy.js';
 import {
   type AttributedCargoWorkspacePackage,
   attributeCargoWorkspacePackages,
@@ -510,11 +514,6 @@ const REPO_ROOT_CARGO_OUTPUT_INPUTS = [
 // because `smoo monorepo validate` reads the same two constants to refuse a
 // declaration that drops it. See cargo-toolchain-policy.ts for why it is the
 // declared pin and not the ambient environment.
-
-/** The toolchain versions `command` prints, from the directory whose `rust-toolchain` selects them. */
-function cargoRuntimeInput(projectRoot: string, command: string): { runtime: string } {
-  return runtimeInput(`sh -c ${shellWord(`cd "$0" && ${command}`)} ${shellWord(projectRoot)}`);
-}
 
 /** A runtime input that changes when the file's bytes do: the runtime hashes the file itself. */
 function fileHashInput(path: string): { runtime: string } {

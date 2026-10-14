@@ -1,0 +1,234 @@
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { ProjectGraph } from 'nx/src/config/project-graph';
+import { WorkspaceContext } from 'nx/src/native';
+import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
+import {
+  type GraphWitness,
+  graphInstallationIdentity,
+  nodesUnchanged,
+  readGraphWitness,
+  reusableGraph,
+  snapshotsEqual,
+  workspaceSnapshot,
+  writeWitness,
+} from './ensure-built-witness.js';
+
+let root = '';
+const graph: ProjectGraph = {
+  nodes: {
+    app: { name: 'app', type: 'app', data: { root: 'packages/app', targets: { build: { executor: 'nx:noop' } } } },
+  },
+  dependencies: { app: [] },
+};
+const data = () => join(root, '.nx', 'workspace-data');
+const snapshot = (previous?: GraphWitness['snapshot']) =>
+  workspaceSnapshot(root, new WorkspaceContext(root, data()), previous);
+
+beforeEach(async () => {
+  root = await realpath(await mkdtemp(join(tmpdir(), 'ensure-built-witness-')));
+  await mkdir(data(), { recursive: true });
+  await mkdir(join(root, 'packages', 'app'), { recursive: true });
+  await writeFile(join(root, '.gitignore'), '.nx/\n');
+  await writeFile(join(root, 'nx.json'), '{}');
+  await writeFile(join(root, 'packages', 'app', 'project.json'), '{"name":"app"}');
+  await writeFile(join(root, 'packages', 'app', 'package.json'), '{"name":"app","version":"1"}');
+  await writeFile(join(root, 'packages', 'app', 'source.txt'), 'before');
+  await writeFile(join(root, 'bun.lock'), 'lock-before');
+});
+afterEach(async () => {
+  await rm(root, { recursive: true, force: true });
+});
+
+function witness(): GraphWitness {
+  return {
+    version: 1,
+    workspaceRoot: root,
+    environment: 'env',
+    installation: 'installed',
+    snapshot: snapshot(),
+    projectGraph: graph,
+  };
+}
+
+describe('authoritative graph witness', () => {
+  it('returns the exact previously awaited graph only for unchanged complete inputs', () => {
+    const previous = witness();
+    expect(reusableGraph(previous, root, 'env', 'installed', snapshot(previous.snapshot))).toBe(graph);
+    expect(reusableGraph(previous, root, 'env-changed', 'installed', previous.snapshot)).toBeNull();
+    expect(reusableGraph(previous, root, 'env', 'provider-changed', previous.snapshot)).toBeNull();
+    expect(reusableGraph(previous, root, 'env', null, previous.snapshot)).toBeNull();
+    expect(reusableGraph(previous, root + '/other', 'env', 'installed', previous.snapshot)).toBeNull();
+    expect(reusableGraph(null, root, 'env', 'installed', previous.snapshot)).toBeNull();
+    expect(reusableGraph(previous, root, 'env', 'installed', { ...previous.snapshot, stable: false })).toBeNull();
+  });
+
+  for (const file of [
+    'nx.json',
+    'bun.lock',
+    'packages/app/project.json',
+    'packages/app/package.json',
+    'packages/app/source.txt',
+  ]) {
+    it(`immediately rejects changed ${file}, including same-length writes with restored mtime`, async () => {
+      const previous = witness();
+      const path = join(root, file);
+      const { stat } = await import('node:fs/promises');
+      const before = await stat(path);
+      const original = await readFile(path, 'utf8');
+      await writeFile(path, 'x'.repeat(original.length));
+      await utimes(path, before.atime, before.mtime);
+      expect(reusableGraph(previous, root, 'env', 'installed', snapshot(previous.snapshot))).toBeNull();
+    });
+  }
+
+  it('rejects newly created and deleted files, including manifests under broad output-like directories', async () => {
+    const previous = witness();
+    await mkdir(join(root, 'packages', 'app', 'dist'));
+    await writeFile(join(root, 'packages', 'app', 'dist', 'project.json'), '{"name":"new-project"}');
+    expect(snapshotsEqual(previous.snapshot, snapshot(previous.snapshot))).toBe(false);
+    await rm(join(root, 'packages', 'app', 'dist'), { recursive: true });
+    await rm(join(root, 'packages', 'app', 'source.txt'));
+    expect(snapshotsEqual(previous.snapshot, snapshot(previous.snapshot))).toBe(false);
+  });
+
+  it('rehashes a replacement node even when its length and mtime match the previous one', async () => {
+    const previous = witness();
+    const path = join(root, 'packages', 'app', 'source.txt');
+    const { stat } = await import('node:fs/promises');
+    const before = await stat(path);
+    await writeFile(path + '.replacement', 'AFTER!');
+    await utimes(path + '.replacement', before.atime, before.mtime);
+    await rename(path + '.replacement', path);
+    expect(reusableGraph(previous, root, 'env', 'installed', snapshot(previous.snapshot))).toBeNull();
+  });
+
+  it('revokes node evidence for a write/revert even when pre/post content hashes are equal', async () => {
+    const previous = witness();
+    const path = join(root, 'packages/app/source.txt');
+    await writeFile(path, 'AFTER!');
+    await writeFile(path, 'before');
+    const after = snapshot(previous.snapshot);
+    expect(snapshotsEqual(previous.snapshot, after)).toBe(true);
+    expect(nodesUnchanged(previous.snapshot.nodes)).toBe(false);
+  });
+  it('does not admit missing, unreadable, malformed or wrong-version evidence', async () => {
+    const path = join(data(), 'ensure-built-graph.json');
+    expect(readGraphWitness(path)).toBeNull();
+    await writeFile(path, 'not JSON');
+    expect(readGraphWitness(path)).toBeNull();
+    writeWitness(path, witness());
+    expect(readGraphWitness(path)?.projectGraph).toEqual(graph);
+    await chmod(path, 0);
+    try {
+      expect(readGraphWitness(path)).toBeNull();
+    } finally {
+      await chmod(path, 0o600);
+    }
+    await writeFile(path, JSON.stringify({ ...witness(), version: 2 }));
+    expect(readGraphWitness(path)).toBeNull();
+  });
+});
+
+describe('installed graph input identity', () => {
+  async function packages() {
+    const nx = join(root, 'installed-nx');
+    const plugin = join(root, 'installed-plugin');
+    const dependency = join(root, 'installed-dependency');
+    for (const path of [nx, plugin, dependency]) {
+      await mkdir(join(path, 'dist'), { recursive: true });
+      await writeFile(join(path, 'package.json'), '{"name":"owned","version":"1","exports":"./dist/index.js"}');
+      await writeFile(join(path, 'dist', 'index.js'), 'exports.value = 1;');
+    }
+    const resolver: typeof readModulePackageJsonWithoutFallbacks = (name) => {
+      const path = name === 'nx' ? nx : name === '@smoothbricks/nx-plugin' ? plugin : dependency;
+      const dependencies: Record<string, string> =
+        name === '@smoothbricks/nx-plugin' ? { alias: 'npm:dependency@1' } : {};
+      return {
+        path: join(path, 'package.json'),
+        packageJson: {
+          name,
+          version: '1',
+          exports: './dist/index.js',
+          files: ['dist'],
+          dependencies,
+        },
+      };
+    };
+    return { nx, plugin, dependency, resolver };
+  }
+
+  it('binds public plugin bytes, package resolution metadata, dependency alias targets and tree membership', async () => {
+    const { plugin, dependency, resolver } = await packages();
+    const identity = () => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver);
+    const original = identity();
+    expect(original).not.toBeNull();
+    expect(identity()).toBe(original);
+    await writeFile(join(plugin, 'dist', 'index.js'), 'exports.value = 2;');
+    expect(identity()).not.toBe(original);
+    const emitted = identity();
+    await writeFile(join(plugin, 'package.json'), '{"name":"renamed","version":"2","exports":"./other.js"}');
+    expect(identity()).not.toBe(emitted);
+    const manifest = identity();
+    await writeFile(join(dependency, 'added.js'), 'exports.member = true;');
+    expect(identity()).not.toBe(manifest);
+    const member = identity();
+    await rm(join(dependency, 'added.js'));
+    expect(identity()).not.toBe(member);
+  });
+
+  it('proves a declared dist link by its physical output tree and rejects changed public bytes', async () => {
+    const { plugin, resolver } = await packages();
+    const published = join(root, 'published-build-volume');
+    await rename(join(plugin, 'dist'), published);
+    await symlink(published, join(plugin, 'dist'), 'dir');
+    const identity = () => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver);
+    const original = identity();
+    expect(original).not.toBeNull();
+    expect(identity()).toBe(original);
+    await writeFile(join(published, 'index.js'), 'exports.value = 2;');
+    expect(identity()).not.toBe(original);
+  });
+
+  it('binds an alias to its physical resolution target, not just its package name', async () => {
+    const { resolver, dependency } = await packages();
+    const alternative = join(root, 'alternative-dependency');
+    await mkdir(alternative);
+    await writeFile(join(alternative, 'package.json'), '{"name":"owned","version":"1"}');
+    const original = graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver);
+    const changed: typeof resolver = (name, from) => {
+      const result = resolver(name, from);
+      return name === 'alias' ? { ...result, path: join(alternative, 'package.json') } : result;
+    };
+    expect(graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, changed)).not.toBe(original);
+    expect(dependency).not.toBe(alternative);
+  });
+
+  it('fails loudly for unreadable required module bytes rather than publishing an installation witness', async () => {
+    const { plugin, resolver } = await packages();
+    const output = join(plugin, 'dist/index.js');
+    await chmod(output, 0);
+    try {
+      expect(() => graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver)).toThrow();
+    } finally {
+      await chmod(output, 0o600);
+    }
+  });
+  it('does not invent an input contract for unknown plugins or unresolved required dependencies', async () => {
+    const { resolver } = await packages();
+    expect(graphInstallationIdentity(root, { plugins: ['opaque-plugin'] }, resolver)).toBeNull();
+    expect(
+      graphInstallationIdentity(root, {}, () => {
+        throw Object.assign(new Error('missing'), { code: 'MODULE_NOT_FOUND' });
+      }),
+    ).toBeNull();
+  });
+
+  it('refuses an unproved directory link instead of overlooking external plugin files', async () => {
+    const { plugin, dependency, resolver } = await packages();
+    await symlink(dependency, join(plugin, 'external'), 'dir');
+    expect(graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver)).toBeNull();
+  });
+});
