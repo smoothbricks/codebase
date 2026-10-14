@@ -221,19 +221,19 @@ skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small
 impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Every scratch root
 selects its backing image paths, then calls the same production owned-attachment cleanup used by normal removal,
 recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup rereads
-image/whole-device/volume identity, raw-pins each currently-owned mounted volume for guarded `diskutil unmount`, then
-runs guarded `hdiutil detach` of the exact physical device under the image's lease. Guards recheck after the host lease
-wait; a previously cached disk number or mountpoint never authorizes an unmount or detach. A failed release keeps the
-scratch tree intact for the next run, rather than deleting a still-attached image's backing files. Before any release, a
-scratch root ends every process working in its tree, selected by the working directory the kernel reports
-(`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a deleted directory): `SIGTERM`, as `nx daemon --stop` sends
-it, then `SIGKILL` after a 10s grace. A stock Nx daemon a fixture started detaches from its starter, so a failed test's
-unwinding otherwise never reached it and it kept running in the deleted root. Successful cleanup removes the root, and
-every run first ends the processes working under, then reclaims the roots and attachments of, runs whose owner pid is
-gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool
-exported on teardown; the Linux leg also exercises `cowshed-helper` and the Landlock/netns exec path. A suite-level
-guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on both; substrate-specific assertions
-(fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+image/whole-device/volume identity and retains each currently-owned mounted volume's raw pin through `diskutil unmount`,
+then runs guarded `hdiutil detach` of the exact physical device under the image's lease. The detach guard rechecks after
+the host lease wait; a previously cached disk number or mountpoint never authorizes an unmount or detach. A failed
+release keeps the scratch tree intact for the next run, rather than deleting a still-attached image's backing files.
+Before any release, a scratch root ends every process working in its tree, selected by the working directory the kernel
+reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a deleted directory): `SIGTERM`, as
+`nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a fixture started detaches from its
+starter, so a failed test's unwinding otherwise never reached it and it kept running in the deleted root. Successful
+cleanup removes the root, and every run first ends the processes working under, then reclaims the roots and attachments
+of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with
+datasets destroyed and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the
+Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
+both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
 line-start image records (RAW, then retained ASIF) and the worker record; neither a sibling's output nor a host
@@ -244,9 +244,9 @@ and exact-root teardown remain unchanged; no delay, retry, dropped assertion or 
 
 Owned-image command-boundary controls pin current provider-tree projection, excluding a foreign/stale cached BSD
 descendant before any command effect, and retain moved/reused-device refusals. Mount requires the exact single owned
-APFS volume, pinned fsck before the first mount and a positive registry/image guard after the host lease wait; a failed
-fsck or mount never earns release grace or retry. Option controls retain read-only/visibility/owners/noatime and the
-separate event-store-repair `nobrowse,noowners` state. Release controls retain exact-volume `diskutil unmount`, exact
+APFS volume, pinned fsck before the first mount and that proven raw pin held across the host lease wait; a failed fsck
+or mount never earns release grace or retry. Option controls retain read-only/visibility/owners/noatime and the separate
+event-store-repair `nobrowse,noowners` state. Release controls retain exact-volume `diskutil unmount`, exact
 physical-device `hdiutil detach`, post-grant guards and the unchanged named-dissenter/busy parsers; permission, general
 and unrecognized refusals remain errors. Real image teardown still proves the complete mounted RAW plus unmounted
 retained-ASIF panic/kill walk. An isolated pass after operator cleanup is not a repair verdict when the unchanged full
@@ -579,8 +579,8 @@ Covered flows:
   and reconnecting a named session bound to N returns the documented stale-session conflict rather than silently
   rebinding. Repeat for both grant and revoke.
 - **One exact-image no-mount attach → pinned fsck → pinned `mount_apfs`** on APFS: assert attach flags/plist parsing,
-  exact current image/whole/volume identity, `fsck_apfs -q` before the first mount, and the mapping guard after the host
-  namespace grant, then helper options, requested root and held mount-root/source identity before publication. A
+  exact current image/whole/volume identity, `fsck_apfs -q` before the first mount, and the raw pin held across the host
+  namespace wait, then helper options, requested root and held mount-root/source identity before publication. A
   structurally-bad clone refuses before mounting. A malformed reply, failed fsck or refused/wrong mount releases only
   the owned attachment or names its cleanup refusal. Foreign/stale descendants are neither targets nor vetoes. No
   combined `--mountPoint` attach, fallback or retry is permitted. Detached verification/resize and unformatted RAW

@@ -126,10 +126,10 @@ refusal. The ordinary mounted path does not retry attach or verification.
 Mount is `mount_apfs -o nobrowse,owners,noatime <verified-volume-device> <mountpoint>` as the invoking user; `--browse`
 omits `nobrowse`, and read-only access adds `rdonly`. The existing root-owned event-store repair uses the same helper
 with its distinct `nobrowse,noowners` policy, without `noatime`, then restores the original workspace policy. The
-mountpoint exists before attach. The image lease and raw volume pin remain held while `run_guarded` rechecks the exact
-image/whole-device/volume mapping after the host namespace lease wait, immediately before spawning the helper. A check
-before that wait is not authority afterward. There is no combined `--mountPoint` attach, `diskutil mount`, fallback,
-retry or StorageKit cached-family selection. A mount refusal retains the actual command status and diagnostics.
+mountpoint exists before attach. The image lease and raw volume pin remain held across the host namespace lease wait and
+the helper: the already-proven exact image/whole-device/volume identity cannot be recycled while that pin is held. There
+is no combined `--mountPoint` attach, `diskutil mount`, fallback, retry or StorageKit cached-family selection. A mount
+refusal retains the actual command status and diagnostics.
 
 After success, cowshed holds the requested mount root and verifies it is the filesystem root sourced from the pinned
 volume before publication or any in-image marker write. A failed attach, malformed reply, mount refusal or wrong
@@ -138,8 +138,9 @@ recovered volume uses the same pinned `mount_apfs` boundary. Blank formatting, d
 and fixtures deliberately exercising an unmounted state retain `--noMount` and explicit `fsck_apfs -q` where required.
 Namespace-only unmount uses `diskutil unmount` of the exact verified volume. Owned-image release unmounts each exact
 currently-owned mounted volume with `diskutil unmount`, then releases the exact physical whole device with
-`hdiutil detach -verbose`; the guards run again after each command's host lease wait. There is no general-eject or
-kernel-unmount fallback. Command selection does not itself claim Spotlight releases departed media references.
+`hdiutil detach -verbose`. The raw volume pin preserves unmount authority across its host lease wait; the unpinned
+detach rechecks ownership after its storage lease wait. There is no general-eject or kernel-unmount fallback. Command
+selection does not itself claim Spotlight releases departed media references.
 
 ### Owned-registry mount boundary
 
@@ -342,9 +343,9 @@ inventory is a typed refusal; each leaves both the attachment and backing file i
 retried and no unproved device is formatted. Shared owned-image cleanup distinguishes this unformatted whole-device
 state from an APFS volume: it rechecks the exact mapping under the image's lease and releases only that owned device
 without deleting the backing file first. Every detach attempt, including a dissent retry and the final force, rechecks
-that mapping in `run_guarded` after the host storage lease wait, immediately before spawning `hdiutil`. Every volume
-unmount similarly rechecks its exact image/whole-device/volume mapping after its host lease wait while holding the raw
-pin. A check before a lease wait is not authority afterward, and a recycled `diskN` cannot substitute another image.
+that mapping in `run_guarded` after the host storage lease wait, immediately before spawning `hdiutil`. Each volume
+unmount instead carries its proven exact image/whole-device/volume identity through the host lease wait under its raw
+pin. An earlier unpinned check is not authority after a lease wait; a recycled `diskN` cannot substitute another image.
 Confirmed image absence needs no operation; a positive conflicting mapping or unreadable inventory refuses the mutation.
 A release deduplicates whole-device views, so the same attachment is never detached twice.
 
@@ -354,9 +355,10 @@ The release owner selects the exact backing image, its registered whole device a
 descendants. Only those identities authorize release: a foreign or stale StorageKit cached descendant must neither be
 selected for unmount/detach nor veto release of the owned tree. A reused BSD spelling is not ownership. The owner-layer
 adapter preserves this boundary through exact-volume `diskutil unmount` and exact-physical-device `hdiutil detach`, with
-positive registry/image guards after their host lease waits, not merely a check of top-level argv before queuing. An
-unrelated refusal remains an error; the boundary is not permission to broaden the dissent parser, force a foreign
-volume, add an automatic command fallback, or weaken a fixture's complete cleanup expectation.
+a registry-proven raw pin across the unmount's host lease wait and a positive registry/image guard after the detach's
+host lease wait, not merely a check of top-level argv before queuing. An unrelated refusal remains an error; the
+boundary is not permission to broaden the dissent parser, force a foreign volume, add an automatic command fallback, or
+weaken a fixture's complete cleanup expectation.
 
 On 2026-10-14 at **20:07:36 +04:00**, the real panic/kill cleanup fixture's retained `second.asif` was joined by the I/O
 Registry to driver **0x100089e2a**, helper **36162**, physical **disk177**, container **disk179** and unmounted,
@@ -415,10 +417,10 @@ orphan helper's file lock remains a named refusal and preserves the file. Confir
 already-absent file, needs no release command. A failed explicit cleanup is never retried from its destructor.
 
 A namespace-only unmount, needed for adopt handoff or a sealed capture without releasing the device, is
-`diskutil unmount <verified-volume-device>`. It holds the image lease and raw IOMedia pin while rechecking the exact
-image/whole-device/volume identity after the host lease wait, never a path selected by an untrusted child. Restart-owned
-mounts additionally require their incarnation marker and matching kernel source. `WhenIdle` returns the recognized
-command dissent without force; `Release` waits the existing grace before
+`diskutil unmount <verified-volume-device>`. It holds the image lease and the raw IOMedia pin that proves the exact
+image/whole-device/volume identity across the host lease wait, never a path selected by an untrusted child.
+Restart-owned mounts additionally require their incarnation marker and matching kernel source. `WhenIdle` returns the
+recognized command dissent without force; `Release` waits the existing grace before
 `diskutil unmount force <verified-volume-device>`. Other errors remain errors. Ordinary image release uses the same
 exact-volume unmount boundary for each currently-owned mounted volume before `hdiutil detach` of the physical whole
 device; namespace-only unmount does not release that device.
@@ -427,9 +429,9 @@ Attach, verification and every lookup that answers one attachment require exactl
 container, and refuse anything else by naming what was reported. A release reads each of the image's attachments as its
 whole device plus every APFS volume in that container, so it can also take an owned image whose container gained a
 volume (for example, one a dead test added). Each mounted volume is unmounted under the image lease and its own raw pin,
-once that volume is rechecked as a member of the current provider tree after the host lease wait. The physical whole
-device is then detached once with `hdiutil`, taking the unmounted volumes with it. A formatted attachment that reports
-no volume, reports a volume without its container, or spans two containers is still refused.
+after proving that volume belongs to the current provider tree; its raw pin preserves that proof across the host lease
+wait. The physical whole device is then detached once with `hdiutil`, taking the unmounted volumes with it. A formatted
+attachment that reports no volume, reports a volume without its container, or spans two containers is still refused.
 
 Concurrent mount-table reads use `getfsstat(MNT_NOWAIT)` into a buffer each call owns: count first, allocate checked
 space with room for new mounts, and grow and reread if the returned buffer is full. No reader borrows `getmntinfo`'s
@@ -457,13 +459,12 @@ returns a handle owning its raw pin through the kernel mount-table read and moun
 already-mounted handle is dropped, after `mount_apfs` finishes, before intentional detach, or before the exclusive
 `diskutil apfs resizeContainer` writer, which cannot run with a raw descriptor open. Independent device ejects during
 container resize after pin release are not covered. While held, the descriptor prevents even external
-`diskutil eject force` or `hdiutil detach -force` from releasing the image and recycling its device name. Detached
-`attach_verified` retains its existing lost-device recovery: if the reported device is lost before pinning, at most one
-fresh attachment is allowed, only when inventory shows no attachment for that image. The ordinary `attach_mounted` path
-attaches once and refuses that loss without a retry. A conflicting or unreadable mapping fails closed, without running
-fsck on the reported device. No live-fsck option authorizes touching a foreign mounted container. Blank-image formatting
-keeps its image-to-whole-device check under the image's lease; its exclusive formatter cannot share a raw-device
-descriptor with another opener.
+`diskutil eject force` or `hdiutil detach -force` from releasing the image and recycling its device name. Every attach
+path, including detached verification and retained read-only mounting, attaches once and refuses a reported device lost
+before pinning without retrying. A conflicting or unreadable mapping fails closed, without running fsck on the reported
+device. No live-fsck option authorizes touching a foreign mounted container. Blank-image formatting keeps its
+image-to-whole-device check under the image's lease; its exclusive formatter cannot share a raw-device descriptor with
+another opener.
 
 For every mounted attachment:
 
