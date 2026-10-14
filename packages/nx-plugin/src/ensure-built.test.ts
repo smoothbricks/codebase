@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { Task } from 'nx/src/config/task-graph';
 import type { DaemonProcessJson } from 'nx/src/daemon/cache';
-import { expandOutputs, matchOutputPaths } from 'nx/src/native';
+import { expandOutputs } from 'nx/src/native';
 import { getExecutorNameForTask } from 'nx/src/tasks-runner/utils';
 import { signalToCode } from 'nx/src/utils/exit-codes';
 import typia from 'typia';
@@ -15,7 +15,6 @@ import { nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
 import {
   assignEnvironment,
   callerOwnsWorkspace,
-  changesOutsideOutputs,
   cliExitOutcome,
   compareWithArtifacts,
   describeError,
@@ -245,6 +244,78 @@ describe('unvouched', () => {
 });
 
 describe('compareWithArtifacts', () => {
+  it('reuses a verified two-tree inventory without expanding or rereading artifact bytes', () => {
+    const path = join(root, 'verified.json');
+    let walks = 0;
+    const expand: typeof expandOutputs = (...args) => {
+      walks += 1;
+      return expandOutputs(...args);
+    };
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expand, path).kind).toBe('restorable');
+    expect(walks).toBeGreaterThan(0);
+    walks = 0;
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expand, path).kind).toBe('restorable');
+    expect(walks).toBe(0);
+  });
+
+  it('invalidates verified equality for output or cache mutations even with restored mtime', async () => {
+    const path = join(root, 'verified.json');
+    const artifact = artifacts().get(claim.hash);
+    if (artifact === undefined) throw new Error('Missing cache artifact in output-mutation fixture');
+    const expected = join(artifact.outputsPath, 'packages/app/dist/marker.txt');
+    for (const file of [marker(), expected]) {
+      await writeFile(marker(), 'built\nlib\n');
+      await writeFile(expected, 'built\nlib\n');
+      expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('restorable');
+      const { stat, utimes } = await import('node:fs/promises');
+      const original = await stat(file);
+      await writeFile(file, 'BUILT\nLIB\n');
+      await utimes(file, original.atime, original.mtime);
+      expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path)).toEqual({
+        kind: 'stale-outputs',
+        taskId: 'app:build',
+      });
+    }
+  });
+
+  it('invalidates inventories for deletion, permission changes, parent symlinks and added directory members', async () => {
+    const path = join(root, 'verified.json');
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('restorable');
+    await chmod(marker(), 0o700);
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('stale-outputs');
+    await chmod(marker(), 0o644);
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('restorable');
+    await writeFile(join(workspace(), 'packages/app/dist/added'), 'added');
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('stale-outputs');
+    await rm(join(workspace(), 'packages/app/dist/added'));
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('restorable');
+    await rm(marker());
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('stale-outputs');
+    await writeFile(marker(), 'built\nlib\n');
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('restorable');
+    const { rename } = await import('node:fs/promises');
+    await rename(join(workspace(), 'packages/app'), join(workspace(), 'packages/real-app'));
+    await symlink('real-app', join(workspace(), 'packages/app'));
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('stale-outputs');
+  });
+
+  it('falls back to real comparison for missing/unreadable witness and a changed cache binding', async () => {
+    const path = join(root, 'verified.json');
+    expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('restorable');
+    await chmod(path, 0);
+    try {
+      expect(compareWithArtifacts(workspace(), [claim], artifacts(), expandOutputs, path).kind).toBe('restorable');
+    } finally {
+      await chmod(path, 0o600);
+    }
+    const renamed = join(root, 'cache', 'other', 'outputs');
+    await mkdir(join(renamed, 'packages/app/dist'), { recursive: true });
+    await writeFile(join(renamed, 'packages/app/dist/marker.txt'), 'other');
+    expect(
+      compareWithArtifacts(workspace(), [claim], new Map([[claim.hash, { outputsPath: renamed }]]), expandOutputs, path)
+        .kind,
+    ).toBe('stale-outputs');
+  });
   // A working tree and the artifact Nx's local cache holds for the claim's
   // hash, laid out as Nx stores one: the outputs under their workspace paths.
   let root = '';
@@ -316,25 +387,6 @@ describe('workspaceFileChanges', () => {
       updated: ['packages/lib/source.txt'],
       deleted: ['packages/lib/added.txt'],
     });
-  });
-});
-
-describe('changesOutsideOutputs', () => {
-  const tasks = [
-    task({ id: 'lib:build', outputs: ['packages/lib/dist'] }),
-    task({ id: 'app:build', outputs: ['packages/app/dist'] }),
-  ];
-
-  it("does not count a build's own output writes as changed inputs", () => {
-    expect(
-      changesOutsideOutputs(tasks, ['packages/lib/dist/lib.txt', 'packages/app/dist/marker.txt'], matchOutputPaths),
-    ).toBe(false);
-  });
-
-  it('counts a dependency input added, edited or deleted outside every declared output', () => {
-    expect(
-      changesOutsideOutputs(tasks, ['packages/app/dist/marker.txt', 'packages/lib/source.txt'], matchOutputPaths),
-    ).toBe(true);
   });
 });
 
@@ -679,6 +731,7 @@ async function writeTwoProjectWorkspace(workspace: string, builds: string): Prom
   // independent Nx workspace: its own Git boundary keeps the daemon's
   // ignore-aware watcher from dropping all of its source changes.
   expect(Bun.spawnSync(['git', 'init', '--quiet', workspace]).exitCode).toBe(0);
+  await writeFile(join(workspace, '.gitignore'), '.nx\nnode_modules\npackages/*/dist\n');
   await mkdir(join(workspace, 'packages', 'app'), { recursive: true });
   await mkdir(join(workspace, 'packages', 'lib'), { recursive: true });
   // The repository's own node_modules, so the fixture resolves the Nx this package is written against.
@@ -822,6 +875,259 @@ describe('smoo-nx-exec with a fresh daemon', () => {
           expect(again).toEqual({ code: 0, signal: null, stdout: '', stderr: '' });
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
 
+          // Probe-only receipts use the real Nx keys/cache and independently
+          // census public output bytes without starting a task runner.
+          const committed = spawnSync(
+            'git',
+            [
+              '-C',
+              workspace,
+              'add',
+              '.gitignore',
+              'report',
+              'nx.json',
+              'packages/app/project.json',
+              'packages/app/source.txt',
+              'packages/lib/project.json',
+              'packages/lib/source.txt',
+            ],
+            { encoding: 'utf8' },
+          );
+          expect(committed.status, committed.stdout + committed.stderr).toBe(0);
+          const sourceCommit = spawnSync(
+            'git',
+            [
+              '-C',
+              workspace,
+              '-c',
+              'user.name=EnsureBuilt fixture',
+              '-c',
+              'user.email=fixture@example.invalid',
+              'commit',
+              '-qm',
+              'source fixture',
+            ],
+            { encoding: 'utf8' },
+          );
+          expect(sourceCommit.status, sourceCommit.stdout + sourceCommit.stderr).toBe(0);
+          const probeEntry = join(root, 'probe-receipt.ts');
+          await writeFile(
+            probeEntry,
+            `
+import { readFile, stat, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const output = join(process.cwd(), 'packages/app/dist/marker.txt');
+const source = join(process.cwd(), 'packages/lib/source.txt');
+const originalOutput = await readFile(output, 'utf8');
+const originalSource = await readFile(source, 'utf8');
+const before = await stat(output, { bigint: true });
+const hit = await ensureBuilt({ target: 'app:build', cwd: process.cwd(), onMiss: 'refuse' });
+const after = await stat(output, { bigint: true });
+process.env.NX_DAEMON = 'false';
+const daemonless = await ensureBuilt({ target: 'app:build', cwd: process.cwd(), onMiss: 'refuse' });
+process.env.NX_DAEMON = 'true';
+await writeFile(output, 'tampered');
+const stale = await ensureBuilt({ target: 'app:build', cwd: process.cwd(), onMiss: 'refuse' });
+await writeFile(output, originalOutput);
+await writeFile(source, 'new uncached source');
+const uncached = await ensureBuilt({ target: 'app:build', cwd: process.cwd(), onMiss: 'refuse' });
+const outputAfterMiss = await readFile(output, 'utf8');
+await writeFile(source, originalSource);
+console.log(JSON.stringify({ hit, daemonless, stale, uncached, outputUnwritten: before.ino === after.ino && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs, outputAfterMiss }));
+`,
+          );
+          const probed = await run('bun', probeEntry, workspace, [], {
+            NX_DAEMON: 'true',
+            NX_USE_LOCAL: 'true',
+            NX_WORKSPACE_ROOT_PATH: workspace,
+            ...ownEnv,
+          });
+          expect(probed.code, probed.stdout + probed.stderr).toBe(0);
+          const receipts = typia.json.assertParse<{
+            hit: import('./ensure-built.js').EnsureBuiltProbeResult;
+            daemonless: import('./ensure-built.js').EnsureBuiltProbeResult;
+            stale: import('./ensure-built.js').EnsureBuiltProbeResult;
+            uncached: import('./ensure-built.js').EnsureBuiltProbeResult;
+            outputUnwritten: boolean;
+            outputAfterMiss: string;
+          }>(probed.stdout);
+          expect(receipts.hit.disposition, probed.stderr).toBe('hit');
+          if (receipts.hit.disposition === 'hit') {
+            expect(receipts.hit.receipt.tasks.map(({ id }) => id).sort()).toEqual(['app:build', 'lib:build']);
+            expect(
+              receipts.hit.receipt.tasks
+                .flatMap(({ outputs }) => outputs)
+                .find(({ path }) => path === 'packages/app/dist/marker.txt'),
+            ).toMatchObject({ type: 'file', sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+          }
+          expect(receipts.daemonless).toEqual({
+            disposition: 'miss',
+            reason: { kind: 'no-daemon', taskId: 'app:build' },
+          });
+          expect(receipts.stale).toEqual({
+            disposition: 'miss',
+            reason: { kind: 'stale-outputs', taskId: 'app:build' },
+          });
+          expect(receipts.uncached.disposition).toBe('miss');
+          expect(receipts.outputUnwritten).toBe(true);
+          expect(receipts.outputAfterMiss).toBe('built\nlib\n');
+          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+
+          const sourceRaceEntry = join(root, 'receipt-source-race.ts');
+          await writeFile(
+            sourceRaceEntry,
+            `
+import { createRequire } from 'node:module';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const source = join(process.cwd(), 'packages/lib/source.txt');
+const text = await readFile(source, 'utf8');
+const { daemonClient } = createRequire(process.cwd() + '/package.json')('nx/src/daemon/client/client');
+const hash = daemonClient.hashTasks.bind(daemonClient);
+daemonClient.hashTasks = async (...args) => {
+  const result = await hash(...args);
+  await writeFile(source, 'transient source');
+  await writeFile(source, text);
+  return result;
+};
+console.log(JSON.stringify(await ensureBuilt({ target: 'app:build', cwd: process.cwd(), onMiss: 'refuse' })));
+`,
+          );
+          const sourceRace = await run('bun', sourceRaceEntry, workspace, [], {
+            NX_DAEMON: 'true',
+            NX_USE_LOCAL: 'true',
+            NX_WORKSPACE_ROOT_PATH: workspace,
+            ...ownEnv,
+          });
+          expect(sourceRace.code, sourceRace.stdout + sourceRace.stderr).toBe(0);
+          const sourceRaceResult = typia.json.assertParse<import('./ensure-built.js').EnsureBuiltProbeResult>(
+            sourceRace.stdout,
+          );
+          expect(sourceRaceResult).toMatchObject({
+            disposition: 'failed',
+            reason: { kind: 'provider-proof', detail: expect.stringContaining('across Nx hashing') },
+          });
+          expect(sourceRace.stderr).toContain('Provider source');
+          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+
+          // An awaited daemon graph can see B while both disk snapshots see
+          // A. Node stamps revoke that generation; the fresh daemon file table
+          // supplies the A reconciliation instead of an empty A-to-A diff.
+          const generationRaceEntry = join(root, 'graph-generation-race.ts');
+          await writeFile(
+            generationRaceEntry,
+            `
+import { createRequire } from 'node:module';
+import { readFile, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const source = join(process.cwd(), 'packages/lib/source.txt');
+const text = await readFile(source, 'utf8');
+await rm(join(process.cwd(), '.nx/workspace-data/ensure-built-graph.json'), { force: true });
+const { daemonClient } = createRequire(process.cwd() + '/package.json')('nx/src/daemon/client/client');
+const request = daemonClient.getProjectGraphAndSourceMaps.bind(daemonClient);
+let requests = 0;
+daemonClient.getProjectGraphAndSourceMaps = async () => {
+  requests += 1;
+  const result = await request();
+  if (requests !== 1) return result;
+  await writeFile(source, 'transient graph input');
+  await daemonClient.updateWorkspaceContext([], ['packages/lib/source.txt'], []);
+  const next = await request();
+  await writeFile(source, text);
+  return next;
+};
+const result = await ensureBuilt({ target: 'app:build', cwd: process.cwd() });
+console.log(JSON.stringify({ result, requests }));
+`,
+          );
+          const generationRace = await run('bun', generationRaceEntry, workspace, [], {
+            NX_DAEMON: 'true',
+            NX_USE_LOCAL: 'true',
+            NX_WORKSPACE_ROOT_PATH: workspace,
+            ...ownEnv,
+          });
+          expect(generationRace.code, generationRace.stdout + generationRace.stderr).toBe(0);
+          const generations = typia.json.assertParse<{
+            result: import('./ensure-built.js').EnsureBuiltResult;
+            requests: number;
+          }>(generationRace.stdout);
+          expect(generations.result).toEqual({ disposition: 'hit' });
+          expect(generations.requests).toBeGreaterThanOrEqual(2);
+          expect(generationRace.stderr).toBe('');
+          expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+          // Count real graph RPCs, without substituting any response. The
+          // second call must use the graph witness; every membership/config
+          // change must return to the daemon's current generation.
+          const reuseEntry = join(root, 'graph-reuse.ts');
+          await writeFile(
+            reuseEntry,
+            `
+import { createRequire } from 'node:module';
+import { chmod, readFile, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const { daemonClient } = createRequire(process.cwd() + '/package.json')('nx/src/daemon/client/client');
+const request = daemonClient.getProjectGraphAndSourceMaps.bind(daemonClient);
+let requests = 0;
+daemonClient.getProjectGraphAndSourceMaps = async () => { requests += 1; return request(); };
+const results = [];
+async function check(label) {
+  const before = requests;
+  const result = await ensureBuilt({ target: 'app:build', cwd: process.cwd() });
+  results.push({ label, requests: requests - before, disposition: result.disposition });
+}
+await check('establish');
+await check('reuse');
+const added = join(process.cwd(), 'new-graph-input.txt');
+await writeFile(added, 'new');
+await check('created');
+await rm(added);
+await check('deleted');
+const project = join(process.cwd(), 'packages/app/project.json');
+const original = await readFile(project, 'utf8');
+const config = JSON.parse(original);
+config.implicitDependencies = [];
+await writeFile(project, JSON.stringify(config));
+await check('dependency');
+await writeFile(project, original);
+await check('dependency-restored');
+const witness = join(process.cwd(), '.nx/workspace-data/ensure-built-graph.json');
+await rm(witness);
+await check('missing-witness');
+await chmod(witness, 0);
+try { await check('unreadable-witness'); } finally { await chmod(witness, 0o600); }
+console.log(JSON.stringify(results));
+`,
+          );
+          const reused = await run('bun', reuseEntry, workspace, [], {
+            NX_DAEMON: 'true',
+            NX_USE_LOCAL: 'true',
+            NX_WORKSPACE_ROOT_PATH: workspace,
+            ...ownEnv,
+          });
+          expect(reused.code, reused.stdout + reused.stderr).toBe(0);
+          const graphChecks = typia.json.assertParse<{ label: string; requests: number; disposition: string }[]>(
+            reused.stdout,
+          );
+          expect(graphChecks.find(({ label }) => label === 'reuse')).toEqual({
+            label: 'reuse',
+            requests: 0,
+            disposition: 'hit',
+          });
+          for (const label of [
+            'created',
+            'deleted',
+            'dependency',
+            'dependency-restored',
+            'missing-witness',
+            'unreadable-witness',
+          ]) {
+            expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
+          }
+          expect(await readFile(join(workspace, 'packages/app/dist/marker.txt'), 'utf8')).toBe('built\nlib\n');
           // Coordinate a real write after the real daemon returned its file
           // table. The response is not substituted: this makes the
           // graph→snapshot race deterministic without relying on FSEvents.
@@ -831,7 +1137,7 @@ describe('smoo-nx-exec with a fresh daemon', () => {
             `
 import { createRequire } from 'node:module';
 import { writeFile } from 'node:fs/promises';
-import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'src', 'ensure-built.ts'))};
+import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
 const { daemonClient } = createRequire(process.cwd() + '/package.json')('nx/src/daemon/client/client');
 const readFiles = daemonClient.getWorkspaceContextFileData.bind(daemonClient);
 daemonClient.getWorkspaceContextFileData = async () => {

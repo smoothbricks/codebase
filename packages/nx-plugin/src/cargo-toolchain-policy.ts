@@ -1,3 +1,4 @@
+import { runtimeInput, shellWord } from './runtime-input.js';
 /**
  * The toolchain half of a cargo task's identity, shared by the two things that
  * must agree about it: target inference, which attaches it, and the monorepo
@@ -55,6 +56,11 @@ export const CARGO_TOOLCHAIN_PIN_INPUTS: readonly string[] = [
  * token that cannot drift from what the plugin attaches.
  */
 export const CARGO_TOOLCHAIN_NAMED_INPUT = 'cargoToolchain';
+
+/** The toolchain versions `command` prints, from the directory whose rust-toolchain selects them. */
+export function cargoRuntimeInput(projectRoot: string, command: string): { runtime: string } {
+  return runtimeInput(`sh -c ${shellWord(`cd "$0" && ${command}`)} ${shellWord(projectRoot)}`);
+}
 
 /**
  * Does one resolved input string carry the toolchain identity?

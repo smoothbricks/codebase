@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
 import {
   closeSync,
@@ -23,7 +23,9 @@ import type * as NxDaemonClient from 'nx/src/daemon/client/client';
 import type * as NxHashTask from 'nx/src/hasher/hash-task';
 import type * as NxTaskHasher from 'nx/src/hasher/task-hasher';
 import type * as NxNative from 'nx/src/native';
+import type * as NxTransformObjects from 'nx/src/native/transform-objects';
 import type * as NxExecutionHooks from 'nx/src/project-graph/plugins/tasks-execution-hooks';
+import type * as NxProjectRootMappings from 'nx/src/project-graph/utils/find-project-for-path';
 import type * as NxCache from 'nx/src/tasks-runner/cache';
 import type * as NxCreateTaskGraph from 'nx/src/tasks-runner/create-task-graph';
 import type { TaskResults } from 'nx/src/tasks-runner/life-cycle';
@@ -33,8 +35,23 @@ import type * as NxTasksRunnerUtils from 'nx/src/tasks-runner/utils';
 import type * as NxCacheDirectory from 'nx/src/utils/cache-directory';
 import type * as NxCommandLineUtils from 'nx/src/utils/command-line-utils';
 import type { NxArgs } from 'nx/src/utils/command-line-utils';
+import type * as NxPackageJson from 'nx/src/utils/package-json';
 import type * as NxPerfLogging from 'nx/src/utils/perf-logging';
 import type * as NxWorkspaceRoot from 'nx/src/utils/workspace-root';
+import { boundedReceiptRuntimes, type ProviderInputProof, providerReceipt } from './ensure-built-receipt.js';
+import {
+  type ArtifactWitness,
+  type GraphWitness,
+  graphInstallationIdentity,
+  nodeStamp,
+  nodesUnchanged,
+  readArtifactWitness,
+  readGraphWitness,
+  reusableGraph,
+  snapshotsEqual,
+  workspaceSnapshot,
+  writeWitness,
+} from './ensure-built-witness.js';
 import { managedAssetsRoot } from './managed-assets.js';
 
 interface NxRuntimeModules {
@@ -43,6 +60,9 @@ interface NxRuntimeModules {
   readonly 'nx/src/hasher/hash-task': typeof NxHashTask;
   readonly 'nx/src/hasher/task-hasher': typeof NxTaskHasher;
   readonly 'nx/src/native': typeof NxNative;
+  readonly 'nx/src/native/transform-objects': typeof NxTransformObjects;
+  readonly 'nx/src/project-graph/utils/find-project-for-path': typeof NxProjectRootMappings;
+  readonly 'nx/src/utils/package-json': typeof NxPackageJson;
   readonly 'nx/src/project-graph/plugins/tasks-execution-hooks': typeof NxExecutionHooks;
   readonly 'nx/src/tasks-runner/cache': typeof NxCache;
   readonly 'nx/src/tasks-runner/create-task-graph': typeof NxCreateTaskGraph;
@@ -155,6 +175,53 @@ export interface EnsureBuiltOptions {
   readonly onMiss?: 'stream';
 }
 
+/** A read-only build probe: no task runner or producer output write is permitted. */
+export interface EnsureBuiltProbeOptions extends Omit<EnsureBuiltOptions, 'onMiss'> {
+  readonly onMiss: 'refuse';
+}
+
+export type EnsureBuiltOutputReceipt =
+  | { readonly path: string; readonly type: 'file'; readonly mode: number; readonly sha256: string }
+  | { readonly path: string; readonly type: 'symlink'; readonly mode: number; readonly linkText: string }
+  | {
+      readonly path: string;
+      readonly type: 'directory';
+      readonly mode: number;
+      readonly entries: readonly string[];
+      readonly sha256: string;
+    };
+
+/** Git provenance covers file inputs only; runtime/env identity remains Nx's current task hash. */
+export interface EnsureBuiltReceipt {
+  readonly workspaceRoot: string;
+  readonly head: string;
+  readonly headTree: string;
+  readonly fileInputProvenance: 'exact-file-inputs' | 'conservative-provider-source';
+  readonly runtimeEnvironmentProvenance: 'nx-task-hash-only';
+  readonly tasks: readonly {
+    readonly id: string;
+    readonly hash: string;
+    readonly outputs: readonly EnsureBuiltOutputReceipt[];
+  }[];
+}
+
+export interface EnsureBuiltProbeFailure {
+  readonly disposition: 'failed';
+  readonly reason: {
+    readonly kind: 'provider-proof';
+    readonly taskId: string;
+    readonly workspaceRoot: string;
+    readonly detail: string;
+  };
+  readonly exitCode: 1;
+  readonly signal: null;
+}
+
+export type EnsureBuiltProbeResult =
+  | { readonly disposition: 'hit'; readonly receipt: EnsureBuiltReceipt }
+  | { readonly disposition: 'miss'; readonly reason: MissReason }
+  | EnsureBuiltProbeFailure
+  | WorkspaceSocketRefusal;
 /** A full hit carries no payload, so it is the same value every time. */
 const HIT: EnsureBuiltResult = Object.freeze({ disposition: 'hit' });
 
@@ -333,7 +400,11 @@ export function unvouched<Entry>(entries: readonly Entry[], verdicts: readonly b
  * output hashes to check the working tree against — so the target is handed to
  * the workspace's own `nx` CLI unconditionally.
  */
-export async function ensureBuilt(options: EnsureBuiltOptions): Promise<EnsureBuiltResult> {
+export function ensureBuilt(options: EnsureBuiltProbeOptions): Promise<EnsureBuiltProbeResult>;
+export function ensureBuilt(options: EnsureBuiltOptions): Promise<EnsureBuiltResult>;
+export async function ensureBuilt(
+  options: EnsureBuiltOptions | EnsureBuiltProbeOptions,
+): Promise<EnsureBuiltResult | EnsureBuiltProbeResult> {
   const selector = parseTargetSelector(options.target);
   if (!selector) {
     throw new Error(`ensureBuilt: '${options.target}' is not a project:target[:configuration] selector`);
@@ -606,14 +677,15 @@ export function missBeforeProbe(env: Readonly<NodeJS.ProcessEnv>, taskId: string
 async function ensureBuiltInWorkspace(
   workspaceRoot: string,
   selector: TargetSelector,
-  onMiss: 'stream',
-): Promise<EnsureBuiltResult> {
+  onMiss: 'stream' | 'refuse',
+): Promise<EnsureBuiltResult | EnsureBuiltProbeResult> {
   const taskId = selectorTaskId(selector);
   // The environment has precedence over nx.json. Avoid loading Nx at all on
   // this explicit fallback path, which also lets a deliberately minimal
   // checkout-local CLI stand in for Nx.
   if (process.env.NX_DAEMON === 'false') {
-    return runViaCli(workspaceRoot, selector, { kind: 'no-daemon', taskId });
+    const reason: MissReason = { kind: 'no-daemon', taskId };
+    return onMiss === 'refuse' ? { disposition: 'miss', reason } : runViaCli(workspaceRoot, selector, reason);
   }
   // Nx rejects daemon access when the client package's version differs from
   // the workspace's running daemon. Resolve every runtime module from the
@@ -623,7 +695,8 @@ async function ensureBuiltInWorkspace(
   bindWorkspaceRoot(workspaceRoot, requireNx);
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
   if (!daemonClient.enabled()) {
-    return runViaCli(workspaceRoot, selector, { kind: 'no-daemon', taskId });
+    const reason: MissReason = { kind: 'no-daemon', taskId };
+    return onMiss === 'refuse' ? { disposition: 'miss', reason } : runViaCli(workspaceRoot, selector, reason);
   }
   assignEnvironment(process.env, withoutOuterTaskCacheBypass(process.env));
 
@@ -639,7 +712,7 @@ async function ensureBuiltInWorkspace(
   // routed through Nx's own argument normalization would key the cache
   // differently from the CLI and turn every probe into a miss.
   const { nxArgs, overrides } = splitArgsIntoNxArgsAndOverrides(
-    { targets: [selector.target], configuration: selector.configuration, outputStyle: onMiss },
+    { targets: [selector.target], configuration: selector.configuration, outputStyle: 'stream' },
     'run-one',
     { printWarnings: false },
     nxJson,
@@ -651,9 +724,10 @@ async function ensureBuiltInWorkspace(
   setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
 
   performance.mark('ensureBuilt:graph:start');
-  let { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
+  const projectGraph = await currentProjectGraph(workspaceRoot, nxJson, requireNx);
+  nxJson = readNxJson();
   requireProject(projectGraph, selector.project);
-  let taskGraph = createTaskGraph(
+  const taskGraph = createTaskGraph(
     projectGraph,
     {},
     [selector.project],
@@ -662,27 +736,9 @@ async function ensureBuiltInWorkspace(
     overrides,
     false,
   );
-  let tasks = Object.values(taskGraph.tasks);
+  const tasks = Object.values(taskGraph.tasks);
   performance.measure('ensureBuilt:graph', 'ensureBuilt:graph:start');
-
-  if (await refreshWorkspaceContext(workspaceRoot, tasks, requireNx)) {
-    // updateWorkspaceContext schedules recomputation. The graph RPC awaits
-    // that generation; hashing the graph obtained before the update would
-    // still describe the old sources. An unrelated edit is not a build miss.
-    ({ projectGraph } = await daemonClient.getProjectGraphAndSourceMaps());
-    nxJson = readNxJson();
-    requireProject(projectGraph, selector.project);
-    taskGraph = createTaskGraph(
-      projectGraph,
-      {},
-      [selector.project],
-      [selector.target],
-      selector.configuration,
-      overrides,
-      false,
-    );
-    tasks = Object.values(taskGraph.tasks);
-  }
+  const probeSource = onMiss === 'refuse' ? captureProbeSource(workspaceRoot, requireNx) : undefined;
 
   const runId = randomUUID();
   const startTime = Date.now();
@@ -700,11 +756,43 @@ async function ensureBuiltInWorkspace(
   performance.mark('ensureBuilt:probe:start');
   const reason =
     missBeforeProbe(process.env, taskId) ??
-    (await probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx));
+    (await probe(workspaceRoot, nxJson, nxArgs, projectGraph, taskGraph, tasks, requireNx, onMiss === 'refuse'));
   performance.measure('ensureBuilt:probe', 'ensureBuilt:probe:start');
   // The CLI runs the hooks around its own run, under its own id. This process
   // ran none of the tasks, so it reports none for the id it opened.
-  const result = reason === null ? HIT : await runViaCli(workspaceRoot, selector, reason);
+  let result: EnsureBuiltResult | EnsureBuiltProbeResult =
+    onMiss === 'refuse'
+      ? reason === null
+        ? providerReceipt(
+            workspaceRoot,
+            taskId,
+            tasks,
+            providerInputProof(workspaceRoot, nxJson, projectGraph, taskGraph, requireNx),
+            requireNx('nx/src/native').expandOutputs,
+          )
+        : ({ disposition: 'miss', reason } satisfies EnsureBuiltProbeResult)
+      : reason === null
+        ? HIT
+        : await runViaCli(workspaceRoot, selector, reason);
+  if (probeSource !== undefined && result.disposition === 'hit') {
+    const after = captureProbeSource(workspaceRoot, requireNx);
+    if (!snapshotsEqual(probeSource, after) || !nodesUnchanged(probeSource.nodes)) {
+      result = {
+        disposition: 'failed',
+        reason: {
+          kind: 'provider-proof',
+          taskId,
+          workspaceRoot,
+          detail: 'Provider source nodes or membership moved across Nx hashing/receipt capture',
+        },
+        exitCode: 1,
+        signal: null,
+      };
+    }
+  }
+  if (result.disposition === 'failed' && result.reason.kind === 'provider-proof') {
+    process.stderr.write(`ensureBuilt: ${result.reason.workspaceRoot}: ${result.reason.detail}\n`);
+  }
   await hooks.runPostTasksExecution({
     id: runId,
     taskResults: NO_TASK_RESULTS,
@@ -717,6 +805,127 @@ async function ensureBuiltInWorkspace(
   return result;
 }
 
+function captureProbeSource(
+  workspaceRoot: string,
+  requireNx: WorkspaceNxRequire,
+): ReturnType<typeof workspaceSnapshot> {
+  const { WorkspaceContext } = requireNx('nx/src/native');
+  const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
+  const data = workspaceDataDirectoryForWorkspace(workspaceRoot);
+  const previous = readGraphWitness(join(data, 'ensure-built-graph.json'));
+  return workspaceSnapshot(workspaceRoot, new WorkspaceContext(workspaceRoot, data), previous?.snapshot);
+}
+/** Nx's native plan is the FILE selection oracle, not a second glob planner.
+ * Config identities skipped by the inspector are included explicitly. A
+ * runtime identity is bounded only by the owning toolchain recipe + a declared
+ * pin; opaque commands and unavailable native proof categorically refuse.
+ */
+function providerInputProof(
+  workspaceRoot: string,
+  nxJson: NxJsonConfiguration,
+  projectGraph: ProjectGraph,
+  taskGraph: TaskGraph,
+  requireNx: WorkspaceNxRequire,
+): ProviderInputProof {
+  const { WorkspaceContext, HashPlanInspector, HashPlanner, transferProjectGraph } = requireNx('nx/src/native');
+  const { transformProjectGraphForRust } = requireNx('nx/src/native/transform-objects');
+  const { createProjectRootMappings } = requireNx('nx/src/project-graph/utils/find-project-for-path');
+  const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
+  const context = new WorkspaceContext(workspaceRoot, workspaceDataDirectoryForWorkspace(workspaceRoot));
+  const { externalReferences } = context.getWorkspaceFiles(
+    Object.fromEntries(createProjectRootMappings(projectGraph.nodes)),
+  );
+  if (externalReferences === undefined) {
+    return {
+      kind: 'conservative-provider-source',
+      files: [],
+      inputs: {},
+      runtimeSource: { kind: 'opaque', detail: 'Nx supplied no native file-input proof' },
+    };
+  }
+  const planner = new HashPlanner(nxJson, transferProjectGraph(transformProjectGraphForRust(projectGraph)));
+  const inspector = new HashPlanInspector(
+    externalReferences.allWorkspaceFiles,
+    externalReferences.projectFiles,
+    workspaceRoot,
+  );
+  const inputs = inspector.inspectInputs(planner.getPlansReference(Object.keys(taskGraph.tasks), taskGraph));
+  const files = new Set<string>();
+  const directories = new Set<string>();
+  const projects = new Set<string>();
+  function includeProject(name: string): void {
+    if (projects.has(name)) return;
+    projects.add(name);
+    const node = projectGraph.nodes[name];
+    if (node === undefined) return;
+    directories.add(node.data.root);
+    for (const file of ['project.json', 'package.json']) {
+      const path = join(node.data.root, file);
+      if (existsSync(join(workspaceRoot, path))) files.add(path);
+    }
+    for (const dependency of projectGraph.dependencies[name] ?? []) includeProject(dependency.target);
+  }
+  let conservative = false;
+  const projectConfigs = Object.fromEntries(
+    Object.entries(projectGraph.nodes).map(([name, node]) => [name, node.data]),
+  );
+  const { getCustomHasher } = requireNx('nx/src/tasks-runner/utils');
+  for (const task of Object.values(taskGraph.tasks)) {
+    const input = inputs[task.id];
+    if (input === undefined || getCustomHasher(task, projectConfigs) !== null) {
+      return {
+        kind: 'conservative-provider-source',
+        files: [...files],
+        inputs,
+        runtimeSource: { kind: 'opaque', detail: `No complete native FILE/runtime plan for ${task.id}` },
+      };
+    }
+    for (const file of input.files) files.add(file);
+    if (input.runtime.length > 0 || input.environment.length > 0) conservative = true;
+    const node = projectGraph.nodes[task.target.project];
+    if (node === undefined) throw new Error(`Lost project for receipt ${task.id}`);
+    includeProject(node.name);
+    const target = node.data.targets?.[task.target.target];
+    const options = {
+      ...target?.options,
+      ...(task.target.configuration === undefined ? {} : target?.configurations?.[task.target.configuration]),
+      ...task.overrides,
+    };
+    if (typeof options.cwd === 'string') {
+      directories.add(options.cwd);
+      directories.add(options.cwd.replaceAll('{projectRoot}', node.data.root).replaceAll('{workspaceRoot}', '.'));
+    }
+    for (const name of ['project.json', 'package.json']) {
+      const path = join(node.data.root, name);
+      if (existsSync(join(workspaceRoot, path))) files.add(path);
+    }
+  }
+  for (const path of [
+    'nx.json',
+    'package.json',
+    'bun.lock',
+    'bun.lockb',
+    'package-lock.json',
+    'pnpm-lock.yaml',
+    'yarn.lock',
+    'tsconfig.json',
+    'tsconfig.base.json',
+  ]) {
+    if (existsSync(join(workspaceRoot, path))) files.add(path);
+  }
+  const installation = graphInstallationIdentity(
+    workspaceRoot,
+    nxJson,
+    requireNx('nx/src/utils/package-json').readModulePackageJson,
+  );
+  const runtimeSource = boundedReceiptRuntimes(inputs, [...directories], [...files], installation !== null);
+  return {
+    kind: conservative ? 'conservative-provider-source' : 'exact-file-inputs',
+    files: [...files],
+    inputs,
+    runtimeSource,
+  };
+}
 /** The id Nx gives the task `selector` names, and the one a miss runs. */
 export function selectorTaskId(selector: TargetSelector): string {
   return selector.configuration === undefined
@@ -751,39 +960,58 @@ function bindWorkspaceRoot(workspaceRoot: string, requireNx: WorkspaceNxRequire)
   }
 }
 
-/**
- * The daemon drains delivered watcher events before serving its graph, but an
- * OS event can still be in flight after a write has completed. Its graph and
- * hashes can then agree with each other while both describe yesterday's files.
- * Take Nx's native, ignore-aware disk snapshot and compare it with the
- * daemon's file table; its metadata cache reuses unchanged file hashes.
- *
- * Any difference is handed to the daemon. If a differing path is not a
- * declared output, the caller awaits its recomputed graph before probing the
- * cache. Output paths need no graph refresh: their live bytes are hashed by
- * the probe, and a build's own writes must not force a cached-log replay.
+/** An exact graph-input witness skips graph transfer, never task hashing.
+ * Reconcile disk with the daemon BEFORE asking for a graph; publish evidence
+ * only when the filesystem and plugin installation stay identical across the
+ * awaited authoritative generation. No disk-cache age or existence is proof.
  */
-async function refreshWorkspaceContext(
+async function currentProjectGraph(
   workspaceRoot: string,
-  tasks: Task[],
+  nxJson: NxJsonConfiguration,
   requireNx: WorkspaceNxRequire,
-): Promise<boolean> {
+): Promise<ProjectGraph> {
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
-  const { WorkspaceContext, matchOutputPaths } = requireNx('nx/src/native');
+  const { WorkspaceContext } = requireNx('nx/src/native');
   const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
+  const packageResolution = requireNx('nx/src/utils/package-json');
+  const data = workspaceDataDirectoryForWorkspace(workspaceRoot);
+  const witnessPath = join(data, 'ensure-built-graph.json');
+  const witness = readGraphWitness(witnessPath);
+  const environment = createHash('sha256')
+    .update(JSON.stringify(Object.entries(process.env).sort(([left], [right]) => left.localeCompare(right))))
+    .digest('hex');
   performance.mark('ensureBuilt:inputs:start');
+  // The daemon's file-table RPC is retained even on reuse: task hashing must
+  // see writes the watcher has not delivered, independently of graph reuse.
   const daemonFiles = await daemonClient.getWorkspaceContextFileData();
-  // A context is a snapshot, not a watcher. Do not reuse one across calls.
-  const context = new WorkspaceContext(workspaceRoot, workspaceDataDirectoryForWorkspace(workspaceRoot));
-  const { created, updated, deleted } = workspaceFileChanges(daemonFiles, context.allFileData());
-  const changed = [...created, ...updated, ...deleted];
-  let inputsChanged = false;
-  if (changed.length > 0) {
+  const before = workspaceSnapshot(workspaceRoot, new WorkspaceContext(workspaceRoot, data), witness?.snapshot);
+  const { created, updated, deleted } = workspaceFileChanges(daemonFiles, before.files);
+  if (created.length + updated.length + deleted.length > 0) {
     await daemonClient.updateWorkspaceContext(created, updated, deleted);
-    inputsChanged = changesOutsideOutputs(tasks, changed, matchOutputPaths);
   }
   performance.measure('ensureBuilt:inputs', 'ensureBuilt:inputs:start');
-  return inputsChanged;
+  const installation = graphInstallationIdentity(workspaceRoot, nxJson, packageResolution.readModulePackageJson);
+  const cached = nodesUnchanged(before.nodes)
+    ? reusableGraph(witness, workspaceRoot, environment, installation, before)
+    : null;
+  if (cached !== null) return cached;
+  const { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
+  const after = workspaceSnapshot(workspaceRoot, new WorkspaceContext(workspaceRoot, data), before);
+  const finalInstallation = graphInstallationIdentity(workspaceRoot, nxJson, packageResolution.readModulePackageJson);
+  const stableGeneration = snapshotsEqual(before, after) && nodesUnchanged(before.nodes);
+  if (installation !== null && installation === finalInstallation && stableGeneration) {
+    const next: GraphWitness = { version: 1, workspaceRoot, environment, installation, snapshot: after, projectGraph };
+    writeWitness(witnessPath, next);
+  }
+  // A write during the await cannot authorize a saved graph. Feed the final
+  // snapshot to Nx and await its successor before current task hashing.
+  if (!stableGeneration) {
+    const currentDaemonFiles = await daemonClient.getWorkspaceContextFileData();
+    const changes = workspaceFileChanges(currentDaemonFiles, after.files);
+    await daemonClient.updateWorkspaceContext(changes.created, changes.updated, changes.deleted);
+    return (await daemonClient.getProjectGraphAndSourceMaps()).projectGraph;
+  }
+  return projectGraph;
 }
 
 /** How the files on disk differ from the daemon's file table, by workspace-relative path. */
@@ -816,24 +1044,6 @@ export function workspaceFileChanges(
   return { created, updated, deleted: [...daemonHashes.keys()] };
 }
 
-/**
- * Whether any `changed` path is not a declared output of a task in the graph.
- * `matchOutputPaths` is Nx's: the same matcher the task runner uses to collect
- * outputs, here over the union of every task's declared outputs. A negation
- * declared by one task then also excludes another task's output, which errs
- * toward a miss.
- */
-export function changesOutsideOutputs(
-  tasks: readonly Task[],
-  changed: string[],
-  matchOutputPaths: typeof NxNative.matchOutputPaths,
-): boolean {
-  return matchOutputPaths(
-    tasks.flatMap((task) => task.outputs),
-    changed,
-  ).includes(false);
-}
-
 /** `null` when the target is already built; otherwise the first reason it is not. */
 async function probe(
   workspaceRoot: string,
@@ -843,6 +1053,7 @@ async function probe(
   taskGraph: TaskGraph,
   tasks: Task[],
   requireNx: WorkspaceNxRequire,
+  verifyAllArtifacts = false,
 ): Promise<MissReason | null> {
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
   const { DaemonBasedTaskHasher } = requireNx('nx/src/hasher/task-hasher');
@@ -909,7 +1120,7 @@ async function probe(
   performance.mark('ensureBuilt:outputs:start');
   const verdicts = await daemonClient.outputsHashesMatchBatch(claims.map(({ outputs, hash }) => ({ outputs, hash })));
   performance.measure('ensureBuilt:outputs', 'ensureBuilt:outputs:start');
-  const doubted = unvouched(claims, verdicts);
+  const doubted = verifyAllArtifacts ? claims : unvouched(claims, verdicts);
   if (doubted.length === 0) {
     return null;
   }
@@ -925,7 +1136,14 @@ async function probe(
   performance.mark('ensureBuilt:artifacts:start');
   // `recorded` excludes `nx:noop`, so a noop's declared outputs have no
   // artifact here and stay a miss.
-  const verdict = compareWithArtifacts(workspaceRoot, doubted, cachedResults, expandOutputs);
+  const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
+  const verdict = compareWithArtifacts(
+    workspaceRoot,
+    doubted,
+    cachedResults,
+    expandOutputs,
+    join(workspaceDataDirectoryForWorkspace(workspaceRoot), 'ensure-built-outputs.json'),
+  );
   if (verdict.kind === 'stale-outputs') {
     return verdict;
   }
@@ -977,7 +1195,33 @@ export function compareWithArtifacts(
   claims: readonly OutputClaim[],
   artifacts: ReadonlyMap<string, { readonly outputsPath: string }>,
   expandOutputs: typeof NxNative.expandOutputs,
+  witnessPath?: string,
 ): ArtifactVerdict {
+  const binding = JSON.stringify(claims.map((claim) => [claim, artifacts.get(claim.hash)?.outputsPath]));
+  const witness = witnessPath === undefined ? null : readArtifactWitness(witnessPath);
+  if (
+    witness !== null &&
+    witness.version === 1 &&
+    witness.workspaceRoot === workspaceRoot &&
+    witness.claims === binding &&
+    witness.nodes.length > 0 &&
+    nodesUnchanged(witness.nodes)
+  ) {
+    try {
+      const observed = witness.nodes.map(({ taskId, path }) => ({
+        taskId,
+        path,
+        stats: lstatSync(path, { bigint: true }),
+      }));
+      // Recheck both node trees after collecting live stats. A read race
+      // invalidates optional evidence and returns to the full comparison.
+      if (observed.every((node, index) => nodeStamp(node.stats) === witness.nodes[index].stamp)) {
+        return { kind: 'restorable', observed };
+      }
+    } catch (error) {
+      if (!isSystemError(error)) throw error;
+    }
+  }
   const comparison: ArtifactComparison = {
     expandOutputs,
     left: Buffer.allocUnsafe(COMPARE_CHUNK_BYTES),
@@ -991,12 +1235,18 @@ export function compareWithArtifacts(
       return { kind: 'stale-outputs', taskId: claim.taskId };
     }
   }
-  // A write that landed while the bytes were being compared would otherwise be
-  // recorded as current.
   const moved = firstMovedClaim(comparison.observed);
-  return moved === null
-    ? { kind: 'restorable', observed: comparison.observed }
-    : { kind: 'stale-outputs', taskId: moved };
+  if (moved !== null) return { kind: 'stale-outputs', taskId: moved };
+  if (witnessPath !== undefined) {
+    const next: ArtifactWitness = {
+      version: 1,
+      workspaceRoot,
+      claims: binding,
+      nodes: comparison.observed.map(({ taskId, path, stats }) => ({ taskId, path, stamp: nodeStamp(stats) })),
+    };
+    writeWitness(witnessPath, next);
+  }
+  return { kind: 'restorable', observed: comparison.observed };
 }
 
 /** What comparing the working tree with the cache artifacts found: the first stale claim, or every node compared. */
@@ -1011,7 +1261,7 @@ export interface OutputClaim {
   readonly hash: string;
 }
 
-/** A working-tree node as it was when compared, so a later write to it can be noticed. */
+/** A working-tree or cache node as compared, so a later write or replacement can be noticed. */
 export interface ObservedNode {
   readonly taskId: string;
   readonly path: string;
@@ -1059,7 +1309,8 @@ function outputsMatchArtifact(
       entries.length > 0 &&
       entries.every(
         (entry) =>
-          throughRealDirectories(comparison.realDirectories, workspaceRoot, entry) &&
+          throughRealDirectories(comparison, claim.taskId, workspaceRoot, entry) &&
+          throughRealDirectories(comparison, claim.taskId, artifactRoot, entry) &&
           sameTree(comparison, claim.taskId, join(workspaceRoot, entry), join(artifactRoot, entry)),
       )
     );
@@ -1077,18 +1328,15 @@ function outputsMatchArtifact(
  * an entry through one would compare bytes the restore does not leave there —
  * and would read the filesystem behind a link.
  */
-function throughRealDirectories(realDirectories: Set<string>, workspaceRoot: string, entry: string): boolean {
-  let directory = workspaceRoot;
-  const segments = entry.split('/');
-  for (const segment of segments.slice(0, -1)) {
+function throughRealDirectories(comparison: ArtifactComparison, taskId: string, root: string, entry: string): boolean {
+  let directory = root;
+  for (const segment of ['', ...entry.split('/').slice(0, -1)]) {
     directory = join(directory, segment);
-    if (realDirectories.has(directory)) {
-      continue;
-    }
-    if (lstatSync(directory, { throwIfNoEntry: false })?.isDirectory() !== true) {
-      return false;
-    }
-    realDirectories.add(directory);
+    if (comparison.realDirectories.has(directory)) continue;
+    const stats = lstatSync(directory, { bigint: true, throwIfNoEntry: false });
+    if (stats?.isDirectory() !== true) return false;
+    comparison.observed.push({ taskId, path: directory, stats });
+    comparison.realDirectories.add(directory);
   }
   return true;
 }
@@ -1107,6 +1355,7 @@ function sameTree(comparison: ArtifactComparison, taskId: string, actual: string
     return false;
   }
   comparison.observed.push({ taskId, path: actual, stats: actualStats });
+  comparison.observed.push({ taskId, path: expected, stats: expectedStats });
   if (expectedStats.isSymbolicLink()) {
     return actualStats.isSymbolicLink() && readlinkSync(actual) === readlinkSync(expected);
   }

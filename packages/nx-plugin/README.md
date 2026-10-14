@@ -708,11 +708,21 @@ values resolve against the Nx workspace root, so they remain checkout-local when
 paths remain caller-controlled, including deliberately shared CI locations; an absolute path inherited from another
 checkout does not become local merely because the working directory changed.
 
-Before hashing, it compares a native snapshot of the workspace with the daemon's file table. A write the watcher has not
-delivered is sent to the daemon, then its authoritative graph is awaited and the task graph rebuilt before hashing. Only
-the current keys and matching artifacts decide whether anything runs: an unrelated edit does not turn a warm invocation
-into a cached-log replay, and an actual input edit cannot hit an old source snapshot. Declared output writes are hashed
-directly, without requiring a graph refresh.
+Before hashing, it compares a fresh native workspace snapshot with the daemon's file table and sends writes the watcher
+has not delivered. It can reuse the exact previously awaited daemon graph only through a witness in the same Nx
+workspace-data directory: filesystem-to-daemon reconciliation, an awaited authoritative graph generation, and identical
+pre/post native file hashes and membership establish the witness. Every new or changed node is rehashed through Nx,
+using device, inode, mode, length and nanosecond modification/change times to reject the native archive's whole-second
+mtime ambiguity. The witness also binds the environment and installed Nx/configured plugin package resolution and owned
+dependency-module/file closure (physical targets, aliases, package manifests and public outputs), plus the
+workspace-resolved TypeScript analyzer. A package-declared dist directory link is proved by its physical tree, including
+every node and the link itself; unreadable required module bytes fail loudly. Unknown plugin input contracts, unresolved
+required packages, directory links whose external graph inputs are unproved, missing or unreadable witnesses, and any
+mismatch require the authoritative graph RPC. No cache-file age or existence decides currentness. Workspace file
+membership, nx.json, project/package manifests and lockfiles have no output exclusions; output writes can therefore
+refresh this conservative graph witness too. Only Nx's current task hashes and matching artifacts decide whether
+anything runs: an unrelated edit does not force cached-log replay, and an actual input edit cannot hit an old source
+snapshot. Argument normalization, per-task environments and plugin pre/post hooks still run.
 
 The daemon's output records are lossy: they are held in memory, tracked per collapsed directory, and erased by writes it
 processes more than two seconds late — including, on a busy daemon, a restore's own writes. When it cannot vouch for a
@@ -722,12 +732,42 @@ text (never followed), file permission bits and bytes. A tree the restore would 
 daemon's record is re-armed as Nx's runner does after a restore. A missing or empty artifact, any difference, a read
 error, or a write observed during the comparison is a miss.
 
-A caller from another workspace never lends its socket, database or cache overrides to the provider. Inside a managed
-shell (`DEVENV_RUNTIME`), `ensureBuilt` asks the packaged `nx-socket-dir.sh` owner for the provider's binding: the
-root's verified cowshed runtime link when present, otherwise its canonical checkout spelling under that shell runtime.
-Outside a managed shell, Nx retains its normal defaults. A socket-owner refusal returns `disposition: 'failed'` with
-`reason.kind: 'workspace-socket'`, the selected `taskId`, `workspaceRoot` and operational `detail`, before any task or
-daemon client starts. The owner's actual exit or signal is preserved; the wrapper must not report that the target ran.
+A successful byte comparison may retain a cache-bound node inventory in that same Nx workspace-data directory. It binds
+the exact task hashes, declared outputs and artifact paths to every compared working-tree/cache node and both sets of
+real parent directories. Reuse requires the same device, inode, type/permission mode, length and nanosecond mtime/ctime
+for all those nodes. It is evidence of the same previously compared bytes, never source identity or an mtime freshness
+rule. Missing/unreadable evidence or moved nodes require a full comparison; mutations to either the cache or working
+tree, parent symlink replacement, and directory membership changes cannot borrow an old equality verdict.
+
+`ensureBuilt({ target, cwd, onMiss: 'refuse' })` is a typed read-only provider probe. It returns
+`EnsureBuiltProbeResult`: a `miss` with its `MissReason` without starting Nx's runner or writing producer outputs; the
+existing operational socket failure; a loud `provider-proof` failure; or a `hit` with `EnsureBuiltReceipt`. The default
+stream overload and its CLI callers retain the existing hit/built/failed result. With the daemon disabled, refuse mode
+returns a no-daemon miss instead of running the target. It still preserves Nx argument normalization, hooks, per-task
+environments, local cache parity and exact-cache artifact equality.
+
+A probe receipt names the real provider workspace, Git HEAD and HEAD's tree, every task id/current Nx hash in the
+selected target's dependency graph, and an independently read census of every Nx-expanded public output. Files carry
+SHA-256; symlinks carry their text and mode without following them; directories carry mode, ordered membership and a
+child-census digest, including empty directories. Source/revision/output nodes must remain unchanged across capture.
+Missing, unreadable or stale output evidence refuses, never starts a build and never signs daemon-state identity.
+
+Git provenance covers Nx's planned FILE inputs and the owning project/dependency manifests and root graph configuration.
+Dirty matched inputs (including new or index-only changes) refuse. The native inspector cannot prove deleted membership
+or a custom hasher's opaque reads: a deleted provider source or a bounded runtime/env input therefore uses conservative
+any-dirty-provider-source refusal, excluding public outputs rather than treating them as committed source. Runtime/env
+values remain explicitly labelled `nx-task-hash-only`, not Git provenance. Only the existing toolchain generator's exact
+version-only recipe with declared cwd, a declared toolchain FILE pin and proved installed-module closure is bounded;
+arbitrary shell/file/runtime commands and unavailable custom/native input proofs categorically refuse receipts. A caller
+probing multiple targets uses the existing single-target API and rejects differing provider HEAD/tree identities before
+publishing its immutable snapshot. This producer evidence binds a managed linked-package snapshot to one current build;
+Nx alone decides whether its current keys and cache/output bytes match. A caller from another workspace never lends its
+socket, database or cache overrides to the provider. Inside a managed shell (`DEVENV_RUNTIME`), `ensureBuilt` asks the
+packaged `nx-socket-dir.sh` owner for the provider's binding: the root's verified cowshed runtime link when present,
+otherwise its canonical checkout spelling under that shell runtime. Outside a managed shell, Nx retains its normal
+defaults. A socket-owner refusal returns `disposition: 'failed'` with `reason.kind: 'workspace-socket'`, the selected
+`taskId`, `workspaceRoot` and operational `detail`, before any task or daemon client starts. The owner's actual exit or
+signal is preserved; the wrapper must not report that the target ran.
 
 ```typescript
 import { ensureBuilt } from '@smoothbricks/nx-plugin/ensure-built';
@@ -749,7 +789,8 @@ smoo-nx-exec my-cli:build -- ./packages/my-cli/dist/my-cli argument
 
 It is deliberately not `nx run <target> && exec`:
 
-- A hit costs one daemon round-trip and a local cache read, not an Nx CLI start.
+- An unchanged witnessed graph avoids graph reconstruction/transfer; current task hashing, daemon file/output probes and
+  local cache reads remain. This is not a measured end-to-end latency guarantee and does not start an Nx CLI.
 - A hit is silent. `nx run` replays the cached log and prints its `[local cache]` banner, which a CLI wrapper must not
   print.
 - It execs the binary, preserving its argv, exit status, and signals. `nx run` has no notion of handing the process over
