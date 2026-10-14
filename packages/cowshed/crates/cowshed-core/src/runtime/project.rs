@@ -10017,7 +10017,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         destination_incarnation: destination_incarnation.clone(),
                     })
                     .await?;
-                self.finish_retirement(current).await?;
+                self.finish_retirement(current, CheckoutNxCheck::CloseRecorded).await?;
             }
             self.complete_lifecycle_intent(
                 &destination,

@@ -295,16 +295,6 @@ fn stage_with(
                 return staged;
             }
         };
-        let ran_nx = match databases_in(&into.join(destination.data)) {
-            Ok(databases) => !databases.is_empty(),
-            Err(error) => {
-                staged.stopped = Some(format!(
-                    "list {}: {error}",
-                    into.join(destination.data).display()
-                ));
-                return staged;
-            }
-        };
         // A target state with no task database indexes nothing; one whose every database is of
         // another Nx schema than the workspace's is not consulted at all.
         let mut indexed = databases.is_empty().then_some(false);
@@ -2572,7 +2562,7 @@ main().catch(error => { console.error(error); process.exitCode = 1; });
             &into,
             &fixture.state,
             &Fixture::selections(&["1"]),
-            Path::new(crate::storage::bootstrap::STORE_ROOT),
+            Path::new(cowshed_gateway_types::STORE_ROOT),
         );
         assert!(staged.stopped.is_none(), "{staged:?}");
         assert_eq!(indexed(&destination_db), 0, "files first, row last");
