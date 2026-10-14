@@ -68,7 +68,7 @@ jobs:
 
       # Step 6
       - name: 🔨 Build
-        run: smoo github-ci nx-smart --target build --name "Build" --step 6
+        run: NX_VERBOSE_LOGGING=true smoo github-ci nx-smart --target build --name "Build" --step 6
 
       # Step 7
       - name: 🔍 Lint
@@ -123,7 +123,10 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: trace-results-${{ github.run_id }}
-          path: packages/*/.cache/lmao/trace-results.db*
+          path: |
+            packages/*/.cache/lmao/trace-results.db*
+            ${{ job.status == 'failure' && format('{0}/project-graph.json', env.NX_WORKSPACE_DATA_DIRECTORY || '.nx/workspace-data') || '' }}
+            ${{ job.status == 'failure' && format('{0}/d/daemon.log', env.NX_WORKSPACE_DATA_DIRECTORY || '.nx/workspace-data') || '' }}
           if-no-files-found: ignore
           retention-days: 14
           include-hidden-files: true

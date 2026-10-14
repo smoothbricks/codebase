@@ -561,7 +561,10 @@ function yamlLinesForStep(step: CiWorkflowStep, options: CiWorkflowDefinitionOpt
         'upload',
         [
           'name: trace-results-${{ github.run_id }}',
-          `path: ${TRACE_DB_ARTIFACT_GLOB}`,
+          'path: |',
+          `  ${TRACE_DB_ARTIFACT_GLOB}`,
+          "  ${{ job.status == 'failure' && format('{0}/project-graph.json', env.NX_WORKSPACE_DATA_DIRECTORY || '.nx/workspace-data') || '' }}",
+          "  ${{ job.status == 'failure' && format('{0}/d/daemon.log', env.NX_WORKSPACE_DATA_DIRECTORY || '.nx/workspace-data') || '' }}",
           'if-no-files-found: ignore',
           'retention-days: 14',
           'include-hidden-files: true',
@@ -1142,7 +1145,7 @@ function renderOptionalLines(lines: string[]): string {
 function nxSmartStep(step: CiWorkflowStep, target: string, name: string): string[] {
   return [
     `      - name: ${step.name}`,
-    `        run: smoo github-ci nx-smart --target ${target} --name "${name}" --step ${step.number}`,
+    `        run: ${step.kind === CiWorkflowStepKind.Build ? 'NX_VERBOSE_LOGGING=true ' : ''}smoo github-ci nx-smart --target ${target} --name "${name}" --step ${step.number}`,
   ];
 }
 
