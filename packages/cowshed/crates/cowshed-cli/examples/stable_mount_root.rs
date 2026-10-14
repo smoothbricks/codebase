@@ -296,7 +296,7 @@ mod native {
         let mut service =
             ActorBridge::open_for_adopt_at(checkout, Some(repo.clone()), storage).await?;
         let operation: ProofResult<()> = async {
-            cli(&mut service, receipts, "adopt", &["--json", "adopt", checkout.to_str().ok_or("non-UTF8 checkout")?, "--repo-id", &repo.to_string(), "--capacity", "1g"]).await?;
+            cli(&mut service, receipts, "adopt", &["--json", "adopt", checkout.to_str().ok_or("non-UTF8 checkout")?, "--repo-id", repo.as_ref(), "--capacity", "1g"]).await?;
             service.reconcile_gateway().await?;
             cli(&mut service, receipts, "doctor-before", &["--json", "doctor"]).await?;
             let before = census(receipts, "before-fork")?;
