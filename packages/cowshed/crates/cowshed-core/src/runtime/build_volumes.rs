@@ -4239,6 +4239,38 @@ mod tests {
         scratch.release_all();
     }
 
+    #[cfg(target_os = "macos")]
+    struct CargoWitness {
+        /// The build script's independently reported parent, checked against the kernel.
+        pid: libc::pid_t,
+        /// Only a grant observed for this fixture's checkout, never an inherited token count.
+        grant_fifo: Option<PathBuf>,
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn cargo_budget_for(source: &Path) -> Option<cowshed_gateway_types::CpuCheckoutStatus> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut stream =
+            tokio::net::UnixStream::connect(cowshed_gateway_types::control_socket_path())
+                .await
+                .expect("connect to the actual jobserver grant's gateway");
+        stream
+            .write_all(b"{\"op\":\"cpu-budget\"}\n")
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        let answer: serde_json::Value = serde_json::from_str(answer.trim_end()).unwrap();
+        let budget: cowshed_gateway_types::CpuBudgetStatus =
+            serde_json::from_value(answer["cpuBudget"].clone()).expect("the actual CPU ledger");
+        budget
+            .checkouts
+            .into_iter()
+            .find(|entry| entry.checkout == source.to_string_lossy())
+    }
+
     /// A real Cargo build stopped inside its build script, after Cargo has taken the profile's
     /// shared `.cargo-lock`. Socket readiness, not a delay, is the proof that it is building.
     #[cfg(target_os = "macos")]
@@ -4246,10 +4278,17 @@ mod tests {
         source: &Path,
         mount: &Path,
         profile: &str,
-    ) -> (tokio::process::Child, tokio::net::UnixStream) {
-        use cowshed_os::fork_lock::Spawn as _;
-        use tokio::io::AsyncReadExt as _;
+    ) -> (tokio::process::Child, tokio::net::UnixStream, CargoWitness) {
+        use cowshed_os::fork_lock::{RunAsync as _, Spawn as _};
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 
+        // Preserve the caller's real budget environment. A direct binary run with neither
+        // inherited variable can prove an actual checkout grant; a harness count cannot.
+        let outside_budget = std::env::var_os("CARGO_MAKEFLAGS").is_none()
+            && std::env::var_os("BOUNDED_EXEC_CPU_TOKENS").is_none();
         fs::create_dir_all(source.join("src")).unwrap();
         fs::write(
             source.join("Cargo.toml"),
@@ -4261,9 +4300,16 @@ mod tests {
         fs::write(
             source.join("build.rs"),
             r#"use std::io::{Read, Write};
+unsafe extern "C" { fn getppid() -> i32; }
 fn main() {
     let path = std::env::var_os("CAPTURE_WRITER_SOCKET").unwrap();
     let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+    // SAFETY: getppid has no preconditions and cannot fail.
+    let cargo = unsafe { getppid() };
+    writeln!(stream, "{cargo}").unwrap();
+    for name in ["CARGO", "CARGO_MAKEFLAGS", "BOUNDED_EXEC_CPU_TOKENS"] {
+        writeln!(stream, "{}", std::env::var(name).unwrap_or_default()).unwrap();
+    }
     stream.write_all(b"R").unwrap();
     stream.read_exact(&mut [0]).unwrap();
 }
@@ -4281,18 +4327,107 @@ fn main() {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn_locked()
-            .expect("run the real Cargo build");
-        let (mut stream, _) = tokio::select! {
+            .expect("run the real Cargo build through the ambient launcher");
+        let (stream, _) = tokio::select! {
             connected = listener.accept() => connected.expect("Cargo build script connects"),
             status = child.wait() => {
                 let output = child.wait_with_output().await.expect("Cargo diagnostics");
                 panic!("Cargo exited before its build script was ready: {status:?}; {output:?}");
             }
         };
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut fields = [String::new(), String::new(), String::new(), String::new()];
+        for field in &mut fields {
+            stream.read_line(field).await.unwrap();
+            assert_eq!(
+                field.pop(),
+                Some('\n'),
+                "the build-script witness is complete"
+            );
+        }
         let mut ready = [0];
         stream.read_exact(&mut ready).await.unwrap();
         assert_eq!(ready, *b"R");
-        (child, stream)
+        let [pid, executable, makeflags, tokens] = fields;
+        let pid: libc::pid_t = pid.parse().expect("the build script's actual parent PID");
+        assert!(pid > 0, "the actual Cargo PID is positive");
+        let arguments = cowshed_os::process::process_arguments(pid)
+            .expect("the kernel names the build script's live Cargo parent");
+        let kernel_executable = PathBuf::from(OsString::from_vec(arguments.executable));
+        let cargo = PathBuf::from(executable)
+            .canonicalize()
+            .expect("the build script's CARGO");
+        assert_eq!(kernel_executable.canonicalize().unwrap(), cargo);
+        assert_eq!(cargo.file_name().unwrap(), "cargo");
+        assert!(
+            arguments.argv.windows(4).any(|args| {
+                args[0] == b"build"
+                    && args[1] == b"--offline"
+                    && args[2] == b"--profile"
+                    && args[3] == profile.as_bytes()
+            }),
+            "the kernel names the actual Cargo build: {:?}",
+            arguments.argv
+        );
+        let started_pid = child.id().expect("the entry Cargo process is still live");
+        let parent = tokio::process::Command::new("/bin/ps")
+            .args(["-o", "ppid=,pgid=", "-p", &pid.to_string()])
+            .output_locked()
+            .await
+            .expect("the actual Cargo kernel parent and process group");
+        assert!(parent.status.success(), "{parent:?}");
+        let lineage = String::from_utf8(parent.stdout).unwrap();
+        let mut lineage = lineage.split_whitespace();
+        let parent_pid: u32 = lineage.next().expect("the kernel parent").parse().unwrap();
+        let group: u32 = lineage
+            .next()
+            .expect("the kernel process group")
+            .parse()
+            .unwrap();
+        assert!(group > 0);
+        assert!(lineage.next().is_none(), "exactly one kernel process row");
+        if u32::try_from(pid) != Ok(started_pid) {
+            assert_eq!(
+                parent_pid, started_pid,
+                "the real Cargo is the launcher child, not an unrelated holder"
+            );
+        }
+        let fifo = makeflags
+            .split_whitespace()
+            .find_map(|flag| flag.strip_prefix("--jobserver-auth=fifo:"))
+            .map(PathBuf::from);
+        let grant_fifo = fifo.as_ref().filter(|_| outside_budget).cloned();
+        if let Some(fifo) = &fifo {
+            let metadata = fs::metadata(fifo).expect("the actual Cargo's live jobserver fifo");
+            assert!(
+                metadata.file_type().is_fifo(),
+                "{} is a kernel FIFO",
+                fifo.display()
+            );
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+        if grant_fifo.is_some() {
+            let tokens: std::num::NonZeroUsize =
+                tokens.parse().expect("the actual grant's token count");
+            let held = cargo_budget_for(source)
+                .await
+                .expect("the actual checkout holds a grant");
+            assert_eq!(
+                held.held,
+                tokens.get(),
+                "the FIFO count matches the gateway's held grant"
+            );
+            assert_eq!(
+                held.running, 1,
+                "only this fixture's Cargo launcher holds its grant"
+            );
+            eprintln!("Cargo fixture held checkout grant: {held:?}");
+        }
+        eprintln!(
+            "Cargo fixture witness: entry_pid={started_pid}, actual_cargo_pid={pid}, kernel_parent_pid={parent_pid}, kernel_process_group={group}, executable={}, makeflags={makeflags:?}, budget_tokens={tokens:?}, own_grant_fifo={grant_fifo:?}",
+            cargo.display()
+        );
+        (child, stream.into_inner(), CargoWitness { pid, grant_fifo })
     }
 
     #[cfg(target_os = "macos")]
@@ -4339,11 +4474,8 @@ fn main() {
                 .unwrap()
                 .expect("no Cargo build has started yet")
         });
-        let (child, mut writer) =
-            running_cargo(&scratch.root.path().join("cargo-source"), &mount, profile).await;
-        let cargo_pid = child
-            .id()
-            .expect("the rendezvous Cargo process is still live");
+        let source = scratch.root.path().join("cargo-source");
+        let (child, mut writer, witness) = running_cargo(&source, &mount, profile).await;
         let expected_lock = mount
             .join("target")
             .join(if profile == "dev" { "debug" } else { profile })
@@ -4359,6 +4491,29 @@ fn main() {
         drop(writer);
         let output = child.wait_with_output().await.unwrap();
         assert!(output.status.success(), "{output:?}");
+        if let Some(fifo) = &witness.grant_fifo {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let held = cargo_budget_for(&source).await;
+                if !fifo.exists()
+                    && held
+                        .as_ref()
+                        .is_none_or(|entry| entry.held == 0 && entry.running == 0)
+                {
+                    eprintln!(
+                        "Cargo fixture grant released: fifo={}, checkout={held:?}",
+                        fifo.display()
+                    );
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the real Cargo build's grant outlives it: {held:?}; fifo={}",
+                    fifo.display()
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
         let kept_seed = scratch
             .layout
             .seed_of(&target.name, &target.incarnation)
@@ -4380,7 +4535,7 @@ fn main() {
         assert_eq!(lock, expected_lock);
         assert!(
             holders.iter().any(|holder| {
-                u32::try_from(holder.pid) == Ok(cargo_pid)
+                holder.pid == witness.pid
                     && holder.command.contains("cargo build --offline --profile")
             }),
             "the skip must identify the actual Cargo process: {holders:?}"

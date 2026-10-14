@@ -1741,23 +1741,43 @@ fn directory_a_failed_nx_test_leaves_no_daemon_under_its_root_substrate_lifecycl
 /// loaded host slows every real build and detach, and a slow pass is not a failure.
 const PATIENCE: Duration = Duration::from_secs(300);
 
-/// The Rust toolchain's `bin` directory the test itself builds with, resolved at run time like
-/// [`repository_nx`].
+/// The real Rust toolchain behind the installed Cargo launcher, resolved at run time like
+/// [`repository_nx`]. Follow the launcher's executable and canonical-identity PATH rules
+/// (03_caches.md, "The `cargo` jobserver launcher"), not the directory beside the wrapper.
 fn rust_toolchain() -> PathBuf {
-    let cargo = std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join("cargo"))
-                .find(|candidate| candidate.is_file())
-        })
-        .expect("cargo on the test's PATH")
+    use cowshed_cli::launchd::{COWSHED_BINARY_NAME, HostStableExecutable};
+
+    let home = PathBuf::from(std::env::var_os("HOME").expect("the test's host HOME"));
+    let launcher = HostStableExecutable::new(&home, COWSHED_BINARY_NAME)
+        .expect("the installed cowshed path")
+        .path()
         .canonicalize()
-        .expect("cargo resolves");
+        .ok();
+    let path = std::env::var_os("PATH").expect("the test's PATH");
+    let cargo = std::env::split_paths(&path)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join("cargo"))
+        .find(|candidate| {
+            candidate.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            }) && (launcher.is_none() || candidate.canonicalize().ok() != launcher)
+        })
+        .expect("real cargo on PATH beyond the installed jobserver launcher")
+        .canonicalize()
+        .expect("the real cargo resolves");
     let bin = cargo.parent().expect("cargo has a directory").to_path_buf();
+    let rustc = bin.join("rustc");
     assert!(
-        bin.join("rustc").is_file(),
-        "rustc beside {}",
+        rustc.metadata().is_ok_and(|metadata| {
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        }),
+        "executable rustc beside the real Cargo {}",
         cargo.display()
+    );
+    eprintln!(
+        "fixture Rust toolchain: launcher={launcher:?}, cargo={}, rustc={}",
+        cargo.display(),
+        rustc.canonicalize().expect("rustc resolves").display()
     );
     bin
 }
@@ -3189,6 +3209,8 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
             "--exact",
             "macos::real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mounts_are_reclaimed",
             "--nocapture",
+                        // Keep the actual PID record line-framed even with inherited RUST_TEST_THREADS=1.
+            "--quiet",
         ])
         .env(CHILD, "1")
         .output()
