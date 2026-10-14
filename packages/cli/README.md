@@ -429,6 +429,12 @@ The generated publish workflow is canonical Prettier YAML. Running the repositor
 
 ### Shell Entry
 
+`tooling/direnv/devenv.nix` selects `coreutils-tee` for this repository's shell. The separate package applies the
+[upstream tee fix](https://bugs.gnu.org/81060) without overriding nixpkgs' `coreutils` or stdenv. The lockfile and
+compiler/SDK inputs stay unchanged; remove the patch when the pinned nixpkgs includes the fix. Evaluate shell edits
+through
+[canonical workspace activation](../../specs/cowshed/04_sandbox.md#evaluating-an-edited-devenvnix-inside-its-workspace).
+
 Every direnv load runs the managed devenv prologue (`tooling/direnv/devenv.smoo.nix`), and it is built to cost almost
 nothing when nothing changed:
 
