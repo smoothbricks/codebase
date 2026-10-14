@@ -200,6 +200,11 @@ that ends first, a crash included, leaves the rest pending. Every later refresh 
 on stderr every 10 seconds what it is waiting on: the processes holding the host Cargo home's package-cache locks, or
 none, in which case it is the shell's activation or Cargo itself.
 
+Cargo discovery runs at most four queries concurrently within one activation of each selected workspace shell. Answers
+and failures retain manifest order; a failed manifest does not hide independent workspaces. The existing tracked-input
+fingerprint caches the complete discovered path set, so unchanged refreshes run no Cargo query. This bound changes only
+discovery scheduling, not carry holds, journal identity or failure fences.
+
 Capability detection names the build-state paths (15_capabilities.md, one contribution contract): the Cargo capability
 contributes each `cargo metadata` `target_directory` inside the checkout, the Nx capability contributes `.nx/cache` and
 `.nx/workspace-data`, and a JavaScript package manager contributes the `node_modules/.cache` of every package it
