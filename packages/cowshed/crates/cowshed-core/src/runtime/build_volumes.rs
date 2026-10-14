@@ -5645,7 +5645,7 @@ fn main() {
             .expect("the landing volume is idle");
         let staged = scratch
             .volumes
-            .stage(&quiet, source_checkout)
+            .stage(&quiet, source_checkout, None)
             .await
             .unwrap();
         let source_during = scratch.layout.claim_release(&source).unwrap().is_none();

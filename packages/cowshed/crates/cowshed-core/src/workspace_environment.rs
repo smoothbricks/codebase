@@ -338,6 +338,7 @@ mod tests {
             EnvironmentMount::Served {
                 workspace_mount: root,
                 temp_dir: &temp_dir,
+                host_home: root,
                 capability_env: &CapabilityContribution::default(),
             },
             &Zeroizing::new("token".to_owned()),
