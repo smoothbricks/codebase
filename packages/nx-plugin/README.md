@@ -230,6 +230,11 @@ atomic rename; failed resolutions are never cached. A corrupt cache is reported 
 during resolution are retried at most three times, then refused with the cause intact. A WASM-only Nx host cannot
 provide the native lock and receives a typed refusal rather than an unserialized fallback.
 
+A persisted warm cache is checked before waiting for the cold-fill lock. Each Cargo resolution child and the
+asynchronous wait for a foreign resolution lock have a 300-second bound. A refusal names the child or lock, the
+workspace and elapsed bound; a timed-out child and its owned process group are killed. These bounds do not change the
+native synchronous lock acquisition or Cargo's own package-cache arbitration.
+
 A plugin worker's normal exit, host disconnect, or handled termination kills Cargo children it still owns; on POSIX it
 kills the whole process group, including wrapper descendants. Standalone callers also forward unhandled termination
 signals to their owned groups. An uncatchable `SIGKILL` cannot run an exit hook; the kernel still releases its file
