@@ -3128,8 +3128,8 @@ fn published_listing_distinguishes_missing_sessions_from_an_invalid_sessions_pat
     assert!(host.list(&repo()).is_err());
 }
 
-/// Independent exact-volume unmount and exact-whole image-driver detach attempt release after cowshed
-/// has checked its identity and before fsck opens diskN. A pathname check alone loses that race;
+/// Independent exact-whole image-driver detach attempts release after cowshed has checked its
+/// identity and before fsck opens diskN. A pathname check alone loses that race;
 /// the raw volume descriptor must keep the kernel from recycling diskN even for a forced eject.
 struct EjectAtFsck {
     owned: PathBuf,
@@ -3153,13 +3153,13 @@ impl EjectAtFsck {
         );
         let whole = owned.whole_device();
         self.release_attempts.fetch_add(1, Ordering::SeqCst);
-        let unmounted = system.run(&CommandRequest::new(
-            "/usr/sbin/diskutil",
-            ["unmount", "force", &volume_device],
-        ))?;
         assert!(
-            unmounted.succeeded(),
-            "exact-volume unmount failed: {unmounted:?}"
+            SystemKernelMountSource
+                .mounts()
+                .expect("kernel mount inventory before the pinned operation")
+                .iter()
+                .all(|mount| mount.source_device != volume_device),
+            "the raw-pin release hook must run before the owned volume is mounted"
         );
         let eject_request = CommandRequest::new("/usr/bin/hdiutil", ["detach", "-force", whole]);
         let eject = system.run(&eject_request)?;
@@ -3253,8 +3253,9 @@ impl CommandRunner for EjectAtFsck {
 
 /// The raw pin is held from cowshed's identity check through fsck and the mount that follows. An
 /// independent forced release is refused in each window: the injected releases fire inside fsck and
-/// mount (`EjectAtFsck`), and independent exact-volume unmount and hdiutil detach fire between
-/// verification and mount. A foreign volume is never attached, whichever window the release tries.
+/// mount (`EjectAtFsck`), and an independent hdiutil detach fires between verification and mount.
+/// Every attack starts from the kernel-proven unmounted state. A foreign volume is never attached,
+/// whichever window the release tries.
 #[test]
 fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
     let fixture = RealFixture::new("pin-vs-foreign-eject");
@@ -3278,13 +3279,14 @@ fn real_apfs_raw_pin_prevents_foreign_eject_during_fsck() {
         "independent image-driver detach released an image while its raw volume was pinned"
     );
     assert_eq!(backend.runner().release_attempts.load(Ordering::SeqCst), 1);
-    let unmounted = SystemCommandRunner
-        .run(&CommandRequest::new(
-            "/usr/sbin/diskutil",
-            ["unmount", "force", attachment.volume_device()],
-        ))
-        .expect("external exact-volume forced unmount");
-    assert!(unmounted.succeeded(), "exact-volume unmount: {unmounted:?}");
+    assert!(
+        SystemKernelMountSource
+            .mounts()
+            .expect("kernel mount inventory between verification and mount")
+            .iter()
+            .all(|mount| mount.source_device != attachment.volume_device()),
+        "verified attachment must remain unmounted before the independent forced detach"
+    );
     let image_driver_request = CommandRequest::new(
         "/usr/bin/hdiutil",
         ["detach", "-force", attachment.whole_device()],
