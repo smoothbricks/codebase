@@ -1050,6 +1050,10 @@ pub fn retirement_lines(report: &RetirementReport) -> Vec<String> {
                 "{} dropped (the host's copy wins)",
                 decimal_size(cache.dropped_bytes)
             ),
+            Merge::Preserve => format!(
+                "{} dropped as byte-identical duplicates; retained state preserved",
+                decimal_size(cache.dropped_bytes)
+            ),
         };
         lines.push(format!(
             "caches volume: {} -> {}: {} moved, {dropped}",

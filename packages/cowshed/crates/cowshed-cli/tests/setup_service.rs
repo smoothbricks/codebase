@@ -2395,6 +2395,28 @@ fn moved(
     }
 }
 
+/// Retained mutable state reports its exact destination and moved bytes, not a host-wins drop.
+#[test]
+fn retained_cache_reports_name_preserved_bytes_and_their_destination() {
+    let report = RetirementReport {
+        caches: vec![moved(
+            "legacy nix fetcher cache (retained)",
+            "/private/cowshed/caches/nix/nix",
+            "/Users/dev/.cache/nix/cowshed-retired/nix-nix",
+            Merge::Preserve,
+            7_600_000,
+            42,
+        )],
+        ..RetirementReport::default()
+    };
+    assert_eq!(
+        cowshed_cli::setup_service::retirement_lines(&report),
+        [
+            "caches volume: legacy nix fetcher cache (retained) -> /Users/dev/.cache/nix/cowshed-retired/nix-nix: 7.6 MB moved, 42 B dropped as byte-identical duplicates; retained state preserved"
+        ]
+    );
+}
+
 fn retirement(leftovers: Vec<Leftover>) -> RetirementReport {
     RetirementReport {
         caches: vec![
