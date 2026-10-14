@@ -394,6 +394,7 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
     use std::process::{Child, Command, Stdio};
 
     // Helpers retain the suite's run identity and own only the roots their parent recovers.
+    // Terse child output keeps libtest's test-name progress off the first image record.
     // Forward stderr line by line so a hung helper still shows its open step, and report
     // whether it printed a panic: its output is this test's, so a panic would read as this
     // test's assertion failure behind any timeout.
@@ -404,6 +405,7 @@ fn real_apfs_fixture_runs_leave_nothing_attached_or_running_however_they_end() {
                 "tests::real_apfs_fixture_run_ended_by_its_parent",
                 "--ignored",
                 "--nocapture",
+                "--quiet",
             ])
             .env(FIXTURE_ENDING, ending)
             .stdin(Stdio::piped())
