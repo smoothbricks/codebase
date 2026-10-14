@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
@@ -53,6 +53,34 @@ function boundFor(other: string): Record<string, string> {
   };
 }
 
+it('selects this checkout profile when the repository declares its native producer', () => {
+  withCheckouts((checkout, other) => {
+    mkdirSync(join(checkout, 'tooling/direnv'), { recursive: true });
+    writeFileSync(join(checkout, 'tooling/direnv/typescript-go.nix'), '{ pkgs }: pkgs.typescript\n');
+    mkdirSync(join(checkout, 'tooling/direnv/.devenv/profile/bin'), { recursive: true });
+    symlinkSync(process.execPath, join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'));
+    expect(enter(checkout, boundFor(other))).toEqual({
+      TTSC_TSGO_BINARY: join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'),
+      TTSC_CACHE_DIR: join(checkout, '.cache/ttsc'),
+      TTSC_GO_CACHE_DIR: join(checkout, '.cache/ttsc/go-build'),
+    });
+  });
+});
+
+it('refuses a declared producer with no executable profile output instead of selecting the stock compiler', () => {
+  withCheckouts((checkout) => {
+    mkdirSync(join(checkout, 'tooling/direnv'), { recursive: true });
+    writeFileSync(join(checkout, 'tooling/direnv/typescript-go.nix'), '{ pkgs }: pkgs.typescript\n');
+    const result = spawnSync('/bin/sh', ['-c', '. "$0"', script], {
+      cwd: checkout,
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', TTSC_TSGO_BINARY: '/old/compiler' },
+      encoding: 'utf8',
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('native TypeScript producer is declared');
+    expect(result.stderr).toContain(join(checkout, 'tooling/direnv/.devenv/profile/bin/tsgo'));
+  });
+});
 describe('ttsc-env.sh', () => {
   it("names this checkout's compiler and caches when nothing is inherited", () => {
     withCheckouts((checkout) => {

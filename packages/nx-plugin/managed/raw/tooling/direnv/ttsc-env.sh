@@ -25,7 +25,15 @@ if [ -n "${NX_WORKSPACE_ROOT_PATH:-}" ] &&
   unset TTSC_CACHE_DIR TTSC_GO_CACHE_DIR
 fi
 unset smoo_ttsc_checkout
-export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
+if [ -f "$PWD/tooling/direnv/typescript-go.nix" ]; then
+  export TTSC_TSGO_BINARY="$PWD/tooling/direnv/.devenv/profile/bin/tsgo"
+  if [ ! -x "$TTSC_TSGO_BINARY" ]; then
+    echo "ttsc-env.sh: native TypeScript producer is declared, but checkout profile/bin/tsgo is unavailable: $TTSC_TSGO_BINARY" >&2
+    return 1
+  fi
+else
+  export TTSC_TSGO_BINARY="$PWD/node_modules/@typescript/native/bin/tsc"
+fi
 export TTSC_CACHE_DIR="${TTSC_CACHE_DIR:-$PWD/.cache/ttsc}"
 export TTSC_GO_CACHE_DIR="${TTSC_GO_CACHE_DIR:-$TTSC_CACHE_DIR/go-build}"
 mkdir -p "$TTSC_GO_CACHE_DIR"
