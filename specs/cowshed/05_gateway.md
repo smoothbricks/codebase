@@ -414,15 +414,20 @@ core count.
 - **The budget.** N tokens, one per core the host reports (`std::thread::available_parallelism`); one token is one
   runnable thread or process. The ledger keeps `free + Σ held = N`; it never infers a holder from a process scan.
 - **Who asks.** The `@smoothbricks/nx-plugin` `bounded-exec` executor, before it starts any command — the inferred
-  nextest runners, `bun test` targets, cargo commands it runs. Its `want` is the command's runner's own parallelism: a
-  `nextest run` asks for its `--test-threads` or one per core; `bun test --parallel=N` for N workers, a bare
-  `--parallel` for one per core; a cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`, `napi build`) for
-  one job per core; anything else, one `bun test` process included, for one. A target's `parallelism` option outranks
-  all of these. `test.concurrent` inside one process is not another CPU.
-- **Sized to the grant.** A grant is between 1 and `want`. The executor sets `NEXTEST_TEST_THREADS` for nextest,
-  rewrites a `--test-threads=`/`--parallel=` count the command names (a flag outranks the environment), sets
-  `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS` for cargo, and gives every command `BOUNDED_EXEC_CPU_TOKENS`, so a script
-  that starts a runner itself can size it.
+  nextest runners, `bun test` targets, cargo commands it runs. Its requested parallelism is the command's runner's own:
+  a `nextest run` names `--test-threads` or defaults to one per core; `bun test --parallel=N` names N workers, a bare
+  `--parallel` defaults to one per core; a cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`,
+  `napi build`) defaults to one job per core; anything else, one `bun test` process included, defaults to one. A
+  target's `parallelism` option selects that request, but positive inherited `NEXTEST_TEST_THREADS` and
+  `CARGO_BUILD_JOBS` are ceilings on their respective runners. A configured environment count may lower an inherited
+  ceiling, never raise it. `want` is the lesser of the request and its ceiling. `test.concurrent` inside one process is
+  not another CPU.
+- **Sized to the grant.** A grant is between 1 and `want`; runner concurrency is at most `min(want, granted tokens)`,
+  never raised above an inherited ceiling. The executor sets `NEXTEST_TEST_THREADS` and rewrites nextest's named
+  `--test-threads=` count to that limit, rewrites Bun's `--parallel=` count, and sets `CARGO_BUILD_JOBS` for cargo.
+  Cargo's `RUST_TEST_THREADS` also retains its independent inherited/configured ceiling. Every command receives the
+  actual held grant as `BOUNDED_EXEC_CPU_TOKENS`; the sub-ledger and telemetry report held tokens, not a fabricated
+  runner count.
 - **Nested runners use a parent-held sub-ledger.** A granted executor serves its T tokens on a private socket and
   publishes that endpoint as `BOUNDED_EXEC_CPU_POOL`, beside its `BOUNDED_EXEC_CPU_TOKENS` count. A default nested
   executor connects to its immediate parent's live pool, requests at most `min(want, inherited)`, and holds one complete
