@@ -76,13 +76,11 @@ bun patch --commit nx@23.2.1 --cache-dir ../nx-registry-cache
 cat patches/nx@23.2.1.patch
 ```
 
-The resulting patch has only three lines and cannot carry the deletion's contents. Generate new changed-file sections
-with Bun against the pinned registry package, then carry those sections verbatim into the maintained patch while
-retaining every existing section byte-identically. Do not rewrite hunk coordinates or adopt the malformed deletion
-headers. Exclude the prepared package's `.bun-tag-*` metadata from patch generation. Keep the managed consumer copy
-identical and install normally as above. If patch preparation left `node_modules/nx` as an editable directory, remove
-that prepared copy before ordinary installation so Nx resolves from Bun's isolated installed store again, with its
-dependency links intact.
+The resulting patch has only three lines and cannot carry the deletion's contents. Repair and maintain the carried patch
+with the verified registry-index generator in [Activating a patch change](#activating-a-patch-change): prepare Nx,
+require `python3 tooling/nx_patch.py --check` to reproduce the current patch byte-identically before editing, then
+regenerate both patch copies with `python3 tooling/nx_patch.py`. Retire the prepared copy and install normally as
+specified there. Do not splice Bun-generated sections or hand-edit the generated patch.
 
 ## Dependency-graph resolution cache identity
 
