@@ -5944,10 +5944,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 // lookup is repeated there so a clone staged since is left for a retry to retire
                 // rather than orphaned. The retirement supersedes the clone intent, so no later
                 // open replays it.
-                if self
+                if let Some(origin) = self
                     .lifecycle_intents
                     .get(&workspace)
-                    .is_some_and(|record| {
+                    .filter(|record| {
                         record.completion.is_none()
                             && matches!(
                                 record.operation,
@@ -5955,6 +5955,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                                     | crate::storage::recovery::LifecycleIntent::Fork { .. }
                             )
                     })
+                    .map(|record| record.operation.clone())
                 {
                     if !self.claim_intent_lease(&workspace)? {
                         return Err(another_process_is_running(&workspace));
@@ -5972,7 +5973,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             format!("cowshed rm {workspace}"),
                         ));
                     }
-                    self.begin_lifecycle_intent(intent).await?;
+                    self.begin_lifecycle_intent(
+                        crate::storage::recovery::LifecycleIntent::Retire {
+                            workspace: workspace.clone(),
+                            options,
+                            origin: Some(Box::new(origin)),
+                        },
+                    )
+                    .await?;
                     self.mark_lifecycle_intent_mutating(&workspace).await?;
                     self.release_slot(&workspace).await?;
                     let report = RemoveReport::default();
@@ -7595,9 +7603,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         metadata: crate::metadata::DetachedWorkspaceMetadata,
     ) -> Result<(RemoveReport, crate::storage::lifecycle::RetiredRef)> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
-        use crate::storage::lifecycle::{
-            Destination, LifecyclePlanner, MountIntent, MountState, Substrate,
-        };
+        use crate::storage::lifecycle::{MountIntent, MountState, OperationIdentity, Substrate};
 
         if metadata.repo_id != self.descriptor.repo_id
             || metadata.workspace != *workspace
@@ -7608,56 +7614,31 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 "cowshed doctor --json",
             ));
         }
-        let (source_name, fork) = match &origin {
+        match &origin {
             crate::storage::recovery::LifecycleIntent::Create {
-                workspace: target,
-                options,
-            } if target == workspace => (
-                options.from_workspace.clone().unwrap_or_else(main_name),
-                false,
-            ),
-            crate::storage::recovery::LifecycleIntent::Fork {
-                source,
-                destination,
-                ..
-            } if destination == workspace => (source.clone(), true),
+                workspace: target, ..
+            } if target == workspace => {}
+            crate::storage::recovery::LifecycleIntent::Fork { destination, .. }
+                if destination == workspace => {}
             _ => {
                 return Err(CowshedError::integrity(
                     format!("pending workspace {workspace} has no matching create or fork intent"),
                     "cowshed doctor --json",
                 ));
             }
-        };
+        }
         let info = &metadata.info_snapshot;
-        let source = self.current(&source_name).await?;
-        require_mounted_source(&source_name, &source)?;
-        let identity = self
-            .operation_identity(
-                metadata.grants.clone(),
-                info.branch.clone(),
-                info.forked_from.clone(),
-                info.git_worktree,
-            )
-            .await?;
-        let destination = Destination {
-            repo: self.descriptor.repo_id.clone(),
-            name: workspace.clone(),
-            topology_revision: source.derived.workspace.topology_revision(),
-            identity,
+        let identity = OperationIdentity {
+            project_root: info.project_root.clone(),
+            base_commit: info.base_commit.clone(),
+            created_at: info.created_at.clone(),
+            branch: info.branch.clone(),
+            forked_from: info.forked_from.clone(),
+            created_trace: uuid::Uuid::new_v4().simple().to_string(),
+            grants: metadata.grants.clone(),
+            git_worktree: info.git_worktree,
         };
-        let plan = if fork {
-            PendingClonePlan::Fork(
-                self.substrate
-                    .plan_fork(&source.derived.workspace, destination)
-                    .map_err(native_integrity_error)?,
-            )
-        } else {
-            PendingClonePlan::Create(
-                self.substrate
-                    .plan_create(&source.derived.workspace, destination)
-                    .map_err(native_integrity_error)?,
-            )
-        };
+        let git_worktree = info.git_worktree;
         let main = self.current(&main_name()).await?;
         let main_detached = matches!(main.derived.mount_state, MountState::Detached);
         if main_detached {
@@ -7680,7 +7661,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let containment = self.main_containment()?;
         let result = async {
             let (retired, abandoned) = substrate
-                .execute_pending_clone_retirement(plan, |stage| {
+                .execute_pending_clone_retirement(metadata, identity, |stage| {
                     let this = &mut *self;
                     let containment = &containment;
                     async move {
@@ -7727,7 +7708,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             ),
                             None => None,
                         };
-                        this.unregister_workspace_in_main(workspace, info.git_worktree)
+                        this.unregister_workspace_in_main(workspace, git_worktree)
                             .await?;
                         Ok::<_, CowshedError>(abandoned)
                     }
@@ -7870,29 +7851,6 @@ enum MainPreservation {
         head: GitOid,
         retained_head: Option<GitOid>,
     },
-}
-
-#[cfg(target_os = "macos")]
-enum PendingClonePlan {
-    Create(crate::storage::lifecycle::CreatePlan),
-    Fork(crate::storage::lifecycle::ForkPlan),
-}
-
-#[cfg(target_os = "macos")]
-impl crate::storage::lifecycle::ImmutablePlan for PendingClonePlan {
-    fn expected(&self) -> &[crate::storage::lifecycle::LifecycleFact] {
-        match self {
-            Self::Create(plan) => crate::storage::lifecycle::ImmutablePlan::expected(plan),
-            Self::Fork(plan) => crate::storage::lifecycle::ImmutablePlan::expected(plan),
-        }
-    }
-
-    fn operation(&self) -> &crate::storage::lifecycle::Operation {
-        match self {
-            Self::Create(plan) => crate::storage::lifecycle::ImmutablePlan::operation(plan),
-            Self::Fork(plan) => crate::storage::lifecycle::ImmutablePlan::operation(plan),
-        }
-    }
 }
 
 /// Refuse a checkout destination anything already occupies: a move never replaces what is there.

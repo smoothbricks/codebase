@@ -4016,6 +4016,22 @@ where
         file.write_all_at(&block, 0).map_err(io)
     }
 
+    fn validate_pending_clone(
+        &self,
+        image: &Path,
+        expected: &DetachedWorkspaceMetadata,
+    ) -> Result<(), ApfsStorageError> {
+        let actual = DetachedWorkspaceMetadata::read_for_image(image)
+            .map_err(|error| ApfsStorageError::Host(error.to_string()))?;
+        if actual != *expected || !path_exists(image)? {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "pending clone changed before retirement: {}",
+                image.display()
+            )));
+        }
+        Ok(())
+    }
+
     fn resumable_clone(
         &self,
         config: &ApfsSubstrateConfig,

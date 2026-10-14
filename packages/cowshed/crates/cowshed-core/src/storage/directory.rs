@@ -1104,6 +1104,23 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         Err(unsupported("taking a clone's own extent map"))
     }
 
+    fn validate_pending_clone(
+        &self,
+        image: &Path,
+        expected: &DetachedWorkspaceMetadata,
+    ) -> Result<(), ApfsStorageError> {
+        self.require_store_image(image)?;
+        validate_image(image)?;
+        let actual = read_metadata(image)?;
+        if actual != *expected || !path_exists(image)? {
+            return Err(ApfsStorageError::MarkerMismatch(format!(
+                "pending clone changed before retirement: {}",
+                image.display()
+            )));
+        }
+        Ok(())
+    }
+
     fn resumable_clone(
         &self,
         config: &ApfsSubstrateConfig,

@@ -354,6 +354,27 @@ impl ApfsExecutionHost for FakeHost {
         Ok(())
     }
 
+    fn validate_pending_clone(
+        &self,
+        image: &Path,
+        expected: &cowshed_core::metadata::DetachedWorkspaceMetadata,
+    ) -> Result<(), ApfsStorageError> {
+        let state = self.state.lock().expect("fake state");
+        let pending = state
+            .resumable_clone
+            .as_ref()
+            .ok_or(ApfsStorageError::InvalidPlan("missing pending clone"))?;
+        if pending.image != image
+            || pending.workspace.incarnation() != &expected.workspace_incarnation
+            || pending.workspace.revision().get() != expected.grants.revision
+        {
+            return Err(ApfsStorageError::InvalidPlan(
+                "pending clone identity changed",
+            ));
+        }
+        Ok(())
+    }
+
     fn resumable_clone(
         &self,
         _: &ApfsSubstrateConfig,
@@ -3018,46 +3039,47 @@ async fn pending_canonical_clone_resumes_without_reclone_and_activates_after_ini
 #[tokio::test]
 async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     let host = FakeHost::default();
-    let source = LifecycleWorkspace::new(
-        repo(),
-        WorkspaceName::main(),
-        incarnation(5),
-        Revision::new(5),
-        Revision::new(10),
-        WorkspaceRole::Main,
-    )
-    .expect("source");
-    host.seed(&source);
     let name = WorkspaceName::new("unfinished").expect("destination");
     let pending = LifecycleWorkspace::new(
         repo(),
         name.clone(),
         incarnation(9),
         Revision::new(6),
-        Revision::new(11),
+        Revision::new(6),
         WorkspaceRole::Workspace,
     )
     .expect("pending");
-    let original = identity();
+    let mut original = identity();
+    original.grants.revision = 6;
     host.resume_clone_from(
         pending.clone(),
         original.clone(),
-        "/store/acme--widget/sessions/unfinished.dmg",
+        "/store/acme/widget/sessions/unfinished.dmg",
     );
     let substrate = substrate(host.clone(), CountingLane::default());
-    let plan = substrate
-        .plan_create(
-            &source,
-            Destination {
-                repo: repo(),
-                name,
-                topology_revision: Revision::new(11),
-                identity: original,
-            },
-        )
-        .expect("retirement plan");
+    let metadata = cowshed_core::metadata::DetachedWorkspaceMetadata {
+        version: cowshed_core::metadata::SIDECAR_VERSION,
+        repo_id: repo(),
+        workspace: name,
+        workspace_incarnation: pending.incarnation().clone(),
+        platform: cowshed_core::metadata::Platform::Macos,
+        publication_state: cowshed_core::metadata::PublicationState::PendingFence,
+        updated_at: original.created_at.clone(),
+        grants: original.grants.clone(),
+        info_snapshot: WorkspaceInfoSnapshot {
+            project_root: original.project_root.clone(),
+            role: WorkspaceRole::Workspace,
+            base_commit: original.base_commit.clone(),
+            created_at: original.created_at.clone(),
+            branch: original.branch.clone(),
+            forked_from: original.forked_from.clone(),
+            captured_at: original.created_at.clone(),
+            stale: true,
+            git_worktree: false,
+        },
+    };
     let refusal = substrate
-        .execute_pending_clone_retirement(plan.clone(), |stage| async move {
+        .execute_pending_clone_retirement(metadata.clone(), original.clone(), |stage| async move {
             assert!(stage.resuming);
             Err::<(), _>("unlanded commits")
         })
@@ -3074,7 +3096,7 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
             .any(|event| event == "atomic-retire-to-trash")
     );
     let (retired, proof) = substrate
-        .execute_pending_clone_retirement(plan, |stage| async move {
+        .execute_pending_clone_retirement(metadata, original, |stage| async move {
             assert_eq!(stage.workspace, pending);
             Ok::<_, &'static str>("landed")
         })
@@ -3083,6 +3105,8 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     assert_eq!(proof, "landed");
     assert_eq!(retired.workspace().revision(), Revision::new(6));
     let events = host.events();
+    assert!(events.iter().any(|event| event == "lock:1"));
+    assert!(!events.iter().any(|event| event == "lock:2"));
     assert!(events.iter().any(|event| event == "atomic-retire-to-trash"));
     assert!(!events.iter().any(|event| event == "activate-pending"));
     assert!(!events.iter().any(|event| event.as_str() == "clone"));

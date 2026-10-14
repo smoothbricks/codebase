@@ -444,6 +444,13 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         let _ = (config, source, destination, destination_topology, identity);
         Ok(None)
     }
+    /// Revalidate the exact pending sidecar and payload under its image lock.
+    fn validate_pending_clone(
+        &self,
+        image: &Path,
+        expected: &crate::metadata::DetachedWorkspaceMetadata,
+    ) -> Result<(), ApfsStorageError>;
+
     /// The unfinished adoption whose canonical main still carries `PendingFence`, if any. A main
     /// that is already published is not an adoption to resume and is refused.
     fn pending_adoption(
@@ -1291,7 +1298,6 @@ where
                     identity,
                 },
                 incarnations.as_ref(),
-                false,
             )
         });
         let Alongside { work, abandon } = alongside;
@@ -1338,69 +1344,50 @@ where
 
     /// Retire an unfinished clone without ever publishing it as runnable. Inspection runs
     /// on its verified mount under the image lock; a refusal preserves the pending payload.
-    pub async fn execute_pending_clone_retirement<P, F, Fut, R, E>(
+    pub async fn execute_pending_clone_retirement<F, Fut, R, E>(
         &self,
-        plan: P,
+        metadata: crate::metadata::DetachedWorkspaceMetadata,
+        identity: OperationIdentity,
         inspect: F,
     ) -> Result<(RetiredRef, R), StagedExecutionError<E>>
     where
-        P: ImmutablePlan,
         F: FnOnce(WorkspaceStage) -> Fut + Send,
         Fut: Future<Output = Result<R, E>> + Send,
         R: Send,
         E: Send,
     {
-        let backend = CheckedApfsBackend {
-            host: Arc::clone(&self.host),
-            lane: Arc::clone(&self.lane),
-            config: Arc::clone(&self.config),
-            incarnations: Arc::clone(&self.incarnations),
-            expected: plan.expected().to_vec(),
-        };
-        let mut guard = backend.acquire(plan.operation()).await?;
-        let actual = backend
-            .read_authoritative(&mut guard, plan.expected())
-            .await?;
-        revalidate(plan.expected(), &actual).map_err(ApfsStorageError::from)?;
-
+        if metadata.workspace.is_main()
+            || metadata.publication_state != crate::metadata::PublicationState::PendingFence
+        {
+            return Err(ApfsStorageError::InvalidPlan(
+                "pending retirement requires an unfinished session clone",
+            )
+            .into());
+        }
+        let workspace = native::metadata_workspace_ref(&metadata)?;
+        let image = canonical_image_path(&self.config, &workspace)?;
+        let lock_path = workspace_lock_path(&self.config, workspace.repo(), workspace.name())?;
         let host = Arc::clone(&self.host);
         let config = Arc::clone(&self.config);
-        let incarnations = Arc::clone(&self.incarnations);
-        let expected = plan.expected().to_vec();
-        let operation = plan.operation().clone();
-        let prepared = self
+        let (_lock, prepared) = self
             .lane
             .dispatch(move || {
-                let (source, destination, identity, fork) = match &operation {
-                    Operation::Create {
-                        source,
-                        destination,
-                        identity,
-                    } => (source, destination, identity, false),
-                    Operation::Fork {
-                        source,
-                        destination,
-                        identity,
-                    } => (source, destination, identity, true),
-                    _ => {
-                        return Err(ApfsStorageError::InvalidPlan(
-                            "pending clone retirement requires a create or fork plan",
-                        ));
-                    }
-                };
-                prepare_clone_stage(
+                let lock = host.lock_images(&[lock_path], LockMode::Wait)?.ok_or(
+                    ApfsStorageError::InvalidPlan("blocking image lock unexpectedly unavailable"),
+                )?;
+                host.validate_pending_clone(&image, &metadata)?;
+                let prepared = mount_clone_stage(
                     host.as_ref(),
                     &config,
-                    &expected,
-                    CloneExecution {
-                        source,
-                        destination,
-                        fork,
+                    ResumableClone {
+                        workspace,
                         identity,
+                        image,
                     },
-                    incarnations.as_ref(),
+                    None,
                     true,
-                )
+                )?;
+                Ok((lock, prepared))
             })
             .await?;
         let prepared = StagedCallbackGuard::new(
@@ -2691,7 +2678,6 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
     expected: &[LifecycleFact],
     execution: CloneExecution<'_>,
     incarnations: &dyn IncarnationSource,
-    require_resume: bool,
 ) -> Result<PreparedClone<H::Attachment>, ApfsStorageError> {
     let CloneExecution {
         source: source_name,
@@ -2708,11 +2694,6 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         destination_topology,
         requested_identity,
     )?;
-    if require_resume && resumed.is_none() {
-        return Err(ApfsStorageError::InvalidPlan(
-            "pending clone retirement requires the exact unfinished image",
-        ));
-    }
     let (workspace, identity, canonical_image, resuming) = match resumed {
         Some(resumed) => (resumed.workspace, resumed.identity, resumed.image, true),
         None => {
@@ -2735,8 +2716,6 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         }
     };
     let source_image = canonical_image_path(config, &source)?;
-    let canonical_mount = mount_point(config, &workspace)?;
-    let canonical_companion = companion_path(&canonical_image);
 
     if !resuming {
         // The sidecar is the publication fence and is durable before the canonical payload name
@@ -2776,15 +2755,36 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         }
     }
 
-    // An attach/mount refusal can be reporting a crash-left live kernel mount or ambiguous
-    // inventory. Preserve the PendingFence payload for the next authoritative recovery pass;
-    // reclaiming a possibly mounted backing image would trade a diagnosable retry for data loss.
+    mount_clone_stage(
+        host,
+        config,
+        ResumableClone {
+            workspace,
+            identity,
+            image: canonical_image,
+        },
+        fork.then_some(source.name()),
+        resuming,
+    )
+}
+
+fn mount_clone_stage<H: ApfsExecutionHost>(
+    host: &H,
+    config: &ApfsSubstrateConfig,
+    clone: ResumableClone,
+    forked_from: Option<&WorkspaceName>,
+    resuming: bool,
+) -> Result<PreparedClone<H::Attachment>, ApfsStorageError> {
+    let ResumableClone {
+        workspace,
+        identity,
+        image: canonical_image,
+    } = clone;
+    let canonical_mount = mount_point(config, &workspace)?;
+    let canonical_companion = companion_path(&canonical_image);
+    // An attach refusal preserves the pending payload: it can be reporting a crash-left mount.
     let attachment =
         host.attach_and_mount_resumable(&canonical_image, &canonical_mount, &workspace)?;
-    // The clone keeps its source's volume label here. Relabelling goes through Disk Arbitration,
-    // which serializes every client on the host — 10–28 s behind a busy fleet, right where a
-    // workspace is being provisioned — and the label is human-facing only, so the workspace's
-    // supervisor relabels it once the clone is in use (`relabel_off_the_path` in the runtime).
     let prepared = timed_apfs_step("canonical", "creds", || {
         host.mint_workspace_credentials(
             &workspace,
@@ -2798,8 +2798,7 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
             host.write_marker(
                 &canonical_mount,
                 &workspace,
-                fork.then_some(source.name())
-                    .or(identity.forked_from.as_ref()),
+                forked_from.or(identity.forked_from.as_ref()),
                 &identity,
             )
         })
@@ -2813,8 +2812,6 @@ fn prepare_clone_stage<H: ApfsExecutionHost>(
         })
     });
     if resuming {
-        // A failed retry must not destroy the original pending image: initialization may
-        // already have changed Git state outside the image.
         return prepared.map(|()| PreparedClone {
             stage: WorkspaceStage {
                 workspace,

@@ -619,6 +619,160 @@ async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed(
     next.shutdown().await.expect("stop the creating runtime");
 }
 
+/// Named removal inspects the pending fork itself, even after its clone source is gone.
+#[tokio::test]
+async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
+    let fixture = Fixture::new("rm-gone-source");
+    let runtime = fixture.adopt().await;
+    fixture.plant_workspace_branch("wedged");
+    fixture
+        .mint(&runtime, "source", ForkOptions::default())
+        .await
+        .expect("mint source");
+    fixture
+        .fork(&runtime, "source", "wedged")
+        .await
+        .expect_err("the inherited destination branch interrupts the fork");
+    let image = fixture
+        .layout()
+        .session_image(&name("wedged"))
+        .expect("pending image")
+        .image()
+        .to_owned();
+    let pending = DetachedWorkspaceMetadata::read_for_image(&image).expect("pending metadata");
+    assert_eq!(pending.publication_state, PublicationState::PendingFence);
+    let origin = fixture.intent("wedged").expect("clone intent").operation;
+    fixture
+        .remove(&runtime, "source")
+        .await
+        .expect("retire the clean, landed source");
+    assert!(
+        !fixture
+            .layout()
+            .session_image(&name("source"))
+            .expect("source image")
+            .image()
+            .exists()
+    );
+    runtime.shutdown().await.expect("stop the creating runtime");
+
+    let rm = fixture
+        .open_removing("wedged")
+        .await
+        .expect("removal never replays the missing source");
+    assert_eq!(fixture.listed(&rm).await, ["main"]);
+    fixture
+        .remove(&rm, "wedged")
+        .await
+        .expect("retire the pending fork without its source");
+    assert!(!image.exists(), "the pending image is logically retired");
+    let retired = fixture.intent("wedged").expect("retirement record");
+    assert!(matches!(
+        retired.completion,
+        Some(LifecycleIntentCompletion::Retire(_))
+    ));
+    assert!(
+        matches!(retired.operation, LifecycleIntent::Retire { origin: Some(ref retained), .. } if **retained == origin)
+    );
+    assert_eq!(
+        fixture.listed(&rm).await,
+        ["main"],
+        "the fork is never activated"
+    );
+    rm.shutdown().await.expect("stop the removing runtime");
+
+    LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
+        journal.begin(LifecycleIntent::Fork {
+            source: name("source"),
+            destination: name("empty"),
+            rename: false,
+        });
+        journal.mark_mutating(&name("empty"))
+    })
+    .expect("journal a fork stopped before its first image write");
+    let rm = fixture
+        .open_removing("empty")
+        .await
+        .expect("open removal of an image-free fork");
+    fixture
+        .remove(&rm, "empty")
+        .await
+        .expect("retire the image-free intent without its source");
+    assert!(matches!(
+        fixture.intent("empty").and_then(|record| record.completion),
+        Some(LifecycleIntentCompletion::Retire(_))
+    ));
+    let empty = fixture
+        .intent("empty")
+        .expect("image-free retirement record");
+    assert!(
+        matches!(empty.operation, LifecycleIntent::Retire { origin: Some(ref retained), .. }
+        if matches!(retained.as_ref(), LifecycleIntent::Fork { source, destination, rename: false }
+            if source == &name("source") && destination == &name("empty")))
+    );
+    rm.shutdown()
+        .await
+        .expect("stop the image-free removing runtime");
+}
+
+/// Losing a finished fork's source never authorizes losing its unlanded commits.
+#[tokio::test]
+async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed() {
+    let fixture = Fixture::new("rm-unlanded-fork");
+    let runtime = fixture.adopt().await;
+    fixture
+        .mint(&runtime, "source", ForkOptions::default())
+        .await
+        .expect("mint source");
+    let fork = fixture
+        .fork(&runtime, "source", "finished")
+        .await
+        .expect("finish fork");
+    let mount = PathBuf::from(fork["info"]["mount"].as_str().expect("fork mount"));
+    fs::write(mount.join("unlanded"), b"unique work\n").expect("unlanded file");
+    git(&mount, &["add", "unlanded"]);
+    git(&mount, &["commit", "-q", "-m", "unlanded work"]);
+    let original_head = head(&mount);
+    fixture
+        .remove(&runtime, "source")
+        .await
+        .expect("retire the landed source");
+    runtime.shutdown().await.expect("stop the creating runtime");
+
+    let rm = fixture
+        .open_removing("finished")
+        .await
+        .expect("open finished-fork removal");
+    for force in [false, true] {
+        let refusal = fixture
+            .call(
+                &rm,
+                "coordinator.destroy",
+                json!({
+                    "repoId": fixture.repo, "workspace": "finished",
+                    "options": RemoveOptions { force, ..RemoveOptions::default() },
+                }),
+            )
+            .await
+            .expect_err("unlanded commits require explicit abandonment");
+        assert_eq!(refusal.code, cowshed_core::ErrorCode::Conflict);
+        assert!(
+            refusal.message.contains("carries 1 commit that main"),
+            "{refusal:?}"
+        );
+        assert_eq!(head(&mount), original_head);
+        assert!(
+            fixture
+                .layout()
+                .session_image(&name("finished"))
+                .expect("finished image")
+                .image()
+                .exists()
+        );
+    }
+    rm.shutdown().await.expect("stop the refusing runtime");
+}
+
 /// The kernel claim on a new workspace's port block lasts until its image publication is
 /// complete and no longer (05_gateway.md): from then on the image owns the block, and another
 /// process's gateway reconcile installing the workspace's session must find no claim of the
