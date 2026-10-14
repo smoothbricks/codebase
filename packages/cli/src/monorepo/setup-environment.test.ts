@@ -125,7 +125,7 @@ async function withManagedRepository(
     await mkdir(join(root, 'tooling', 'git-hooks'), { recursive: true });
     await mkdir(ledgers);
     await mkdir(bin);
-    for (const name of ['setup-environment.ts', 'developer-links.ts', 'secret-references.ts']) {
+    for (const name of ['setup-environment.ts', 'developer-links.ts', 'linked-snapshots.ts', 'secret-references.ts']) {
       await copyFile(join(MANAGED, 'tooling', 'direnv', name), join(root, 'tooling', 'direnv', name));
     }
     await copyFile(join(MANAGED, 'envrc'), join(root, '.envrc'));

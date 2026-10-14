@@ -17,7 +17,7 @@ import typia, { type IValidation } from 'typia';
 export * from '@smoothbricks/nx-plugin/workspace-manifest';
 
 /** Parse package.json text. Invalid JSON throws; wrong shape returns null. */
-export const parsePackageJsonText = typia.json.createIsParse<PackageJson>();
+export const parsePackageJsonText: (text: string) => PackageJson | null = typia.json.createIsParse<PackageJson>();
 
 /** Parse `nx show project --json` output. Invalid JSON throws; wrong shape returns null. */
 export const parseNxProjectJsonText = typia.json.createIsParse<NxProjectJson>();

@@ -245,6 +245,27 @@ export interface PackageSecretCommand {
  */
 export type DeveloperLinkDirectory = string & typia.tags.MinLength<1> & typia.tags.Pattern<'^[^/]'>;
 
+/** An Nx task of the provider workspace: `project:target`, optionally `:configuration`. */
+export type DeveloperLinkTarget = string & typia.tags.Pattern<'^[^:\\s]+:[^:\\s]+(?::[^:\\s]+)?$'>;
+
+/**
+ * Binds a declared package's aliases to a sealed snapshot of its checkout
+ * (tooling/direnv/linked-snapshots.ts): `targets` are the provider Nx targets
+ * whose recorded outputs the snapshot publishes, and `artifactModules` the
+ * package's modules exporting `nativeArtifactPath()`, its own resolution of a
+ * native library the snapshot carries.
+ */
+export interface DeveloperLinkSnapshot {
+  targets: DeveloperLinkTarget[] & typia.tags.MinItems<1>;
+  artifactModules: string[];
+}
+
+/** A declared checkout whose aliases bind a snapshot of it instead of the live directory. */
+export interface DeveloperLinkSnapshotDeclaration {
+  directory: DeveloperLinkDirectory;
+  snapshot: DeveloperLinkSnapshot;
+}
+
 export interface PackageSmooConfig {
   github?: PackageSmooGithub;
   privateNpm?: PackagePrivateNpmConfig;
@@ -259,9 +280,12 @@ export interface PackageSmooConfig {
    * every checkout gets it. Shell entry links each tree that installed the
    * package, a directory the machine lacks keeps the installed version, and CI
    * links nothing (tooling/direnv/developer-links.ts, which validates the same
-   * shape at runtime). Nx is lockfile/patch-owned and cannot be declared here.
+   * shape at runtime). A `{ directory, snapshot }` declaration binds a sealed,
+   * Nx-attested snapshot of that checkout instead, so the provider's own builds
+   * never change a file a running consumer task resolves. Nx is
+   * lockfile/patch-owned and cannot be declared here.
    */
-  developerLinks?: Record<string, DeveloperLinkDirectory>;
+  developerLinks?: Record<string, DeveloperLinkDirectory | DeveloperLinkSnapshotDeclaration>;
 }
 
 export interface PackageWorkspacesObject {

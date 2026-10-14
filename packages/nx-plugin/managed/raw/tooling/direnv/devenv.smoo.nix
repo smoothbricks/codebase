@@ -503,6 +503,7 @@ in {
         "../../tooling/workspace.gitconfig"
         "setup-environment.ts"
         "developer-links.ts"
+        "linked-snapshots.ts"
         "secret-references.ts"
         "../../node_modules/.smoo-install"
       ];
