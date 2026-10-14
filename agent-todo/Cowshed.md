@@ -34,8 +34,6 @@
   runs whose temporary checkout root disappears; an unavailable root must not make its durable registration invisible to
   recovery or require raw store deletion.
 
-<<<<<<< HEAD
-
 - Move the APFS workspace host into `cowshed-apfs` so a core land stops rerunning real-image tests. This follows the
   `cowshed-apfs`/`cowshed-os` split. Until it lands, the host-subject real-APFS tests run as the `real-apfs-host` serial
   group over core's closure (specs/cowshed/08_testing.md §Integration tests). The host is `MacOsApfsExecutionHost`:
@@ -210,10 +208,6 @@
   refuse controller verbs on platforms that cannot enforce it. Hardened flags alone do not satisfy that confinement
   contract.
 
-=======
-
-> > > > > > > 70d9ed52c (docs(cowshed): record unnamed build-hold refusal)
-
 ## Refused build hold reports no holders
 
 On 2026-10-12, an ordinary fork of `<source-ws>` retained a stale seed because the source build hold was shared, but its
@@ -226,28 +220,11 @@ seed holds** (`16_build_volumes.md:398`) likewise requires a skip to name each h
 that exclusion; investigate why the refused shared hold has no reported owner, rather than forcing a seal or copying
 live Nx databases.
 
-<<<<<<< HEAD Start in `packages/cowshed/crates/cowshed-core/src/storage/apfs/native/build_volumes.rs:122-145`, <<<<<<<
-HEAD `MacOsApfsExecutionHost::claim_capture_source`: a refused claim collects hold owners through `crate::build_volume::nx::holders`
-(`src/build_volume/nx.rs:568-569`, macOS), then constructs `ApfsStorageError::BuildVolumeHeld` (`src/storage/apfs.rs:748-760`,
-its diagnostic formatter). The current tree's error wording differs from the installed binary's recorded text below; no
-matching-binary source diagnosis was performed.
-=======
-
-`ApfsStorageHost::claim_capture_source`: a refused claim collects hold owners through `crate::build_volume::nx::holders`
-(`src/build_volume/nx.rs:568-569`, macOS), then constructs `ApfsStorageError::BuildVolumeHeld` (`src/storage/apfs.rs:748-760`,
-its diagnostic formatter). The current tree's error wording differs from the installed binary's recorded text below; no
-matching-binary source diagnosis was performed.
-=======
-
 Start in `packages/cowshed/crates/cowshed-core/src/storage/apfs/native/build_volumes.rs:122-145`,
 `MacOsApfsExecutionHost::claim_capture_source`: a refused claim collects hold owners through
 `crate::build_volume::nx::holders` (`src/build_volume/nx.rs:568-569`, macOS), then constructs
 `ApfsStorageError::BuildVolumeHeld` (`src/storage/apfs.rs:748-760`, its diagnostic formatter). The current tree's error
 wording differs from the installed binary's recorded text below; no matching-binary source diagnosis was performed.
-
-> > > > > > > b5de8ff84 (docs(cowshed): name the native capture host correctly)
-
-> > > > > > > 70d9ed52c (docs(cowshed): record unnamed build-hold refusal)
 
 Path placeholders: `<checkout>` is the source checkout; `<store>` is the project's Cowshed store; `<image-id>` is the
 affected build volume; `<host cowshed>` is the installed host CLI. The affected image is `<store>/build/<image-id>.dmg`,

@@ -376,31 +376,6 @@ contents are not a path the rename can carry by bytes, so the workspace rename r
 capture, naming the directory and the way out — commit it, move it out of the workspace, or exclude it, then retry.
 Untracked files are preserved by path, mode and bytes; a nested repository is never recursed into.
 
-`mv` is a rename, not a fresh fork or mint. It preserves the source branch, remotes, uncommitted work and git-worktree
-registration through its clone-then-retire composition.
-
-The existing on-disk `fork` intent has an optional `rename` discriminator. Absent or false retains historical raw-fork
-recovery; true owns the complete rename transaction: raw clone, linked-registration/index handoff when applicable, and
-source retirement. It is never a public fork alias or a fresh mint. The intent is durable before any mutation. The
-source's supervisor admission and ownership fences remain enforced without force; dirty state alone does not refuse a
-rename because the destination preserves it. In-progress Git operations still refuse.
-
-A rename preserves the source branch, staged-only index state, working-tree edits, untracked files and ignored warm
-state. Linked registration handoff is resumable before and after its durable publication, never an index reset. Neither
-source nor destination may start new work while the rename is unfinished, and the destination is not served before
-ownership transfer and source retirement complete. Recovery resumes the exact journaled source/destination pair rather
-than creating another incarnation or discarding staged state. A rename intent still `Prepared` with no `PendingFence`
-destination is discarded and named, like a refused fork; only a mutating rename or one with durable destination facts
-resumes. Before source retirement, including a retry with an existing destination, the destination's HEAD and a
-read-only work digest must equal the source fence. Without optional locks, the digest covers the porcelain status with
-its branch header, the binary diff of the index against HEAD, the binary diff of the working tree against the index, and
-the path, mode and bytes of every untracked non-ignored file. Links rewritten by inherited-link restoration compare by
-path only. Linked worktrees must also have equal index-byte digests. A mismatch keeps both workspaces and the unfinished
-intent, with a rename-specific preservation refusal. An untracked nested repository is Git's `??dir/` entry: its
-contents are not a path the rename can carry by bytes, so the workspace rename refuses it with `conflict` before any
-capture, naming the directory and the way out — commit it, move it out of the workspace, or exclude it, then retry.
-Untracked files are preserved by path, mode and bytes; a nested repository is never recursed into.
-
 Moving an adopted checkout is always cowshed-mediated (`mv <ws> <new-path>`): the image is detached, published at the
 new path, and reattached — no unmount-and-remount gap at the user's path, no relink to maintain.
 
