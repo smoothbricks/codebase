@@ -13,7 +13,8 @@ use cowshed_apfs::{
 
 impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
     /// Mint `image`, which must not exist: one `clonefile` of the store's template at `capacity`
-    /// and one checked Disk Arbitration attach/mount. The clone shares the
+    /// and one exact-image `--noMount` attach, pinned `fsck_apfs` check and `mount_apfs` mount.
+    /// The clone shares the
     /// template's volume and container UUIDs, as every clone shares its source's, and carries its
     /// label. A failed attach removes the clone only after its attachment was released.
     pub(super) fn mint(
