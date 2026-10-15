@@ -1429,16 +1429,16 @@ impl DirectoryExecutionHost {
         });
         lock_paths.sort();
         lock_paths.dedup();
-        Ok(StorageGcPlan::new(
-            repo.clone(),
+        Ok(StorageGcPlan {
+            repo: repo.clone(),
             observed_at,
             options,
             candidates,
             lock_paths,
             examined,
             retained,
-            Vec::new(),
-        ))
+            root_held_mountpoints: Vec::new(),
+        })
     }
 
     pub(super) fn execute_gc_plan(
