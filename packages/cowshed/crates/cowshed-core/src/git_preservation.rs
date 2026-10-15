@@ -1333,14 +1333,19 @@ mod tests {
         assert_eq!(error.code, crate::ErrorCode::Integrity);
     }
 
+    /// The modification time of a copied path.
+    fn modification_time(path: &Path) -> std::time::SystemTime {
+        fs::metadata(path)
+            .expect("stat copied path")
+            .modified()
+            .expect("copied modification time")
+    }
+
     /// Replace a copied file's bytes and restore its modification time, so only content differs.
     /// Returns the bytes replaced, for the exact restore.
     fn plant(path: &Path, bytes: &[u8]) -> Vec<u8> {
         let original = fs::read(path).expect("read copied bytes");
-        let modified = fs::metadata(path)
-            .expect("stat copied file")
-            .modified()
-            .expect("copied modification time");
+        let modified = modification_time(path);
         fs::write(path, bytes).expect("plant copied bytes");
         fs::File::open(path)
             .expect("open planted file")
@@ -1406,28 +1411,39 @@ mod tests {
         }
 
         /// Plant `bytes` over `relative` in the copy, require `refusal`, then put the original
-        /// bytes back and require the copy to verify again.
+        /// bytes and modification time back, checking that both are back. The copy is verified
+        /// again once, after the witness: each refusal names its own plant, so nothing has to
+        /// prove the copy clean between plants.
         fn reject_changed_bytes(&self, relative: &str, bytes: &[u8], refusal: Refusal<'_>) {
             let path = self.staging.join(relative);
+            let modified = modification_time(&path);
             let original = plant(&path, bytes);
             let error = self
                 .verify()
                 .expect_err(&format!("planted bytes in {}", path.display()));
             refusal.assert_met(&error);
             plant(&path, &original);
-            self.verify().expect("restored bytes verify again");
+            assert_eq!(
+                fs::read(&path).expect("reread restored bytes"),
+                original,
+                "{} holds its original bytes again",
+                path.display()
+            );
+            assert_eq!(
+                modification_time(&path),
+                modified,
+                "{} holds its original modification time again",
+                path.display()
+            );
         }
 
-        /// Add a file only the copy holds, require `refusal`, then remove it and require the copy to
-        /// verify again. The directory it was added to gets its modification time back: the plant
-        /// changed that too, and the verifier compares it.
+        /// Add a file only the copy holds, require `refusal`, then remove it and give the directory
+        /// it was added to its modification time back, checking both. The plant changed that time
+        /// too, and the verifier compares it.
         fn reject_extra_path(&self, relative: &str, refusal: Refusal<'_>) {
             let path = self.staging.join(relative);
             let directory = path.parent().expect("planted path has a parent");
-            let modified = fs::metadata(directory)
-                .expect("stat the planted path's directory")
-                .modified()
-                .expect("directory modification time");
+            let modified = modification_time(directory);
             fs::write(&path, b"only in the copy\n").expect("plant extra path");
             let error = self
                 .verify()
@@ -1438,7 +1454,13 @@ mod tests {
                 .expect("open the planted path's directory")
                 .set_modified(modified)
                 .expect("restore the directory metadata changed by the planted path");
-            self.verify().expect("removed extra path verifies again");
+            assert!(!path.exists(), "{} is gone again", path.display());
+            assert_eq!(
+                modification_time(directory),
+                modified,
+                "{} holds its original modification time again",
+                directory.display()
+            );
         }
     }
 
@@ -1601,6 +1623,11 @@ mod tests {
             .verify()
             .expect("filter-free copy verifies against its retained source");
         check(&fixture);
+        // Each witness restores what it planted exactly and its refusals named their own plants,
+        // so one verification proves the whole copy clean again.
+        fixture
+            .verify()
+            .expect("the restored copy verifies against its retained source again");
 
         assert!(
             !marker.exists(),
