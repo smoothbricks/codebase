@@ -230,6 +230,11 @@ for a failure.
 
 Assert on **what your code did**, not just what it returned. Each test's ops emit a queryable span tree.
 
+Lifecycle layout tests inspect retained `TestTracer.rootBuffers`: start is row 0, completion is row 1, and appended
+events begin at row 2. They check the expected row and physical-lane populations before per-row predicates, and drive
+the existing clock seam when asserting timestamp differences. Billing delivery tests identify the actual acknowledged
+rows, not just an acknowledged batch; typed fact-filter tests require their fixture's spans, logs and tags.
+
 ```ts
 import { describe, it, expect } from 'bun:test';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';

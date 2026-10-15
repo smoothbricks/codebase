@@ -618,11 +618,13 @@ describe('specialized message buffer families', () => {
           expect(buffer._writeIndex).toBe(0);
           expect(buffer.constructor).toBe(SpanBufferClass);
           expect(buffer._opMetadata).toBe(op.metadata);
+          expect(buffer.timestamp).toHaveLength(capacity);
           expect(buffer.timestamp.every((value) => value === 0n)).toBe(true);
 
           if (mode === 'packed') {
             const rowHeaders = buffer._rowHeaders;
             if (rowHeaders === undefined) throw new Error(`Expected ${kind} packed row headers`);
+            expect(rowHeaders).toHaveLength(capacity);
             expect(rowHeaders.every((value) => value === 0)).toBe(true);
             expect('entry_type' in buffer).toBe(false);
             expect('_messageIds' in buffer).toBe(false);
@@ -630,16 +632,19 @@ describe('specialized message buffer families', () => {
           } else {
             const entryTypes = buffer.entry_type;
             if (entryTypes === undefined) throw new Error(`Expected ${kind} ${mode} entry types`);
+            expect(entryTypes).toHaveLength(capacity);
             expect(entryTypes.every((value) => value === 0)).toBe(true);
             expect('_rowHeaders' in buffer).toBe(false);
             if (mode === 'current') {
               const messageIds = buffer._messageIds;
               if (messageIds === undefined) throw new Error(`Expected ${kind} current message IDs`);
+              expect(messageIds).toHaveLength(capacity);
               expect(messageIds.every((value) => value === 0)).toBe(true);
               expect('_logHeaders' in buffer).toBe(false);
             } else {
               const logHeaders = buffer._logHeaders;
               if (logHeaders === undefined) throw new Error(`Expected ${kind} specialized log headers`);
+              expect(logHeaders).toHaveLength(capacity);
               expect(logHeaders.every((value) => value === 0)).toBe(true);
               expect('_messageIds' in buffer).toBe(false);
             }

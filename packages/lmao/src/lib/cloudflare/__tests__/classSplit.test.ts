@@ -5,6 +5,7 @@ import { describe, expect, it } from 'bun:test';
 import { createTestTracerOptions } from '../../__tests__/test-helpers.js';
 import { defineLogSchema, defineOpContext, S } from '../../defineOpContext.js';
 import { Err, Ok } from '../../result.js';
+import { ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
 import { ClassSplitTracer, type DeliveryClassifier } from '../classSplit.js';
 import { type CollectorSendFailure, FakeCollectorClient } from '../collectorClient.js';
 import type { TraceRow } from '../traceRows.js';
@@ -81,6 +82,8 @@ describe('ClassSplitTracer', () => {
       const { tracer, collector } = makeHarness();
       collector.holdSends();
       await tracer.trace('req', billableOp);
+      const buffer = tracer.queue[0];
+      if (!buffer) throw new Error('expected the generated billable trace buffer');
 
       let settledFlag = false;
       const pending = tracer.settleBillable().then((result) => {
@@ -97,6 +100,19 @@ describe('ClassSplitTracer', () => {
       const settled = await pending;
       expect(settled).toBeInstanceOf(Ok);
       expect(collector.acked).toHaveLength(1);
+      expect(collector.acked[0]).toHaveLength(1);
+      expect(collector.acked[0]).toMatchObject([
+        {
+          trace_id: buffer.trace_id,
+          span_id: buffer.span_id,
+          parent_span_id: buffer.parent_span_id,
+          row_index: 0,
+          entry_type: ENTRY_TYPE_SPAN_START,
+          timestamp_ns: Number(buffer.timestamp[0]),
+          message: 'req',
+          lane: 'billing',
+        },
+      ]);
       expect(collector.acked[0].every((row) => row.lane === 'billing')).toBe(true);
       // No billing-grade rows may remain buffered in the isolate.
       expect(tracer.queue).toHaveLength(0);

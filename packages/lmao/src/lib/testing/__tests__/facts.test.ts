@@ -213,12 +213,15 @@ describe('facts', () => {
 
     it('provides typed namespace filters', () => {
       const spans = facts.spans();
+      expect(spans).toHaveLength(6);
       expect(spans.every(isSpanFact)).toBe(true);
 
       const logs = facts.logs();
+      expect(logs).toHaveLength(2);
       expect(logs.every(isLogFact)).toBe(true);
 
       const tags = facts.tags();
+      expect(tags).toHaveLength(1);
       expect(tags.every(isTagFact)).toBe(true);
     });
 
