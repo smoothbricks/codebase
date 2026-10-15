@@ -3112,16 +3112,17 @@ fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> V
                 "build volume adopted by the target in {elapsed_ms} ms"
             ));
             lines.push(format!(
-                "build volume: the re-run check hit {} Nx task(s) and missed {}",
+                "build volume: cache-only output restoration hit {} Nx task(s) and missed {}",
                 check.hits,
                 check.misses.len()
             ));
             for miss in &check.misses {
                 lines.push(format!(
-                    "build volume: cache miss {} (hash {}, inputs {}){}",
+                    "build volume: cache miss {} (checked hash {}, inputs {}): {}{}",
                     miss.task,
                     miss.hash,
                     miss.inputs_digest.to_hex(),
+                    miss.reason,
                     miss.inputs_error
                         .as_ref()
                         .map(|error| format!(": {error}"))
@@ -3136,11 +3137,12 @@ fn land_build_volume_lines(build: &cowshed_core::api::dto::LandBuildVolume) -> V
             }
             for failed in &check.failed {
                 lines.push(format!(
-                    "build volume: `{}` failed in the target ({})",
+                    "build volume: output restoration for `{}` failed in the target ({}): {}",
                     failed.check,
                     failed
                         .exit
-                        .map_or_else(|| "killed".to_owned(), |code| format!("exit {code}"))
+                        .map_or_else(|| "killed".to_owned(), |code| format!("exit {code}")),
+                    failed.error
                 ));
             }
         }

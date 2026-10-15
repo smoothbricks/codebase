@@ -1011,6 +1011,11 @@ against the branch it just landed on, so a lane unit retires once its lane base 
 workspace itself (exit 2). `--no-retire` keeps the workspace; `--push-only` stops after validation for review-gated
 flows.
 
+Post-land output restoration never reruns `--check` commands. Checks pass once in the landing workspace; only their
+attributed Nx task graphs may be hashed and restored from the adopted local cache. Missing or uncacheable results are
+reported without executing a task. Non-Nx checks are not replayed. Declared outputs are restored onto main's source
+volume; adopting incremental state alone does not provide them (16_build_volumes.md, Land step 7).
+
 ## Time travel
 
 ### `cowshed fork <src> <dst>`

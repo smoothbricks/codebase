@@ -139,24 +139,25 @@ link it had when taken, and a land interrupted between renaming a target's link 
 target naming the landing volume. Mounting such a link as found would let the checkout write a volume a target or
 another checkout owns, or one already collected. A restore therefore never rewinds the build volume.
 
-**Refresh.** Before a job of a checkout is admitted (exec, a land check, the adoption check), at adoption for main, and
-from `cowshed setup` for every mounted workspace, cowshed refreshes the checkout's build state: it fingerprints the
-tracked build inputs (Cargo manifests, `.cowshed.toml`, the build-state capabilities' markers) and, while the
-fingerprint matches the one the volume's state records, only restores a fixed link a tool displaced (a real directory
-where the link belongs is discarded and relinked, never copied, and reported). When it moved, capability detection runs
-again in the canonical job environment (the caller's `CARGO_TARGET_DIR` and the like never name a checkout's build
-state): new paths join the volume, held ones never move. A checkout with build state and no volume gets its first one
-(its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it is a target from then on.
-Main's first volume is minted while `cowshed adopt` stages main's image, at the capacity the adopted checkout's
-`.cowshed.toml` asks, so the two attaches wait on `storagekitd` once (01a_apfs.md, "How the APFS host degrades"), unless
-nothing in the checkout can name build state (no tracked Cargo or package manifest, no declared `[build] state`, no
-enabled Nx detector match), whose first touch makes no volume. Main's first touch links it once main is mounted at the
-checkout, when main links no volume yet and asks the capacity it was minted at (the checkout's `.cowshed.toml` may
-change while main is copied; the first touch then mints its own at the capacity asked now). A mint that failed fails
-only a first touch that needs a volume, with the mint's own error, and is not retried. An adoption releases the volume
-before it completes whenever its first touch does not link it (nothing to hold, a refusal, a failure, a volume already
-linked, another capacity), and an adoption dropped before that (a cancelled request) releases it as it is dropped, the
-mint itself when it was still running. A build-state path that holds tracked source refuses before anything is deleted.
+**Refresh.** Before a job of a checkout is admitted (exec, a land check, Land step 7 output restoration), at adoption
+for main, and from `cowshed setup` for every mounted workspace, cowshed refreshes the checkout's build state: it
+fingerprints the tracked build inputs (Cargo manifests, `.cowshed.toml`, the build-state capabilities' markers) and,
+while the fingerprint matches the one the volume's state records, only restores a fixed link a tool displaced (a real
+directory where the link belongs is discarded and relinked, never copied, and reported). When it moved, capability
+detection runs again in the canonical job environment (the caller's `CARGO_TARGET_DIR` and the like never name a
+checkout's build state): new paths join the volume, held ones never move. A checkout with build state and no volume gets
+its first one (its first touch) at the project's `[build] capacity`, and the checkout's seed with it, so it is a target
+from then on. Main's first volume is minted while `cowshed adopt` stages main's image, at the capacity the adopted
+checkout's `.cowshed.toml` asks, so the two attaches wait on `storagekitd` once (01a_apfs.md, "How the APFS host
+degrades"), unless nothing in the checkout can name build state (no tracked Cargo or package manifest, no declared
+`[build] state`, no enabled Nx detector match), whose first touch makes no volume. Main's first touch links it once main
+is mounted at the checkout, when main links no volume yet and asks the capacity it was minted at (the checkout's
+`.cowshed.toml` may change while main is copied; the first touch then mints its own at the capacity asked now). A mint
+that failed fails only a first touch that needs a volume, with the mint's own error, and is not retried. An adoption
+releases the volume before it completes whenever its first touch does not link it (nothing to hold, a refusal, a
+failure, a volume already linked, another capacity), and an adoption dropped before that (a cancelled request) releases
+it as it is dropped, the mint itself when it was still running. A build-state path that holds tracked source refuses
+before anything is deleted.
 
 **Owned index links.** `.codegraph/` is build-volume state and follows the same fixed-link contract as other contributed
 paths. At the checkout root, `.codegraph -> .cowshed/build/codegraph`; a nested project's contribution preserves its
@@ -303,12 +304,11 @@ taking a conflicting second claim. A legacy source's `<id>.asif.hold` is a diffe
 alive while capture takes the replacement's `<id>.dmg.hold` normally.
 
 **Why a reseed.** A land freezes the seed before the target runs anything on the adopted volume. Everything the target
-runs afterwards (its own builds and gates, the land's adoption check, a developer's build in main) is written to its
+runs afterwards (its own builds and gates, the land's output restoration, a developer's build in main) is written to its
 live volume and never reaches that seed. A fork made afterwards would miss every task the target executed after the seed
 was frozen, though its hash equals the target's: the seed has no row for it. A fork of a target is meant to be warm for
 what the target ran, not only for what last landed in it, so the seed follows the live volume. Refreezing once more at
-the end of the land would not do it: it would capture only the adoption check, which hits by construction, and miss
-everything the target runs later.
+the end of the land would not do it: it would capture only output restoration and miss everything the target runs later.
 
 **Behind is one comparison of two modification times.** An image's modification time is the instant of the last write it
 holds: the image driver writes the image file as its volume is written, and a clone keeps its source's modification time
@@ -320,10 +320,10 @@ reopening admission. The immutable mark survives the clone's own first write; no
 admission reopens. A seed is behind when the live volume's image, its volume flushed first, was modified after the
 seed's image. A fork sets its own seed's time to its new live volume's, so a new workspace starts with a fresh seed
 rather than one behind by its own mount. After a busy seal the kept seed and the adopted volume come from different
-lineages, and the comparison still decides: the adoption check (Land step 7) runs on the adopted volume after the land
-took the target's image lock, so whatever it writes there (an Nx run writes its task database and run summary) is after
-every earlier seed's mark. A land whose check writes nothing there leaves the seed current until the target's next
-write, when it is behind and a reseed refreezes it.
+lineages, and the comparison still decides: output restoration (Land step 7) runs on the adopted volume after the land
+took the target's image lock, so whatever it writes there (Nx hashing updates its task database) is after every earlier
+seed's mark. A land whose restoration writes nothing there (no attributed Nx run) leaves the seed current until the
+target's next write, when it is behind and a reseed refreezes it.
 
 **A reseed clones the live volume only while it has no writer**, because a clone of a volume being written can hold a
 half-written Cargo unit or Nx database. It runs under the target's image lock, which every fork of the target holds
@@ -411,10 +411,10 @@ fast-forward performs no carry, output restoration or adoption.
   the shed's latest run; a real-APFS test in which main's branch moves externally to the tree of a workspace whose
   volume holds a marker output, a fork of main at that tree inherits the marker without building, the same fork with no
   candidate lacks it, and a candidate whose tree moved is refused with the old seed kept; a real-APFS land whose landing
-  volume a host process holds a file of open, which keeps main's previous seed, still adopts with every re-run Nx task a
-  hit, and whose next fork after the holder exits refreezes the seed at the landed tree; unit tests of the nearness
-  order; real Cargo build-script rendezvous tests for both an existing profile and a profile created after quiescence
-  and lock enumeration; and the sealed-source holder and attachment-exclusion tests.
+  volume a host process holds a file of open, which keeps main's previous seed, still adopts with every checked Nx
+  output restored from cache, and whose next fork after the holder exits refreezes the seed at the landed tree; unit
+  tests of the nearness order; real Cargo build-script rendezvous tests for both an existing profile and a profile
+  created after quiescence and lock enumeration; and the sealed-source holder and attachment-exclusion tests.
 - **Freshness boundary enforced by**: real APFS capture without a job write remains Fresh without tolerance; actual job
   admission is refused during canonical restore, both by a direct capture's exclusive claim and a land's retained
   stopped socket lease; an admitted shell job after admission reopens writes bytes absent from the seed and makes it
@@ -545,23 +545,29 @@ an integration workspace; "the target" is whichever one it is.
    Every seeded/unseeded and adopted/skipped result is also a durable `LandOutcome` commitment, including every
    `AdoptionSkip` and its holders (13_telemetry.md §"Controller audit record schema"), not just cache misses.
 
-7. **Check the adoption (2b).** Re-run the landed check in the target, now on the adopted build volume. For Nx it must
-   be **100% cache hits**. Every miss is a defect in the project's build configuration, not a reason to build: an input
-   that differs between checkouts, an output that is not declared, a nondeterministic step. The land report lists each
-   missed task with its hash inputs as a typed finding (13_telemetry.md records it), and the land still succeeds,
-   because the landed code was already checked. This is a free, continuous lint of the Nx configuration: a coordinator
-   turns findings into fix work.
+7. **Restore the checked outputs (2b).** Checks run **once**, in the landing workspace before delivery. Capture each
+   check's attributed stock Nx run summary immediately, in memory for this land only. After adoption, a cowshed-owned
+   cache-only helper reconstructs that run's declared task graph through stock Nx's argument parsers and graph builder.
+   Its task IDs must equal the captured IDs; a different graph refuses restoration and is reported, never expanded. Hash
+   and restore dependencies before their consumers, using only successful entries in the adopted local Nx cache.
 
-A check's counts come only from the run summary stock Nx writes into the target's cache (`cache/run.json`) when that
-summary is the check's own: Nx's `run.startTime` is not before the check was spawned, its `run.endTime` is not after the
-check exited, its command is one the check spells, and it has a task for every target that command names. Any other
-summary leaves the check **unattributed**, with the reason, and counts neither a hit nor a miss. Why: stock Nx records
-no pid or invocation in the summary and writes it once, at the end of a run, so the summary a check leaves is the last
-one any Nx process in the target wrote. Step 7 runs under the target's repository lock right after the target's daemon
-was stopped, so only a host shell in the target can run Nx then. A run that ended inside the window before the check's
-own was overwritten by it, and every other interleaving fails one of the four conditions, except one: a run of the same
-command that began after the check and ended between the check's Nx writing its summary and the check exiting. That run
-hashes the same tree with the same tasks, so the hashes it reports are the check's.
+   Each recomputed hash must equal the source check's captured hash; a different input identity is a miss, never a
+   different cached result silently substituted for the validated one. Declared outputs live on the source volume, so
+   adoption of the build volume alone does not materialize them.
+
+   No check shell, task executor or task-execution hook runs in the target. A missing result, an uncacheable task or an
+   unrestored dependency is a finding, **not permission to execute it**; non-Nx or unattributed checks are not replayed.
+   The report counts only actual cache restorations as hits, lists misses with their inputs/reason, and reports helper
+   failures honestly. The land still succeeds because validation already passed. Restoration performs hashing and
+   filesystem work; it is not a promise of a free configuration lint. Cross-checkout cache identity and output
+   availability remain enforced by the real restoration and warm-fork tests.
+
+A source check's run summary (`cache/run.json`) is attributed only when Nx's `run.startTime` is not before the check was
+spawned, its `run.endTime` is not after the check exited, its command is one the check spells, and it has a task for
+every target that command names. An ambiguous or foreign summary leaves the check **unattributed**, with the reason, and
+supplies no restoration authority. Stock Nx writes a summary once at run completion and records no pid or invocation;
+capturing it immediately avoids treating a later check's summary as the earlier check's. These summaries are transient
+byproducts of the completed checks, not another validation ledger.
 
 8. **Retire the workspace**. An adopted build volume is now the target's and does not retire with it. After a
    compare-and-swap at step 3 nothing adopted it, so it is still the workspace's.

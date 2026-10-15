@@ -984,11 +984,12 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
    head a conflicted replay was rolled back to — so a coordinator types the outcome without reading either repository
    again.
 
-4. **Freeze the seed, adopt the build volume and check it**: every land refreshes the target's seed by sealing and
-   cloning the landing workspace's warm build volume before the target adopts it by renaming its `.cowshed/build` link.
-   It then re-runs the check on the adopted volume and reports every Nx miss as a configuration finding. The target
-   builds nothing the workspace built. 16_build_volumes.md owns this step, writer-quiescence skips and collection; every
-   seeded/unseeded and adopted/skipped outcome is durable (13_telemetry.md).
+4. **Freeze the seed, adopt the build volume and restore checked outputs**: every land refreshes the target's seed by
+   sealing and cloning the landing workspace's warm build volume before the target adopts it by renaming its
+   `.cowshed/build` link. It restores only the attributed Nx task graphs of the checks already completed in the landing
+   workspace, from the adopted local cache. A miss or uncacheable task is reported without executing it; check commands
+   never run again in the target. 16_build_volumes.md, Land step 7, owns restoration, writer-quiescence skips and
+   collection; every seeded/unseeded and adopted/skipped outcome is durable (13_telemetry.md).
 
 5. **Retire**: only after the target branch and, when checked out, its visible working state resolve to the validated
    source head, destroy the workspace (supervisor tree first — 11_shell.md) and prune its `refs/cowshed/<ws>/*`
