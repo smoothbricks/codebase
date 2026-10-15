@@ -93,6 +93,15 @@ pub struct WorkspaceAuthoritySnapshot {
     pub lifecycle_revision: u64,
 }
 
+/// Who owns Nx daemon cleanup when a supervisor retires. A land keeps that authority in
+/// the controller's prevalidated process plans, never in a mutable daemon record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NxDaemonRetirement {
+    Recorded,
+    ControllerOwned,
+}
+
 /// Production construction inputs for exactly one mounted workspace incarnation.
 #[derive(Clone, Debug)]
 pub struct WorkspaceSupervisorConfig {
@@ -3060,9 +3069,10 @@ impl WorkspaceSupervisorHandle {
         self.call(|reply| Command::Idle { reply }).await
     }
 
-    pub async fn retire(&self) -> Result<()> {
+    pub async fn retire(&self, nx_daemon: NxDaemonRetirement) -> Result<()> {
         self.call(|reply| Command::Retire {
             authority: self.authority.clone(),
+            nx_daemon,
             reply,
         })
         .await
@@ -3339,6 +3349,7 @@ pub(super) enum Command {
     },
     Retire {
         authority: WorkspaceAuthoritySnapshot,
+        nx_daemon: NxDaemonRetirement,
         reply: oneshot::Sender<Result<()>>,
     },
     NameBuildVolume {
@@ -4450,13 +4461,22 @@ impl SupervisorActor {
                 }
                 let _ = reply.send(named);
             }
-            Command::Retire { authority, reply } => {
+            Command::Retire {
+                authority,
+                nx_daemon,
+                reply,
+            } => {
                 if let Err(error) = self.validate_authority(&authority) {
                     let _ = reply.send(Err(error));
                 } else if self.lifecycle == ActorLifecycle::Retired {
                     let _ = reply.send(Ok(()));
                 } else {
                     self.lifecycle = ActorLifecycle::Retiring;
+                    if nx_daemon == NxDaemonRetirement::ControllerOwned {
+                        // Land already captured the only processes its controller may signal.
+                        // Relinquish record cleanup, not any admitted job's retirement.
+                        self.nx_daemon.take();
+                    }
                     self.retire_waiters.push(reply);
                     // The keeper is the foreground daemon itself, so it stops and concludes
                     // through the same lifecycle as every other admitted job.

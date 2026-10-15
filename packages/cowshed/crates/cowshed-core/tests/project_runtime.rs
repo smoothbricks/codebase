@@ -32,9 +32,10 @@ use cowshed_core::metadata::{
 use cowshed_core::repository::{BoundIdentity, OwnedRepoIds, RepoId, RepositoryBinding};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::supervisor::{
-    ArtifactStoreSink, CommitmentDraft, CommitmentSink, OwnedProcess, ProcessEvent, ProcessSignal,
-    ProcessSpawnRequest, RunningProcess, SpawnSink, WorkspaceAuthoritySnapshot,
-    WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
+    ArtifactStoreSink, CommitmentDraft, CommitmentSink, NxDaemonRetirement, OwnedProcess,
+    ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess, SpawnSink,
+    WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+    WorkspaceSupervisorHandle,
 };
 use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::runtime::{
@@ -4057,7 +4058,10 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
         )
         .await;
     let counter = std::fs::read(root.join("workspace").join("counter")).expect("counter");
-    supervisor.retire().await.expect("retire supervisor");
+    supervisor
+        .retire(NxDaemonRetirement::Recorded)
+        .await
+        .expect("retire supervisor");
     let refusal = repeated.expect_err("another unnamed session is not the same request");
     assert_eq!(refusal.code, ErrorCode::Conflict);
     assert_eq!(
@@ -4078,7 +4082,7 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
         .await;
     let counter = std::fs::read(root.join("workspace").join("counter")).expect("counter");
     restarted
-        .retire()
+        .retire(NxDaemonRetirement::Recorded)
         .await
         .expect("retire restarted supervisor");
     let refusal = repeated.expect_err("a restarted unnamed session is a different request");
@@ -4647,7 +4651,10 @@ async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
     }
     let ended = job.wait().await.expect("child exit");
     let echoed = until_admitted(&job, JobStream::Stdout, 6, 6 + 80 * 1024).await;
-    supervisor.retire().await.expect("retire");
+    supervisor
+        .retire(NxDaemonRetirement::Recorded)
+        .await
+        .expect("retire");
     assert_eq!(&echoed[..16 * 1024], &[1; 16 * 1024]);
     assert_eq!(&echoed[16 * 1024..], &[2; 64 * 1024]);
     assert_eq!(ended.stdin.bytes, 80 * 1024);
