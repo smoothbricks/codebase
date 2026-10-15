@@ -221,8 +221,19 @@ function summarize(selection, own, main) {
     value.maxSeconds = Math.max(value.maxSeconds, seconds);
     durations.set(key, value);
   }
+  const candidatesUsable = own.hashes !== null && main.hashes !== null;
+  const hasNxCache = candidatesUsable && (own.hashes.size > 0 || main.hashes.size > 0);
   const classes = { HIT_BOTH: 0, HIT_OWN: 0, HIT_MAIN: 0, MISS_BOTH: 0, UNRESOLVED: 0 };
-  const totals = { ownMissWorkSeconds: 0, mainMissWorkSeconds: 0, ownUnweightedMisses: 0, mainUnweightedMisses: 0 };
+  const totals = {
+    ownMissWorkSeconds: 0,
+    mainMissWorkSeconds: 0,
+    ownMeasuredMissWorkSeconds: 0,
+    mainMeasuredMissWorkSeconds: 0,
+    keylessWorstCaseSeconds: 0,
+    weightedKeylessTasks: 0,
+    ownUnweightedMisses: 0,
+    mainUnweightedMisses: 0,
+  };
   let withDuration = 0;
   let resolvedWithDuration = 0;
   const tasks = selection.tasks.map((task) => {
@@ -249,35 +260,51 @@ function summarize(selection, own, main) {
             ? 'HIT_MAIN'
             : 'MISS_BOTH';
     classes[classification]++;
-    if (classification !== 'UNRESOLVED') {
-      if (weight) resolvedWithDuration++;
+    const assumedMiss = candidatesUsable && !task.hash;
+    if (classification !== 'UNRESOLVED' && weight) resolvedWithDuration++;
+    if (assumedMiss && weight) {
+      totals.keylessWorstCaseSeconds += weight.meanSeconds;
+      totals.weightedKeylessTasks++;
+    }
+    if (candidatesUsable) {
       for (const [side, hit] of [
         ['own', ownHit],
         ['main', mainHit],
       ]) {
-        if (!hit) {
-          if (weight) totals[`${side}MissWorkSeconds`] += weight.meanSeconds;
-          else totals[`${side}UnweightedMisses`]++;
+        if (assumedMiss || hit === false) {
+          if (weight) {
+            totals[`${side}MissWorkSeconds`] += weight.meanSeconds;
+            if (!assumedMiss) totals[`${side}MeasuredMissWorkSeconds`] += weight.meanSeconds;
+          } else totals[`${side}UnweightedMisses`]++;
         }
       }
     }
     return {
       ...task,
       reason: task.reason ?? own.error ?? main.error ?? null,
-      own: ownHit === null ? 'UNRESOLVED' : ownHit ? 'HIT' : 'MISS',
-      main: mainHit === null ? 'UNRESOLVED' : mainHit ? 'HIT' : 'MISS',
+      own: assumedMiss ? 'ASSUMED_MISS' : ownHit === null ? 'UNRESOLVED' : ownHit ? 'HIT' : 'MISS',
+      main: assumedMiss ? 'ASSUMED_MISS' : mainHit === null ? 'UNRESOLVED' : mainHit ? 'HIT' : 'MISS',
       classification,
       weight,
+      cost: {
+        basis: !candidatesUsable ? 'unavailable-candidate' : assumedMiss ? 'worst-case-keyless' : 'cache-lookup',
+        label: assumedMiss ? 'unpriced key, worst case: misses in both' : null,
+        ownSeconds: !candidatesUsable ? null : ownHit === true ? 0 : (weight?.meanSeconds ?? null),
+        mainSeconds: !candidatesUsable ? null : mainHit === true ? 0 : (weight?.meanSeconds ?? null),
+      },
     };
   });
   const unpriced = tasks
-    .filter((task) => task.classification === 'UNRESOLVED' || !task.weight)
+    .filter((task) => task.cost.basis === 'unavailable-candidate' || !task.weight)
     .map((task) => ({
       id: task.id,
-      reason: task.reason ?? 'no successful uncached duration sample for this task identity',
+      reason:
+        task.cost.basis === 'unavailable-candidate'
+          ? task.reason
+          : 'no successful uncached duration sample for this task identity',
     }));
-  const timeAvailable = unpriced.length === 0;
-  const difference = totals.ownMissWorkSeconds - totals.mainMissWorkSeconds;
+  const timeAvailable = hasNxCache && withDuration > 0;
+  const difference = totals.ownMeasuredMissWorkSeconds - totals.mainMeasuredMissWorkSeconds;
   const observation = ({ root, databases, snapshotBytes, snapshotSeconds, error }) => ({
     root,
     databases,
@@ -290,14 +317,18 @@ function summarize(selection, own, main) {
     candidates: { own: observation(own), main: observation(main) },
     tasks,
     classes,
-    totals: { ...totals, ownMinusMainSeconds: difference, complete: timeAvailable },
+    totals: { ...totals, ownMinusMainSeconds: difference, complete: timeAvailable && unpriced.length === 0 },
     decision: {
       basis: timeAvailable ? 'time' : 'space',
       timeDecisionAvailable: timeAvailable,
       workScoreSeconds: timeAvailable ? difference : null,
-      reason: timeAvailable
-        ? 'every cacheable task has a current key and a duration sample'
-        : 'incomplete pricing; caller must fall back to space',
+      reason: !candidatesUsable
+        ? 'candidate observation unavailable; caller must fall back to space'
+        : !hasNxCache
+          ? 'neither candidate has a usable Nx cache; caller must fall back to space'
+          : !withDuration
+            ? 'no selected task has a duration sample; caller must fall back to space'
+            : 'historical mean weights are usable; keyless tasks assume misses in both candidates',
     },
     unpriced,
     coverage: {
@@ -308,7 +339,7 @@ function summarize(selection, own, main) {
     },
     unresolved: tasks.filter((task) => task.classification === 'UNRESOLVED').map(({ id, reason }) => ({ id, reason })),
     caveat:
-      'Historical task-identity means estimate serial work, not elapsed gate time. Unresolved and unweighted work is excluded, never treated as free.',
+      'Historical means estimate serial work, not gate elapsed time. Keyless tasks are charged as misses in both; their common worst-case term is reported separately. Tasks without duration samples remain unpriced.',
   };
 }
 
