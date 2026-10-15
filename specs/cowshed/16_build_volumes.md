@@ -893,6 +893,72 @@ again at any level above it.
 
 Each rule states what is enforced and why. Each has an enforcing test or check; a rule without one is not done.
 
+### Read-only cache-reuse advisor
+
+`node packages/cowshed/bin/cache-advisor.cjs --workspace <checkout> --main <main-checkout> -- [bun] nx run-many <args>`
+advises an operator before a gate; it never rebases, restores outputs, carries entries, reseeds, replaces or deletes an
+image. It accepts an explicit `run-many` argv, including project selection, configuration and task overrides, not shell
+text or package-script indirection. It runs in the workspace's ordinary activated toolchain environment. Its one JSON
+report is stdout; Nx diagnostics and failures are stderr.
+
+The standalone script ships beside the cowshed launcher. The embedded `build_volume/task_hashes.js` remains the carry
+helper: its all-target/all-configuration selection, database writes and daemon stop are deliberately different from an
+advisor for one next command. A new cowshed verb would add supervisor/controller/API lifecycle plumbing to a read-only
+calculation, and an advisory branch in carry would mix these incompatible authority contracts. The standalone surface
+can run from a workspace's existing read grant; it needs no new lifecycle operation or candidate write grant.
+
+On macOS, the advisor starts one confined child with kernel denial of persistent writes except its private scratch
+directory. The nonpersistent `/dev/null` device is explicitly writable because Git opens it O_RDWR. All process signals
+and network access are denied except outbound IPC to the configured `SCCACHE_SERVER_UDS` Unix socket. Graph plugins and
+runtime-input descendants inherit that denial. The probe does talk to sccache for metadata/toolchain queries
+(`cargo metadata` asks its compiler for `-vV`); this is a read-only consultation of a toolchain service, not a build or
+target invocation. A missing/unavailable wrapper or service fails loudly, never unsets `RUSTC_WRAPPER` or silently
+probes a different toolchain. Unsupported platforms refuse rather than run unconfined. Node 22.13 or newer supplies
+SQLite.
+
+SQLite never opens a live candidate database, even read-only: a read-only WAL connection can still require SHM writes.
+Instead each database and its present `-wal`/`-journal` files are copied once into scratch, without its `-shm`. The
+entire set's device, inode, size, mtimeNs and ctimeNs are captured before any copy and checked after all copies;
+appearance/disappearance is a change too. A changed file refuses the observation with `busy` and its path, without a
+retry or live-SHM fallback. The candidate database list and resolved state links are checked for change too. Private
+SQLite recovery and SHM bookkeeping then occur only in scratch; `query_only` and a read transaction cover the queries.
+No `immutable` shortcut may omit committed WAL rows. The report includes copied bytes and snapshot/query seconds per
+candidate; the typical approximately 1 MiB database copy is not free. A refused copy gives an explicit
+`decision.basis: "space"`, `timeDecisionAvailable: false` and null work score, alongside the loud diagnostic. Candidates
+are advisory observations, not a cross-volume atomic snapshot or a reservation against concurrent eviction.
+
+The workspace's current graph and hashes are computed once; main's source tree is never hashed. Disposable Cargo
+resolution and parsed-lockfile caches can seed scratch, but neither old native file hashes nor an old project graph can
+replace the fresh tree walk. Cacheable non-continuous tasks retain their id, project, target, configuration and current
+hash. Custom hashers and tasks that depend on dependency outputs are unresolved, with the reason, never keyed from stale
+outputs. Noncacheable/continuous tasks are listed separately and never called cache hits.
+
+Execution hooks never run. A workspace declaring pre/post-task hooks reports its cacheable tasks unresolved because the
+omitted pre-hook may supply hashed environment inputs. Runtime inputs default to denied; their exact per-task commands
+are still reported. An operator may opt into `--runtime=read-only`: runtime commands run under the same write/network
+denial, but only through the Nx plugin's fail-closed `runtime-input.sh` wrapper (Nx otherwise hashes a failed command's
+error text). A refused runtime/hash pass reports unresolved tasks and its diagnostic, never guessed keys. The report
+distinguishes runtime commands admitted to the hash pass from tasks excluded before it.
+
+Each current hash is looked up in both candidates' successful `cache_outputs` rows, with its cache directory present.
+The report distinguishes `HIT_BOTH`, `HIT_OWN`, `HIT_MAIN`, `MISS_BOTH` and `UNRESOLVED`, and gives each candidate's
+HIT/MISS independently. A task's weight is the arithmetic mean of successful uncached `task_history` execution seconds
+joined to `task_details` by hash and grouped by task identity, not exact current hash. Cache replays and failed/stopped
+attempts are excluded. A UNION-equivalent tuple of identity, hash, start and end de-duplicates histories inherited by
+cloning; sample count and min/max accompany every mean.
+
+Totals sum weighted misses for own and main and report `own - main` in serial task-seconds, not future gate wall time.
+Unresolved tasks and tasks without a duration remain explicit and are excluded from those partial totals, never counted
+as free. Coverage includes all cacheable tasks with a duration and the resolved subset with one. A time decision is
+available only when every cacheable task has both a current key and a duration sample; otherwise `totals.complete` is
+false, `decision.workScoreSeconds` is null and `decision.basis` tells the caller to fall back to space. The advisor does
+not implement the space policy or adopt an image. Probe wall time and graph/hash-pass wall time are reported separately.
+
+- **Enforced by**: `packages/cowshed/scripts/cache-advisor.test.cjs`, using real stock Nx and a running fixture daemon,
+  asymmetric cache entries, cloned histories and a deferred dependency-output task. Candidate state bytes and
+  `task_details` counts stay unchanged, the daemon's pid and record survive, the mean and totals match known samples,
+  and a runtime descendant cannot write the fixture source.
+
 ### Every checkout has exactly one Nx state
 
 Host shells, sandboxed jobs, land checks and the daemon of one checkout use one `.nx/cache`, one task database and one
@@ -901,6 +967,11 @@ even for a read-only job: build state is not source, so a read-only job keeps th
 writes its checkout's build volume like any other job. Nx is configured to use its cache, never to avoid it: cowshed
 does not unset Nx's variables to sidestep a problem. Clearing Nx's graph state (a shell entry that rebuilt a stale Nx
 plugin) keeps the task database: it is the cache's only index, so the cache without it is unreachable and never evicted.
+
+The read-only cache-reuse advisor is the sole exception: its disposable graph, file-map and native-hash bookkeeping
+lives in a scratch directory outside both candidate images. It writes no task cache entry or task database, never calls
+`getTaskDetails`, and passes no `taskDetails` to `hashTasks`. The checkout's own Nx state stays untouched. This is not a
+second build cache: no task executes and scratch is removed after success or failure.
 
 - **Why**: Nx's task database indexes exactly one cache directory, and setting any of `NX_WORKSPACE_DATA_DIRECTORY`,
   `NX_CACHE_DIRECTORY` or `NX_PROJECT_GRAPH_CACHE_DIRECTORY` to something else moves the database with it. A second
@@ -921,7 +992,10 @@ plugin) keeps the task database: it is the cache's only index, so the cache with
 
 ### The Nx daemon stays on
 
-Cowshed never sets `NX_DAEMON=false` for any process, and never withholds the daemon to work around state problems.
+For a normal run, cowshed never sets `NX_DAEMON=false`, and never withholds the daemon to work around state problems.
+The read-only cache-reuse advisor alone bypasses the daemon and computes in-process, without stopping, restarting or
+signalling the checkout's existing daemon. A fresh walk of the rebased source tree must not use a watcher's lagging file
+map, and the probe's bookkeeping must not reach either candidate image.
 
 - **Why**: the daemon is how Nx keeps the project graph and file hashes warm between commands; disabling it recomputes
   them on every run.

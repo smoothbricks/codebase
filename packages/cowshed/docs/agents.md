@@ -94,6 +94,47 @@ Notes for harness integration:
 - Parallel exploration: `cowshed fork <ws> <ws>-alt` mid-task gives you two divergent futures from the same state. Forks
   start with a closed sandbox regardless of the source's grants.
 
+### Compare build-cache reuse before a gate
+
+From the workspace's activated toolchain environment, run the standalone advisor:
+
+```sh
+node packages/cowshed/bin/cache-advisor.cjs \
+  --workspace "$WS_PATH" --main "$PROJECT" -- \
+  bun nx run-many -t gate --parallel=2 --nx-bail=false
+```
+
+This is not a cowshed lifecycle verb: it does not rebase, reseed, replace or delete an image, and does not run gate
+targets. It hashes the workspace tree once and compares those same keys with both candidates. It needs read access to
+both checkouts and their resolved build volumes; when invoked through a workspace grant, request those reads through the
+normal coordinator rather than widening authority silently.
+
+The one JSON report includes per-task keys, independent own/main HIT/MISS, exclusive hit classes, mean miss weights with
+sample count and min/max, coverage, unresolved reasons, serial task-second totals and probe wall time. Positive
+`totals.ownMinusMainSeconds` means main has less estimated missing work. These are historical means, not gate elapsed
+time, and unresolved/unweighted tasks are excluded rather than assumed free. A complete `decision.workScoreSeconds`
+requires `decision.timeDecisionAvailable` to be true; otherwise that score is null, `totals.complete` is false and
+`decision.basis: "space"` explicitly tells the caller to use the space branch, not act on the partial time totals.
+
+Runtime inputs are denied by default and their exact commands are listed. After inspecting those commands,
+`--runtime=read-only` admits the plugin's fail-closed `runtime-input.sh` commands under kernel-enforced write/network
+denial. This can execute toolchain/version and Cargo-resolution input commands, never targets. Arbitrary unwrapped
+runtime commands remain unresolved because pinned Nx can hash a failed command's error text. Hooks never run; a
+hook-bearing workspace is unresolved rather than keyed without its hook-provided environment. Dependency-output and
+custom-hasher tasks also stay unresolved. macOS and Node 22.13+ are required; there is no unconfined fallback.
+
+Confinement permits persistent writes only in disposable scratch, plus nonpersistent `/dev/null` access (Git opens that
+device O_RDWR). Network access is denied except outbound IPC to the configured `SCCACHE_SERVER_UDS` Unix socket for
+read-only compiler metadata queries. A missing toolchain service fails rather than changing the environment. Live
+candidate databases are never opened by SQLite: DB/WAL/journal files are copied once to scratch, with unchanged
+device/inode/size/mtimeNs/ctimeNs required across the entire copy. Any changed/appeared/disappeared file reports busy
+and no time decision. Private SHM/recovery stays in scratch; candidate snapshot bytes and query seconds are reported.
+
+The advisor uses disposable graph/native state outside both images and never stops the existing daemon or records
+`task_details`. This narrowly scoped exception to ordinary Nx state/daemon policy, and the standalone-versus-embedded
+surface decision, are governed by
+[16_build_volumes.md §Read-only cache-reuse advisor](../../../specs/cowshed/16_build_volumes.md#read-only-cache-reuse-advisor).
+
 This is cowshed's layered capability model: the trusted coordinator holds policy authority; workers run closed and ask.
 A worker handle controls exactly one workspace's exec, shells, jobs, quota-limited checkpoints, push, and read-only
 grants. It cannot grant/revoke, restore/destroy/rebase/land, run gc, mirror repositories, or select another workspace.
