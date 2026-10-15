@@ -1664,6 +1664,11 @@ mod tests {
             let mut planted_config =
                 fs::read(fixture.staging.join(".git/config")).expect("copied config");
             planted_config.extend_from_slice(b"\n# planted\n");
+            // No Git probe reads `.git/description`, so only the `.git` tree comparison can refuse
+            // a same-size change to it: the one plant that gives that refusal a way to fail.
+            let mut description =
+                fs::read(fixture.staging.join(".git/description")).expect("copied description");
+            *description.first_mut().expect("description byte") ^= 0x20;
             // Only `git fsck --full` rejects a flipped index checksum: status reads the index
             // without verifying it, so the refusal is the fsck component.
             for (relative, bytes, refusal) in [
@@ -1676,6 +1681,11 @@ mod tests {
                     ".git/config",
                     planted_config,
                     Refusal::Component(GitPreservationComponent::LocalConfigRaw),
+                ),
+                (
+                    ".git/description",
+                    description,
+                    Refusal::Bytes("description"),
                 ),
                 ("README", b"DIRTY\n".to_vec(), Refusal::Bytes("README")),
                 (
