@@ -47,7 +47,7 @@
     "workspace": "feature",
     "options": { "force": false, "restore": false, "abandon": false }
   },
-  "coordinator.gc": { "repoId": "acme/widget", "options": { "dryRun": false } },
+  "coordinator.gc": { "repoId": "acme/widget", "options": { "dryRun": false, "abandoned": false } },
   "coordinator.removeProject": { "repoId": "acme/widget", "options": { "force": false, "abandon": false } },
   "coordinator.repoMirror": {
     "repoId": "acme/widget",
