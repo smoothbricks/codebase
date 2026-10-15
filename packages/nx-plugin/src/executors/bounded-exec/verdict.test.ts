@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, it } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { onProgressClock } from '../../__tests__/progress-clock.js';
-import { type BoundedExecContext, createProcessTreeKiller, runBoundedExec } from './executor.js';
+import {
+  type BoundedExecContext,
+  createProcessTreeKiller,
+  type ProcessTreeKiller,
+  runBoundedExec,
+} from './executor.js';
 import type { BoundedExecBounds } from './schema.js';
 import {
   type BoundedExecVerdict,
@@ -20,12 +26,24 @@ import {
 } from './verdict.js';
 
 const roots: string[] = [];
+const ownedProcessGroups = new Set<number>();
 const originalStdoutWrite = process.stdout.write;
 const originalStderrWrite = process.stderr.write;
 
 afterEach(async () => {
   process.stdout.write = originalStdoutWrite;
   process.stderr.write = originalStderrWrite;
+  for (const pid of ownedProcessGroups) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch (cause) {
+      if (!(cause instanceof Error && 'code' in cause && cause.code === 'ESRCH')) {
+        throw new Error(`cleanup owned abort-report process group pgid=${pid} failed`, { cause });
+      }
+    } finally {
+      ownedProcessGroups.delete(pid);
+    }
+  }
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -49,6 +67,7 @@ async function verdictOf(
   bounds: BoundedExecBounds & { killAfterMs?: number },
   files: Record<string, string> = {},
   links: Record<string, string> = {},
+  prepareKiller?: (root: string) => Promise<ProcessTreeKiller>,
 ): Promise<BoundedExecVerdict | undefined> {
   const { root, context } = await workspace();
   for (const [name, contents] of Object.entries(files)) {
@@ -60,7 +79,8 @@ async function verdictOf(
   }
   process.stdout.write = () => true;
   process.stderr.write = () => true;
-  await runBoundedExec({ command, killAfterMs: 0, ...bounds }, context, createProcessTreeKiller(), null, null);
+  const killer = (await prepareKiller?.(root)) ?? createProcessTreeKiller();
+  await runBoundedExec({ command, killAfterMs: 0, ...bounds }, context, killer, null, null);
   const record = await readRecord(context.record?.directory ?? '');
   expect(record?.task).toBe('app:test');
   expect(record?.hash).toBe('42');
@@ -285,11 +305,50 @@ process.on('SIGTERM', () => {
   fs.writeFileSync(process.env.BOUNDED_EXEC_JUNIT, '<testsuites name="nextest-run" tests="2" failures="1"><testsuite name="nt" tests="2" failures="1"><testcase name="t::ok" classname="nt"/><testcase name="t::cut" classname="nt"><failure message="process aborted with signal 15 (SIGTERM)" type="test abort">process aborted with signal 15 (SIGTERM)</failure></testcase></testsuite></testsuites>');
   process.exit(143);
 });
+fs.writeFileSync('runner-ready.fifo', 'ready pid=' + process.pid + '\\n');
 setInterval(() => console.log('running'), 10);
 `;
-    expect(
-      await verdictOf('node runner.js', { timeoutMs: 300, killAfterMs: 5_000 }, { 'runner.js': runner }),
-    ).toMatchObject({ outcome: 'bound', bound: 'total', limitMs: 300 });
+    let armed: Promise<void> | undefined;
+    let report = '';
+    const verdict = await verdictOf(
+      'exec node runner.js',
+      { timeoutMs: 300, killAfterMs: 5_000 },
+      { 'runner.js': runner },
+      {},
+      async (root) => {
+        const ready = join(root, 'runner-ready.fifo');
+        report = join(taskDirectory(join(root, '.nx', 'workspace-data'), 'app:test'), JUNIT_FILE);
+        expect(spawnSync('mkfifo', [ready]).status).toBe(0);
+        const real = createProcessTreeKiller();
+        return {
+          async kill(pid, signal) {
+            ownedProcessGroups.add(pid);
+            armed ??= readFile(ready, 'utf8').then((text) => {
+              const observed = spawnSync('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-p', String(pid)], {
+                encoding: 'utf8',
+              });
+              const detail = `abort-report handler pid=${pid} signal=${signal} ready=${JSON.stringify(text)} state=${observed.stdout.trim()} status=${observed.status} stderr=${observed.stderr} error=${observed.error}`;
+              expect(text, detail).toBe(`ready pid=${pid}\n`);
+              expect(observed.status, detail).toBe(0);
+              const [seenPid, pgid, state] = observed.stdout.trim().split(/\s+/);
+              expect(Number(seenPid), detail).toBe(pid);
+              expect(Number(pgid), detail).toBe(pid);
+              expect(state !== undefined && !state.startsWith('Z'), detail).toBe(true);
+            });
+            await armed;
+            await real.kill(pid, signal);
+          },
+        };
+      },
+    );
+    expect(armed, 'abort-report handler readiness must precede the total-bound signal').toBeDefined();
+    await armed;
+    expect(verdict).toMatchObject({ outcome: 'bound', bound: 'total', limitMs: 300 });
+    expect(junitFailures(await readFile(report, 'utf8')), `runner abort report ${report} must name nt t::cut`).toEqual({
+      timedOut: [],
+      cancelled: ['nt t::cut'],
+      failed: [],
+    });
   });
 
   it('asks the one runner in a command for a report, and leaves two runners alone', async () => {

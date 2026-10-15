@@ -1268,6 +1268,11 @@ may run a script that lives in another project) may use any `cwd`.
 
 ## Test Fixtures That Run Nx
 
+The executor's real-process tests acknowledge handler installation and process-group membership before delivering a
+timeout signal. Cooperative termination requires its handler receipt and no force kill; descendant lifetime pipes prove
+actual closure. The abort-report walk requires the runner's named cancellation record as well as total-bound
+classification, so an executor-only expiry cannot stand in for a report the runner never wrote.
+
 Most tests never start Nx. Plugin behaviour is the value `createNodesV2` returns, so a test asserts on that value, and
 where it needs Nx's verdict on it, it calls the Nx function that gives the verdict, in process: `createTaskGraph` for
 the order a run-many runs tasks in, `getOutputsForTargetAndConfiguration` for what a cache hit restores,

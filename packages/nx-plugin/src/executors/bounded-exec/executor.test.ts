@@ -20,6 +20,7 @@ import type { RamTempAcquisition, RamTempError, RamTempLease, Result } from './r
 import { VERDICT_FILE } from './verdict.js';
 
 const workspaces: string[] = [];
+const ownedProcessGroups = new Set<number>();
 const originalStdoutWrite = process.stdout.write;
 const originalStderrWrite = process.stderr.write;
 
@@ -39,6 +40,17 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
   afterEach(async () => {
     process.stdout.write = originalStdoutWrite;
     process.stderr.write = originalStderrWrite;
+    for (const pid of ownedProcessGroups) {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch (cause) {
+        if (!(cause instanceof Error && 'code' in cause && cause.code === 'ESRCH')) {
+          throw new Error(`cleanup owned readiness process group pgid=${pid} failed`, { cause });
+        }
+      } finally {
+        ownedProcessGroups.delete(pid);
+      }
+    }
     await Promise.all(workspaces.splice(0).map((workspace) => rm(workspace, { recursive: true, force: true })));
   });
 
@@ -403,29 +415,42 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
 
     const workspace = await createWorkspace();
-    const calls: string[] = [];
-    const killer: ProcessTreeKiller = {
-      async kill(pid, signal) {
-        calls.push(signal);
-        process.kill(-pid, signal);
-      },
-    };
+    const ready = join(workspace.root, 'cooperative-ready.fifo');
+    const handled = join(workspace.root, 'handled.txt');
+    expect(spawnSync('mkfifo', [ready]).status).toBe(0);
+    await workspace.write(
+      'cooperative.js',
+      [
+        "const fs = require('node:fs');",
+        "process.on('SIGTERM', () => {",
+        "  fs.writeFileSync('handled.txt', 'handled pid=' + process.pid + '\\n');",
+        '  process.exit(0);',
+        '});',
+        "fs.writeFileSync('cooperative-ready.fifo', 'ready pid=' + process.pid + '\\n');",
+        'setTimeout(() => {}, 5000);',
+        '',
+      ].join('\n'),
+    );
+    let handlerPid: number | undefined;
+    const termination = armedKiller('cooperative SIGTERM handler', async (pid) => {
+      handlerPid = await armedPid(ready, pid, 'cooperative SIGTERM handler');
+      expect(handlerPid, `handler readiness must name the command leader pid=${pid}`).toBe(pid);
+    });
 
     const result = await runBoundedExec(
-      {
-        command: 'node -e "process.on(\'SIGTERM\', () => process.exit(0)); setTimeout(() => {}, 5000)"',
-        timeoutMs: 50,
-        killAfterMs: 500,
-      },
+      { command: 'exec node cooperative.js', timeoutMs: 50, killAfterMs: 500 },
       workspace.context,
-      killer,
+      termination.killer,
       null,
       null,
     );
 
+    await termination.armed();
     expect(result.success).toBe(false);
-    expect(calls[0]).toBe('SIGTERM');
-    expect(calls.every((signal) => signal === 'SIGTERM' || signal === 'SIGKILL')).toBe(true);
+    expect(await readFile(handled, 'utf8'), `cooperative handler pid=${handlerPid} must handle SIGTERM`).toBe(
+      `handled pid=${handlerPid}\n`,
+    );
+    expect(termination.calls).toEqual(['SIGTERM']);
   });
 
   it('force-kills after killAfterMs when graceful termination is ignored on POSIX', async () => {
@@ -541,26 +566,46 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     const workspace = await createWorkspace();
     const marker = join(workspace.root, 'marker.txt');
+    const ready = join(workspace.root, 'descendant-ready.fifo');
+    const lifetime = join(workspace.root, 'descendant-lifetime.fifo');
+    expect(spawnSync('mkfifo', [ready, lifetime]).status).toBe(0);
+    await workspace.write(
+      'group-child.js',
+      [
+        "const fs = require('node:fs');",
+        "fs.openSync('descendant-lifetime.fifo', 'w');",
+        "fs.writeFileSync('descendant-ready.fifo', 'ready pid=' + process.pid + '\\n');",
+        "setTimeout(() => fs.writeFileSync(process.argv[2], 'alive'), 700);",
+        '',
+      ].join('\n'),
+    );
     await workspace.write(
       'spawn-child.js',
       [
         "import { spawn } from 'node:child_process';",
-        "spawn(process.execPath, ['-e', `setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'alive'), 700)` , process.argv[2]], { stdio: 'ignore' });",
+        "spawn(process.execPath, ['group-child.js', process.argv[2]], { stdio: 'ignore' });",
         'setTimeout(() => {}, 5000);',
         '',
       ].join('\n'),
     );
+    // Only the descendant owns the writer; EOF observes its actual terminal closure, not a time horizon.
+    const closed = readToEnd(lifetime);
+    let descendantPid: number | undefined;
+    const termination = armedKiller('process-group descendant', async (pid) => {
+      descendantPid = await armedPid(ready, pid, 'process-group descendant');
+      expect(descendantPid, `ready descendant must differ from group leader pid=${pid}`).not.toBe(pid);
+    });
 
     const result = await runBoundedExec(
-      { command: `node spawn-child.js ${marker}`, timeoutMs: 50, killAfterMs: 50 },
+      { command: `exec node spawn-child.js ${marker}`, timeoutMs: 50, killAfterMs: 50 },
       workspace.context,
-      createProcessTreeKiller(),
+      termination.killer,
       null,
       null,
     );
 
-    await sleep(1_000);
-
+    await termination.armed();
+    expect(await closed, `ready descendant pid=${descendantPid} must close its lifetime FIFO on exit`).toBe('');
     expect(result.success).toBe(false);
     expect(await exists(marker)).toBe(false);
   });
@@ -572,7 +617,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     const workspace = await createWorkspace();
     const fifo = join(workspace.root, 'straggler.fifo');
-    expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+    const ready = join(workspace.root, 'straggler-ready.fifo');
+    expect(spawnSync('mkfifo', [fifo, ready]).status).toBe(0);
     // The leader exits on SIGTERM. The subshell beside it ignores SIGTERM, a disposition its
     // `sleep` inherits, and announces itself only once it holds the FIFO: from then on the
     // graceful signal cannot end it. A process forked while that signal goes out is the same
@@ -580,7 +626,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     await workspace.write(
       'straggle.sh',
       [
-        '( trap "" TERM; exec 3>"$1"; echo ready; sleep 10; echo survived >&3 ) | {',
+        '( trap "" TERM; exec 3>"$1"; echo ready; echo armed >"$2"; sleep 10; echo survived >&3 ) | {',
         '  read -r line; echo "$line"; exec sleep 30',
         '}',
         '',
@@ -589,15 +635,19 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     // The straggler is the FIFO's only writer, so the read ends when it is gone: with nothing
     // written if it was killed, with "survived" if it lived to finish its sleep.
     const straggler = readToEnd(fifo);
+    const termination = armedKiller('TERM-ignoring FIFO straggler', async (pid) => {
+      expect(await readToEnd(ready), `straggler readiness pgid=${pid} must follow trap and FIFO open`).toBe('armed\n');
+    });
 
     const result = await runBoundedExec(
-      { command: `sh straggle.sh ${fifo}`, timeoutMs: 5_000, killAfterMs: 30_000 },
+      { command: `sh straggle.sh ${fifo} ${ready}`, timeoutMs: 5_000, killAfterMs: 30_000 },
       workspace.context,
-      createProcessTreeKiller(),
+      termination.killer,
       null,
       null,
     );
 
+    await termination.armed();
     expect(result.terminalOutput).toContain('ready');
     expect(await straggler).toBe('');
     expect(result.success).toBe(false);
@@ -1226,6 +1276,47 @@ async function readToEnd(path: string): Promise<string> {
   }
 }
 
+/** Reuses the real killer, delaying delivery (not the bound) until the named fixture is armed. */
+function armedKiller(subject: string, ready: (pid: number) => Promise<void>) {
+  const real = createProcessTreeKiller();
+  const calls: NodeJS.Signals[] = [];
+  let armed: Promise<void> | undefined;
+  return {
+    calls,
+    killer: {
+      async kill(pid: number, signal: NodeJS.Signals) {
+        ownedProcessGroups.add(pid);
+        armed ??= ready(pid);
+        await armed;
+        calls.push(signal);
+        await real.kill(pid, signal);
+      },
+    } satisfies ProcessTreeKiller,
+    async armed() {
+      expect(armed, `${subject}: readiness was never requested before timeout signal delivery`).toBeDefined();
+      // The executor tolerates killer errors; re-await here so a failed readiness assertion cannot be swallowed.
+      await armed;
+    },
+  };
+}
+
+/** A complete readiness line identifies a live member of the executor's own process group. */
+async function armedPid(path: string, pgid: number, subject: string): Promise<number> {
+  const text = await readToEnd(path);
+  const match = /^ready pid=(\d+)\n$/.exec(text);
+  const pid = Number(match?.[1]);
+  const detail = `${subject}: ready=${JSON.stringify(text)} fifo=${path} pid=${pid} expected pgid=${pgid}`;
+  expect(Number.isSafeInteger(pid) && pid > 0, `${detail}; state=unobserved (invalid readiness PID)`).toBe(true);
+  const observed = spawnSync('/bin/ps', ['-o', 'pid=,ppid=,pgid=,stat=', '-p', String(pid)], { encoding: 'utf8' });
+  const state = `${detail}; state=${observed.stdout.trim()} status=${observed.status} stderr=${observed.stderr} error=${observed.error}`;
+  expect(observed.status, state).toBe(0);
+  const [seenPid, , seenGroup, stat] = observed.stdout.trim().split(/\s+/);
+  expect(Number(seenPid), state).toBe(pid);
+  expect(Number(seenGroup), state).toBe(pgid);
+  expect(stat !== undefined && !stat.startsWith('Z'), state).toBe(true);
+  return pid;
+}
+
 /**
  * A command that ignores SIGTERM, a disposition its `sleep` inherits, and `armed`, which resolves once it does. A
  * killer that awaits `armed` before the graceful signal sends it to a command that cannot die of it: a bound that fires
@@ -1307,10 +1398,6 @@ async function exists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** A granted host grant whose `closed` resolves on release, as the gateway's does when the grant's socket closes. */
