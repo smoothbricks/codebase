@@ -16,6 +16,8 @@ const b: ReleasePackageInfo = { name: '@scope/b', projectName: 'b', path: 'packa
 describe('release packages at a ref', () => {
   it('recognises an untagged release commit from its subject and bumped versions', async () => {
     await withFixtureRepo(async (root) => {
+      // HEAD is unborn: Git runs and refuses the read, rather than Bun refusing a missing cwd.
+      await expect(gitTagsAt(root)).rejects.toThrow();
       await writePackage(root, a.name, a.path, '1.0.0-next.0');
       await writePackage(root, b.name, b.path, '1.0.0-next.0');
       await git(root, ['add', '.']);
