@@ -130,8 +130,8 @@ test('real Nx: no candidate writes or daemon stop; asymmetric hits, deferred ide
     const b = byId['fixture:main'];
     const c = byId['fixture:missing'];
     assert.match(a.hash, /^\d+$/);
-    seed(ownDb, a, [1, 9], true);
-    seed(mainDb, a, [1, 9], false); // inherited histories count once
+    seed(ownDb, a, [1, 1, 10], true);
+    seed(mainDb, a, [1, 1, 10], false); // inherited histories count once; mean 4 differs from median 1
     seed(ownDb, b, [2, 4], false);
     seed(mainDb, b, [2, 4], true);
     seed(ownDb, c, [7], false);
@@ -144,10 +144,10 @@ test('real Nx: no candidate writes or daemon stop; asymmetric hits, deferred ide
     assert.equal(rows['fixture:own'].classification, 'HIT_OWN');
     assert.equal(rows['fixture:main'].classification, 'HIT_MAIN');
     assert.equal(rows['fixture:missing'].classification, 'MISS_BOTH');
-    assert.deepEqual(rows['fixture:own'].weight, { meanSeconds: 5, samples: 2, minSeconds: 1, maxSeconds: 9 });
+    assert.deepEqual(rows['fixture:own'].weight, { meanSeconds: 4, samples: 3, minSeconds: 1, maxSeconds: 10 });
     assert.equal(result.totals.ownMissWorkSeconds, 10);
-    assert.equal(result.totals.mainMissWorkSeconds, 12);
-    assert.equal(result.totals.ownMinusMainSeconds, -2);
+    assert.equal(result.totals.mainMissWorkSeconds, 11);
+    assert.equal(result.totals.ownMinusMainSeconds, -1);
     assert.equal(result.coverage.withDuration, 3);
     assert.equal(result.coverage.resolvedWithDuration, 3);
     assert.equal(result.decision.timeDecisionAvailable, false);
