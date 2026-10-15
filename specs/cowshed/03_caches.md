@@ -73,6 +73,22 @@ travels with `node_modules`; a receipt without lock digests is not current. `cow
 and receipt and reports `node-modules-install-missing` or `node-modules-lock-drift`, without installing or changing
 files.
 
+Before managed setup records a successful Bun installation, it checks the installed isolated-store links and their
+immediate package aliases, including transitive aliases inside shared cache entries. Every observed package alias must
+reach a directory with a readable package manifest. A refusal names the actual alias path, its expected target and the
+metadata operation and cause; no new successful installation receipt is written. The check neither mutates shared cache
+entries nor retries, purges or forces an install. Local setup retains its documented degraded shell; CI fails. Both
+receipt-writing setup paths use this check. The CLI update command installs without writing this receipt and is not
+covered by this receipt-admission check.
+
+This is link and package-manifest admission at the installation boundary, not verification of every published payload
+file or a guarantee against later modification of a shared cache entry. Registry tarball integrity remains the package
+manager's responsibility.
+
+**Open question — reuse after installation.** A matching install stamp and devenv's task status do not revalidate the
+shared dependency targets. Extending admission to that path requires a separate contract decision and comparable
+measurements of unchanged shell-entry cost and validation coverage; it is not part of receipt-writing admission.
+
 ## The reflink-reachability rule
 
 A clone-materializing cache must live where the substrate can reflink from it into the workspace — on APFS, the same

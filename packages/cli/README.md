@@ -429,8 +429,16 @@ nothing when nothing changed:
   as its stderr alone, so anything written to stdout would be lost. The same receipt records each present
   `bun.lock`/`bun.lockb` SHA-256 after success. Missing or mismatching lock receipts require the normal installer to
   run; `cowshed doctor` reports `node-modules-install-missing` or `node-modules-lock-drift` without installing or
-  rewriting anything. Direct `devenv shell` sources `.cowshed/env` in the managed prologue before project hooks, just as
-  direnv does, so both entry paths reuse cowshed's CI and pinned compiler-cache environment.
+  rewriting anything. Before a successful managed setup install records this receipt, an isolated-store metadata pass
+  checks the installed store links and their immediate package aliases, including transitive cache links, and requires
+  each observed package alias to reach a directory with a readable package manifest. A failure names the alias, its
+  expected target and the metadata cause; it records no successful install and uses the existing
+  degraded-local/strict-CI reporting. The check writes no new receipt on failure and performs no cache repair or
+  automatic retry. It does not certify every published payload file, protect against later shared-cache changes, or run
+  on the matching-stamp/status path. Extending that path remains an open contract question requiring measured
+  unchanged-entry cost and coverage. The CLI update command installs without writing this receipt and is outside this
+  receipt-admission check. Direct `devenv shell` sources `.cowshed/env` in the managed prologue before project hooks,
+  just as direnv does, so both entry paths reuse cowshed's CI and pinned compiler-cache environment.
 - A repository whose `devenv.nix` enables `languages.python.uv` gets its uv workspace synced the same way
   (`uv sync --all-packages --all-groups`, `--locked` on a CI runner) into devenv's `UV_PROJECT_ENVIRONMENT`, with the
   interpreter devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and
