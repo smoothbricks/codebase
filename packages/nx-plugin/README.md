@@ -77,9 +77,11 @@ a test file, with
 is scheduling data, not a test allowlist.
 
 Real Nx fixtures own their cache and workspace-data directories and stop their daemon before removing the fixture.
-Fixtures that intentionally strip caller directory overrides declare `cacheDirectory: ".nx/cache"` in their own
-`nx.json`; this keeps the native task database local too, rather than leaving a new `~/.nx/<repoKey>` behind. Offline,
-path-only Cargo fixtures likewise own a temporary `CARGO_HOME`; production commands still keep the caller's Cargo home.
+Retirement also drains processes whose working directory is inside the fixture when no daemon record exists: startup may
+not have published its record yet, so an absent record never proves the fixture is empty. Fixtures that intentionally
+strip caller directory overrides declare `cacheDirectory: ".nx/cache"` in their own `nx.json`; this keeps the native
+task database local too, rather than leaving a new `~/.nx/<repoKey>` behind. Offline, path-only Cargo fixtures likewise
+own a temporary `CARGO_HOME`; production commands still keep the caller's Cargo home.
 
 Fixture sockets and loopback listeners live where a Cowshed sandbox admits them, never at a literal `/tmp` path or on
 port 0. A fixture's short socket parent alias lives beside the Nx socket directory the job supplies (the parent of
