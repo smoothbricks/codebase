@@ -34,11 +34,16 @@ async function main() {
   // with spaces; quoted/ambiguous check arguments fail attribution rather than being guessed.
   const argv = checked.command.split(/\s+/).slice(1);
   const mode = argv[0];
+  if (mode === 'affected' || mode.startsWith('affected:')) {
+    throw new Error(`graph-query selection is unsupported for cache-only restoration: ${checked.command}`);
+  }
+  const run = requireNx('nx/src/command-line/run/command-object');
   const command =
     mode === 'run-many'
       ? requireNx('nx/src/command-line/run-many/command-object').yargsRunManyCommand
-      : requireNx('nx/src/command-line/run/command-object').yargsRunCommand;
-  if (mode !== 'run-many' && mode !== 'run') throw new Error(`unsupported checked Nx command: ${checked.command}`);
+      : mode === 'run'
+        ? run.yargsRunCommand
+        : run.yargsNxInfixCommand;
   const parsedArgv =
     mode === 'run-many'
       ? requireNx('nx/bin/init-local').rewriteTargetsAndProjects([process.execPath, 'nx', ...argv])
@@ -50,7 +55,7 @@ async function main() {
     .version(false)
     .command(command.command, false, command.builder)
     .parseSync(parsedArgv);
-  const args = withOverrides(parsed);
+  const args = withOverrides(parsed, mode === 'run-many' || mode === 'run' ? 1 : 0);
   let projects;
   let split;
   if (mode === 'run-many') {

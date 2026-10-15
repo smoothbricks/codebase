@@ -548,8 +548,10 @@ an integration workspace; "the target" is whichever one it is.
 7. **Restore the checked outputs (2b).** Checks run **once**, in the landing workspace before delivery. Capture each
    check's attributed stock Nx run summary immediately, in memory for this land only. After adoption, a cowshed-owned
    cache-only helper reconstructs that run's declared task graph through stock Nx's argument parsers and graph builder.
-   Its task IDs must equal the captured IDs; a different graph refuses restoration and is reported, never expanded. Hash
-   and restore dependencies before their consumers, using only successful entries in the adopted local Nx cache.
+   Explicit `run`, `run-many` and infix task commands use the same stock parser paths. Graph-query selections
+   (`affected`) are not reconstructed; restoration reports them unsupported. Its task IDs must equal the captured IDs; a
+   different graph refuses restoration and is reported, never expanded. Hash and restore dependencies before their
+   consumers, using only successful entries in the adopted local Nx cache.
 
    Each recomputed hash must equal the source check's captured hash; a different input identity is a miss, never a
    different cached result silently substituted for the validated one. Declared outputs live on the source volume, so

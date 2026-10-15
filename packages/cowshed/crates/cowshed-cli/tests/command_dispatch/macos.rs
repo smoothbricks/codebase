@@ -1722,7 +1722,7 @@ async fn directory_adoption_never_reexecutes_shell_checks_or_uncacheable_tasks_s
     fs::write(topic.join("a/src.txt"), b"landed input\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change input"]);
     let shell = "printf 'once\\n' >> .cowshed/shell-runs";
-    let test = nx_run_many(&node, "test");
+    let test = format!("{} node_modules/nx/dist/bin/nx.js test a", node.display());
     let report = land(&mut service, "topic", false, &[shell, &test]).await;
     let Adoption::Adopted { check, .. } = &report.build_volume.adoption else {
         panic!("the build volume was not adopted: {report:?}");

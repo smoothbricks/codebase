@@ -104,7 +104,7 @@ export type Adoption =
 export type AdoptionCheck = {
   readonly hits: number & tags.Type<'uint64'>;
   /**
-   * Each Nx task that missed: a defect in the project's build configuration.
+   * Checked tasks not restored, including uncacheable tasks and absent local results.
    */
   readonly misses: ReadonlyArray<CacheMiss>;
   /**
@@ -2183,7 +2183,7 @@ export type TraceContext = {
 export type TraceId = string & tags.Pattern<'^(?!0{32}$)[0-9a-f]{32}$'>;
 
 /**
- * A landed check whose Nx run summary in one of the target's caches was not its own.
+ * A landed check without an attributable run summary in the landing workspace's cache.
  */
 export type UnattributedCheck = {
   readonly check: string;
