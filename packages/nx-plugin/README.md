@@ -97,6 +97,10 @@ process connects to (the counted Cargo broker, a remote-cache server) binds thro
 workspace's `COWSHED_PORT_BASE`/`COWSHED_PORT_BLOCK_SIZE` block, lowest first, skipping only ports in use, and port 0
 outside a block.
 
+On macOS the working-directory holder census invokes `/usr/sbin/lsof` explicitly, independent of a test or devenv
+`PATH`. A missing or inaccessible census tool fails cleanup with its command error; it never means no holders. Only
+lsof's exit-1 process-disappearance race retains the partial inventory it produced.
+
 ## Cargo Workspace Layouts
 
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:

@@ -80,6 +80,31 @@ it('lists a process once when it descends from another of the pids it is asked a
   ).toEqual([10, 11, 12]);
 });
 
+it('finds its Darwin working-directory holder without system sbin on PATH', async () => {
+  if (process.platform !== 'darwin') return;
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cwd-restricted-path-')));
+  try {
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        '-e',
+        `import { pidsWorkingIn } from ${JSON.stringify(join(import.meta.dir, 'testing.ts'))};
+console.log(JSON.stringify(await pidsWorkingIn(process.cwd())));`,
+      ],
+      { cwd: root, env: { ...process.env, PATH: '/usr/bin:/bin' }, stdout: 'pipe', stderr: 'pipe' },
+    );
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    expect(code, stderr).toBe(0);
+    expect(JSON.parse(stdout)).toContain(child.pid);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 it('stops the Nx daemon of a fixture whose body throws, and deletes its socket alias and root', async () => {
   let root = '';
   let alias = '';

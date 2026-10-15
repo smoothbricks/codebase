@@ -175,7 +175,7 @@ export async function pidsWorkingIn(root: string): Promise<number[]> {
       // lsof keeps naming a working directory after it has been deleted. It
       // exits 1 when a listed process vanished before it was read; what it
       // printed for the rest is still the answer.
-      const fields = await run('lsof', ['-nP', '-a', '-d', 'cwd', '-u', String(userInfo().uid), '-Fpn'], {
+      const fields = await run('/usr/sbin/lsof', ['-nP', '-a', '-d', 'cwd', '-u', String(userInfo().uid), '-Fpn'], {
         maxBuffer: 64 * 1024 * 1024,
       }).then(
         ({ stdout }) => stdout,
