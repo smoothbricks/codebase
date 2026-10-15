@@ -242,24 +242,23 @@ export async function nxDaemonProcesses(workspace: string): Promise<ProcessEntry
  * extension probe it starts at launch never. Those get SIGTERM with it, the
  * ones it started while it was stopping included. A child that outlives the
  * daemon is reparented to init and leaves the daemon's process tree, but it
- * still works in the workspace, so once the daemon has exited, the workspace
- * census ends what is left. A workspace without the record never had a
- * daemon, and `stop` does not run.
+ * still works in the workspace, so the workspace census ends what is left.
+ * A missing record can mean startup has not published it yet: skip the
+ * daemon-stop command, but never skip the working-directory census.
  */
 export async function stopNxDaemon(workspace: string, stop: () => Promise<void>): Promise<void> {
   const [daemon, ...before] = await nxDaemonProcesses(workspace);
-  if (daemon === undefined) {
-    return;
+  if (daemon !== undefined) {
+    await stop();
+    const known = new Set([daemon.pid, ...before.map((entry) => entry.pid)]);
+    const after = withDescendants(await processTable(), [daemon.pid]).filter((entry) => !known.has(entry.pid));
+    const spawned = [...before, ...after];
+    for (const entry of spawned) {
+      terminate(entry.pid);
+    }
+    await awaitExit([daemon, ...spawned], `Nx daemon of ${workspace}`);
   }
-  await stop();
-  const known = new Set([daemon.pid, ...before.map((entry) => entry.pid)]);
-  const after = withDescendants(await processTable(), [daemon.pid]).filter((entry) => !known.has(entry.pid));
-  const spawned = [...before, ...after];
-  for (const entry of spawned) {
-    terminate(entry.pid);
-  }
-  await awaitExit([daemon, ...spawned], `Nx daemon of ${workspace}`);
-  await endWorkspaceProcesses(workspace, `Nx daemon of ${workspace}`);
+  await endWorkspaceProcesses(workspace, `Nx processes of ${workspace}`);
 }
 
 /**
