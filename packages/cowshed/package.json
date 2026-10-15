@@ -42,6 +42,30 @@
   "nx": {
     "name": "cowshed",
     "targets": {
+      "cache-advisor-test": {
+        "executor": "@smoothbricks/nx-plugin:bounded-exec",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/bin/cache-advisor.cjs",
+          "{projectRoot}/scripts/cache-advisor.test.cjs",
+          "{workspaceRoot}/packages/nx-plugin/runtime-input.sh",
+          {
+            "externalDependencies": [
+              "nx"
+            ]
+          },
+          {
+            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node --version"
+          }
+        ],
+        "outputs": [],
+        "options": {
+          "command": "node --check packages/cowshed/bin/cache-advisor.cjs && node --test packages/cowshed/scripts/cache-advisor.test.cjs",
+          "cwd": ".",
+          "timeoutMs": 120000,
+          "killAfterMs": 10000
+        }
+      },
       "api-generator": {
         "executor": "nx:run-commands",
         "cache": true,
@@ -565,6 +589,7 @@
         "dependsOn": [
           "napi-test",
           "launcher-test",
+          "cache-advisor-test",
           "wire-test",
           "declaration-model-test",
           "verify-packaging"

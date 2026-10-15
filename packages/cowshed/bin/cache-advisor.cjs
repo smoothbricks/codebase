@@ -1,0 +1,509 @@
+#!/usr/bin/env node
+'use strict';
+
+// specs/cowshed/16_build_volumes.md, "Read-only cache-reuse advisor".
+// This is deliberately separate from task_hashes.js: carry opens the task database,
+// stops the daemon and records details. None of those operations belongs in a probe.
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { createRequire } = require('node:module');
+const { spawnSync } = require('node:child_process');
+const { performance } = require('node:perf_hooks');
+
+const usage = `Usage: node cache-advisor.cjs --workspace <absolute checkout> --main <absolute checkout>
+  [--runtime=deny|read-only] -- [bun] nx run-many <gate arguments...>
+macOS and Node >=22.13 required. Emits one JSON report; never runs targets.
+Runtime inputs are denied by default. read-only permits them under the probe's
+kernel-enforced write/network denial and reports their exact commands.
+`;
+
+function parse(argv) {
+  const split = argv.indexOf('--');
+  if (split < 0) throw new Error(usage);
+  const options = { runtime: 'deny' };
+  for (let i = 0; i < split; i++) {
+    const arg = argv[i];
+    if (arg.startsWith('--runtime=')) options.runtime = arg.slice('--runtime='.length);
+    else if (arg === '--workspace' || arg === '--main') options[arg.slice(2)] = argv[++i];
+    else throw new Error(`unknown advisor argument ${arg}\n${usage}`);
+  }
+  for (const key of ['workspace', 'main']) {
+    if (!options[key] || !path.isAbsolute(options[key]))
+      throw new Error(`${key} must be an absolute checkout path\n${usage}`);
+    options[key] = fs.realpathSync(options[key]);
+  }
+  if (!['deny', 'read-only'].includes(options.runtime)) throw new Error(`unknown runtime policy ${options.runtime}`);
+  const command = argv.slice(split + 1);
+  if (command[0] === 'bun') command.shift();
+  if (command.shift() !== 'nx' || command.shift() !== 'run-many') {
+    throw new Error(`only an explicit nx run-many command is supported; shell scripts are not interpreted\n${usage}`);
+  }
+  options.command = command;
+  return options;
+}
+
+function sandboxProfile(scratch) {
+  // All descendants inherit this restriction, including graph plugins and runtime
+  // shells. The existing sccache socket is metadata/toolchain IPC, not a target.
+  const socket = process.env.SCCACHE_SERVER_UDS;
+  const sccache = socket
+    ? `(allow network-outbound (remote unix-socket (path-literal ${JSON.stringify(socket)})))`
+    : '';
+  return `(version 1)(allow default)(deny file-write*)(deny network*)(deny signal)
+    (allow file-write* (subpath ${JSON.stringify(scratch)}) (literal "/dev/null"))${sccache}`;
+}
+
+function run(options) {
+  if (process.platform !== 'darwin')
+    throw new Error('cache advisor requires macOS sandbox-exec; refusing an unconfined probe');
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  if (major < 22 || (major === 22 && minor < 13))
+    throw new Error(`cache advisor requires Node >=22.13, got ${process.versions.node}`);
+  const start = performance.now();
+  const scratch = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cowshed-advisor-')));
+  try {
+    const child = spawnSync(
+      '/usr/bin/sandbox-exec',
+      ['-p', sandboxProfile(scratch), process.execPath, __filename, '--probe', scratch, JSON.stringify(options)],
+      {
+        cwd: options.workspace,
+        env: { ...process.env, TMPDIR: `${scratch}/` },
+        encoding: 'utf8',
+        maxBuffer: 32 * 1024 * 1024,
+      },
+    );
+    if (child.stderr) process.stderr.write(child.stderr);
+    if (child.error)
+      throw new Error(`starting confined advisor for ${options.workspace}: ${child.error.message}`, {
+        cause: child.error,
+      });
+    if (child.status !== 0)
+      throw new Error(`confined advisor for ${options.workspace} exited ${child.status ?? child.signal}`);
+    const report = JSON.parse(child.stdout);
+    report.wallSeconds = (performance.now() - start) / 1000;
+    return report;
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+function identity(task) {
+  return JSON.stringify([task.project, task.target, task.configuration ?? null]);
+}
+
+function fingerprint(file) {
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs];
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function assertUnchanged(file, before) {
+  const after = fingerprint(file);
+  if ((before === null) !== (after === null) || before?.some((value, i) => value !== after[i])) {
+    throw new Error(`busy: candidate file changed during snapshot: ${file}; no time decision available`);
+  }
+}
+
+function copyDatabase(filename, destination) {
+  const files = ['', '-wal', '-journal'].map((suffix) => ({
+    source: filename + suffix,
+    destination: destination + suffix,
+    before: fingerprint(filename + suffix),
+  }));
+  if (!files[0].before)
+    throw new Error(`busy: candidate database disappeared before snapshot: ${filename}; no time decision available`);
+  let bytes = 0;
+  try {
+    for (const file of files) {
+      if (file.before) {
+        fs.copyFileSync(file.source, file.destination);
+        bytes += Number(file.before[2]);
+      }
+    }
+  } catch (error) {
+    for (const file of files) assertUnchanged(file.source, file.before);
+    throw new Error(`copying candidate database ${filename}: ${error.message}`, { cause: error });
+  }
+  // Check the ENTIRE set after all copies, including previously absent sidecars.
+  // A writer invalidates the observation; never retry or ignore the live WAL.
+  for (const file of files) assertUnchanged(file.source, file.before);
+  return bytes;
+}
+
+function candidate(root, scratch) {
+  const { DatabaseSync } = require('node:sqlite');
+  const started = performance.now();
+  const dataLink = path.join(root, '.nx', 'workspace-data');
+  const cacheLink = path.join(root, '.nx', 'cache');
+  const data = fs.existsSync(dataLink) ? fs.realpathSync(dataLink) : dataLink;
+  const cache = fs.existsSync(cacheLink) ? fs.realpathSync(cacheLink) : cacheLink;
+  const databaseNames = () =>
+    fs.existsSync(data)
+      ? fs
+          .readdirSync(data)
+          .filter((name) => name.endsWith('.db'))
+          .sort()
+      : [];
+  const databases = databaseNames();
+  fs.mkdirSync(scratch, { recursive: true });
+  const hashes = new Set();
+  const samples = [];
+  let snapshotBytes = 0;
+  for (const name of databases) {
+    const filename = path.join(data, name);
+    const privateFile = path.join(scratch, name);
+    snapshotBytes += copyDatabase(filename, privateFile);
+    // Only the private copy is opened by SQLite. Writable scratch permits private
+    // WAL/journal recovery and SHM creation; no live database is opened at all.
+    const db = new DatabaseSync(privateFile);
+    try {
+      db.exec('PRAGMA query_only=ON; BEGIN');
+      const tables = new Set(
+        db
+          .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+          .all()
+          .map((row) => row.name),
+      );
+      if (tables.has('cache_outputs')) {
+        for (const row of db.prepare('SELECT hash FROM cache_outputs WHERE code=0').all()) {
+          if (!/^[0-9]+$/.test(row.hash)) throw new Error(`invalid Nx hash ${JSON.stringify(row.hash)} in ${filename}`);
+          if (fs.existsSync(path.join(cache, row.hash))) hashes.add(row.hash);
+        }
+      }
+      if (tables.has('task_history') && tables.has('task_details')) {
+        samples.push(
+          ...db
+            .prepare(`SELECT d.project, d.target, d.configuration, h.hash, h.start, h.end
+          FROM task_history h JOIN task_details d ON d.hash=h.hash
+          WHERE h.status='success' AND h.code=0 AND h.end>=h.start`)
+            .all(),
+        );
+      }
+      db.exec('ROLLBACK');
+    } catch (error) {
+      throw new Error(`reading candidate database ${filename}: ${error.message}`, { cause: error });
+    } finally {
+      db.close();
+    }
+  }
+  if (JSON.stringify(databaseNames()) !== JSON.stringify(databases))
+    throw new Error(`busy: database set changed in ${data}; no time decision available`);
+  for (const [link, resolved] of [
+    [dataLink, data],
+    [cacheLink, cache],
+  ]) {
+    if (fs.existsSync(link) && fs.realpathSync(link) !== resolved)
+      throw new Error(`busy: candidate link changed: ${link}; no time decision available`);
+  }
+  return { root, databases, hashes, samples, snapshotBytes, snapshotSeconds: (performance.now() - started) / 1000 };
+}
+
+function summarize(selection, own, main) {
+  // The same tuple is the SQL UNION key used by the measured duration query.
+  // Do not count a historical run twice just because its database was cloned.
+  const seen = new Set();
+  const durations = new Map();
+  for (const sample of [...own.samples, ...main.samples]) {
+    const key = identity(sample);
+    const event = JSON.stringify([key, sample.hash, sample.start, sample.end]);
+    if (seen.has(event)) continue;
+    seen.add(event);
+    const seconds = (sample.end - sample.start) / 1000;
+    const value = durations.get(key) ?? { samples: 0, total: 0, minSeconds: seconds, maxSeconds: seconds };
+    value.samples++;
+    value.total += seconds;
+    value.minSeconds = Math.min(value.minSeconds, seconds);
+    value.maxSeconds = Math.max(value.maxSeconds, seconds);
+    durations.set(key, value);
+  }
+  const classes = { HIT_BOTH: 0, HIT_OWN: 0, HIT_MAIN: 0, MISS_BOTH: 0, UNRESOLVED: 0 };
+  const totals = { ownMissWorkSeconds: 0, mainMissWorkSeconds: 0, ownUnweightedMisses: 0, mainUnweightedMisses: 0 };
+  let withDuration = 0;
+  let resolvedWithDuration = 0;
+  const tasks = selection.tasks.map((task) => {
+    const history = durations.get(identity(task));
+    const weight = history
+      ? {
+          meanSeconds: history.total / history.samples,
+          samples: history.samples,
+          minSeconds: history.minSeconds,
+          maxSeconds: history.maxSeconds,
+        }
+      : null;
+    if (weight) withDuration++;
+    const ownHit = task.hash && own.hashes ? own.hashes.has(task.hash) : null;
+    const mainHit = task.hash && main.hashes ? main.hashes.has(task.hash) : null;
+    const classification =
+      ownHit === null || mainHit === null
+        ? 'UNRESOLVED'
+        : ownHit
+          ? mainHit
+            ? 'HIT_BOTH'
+            : 'HIT_OWN'
+          : mainHit
+            ? 'HIT_MAIN'
+            : 'MISS_BOTH';
+    classes[classification]++;
+    if (classification !== 'UNRESOLVED') {
+      if (weight) resolvedWithDuration++;
+      for (const [side, hit] of [
+        ['own', ownHit],
+        ['main', mainHit],
+      ]) {
+        if (!hit) {
+          if (weight) totals[`${side}MissWorkSeconds`] += weight.meanSeconds;
+          else totals[`${side}UnweightedMisses`]++;
+        }
+      }
+    }
+    return {
+      ...task,
+      reason: task.reason ?? own.error ?? main.error ?? null,
+      own: ownHit === null ? 'UNRESOLVED' : ownHit ? 'HIT' : 'MISS',
+      main: mainHit === null ? 'UNRESOLVED' : mainHit ? 'HIT' : 'MISS',
+      classification,
+      weight,
+    };
+  });
+  const unpriced = tasks
+    .filter((task) => task.classification === 'UNRESOLVED' || !task.weight)
+    .map((task) => ({
+      id: task.id,
+      reason: task.reason ?? 'no successful uncached duration sample for this task identity',
+    }));
+  const timeAvailable = unpriced.length === 0;
+  const difference = totals.ownMissWorkSeconds - totals.mainMissWorkSeconds;
+  const observation = ({ root, databases, snapshotBytes, snapshotSeconds, error }) => ({
+    root,
+    databases,
+    snapshotBytes,
+    snapshotSeconds,
+    error,
+  });
+  return {
+    ...selection,
+    candidates: { own: observation(own), main: observation(main) },
+    tasks,
+    classes,
+    totals: { ...totals, ownMinusMainSeconds: difference, complete: timeAvailable },
+    decision: {
+      basis: timeAvailable ? 'time' : 'space',
+      timeDecisionAvailable: timeAvailable,
+      workScoreSeconds: timeAvailable ? difference : null,
+      reason: timeAvailable
+        ? 'every cacheable task has a current key and a duration sample'
+        : 'incomplete pricing; caller must fall back to space',
+    },
+    unpriced,
+    coverage: {
+      cacheableTasks: tasks.length,
+      withDuration,
+      resolvedTasks: tasks.length - classes.UNRESOLVED,
+      resolvedWithDuration,
+    },
+    unresolved: tasks.filter((task) => task.classification === 'UNRESOLVED').map(({ id, reason }) => ({ id, reason })),
+    caveat:
+      'Historical task-identity means estimate serial work, not elapsed gate time. Unresolved and unweighted work is excluded, never treated as free.',
+  };
+}
+
+async function probe(options, scratch) {
+  const start = performance.now();
+  const root = options.workspace;
+  process.chdir(root);
+  Object.assign(process.env, {
+    NX_WORKSPACE_ROOT_PATH: root,
+    NX_WORKSPACE_DATA_DIRECTORY: path.join(scratch, 'workspace-data'),
+    NX_CACHE_DIRECTORY: path.join(scratch, 'cache'),
+    NX_PROJECT_GRAPH_CACHE_DIRECTORY: path.join(scratch, 'workspace-data'),
+    NX_NATIVE_FILE_CACHE_DIRECTORY: path.join(scratch, 'native'),
+    NX_DAEMON: 'false',
+    NX_ISOLATE_PLUGINS: 'false',
+  });
+  // Reuse only disposable resolution caches, not file hashes or a possibly stale
+  // project graph. Nx walks this checkout and builds its graph afresh exactly once.
+  const data = process.env.NX_WORKSPACE_DATA_DIRECTORY;
+  fs.mkdirSync(data, { recursive: true });
+  const sourceData = path.join(root, '.nx', 'workspace-data');
+  for (const name of [
+    'cargo-resolve',
+    'parsed-lock-file.dependencies.json',
+    'parsed-lock-file.nodes.json',
+    'lockfile-dependencies.hash',
+    'lockfile-nodes.hash',
+  ]) {
+    if (fs.existsSync(path.join(sourceData, name)))
+      fs.cpSync(path.join(sourceData, name), path.join(data, name), { recursive: true });
+  }
+  const requireNx = createRequire(path.join(root, 'package.json'));
+  const { readNxJson } = requireNx('nx/src/config/nx-json');
+  const { createProjectGraphAsync, readProjectsConfigurationFromProjectGraph } = requireNx(
+    'nx/src/project-graph/project-graph',
+  );
+  const { withOverrides } = requireNx('nx/src/command-line/yargs-utils/shared-options');
+  const { yargsRunManyCommand } = requireNx('nx/src/command-line/run-many/command-object');
+  const { splitArgsIntoNxArgsAndOverrides } = requireNx('nx/src/utils/command-line-utils');
+  const { setEnvVarsBasedOnArgs, getRunnerOptions } = requireNx('nx/src/tasks-runner/run-command');
+  const nxJson = readNxJson();
+  const yargs = createRequire(requireNx.resolve('nx/package.json'))('yargs');
+  const parsed = await yargsRunManyCommand
+    .builder(yargs(options.command).exitProcess(false).help(false).version(false))
+    .parse();
+  const { nxArgs, overrides } = splitArgsIntoNxArgsAndOverrides(
+    withOverrides(parsed, 0),
+    'run-many',
+    { printWarnings: false },
+    nxJson,
+  );
+  if (!nxArgs.targets?.length) throw new Error('the gate command must name at least one target');
+  if (nxArgs.skipNxCache || nxArgs.graph || nxArgs.watch)
+    throw new Error('cache bypass, graph and watch commands are not advisory gate commands');
+  setEnvVarsBasedOnArgs(nxArgs, process.env.NX_LOAD_DOT_ENV_FILES !== 'false');
+  const projectGraph = await createProjectGraphAsync({ exitOnError: false, resetDaemonClient: false });
+  const { projectsToRun } = requireNx('nx/src/command-line/run-many/run-many');
+  const { createTaskGraph } = requireNx('nx/src/tasks-runner/create-task-graph');
+  const { findCycle, makeAcyclic } = requireNx('nx/src/tasks-runner/task-graph-utils');
+  const taskGraph = createTaskGraph(
+    projectGraph,
+    {},
+    projectsToRun(nxArgs, projectGraph).map((project) => project.name),
+    nxArgs.targets,
+    nxArgs.configuration,
+    overrides,
+    nxArgs.excludeTaskDependencies,
+  );
+  const cycle = findCycle(taskGraph);
+  if (cycle) {
+    if (!nxArgs.nxIgnoreCycles && process.env.NX_IGNORE_CYCLES !== 'true')
+      throw new Error(`circular task graph: ${cycle.join(' --> ')}`);
+    makeAcyclic(taskGraph);
+  }
+  const { getPlugins, cleanupPlugins } = requireNx('nx/src/project-graph/plugins/get-plugins');
+  const plugins = await getPlugins(nxJson, root);
+  const hooks = plugins
+    .filter((plugin) => plugin.preTasksExecution || plugin.postTasksExecution)
+    .map((plugin) => plugin.name);
+  const { getInputs } = requireNx('nx/src/hasher/task-hasher');
+  const { getCustomHasher } = requireNx('nx/src/tasks-runner/utils');
+  const { createTaskHasher } = requireNx('nx/src/hasher/create-task-hasher');
+  const { hashTasks } = requireNx('nx/src/hasher/hash-task');
+  const { getTaskSpecificEnv } = requireNx('nx/src/tasks-runner/task-env');
+  const { HashPlanInspector } = requireNx('nx/src/hasher/hash-plan-inspector');
+  const configurations = readProjectsConfigurationFromProjectGraph(projectGraph).projects;
+  const inspector = new HashPlanInspector(projectGraph, root, nxJson);
+  await inspector.init();
+  const plans = inspector.inspector.inspectInputs(
+    inspector.planner.getPlansReference(Object.keys(taskGraph.tasks), taskGraph),
+  );
+  const cacheable = Object.values(taskGraph.tasks).filter((task) => task.cache && !task.continuous);
+  const rows = [];
+  const upFront = [];
+  for (const task of cacheable) {
+    const runtimeCommands = plans[task.id]?.runtime ?? [];
+    let reason = null;
+    if (getCustomHasher(task, configurations)) reason = 'custom hasher may consume dependency outputs';
+    else if (taskGraph.dependencies[task.id].length && getInputs(task, projectGraph, nxJson).depsOutputs.length)
+      reason = 'deferred: dependency outputs are not current until dependencies execute';
+    else if (hooks.length) reason = `execution hooks are not run by the advisor: ${hooks.join(', ')}`;
+    else if (runtimeCommands.length && options.runtime === 'deny')
+      reason = 'runtime inputs denied; opt in with --runtime=read-only after auditing the reported commands';
+    // Pinned Nx ignores a runtime command's exit status. The repository wrapper
+    // makes failures invalid UTF-8, which Nx rejects rather than hashing an error.
+    else if (
+      runtimeCommands.some(
+        (command) => !command.startsWith('sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh '),
+      )
+    ) {
+      reason = 'runtime input lacks the fail-closed nx-plugin/runtime-input.sh wrapper';
+    }
+    if (!reason) upFront.push(task);
+    rows.push({
+      id: task.id,
+      project: task.target.project,
+      target: task.target.target,
+      configuration: task.target.configuration ?? null,
+      hash: null,
+      reason,
+      runtimeCommands,
+      runtimeInputsAdmitted: !reason && runtimeCommands.length > 0,
+    });
+  }
+  const hasher = createTaskHasher(projectGraph, nxJson, getRunnerOptions(nxArgs.runner, nxJson, nxArgs, false));
+  const envs = Object.fromEntries(upFront.map((task) => [task.id, getTaskSpecificEnv(task, projectGraph)]));
+  let hashFailure = null;
+  try {
+    // Exactly one hash pass, and deliberately NO TaskDetails argument/connection.
+    await hashTasks(hasher, projectGraph, taskGraph, envs, undefined, upFront);
+  } catch (error) {
+    hashFailure = `hash pass failed under read-only policy: ${error.stack ?? error}`;
+  } finally {
+    cleanupPlugins();
+  }
+  for (const row of rows) {
+    if (row.reason) continue;
+    const task = taskGraph.tasks[row.id];
+    if (hashFailure || !/^[0-9]+$/.test(task.hash ?? '')) row.reason = hashFailure ?? 'Nx returned no decimal hash';
+    else row.hash = task.hash;
+  }
+  const selection = {
+    command: ['nx', 'run-many', ...options.command],
+    tasks: rows.sort((a, b) => a.id.localeCompare(b.id)),
+    noncacheableTasks: Object.values(taskGraph.tasks)
+      .filter((task) => !task.cache || task.continuous)
+      .map((task) => task.id)
+      .sort(),
+    audit: {
+      runtimePolicy: options.runtime,
+      hooksNotExecuted: hooks,
+      targetExecutions: 0,
+      sccacheSocket: process.env.SCCACHE_SERVER_UDS ?? null,
+      confinement:
+        'persistent writes only to scratch; /dev/null allowed; signals denied; network only to configured sccache Unix metadata socket; Nx daemon bypassed in-process',
+    },
+    hashPassSeconds: (performance.now() - start) / 1000,
+  };
+  function observe(candidateRoot, label) {
+    try {
+      return candidate(candidateRoot, path.join(scratch, label));
+    } catch (error) {
+      const reason = `candidate ${label} (${candidateRoot}) unavailable: ${error.message}`;
+      console.error(reason);
+      return { root: candidateRoot, databases: [], hashes: null, samples: [], error: reason };
+    }
+  }
+  return summarize(selection, observe(root, 'own'), observe(options.main, 'main'));
+}
+
+module.exports = { parse, run, summarize, candidate, sandboxProfile, fingerprint, assertUnchanged };
+if (require.main === module) {
+  if (process.argv[2] === '--probe') {
+    const answer = process.stdout.write.bind(process.stdout);
+    process.stdout.write = process.stderr.write.bind(process.stderr);
+    probe(JSON.parse(process.argv[4]), process.argv[3]).then(
+      (report) => answer(`${JSON.stringify(report)}\n`),
+      (error) => {
+        console.error(error);
+        process.exitCode = 1;
+      },
+    );
+  } else {
+    try {
+      if (process.argv.includes('--help')) process.stdout.write(usage);
+      else process.stdout.write(`${JSON.stringify(run(parse(process.argv.slice(2))))}\n`);
+    } catch (error) {
+      console.error(error);
+      process.stdout.write(
+        `${JSON.stringify({
+          decision: { basis: 'space', timeDecisionAvailable: false, workScoreSeconds: null, reason: error.message },
+          error: error.message,
+        })}\n`,
+      );
+      process.exitCode = 1;
+    }
+  }
+}
