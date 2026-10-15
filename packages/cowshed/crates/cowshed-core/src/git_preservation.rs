@@ -1349,6 +1349,36 @@ mod tests {
         original
     }
 
+    /// The step of `verify_copy` that must refuse a planted copy, named by what its error says. A
+    /// refusal for any other reason fails the witness, so the refusal itself attributes it to the
+    /// plant.
+    enum Refusal<'a> {
+        /// The raw byte comparison names this path, relative to the tree it walks.
+        Bytes(&'a str),
+        /// The copy holds a path the source does not.
+        PathSet,
+        /// The live comparison names exactly this one component.
+        Component(GitPreservationComponent),
+    }
+
+    impl Refusal<'_> {
+        fn assert_met(&self, error: &CowshedError) {
+            assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
+            let met = match self {
+                Self::Bytes(path) => error
+                    .message
+                    .contains(&format!("copied tree differs at {path}: file content")),
+                Self::PathSet => error
+                    .message
+                    .contains("copied tree has a different path set"),
+                Self::Component(component) => error
+                    .message
+                    .starts_with(&format!("Git preservation mismatch: {component} at ")),
+            };
+            assert!(met, "the refusal names another reason: {}", error.message);
+        }
+    }
+
     struct FilteredCopy {
         repository: Repository,
         staging: PathBuf,
@@ -1375,15 +1405,40 @@ mod tests {
             )
         }
 
-        fn reject_changed_bytes(&self, relative: &str, bytes: &[u8]) {
+        /// Plant `bytes` over `relative` in the copy, require `refusal`, then put the original
+        /// bytes back and require the copy to verify again.
+        fn reject_changed_bytes(&self, relative: &str, bytes: &[u8], refusal: Refusal<'_>) {
             let path = self.staging.join(relative);
             let original = plant(&path, bytes);
             let error = self
                 .verify()
                 .expect_err(&format!("planted bytes in {}", path.display()));
-            assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
+            refusal.assert_met(&error);
             plant(&path, &original);
             self.verify().expect("restored bytes verify again");
+        }
+
+        /// Add a file only the copy holds, require `refusal`, then remove it and require the copy to
+        /// verify again. The directory it was added to gets its modification time back: the plant
+        /// changed that too, and the verifier compares it.
+        fn reject_extra_path(&self, relative: &str, refusal: Refusal<'_>) {
+            let path = self.staging.join(relative);
+            let directory = path.parent().expect("planted path has a parent");
+            let modified = fs::metadata(directory)
+                .expect("stat the planted path's directory")
+                .modified()
+                .expect("directory modification time");
+            fs::write(&path, b"only in the copy\n").expect("plant extra path");
+            let error = self
+                .verify()
+                .expect_err(&format!("an extra path {}", path.display()));
+            refusal.assert_met(&error);
+            fs::remove_file(&path).expect("remove extra path");
+            fs::File::open(directory)
+                .expect("open the planted path's directory")
+                .set_modified(modified)
+                .expect("restore the directory metadata changed by the planted path");
+            self.verify().expect("removed extra path verifies again");
         }
     }
 
@@ -1582,14 +1637,35 @@ mod tests {
             let mut planted_config =
                 fs::read(fixture.staging.join(".git/config")).expect("copied config");
             planted_config.extend_from_slice(b"\n# planted\n");
-            for (relative, bytes) in [
-                (".git/index", flipped_index),
-                (".git/config", planted_config),
-                ("README", b"DIRTY\n".to_vec()),
-                ("scratch.txt", b"UNTRACKED\n".to_vec()),
-                ("secret.txt", b"RAW SECRET\n".to_vec()),
+            // Only `git fsck --full` rejects a flipped index checksum: status reads the index
+            // without verifying it, so the refusal is the fsck component.
+            for (relative, bytes, refusal) in [
+                (
+                    ".git/index",
+                    flipped_index,
+                    Refusal::Component(GitPreservationComponent::Fsck),
+                ),
+                (
+                    ".git/config",
+                    planted_config,
+                    Refusal::Component(GitPreservationComponent::LocalConfigRaw),
+                ),
+                ("README", b"DIRTY\n".to_vec(), Refusal::Bytes("README")),
+                (
+                    "scratch.txt",
+                    b"UNTRACKED\n".to_vec(),
+                    Refusal::Bytes("scratch.txt"),
+                ),
+                // Neither the raw bytes nor what the clean filter stored in the index: the stored
+                // bytes would let a racily clean entry rehash to a clean status in the copy, and
+                // the refusal would then be the live comparison's rather than the byte comparison's.
+                (
+                    "secret.txt",
+                    b"RAW secret\n".to_vec(),
+                    Refusal::Bytes("secret.txt"),
+                ),
             ] {
-                fixture.reject_changed_bytes(relative, &bytes);
+                fixture.reject_changed_bytes(relative, &bytes, refusal);
             }
         });
     }
@@ -1597,23 +1673,22 @@ mod tests {
     #[test]
     fn filtered_copy_verification_refuses_submodule_byte_and_head_drift() {
         with_filtered_copy(SubmoduleHead::Advanceable, |fixture| {
-            fixture.reject_changed_bytes("subdir/README", b"SECONX\n");
-            fixture.reject_changed_bytes("subdir/ignored.log", b"IGNORED\n");
-            // Commit-level pointer drift stays visible even though child status is disabled.
-            let submodule_head = fixture.staging.join(".git/modules/subdir/HEAD");
-            let recorded_head = plant(
-                &submodule_head,
-                format!("{}\n", fixture.advanced()).as_bytes(),
+            fixture.reject_changed_bytes(
+                "subdir/README",
+                b"SECONX\n",
+                Refusal::Bytes("subdir/README"),
             );
-            let error = fixture
-                .verify()
-                .expect_err("a drifted submodule pointer must refuse");
-            assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
-            assert!(error.message.contains("porcelain"), "{}", error.message);
-            plant(&submodule_head, &recorded_head);
-            fixture
-                .verify()
-                .expect("restored submodule pointer verifies again");
+            fixture.reject_changed_bytes(
+                "subdir/ignored.log",
+                b"IGNORED\n",
+                Refusal::Bytes("subdir/ignored.log"),
+            );
+            // Commit-level pointer drift stays visible even though child status is disabled.
+            fixture.reject_changed_bytes(
+                ".git/modules/subdir/HEAD",
+                format!("{}\n", fixture.advanced()).as_bytes(),
+                Refusal::Component(GitPreservationComponent::Porcelain),
+            );
         });
     }
 
@@ -1621,34 +1696,12 @@ mod tests {
     fn filtered_copy_verification_refuses_copy_only_paths() {
         with_filtered_copy(SubmoduleHead::Recorded, |fixture| {
             // A file only the copy holds is a path the source never had, never a silent omission.
-            let extra = fixture.staging.join("extra.txt");
-            fs::write(&extra, b"only in the copy\n").expect("plant extra file");
-            let error = fixture
-                .verify()
-                .expect_err("a copy-only untracked file must refuse");
-            assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
-            fs::remove_file(&extra).expect("remove extra file");
-            fixture.verify().expect("removed extra file verifies again");
+            fixture.reject_extra_path(
+                "extra.txt",
+                Refusal::Component(GitPreservationComponent::Porcelain),
+            );
             // An extra submodule path is refused by the subtree compare, including ignored paths.
-            let subdir = fixture.staging.join("subdir");
-            let modified = fs::metadata(&subdir)
-                .expect("stat copied submodule directory")
-                .modified()
-                .expect("copied submodule modification time");
-            let extra = subdir.join("extra.txt");
-            fs::write(&extra, b"only in the copy\n").expect("plant submodule extra file");
-            let error = fixture
-                .verify()
-                .expect_err("a copy-only file inside the submodule must refuse");
-            assert_eq!(error.code, crate::ErrorCode::Integrity, "{}", error.message);
-            fs::remove_file(&extra).expect("remove submodule extra file");
-            fs::File::open(&subdir)
-                .expect("open copied submodule directory")
-                .set_modified(modified)
-                .expect("restore the directory metadata changed by the planted extra file");
-            fixture
-                .verify()
-                .expect("removed submodule extra file verifies again");
+            fixture.reject_extra_path("subdir/extra.txt", Refusal::PathSet);
         });
     }
 
