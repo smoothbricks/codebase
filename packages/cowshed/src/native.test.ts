@@ -214,6 +214,14 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
         else demand(message.id);
       } else if (message.method in results) {
         answer(message.id, results[message.method]);
+      } else if (message.method === 'coordinator.reseed') {
+        heard.push('reseed ' + JSON.stringify(message.params));
+        const { workspace, from, dryRun } = message.params;
+        answer(message.id, {
+          workspace, from, previousVolume: 'previous-volume', seed: 'existing-seed',
+          ...(!dryRun ? { replacementVolume: 'replacement-volume' } : {}),
+          previousBytes: 8192, replacementBytes: 4096, freedBytes: dryRun ? 0 : 8192, dryRun,
+        });
       } else if (message.method === 'job.progress') {
         heard.push('open every ' + message.params.everyMs);
         streams.set(message.id, {
@@ -358,6 +366,48 @@ describe('Cowshed Node-API bindings', () => {
     expect(stderr).toBe('');
     expect(exitCode).toBe(0);
   });
+
+  it('round-trips coordinator-only reseed preview and replacement through generated adapters', async () => {
+    const client = `
+      import { connectCoordinator, coordinatorEndpoint } from ${JSON.stringify(moduleUrl)};
+      const coordinator = await connectCoordinator(coordinatorEndpoint(3), '/w/widget');
+      const preview = await coordinator.reseed('raven', 'main', true);
+      const replacement = await coordinator.reseed('raven', 'lane-base', false);
+      const worker = await coordinator.worker('main');
+      console.log(JSON.stringify({ preview, replacement, workerCanReseed: 'reseed' in worker }));
+    `;
+    const result = await scriptedController(client);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(JSON.parse(result.stdout)).toEqual({
+      preview: {
+        workspace: 'raven',
+        from: 'main',
+        previousVolume: 'previous-volume',
+        seed: 'existing-seed',
+        previousBytes: 8192,
+        replacementBytes: 4096,
+        freedBytes: 0,
+        dryRun: true,
+      },
+      replacement: {
+        workspace: 'raven',
+        from: 'lane-base',
+        previousVolume: 'previous-volume',
+        seed: 'existing-seed',
+        replacementVolume: 'replacement-volume',
+        previousBytes: 8192,
+        replacementBytes: 4096,
+        freedBytes: 8192,
+        dryRun: false,
+      },
+      workerCanReseed: false,
+    });
+    expect(result.heard.map((request) => JSON.parse(request.slice('reseed '.length)))).toEqual([
+      { repoId: 'acme/widget', workspace: 'raven', from: 'main', dryRun: true },
+      { repoId: 'acme/widget', workspace: 'raven', from: 'lane-base', dryRun: false },
+    ]);
+  }, 30_000);
 
   /**
    * One `Cowshed` holds one controller connection for every handle, and `job.wait()` lasts as

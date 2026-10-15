@@ -366,12 +366,20 @@ images are unaffected.
 | Preserve Git work                | `cowshed push <workspace>`, `cowshed rebase <workspace>`, `cowshed land <workspace>` |
 | Remove a workspace               | `cowshed rm <workspace>`                                                             |
 | Preview / run reclamation        | `cowshed gc --dry-run`, `cowshed gc`                                                 |
+| Replace rebuildable build state  | `cowshed reseed <ws> [--from <target>] [--dry-run]` (default target: main)           |
 | Make `fork` fast on an old main  | `cowshed defrag main` (idle checkout; `doctor` warns `main-extents` when it is due)  |
 | Diagnose host state              | `cowshed doctor`                                                                     |
 | Manage the gateway               | `cowshed gateway start`, `status`, `stop`                                            |
 
 `--project <git-root>`, `--json`, and `--quiet` are global options accepted by repository-scoped commands. Gateway
 service commands are host-global and reject `--project`.
+
+`reseed` discards live build-volume contents for a new clone of the target's current-incarnation latest existing seed.
+It leaves source files, HEAD, index, dirty and untracked work untouched; missing incremental work rebuilds cold. It
+never refreshes or deletes a seed: stale seeds are used as-is and an absent seed refuses. Run it while idle; jobs, land
+holds, filesystem holders and unfinished lifecycle work refuse. Preview changes no build state and reports
+allocated-byte estimates; execution reports removed-image allocation, not unique physical savings on APFS shared
+extents. See [the CLI reference](cli.md) for JSON fields and full refusal/accounting rules.
 
 ## Related guides
 

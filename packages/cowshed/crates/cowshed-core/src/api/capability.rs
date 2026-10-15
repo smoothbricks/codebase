@@ -5,8 +5,8 @@ use super::dto::{
     GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail,
     JobTailLimits, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants,
     PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume, SealedJob, StdinSource,
-    StepReport, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, SealedJob,
+    StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
 };
 use super::frame;
 use super::operations::{
@@ -14,7 +14,7 @@ use super::operations::{
     DestroyRequest, ExecParams, ExecStdin, ForkRequest, GcRequest, GrantRequest, JobRequest,
     JobStream, LandRequest, LogsChunk, LogsRequest, MirrorRequest, MoveCheckoutRequest, Operation,
     ProgressRequest, ProjectGrantRequest, ProjectOpenRequest, PushRequest, QuotaRequest,
-    RebaseRequest, RemoveProjectRequest, RepoRequest, ResizeRequest, RestoreRequest,
+    RebaseRequest, RemoveProjectRequest, RepoRequest, ReseedRequest, ResizeRequest, RestoreRequest,
     SessionRequest, SlotRequest, SourceDestinationRequest, StdinWriteRequest, StreamOperation,
     TailRequest, WorkerScope, WorkerView, WorkspaceAtRequest, WorkspaceAttachRequest,
     WorkspaceGrantsRequest, WorkspaceRequest, WorkspaceView, decode_result, encode_request,
@@ -2065,6 +2065,18 @@ impl Coordinator {
     pub async fn defragment(&self, workspace: &str) -> Result<DefragmentResult> {
         let request = self.workspace_request(workspace)?;
         invoke::<operations::CoordinatorDefragment>(&*self.runtime, &request).await
+    }
+
+    /// Discard a workspace's live build state by cloning the target's latest existing seed.
+    /// Source files are untouched; missing incremental state is rebuilt cold. No seed is refreshed.
+    pub async fn reseed(&self, workspace: &str, from: &str, dry_run: bool) -> Result<ReseedResult> {
+        let request = ReseedRequest {
+            repo_id: self.repo_id(),
+            workspace: workspace_name(workspace)?,
+            from: workspace_name(from)?,
+            dry_run,
+        };
+        invoke::<operations::CoordinatorReseed>(&*self.runtime, &request).await
     }
 
     pub async fn assign_slot(&self, workspace: &str, slot: u32) -> Result<()> {

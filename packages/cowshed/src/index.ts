@@ -243,6 +243,10 @@ class CoordinatorImpl implements Coordinator {
     return callNativeAsync(() => N.coordinatorResize(this.#native, { workspace, capacity, volume }));
   }
 
+  async reseed(workspace: string, from: string, dryRun: boolean): Promise<Api.ReseedResult> {
+    return callNativeAsync(() => N.coordinatorReseed(this.#native, { workspace, from, dryRun }));
+  }
+
   async remove(workspace: string, options?: Api.RemoveOptions): Promise<Api.RemoveReport> {
     return callNativeAsync(() => N.coordinatorDestroy(this.#native, { workspace, options: options ?? {} }));
   }

@@ -210,10 +210,18 @@ index is build-volume state carried like the rest. Every land freezes a seed fro
 plain Git fast-forward is detected at the next fork, including `--ref` at the target's current tree: a quiet live
 workspace at exactly that tree seeds the target automatically. Between lands, the fork captures newer live state only
 when it is at least as near the requested tree and has no writer. A nearer landed seed beats an older live volume. There
-is no manual reseed or warm step. `doctor` reports target-only `seed-age`, `seed-tree-behind` and
+is no manual seed-refresh or warm step. `doctor` reports target-only `seed-age`, `seed-tree-behind` and
 `target-moved-outside-land`; land records its actual seeded/adopted/skipped outcome durably, including holders. An owned
 index link points back to source only through a verified sealed snapshot; a holder refuses that change without losing
 bytes or being forced off.
+
+**Replace rebuildable state explicitly.** `cowshed reseed <workspace> [--from <target>] [--dry-run]` discards that
+workspace's live build-volume contents for a new clone of the target's current-incarnation latest existing seed (default
+main). Source files, HEAD, index, dirty and untracked work remain untouched; missing incremental work rebuilds cold.
+This never refreshes or deletes a seed: stale seeds are cloned as-is and absent seeds refuse. Preview reports old
+allocation and a seed-based replacement estimate without mutation; execution reports removed-image allocation. APFS
+shared extents mean these allocated bytes are GC accounting, not unique physical bytes or promised physical free space.
+See the [CLI reseed command](./cli.md#cowshed-reseed-namemain---from-target---dry-run) for refusals and JSON fields.
 
 **Existing checkouts migrate by rebuilding, never copying.** Setup and the first admitted job create an empty build
 volume, publish `.cowshed/build`, discard only contributed real build-state directories, and install their fixed links.

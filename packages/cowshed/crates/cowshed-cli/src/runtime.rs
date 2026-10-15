@@ -20,10 +20,10 @@ use cowshed_core::api::{
     GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport,
     LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
     PublicationPolicy, PushOptions, PushReport, RebaseBuildVolume, RebaseOptions, RebaseReport,
-    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult,
-    ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
-    UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath, WorkspaceState,
-    validate_command_argv,
+    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult,
+    ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus,
+    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
+    WorkspaceState, validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -135,6 +135,7 @@ pub trait CliService: Send {
         volume: ResizeVolume,
     ) -> Result<ResizeResult>;
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult>;
+    async fn reseed(&mut self, workspace: &str, from: &str, dry_run: bool) -> Result<ReseedResult>;
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
         let _ = workspace;
         Err(CowshedError::environment_missing(
@@ -209,6 +210,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Detach(_)
         | Command::Resize(_)
         | Command::Defrag(_)
+        | Command::Reseed(_)
         | Command::Rekey(_)
         | Command::Gc(_)
         | Command::Push(_)
@@ -271,6 +273,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Detach(_)
         | Command::Resize(_)
         | Command::Defrag(_)
+        | Command::Reseed(_)
         | Command::Rekey(_)
         | Command::Gc(_)
         | Command::Push(_)
@@ -325,7 +328,8 @@ fn binds_re_adoption_primary(command: &Command, resuming_re_adoption: bool) -> b
 /// journaled intent, so it adds nothing; a removal alone refuses one before opening, because
 /// its scope is the name. `gc` is store maintenance and finishes residue everywhere. `doctor`
 /// never mutates: its open finishes nothing and it reports what another open would finish; only
-/// `doctor --repair` opens the way every other verb does.
+/// `doctor --repair` opens the way other mutating verbs do. `reseed` inspects too: its operation
+/// must refuse unfinished create/fork/adopt work, never finish it before making that decision.
 fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
     fn named<'a>(names: impl IntoIterator<Item = Option<&'a str>>) -> RecoveryScope {
         RecoveryScope::Workspaces(
@@ -342,6 +346,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
             .map_err(|error| usage(error.to_string(), "use a valid workspace name"))?,
         Command::Gc(_) => RecoveryScope::Store,
         Command::Doctor(args) if !args.repair => RecoveryScope::Inspect,
+        Command::Reseed(_) => RecoveryScope::Inspect,
         Command::Fork(args) => named([args.source.as_deref(), Some(args.destination.as_str())]),
         Command::Move(args) => match &args.destination {
             MoveDestination::Workspace(destination) => {
@@ -756,6 +761,10 @@ impl CliService for ActorBridge {
 
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult> {
         self.coordinator()?.defragment(workspace).await
+    }
+
+    async fn reseed(&mut self, workspace: &str, from: &str, dry_run: bool) -> Result<ReseedResult> {
+        self.coordinator()?.reseed(workspace, from, dry_run).await
     }
 
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
@@ -1653,6 +1662,16 @@ where
                     previous.first_write_cost()
                 ))
                 .map_err(output_error)?;
+            Ok(success())
+        }
+        Command::Reseed(args) => {
+            let result = service
+                .reseed(&args.workspace, &args.from, args.dry_run)
+                .await?;
+            if !result.dry_run {
+                service.reconcile_gateway().await?;
+            }
+            emit_reseed_result(output, json, result)?;
             Ok(success())
         }
         Command::Rekey(args) => {
@@ -2989,6 +3008,56 @@ async fn resolve_detach_root(cli: &Cli) -> Result<PathBuf> {
     })?;
     let storage = host_storage().await?;
     resolve_session_project_root(storage.store(), workspace)
+}
+
+fn emit_reseed_result<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    json: bool,
+    result: ReseedResult,
+) -> Result<()> {
+    if result.dry_run {
+        let reduction = i128::from(result.previous_bytes) - i128::from(result.replacement_bytes);
+        output
+            .guidance(&format!(
+                "would discard workspace {} build volume {} ({} allocated bytes) and clone {}'s existing seed {} ({} allocated bytes estimated); estimated allocation reduction: {reduction:+} bytes; no changes made",
+                result.workspace,
+                result.previous_volume,
+                result.previous_bytes,
+                result.from,
+                result.seed,
+                result.replacement_bytes,
+            ))
+            .map_err(output_error)?;
+    } else {
+        output
+            .guidance(&format!(
+                "workspace {} build state replaced from {}'s existing seed {}: {} allocated bytes before, {} after; {} allocated image bytes reclaimed",
+                result.workspace,
+                result.from,
+                result.seed,
+                result.previous_bytes,
+                result.replacement_bytes,
+                result.freed_bytes,
+            ))
+            .map_err(output_error)?;
+    }
+    output
+        .guidance(if result.dry_run {
+            "source tree, HEAD, index, dirty and untracked files untouched; execution would discard live build-volume contents, missing incremental work rebuilds cold; no seed refreshed"
+        } else {
+            "source tree, HEAD, index, dirty and untracked files untouched; build-volume contents discarded, missing incremental work rebuilds cold; no seed refreshed"
+        })
+        .map_err(output_error)?;
+    output
+        .guidance("allocated image bytes are GC accounting, not unique physical bytes or a promise of physical free space: APFS clones share extents")
+        .map_err(output_error)?;
+    if json {
+        output.success(result).map_err(output_error)
+    } else {
+        output
+            .bare_line(result.freed_bytes.to_string().as_bytes())
+            .map_err(output_error)
+    }
 }
 
 fn emit_gc_candidates<W: Write, E: Write>(
@@ -4774,6 +4843,69 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn reseed_control_output_preserves_the_named_envelope_and_allocation_units() {
+        for dry_run in [false, true] {
+            for json in [false, true] {
+                for quiet in [false, true] {
+                    let result = ReseedResult {
+                        workspace: WorkspaceName::new("raven").unwrap(),
+                        from: WorkspaceName::main(),
+                        previous_volume: "old-volume".into(),
+                        seed: "main-seed".into(),
+                        replacement_volume: (!dry_run).then(|| "replacement-volume".into()),
+                        previous_bytes: 128,
+                        replacement_bytes: 256,
+                        freed_bytes: if dry_run { 0 } else { 128 },
+                        dry_run,
+                    };
+                    let expected = result.clone();
+                    let mut output = Output::new(Vec::new(), Vec::new(), quiet);
+                    emit_reseed_result(&mut output, json, result).expect("reseed output");
+                    let (stdout, stderr) = output.into_inner();
+                    if json {
+                        assert_eq!(stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+                        let envelope: cowshed_core::api::JsonEnvelope<ReseedResult> =
+                            serde_json::from_slice(&stdout).expect("named reseed envelope");
+                        assert_eq!(envelope, cowshed_core::api::JsonEnvelope::success(expected));
+                        let value: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                        assert_eq!(value.as_object().unwrap().len(), 2);
+                        assert_eq!(value["ok"], true);
+                        assert_eq!(value["result"].get("replacementVolume").is_none(), dry_run);
+                    } else {
+                        assert_eq!(
+                            stdout,
+                            if dry_run {
+                                b"0\n".to_vec()
+                            } else {
+                                b"128\n".to_vec()
+                            }
+                        );
+                    }
+                    let stderr = String::from_utf8(stderr).unwrap();
+                    if quiet {
+                        assert!(stderr.is_empty());
+                    } else {
+                        for fact in [
+                            "source tree, HEAD, index, dirty and untracked files untouched",
+                            "missing incremental work rebuilds cold",
+                            "no seed refreshed",
+                            "not unique physical bytes",
+                        ] {
+                            assert!(stderr.contains(fact), "{stderr}");
+                        }
+                        if dry_run {
+                            assert!(stderr.contains("estimated allocation reduction: -128 bytes"));
+                            assert!(stderr.contains("no changes made"));
+                        } else {
+                            assert!(stderr.contains("128 allocated image bytes reclaimed"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// The defect: a daemon of another build refused `cowshed rm`'s supervisor ensure *after* the
     /// removal had stopped the workspace's supervisor and journaled its intent, and the path that
     /// would put that back was refused too — "state restoration also failed", a workspace half
@@ -4798,6 +4930,8 @@ mod tests {
             &["attach", "raven"],
             &["detach", "raven"],
             &["resize", "raven", "200g"],
+            &["reseed", "raven"],
+            &["reseed", "raven", "--dry-run"],
             &["land", "raven", "--target", "main"],
             &["rebase", "raven"],
             &["push", "raven", "--branch", "review"],
@@ -6488,6 +6622,12 @@ mod tests {
         // reclaims nothing. Only an explicit repair opens the way every other verb does.
         assert_eq!(scope(&["doctor"]).unwrap(), RecoveryScope::Inspect);
         assert_eq!(scope(&["doctor", "--repair"]).unwrap(), names(&[]));
+        for argv in [
+            &["reseed", "raven"][..],
+            &["reseed", "raven", "--from", "lane", "--dry-run"],
+        ] {
+            assert_eq!(scope(argv).unwrap(), RecoveryScope::Inspect);
+        }
         assert_eq!(
             scope(&["rm", "gone"]).unwrap(),
             RecoveryScope::Removal(WorkspaceName::new("gone").expect("workspace name"))

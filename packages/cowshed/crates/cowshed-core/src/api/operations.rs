@@ -15,9 +15,9 @@ use super::dto::{
     GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts,
     JobTail, JobTailLimits, LandOptions, LandReport, MirrorInfo, OutputPublication,
     ProjectGrantDelta, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
-    RunSandboxMode, ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation, WorkspaceInfo,
-    WorkspacePath, WorkspaceTarget,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
+    ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation,
+    WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
 use super::process::{JobProcessEvent, JobProcessTree};
 use super::resources::{JobResourceSample, SampleInterval};
@@ -292,6 +292,8 @@ operations! {
     coordinator json "coordinator.resize" CoordinatorResize(ResizeRequest) -> ResizeResult;
     /// Rewrites a workspace's image contiguously.
     coordinator json "coordinator.defragment" CoordinatorDefragment(WorkspaceRequest) -> DefragmentResult;
+    /// Replaces a workspace's build volume with a clone of an existing target seed.
+    coordinator json "coordinator.reseed" CoordinatorReseed(ReseedRequest) -> ReseedResult;
     /// Detaches a workspace.
     coordinator json "coordinator.detach" CoordinatorDetach(WorkspaceRequest) -> EmptyResult;
     /// Assigns a workspace's gateway port slot.
@@ -547,6 +549,15 @@ pub struct ResizeRequest {
     pub workspace: WorkspaceName,
     pub capacity: String,
     pub volume: ResizeVolume,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReseedRequest {
+    pub repo_id: RepoId,
+    pub workspace: WorkspaceName,
+    pub from: WorkspaceName,
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -826,6 +837,32 @@ mod tests {
                 .code,
             crate::error::ErrorCode::Usage
         );
+    }
+
+    #[test]
+    fn reseed_is_coordinator_only_and_requires_explicit_target_and_preview_mode() {
+        let declaration = operation("coordinator.reseed").expect("reseed operation");
+        assert_eq!(declaration.scope, Scope::Coordinator);
+        assert_eq!(declaration.lane, Lane::Json);
+        let params = serde_json::json!({
+            "repoId": "acme/widget", "workspace": "raven", "from": "main", "dryRun": true
+        });
+        let request = OperationRequest::decode("coordinator.reseed", &params).expect("reseed");
+        let OperationRequest::CoordinatorReseed(reseed) = &request else {
+            panic!("expected reseed")
+        };
+        assert_eq!(reseed.workspace.as_str(), "raven");
+        assert_eq!(reseed.from, WorkspaceName::main());
+        assert!(reseed.dry_run);
+        assert_eq!(request.params().unwrap(), params);
+        for field in ["from", "dryRun"] {
+            let mut missing = params.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(OperationRequest::decode("coordinator.reseed", &missing).is_err());
+        }
+        let mut extra = params.clone();
+        extra["refreshSeed"] = serde_json::json!(true);
+        assert!(OperationRequest::decode("coordinator.reseed", &extra).is_err());
     }
 
     /// The latest tail names no cursor: the field is omitted, never `null`, both ways.

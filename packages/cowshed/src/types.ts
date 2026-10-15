@@ -93,6 +93,8 @@ export interface Coordinator {
   restore(workspace: string, label: string): Promise<void>;
   detach(workspace: string): Promise<void>;
   resize(workspace: string, capacity: string, volume: Api.ResizeVolume): Promise<Api.ResizeResult>;
+  /** Discard live build state for an existing seed clone; never refresh a seed or alter source files. */
+  reseed(workspace: string, from: string, dryRun: boolean): Promise<Api.ReseedResult>;
   remove(workspace: string, options?: Api.RemoveOptions): Promise<Api.RemoveReport>;
   gc(options?: Api.GcOptions): Promise<Api.GcReport>;
   doctor(): Promise<Api.DoctorReport>;

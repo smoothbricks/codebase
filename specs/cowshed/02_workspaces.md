@@ -312,6 +312,21 @@ unbound — its own open-time recovery may have finished the pending restore —
 between the last two removals leaves an unbound store directory holding only `checkout-root.json`; nothing bound reads
 it, and a later adoption's main image outranks it.
 
+## `cowshed reseed` — replace only accumulated build state
+
+`cowshed reseed <ws> [--from <target>] [--dry-run]` leaves the workspace's source and Git state in place and replaces
+only its live build volume with a clone of the target's existing latest seed (`main` by default). It is not a rebase,
+restore, re-adoption or seed refresh. Dirty tracked files, staged changes, untracked source, refs and HEAD stay as they
+are. The mounted workspace's excluded `.cowshed/build` link is the sole source-volume change. The next build pays a cold
+rebuild for work absent from that seed. A stale seed is used unchanged; an absent current-incarnation seed refuses.
+
+Before replacing anything it refuses an admitted job or land's build hold, a held lifecycle/image lock, an unfinished
+create/fork/adopt journal entry, or a filesystem holder of the old volume, naming the recorded operation or the holder's
+PID and command. It never kills a job or forces an unmount. Dry-run is read-only and reports per-image allocated bytes;
+those bytes are not a promise of unique APFS physical space because other clones and seeds can retain shared extents.
+The exact planning, writer-exclusion, publication and accounting contract lives in 16_build_volumes.md §Workspace
+reseed.
+
 ## `cowshed mv` — rename a workspace or move the checkout
 
 Renaming is a lifecycle operation, not a filesystem accident, for the same reason `rm` is: it has to own the unmount
@@ -1005,7 +1020,7 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
 
 A target fast-forwarded through plain Git instead is an **external land**: it forfeits carry, output restoration and
 adoption. The next fork (including `--ref` naming the target's current tree) automatically captures a live workspace at
-exactly that tree as the target's seed, under writer exclusion; no manual reseed or warm command exists. `doctor`
+exactly that tree as the target's seed, under writer exclusion; no manual seed-refresh or warm command exists. `doctor`
 reports `seed-tree-behind` and `target-moved-outside-land` when the recorded volumes do not match the tree.
 
 ### Lanes: `fork` and `--into`

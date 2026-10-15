@@ -1797,6 +1797,32 @@ export type RepositoryBinding = {
   readonly formerIdentities?: ReadonlyArray<RepoId>;
 };
 
+export type ReseedRequest = {
+  readonly repoId: RepoId;
+  readonly workspace: WorkspaceName;
+  readonly from: WorkspaceName;
+  readonly dryRun: boolean;
+};
+
+/**
+ * Replacing a workspace's live build state with a clone of an existing target seed.
+ *
+ * Byte counts are allocated image bytes, like GC accounting, not unique physical bytes:
+ * APFS clones may share extents. A preview estimates replacement allocation from the seed,
+ * names no replacement volume, and frees nothing. No seed is refreshed by this operation.
+ */
+export type ReseedResult = {
+  readonly workspace: WorkspaceName;
+  readonly from: WorkspaceName;
+  readonly previousVolume: string;
+  readonly seed: string;
+  readonly replacementVolume?: string;
+  readonly previousBytes: number & tags.Type<'uint64'>;
+  readonly replacementBytes: number & tags.Type<'uint64'>;
+  readonly freedBytes: number & tags.Type<'uint64'>;
+  readonly dryRun: boolean;
+};
+
 /**
  * Bytes of memory resident in RAM: what processes hold now, never memory charged to them
  * elsewhere (a cgroup's `memory.current` counts page cache and kernel charges too).

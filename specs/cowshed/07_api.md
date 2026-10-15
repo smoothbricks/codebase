@@ -15,11 +15,11 @@ workspace.** Authority is attached to explicit capabilities, never inferred from
   grants, and `attach`; it cannot detach, exec, open a shell, mutate lifecycle, or mint a worker capability.
 - **`WorkspaceHandle`** — a worker's non-escalating capability over exactly one workspace: exec, shell, job control,
   checkpoint subject to controller-configured checkpoint quotas, push, and read-only grant inspection. It has no
-  grant/revoke, restore/destroy/rebase/land/gc, repo-mirror, or cross-workspace access.
+  grant/revoke, restore/destroy/rebase/land/gc/reseed, repo-mirror, or cross-workspace access.
 - **`Coordinator`** — the sole project mutation, diagnostics, and cross-workspace authority: adopt/create/fork,
-  grant/revoke, restore/destroy/rebase/land, garbage collection, repository mirroring, doctor, slot assignment,
-  checkpoint-quota policy, and minting one-workspace handles. A trusted unsandboxed controller holds it; workers never
-  do.
+  grant/revoke, restore/destroy/rebase/land, build-volume reseed, garbage collection, repository mirroring, doctor, slot
+  assignment, checkpoint-quota policy, and minting one-workspace handles. A trusted unsandboxed controller holds it;
+  workers never do.
 
 `CoordinatorToken` is an affine, opaque, non-serializable proof acquired only by consuming a controller-provided
 inherited Unix stream descriptor. Acquisition validates that the descriptor is a connected socket owned by the current
@@ -504,6 +504,8 @@ impl Coordinator {
     pub async fn land(&self, ws: &str, into: Option<&WorkspaceRef>, opts: LandOptions) -> Result<LandReport, CowshedError>;
     pub async fn restore(&self, ws: &str, label: &str) -> Result<(), CowshedError>;
     pub async fn detach(&self, ws: &str) -> Result<EmptyResult, CowshedError>;
+    /// Clone an existing target seed into a new live build volume; never refresh a seed or alter source Git state.
+    pub async fn reseed(&self, workspace: &str, from: &str, dry_run: bool) -> Result<ReseedResult, CowshedError>;
     pub async fn assign_slot(&self, ws: &str, slot: u32) -> Result<(), CowshedError>;
     pub async fn destroy(&self, ws: &str, opts: RemoveOptions) -> Result<(), CowshedError>;
     pub async fn gc(&self, opts: GcOptions) -> Result<GcReport, CowshedError>;
@@ -698,6 +700,40 @@ camel-case, but `ErrorCode` values are taxonomy tokens: every adapter uses the s
 Public request/result and controller-commitment definitions live in `cowshed_core::api::dto`; the protected
 `JobArtifactRecord`/manifest/record envelope and Arrow projections live in `cowshed_core::storage::job_artifact` and
 reuse those DTOs. Serde uses `camelCase`, documented enum strings, and omission rather than `null`.
+
+### Build-volume reseed
+
+`coordinator.reseed` is a coordinator-only, JSON-only operation:
+`ReseedRequest { repoId: RepoId, workspace: WorkspaceName, from: WorkspaceName, dryRun: bool } -> ReseedResult`. The CLI
+supplies `from: "main"` by default; protocol callers explicitly name the target and preview mode. No worker,
+workspace-ref or project-discovery capability serves it. Rust `Coordinator::reseed` and the TypeScript coordinator's
+`reseed(workspace, from, dryRun)` use the same operation and result.
+
+`ReseedResult` is the named core DTO with `workspace`, `from`, `previousVolume`, `seed`, optional `replacementVolume`,
+`previousBytes`, `replacementBytes`, `freedBytes`, and `dryRun`. Preview omits `replacementVolume`, observes the old
+allocated image bytes, estimates replacement bytes from the seed and frees zero. Execution reports the actual new image
+allocation and removed old image allocation. These counts use GC allocation accounting, not unique physical bytes; APFS
+shared extents mean neither the counts nor their signed difference promise physical free space.
+
+The operation discards only live build-volume contents and atomically replaces the excluded `.cowshed/build` link.
+Source files, HEAD, index, dirty and untracked files remain untouched. Missing incremental work rebuilds cold. Only the
+target's current-incarnation latest existing seed may be cloned: a stale seed is used unchanged; an absent seed refuses.
+No seed is refreshed, written or deleted, including the destination's own seed. Held jobs/land work, filesystem holders,
+lifecycle/image locks and unfinished create/fork/adopt work refuse; opening for this operation inspects rather than
+replays that work. The storage and publication rules remain 16_build_volumes.md §One link per checkout, §Targets and
+seeds and §Garbage collection.
+
+### Generated surfaces
+
+Canonical declarations in `cowshed-core/src/api/dto.rs`, `operations.rs` and capability authority generate the public
+protocol projections; adapters never maintain request/result field copies. Run `bun nx run cowshed:api-generate` from
+the repository root. Its declared generator writes `src/api.generated.ts`, `src/validators.generated.ts`,
+`src/native.generated.ts`, `src/declaration-ir.generated.ts`, `crates/cowshed-core/src/api/served.generated.rs` and
+`crates/cowshed-napi/src/operations.generated.rs` under `packages/cowshed`. The underlying write command is
+`packages/cowshed/.cache/api-generator/cowshed-api-gen write packages/cowshed`; the target builds that canonical
+generator first when needed. Generated files are changed only by this generator. Handwritten TypeScript capability
+facades call the generated adapters with the generated DTO types; they do not redefine protocol records. The operation
+corpus and CLI/N-API parity samples cover the same operation table, including coordinator-only reseed.
 
 ### Job monitoring
 

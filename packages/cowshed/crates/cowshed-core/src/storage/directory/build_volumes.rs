@@ -447,6 +447,40 @@ impl DirectoryExecutionHost {
         }
     }
 
+    /// Seal the still-linked payload under its caller's exclusive admission claim
+    /// (16_build_volumes.md, "Targets and seeds"). This is an idle tree census and an unbind,
+    /// not a physical detach: the payload, record, mark, hold and empty mountpoint survive. A
+    /// failed unbind restores the previous binding, reporting both errors if restoration fails.
+    pub fn detach_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+    ) -> Result<(), ApfsStorageError> {
+        let id = claim.id();
+        let image = layout.image(id);
+        self.require_store_image(&image)?;
+        let mount = layout.mount(id);
+        let was_bound = Self::build_volume_bound(layout, id)?;
+        let open = holders_of(&image)?;
+        if !open.is_empty() {
+            return Err(ApfsStorageError::BuildVolumeHeld {
+                hold: layout.hold_path(id),
+                image,
+                holds: Vec::new(),
+                open,
+            });
+        }
+        match unbind(&image, &mount, cowshed_apfs::DetachIntent::WhenIdle) {
+            Ok(()) => Ok(()),
+            Err(primary) if was_bound => crate::storage::apfs::combine_cleanup(
+                "detach and restore claimed build volume",
+                primary,
+                bind(&image, &mount),
+            ),
+            Err(primary) => Err(primary),
+        }
+    }
+
     /// Unbind and delete the volume `claim` claimed, with its record, mark, hold and
     /// mountpoint, journaled in the project's deletion log. A process that still has anything
     /// open inside the tree refuses the release before anything changes: there is no forced
@@ -640,5 +674,128 @@ mod clock_tests {
             tree_change_clock(&root).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+}
+
+#[cfg(test)]
+mod detach_tests {
+    use super::*;
+    use crate::repository::{ProjectPaths, RepoId};
+    use crate::storage::apfs::ApfsSubstrateConfig;
+
+    #[test]
+    fn claimed_build_detach_refuses_holders_and_preserves_payload_metadata_and_claim() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-directory-build-detach-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let store = root.join("store");
+        let host =
+            DirectoryExecutionHost::new(ApfsSubstrateConfig::new(&store, root.join("checkout")))
+                .unwrap();
+        let project = ProjectPaths::with_mount_root(
+            &store,
+            root.join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        let id = BuildVolumeId::mint();
+        let image = layout.image(&id);
+        fs::create_dir_all(&image).unwrap();
+        fs::write(image.join("warm"), b"old build state\n").unwrap();
+        layout
+            .write_record(
+                &id,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Linked {
+                        checkout: WorkspaceName::main(),
+                    },
+                ),
+            )
+            .unwrap();
+        host.mark_seed_written(&layout, &id, SystemTime::now())
+            .unwrap();
+        let mark = written_mark_path(&image);
+        let mark_bytes = fs::read(&mark).unwrap();
+        let record = fs::read(layout.record(&id)).unwrap();
+        let payload_inode = fs::metadata(&image).unwrap().ino();
+        let mount = host.mount_build_volume(&layout, &id).unwrap();
+        let claim = layout.claim_release(&id).unwrap().unwrap();
+        let hold_inode = fs::metadata(layout.hold_path(&id)).unwrap().ino();
+        let open = fs::File::open(mount.join("warm")).unwrap();
+        let me = i32::try_from(std::process::id()).unwrap();
+
+        let error = host
+            .detach_claimed_build_volume(&layout, &claim)
+            .expect_err("an unmanaged tree holder must refuse the unbind");
+        let ApfsStorageError::BuildVolumeHeld { open: holders, .. } = &error else {
+            panic!("the refusal must name tree holders: {error:?}");
+        };
+        assert!(holders.iter().any(|holder| holder.pid == me), "{holders:?}");
+        assert!(error.to_string().contains(&format!("pid {me} (")));
+        assert_eq!(observed_mount(&image).unwrap(), Some(mount.clone()));
+        assert_eq!(fs::read(mount.join("warm")).unwrap(), b"old build state\n");
+        assert!(layout.hold(&id).is_err());
+        // Exercise the unbind's own census too: a holder arriving after the first census
+        // must have the same typed refusal, without parsing a host-error string.
+        let late = unbind(&image, &mount, cowshed_apfs::DetachIntent::WhenIdle).unwrap_err();
+        let ApfsStorageError::BuildVolumeHeld {
+            image: refused_image,
+            hold,
+            open: holders,
+            ..
+        } = &late
+        else {
+            panic!("the unbind census must preserve holder taxonomy: {late:?}");
+        };
+        assert_eq!(refused_image, &image);
+        assert_eq!(hold, &layout.hold_path(&id));
+        assert!(holders.iter().any(|holder| holder.pid == me), "{holders:?}");
+        assert!(late.to_string().contains(&format!("pid {me} (")));
+        assert_eq!(observed_mount(&image).unwrap(), Some(mount.clone()));
+        drop(open);
+
+        for _ in 0..2 {
+            host.detach_claimed_build_volume(&layout, &claim).unwrap();
+            assert_eq!(observed_mount(&image).unwrap(), None);
+            assert_eq!(fs::metadata(&image).unwrap().ino(), payload_inode);
+            assert_eq!(fs::read(image.join("warm")).unwrap(), b"old build state\n");
+            assert_eq!(fs::read(layout.record(&id)).unwrap(), record);
+            assert_eq!(fs::read(&mark).unwrap(), mark_bytes);
+            assert_eq!(
+                fs::metadata(layout.hold_path(&id)).unwrap().ino(),
+                hold_inode
+            );
+            assert!(matches!(
+                mount_point_state(&mount).unwrap(),
+                MountPointState::Vacant
+            ));
+            assert!(
+                layout.hold(&id).is_err(),
+                "the borrowed claim still fences admission"
+            );
+        }
+        host.mount_build_volume(&layout, &id).unwrap();
+        assert_eq!(fs::read(mount.join("warm")).unwrap(), b"old build state\n");
+        host.detach_claimed_build_volume(&layout, &claim).unwrap();
+        assert_eq!(host.release_claimed(&layout, claim).unwrap(), None);
+        for path in [
+            image,
+            layout.record(&id),
+            mark,
+            layout.hold_path(&id),
+            mount,
+        ] {
+            assert!(
+                !path.exists(),
+                "ordinary release removes {}",
+                path.display()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }
