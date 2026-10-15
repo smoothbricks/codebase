@@ -70,8 +70,9 @@
     result, so the reader needs no second run to understand it.
 
 16. **Pay for computation once; keep what it proves.** Prefer work that leaves reusable structure: one structure, many
-    consumers. Derived state (indexes, envelopes, checkpoints, caches) is a byproduct, never a second store; units name
-    their authoritative source and why no duplicate store exists. Assess every unit through this byproduct lens.
+    consumers; compute order once. Derived state (indexes, envelopes, checkpoints, caches) is a byproduct, never a
+    second store; units name their authoritative source and why no duplicate store exists. Assess every unit through
+    this byproduct lens.
 17. **First remove work; only cache in the end.** Measure and optimize the real computation before memoizing it; a cache
     is a last-mile byproduct of an already-fast path, never a substitute for cheaper work.
 
