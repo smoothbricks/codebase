@@ -2074,18 +2074,26 @@ pub(crate) fn plan(
         }
         let record = match layout.read_record_present(&id) {
             Ok(Some(record)) => record,
-            Ok(None) if links.detached.is_empty() && links.creating.is_empty() => {
-                doomed.push((id, GcReason::UnrecordedBuildVolume, None));
-                continue;
-            }
-            Ok(None) => {
+            // An image with no record is an interrupted creation — a mint that died before its
+            // record was written — so no checkout and no forming verb names it, and a detached or
+            // still-forming workspace must not block its collection: only a volume a forming verb
+            // recorded is deferred. A create or fork writes its PendingFence record before its
+            // payload appears, so its volumes are never unrecorded and are deferred by the
+            // Creating arm below. The one exception is an adopt or re-adopt of main mid-mint: its
+            // first volume exists before its record does, so while main is forming an unrecorded
+            // image may still be that mint and waits for the adopt to finish.
+            Ok(None) if links.creating.contains(&WorkspaceName::main()) => {
                 plan.deferred.push((
                     id,
                     Deferral::Unrecorded {
-                        detached: links.detached.iter().cloned().collect(),
+                        detached: Vec::new(),
                         creating: links.creating.iter().cloned().collect(),
                     },
                 ));
+                continue;
+            }
+            Ok(None) => {
+                doomed.push((id, GcReason::UnrecordedBuildVolume, None));
                 continue;
             }
             Err(error) => {
@@ -3253,9 +3261,10 @@ mod tests {
 
     /// A detached workspace's link cannot be read, so a record naming it proves nothing: the
     /// volume is deferred with that workspace named, never counted reachable or deleted. An
-    /// image without a record may be any detached workspace's, so it waits for them too.
+    /// image without a record is named by no detached workspace, so it is an interrupted
+    /// creation and is collected — a detached shed does not block what it does not name.
     #[test]
-    fn a_detached_checkout_defers_what_it_may_link() {
+    fn a_detached_checkout_defers_only_what_it_names() {
         let store = Store::new();
         let named = store.volume(linked("topic"));
         let unrecorded = store.image();
@@ -3263,54 +3272,32 @@ mod tests {
             detached: [name("topic")].into_iter().collect(),
             ..Links::default()
         };
-        let mut plan = plan(&store.layout, &store.layout.list().unwrap(), &links).unwrap();
-        plan.deferred.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut expected = vec![
-            (named, Deferral::DetachedCheckout(name("topic"))),
-            (
-                unrecorded,
-                Deferral::Unrecorded {
-                    detached: vec![name("topic")],
-                    creating: Vec::new(),
-                },
-            ),
-        ];
-        expected.sort_by(|left, right| left.0.cmp(&right.0));
-        assert_eq!(plan.deferred, expected);
-        assert_eq!(doomed(&plan), []);
-        assert!(plan.deferred.iter().all(|(_, deferral)| match deferral {
-            Deferral::DetachedCheckout(_) => deferral.is_routine(),
-            _ => !deferral.is_routine(),
-        }));
-        // With nothing detached, the same unrecorded image is an interrupted creation.
-        let plan = super::plan(
-            &store.layout,
-            &store.layout.list().unwrap(),
-            &Links::default(),
-        )
-        .unwrap();
+        let plan = plan(&store.layout, &store.layout.list().unwrap(), &links).unwrap();
+        assert_eq!(
+            plan.deferred,
+            [(named, Deferral::DetachedCheckout(name("topic")))]
+        );
+        assert_eq!(
+            doomed(&plan),
+            [(unrecorded, GcReason::UnrecordedBuildVolume)]
+        );
         assert!(
-            doomed(&plan).contains(&(
-                plan.doomed
-                    .iter()
-                    .find(|doomed| doomed.reason == GcReason::UnrecordedBuildVolume)
-                    .unwrap()
-                    .id
-                    .clone(),
-                GcReason::UnrecordedBuildVolume
-            )),
-            "{plan:?}"
+            plan.deferred
+                .iter()
+                .all(|(_, deferral)| deferral.is_routine())
         );
     }
 
     /// A create or fork forks its volume and seed into a staged checkout no other process can
     /// read, and an adopt mints main's first volume beside main's image, before the workspace
-    /// exists. Until its intent completes, whatever may be its own — its live volume, its seed,
-    /// an image still being cloned or minted for it — is deferred, never collected. Another
-    /// process's `rm` collected exactly these, and the new workspace's mount then refused a link
-    /// to a volume that was gone.
+    /// exists. Until its intent completes, whatever it recorded as its own — its live volume and
+    /// its seed — is deferred, never collected. An image without a record is named by no forming
+    /// verb, so it is collected and a forming shed does not block what it does not name; only an
+    /// adopt of main mid-mint defers an unrecorded image. Another process's `rm` collected the
+    /// forming shed's own volumes, and the new workspace's mount then refused a link to a volume
+    /// that was gone.
     #[test]
-    fn a_forming_workspace_defers_its_volume_seed_and_unrecorded_clones() {
+    fn a_forming_workspace_defers_only_the_volumes_it_names() {
         let store = Store::new();
         let live = store.volume(linked("lane"));
         let seed = store.volume(BuildVolumeRole::Seed {
@@ -3326,28 +3313,21 @@ mod tests {
         let images = store.layout.list().unwrap();
         let mut plan = plan(&store.layout, &images, &links).unwrap();
         plan.deferred.sort_by(|left, right| left.0.cmp(&right.0));
-        let unrecorded = Deferral::Unrecorded {
-            detached: Vec::new(),
-            creating: vec![name("lane")],
-        };
         let mut expected = vec![
             (live.clone(), Deferral::Creating(name("lane"))),
             (seed.clone(), Deferral::Creating(name("lane"))),
-            (cloning.clone(), unrecorded.clone()),
         ];
         expected.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(plan.deferred, expected);
-        assert_eq!(
-            doomed(&plan),
-            [(garbage.clone(), GcReason::UnlinkedBuildVolume)]
-        );
+        let mut collected = doomed(&plan);
+        collected.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut expected_doomed = vec![
+            (cloning.clone(), GcReason::UnrecordedBuildVolume),
+            (garbage.clone(), GcReason::UnlinkedBuildVolume),
+        ];
+        expected_doomed.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(collected, expected_doomed);
         assert!(Deferral::Creating(name("lane")).is_routine());
-        assert!(!unrecorded.is_routine());
-        assert_eq!(
-            unrecorded.to_string(),
-            "it has no record, and the links of still-forming lane (until their create, fork or \
-             adopt finishes) cannot be read"
-        );
         // Without the forming workspace, all three read as garbage: the collection that left
         // a new workspace linking a volume nobody owned.
         let mut doomed = doomed(&super::plan(&store.layout, &images, &Links::default()).unwrap());
