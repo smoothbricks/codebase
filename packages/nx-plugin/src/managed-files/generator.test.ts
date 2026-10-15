@@ -227,11 +227,15 @@ describe('managed-files generator', () => {
     // inside a workspace with inherited Prettier settings.
     flushChanges(root, workspace().listChanges());
     const first = new FsTree(root, false);
-    await generate(first);
+    const initialResults = await generateManagedFiles(first, projects, new Map());
+    assertNoManagedConflicts(initialResults);
+    const initialTargets = initialResults.map((result) => result.target).sort();
+    expect(initialTargets).toContain('tooling/devenv');
     flushChanges(root, first.listChanges());
     const second = new FsTree(root, false);
     const results = await generateManagedFiles(second, projects);
     assertNoManagedConflicts(results);
+    expect(results.map((result) => result.target).sort()).toEqual(initialTargets);
     expect(second.listChanges()).toEqual([]);
     expect(results.every((result) => result.action === 'unchanged' || result.action === 'skipped')).toBe(true);
     expect(readFileSync(join(root, 'tooling/devenv'), 'utf8')).toBe(first.read('tooling/devenv', 'utf8') ?? '');

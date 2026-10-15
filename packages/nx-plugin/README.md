@@ -1327,6 +1327,10 @@ The plugin owns the packaged templates, pure rendering and content-preservation 
 files through Nx `Tree` and uses Nx's resolved project graph for inferred targets. The CLI only supplies the filesystem
 and process boundary. There is no separate serialized change plan.
 
+The idempotence witness compares the second pass's managed-target roster with the populated first pass before checking
+unchanged actions, an empty staged diff and retained bytes. An empty result is not evidence that generation inspected
+the managed files.
+
 Files with a `# smoo-local` tail or `# smoo-local-begin` / `# smoo-local-end` blocks retain those sections. Matching
 source symlinks are preserved; conflicting local blocks and broken or external links are reported instead of
 overwritten. The generator does not remove a repository-owned file when a capability is disabled.
