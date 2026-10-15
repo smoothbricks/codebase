@@ -6479,31 +6479,157 @@ mod tests {
     /// its own outcome rather than a deadline failure.
     #[test]
     fn a_slow_disk_image_command_outliving_its_deadline_is_waited_for_never_killed() {
+        use cowshed_os::fork_lock::Fenced;
+        use std::io::{Read, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        struct FifoDirectory(PathBuf);
+        impl Drop for FifoDirectory {
+            fn drop(&mut self) {
+                if let Err(error) = fs::remove_dir_all(&self.0) {
+                    eprintln!(
+                        "remove owned disk-child FIFOs {}: {error}",
+                        self.0.display()
+                    );
+                }
+            }
+        }
+        struct ReleaseOnDrop<'a>(Option<&'a File>);
+        impl Drop for ReleaseOnDrop<'_> {
+            fn drop(&mut self) {
+                if let Some(mut pipe) = self.0.take()
+                    && let Err(error) = pipe.write_all(b"cancel\n")
+                {
+                    eprintln!("release owned disk child during cleanup: {error}");
+                }
+            }
+        }
+
+        let directory = temp_path("disk-child-warnings", "fifo");
+        fs::create_dir(&directory).expect("create owned disk-child FIFO directory");
+        let directory = FifoDirectory(directory);
+        let ready_path = directory.0.join("ready");
+        let release_path = directory.0.join("release");
+        for path in [&ready_path, &release_path] {
+            let name =
+                std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("FIFO path");
+            // SAFETY: the NUL-terminated path is in this test's owned directory.
+            assert_eq!(
+                unsafe { libc::mkfifo(name.as_ptr(), 0o600) },
+                0,
+                "create {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            );
+        }
+        let reader = |path: &Path| {
+            Fenced::new(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path)
+                    .expect("open owned FIFO reader"),
+            )
+        };
+        let ready = reader(&ready_path);
+        let _release_reader = reader(&release_path);
+        let release = Fenced::new(
+            fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&release_path)
+                .expect("open owned child release writer"),
+        );
+
         let deadline = Duration::from_millis(10);
         assert!(matches!(
             DeadlinePolicy::for_request(&disk_image_request(), deadline).past_deadline,
             PastDeadline::WarnEvery(_)
         ));
-        // The real policy at a warning interval a test can outlive many times over.
         let policy = DeadlinePolicy {
             deadline,
             past_deadline: PastDeadline::WarnEvery(Duration::from_millis(50)),
         };
-        let started = std::time::Instant::now();
-        let mut warnings = 0;
-        let output = SystemCommandRunner::run_unleased(
-            &CommandRequest::new("/bin/sh", ["-c", "sleep 1; printf done; exit 3"]),
-            ChildInput::Null,
-            policy,
-            &mut |_| warnings += 1,
-        )
-        .expect("a slow disk-image command ends on its own, never at a deadline");
-        assert!(started.elapsed() >= Duration::from_secs(1));
+        let request = CommandRequest::new(
+            "/bin/sh",
+            [
+                OsStr::new("-c"),
+                OsStr::new(
+                    "exec 3<\"$2\" || exit 4; printf r >\"$1\" || exit 4; \
+                     IFS= read -r release <&3 || exit 4; \
+                     [ \"$release\" = release ] || exit 4; printf done; exit 3",
+                ),
+                OsStr::new("disk-image-child"),
+                ready_path.as_os_str(),
+                release_path.as_os_str(),
+            ],
+        );
+        let (result, warnings, readiness) = std::thread::scope(|scope| {
+            // This guard releases even on unwind, before the scope joins the waiter. The writer
+            // stays open outside the scope so a child still starting can open and read its FIFO.
+            let mut cleanup = ReleaseOnDrop(Some(&release));
+            let (warned, observed) = std::sync::mpsc::channel();
+            let running = scope.spawn(move || {
+                let mut warnings = 0;
+                let result = SystemCommandRunner::run_unleased(
+                    &request,
+                    ChildInput::Null,
+                    policy,
+                    &mut |_| {
+                        warnings += 1;
+                        // Disconnect means the observer is done or unwinding; never abandon the child.
+                        let _ = warned.send(());
+                    },
+                );
+                (result, warnings)
+            });
+            let mut observations = 0;
+            let readiness = loop {
+                if observed.recv().is_err() {
+                    break Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "disk-child waiter ended before five warnings and child readiness",
+                    ));
+                }
+                observations += 1;
+                if observations < 5 {
+                    continue;
+                }
+                let mut token = [0];
+                match (&*ready).read(&mut token) {
+                    Ok(1) if token == [b'r'] => break Ok(()),
+                    Ok(0) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Ok(_) => {
+                        break Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unexpected disk-child readiness token {token:?}"),
+                        ));
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
+            let released = if readiness.is_ok() {
+                let released = (&*release).write_all(b"release\n");
+                if released.is_ok() {
+                    cleanup.0 = None;
+                }
+                released
+            } else {
+                Ok(())
+            };
+            drop(cleanup);
+            let (result, warnings) = running.join().expect("join the owned disk-child waiter");
+            (result, warnings, readiness.and(released))
+        });
+        let output =
+            result.expect("a slow disk-image command ends on its own, never at a deadline");
+        readiness.expect("five actual warnings and child readiness precede release");
         assert_eq!(output.status, ProcessStatus::Exit(3));
         assert_eq!(output.stdout, b"done");
         assert!(
             warnings >= 5,
-            "only {warnings} warnings across a second past a 10 ms deadline"
+            "only {warnings} warnings before child release"
         );
     }
 
