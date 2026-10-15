@@ -2,11 +2,12 @@ import { describe, expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
+import { createInterface } from 'node:readline';
+import { awaitExit, ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
 import {
   COWSHED_EXECUTABLE_ENV,
   createHostCommands,
@@ -108,6 +109,74 @@ describe('RAM temp volume output parsing', () => {
   });
 });
 
+/** A real facade boundary: owns a detached stand-in, kills only SAFE children, and waits for reap.
+ * The control socket gates facade exit after reap; protected output stays in owned files.
+ */
+async function ownedDiskFacadeFixture() {
+  const directory = await ownedSocketDirectory('rt-', 'facade.sock');
+  const socketPath = join(directory, 'facade.sock');
+  const executable = join(directory, 'cowshed');
+  const server = createServer();
+  const connected = new Promise<Socket>((resolve) => server.once('connection', resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolve);
+  });
+  const session = connected.then((socket) => ({
+    socket,
+    lines: createInterface({ input: socket })[Symbol.asyncIterator](),
+  }));
+  let facadePid: number | undefined;
+  await writeFile(
+    executable,
+    `#!${process.execPath}\n` +
+      "import { spawn } from 'node:child_process';\nimport { once } from 'node:events';\nimport { closeSync, openSync } from 'node:fs';\nimport { createConnection } from 'node:net';\nimport { dirname, join } from 'node:path';\nimport { createInterface } from 'node:readline';\n\nconst startedAt = performance.now();\nconst argv = process.argv.slice(2);\nconst control = createConnection(argv.at(-1));\nawait once(control, 'connect');\nconst tool = argv[1];\nconst safe = argv[2] === '--deadline-ms';\nconst budget = safe ? Number(argv[3]) : undefined;\nconst native = argv.slice(safe ? 5 : 3);\nconst image = tool === 'hdiutil' || (tool === 'diskutil' && (native[0] === 'image' || native[0] === 'eject'));\nif (argv[0] !== 'disk-command' || (tool !== 'hdiutil' && tool !== 'diskutil') ||\n    argv[safe ? 4 : 2] !== '--' || safe === image ||\n    (safe && (!Number.isSafeInteger(budget) || budget <= 0))) {\n  control.end('invalid facade request\\n');\n  process.exitCode = 2;\n} else {\n  const mode = native[1];\n  const tail = mode === 'exit' ? 'exit 7' : mode === 'signal' ? 'kill -TERM $$' : 'exec sleep 600';\n  const files = image ? [openSync(join(dirname(argv.at(-1)), 'stdout'), 'w'), openSync(join(dirname(argv.at(-1)), 'stderr'), 'w')] : [];\n  const child = spawn('/bin/sh', ['-c', 'printf \"owned stdout\\\\n\"; printf \"owned stderr\\\\n\" >&2; printf ready >&3; ' + tail], {\n    detached: true,\n    stdio: ['ignore', files[0] ?? 'pipe', files[1] ?? 'pipe', 'pipe'],\n  });\n  for (const fd of files) closeSync(fd);\n  const ended = once(child, 'close');\n  if (!image) {\n    child.stdout.on('data', (chunk) => process.stdout.write(chunk));\n    child.stderr.on('data', (chunk) => process.stderr.write(chunk));\n  }\n  let release;\n  const finished = new Promise((resolve) => { release = resolve; });\n  let reaped = false;\n  const commands = createInterface({ input: control });\n  commands.on('line', (line) => {\n    if (line === 'cleanup') {\n      if (!reaped && child.exitCode === null && child.signalCode === null) process.kill(-child.pid, 'SIGKILL');\n      release();\n    } else if (line === 'finish') {\n      release();\n    } else if (line === 'inspect') {\n      process.kill(child.pid, 0);\n      control.write('custody ' + child.pid + '\\n');\n    }\n  });\n  let expired = false;\n  const timer = safe ? setTimeout(() => {\n    expired = true;\n    control.write('deadline ' + budget + '\\n');\n    process.kill(-child.pid, 'SIGKILL');\n  }, Math.max(0, budget - (performance.now() - startedAt))) : undefined;\n  await Promise.race([\n    once(child.stdio[3], 'data'),\n    ended.then(() => { throw new Error('owned child ended before readiness'); }),\n  ]);\n  control.write('started ' + process.pid + ' ' + child.pid + '\\n');\n  const [code, signal] = await ended;\n  reaped = true;\n  clearTimeout(timer);\n  control.write('reaped ' + child.pid + ' ' + code + ' ' + signal + '\\n');\n  if (expired) process.stderr.write('owned child ' + child.pid + ' terminated by ' + signal + ' and reaped after ' + budget + ' ms deadline\\n');\n  await finished;\n  commands.close();\n  control.end();\n  await once(control, 'close');\n  if (mode === 'signal') process.kill(process.pid, 'SIGTERM');\n  else process.exitCode = expired ? 1 : code ?? 1;\n}\n",
+    { mode: 0o755 },
+  );
+  async function event(): Promise<string> {
+    const { lines } = await session;
+    const next = await lines.next();
+    if (next.done) throw new Error('owned disk facade closed before the expected event');
+    return next.value;
+  }
+  return {
+    directory,
+    executable,
+    socketPath,
+    event,
+    async started() {
+      const line = await event();
+      const match = /^started (\d+) (\d+)$/.exec(line);
+      if (match === null) throw new Error(`owned disk facade did not start its child: ${line}`);
+      facadePid = Number(match[1]);
+      return Number(match[2]);
+    },
+    async send(command: 'finish' | 'inspect') {
+      const { socket } = await session;
+      socket.write(`${command}\n`);
+    },
+    async cleanup() {
+      try {
+        const { socket } = await session;
+        if (!socket.destroyed) {
+          const closed = once(socket, 'close');
+          socket.write('cleanup\n');
+          await closed;
+        }
+        if (facadePid !== undefined) {
+          await awaitExit(
+            [{ pid: facadePid, ppid: process.pid, stat: 'S', command: executable }],
+            'owned disk facade cleanup',
+          );
+        }
+      } finally {
+        await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
 describe('RAM temp volume on this host', () => {
   it('kills a deadlined command together with everything it spawned', async () => {
     // Ordinary helpers remain deadline-bound; disk-image tools are owned by cowshed instead.
@@ -121,57 +190,126 @@ describe('RAM temp volume on this host', () => {
     expect(state.status === 1 || state.stdout.trim().startsWith('Z')).toBe(true);
   });
 
-  it('routes both disk tools through cowshed without shell interpolation', () => {
-    for (const tool of ['hdiutil', 'diskutil']) {
-      for (const file of [tool, `/usr/sbin/${tool}`]) {
-        expect(diskCommand(file, ['attach', '/image with spaces; echo unsafe'])).toEqual([
-          'disk-command',
-          tool,
-          '--',
-          'attach',
-          '/image with spaces; echo unsafe',
-        ]);
+  it('routes disk tools and their lifetime together without shell interpolation', () => {
+    const target = '/image with spaces; echo unsafe';
+    for (const file of ['hdiutil', '/usr/bin/hdiutil']) {
+      expect(diskCommand(file, ['attach', target], 300)).toEqual({
+        args: ['disk-command', 'hdiutil', '--', 'attach', target],
+        lifetime: 'stop-wait',
+      });
+    }
+    for (const file of ['diskutil', '/usr/sbin/diskutil']) {
+      for (const verb of ['image', 'eject']) {
+        expect(diskCommand(file, [verb, target], 300)).toEqual({
+          args: ['disk-command', 'diskutil', '--', verb, target],
+          lifetime: 'stop-wait',
+        });
+      }
+      for (const verb of ['info', 'apfs', 'mount', 'unmount', 'Image']) {
+        expect(diskCommand(file, [verb, target], 300)).toEqual({
+          args: ['disk-command', 'diskutil', '--deadline-ms', '300', '--', verb, target],
+          lifetime: 'facade-owned',
+        });
       }
     }
-    expect(diskCommand('/sbin/umount', ['/volume'])).toBeNull();
+    expect(diskCommand('/sbin/umount', ['/volume'], 300)).toBeNull();
   });
 
-  it('bounds its wait without killing the cowshed disk-command owner', async () => {
-    const directory = await ownedSocketDirectory('rt-', 'fake-cowshed');
-    const fake = join(directory, 'cowshed');
-    await writeFile(fake, '#!/bin/sh\necho $$\nprintf "%s\\n" "$@"\nsleep 60\n', { mode: 0o755 });
-    let pid = 0;
+  it('waits past the SAFE deadline for actual owned child reap and the facade terminal exit', async () => {
+    const fixture = await ownedDiskFacadeFixture();
+    let settled = false;
+    const result = createHostCommands(undefined, undefined, undefined, fixture.executable)
+      .run('/usr/sbin/diskutil', ['info', 'overrun', fixture.socketPath], 300)
+      .then((output) => {
+        settled = true;
+        return output;
+      });
     try {
-      const started = Date.now();
-      const result = await createHostCommands(300, undefined, undefined, fake).run('/usr/bin/hdiutil', [
-        'attach',
-        '/image with spaces',
-      ]);
-      expect(Date.now() - started).toBeLessThan(10_000);
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toMatch(/^no answer within 300 ms; cowshed command \d+ left running, not killed/);
-      const [processId, ...args] = result.stdout.trim().split('\n');
-      pid = Number(processId);
-      expect(args).toEqual(['disk-command', 'hdiutil', '--', 'attach', '/image with spaces']);
-      expect(() => process.kill(pid, 0)).not.toThrow();
+      const pid = await fixture.started();
+      expect(await fixture.event()).toBe('deadline 300');
+      expect(await fixture.event()).toBe(`reaped ${pid} null SIGKILL`);
+      expect(settled).toBe(false);
+      expect(() => process.kill(pid, 0)).toThrow();
+      await fixture.send('finish');
+      expect(await result).toEqual({
+        status: 1,
+        stdout: 'owned stdout\n',
+        stderr: `owned stderr\nowned child ${pid} terminated by SIGKILL and reaped after 300 ms deadline\n`,
+      });
     } finally {
-      if (pid > 0) process.kill(-pid, 'SIGKILL');
-      rmSync(directory, { recursive: true, force: true });
+      await fixture.cleanup();
     }
   });
 
-  it('runs disk commands through the cowshed its environment names', async () => {
-    const directory = await ownedSocketDirectory('rt-', 'named-cowshed');
-    const named = join(directory, 'cowshed');
-    await writeFile(named, '#!/bin/sh\necho "checkout cowshed: $*"\n', { mode: 0o755 });
+  it('stops waiting only for protected images while preserving their live owner and file output', async () => {
+    for (const { tool, verb } of [
+      { tool: 'hdiutil', verb: 'attach' },
+      { tool: 'diskutil', verb: 'image' },
+      { tool: 'diskutil', verb: 'eject' },
+    ]) {
+      const fixture = await ownedDiskFacadeFixture();
+      const result = createHostCommands(300, undefined, undefined, fixture.executable).run(tool, [
+        verb,
+        fixture.socketPath,
+      ]);
+      let pid = 0;
+      try {
+        pid = await fixture.started();
+        const output = await result;
+        expect(output.status).toBe(1);
+        expect(output.stderr).toMatch(/^no answer within 300 ms; cowshed command \d+ left running, not killed/);
+        expect(() => process.kill(pid, 0)).not.toThrow();
+        await fixture.send('inspect');
+        expect(await fixture.event()).toBe(`custody ${pid}`);
+        expect(await readFile(join(fixture.directory, 'stdout'), 'utf8')).toBe('owned stdout\n');
+        expect(await readFile(join(fixture.directory, 'stderr'), 'utf8')).toBe('owned stderr\n');
+      } finally {
+        // The fixture alone owns cleanup authority; it kills its exact stand-in and awaits reap.
+        await fixture.cleanup();
+        if (pid > 0) expect(() => process.kill(pid, 0)).toThrow();
+      }
+    }
+  });
+
+  it('preserves facade nonzero exit, signal diagnostics and the environment-selected owner', async () => {
     const before = process.env[COWSHED_EXECUTABLE_ENV];
     try {
-      process.env[COWSHED_EXECUTABLE_ENV] = named;
-      const result = await createHostCommands().run('/usr/bin/hdiutil', ['info']);
-      expect(result).toMatchObject({ status: 0, stdout: 'checkout cowshed: disk-command hdiutil -- info\n' });
+      for (const mode of ['exit', 'signal']) {
+        const fixture = await ownedDiskFacadeFixture();
+        process.env[COWSHED_EXECUTABLE_ENV] = fixture.executable;
+        const result = createHostCommands().run('/usr/sbin/diskutil', ['info', mode, fixture.socketPath]);
+        try {
+          const pid = await fixture.started();
+          expect(await fixture.event()).toBe(`reaped ${pid} ${mode === 'exit' ? '7 null' : 'null SIGTERM'}`);
+          await fixture.send('finish');
+          expect(await result).toEqual({
+            status: mode === 'exit' ? 7 : 1,
+            stdout: 'owned stdout\n',
+            stderr: mode === 'exit' ? 'owned stderr\n' : 'owned stderr\n\nkilled by SIGTERM',
+          });
+        } finally {
+          await fixture.cleanup();
+        }
+      }
     } finally {
       if (before === undefined) delete process.env[COWSHED_EXECUTABLE_ENV];
       else process.env[COWSHED_EXECUTABLE_ENV] = before;
+    }
+  });
+
+  it('reports an unavailable facade as a process-start error, not a child signal', async () => {
+    const directory = await ownedSocketDirectory('rt-', 'missing-cowshed');
+    try {
+      const executable = join(directory, 'missing-cowshed');
+      const output = await createHostCommands(300, undefined, undefined, executable).run('/usr/sbin/diskutil', [
+        'info',
+      ]);
+      expect(output.status).toBe(1);
+      expect(output.stdout).toBe('');
+      expect(output.stderr).toContain(executable);
+      expect(output.stderr).toContain('ENOENT');
+      expect(output.stderr).not.toContain('killed by');
+    } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });

@@ -164,6 +164,7 @@ impl Command {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiskCommandArgs {
     pub tool: DiskTool,
+    pub deadline: std::time::Duration,
     pub args: Vec<OsString>,
 }
 
@@ -895,13 +896,16 @@ fn cli_command() -> ClapCommand {
         ]))
         .subcommand(leaf("doctor").args([flag("repair"), flag("clear-attach-budget")]))
         .subcommand(
-            leaf("disk-command").arg(positional("tool", 0..=1)).arg(
-                Arg::new("argv")
-                    .value_parser(value_parser!(OsString))
-                    .num_args(0..)
-                    .last(true)
-                    .allow_hyphen_values(true),
-            ),
+            leaf("disk-command")
+                .arg(positional("tool", 0..=1))
+                .arg(value("deadline-ms"))
+                .arg(
+                    Arg::new("argv")
+                        .value_parser(value_parser!(OsString))
+                        .num_args(0..)
+                        .last(true)
+                        .allow_hyphen_values(true),
+                ),
         )
         .subcommand(
             leaf("gateway")
@@ -1376,10 +1380,13 @@ const DISK_COMMAND: CommandSpec = CommandSpec {
     summary: "run diskutil/hdiutil via cowshed's disk runner",
     about: &[
         "Runs one `diskutil` or `hdiutil` argv — never a shell string — exactly as cowshed runs its own disk tools: under the host's disk-lifecycle lease, in its own session, with the tool's stdout and stderr passed through as its own bytes and its exit status as this command's (a signal ends it with 128 + the signal). The command's standard input is forwarded to the tool, so a passphrase can be piped to `diskutil apfs unlockVolume … -stdinpassphrase`. It needs no project and asks no daemon: scripts and other programs call it from any directory.",
-        "A command that creates or releases a disk-image device — `diskutil image …`, `diskutil eject` and every `hdiutil` verb — is never killed: past 120 s it is waited for, with a `cowshed:` warning on stderr every 30 s, because one killed mid-operation can leak its kernel device until reboot. It also ignores hangup, interrupt and terminate and writes its output to files the runner reads back, so a caller that gives up and kills this command leaves the operation to finish. Every other verb is killed at 120 s.",
+        "A command that creates or releases a disk-image device — `diskutil image …`, `diskutil eject` and every `hdiutil` verb — is never killed: past 120 s it is waited for, with a `cowshed:` warning on stderr every 30 s, because one killed mid-operation can leak its kernel device until reboot. It also ignores hangup, interrupt and terminate and writes its output to files the runner reads back, so a caller that gives up and kills this command leaves the operation to finish. Every other verb has one total monotonic budget for lease admission and child execution, 120 s by default or --deadline-ms before --. An exhausted budget never executes the native tool; an overrun kills the owned group and waits for the child's actual termination before reporting a wrapper timeout.",
         "Failures of the runner itself — the tool could not be started or waited for, or an ordinary verb hit its deadline — exit 100–106 with a `cowshed:` line on stderr and nothing on stdout, as `exec` reports its wrapper failures. `--json` is refused: the answer is the tool's own output, so ask the tool for structure (`-plist`).",
     ],
-    options: &[],
+    options: &[Opt {
+        spelling: "--deadline-ms <positive integer>",
+        meaning: "before -- only: total SAFE admission-and-child budget in milliseconds; default 120000. Image commands retain their 120 s warning-only, never-kill policy",
+    }],
 };
 
 fn parse_disk_command(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
@@ -1419,7 +1426,27 @@ fn parse_disk_command(matches: &ArgMatches, global: &GlobalOptions) -> Result<Co
             USAGE,
         ));
     }
-    Ok(Command::DiskCommand(DiskCommandArgs { tool, args }))
+    let deadline = match os(matches, "deadline-ms") {
+        None => cowshed_apfs::DISK_CHILD_DEADLINE,
+        Some(value) => {
+            let millis = value
+                .to_str()
+                .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+                .and_then(|text| text.parse::<std::num::NonZeroU64>().ok())
+                .ok_or_else(|| {
+                    UsageError::new(
+                        "--deadline-ms must be a positive integer number of milliseconds",
+                        USAGE,
+                    )
+                })?;
+            std::time::Duration::from_millis(millis.get())
+        }
+    };
+    Ok(Command::DiskCommand(DiskCommandArgs {
+        tool,
+        deadline,
+        args,
+    }))
 }
 
 const CONTROLLER: CommandSpec = CommandSpec {
@@ -5013,12 +5040,67 @@ mod tests {
     }
 
     #[test]
+    fn disk_command_deadline_is_positive_and_only_before_the_separator() {
+        let Command::DiskCommand(args) = parse_args([
+            "disk-command",
+            "diskutil",
+            "--deadline-ms",
+            "37",
+            "--",
+            "info",
+            "--deadline-ms",
+            "0",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("disk command")
+        };
+        assert_eq!(args.deadline, std::time::Duration::from_millis(37));
+        assert_eq!(
+            args.args,
+            ["info", "--deadline-ms", "0"].map(OsString::from)
+        );
+        let Command::DiskCommand(default) = parse_args([
+            "disk-command",
+            "diskutil",
+            "--",
+            "info",
+            "--deadline-ms",
+            "0",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("disk command")
+        };
+        assert_eq!(default.deadline, cowshed_apfs::DISK_CHILD_DEADLINE);
+        assert_eq!(
+            default.args,
+            ["info", "--deadline-ms", "0"].map(OsString::from)
+        );
+        for value in ["0", "-1", "+1", "1.5", "no", "18446744073709551616"] {
+            let error = parse_args([
+                "disk-command",
+                "diskutil",
+                "--deadline-ms",
+                value,
+                "--",
+                "info",
+            ])
+            .expect_err("invalid deadline");
+            assert_eq!(error.exit_code(), 2, "{value}");
+        }
+    }
+
+    #[test]
     fn disk_command_takes_a_named_tool_and_its_argv_after_the_separator() {
         let cli = parse_args(["disk-command", "hdiutil", "--", "info"]).unwrap();
         assert_eq!(
             cli.command,
             Command::DiskCommand(DiskCommandArgs {
                 tool: DiskTool::Hdiutil,
+                deadline: cowshed_apfs::DISK_CHILD_DEADLINE,
                 args: vec![OsString::from("info")],
             })
         );

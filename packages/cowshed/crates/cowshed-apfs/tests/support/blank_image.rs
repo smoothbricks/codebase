@@ -205,7 +205,7 @@ impl Drop for SharedMount {
 /// lease, which also appends it to the run's disk command record, through the fork-safe launch.
 fn disk_tool(program: &str, args: &[&std::ffi::OsStr]) -> std::process::Output {
     let program = Path::new(program);
-    cowshed_apfs::disk_lease::leased(program, args, || {
+    cowshed_apfs::disk_lease::leased(program, args, None, || {
         Command::new(program).args(args).output_locked()
     })
     .unwrap_or_else(|error| panic!("run {}: {error}", program.display()))

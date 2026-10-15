@@ -7,9 +7,10 @@
 //! `disk-lease <class> phase` around the command the grant admitted.
 //!
 //! The lease spaces commands out; it never decides whether one runs. With no gateway to ask, a
-//! gateway that predates leases, a refusal, or a wait past [`DISK_CHILD_DEADLINE`], the command
-//! runs unleased and the wait span ends `status=err` with the reason beside it — except a gateway
-//! that is not running at all, which is said once per process rather than once per command.
+//! gateway that predates leases, a refusal, or a wait past the admission bound, the command runs
+//! unleased. A SAFE command's own total deadline still applies to every admission step and
+//! retry; its runner rejects spawn after that budget expires. The wait span ends status=err
+//! with an unleased reason; a missing gateway is said once per process.
 //!
 //! A test's lease waits are the host's queue, not its code. When [`LEASE_WAIT_RECORD_ENV`] names
 //! a file, every wait is also appended to it (08_testing.md, "Integration tests (real
@@ -21,6 +22,8 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -31,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cowshed_gateway_types::{DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState, PhaseShare};
 
 use crate::device::DISKUTIL;
-use crate::{DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS};
+use crate::{CommandDeadline, DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS};
 
 const UMOUNT: &str = "/sbin/umount";
 
@@ -116,13 +119,14 @@ pub fn refuse_volume_rename(
 pub fn leased<T, E: fmt::Display + From<VolumeRenameRefused>>(
     program: &Path,
     args: &[impl AsRef<OsStr>],
+    deadline: Option<CommandDeadline>,
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
     refuse_volume_rename(program, args)?;
     let Some(class) = class_of(program) else {
         return run();
     };
-    leased_class(class, &describe(program, args), run)
+    leased_class(class, &describe(program, args), deadline, run)
 }
 
 /// Admit a descriptor-native namespace operation through the same client as disk children.
@@ -131,12 +135,13 @@ pub(crate) fn namespace<T, E: fmt::Display>(
     operation: &str,
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    leased_class(DiskClass::Namespace, operation, run)
+    leased_class(DiskClass::Namespace, operation, None, run)
 }
 
 fn leased_class<T, E: fmt::Display>(
     class: DiskClass,
     command: &str,
+    deadline: Option<CommandDeadline>,
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
     if let Some(record) = COMMAND_RECORD.as_ref() {
@@ -148,7 +153,15 @@ fn leased_class<T, E: fmt::Display>(
         None => wanted_share(),
     };
     let socket = cowshed_gateway_types::control_socket_path();
-    lease_then(&socket, class, share, command, remember_predates, run)
+    lease_then(
+        &socket,
+        class,
+        share,
+        command,
+        remember_predates,
+        deadline,
+        run,
+    )
 }
 
 /// [`leased`] against the control socket at `socket`, for a command already classed and named.
@@ -157,9 +170,18 @@ pub fn leased_at<T, E: fmt::Display>(
     socket: &Path,
     class: DiskClass,
     command: &str,
+    deadline: Option<CommandDeadline>,
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    lease_then(socket, class, wanted_share(), command, |_| {}, run)
+    lease_then(
+        socket,
+        class,
+        wanted_share(),
+        command,
+        |_| {},
+        deadline,
+        run,
+    )
 }
 
 /// The share this process asks for: the whole phase when its lease waits are recorded.
@@ -179,10 +201,14 @@ fn lease_then<T, E: fmt::Display>(
     share: PhaseShare,
     command: &str,
     unleased_by: impl Fn(&Unleased),
+    deadline: Option<CommandDeadline>,
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
+    if deadline.is_some_and(|deadline| deadline.remaining().is_none()) {
+        return run();
+    }
     let waiting = RECORD.as_ref().map(|record| record.begin(class));
-    let stream = match UnixStream::connect(socket) {
+    let stream = match connect(socket, deadline) {
         Ok(stream) => stream,
         Err(error) => {
             if !ABSENT_SAID.swap(true, Ordering::Relaxed) {
@@ -197,7 +223,16 @@ fn lease_then<T, E: fmt::Display>(
         }
     };
     let lease = cowshed_os::timing::timed("disk-lease", format_args!("{class} wait"), || {
-        acquire(stream, class, share, command, Bounds::PRODUCTION)
+        acquire(
+            stream,
+            class,
+            share,
+            command,
+            Bounds {
+                deadline,
+                ..Bounds::PRODUCTION
+            },
+        )
     });
     drop(waiting);
     match lease {
@@ -214,11 +249,127 @@ fn lease_then<T, E: fmt::Display>(
                 Unleased::Predates {
                     what: Predates::Alone,
                     ..
-                } => lease_then(socket, class, PhaseShare::Shared, command, unleased_by, run),
+                } => lease_then(
+                    socket,
+                    class,
+                    PhaseShare::Shared,
+                    command,
+                    unleased_by,
+                    deadline,
+                    run,
+                ),
                 _ => run(),
             }
         }
     }
+}
+
+/// Establish the existing lease connection within the SAFE command's remaining total budget.
+/// No thread or connector outlives an error: the one owned descriptor closes on every failure.
+fn connect(socket: &Path, deadline: Option<CommandDeadline>) -> io::Result<UnixStream> {
+    // SAFETY: sockaddr_un's integer and byte-array fields all admit zero.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let path = socket.as_os_str().as_bytes();
+    if path.is_empty() || path.len() >= address.sun_path.len() || path.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the gateway control socket path is empty, contains NUL, or exceeds sockaddr_un",
+        ));
+    }
+    address.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX).map_err(io::Error::other)?;
+    for (target, byte) in address.sun_path.iter_mut().zip(path.iter().copied()) {
+        *target = libc::c_char::from_ne_bytes([byte]);
+    }
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1;
+    let length = libc::socklen_t::try_from(length).map_err(io::Error::other)?;
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = u8::try_from(length).map_err(io::Error::other)?;
+    }
+    let descriptor = cowshed_os::fork_lock::create(|| {
+        // SAFETY: socket creates a fresh descriptor; ownership is transferred exactly once.
+        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if raw == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: raw is the fresh, uniquely owned socket descriptor just returned above.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: fcntl only changes flags on this owned descriptor. Both two-step flags
+        // are installed under the existing exclusive fork lock, before any fork can copy it.
+        if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } == -1
+            || unsafe { libc::fcntl(raw, libc::F_SETFL, libc::O_NONBLOCK) } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(descriptor)
+    })?;
+    let stream = UnixStream::from(descriptor);
+    if deadline.is_none() {
+        // Protected/custom admission retains its blocking connect, outside the fork lock.
+        stream.set_nonblocking(false)?;
+    }
+    if deadline.is_some_and(|deadline| deadline.remaining().is_none()) {
+        return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+    }
+    // SAFETY: address is a complete pathname sockaddr_un, its checked length fits the object,
+    // and the stream owns the descriptor throughout the one connect call and optional poll.
+    let connected = unsafe {
+        libc::connect(
+            stream.as_raw_fd(),
+            std::ptr::from_ref(&address).cast(),
+            length,
+        )
+    };
+    if connected == -1 {
+        let error = io::Error::last_os_error();
+        let Some(deadline) = deadline else {
+            return Err(error);
+        };
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EINPROGRESS | libc::EALREADY)
+        ) {
+            // In particular EAGAIN on a full AF_UNIX backlog is an immediate, explicit
+            // refusal/fallback, not a timeout and not permission to retry the connection.
+            return Err(error);
+        }
+        loop {
+            let remaining = deadline
+                .remaining()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ETIMEDOUT))?;
+            let millis = remaining
+                .as_millis()
+                .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+            let timeout = i32::try_from(millis).unwrap_or(i32::MAX);
+            let mut pending = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: pending is one initialized pollfd, live and exclusively borrowed here.
+            let ready = unsafe { libc::poll(std::ptr::from_mut(&mut pending), 1, timeout) };
+            if ready == -1 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue; // Recompute the original remaining budget, never restart it.
+                }
+                return Err(error);
+            }
+            if ready == 0 {
+                continue; // A capped poll interval is not a fresh connection or deadline.
+            }
+            if let Some(error) = stream.take_error()? {
+                return Err(error);
+            }
+            stream.peer_addr()?;
+            break;
+        }
+    }
+    if deadline.is_some_and(|deadline| deadline.remaining().is_none()) {
+        return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
 }
 
 /// A held lease: the open connection to the gateway. Dropping it releases the lease.
@@ -241,6 +392,8 @@ pub enum Unleased {
     Broken(io::Error),
     /// The gateway queued the request but granted nothing within [`Bounds::grant`].
     NotGranted(Duration),
+    /// The SAFE command's total admission-and-child budget is exhausted.
+    BudgetExhausted,
 }
 
 /// What a gateway from an older build predates (05_gateway.md, "Disk-lifecycle lease").
@@ -282,6 +435,8 @@ impl fmt::Display for Unleased {
                 "the gateway did not queue the request in time; it is alive but overloaded",
             ),
             Self::Broken(error) => write!(formatter, "the lease connection broke: {error}"),
+            Self::BudgetExhausted => formatter
+                .write_str("the command's total deadline expired during disk-lease admission"),
             Self::NotGranted(waited) => {
                 write!(formatter, "the gateway granted nothing within {waited:?}")
             }
@@ -299,13 +454,25 @@ pub(crate) struct Bounds {
     pub after_close: Duration,
     /// For the grant, once queued: the bound every disk child answers inside.
     pub grant: Duration,
+    /// Present only for SAFE commands with a total monotonic admission-and-child budget.
+    pub deadline: Option<CommandDeadline>,
 }
 
 impl Bounds {
+    fn limit(self, requested: Duration) -> Result<Duration, Unleased> {
+        match self.deadline {
+            Some(deadline) => deadline
+                .remaining()
+                .map(|remaining| requested.min(remaining))
+                .ok_or(Unleased::BudgetExhausted),
+            None => Ok(requested),
+        }
+    }
     pub(crate) const PRODUCTION: Self = Self {
         ack: Duration::from_secs(2),
         after_close: Duration::from_secs(5),
         grant: DISK_CHILD_DEADLINE,
+        deadline: None,
     };
 }
 
@@ -481,12 +648,13 @@ pub(crate) fn acquire(
     let mut line = serde_json::to_vec(&DiskLeaseRequest::new(class, share, command))
         .map_err(|error| Unleased::Broken(io::Error::other(error)))?;
     line.push(b'\n');
+    stream
+        .set_write_timeout(Some(bounds.limit(bounds.ack)?))
+        .map_err(Unleased::Broken)?;
     (&stream).write_all(&line).map_err(Unleased::Broken)?;
     let mut answers = BufReader::new(stream.try_clone().map_err(Unleased::Broken)?);
-    stream
-        .set_read_timeout(Some(bounds.ack))
-        .map_err(Unleased::Broken)?;
-    match read_answer(&mut answers) {
+    let ack = bounds.limit(bounds.ack)?;
+    match read_answer(&mut answers, ack, bounds.deadline) {
         Ok(answer) => expect(answer, LeaseState::Queued).map_err(|unleased| match unleased {
             Unleased::Refused { code, error }
                 if share == PhaseShare::Alone
@@ -504,10 +672,9 @@ pub(crate) fn acquire(
             stream
                 .shutdown(std::net::Shutdown::Write)
                 .map_err(Unleased::Broken)?;
-            stream
-                .set_read_timeout(Some(bounds.after_close))
+            let after_close = bounds.limit(bounds.after_close)?;
+            let answer = read_answer(&mut answers, after_close, bounds.deadline)
                 .map_err(Unleased::Broken)?;
-            let answer = read_answer(&mut answers).map_err(Unleased::Broken)?;
             return Err(match answer {
                 DiskLeaseAnswer {
                     ok: false, error, ..
@@ -520,12 +687,10 @@ pub(crate) fn acquire(
         }
         Err(error) => return Err(Unleased::Broken(error)),
     }
-    stream
-        .set_read_timeout(Some(bounds.grant))
-        .map_err(Unleased::Broken)?;
-    match read_answer(&mut answers) {
+    let grant = bounds.limit(bounds.grant)?;
+    match read_answer(&mut answers, grant, bounds.deadline) {
         Ok(answer) => expect(answer, LeaseState::Granted)?,
-        Err(error) if timed_out(&error) => return Err(Unleased::NotGranted(bounds.grant)),
+        Err(error) if timed_out(&error) => return Err(Unleased::NotGranted(grant)),
         Err(error) => return Err(Unleased::Broken(error)),
     }
     Ok(DiskLease {
@@ -556,15 +721,43 @@ fn expect(answer: DiskLeaseAnswer, state: LeaseState) -> Result<(), Unleased> {
     }
 }
 
-fn read_answer(answers: &mut BufReader<UnixStream>) -> io::Result<DiskLeaseAnswer> {
-    let mut line = String::new();
-    if answers.read_line(&mut line)? == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "the gateway closed the lease connection",
-        ));
+fn read_answer(
+    answers: &mut BufReader<UnixStream>,
+    within: Duration,
+    deadline: Option<CommandDeadline>,
+) -> io::Result<DiskLeaseAnswer> {
+    let step = CommandDeadline::new(within);
+    let mut line = Vec::new();
+    loop {
+        let remaining = step
+            .remaining()
+            .and_then(|remaining| match deadline {
+                Some(deadline) => deadline.remaining().map(|total| total.min(remaining)),
+                None => Some(remaining),
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the disk-lease answer deadline expired",
+                )
+            })?;
+        answers.get_ref().set_read_timeout(Some(remaining))?;
+        let available = answers.fill_buf()?;
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the gateway closed the lease connection",
+            ));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |at| at + 1);
+        line.extend_from_slice(&available[..consumed]);
+        answers.consume(consumed);
+        if newline.is_some() {
+            return serde_json::from_slice(&line)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+        }
     }
-    serde_json::from_str(&line).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// A read timeout on a socket reads as `WouldBlock` on macOS and `TimedOut` elsewhere.
@@ -605,6 +798,7 @@ mod tests {
         ack: PEER_ENDS,
         after_close: PEER_ENDS,
         grant: PEER_ENDS,
+        deadline: None,
     };
 
     /// A listening socket the client is already connected to, removed on drop. Directly under
@@ -633,6 +827,105 @@ mod tests {
         let (mut server, _) = listener.accept().expect("accept");
         server.write_all(answers).expect("answer");
         server
+    }
+
+    #[test]
+    fn a_full_control_backlog_is_bounded_and_expired_safe_admission_executes_no_payload() {
+        let socket = Socket(std::path::PathBuf::from(format!(
+            "/tmp/cowshed-dl-{}.sock",
+            uuid::Uuid::new_v4().simple()
+        )));
+        let marker = socket.0.with_extension("payload");
+        let listener = UnixListener::bind(&socket.0).expect("bind exact backlog fixture");
+        // SAFETY: adjust only this fixture-owned listener's real kernel backlog.
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), 1) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let mut queued = Vec::new();
+        let refused = loop {
+            match connect(&socket.0, Some(CommandDeadline::new(NO_ANSWER))) {
+                Ok(stream) => queued.push(stream),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            !queued.is_empty(),
+            "the real listener admitted connections before becoming full"
+        );
+        assert!(
+            matches!(
+                refused.kind(),
+                io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::ConnectionRefused
+            ),
+            "full backlog refused with {refused}"
+        );
+        let request = crate::CommandRequest::new(
+            "/bin/sh",
+            [
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("printf executed > \"$1\""),
+                std::ffi::OsString::from("owned-backlog-child"),
+                marker.clone().into_os_string(),
+            ],
+        );
+        let outcome =
+            crate::SystemCommandRunner.run_within(&request, NO_ANSWER, |deadline, run| {
+                let deadline = deadline.expect("SAFE admission has the original budget");
+                let refused = connect(&socket.0, Some(deadline))
+                    .expect_err("the real kernel backlog remains full");
+                assert!(
+                    matches!(
+                        refused.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::ConnectionRefused
+                    ),
+                    "{refused}"
+                );
+                // An immediate EAGAIN/refusal is not a timeout. This custom admission fixture
+                // deliberately spends the same remaining budget before returning its unleased run.
+                while let Some(remaining) = deadline.remaining() {
+                    std::thread::park_timeout(remaining);
+                }
+                run()
+            });
+        let executed = marker.exists();
+        if executed {
+            std::fs::remove_file(&marker)
+                .expect("remove only an unexpectedly executed fixture marker");
+        }
+        for _ in &queued {
+            let (accepted, _) = listener.accept().expect("drain each actual queued client");
+            drop(accepted);
+        }
+        drop(queued);
+        // A failed pending connect owns no background worker or retained descriptor. Once the
+        // real queue is drained a new connection succeeds, and only that client is accepted.
+        let fresh = connect(&socket.0, Some(CommandDeadline::new(NO_ANSWER)))
+            .expect("connect after draining the full backlog");
+        let (accepted, _) = listener.accept().expect("accept the fresh owned client");
+        drop(accepted);
+        drop(fresh);
+        listener
+            .set_nonblocking(true)
+            .expect("observe the drained real queue");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "no failed connector was left queued"
+        );
+        assert!(
+            matches!(outcome, Err(crate::CommandRunError { failure: crate::CommandRunFailure::Unspawned(budget), .. }) if budget == NO_ANSWER),
+            "{outcome:?}"
+        );
+        assert!(
+            !executed,
+            "exhausted admission never executes the native payload"
+        );
     }
 
     #[test]
@@ -863,6 +1156,7 @@ mod tests {
             PhaseShare::Alone,
             "x",
             |unleased| said.borrow_mut().push(unleased.to_string()),
+            None,
             || Ok::<_, String>("ran"),
         );
         assert_eq!(ran, Ok("ran"));
@@ -880,6 +1174,97 @@ mod tests {
             "only the alone ask went unleased; the shared one was granted: {said:?}"
         );
         assert!(said[0].contains("predates alone disk leases"), "{said:?}");
+    }
+
+    #[test]
+    fn total_safe_budget_covers_queued_legacy_and_alone_admission_without_late_spawn() {
+        enum Admission {
+            Queued,
+            Legacy,
+            Alone,
+        }
+        for admission in [Admission::Queued, Admission::Legacy, Admission::Alone] {
+            let socket = Socket(std::path::PathBuf::from(format!(
+                "/tmp/cowshed-dl-{}.sock",
+                uuid::Uuid::new_v4().simple()
+            )));
+            let marker = socket.0.with_extension("spawned");
+            let listener = UnixListener::bind(&socket.0).expect("bind owned gateway");
+            let (finished, finish) = std::sync::mpsc::channel::<()>();
+            let legacy = matches!(admission, Admission::Legacy);
+            let alone = matches!(admission, Admission::Alone);
+            let gateway = std::thread::spawn(move || {
+                if alone {
+                    let (mut server, _) = listener.accept().expect("alone request");
+                    let mut request = String::new();
+                    BufReader::new(&server)
+                        .read_line(&mut request)
+                        .expect("read alone request");
+                    assert!(request.contains("\"share\":\"alone\""));
+                    server
+                        .write_all(UNKNOWN_SHARE)
+                        .expect("refuse only the old share field");
+                }
+                let (mut server, _) = listener.accept().expect("admission request");
+                let mut request = String::new();
+                BufReader::new(&server)
+                    .read_line(&mut request)
+                    .expect("read request");
+                if !legacy {
+                    server
+                        .write_all(b"{\"ok\":true,\"lease\":\"queued\"}\n")
+                        .expect("queue without grant");
+                }
+                let mut rest = Vec::new();
+                io::Read::read_to_end(&mut server, &mut rest)
+                    .expect("client closes or half-closes");
+                // The old gateway remains silent after EOF too, so its after-close read must
+                // also be clipped. Dropping the sender on any test failure releases this peer.
+                let _ = finish.recv();
+            });
+            let budget = if legacy {
+                Duration::from_millis(2100)
+            } else {
+                NO_ANSWER
+            };
+            let request = crate::CommandRequest::new(
+                "/bin/sh",
+                [
+                    std::ffi::OsString::from("-c"),
+                    std::ffi::OsString::from("printf spawned > \"$1\""),
+                    std::ffi::OsString::from("admission-child"),
+                    marker.clone().into_os_string(),
+                ],
+            );
+            let error = crate::SystemCommandRunner
+                .run_within(&request, budget, |deadline, run| {
+                    assert!(
+                        deadline.is_some(),
+                        "the real SAFE runner supplies its budget"
+                    );
+                    lease_then(
+                        &socket.0,
+                        DiskClass::Storage,
+                        if alone {
+                            PhaseShare::Alone
+                        } else {
+                            PhaseShare::Shared
+                        },
+                        "owned-safe-stand-in",
+                        |_| {},
+                        deadline,
+                        run,
+                    )
+                })
+                .expect_err("admission exhausted the same total budget");
+            finished.send(()).expect("finish owned gateway");
+            gateway.join().expect("owned gateway");
+            assert!(
+                matches!(error.failure, crate::CommandRunFailure::Unspawned(deadline) if deadline == budget),
+                "{error:?}"
+            );
+            assert!(!marker.exists(), "an over-budget child must never start");
+        }
     }
 
     #[test]

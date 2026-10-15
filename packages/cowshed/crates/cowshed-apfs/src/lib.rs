@@ -142,12 +142,27 @@ pub enum CommandRunFailure {
     Spawn(io::Error),
     /// The child started, but its exit could not be observed.
     Wait(io::Error),
-    /// The child was still running at this deadline and was killed. It *ran*: a hung child is
-    /// never reported as one that could not be started.
-    Deadline(Duration),
-    /// Refused before spawning: a Disk Arbitration rename
-    /// ([`disk_lease::VolumeRenameRefused`](crate::disk_lease::VolumeRenameRefused)).
+    /// Refused before spawning: a Disk Arbitration rename.
     VolumeRename,
+    /// The total budget expired before the native tool executed.
+    Unspawned(Duration),
+    /// The deadline expired; the owned group was signalled and the child's actual end observed.
+    Deadline {
+        deadline: Duration,
+        ended: ProcessStatus,
+    },
+    /// Signalling the owned group failed. The subsequent wait's outcome is retained too.
+    Kill {
+        deadline: Duration,
+        pid: u32,
+        source: io::Error,
+        ended: Result<Option<ProcessStatus>, io::Error>,
+    },
+    /// The group was signalled, but reaping the child failed.
+    Reap {
+        deadline: Duration,
+        source: io::Error,
+    },
 }
 
 #[derive(Debug)]
@@ -179,12 +194,45 @@ impl fmt::Display for CommandRunError {
                 fmt_command(f, program, args)?;
                 write!(f, ": {source}")
             }
-            CommandRunFailure::Deadline(deadline) => {
+            CommandRunFailure::Unspawned(deadline) => {
                 fmt_command(f, program, args)?;
                 write!(
                     f,
-                    " did not finish within {deadline:?}; the child was killed and its item \
-                     deferred for the next pass"
+                    " exhausted its total {deadline:?} deadline before native execution; no disk tool was started"
+                )
+            }
+            CommandRunFailure::Deadline { deadline, ended } => {
+                fmt_command(f, program, args)?;
+                write!(
+                    f,
+                    " did not finish within {deadline:?}; the owned process group was signalled and the child reaped with {ended}; its item deferred for the next pass"
+                )
+            }
+            CommandRunFailure::Kill {
+                deadline,
+                pid,
+                source,
+                ended,
+            } => {
+                fmt_command(f, program, args)?;
+                write!(
+                    f,
+                    " did not finish within {deadline:?}; could not kill owned process group {pid}: {source}; "
+                )?;
+                match ended {
+                    Ok(Some(status)) => write!(f, "the child was reaped with {status}"),
+                    Ok(None) => write!(
+                        f,
+                        "the child is still running as pid {pid}; it was not reaped"
+                    ),
+                    Err(error) => write!(f, "could not observe or reap the child: {error}"),
+                }
+            }
+            CommandRunFailure::Reap { deadline, source } => {
+                fmt_command(f, program, args)?;
+                write!(
+                    f,
+                    " did not finish within {deadline:?}; the owned process group was signalled, but could not reap the child: {source}"
                 )
             }
             CommandRunFailure::VolumeRename => {
@@ -199,8 +247,13 @@ impl fmt::Display for CommandRunError {
 impl std::error::Error for CommandRunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.failure {
-            CommandRunFailure::Spawn(source) | CommandRunFailure::Wait(source) => Some(source),
-            CommandRunFailure::Deadline(_) | CommandRunFailure::VolumeRename => None,
+            CommandRunFailure::Spawn(source)
+            | CommandRunFailure::Wait(source)
+            | CommandRunFailure::Kill { source, .. }
+            | CommandRunFailure::Reap { source, .. } => Some(source),
+            CommandRunFailure::Deadline { .. }
+            | CommandRunFailure::Unspawned(_)
+            | CommandRunFailure::VolumeRename => None,
         }
     }
 }
@@ -337,6 +390,29 @@ pub const DISK_CHILD_DEADLINE: Duration = Duration::from_secs(120);
 /// How often a disk-image command past [`DISK_CHILD_DEADLINE`] says what it is still waiting on.
 pub const DISK_IMAGE_WARNING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// One monotonic budget covering admission and the owned SAFE child's lifetime.
+/// Constructed before admission (and before the CLI's blocking-runner handoff).
+#[derive(Clone, Copy, Debug)]
+pub struct CommandDeadline {
+    started: std::time::Instant,
+    duration: Duration,
+}
+
+impl CommandDeadline {
+    pub fn new(duration: Duration) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            duration,
+        }
+    }
+
+    pub(crate) fn remaining(self) -> Option<Duration> {
+        self.duration
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+    }
+}
+
 /// What the waiter does with a disk child still running at its deadline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PastDeadline {
@@ -392,66 +468,75 @@ enum DeadlineStep {
 pub struct SystemCommandRunner;
 
 impl SystemCommandRunner {
-    /// Spawn `request` and collect its output under [`DeadlinePolicy::for_request`] at
-    /// `deadline`. [`CommandRunner::run`] is this with [`DISK_CHILD_DEADLINE`]; tests pass a
-    /// short deadline to prove a hung child is reaped promptly.
-    ///
-    /// A disk tool runs under the host disk-lifecycle lease of its class ([`crate::disk_lease`]):
-    /// the deadline starts once the lease is granted, and the lease is released when the child
-    /// has been reaped.
+    /// Run a disk command with one total monotonic SAFE budget, including lease admission.
+    /// Protected image commands retain their warning-only child policy.
     pub fn run_with_deadline(
         &self,
         request: &CommandRequest,
         deadline: Duration,
     ) -> Result<CommandOutput, CommandRunError> {
-        self.run_admitted(request, deadline, ChildInput::Null, |run| {
-            crate::disk_lease::leased(&request.program, &request.args, run)
-        })
+        self.run_admitted(
+            request,
+            CommandDeadline::new(deadline),
+            ChildInput::Null,
+            |deadline, run| {
+                crate::disk_lease::leased(&request.program, &request.args, deadline, run)
+            },
+        )
     }
 
-    /// [`CommandRunner::run`] with the child reading this process's standard input instead of
-    /// `/dev/null`: the `cowshed disk-command` facade, whose caller may pipe a passphrase to the
-    /// tool. Everything else — lease, session, deadline policy, bookkeeping — is the same run.
+    /// The facade run, including standard input. Its SAFE budget begins before the blocking
+    /// thread handoff; an image command keeps the shared 120 s warning point and never kills.
     pub fn run_with_inherited_input(
         &self,
         request: &CommandRequest,
+        deadline: CommandDeadline,
     ) -> Result<CommandOutput, CommandRunError> {
-        self.run_admitted(request, DISK_CHILD_DEADLINE, ChildInput::Inherited, |run| {
-            crate::disk_lease::leased(&request.program, &request.args, run)
+        let deadline = if is_disk_image_command(request) {
+            CommandDeadline::new(DISK_CHILD_DEADLINE)
+        } else {
+            deadline
+        };
+        self.run_admitted(request, deadline, ChildInput::Inherited, |deadline, run| {
+            crate::disk_lease::leased(&request.program, &request.args, deadline, run)
         })
     }
 
-    /// [`Self::run_with_deadline`] admitted by `lease` instead of the host gateway's lease:
-    /// `lease` is handed the child's run and calls it once, inside whatever admission it grants.
-    /// A test gateway's lease (`|run| disk_lease::leased_at(socket, class, command, run)`) and a
-    /// measurement's deliberately free-for-all baseline (`|run| run()`) get the same spawn,
-    /// deadline policy and attach-pool bookkeeping as production; there is no second runner.
+    /// The same run under custom admission. The callback receives the SAFE budget so a real
+    /// test gateway clips its own waits; even arbitrary admission cannot spawn a late child.
     pub fn run_within(
         &self,
         request: &CommandRequest,
         deadline: Duration,
         lease: impl FnOnce(
+            Option<CommandDeadline>,
             &mut dyn FnMut() -> Result<CommandOutput, CommandRunError>,
         ) -> Result<CommandOutput, CommandRunError>,
     ) -> Result<CommandOutput, CommandRunError> {
-        self.run_admitted(request, deadline, ChildInput::Null, lease)
+        self.run_admitted(
+            request,
+            CommandDeadline::new(deadline),
+            ChildInput::Null,
+            lease,
+        )
     }
 
-    /// The one run every public entry point is: `request` reading `input`, admitted by `lease`,
-    /// under [`DeadlinePolicy::for_request`] at `deadline`.
+    /// One runner owns admission, spawn, deadline policy and attach-pool bookkeeping.
     fn run_admitted(
         &self,
         request: &CommandRequest,
-        deadline: Duration,
+        deadline: CommandDeadline,
         input: ChildInput,
         lease: impl FnOnce(
+            Option<CommandDeadline>,
             &mut dyn FnMut() -> Result<CommandOutput, CommandRunError>,
         ) -> Result<CommandOutput, CommandRunError>,
     ) -> Result<CommandOutput, CommandRunError> {
-        let policy = DeadlinePolicy::for_request(request, deadline);
-        let output = lease(&mut || {
-            Self::run_unleased(request, input, policy, &mut |elapsed| {
-                warn_outlived(request, deadline, elapsed)
+        let policy = DeadlinePolicy::for_request(request, deadline.duration);
+        let total = matches!(policy.past_deadline, PastDeadline::Kill).then_some(deadline);
+        let output = lease(total, &mut || {
+            Self::run_unleased(request, input, policy, total, &mut |elapsed| {
+                warn_outlived(request, policy.deadline, elapsed)
             })
         })?;
         record_pool_outcome(request, &output);
@@ -466,14 +551,23 @@ impl SystemCommandRunner {
         request: &CommandRequest,
         input: ChildInput,
         policy: DeadlinePolicy,
+        total: Option<CommandDeadline>,
         warn: &mut dyn FnMut(Duration),
     ) -> Result<CommandOutput, CommandRunError> {
         use std::io::Read;
         crate::disk_lease::refuse_volume_rename(&request.program, &request.args)?;
-        let (mut child, output_files) =
-            spawn_disk_child(request, input).map_err(|source| CommandRunError {
+        if let Some(deadline) = total
+            && deadline.remaining().is_none()
+        {
+            return Err(CommandRunError {
                 request: request.clone(),
-                failure: CommandRunFailure::Spawn(source),
+                failure: CommandRunFailure::Unspawned(deadline.duration),
+            });
+        }
+        let (mut child, output_files) =
+            spawn_disk_child(request, input, total).map_err(|failure| CommandRunError {
+                request: request.clone(),
+                failure,
             })?;
         // Drain both pipes on dedicated threads while the deadline poll runs, exactly as
         // `Command::output` drains while it waits: a verbose child (fsck) must never wedge
@@ -525,7 +619,7 @@ impl SystemCommandRunner {
                 ),
             }
         };
-        let started = std::time::Instant::now();
+        let started = total.map_or_else(std::time::Instant::now, |deadline| deadline.started);
         let mut warned = 0;
         loop {
             match child.try_wait().map_err(|source| CommandRunError {
@@ -542,18 +636,48 @@ impl SystemCommandRunner {
                     return Ok(CommandOutput::from(output));
                 }
                 None => match policy.step(started.elapsed(), warned) {
-                    DeadlineStep::Wait => std::thread::sleep(Duration::from_millis(25)),
+                    DeadlineStep::Wait => std::thread::sleep(
+                        total
+                            .and_then(CommandDeadline::remaining)
+                            .map_or(Duration::from_millis(25), |remaining| {
+                                remaining.min(Duration::from_millis(25))
+                            }),
+                    ),
                     DeadlineStep::Warn => {
                         warned += 1;
                         warn(started.elapsed());
                     }
                     DeadlineStep::Kill => {
-                        kill_disk_child_group(&mut child);
-                        let _ = child.wait();
-                        let _ = collect(stdout, stderr);
+                        let pid = child.id();
+                        let failure = match kill_disk_child_group(&mut child) {
+                            Ok(()) => match child.wait() {
+                                Ok(status) => {
+                                    let _ = collect(stdout, stderr);
+                                    CommandRunFailure::Deadline {
+                                        deadline: policy.deadline,
+                                        ended: ProcessStatus::from(status),
+                                    }
+                                }
+                                Err(source) => CommandRunFailure::Reap {
+                                    deadline: policy.deadline,
+                                    source,
+                                },
+                            },
+                            Err(source) => {
+                                let ended = child
+                                    .try_wait()
+                                    .map(|status| status.map(ProcessStatus::from));
+                                CommandRunFailure::Kill {
+                                    deadline: policy.deadline,
+                                    pid,
+                                    source,
+                                    ended,
+                                }
+                            }
+                        };
                         return Err(CommandRunError {
                             request: request.clone(),
-                            failure: CommandRunFailure::Deadline(policy.deadline),
+                            failure,
                         });
                     }
                 },
@@ -657,12 +781,14 @@ impl CommandRunner for SystemCommandRunner {
                 Self::Run(refused.into())
             }
         }
+        let deadline = CommandDeadline::new(DISK_CHILD_DEADLINE);
         let policy = DeadlinePolicy::for_request(request, DISK_CHILD_DEADLINE);
-        let output = crate::disk_lease::leased(&request.program, &request.args, || {
+        let total = matches!(policy.past_deadline, PastDeadline::Kill).then_some(deadline);
+        let output = crate::disk_lease::leased(&request.program, &request.args, total, || {
             if !check().map_err(Guarded::Check)? {
                 return Ok(None);
             }
-            Self::run_unleased(request, ChildInput::Null, policy, &mut |elapsed| {
+            Self::run_unleased(request, ChildInput::Null, policy, total, &mut |elapsed| {
                 warn_outlived(request, DISK_CHILD_DEADLINE, elapsed)
             })
             .map(Some)
@@ -965,8 +1091,19 @@ fn lease_holder(lease: &Path) -> String {
 fn spawn_disk_child(
     request: &CommandRequest,
     input: ChildInput,
-) -> io::Result<(std::process::Child, Option<PathBuf>)> {
-    spawn_disk_child_as(request, input, is_disk_image_command(request))
+    total: Option<CommandDeadline>,
+) -> Result<(std::process::Child, Option<PathBuf>), CommandRunFailure> {
+    spawn_disk_child_as(request, input, is_disk_image_command(request), total).map_err(|source| {
+        match total {
+            Some(deadline)
+                if source.raw_os_error() == Some(libc::ETIMEDOUT)
+                    && deadline.remaining().is_none() =>
+            {
+                CommandRunFailure::Unspawned(deadline.duration)
+            }
+            _ => CommandRunFailure::Spawn(source),
+        }
+    })
 }
 
 /// `spawn_disk_child` with the detachment decided by the caller, so tests can detach a
@@ -975,6 +1112,7 @@ fn spawn_disk_child_as(
     request: &CommandRequest,
     input: ChildInput,
     detached: bool,
+    total: Option<CommandDeadline>,
 ) -> io::Result<(std::process::Child, Option<PathBuf>)> {
     let mut command = Command::new(&request.program);
     command.args(&request.args).stdin(match input {
@@ -1023,6 +1161,12 @@ fn spawn_disk_child_as(
                         return Err(io::Error::last_os_error());
                     }
                 }
+                // spawn_locked may have waited behind a descriptor release. Check inside
+                // its fork window, after that wait and immediately before native exec.
+                // Instant's monotonic read and this errno value allocate nothing.
+                if total.is_some_and(|deadline| deadline.remaining().is_none()) {
+                    return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                }
                 Ok(())
             });
         }
@@ -1030,19 +1174,20 @@ fn spawn_disk_child_as(
     command.spawn_locked().map(|child| (child, output_files))
 }
 
-/// Kill a disk child and, on Unix, its whole process group.
-fn kill_disk_child_group(child: &mut std::process::Child) {
+/// Kill exactly the owned child's process group; retain any failure for the caller.
+fn kill_disk_child_group(child: &mut std::process::Child) -> io::Result<()> {
     #[cfg(unix)]
     {
-        // A negative pid addresses the group, which the child leads after setsid, so
-        // this reaches `diskimages-helper` too. Fail-open is safe here: the direct kill
-        // below still runs, and a group that is already gone reports ESRCH, not damage.
-        // SAFETY: `kill` with SIGKILL takes no callbacks and touches no Rust state.
-        unsafe {
-            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        let pid = libc::pid_t::try_from(child.id()).map_err(io::Error::other)?;
+        // SAFETY: the child successfully became its own session leader before exec. This
+        // negative, checked PID addresses only its owned group, never the caller's group.
+        if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
+            return Err(io::Error::last_os_error());
         }
+        Ok(())
     }
-    let _ = child.kill();
+    #[cfg(not(unix))]
+    child.kill()
 }
 
 /// The wait an unforced detach spends before it gives up on politeness.
@@ -6343,10 +6488,19 @@ mod tests {
         // must use `/bin/sh` builtins only. A child that is no disk-image command is killed at
         // the deadline, and the queue continues; a disk-image command is never killed (the tests
         // below), only warned about.
+        let pid_file = temp_path("safe-child-pid", "txt");
         let started = std::time::Instant::now();
         let error = SystemCommandRunner
             .run_with_deadline(
-                &CommandRequest::new("/bin/sh", ["-c", "while true; do :; done"]),
+                &CommandRequest::new(
+                    "/bin/sh",
+                    [
+                        OsString::from("-c"),
+                        OsString::from("printf '%s' $$ > \"$1\"; while true; do :; done"),
+                        OsString::from("owned-safe-child"),
+                        pid_file.clone().into_os_string(),
+                    ],
+                ),
                 Duration::from_millis(250),
             )
             .unwrap_err();
@@ -6356,7 +6510,7 @@ mod tests {
             started.elapsed()
         );
         assert!(
-            matches!(error.failure, CommandRunFailure::Deadline(deadline) if deadline == Duration::from_millis(250)),
+            matches!(error.failure, CommandRunFailure::Deadline { deadline, ended: ProcessStatus::Signal(libc::SIGKILL) } if deadline == Duration::from_millis(250)),
             "{error:?}"
         );
         // The child ran; the report must say it hung, never that it could not be started.
@@ -6364,6 +6518,29 @@ mod tests {
         assert!(!report.contains("could not run"), "{report}");
         assert!(report.contains("did not finish within 250ms"), "{report}");
         assert!(report.contains("deferred"), "{report}");
+        assert!(report.contains("reaped with signal"), "{report}");
+        let pid = fs::read_to_string(&pid_file)
+            .expect("the real owned child ran")
+            .parse::<libc::pid_t>()
+            .expect("child pid");
+        fs::remove_file(&pid_file).expect("remove owned pid receipt");
+        // SAFETY: waitpid only observes our already-reaped child, without waiting.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "the runner actually reaped its child"
+        );
+        // SAFETY: signal zero observes this exact fixture PID; it sends no signal.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "no owned child remains alive"
+        );
         // The queue continues: a fast child right after the kill still runs.
         let output = SystemCommandRunner
             .run(&CommandRequest::new("/bin/sh", ["-c", "printf 'next\\n'"]))
@@ -6390,7 +6567,7 @@ mod tests {
             ],
         );
         let (mut child, files) =
-            spawn_disk_child_as(&request, ChildInput::Null, true).expect("spawn detached");
+            spawn_disk_child_as(&request, ChildInput::Null, true, None).expect("spawn detached");
         let directory = files.expect("a detached child writes files");
         let status = child.wait().expect("reap the detached child");
         assert!(status.success(), "{status:?}");
@@ -6399,17 +6576,23 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
 
         let request = CommandRequest::new("/bin/sh", ["-c", "sleep 5"]);
-        let (mut child, _) =
-            spawn_disk_child_as(&request, ChildInput::Null, true).expect("spawn sleeper");
+        let (mut child, files) =
+            spawn_disk_child_as(&request, ChildInput::Null, true, None).expect("spawn sleeper");
+        let directory = files.expect("the owned protected fixture writes files");
         let pid = child.id() as libc::pid_t;
+        fs::remove_dir_all(directory).expect("unlink the exact fixture's open output files");
         // SAFETY: getpgid only reads the child's group; the child is ours, unreaped.
         assert_eq!(
             unsafe { libc::getpgid(pid) },
             pid,
             "the child leads its session"
         );
-        kill_disk_child_group(&mut child);
-        let _ = child.wait();
+        kill_disk_child_group(&mut child).expect("kill exact owned fixture group");
+        let status = child.wait().expect("reap exact owned fixture");
+        assert_eq!(
+            ProcessStatus::from(status),
+            ProcessStatus::Signal(libc::SIGKILL)
+        );
     }
 
     /// A disk tool's own handlers do not reopen it to the caller's tree-killer: `diskutil`
@@ -6428,7 +6611,7 @@ mod tests {
             ],
         );
         let (mut child, files) =
-            spawn_disk_child_as(&request, ChildInput::Null, true).expect("spawn detached");
+            spawn_disk_child_as(&request, ChildInput::Null, true, None).expect("spawn detached");
         let directory = files.expect("a detached child writes files");
         let status = child.wait().expect("reap the detached child");
         let stdout = fs::read_to_string(directory.join("stdout")).unwrap();
@@ -6633,6 +6816,7 @@ mod tests {
                     &request,
                     ChildInput::Null,
                     policy,
+                    None,
                     &mut |_| {
                         warnings += 1;
                         // Disconnect means the observer is done or unwinding; never abandon the child.
@@ -6691,6 +6875,162 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_safe_child_cannot_exec_after_the_fork_lock_outlives_its_budget() {
+        let marker = temp_path("fork-lock-late-exec", "txt");
+        let request = CommandRequest::new(
+            "/bin/sh",
+            [
+                OsString::from("-c"),
+                OsString::from("printf executed > \"$1\""),
+                OsString::from("owned-fork-lock-child"),
+                marker.clone().into_os_string(),
+            ],
+        );
+        let (locked, acquired) = std::sync::mpsc::sync_channel(0);
+        let (give_budget, budget) = std::sync::mpsc::sync_channel::<CommandDeadline>(0);
+        let owner = std::thread::spawn(move || {
+            cowshed_os::fork_lock::create(|| {
+                assert!(cowshed_os::fork_lock::held_exclusive());
+                locked
+                    .send(())
+                    .expect("announce the real exclusive fork lock");
+                let deadline = budget.recv().expect("the fixture's monotonic budget");
+                while let Some(remaining) = deadline.remaining() {
+                    std::thread::park_timeout(remaining);
+                }
+                Ok(())
+            })
+            .expect("release the owned fork-lock fixture");
+        });
+        acquired.recv().expect("the real fork lock is held");
+        let deadline = CommandDeadline::new(Duration::from_millis(50));
+        give_budget
+            .send(deadline)
+            .expect("hold the fork lock through budget exhaustion");
+        // Exercise the production spawn seam directly: an outer admission check cannot make
+        // this oracle pass. std reaps a pre_exec-failed fork stub without executing the tool.
+        let outcome = spawn_disk_child(&request, ChildInput::Null, Some(deadline));
+        owner.join().expect("the exact fork-lock owner finished");
+        let (failure, unexpected_status) = match outcome {
+            Err(failure) => (Some(failure), None),
+            Ok((mut child, files)) => {
+                let status = child
+                    .wait()
+                    .expect("reap any unexpectedly executed owned fixture");
+                if let Some(directory) = files {
+                    fs::remove_dir_all(directory).expect("remove only the owned output files");
+                }
+                (None, Some(ProcessStatus::from(status)))
+            }
+        };
+        let executed = marker.exists();
+        if executed {
+            fs::remove_file(&marker).expect("remove the unexpected owned marker before asserting");
+        }
+        assert!(
+            matches!(failure, Some(CommandRunFailure::Unspawned(budget)) if budget == deadline.duration),
+            "failure={failure:?}; unexpected status={unexpected_status:?}"
+        );
+        assert!(
+            !executed,
+            "the native tool must not exec after the fork lock spends its budget"
+        );
+    }
+
+    #[test]
+    fn exhausted_custom_admission_never_spawns_a_late_safe_child() {
+        let marker = temp_path("late-safe-spawn", "txt");
+        let request = CommandRequest::new(
+            "/bin/sh",
+            [
+                OsString::from("-c"),
+                OsString::from("printf spawned > \"$1\""),
+                OsString::from("late-safe-child"),
+                marker.clone().into_os_string(),
+            ],
+        );
+        let error = SystemCommandRunner
+            .run_within(&request, Duration::from_millis(25), |deadline, run| {
+                let deadline = deadline.expect("SAFE custom admission carries its total budget");
+                while let Some(remaining) = deadline.remaining() {
+                    std::thread::park_timeout(remaining);
+                }
+                run()
+            })
+            .expect_err("an expired admitted command must not spawn");
+        assert!(
+            matches!(error.failure, CommandRunFailure::Unspawned(deadline) if deadline == Duration::from_millis(25)),
+            "{error:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "the real child would have written this marker"
+        );
+    }
+
+    #[test]
+    fn a_protected_stand_in_is_alive_at_its_warning_then_finishes_on_fixture_release() {
+        let pid_file = temp_path("protected-child-pid", "txt");
+        let release = temp_path("protected-child-release", "txt");
+        let request = CommandRequest::new(
+            "/bin/sh",
+            [
+                OsString::from("-c"),
+                OsString::from(
+                    "printf '%s' $$ > \"$1\"; while ! test -f \"$2\"; do :; done; printf done; exit 3",
+                ),
+                OsString::from("owned-protected-child"),
+                pid_file.clone().into_os_string(),
+                release.clone().into_os_string(),
+            ],
+        );
+        let policy = DeadlinePolicy {
+            deadline: Duration::from_millis(10),
+            past_deadline: PastDeadline::WarnEvery(Duration::from_millis(10)),
+        };
+        assert!(matches!(
+            DeadlinePolicy::for_request(&disk_image_request(), policy.deadline).past_deadline,
+            PastDeadline::WarnEvery(_)
+        ));
+        let mut warnings = 0;
+        let output = SystemCommandRunner::run_unleased(
+            &request,
+            ChildInput::Null,
+            policy,
+            None,
+            &mut |elapsed| {
+                assert!(elapsed >= policy.deadline);
+                let pid = loop {
+                    match fs::read_to_string(&pid_file) {
+                        Ok(text) if !text.is_empty() => {
+                            break text.parse::<libc::pid_t>().expect("fixture pid");
+                        }
+                        Ok(_) => std::thread::yield_now(),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            std::thread::yield_now()
+                        }
+                        Err(error) => panic!("read exact fixture pid: {error}"),
+                    }
+                };
+                // SAFETY: observe only our live stand-in; signal zero does not cancel it.
+                assert_eq!(
+                    unsafe { libc::kill(pid, 0) },
+                    0,
+                    "the protected stand-in survives its warning point"
+                );
+                warnings += 1;
+                fs::write(&release, b"release").expect("release only this owned fixture");
+            },
+        )
+        .expect("protected fixture ends on its own, not as a timeout");
+        assert!(warnings > 0, "the real waiter reported the overrun");
+        assert_eq!(output.status, ProcessStatus::Exit(3));
+        assert_eq!(output.stdout, b"done");
+        fs::remove_file(pid_file).expect("remove owned pid receipt");
+        fs::remove_file(release).expect("remove owned release marker");
+    }
+
     const DISK_CHILD_INPUT_ROLE: &str = "COWSHED_TEST_DISK_CHILD_INPUT";
 
     /// A disk child reads `/dev/null` unless it is run with this process's standard input
@@ -6710,7 +7050,7 @@ mod tests {
         if std::env::var_os(DISK_CHILD_INPUT_ROLE).is_some() {
             let null = SystemCommandRunner.run(&read).expect("null-input child");
             let inherited = SystemCommandRunner
-                .run_with_inherited_input(&read)
+                .run_with_inherited_input(&read, CommandDeadline::new(DISK_CHILD_DEADLINE))
                 .expect("inheriting child");
             println!(
                 "null={} inherited={}",

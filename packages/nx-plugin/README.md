@@ -1233,16 +1233,22 @@ Before creating, a task detaches every RAM disk of the same user and size that i
 paths: the debris of a creator that was killed or ran into its deadline. One that still carries a lease directory, or
 has something attached below it, is named in the task's error instead.
 
-Every `hdiutil` and `diskutil` execution goes through `cowshed disk-command <tool> -- <args>`, including host-test
-inventory and cleanup. The cowshed is the installed one on `PATH`, which must provide this command, unless
-`COWSHED_EXECUTABLE` names another. A target may set it in its `env`, workspace-relative or absolute: the task's own RAM
-volume work and its command then both run that cowshed, given to the command as an absolute path. This repository sets
-it to `packages/cowshed/bin/cowshed`, after `cowshed:build`, on the targets that exercise the facade (both real-APFS
-groups and `nx-plugin:test-host`), so they test this checkout's cowshed, not an installed one that may predate a command
-the checkout added. Cowshed owns disk-lifecycle leasing and starts image commands detached from the caller's signals,
-with file-backed output. A caller deadline stops waiting; it never kills the disk command, because killing an attach or
-detach can leak its kernel device until reboot. A still-running command retains its lease and is named in the timeout
-error. Other helpers retain their process-group deadline. A process whose lease waits are recorded
+Every `hdiutil` and `diskutil` execution goes through `cowshed disk-command`, including host-test inventory and cleanup.
+The cowshed is the installed one on `PATH`, which must provide this command, unless `COWSHED_EXECUTABLE` names another.
+A target may set it in its `env`, workspace-relative or absolute: the task's own RAM volume work and its command then
+both run that cowshed, given to the command as an absolute path. This repository sets it to
+`packages/cowshed/bin/cowshed`, after `cowshed:build`, on the targets that exercise the facade (both real-APFS groups
+and `nx-plugin:test-host`), so they test this checkout's cowshed, not an installed one that may predate a command the
+checkout added. Cowshed alone owns disk-lifecycle leasing. Safe disk commands use
+`cowshed disk-command diskutil --deadline-ms <positive integer> -- <args>`: the CLI owns that total monotonic budget
+across lease admission and child execution, never starts a child after it expires, and kills and reaps an overrun safe
+child before returning. Node waits for the facade's actual terminal exit without a second timer or lease. Only protected
+image commands (any `hdiutil`, `diskutil image`, and `diskutil eject`) use `cowshed disk-command <tool> -- <args>` and a
+caller-bounded stop-wait: cowshed starts them detached from caller signals, with file-backed output, and never kills
+them, because killing an attach or detach can leak its kernel device until reboot. A still-running protected command
+retains its lease and is named in the timeout error. That timeout status is the wrapper's stop-wait outcome, not an
+actual disk-child exit or signal; native termination diagnostics come from the CLI's owned child wait. Other helpers
+retain their process-group deadline. The shared default remains 120 s. A process whose lease waits are recorded
 (`COWSHED_LEASE_WAIT_RECORD`) asks for its phase `alone`; a gateway from before `alone` refuses the field at once and is
 asked shared instead, for a minute. Cowshed's runner refuses `diskutil rename` and `renameVolume` for every caller; the
 RAM volume is created under its final name and never renamed.

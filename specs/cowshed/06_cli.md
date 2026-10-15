@@ -253,6 +253,28 @@ never errors).
 | `cowshed gc [--abandoned]`                          | freed bytes                                      | Two-phase exact candidate plan (01); `--dry-run` lists typed candidates and sums bytes with zero mutation. Only explicit `--abandoned` also reclaims the recovery bundles `rm --abandon` kept in `sessions/.trash`, the only copy of those abandoned commits; `--dry-run --abandoned` lists them without deleting them.                                                                                                                                                                                                                                                                                 |
 | `cowshed doctor`                                    | `--json` findings                                | Invariant checks; each finding carries a `fix:` hint.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
+`cowshed disk-command <diskutil|hdiutil> [--deadline-ms <positive integer>] -- <native args…>` runs one native argv
+through the same `SystemCommandRunner` and disk-lifecycle lease as cowshed's own disk tools (05, "Disk-lifecycle
+lease"). The option is parsed only before `--`; every later argument remains the tool's byte-exact argument, even
+`--deadline-ms`. Standard input is inherited, and terminal stdout/stderr and a normal child's exit code or
+`128 + signal` pass through unchanged. The command needs no project; `--json` is refused because its output belongs to
+the tool.
+
+For SAFE commands, the facade starts one monotonic total admission-and-child budget before handing work to the blocking
+runner: 120000 ms by default, or the supplied positive integer milliseconds. Exhausted admission never executes the
+native tool, including when the fork lock spends the remaining budget: the final pre-exec check refuses it and the spawn
+operation reaps any failed fork stub. Such a stub performs no disk-tool effect. A running overrun is killed through its
+owned process group and actually waited/reaped before a timeout is reported. The facade's timeout is wrapper exit 103,
+not a fabricated child exit or signal: stderr separately retains the child's observed terminal status, or says that no
+child started. Kill and reap failures are wrapper failures (exit 100), with their causes and any still-running child pid
+retained; they never assert successful termination. A SAFE caller passes its budget and waits for the facade's actual
+terminal close; it does not time out and abandon or kill the facade, unref it, or destroy its pipes.
+
+Protected image commands (any `hdiutil`, `diskutil image …`, `diskutil eject`) retain their 120 s warning point and 30 s
+warnings thereafter, detached session, file-backed output and never-kill custody (01a_apfs.md, "How the APFS host
+degrades" §2). `--deadline-ms` does not grant authority to cancel them or change that warning policy. Their caller may
+stop waiting with a bounded, named still-running report, leaving the operation and its leases alive.
+
 During an interrupted re-adoption (02 §Re-adoption), `adopt <checkout> --re-adopt` and
 `mount main --repo-id <owner/repo>` resolve from the existing controller checkout-path record only when a strict
 unfinished journal owns the exact repository and checkout. No Git checkout is required at that boundary. They finish the
