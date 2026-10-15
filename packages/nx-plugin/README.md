@@ -105,6 +105,9 @@ The provider-real-Nx snapshot walk uses asynchronous children so its case timer 
 active. Its 60 s case guard covers one provider, daemon lifecycle and all provenance/refusal checks; it does not split
 those checks into separately rebuilt fixtures.
 
+Ignored-lockfile validity uses one daemon-successor walk: first refusal at the request boundary, then the successor's
+request-free safety-poll invalidation. Both boundaries keep their original observations without a second fixture start.
+
 ## Cargo Workspace Layouts
 
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
