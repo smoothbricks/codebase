@@ -29,7 +29,11 @@ const repo = dirname(tooling);
 const bun = process.execPath;
 
 const TASK = 'cowshed:cargo-test-cowshed-core-shard1';
-const GATE = ['run-many', '-t', 'gate', '--parallel=2', '--nx-bail=false', '--outputStyle=static-failures-only'];
+// The landing gate is never CPU-limited, so the wrapper asks the kernel for the core count
+// rather than carrying a constant. The fixture does the same, which means it asserts that the
+// wrapper reads the host - not that it passes some number this file happens to know.
+const CORES = String(spawnSync('sysctl', ['-n', 'hw.ncpu'], { encoding: 'utf8' }).stdout).trim();
+const GATE = ['run-many', '-t', 'gate', `--parallel=${CORES}`, '--nx-bail=false', '--outputStyle=static-failures-only'];
 const DAEMON_STOP: Call = { args: ['daemon', '--stop'], exit: 0 };
 const passingRun = (args: readonly string[]): Call => ({ args, exit: 0 });
 
