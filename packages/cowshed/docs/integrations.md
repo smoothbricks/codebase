@@ -62,15 +62,16 @@ A fresh workspace starts from the closed baseline. The coordinator mutates the c
 compare-and-swap revision semantics; workers may observe grants but cannot mutate them.
 
 - Egress and simulator changes apply immediately because the gateway evaluates current policy per request.
-- An effective filesystem grant or revoke changes the supervisor envelope. The old supervisor stops accepting
-  submissions and drains; admitted jobs retain the old revision. The controller then relaunches under the new revision
-  before accepting the next exec.
+- An effective filesystem grant or revoke advances the revision the workspace's supervisor serves, in place. Later exec
+  hosts and commands start under the new profile and report it; admitted jobs keep theirs until they end or are killed
+  ([11_shell.md, Grant-change propagation](../../../specs/cowshed/11_shell.md#grant-change-propagation)).
 - A command that read the grants just before another change landed is answered by the supervisor already serving the
   newer revision, under that revision: it never runs under grants older than the ones it read, and never fails because
   grants moved forward under it.
 - Inner command profiles may narrow the revision-bound envelope and can never widen it.
 - A named session pinned to a stale revision conflicts instead of silently migrating.
-- A no-op, egress-only, or simulator-only mutation does not relaunch the supervisor.
+- No filesystem, no-op, egress-only, or simulator-only mutation relaunches the supervisor. Port-block growth follows the
+  separate idle-only protocol in [04_sandbox.md](../../../specs/cowshed/04_sandbox.md#widening-and-narrowing).
 
 There is no interactive MCP consent or elicitation. A worker reports a denied need to its coordinator, which applies
 project policy and decides whether to grant it. Simulator installation remains human-gated per artifact, and desktop

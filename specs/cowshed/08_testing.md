@@ -780,11 +780,11 @@ Covered flows:
   Ordinary `JobInfo` JSON permits this bounded union, while controller audit records reject every payload/path field.
   File variants have no inline data and inline variants invent no path. Logs/follow/reconnect/ checkpoint readers return
   identical raw bytes without caller representation branches.
-- **supervisor grant-revision cutover**: start a long-running job at revision N, apply an effective filesystem grant or
-  revoke, and assert the enclosing supervisor drains and is relaunched at N+1 before the next exec. The running job
-  completes under N, an inner per-command profile can only narrow N and cannot broaden it, the next exec observes N+1,
-  and reconnecting a named session bound to N returns the documented stale-session conflict rather than silently
-  rebinding. Repeat for both grant and revoke.
+- **supervisor grant-revision advance**: start a long-running job at revision N, apply an effective filesystem grant or
+  revoke, and assert the manager advances the same supervisor to N+1 and starts no second one before the next exec. The
+  running job completes under N, an inner per-command profile can only narrow N and cannot broaden it, the next exec
+  observes N+1, and reconnecting a named session bound to N returns the documented stale-session conflict rather than
+  silently rebinding. Repeat for both grant and revoke.
 - **One exact-image no-mount attach → pinned fsck → pinned `mount_apfs`** on APFS: assert attach flags/plist parsing,
   exact current image/whole/volume identity, `fsck_apfs -q` before the first mount, and the raw pin held across the host
   namespace wait, then helper options, requested root and held mount-root/source identity before publication. A
