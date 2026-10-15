@@ -410,6 +410,16 @@ incomplete evidence, never an empty holder set. Successful observations with res
 matches and incomplete/raced captures remain distinct. An open file is not proof of a contested lock, and an admission
 token count or one CPU/state sample does not establish CPU starvation or its absence.
 
+**Unresolved script-host wedge (2026-10-16).** The isolation case
+`nothing_one_script_does_to_its_process_reaches_the_next` reached the unchanged 180s no-progress bound in a full gate.
+The pre-expiry snapshot showed the test and exec host sleeping at 0% CPU, a connected control-socket pair, and no script
+child in that snapshot; this does not establish that a child never ran. With diagnostic-only protocol checkpoints, the
+exact case passed at one token in 0.109s, and the original captured owner target passed all 13 tests in 1.186s at 3/18
+tokens. The exact-case trace completed both script lifecycles through `STARTED → EXITED → stream EOF → RELEASED`, then
+host shutdown and join. The cause remains unknown: those are negative diagnostic results, not a wedge repair or
+permission to raise the bound. Checkpoints retain request, observation, exit, stream, release and shutdown positions for
+the next occurrence.
+
 The real process-snapshot witness keeps its child, grandchild and opened file alive through capture. Its readiness PID
 is a tagged, newline-terminated string, not a console-inspected number that inherited color settings can decorate. The
 reader assembles a complete line across chunks within an abortable readiness bound; EOF and expiry report the text

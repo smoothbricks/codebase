@@ -3,6 +3,10 @@
 //! The host runs unsandboxed here: these tests are about what brush and the fork do with a
 //! job's process group, streams and status, which no sandbox changes. The workspace has no
 //! `.envrc`, so the host holds exactly the environment it was started with.
+//!
+//! Protocol-position checkpoints are diagnostic only: they do not repair the historical
+//! isolation-case wedge or change its bound. `specs/cowshed/08_testing.md`, CI, records the
+//! unresolved observation and the negative diagnostic runs.
 
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -76,6 +80,7 @@ impl Host {
                 });
             }
             let child = command.spawn()?;
+            eprintln!("script-fixture host={} phase=spawned", child.id());
             drop(theirs);
             Ok(Self {
                 child,
@@ -107,8 +112,20 @@ impl Host {
             return Ok(());
         }
         // The actual parent host must retire its held group before it is joined.
+        eprintln!(
+            "script-fixture host={} phase=control-shutdown",
+            self.child.id()
+        );
         let shutdown = self.control.shutdown(std::net::Shutdown::Both);
+        eprintln!(
+            "script-fixture host={} phase=host-wait shutdown={shutdown:?}",
+            self.child.id()
+        );
         let joined = self.child.wait();
+        eprintln!(
+            "script-fixture host={} phase=host-joined result={joined:?}",
+            self.child.id()
+        );
         let removed = std::fs::remove_dir_all(&self.directory);
         self.finished = joined.is_ok() && removed.is_ok();
         match (&shutdown, &joined, &removed) {
@@ -235,6 +252,10 @@ fn submit(
         send_with_descriptors(control.as_raw_fd(), &frame, &descriptors).expect("send the request");
     std::io::Write::write_all(&mut &*control, &frame[sent..]).expect("send the rest");
     drop((stdin, stdout_write, stderr_write));
+    eprintln!(
+        "script-fixture control={} phase=request-sent",
+        control.as_raw_fd()
+    );
     let readers = [stdout_read, stderr_read].map(|reader| {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -248,6 +269,10 @@ fn submit(
     let _observation = {
         drop((ready_write, go_read));
         let mut ready = std::fs::File::from(ready_read);
+        eprintln!(
+            "script-fixture control={} phase=waiting-observation-ready",
+            control.as_raw_fd()
+        );
         let mut pid = [0_u8; 4];
         let first = loop {
             match ready.read(&mut pid[..1]) {
@@ -262,6 +287,10 @@ fn submit(
                 .read_exact(&mut pid[1..])
                 .expect("the complete leader report");
             let pid = u32::try_from(i32::from_ne_bytes(pid)).expect("leader pid");
+            eprintln!(
+                "script-fixture control={} phase=leader-reported pid={pid}",
+                control.as_raw_fd()
+            );
             let observer = cowshed_core::runtime::process_events::KqueueObserver::watch(
                 cowshed_core::api::JobId::new(1).expect("job id"),
                 pid,
@@ -270,9 +299,17 @@ fn submit(
             assert_eq!(observer.fold().live(pid).map(|life| life.pid), Some(pid));
             std::io::Write::write_all(&mut std::fs::File::from(go_write), b"x")
                 .expect("release the observed leader");
+            eprintln!(
+                "script-fixture control={} phase=observer-released pid={pid}",
+                control.as_raw_fd()
+            );
             Some(observer)
         }
     };
+    eprintln!(
+        "script-fixture control={} phase=waiting-start-reply",
+        control.as_raw_fd()
+    );
     let (reply, _) = read_frame(control).unwrap().expect("a reply");
     Submitted { reply, readers }
 }
@@ -291,6 +328,11 @@ fn run_on(
         REPLY_SCRIPT_SYNTAX => (None, None),
         REPLY_STARTED => {
             let birth = fields.birth().unwrap();
+            eprintln!(
+                "script-fixture control={} phase=waiting-exit pid={}",
+                control.as_raw_fd(),
+                birth.pid()
+            );
             fields.finish().unwrap();
             if let Some(signal) = signal {
                 send_signal(control, signal);
@@ -303,10 +345,22 @@ fn run_on(
         ),
         other => panic!("unexpected reply {other}"),
     };
+    eprintln!(
+        "script-fixture control={} phase=waiting-stream-eof",
+        control.as_raw_fd()
+    );
     let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
     if birth.is_some() {
+        eprintln!(
+            "script-fixture control={} phase=waiting-release-reply",
+            control.as_raw_fd()
+        );
         release(control);
     }
+    eprintln!(
+        "script-fixture control={} phase=run-completed",
+        control.as_raw_fd()
+    );
     Ran {
         pid: birth.as_ref().map(Birth::pid),
         birth,
@@ -829,19 +883,24 @@ fn scripts_forked_at_once_each_run_whole() {
 
 #[test]
 fn nothing_one_script_does_to_its_process_reaches_the_next() {
+    eprintln!("script-isolation phase=starting-host");
     let mut host = Host::start("isolation");
+    eprintln!("script-isolation phase=first-command");
     let first = host.run(&text(
         "umask 077; ulimit -n 64; cd /; export LEAK=1; trap 'echo trapped' EXIT",
     ));
+    eprintln!("script-isolation phase=first-completed");
     assert_eq!(exited(first.status.as_ref()), Some(0));
     let second = host.run(&text(
         "umask; ulimit -n; printf '%s|%s\\n' \"$PWD\" \"${LEAK-}\"",
     ));
+    eprintln!("script-isolation phase=second-completed");
     let lines: Vec<&str> = second.stdout.lines().collect();
     assert_ne!(lines[0], "0077", "umask leaked: {}", second.stdout);
     assert_ne!(lines[1], "64", "ulimit leaked: {}", second.stdout);
     assert_eq!(lines[2], format!("{}|", host.directory.display()));
     assert!(!second.stdout.contains("trapped"));
+    eprintln!("script-isolation phase=assertions-completed");
 }
 
 #[test]
