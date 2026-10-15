@@ -101,7 +101,7 @@ fn holder(socket: &Path, class: DiskClass, label: &'static str) -> (Receiver<()>
     let (finish, finish_rx) = channel::<()>();
     let socket = socket.to_path_buf();
     std::thread::spawn(move || {
-        leased_at(&socket, class, label, || {
+        leased_at(&socket, class, label, None, || {
             let _ = entered.send(());
             let _ = finish_rx.recv();
             Ok::<(), String>(())
@@ -213,7 +213,7 @@ fn timed(
     let asked = Instant::now();
     let mut ran = Duration::ZERO;
     let output = SystemCommandRunner
-        .run_within(&request, DISK_CHILD_DEADLINE, |run| {
+        .run_within(&request, DISK_CHILD_DEADLINE, |deadline, run| {
             let mut timed_run = || {
                 let started = Instant::now();
                 let output = run();
@@ -222,7 +222,7 @@ fn timed(
             };
             match arm {
                 Arm::Unleased => timed_run(),
-                Arm::Leased => leased_at(socket, class, &argv.join(" "), timed_run),
+                Arm::Leased => leased_at(socket, class, &argv.join(" "), deadline, timed_run),
             }
         })
         .expect("run a disk command");

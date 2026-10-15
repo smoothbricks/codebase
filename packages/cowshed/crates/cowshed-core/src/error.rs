@@ -1171,7 +1171,10 @@ mod tests {
         let hung = || {
             ApfsError::from(CommandRunError {
                 request: CommandRequest::new("/sbin/mount_apfs", ["-o", "nobrowse,owners"]),
-                failure: CommandRunFailure::Deadline(std::time::Duration::from_secs(120)),
+                failure: CommandRunFailure::Deadline {
+                    deadline: std::time::Duration::from_secs(120),
+                    ended: cowshed_apfs::ProcessStatus::Signal(libc::SIGKILL),
+                },
             })
         };
 

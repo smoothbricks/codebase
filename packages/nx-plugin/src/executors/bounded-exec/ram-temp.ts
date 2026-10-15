@@ -1713,10 +1713,24 @@ const HOST_COMMAND_DEADLINE_MS = 120_000;
  */
 const STRAY_DETACH_DEADLINE_MS = 30_000;
 
-/** Disk tools have one process owner: cowshed's detached, file-backed command layer. */
-export function diskCommand(file: string, args: readonly string[]): string[] | null {
+/** Disk tools delegate their lease and process lifetime to cowshed, with one image policy. */
+export function diskCommand(
+  file: string,
+  args: readonly string[],
+  deadlineMs: number,
+): { args: string[]; lifetime: 'stop-wait' | 'facade-owned' } | null {
   const program = basename(file);
-  return program === 'hdiutil' || program === 'diskutil' ? ['disk-command', program, '--', ...args] : null;
+  if (program !== 'hdiutil' && program !== 'diskutil') {
+    return null;
+  }
+  // Match SystemCommandRunner's protected-image policy, including its case-sensitive verbs.
+  const image = program === 'hdiutil' || args[0] === 'image' || args[0] === 'eject';
+  return {
+    args: image
+      ? ['disk-command', program, '--', ...args]
+      : ['disk-command', program, '--deadline-ms', String(deadlineMs), '--', ...args],
+    lifetime: image ? 'stop-wait' : 'facade-owned',
+  };
 }
 
 /**
@@ -1740,12 +1754,12 @@ const PREDATES_RECHECK_MS = 60_000;
 const predatesSeen = new Map<string, { at: number; what: 'leases' | 'alone' }>();
 
 /**
- * Disk-image tools delegate both process lifetime and disk leasing to cowshed. In particular,
- * a caller timeout never kills an attach or detach, which can leak its kernel device until
- * reboot. Other disk tools take the host lease here; acquiring it again around cowshed would
- * deadlock a queued storage phase against its own caller. A process whose lease waits are
- * recorded asks for its phase `alone`; a gateway that refuses `alone` is asked shared at once,
- * and for a minute after.
+ * hdiutil and diskutil delegate process lifetime and disk leasing to cowshed: safe commands
+ * pass their total budget and wait for the facade's actual exit after child reap. Only image
+ * commands have a caller stop-wait deadline; killing an attach or detach can leak its kernel
+ * device until reboot. Never acquire a second lease around the facade. Other leased helpers
+ * take their lease here. Recorded lease waits ask for `alone`; an older gateway is asked
+ * shared at once, and for a minute after.
  */
 export function createHostCommands(
   defaultDeadlineMs: number = HOST_COMMAND_DEADLINE_MS,
@@ -1756,9 +1770,9 @@ export function createHostCommands(
   return {
     async run(file, args, callDeadlineMs) {
       const deadlineMs = callDeadlineMs ?? defaultDeadlineMs;
-      const disk = diskCommand(file, args);
+      const disk = diskCommand(file, args, deadlineMs);
       if (disk !== null) {
-        return runBounded(cowshed, disk, deadlineMs, false);
+        return runBounded(cowshed, disk.args, deadlineMs, disk.lifetime);
       }
       const diskClass = diskClassOf(file);
       const seen = predatesSeen.get(gatewaySocket);
@@ -1798,7 +1812,7 @@ function runBounded(
   file: string,
   args: readonly string[],
   deadlineMs: number,
-  killOnDeadline = true,
+  lifetime: 'kill' | 'stop-wait' | 'facade-owned' = 'kill',
 ): Promise<CommandOutput> {
   // `Promise.withResolvers` would read better but needs lib es2024; this package inherits lib
   // es2022 from tsconfig.base.json.
@@ -1806,37 +1820,46 @@ function runBounded(
   const promise = new Promise<CommandOutput>((settled) => {
     resolve = settled;
   });
-  // Ordinary children own their process group so their deadline also reaps helpers. Disk
-  // commands instead run through cowshed, which owns their detached lifetime and output.
+  // Ordinary helpers own their process group. The facade alone owns disk-child termination,
+  // reap and lease custody; a wrapper's exit or signal is not the disk child's exit or signal.
   const child = spawn(file, [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
   const text = (chunks: Buffer[]) => Buffer.concat(chunks).toString('utf8');
-  // The facade owns its disk child's output files. Stop waiting, not the disk operation:
-  // closing these pipes cannot wedge the disk tool, and cowshed still holds its disk lease.
-  const timer = setTimeout(() => {
-    if (!killOnDeadline) {
-      child.stdout.destroy();
-      child.stderr.destroy();
-      child.unref();
-      // A piped child's streams are sockets; only a socket can be unref'd.
-      if (child.stdout instanceof Socket) child.stdout.unref();
-      if (child.stderr instanceof Socket) child.stderr.unref();
-      resolve({
-        status: 1,
-        stdout: text(stdout),
-        stderr: `no answer within ${deadlineMs} ms; cowshed command ${child.pid ?? 'unknown'} left running, not killed: disk-image operations must finish to release their kernel devices`,
-      });
-      return;
-    }
-    resolve({
-      status: 1,
-      stdout: text(stdout),
-      stderr: `no answer within ${deadlineMs} ms; ${killGroup(child)}`,
-    });
-  }, deadlineMs);
+  // Safe disk commands have no Node timer: the CLI owns the total admission + child budget,
+  // kills only its owned safe child, and returns after reap. Protected image output is already
+  // file-backed in cowshed, so only that caller may close its pipes and stop waiting.
+  const timer =
+    lifetime === 'facade-owned'
+      ? undefined
+      : setTimeout(() => {
+          if (lifetime === 'stop-wait') {
+            child.stdout.destroy();
+            child.stderr.destroy();
+            child.unref();
+            // A piped child's streams are sockets; only a socket can be unref'd.
+            if (child.stdout instanceof Socket) child.stdout.unref();
+            if (child.stderr instanceof Socket) child.stderr.unref();
+            resolve({
+              status: 1,
+              stdout: text(stdout),
+              stderr: [
+                text(stderr),
+                `no answer within ${deadlineMs} ms; cowshed command ${child.pid ?? 'unknown'} left running, not killed: disk-image operations must finish to release their kernel devices`,
+              ]
+                .filter(Boolean)
+                .join('\n'),
+            });
+            return;
+          }
+          resolve({
+            status: 1,
+            stdout: text(stdout),
+            stderr: `no answer within ${deadlineMs} ms; ${killGroup(child)}`,
+          });
+        }, deadlineMs);
   child.on('error', (error) => {
     clearTimeout(timer);
     resolve({ status: 1, stdout: text(stdout), stderr: error.message });
@@ -1847,7 +1870,7 @@ function runBounded(
     resolve({
       status: code ?? 1,
       stdout: text(stdout),
-      stderr: error === '' && signal !== null ? `killed by ${signal}` : error,
+      stderr: signal === null ? error : [error, `killed by ${signal}`].filter(Boolean).join('\n'),
     });
   });
   return promise;

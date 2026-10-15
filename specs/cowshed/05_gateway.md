@@ -464,10 +464,22 @@ so attaches stall beside mount churn and stay fast once the two are kept apart. 
   evicted from the phase: it no longer counts, the phase hands over once its other holders leave, and the gateway's
   stderr names it — `disk-lease evicted a <class> holder after <held> while <class> waited`, with its pid and the
   command line it asked for. Its command may still be running beside the next phase; a hung `umount` costs that one
-  overlap, not every attach on the host. Non-image children obey the caller's execution budget; the gateway adds no
-  command deadline. For a disk-image command (`diskutil image …`, `diskutil eject`, `hdiutil`), that deadline produces a
-  warning and progress diagnostics at the caller's configured cadence, never a timed kill, because interruption can leak
-  its device until reboot (01a_apfs.md, "How the APFS host degrades" §2).
+  overlap, not every attach on the host. A SAFE command (every disk child except a protected disk-image command) owns
+  one monotonic caller execution budget for admission and child execution; the gateway adds no command deadline.
+  Control-socket establishment uses one nonblocking connect and any pending-connect poll is clipped to that same
+  remaining budget; refusal (including a full-backlog EAGAIN) is an immediate unleased fallback, not a timeout or
+  authority to retry. Descriptor creation and close-on-exec/nonblocking flag installation alone run under the fork
+  lock, never connect or poll. Every failed connection closes its owned descriptor; no connector thread remains alive.
+  Each queued acknowledgement, grant and after-half-close wait is clipped to its remaining budget, including
+  old-gateway and alone-to-shared retries. The runner checks remaining time before spawn and inside its existing
+  pre-exec closure, after any fork-lock wait: exhausted admission never executes the native tool. A failed pre-exec
+  fork stub is reaped by the spawn operation; it performs no disk-tool effect. An overrun signals the owned process
+  group and waits to reap the child, retaining its actual exit or signal status. A kill failure retains the kill error,
+  exact child pid and a nonblocking observation of exited, still running or reap failure; it neither waits without bound
+  nor joins live output pipes. A reap failure is distinct and never claims the child was reaped. A protected disk-image
+  command (`diskutil image …`, `diskutil eject`, every `hdiutil` verb) instead warns at the caller's configured cadence
+  and is never killed, because interruption can leak its device until reboot (01a_apfs.md, "How the APFS host degrades"
+  §2). Its detached session, file-backed output and caller-bounded stop-wait policy are unchanged.
 - **Wire.** The client writes `{"op":"disk-lease","class":"storage"|"namespace","command":"<argv>"}`, with
   `"share":"alone"` when it asks for the whole phase, and does not half-close. The gateway answers
   `{"ok":true,"lease":"queued"}` at once and `{"ok":true,"lease":"granted"}` when the command may run; the lease lasts
@@ -479,7 +491,9 @@ so attaches stall beside mount churn and stay fast once the two are kept apart. 
   an execution timeout, and the gateway adds no fixed grant-wait deadline. An older gateway says nothing until it reads
   EOF, so a client that hears no `queued` within 2 s half-closes, reads that gateway's `invalid-request` refusal, and
   stops asking it for a minute. A gateway that predates `alone` refuses the field as `invalid-request` at once; the
-  client asks it shared instead, from that command on, for a minute.
+  client asks it shared instead, from that command on, for a minute. These are lease fallbacks, not authority to restart
+  a SAFE command's total budget: every fallback and retry keeps the original deadline, and an exhausted budget prevents
+  child spawn even when no lease is available.
 - **Spans.** The client's lifecycle spans are `disk-lease <class> wait`, from the request to the grant (`status=err`,
   with an `unleased=<reason>` line, when the command runs unleased), and `disk-lease <class> phase`, around the command
   the grant admitted. With `COWSHED_TIMING` set, the gateway prints each phase as it drains: its class, how long it ran,

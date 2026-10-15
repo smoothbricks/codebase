@@ -106,12 +106,15 @@ fn run_disk_tool(
     SystemCommandRunner
         .run_with_deadline(&request, deadline)
         .map_err(|error| match error.failure {
-            CommandRunFailure::Deadline(deadline) => HostError::new(format!(
-                "{:?} produced no result within {deadline:?}; the disk arbitration daemon is unresponsive",
+            CommandRunFailure::Deadline { deadline, .. }
+            | CommandRunFailure::Unspawned(deadline) => HostError::new(format!(
+                "disk command {:?} produced no result within {deadline:?}: {error}",
                 command.program()
             )),
             CommandRunFailure::Spawn(_)
             | CommandRunFailure::Wait(_)
+            | CommandRunFailure::Kill { .. }
+            | CommandRunFailure::Reap { .. }
             | CommandRunFailure::VolumeRename => HostError::new(format!(
                 "cannot execute {:?} with argv {:?}: {error}",
                 command.program(),
@@ -2769,7 +2772,7 @@ fn run_command_with(
             command.program()
         )));
     }
-    let output = cowshed_apfs::disk_lease::leased(program, command.args(), || {
+    let output = cowshed_apfs::disk_lease::leased(program, command.args(), None, || {
         spawn(program, command.args())
     })
     .map_err(|source| {
@@ -3325,7 +3328,7 @@ impl MacAuthorizationSession {
                 command.program()
             )));
         }
-        cowshed_apfs::disk_lease::leased(Path::new(command.program()), command.args(), || {
+        cowshed_apfs::disk_lease::leased(Path::new(command.program()), command.args(), None, || {
             self.execute_authorized_unleased(command, input)
         })
     }

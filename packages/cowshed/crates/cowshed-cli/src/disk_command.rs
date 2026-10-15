@@ -11,8 +11,8 @@
 use std::io::{self, Write};
 
 use cowshed_apfs::{
-    CommandOutput, CommandRequest, CommandRunError, CommandRunFailure, ProcessStatus,
-    SystemCommandRunner,
+    CommandDeadline, CommandOutput, CommandRequest, CommandRunError, CommandRunFailure,
+    ProcessStatus, SystemCommandRunner,
 };
 use cowshed_core::{CowshedError, ErrorCode};
 
@@ -59,12 +59,15 @@ where
 /// passphrase to it.
 async fn run(args: &DiskCommandArgs) -> Result<CommandOutput, CowshedError> {
     let request = request(args);
-    tokio::task::spawn_blocking(move || SystemCommandRunner.run_with_inherited_input(&request))
-        .await
-        .map_err(|error| {
-            CowshedError::internal(format!("the disk-command runner thread failed: {error}"))
-        })?
-        .map_err(runner_error)
+    let deadline = CommandDeadline::new(args.deadline);
+    tokio::task::spawn_blocking(move || {
+        SystemCommandRunner.run_with_inherited_input(&request, deadline)
+    })
+    .await
+    .map_err(|error| {
+        CowshedError::internal(format!("the disk-command runner thread failed: {error}"))
+    })?
+    .map_err(runner_error)
 }
 
 /// Why the runner produced no outcome, in the taxonomy a caller branches on.
@@ -74,12 +77,17 @@ fn runner_error(error: CommandRunError) -> CowshedError {
         CommandRunFailure::Spawn(source) if source.kind() == io::ErrorKind::NotFound => {
             CowshedError::new(ErrorCode::EnvironmentMissing, message, "cowshed doctor")
         }
-        CommandRunFailure::Deadline(_) => CowshedError::conflict(message, "cowshed doctor"),
+        CommandRunFailure::Deadline { .. } | CommandRunFailure::Unspawned(_) => {
+            CowshedError::conflict(message, "cowshed doctor")
+        }
         CommandRunFailure::VolumeRename => CowshedError::usage(
             message,
             "no disk tool renames a volume; create it under its final name (specs/cowshed/01a_apfs.md, \"Ownership, identity, and the volume label\")",
         ),
-        CommandRunFailure::Spawn(_) | CommandRunFailure::Wait(_) => CowshedError::internal(message),
+        CommandRunFailure::Spawn(_)
+        | CommandRunFailure::Wait(_)
+        | CommandRunFailure::Kill { .. }
+        | CommandRunFailure::Reap { .. } => CowshedError::internal(message),
     }
 }
 
@@ -120,6 +128,7 @@ mod tests {
     fn args(tool: DiskTool, argv: &[&str]) -> DiskCommandArgs {
         DiskCommandArgs {
             tool,
+            deadline: cowshed_apfs::DISK_CHILD_DEADLINE,
             args: argv.iter().map(OsString::from).collect(),
         }
     }
@@ -216,9 +225,48 @@ mod tests {
         assert_eq!(missing.exec_wrapper_exit_code(), 104);
         let hung = runner_error(CommandRunError {
             request: request.clone(),
-            failure: CommandRunFailure::Deadline(std::time::Duration::from_secs(120)),
+            failure: CommandRunFailure::Deadline {
+                deadline: std::time::Duration::from_secs(120),
+                ended: ProcessStatus::Signal(libc::SIGKILL),
+            },
         });
         assert_eq!(hung.exec_wrapper_exit_code(), 103);
+        assert!(hung.message.contains("reaped with signal"), "{hung}");
+        let unspawned = runner_error(CommandRunError {
+            request: request.clone(),
+            failure: CommandRunFailure::Unspawned(std::time::Duration::from_millis(37)),
+        });
+        assert_eq!(unspawned.exec_wrapper_exit_code(), 103);
+        assert!(
+            unspawned.message.contains("no disk tool was started"),
+            "{unspawned}"
+        );
+        let failed_kill = runner_error(CommandRunError {
+            request: request.clone(),
+            failure: CommandRunFailure::Kill {
+                deadline: std::time::Duration::from_millis(37),
+                pid: 123,
+                source: io::Error::from(io::ErrorKind::PermissionDenied),
+                ended: Ok(None),
+            },
+        });
+        assert_eq!(failed_kill.exec_wrapper_exit_code(), 100);
+        assert!(
+            failed_kill.message.contains("still running as pid 123"),
+            "{failed_kill}"
+        );
+        let failed_reap = runner_error(CommandRunError {
+            request: request.clone(),
+            failure: CommandRunFailure::Reap {
+                deadline: std::time::Duration::from_millis(37),
+                source: io::Error::from(io::ErrorKind::Interrupted),
+            },
+        });
+        assert_eq!(failed_reap.exec_wrapper_exit_code(), 100);
+        assert!(
+            failed_reap.message.contains("could not reap"),
+            "{failed_reap}"
+        );
         let lost = runner_error(CommandRunError {
             request,
             failure: CommandRunFailure::Wait(io::Error::from(io::ErrorKind::Interrupted)),
