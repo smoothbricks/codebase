@@ -657,16 +657,17 @@ impl StorageGcCandidate {
     }
 }
 
+/// Storage hosts construct complete plans; callers outside storage can only read them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageGcPlan {
-    repo: RepoId,
-    observed_at: std::time::SystemTime,
-    options: StorageGcOptions,
-    candidates: Vec<StorageGcCandidate>,
-    lock_paths: Vec<PathBuf>,
-    examined: usize,
-    retained: StorageGcRetained,
-    root_held_mountpoints: Vec<RootHeldMountpoint>,
+    pub(super) repo: RepoId,
+    pub(super) observed_at: std::time::SystemTime,
+    pub(super) options: StorageGcOptions,
+    pub(super) candidates: Vec<StorageGcCandidate>,
+    pub(super) lock_paths: Vec<PathBuf>,
+    pub(super) examined: usize,
+    pub(super) retained: StorageGcRetained,
+    pub(super) root_held_mountpoints: Vec<RootHeldMountpoint>,
 }
 
 /// A bare directory holding only the kernel's root-owned event log. Collection may move its
@@ -721,39 +722,17 @@ pub struct StorageGcRetained {
 }
 
 impl StorageGcPlan {
-    pub(crate) fn new(
-        repo: RepoId,
-        observed_at: std::time::SystemTime,
-        options: StorageGcOptions,
-        candidates: Vec<StorageGcCandidate>,
-        lock_paths: Vec<PathBuf>,
-        examined: usize,
-        retained: StorageGcRetained,
-        root_held_mountpoints: Vec<RootHeldMountpoint>,
-    ) -> Self {
+    pub fn empty(repo: RepoId) -> Self {
         Self {
             repo,
-            observed_at,
-            options,
-            candidates,
-            lock_paths,
-            examined,
-            retained,
-            root_held_mountpoints,
+            observed_at: std::time::SystemTime::UNIX_EPOCH,
+            options: StorageGcOptions::default(),
+            candidates: Vec::new(),
+            lock_paths: Vec::new(),
+            examined: 0,
+            retained: StorageGcRetained::default(),
+            root_held_mountpoints: Vec::new(),
         }
-    }
-
-    pub fn empty(repo: RepoId) -> Self {
-        Self::new(
-            repo,
-            std::time::SystemTime::UNIX_EPOCH,
-            StorageGcOptions::default(),
-            Vec::new(),
-            Vec::new(),
-            0,
-            StorageGcRetained::default(),
-            Vec::new(),
-        )
     }
 
     pub fn repo(&self) -> &RepoId {

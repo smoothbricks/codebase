@@ -3065,20 +3065,20 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         lock_paths.sort();
         lock_paths.dedup();
         root_held_mountpoints.sort_by(|left, right| left.mount_point().cmp(right.mount_point()));
-        Ok(StorageGcPlan::new(
-            repo.clone(),
+        Ok(StorageGcPlan {
+            repo: repo.clone(),
             observed_at,
             options,
             candidates,
             lock_paths,
             examined,
-            StorageGcRetained {
+            retained: StorageGcRetained {
                 pinned: retained_pinned,
                 recent: retained_recent,
                 active: retained_active,
             },
             root_held_mountpoints,
-        ))
+        })
     }
     fn orphan_session_image_mount_blocker(
         &self,
