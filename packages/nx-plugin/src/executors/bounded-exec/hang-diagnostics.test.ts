@@ -179,6 +179,16 @@ describe('pre-expiry hang diagnostics', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('starts no process probe after the pre-expiry window or with no remaining budget', async () => {
+    for (const bounds of [{ expiresAtMs: Date.now() - 1 }, { deadlineMs: 0 }]) {
+      const { host, calls } = scriptedHost([]);
+      const capture = await captureHangDiagnostics({ ...request(), ...bounds }, host);
+      expect(capture.outcome).toBe('incomplete');
+      expect(capture.text).toContain('no probe started');
+      expect(calls).toEqual([]);
+    }
+  });
+
   it('keeps process-only visibility explicit on platforms without the Darwin open-file probe', async () => {
     const { host, calls } = scriptedHost([exited(rootRow), exited(rootRow)]);
     const capture = await captureHangDiagnostics(request(), { ...host, platform: 'linux' });
