@@ -305,11 +305,11 @@ pub struct TaskQueueStatus {
     pub cpu: Option<CpuBudgetStatus>,
 }
 
-fn deps_are_empty(deps: &Vec<&str>) -> bool {
+fn deps_are_empty(deps: &[&str]) -> bool {
     deps.is_empty()
 }
 
-fn leases_are_empty(leases: &Vec<LeaseClass>) -> bool {
+fn leases_are_empty(leases: &[LeaseClass]) -> bool {
     leases.is_empty()
 }
 
