@@ -818,11 +818,16 @@ mod tests {
     }
 
     impl Repository {
-        fn new() -> Self {
+        /// An empty checkout in a scratch root of its own.
+        fn empty() -> Self {
             let scratch = TempRoot::new("cowshed-git-preservation");
             let root = scratch.join("repository");
             fs::create_dir(&root).expect("create test checkout");
-            let repository = Self { scratch, root };
+            Self { scratch, root }
+        }
+
+        fn new() -> Self {
+            let repository = Self::empty();
             repository.git(&["init", "-q", "-b", "main"]);
             repository.git(&["config", "user.name", "Cowshed Test"]);
             repository.git(&["config", "user.email", "test@example.invalid"]);
@@ -837,6 +842,27 @@ mod tests {
             fs::write(repository.root.join("README"), b"second\n").expect("change fixture");
             repository.git(&["commit", "-qam", "second"]);
             repository.git(&["tag", "held", "HEAD^"]);
+            repository
+        }
+
+        /// A repository whose one commit holds exactly `files`: for a fixture that reads neither
+        /// the history, the remote nor the tag that `new` builds.
+        fn committed(files: &[(&str, &str)]) -> Self {
+            let repository = Self::empty();
+            repository.git(&["init", "-q", "-b", "main"]);
+            for (path, text) in files {
+                fs::write(repository.root.join(path), text).expect("write fixture file");
+            }
+            repository.git(&["add", "."]);
+            repository.git(&[
+                "-c",
+                "user.name=Cowshed Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ]);
             repository
         }
 
@@ -1327,10 +1353,19 @@ mod tests {
         repository: Repository,
         staging: PathBuf,
         before: GitPreservationSnapshot,
-        advanced: String,
+        /// A commit of the submodule's tree that nothing records, when the fixture was built to
+        /// offer one ([`SubmoduleHead::Advanceable`]).
+        advanced: Option<String>,
     }
 
     impl FilteredCopy {
+        /// The unrecorded submodule commit this fixture was built to offer.
+        fn advanced(&self) -> &str {
+            self.advanced
+                .as_deref()
+                .expect("this fixture was built without an advanced submodule commit")
+        }
+
         fn verify(&self) -> Result<()> {
             verify_copy(
                 &self.staging,
@@ -1352,9 +1387,17 @@ mod tests {
         }
     }
 
+    /// Whether a witness plants submodule commit drift. The unrecorded commit it moves the
+    /// submodule's HEAD onto must exist in the source, and so in the copy, before the copy is taken.
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum SubmoduleHead {
+        Recorded,
+        Advanceable,
+    }
+
     // Each independent witness gets the same real filtered checkout and source-byte controls.
     // Keep repeated full Git captures out of one aggregate test's 30-second window.
-    fn with_filtered_copy(check: impl FnOnce(&FilteredCopy)) {
+    fn with_filtered_copy(submodule_head: SubmoduleHead, check: impl FnOnce(&FilteredCopy)) {
         let repository = Repository::new();
         // A clean filter stores the index blob, so raw worktree bytes differ from it: the shape
         // git-crypt and LFS checkouts take. The copy must verify without running that filter.
@@ -1369,15 +1412,12 @@ mod tests {
         repository.git(&["add", ".gitattributes", "secret.txt"]);
         repository.git(&["commit", "-qm", "filtered"]);
         // A populated submodule with a filtered README. Its clone is made before any driver is
-        // configured, so checkout never runs one.
-        let submodule_source = Repository::new();
-        fs::write(
-            submodule_source.root.join(".gitattributes"),
-            b"README filter=enc\n",
-        )
-        .expect("write submodule attributes");
-        submodule_source.git(&["add", ".gitattributes"]);
-        submodule_source.git(&["commit", "-qm", "attributes"]);
+        // configured, so checkout never runs one. The README is seven bytes, as are the bytes
+        // planted over it below.
+        let submodule_source = Repository::committed(&[
+            ("README", "second\n"),
+            (".gitattributes", "README filter=enc\n"),
+        ]);
         repository.git(&[
             "-c",
             "protocol.file.allow=always",
@@ -1430,23 +1470,26 @@ mod tests {
         fs::write(&exclude, b"ignored.log\n").expect("ignore submodule log");
         fs::write(repository.root.join("subdir/ignored.log"), b"ignored\n")
             .expect("write ignored submodule file");
-        // Commit-level drift: an unrecorded commit the copy's submodule HEAD will move onto.
-        let tree = text(repository.git(&["-C", "subdir", "rev-parse", "HEAD^{tree}"]));
-        let head = text(repository.git(&["-C", "subdir", "rev-parse", "HEAD"]));
-        let advanced = text(repository.git(&[
-            "-C",
-            "subdir",
-            "-c",
-            "user.name=Cowshed Test",
-            "-c",
-            "user.email=test@example.invalid",
-            "commit-tree",
-            tree.as_str(),
-            "-p",
-            head.as_str(),
-            "-m",
-            "advance",
-        ]));
+        // Commit-level drift: an unrecorded commit the copy's submodule HEAD will move onto, made
+        // only for the witness that plants it.
+        let advanced = (submodule_head == SubmoduleHead::Advanceable).then(|| {
+            let tree = text(repository.git(&["-C", "subdir", "rev-parse", "HEAD^{tree}"]));
+            let head = text(repository.git(&["-C", "subdir", "rev-parse", "HEAD"]));
+            text(repository.git(&[
+                "-C",
+                "subdir",
+                "-c",
+                "user.name=Cowshed Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit-tree",
+                tree.as_str(),
+                "-p",
+                head.as_str(),
+                "-m",
+                "advance",
+            ]))
+        });
         // Ordinary Git runs the driver; the marker is what a probe run would leave behind.
         let ordinary = crate::git::git_command_at(&repository.root)
             .args(["hash-object", "--path=secret.txt", "secret.txt"])
@@ -1532,7 +1575,7 @@ mod tests {
 
     #[test]
     fn configured_filters_never_run_and_copies_verify_their_raw_state() {
-        with_filtered_copy(|fixture| {
+        with_filtered_copy(SubmoduleHead::Recorded, |fixture| {
             let mut flipped_index =
                 fs::read(fixture.staging.join(".git/index")).expect("copied index");
             *flipped_index.last_mut().expect("index checksum byte") ^= 0xff;
@@ -1553,14 +1596,14 @@ mod tests {
 
     #[test]
     fn filtered_copy_verification_refuses_submodule_byte_and_head_drift() {
-        with_filtered_copy(|fixture| {
+        with_filtered_copy(SubmoduleHead::Advanceable, |fixture| {
             fixture.reject_changed_bytes("subdir/README", b"SECONX\n");
             fixture.reject_changed_bytes("subdir/ignored.log", b"IGNORED\n");
             // Commit-level pointer drift stays visible even though child status is disabled.
             let submodule_head = fixture.staging.join(".git/modules/subdir/HEAD");
             let recorded_head = plant(
                 &submodule_head,
-                format!("{}\n", fixture.advanced).as_bytes(),
+                format!("{}\n", fixture.advanced()).as_bytes(),
             );
             let error = fixture
                 .verify()
@@ -1576,7 +1619,7 @@ mod tests {
 
     #[test]
     fn filtered_copy_verification_refuses_copy_only_paths() {
-        with_filtered_copy(|fixture| {
+        with_filtered_copy(SubmoduleHead::Recorded, |fixture| {
             // A file only the copy holds is a path the source never had, never a silent omission.
             let extra = fixture.staging.join("extra.txt");
             fs::write(&extra, b"only in the copy\n").expect("plant extra file");
