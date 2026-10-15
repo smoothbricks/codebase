@@ -378,6 +378,18 @@ selects nothing fails rather than passing a run of no test. The RAM host walk an
 production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing case bounds. The shards
 exclude `*-host.test.ts`; the host target names both owned host files.
 
+An unfinished test name is not holder attribution. During the final five seconds of an unchanged no-progress interval,
+the executor takes one bounded pre-signal snapshot of its runner, descendants and retained process group. Resumed
+progress discards and cancels that interval's snapshot. At expiry the executor emits the completed observation, or an
+explicit incomplete-capture result, and starts termination immediately without awaiting a probe. The 180s bound is
+unchanged. Capture timestamps, the offset from the scheduled expiry and the actual expiry-to-capture interval accompany
+the observation. Process rows retain PID, PPID, PGID, state, percent CPU, elapsed time, start identity and command. On
+macOS the open-resource probe invokes `/usr/sbin/lsof` through noninteractive sudo, with an explicitly limited
+ordinary-user fallback. A missing tool, denied privilege, timeout, truncated output or changing process identity is
+incomplete evidence, never an empty holder set. Successful observations with resources, successful observations without
+matches and incomplete/raced captures remain distinct. An open file is not proof of a contested lock, and an admission
+token count or one CPU/state sample does not establish CPU starvation or its absence.
+
 Re-executed libtest fixture roles that report a line protocol use `--nocapture --quiet`. With an inherited
 `RUST_TEST_THREADS=1`, ordinary libtest output prefixes the first report with its unfinished test-name line; a reader
 waiting for a report at the start of a line then waits forever. Quiet formatting preserves the CPU grant and the exact
@@ -412,8 +424,8 @@ rebase-carries 36.0s, warm fork 30.9s, the foreign database holder 30.2s, agains
 were over 30s, so that class cannot hold them under ordinary host load; 60s holds every measurement. It is below 3×
 their ~25s idle floor (75s): a walk past it on a loaded host is a regression to find, not a class to raise. A class is a
 warning, never a kill or a failure: a test that never returns is ended by its runner's 180s no-progress bound, which
-names it, and a killed test leaves its images attached until the next run's sweep (01a_apfs.md, "How the APFS host
-degrades" §2).
+names it and emits the pre-signal holder observation or explicit capture failure described above. A killed test leaves
+its images attached until the next run's sweep (01a_apfs.md, "How the APFS host degrades" §2).
 
 The genuine-Nx CLI fixtures use the normal enabled daemon (16_build_volumes.md, "The Nx daemon stays on"). Both halves
 of the declared-versus-undeclared output witness require a seeded, actually adopted build volume through the typed land

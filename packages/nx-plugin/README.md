@@ -1037,6 +1037,10 @@ nextest's slow-timeout and the serial groups' code-time classes only warn; no pe
 that passed. `timeoutMs`, an absolute ceiling, is for commands that report no tests; a target names at least one of the
 two.
 
+The final-five-second pre-signal snapshot attributes the runner's process tree and observed resources, with explicit
+incomplete/raced results and no delay to termination. Its timing, visibility and evidence contract is defined in
+`specs/cowshed/08_testing.md`, "Integration tests (real substrate)".
+
 On a macOS host, every `bounded-exec` task runs with its own `TMPDIR` lease: a directory on one RAM-backed APFS volume
 per user, so test temp files never reach the SSD. The volume is created lazily by the first task that needs it and
 detached when the last live lease ends, since its pages return only on detach. It is a legacy DiskImages RAM disk, so it

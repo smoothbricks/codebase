@@ -15,6 +15,7 @@ import {
   runBoundedExec,
   type TempVolume,
 } from './executor.js';
+import type { HangDiagnostics } from './hang-diagnostics.js';
 import type { RamTempAcquisition, RamTempError, RamTempLease, Result } from './ram-temp.js';
 import { VERDICT_FILE } from './verdict.js';
 
@@ -171,6 +172,106 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain('Command made no progress: no test finished for 400ms (idleTimeoutMs=400)');
     expect(result.terminalOutput).toContain('still running: fake tests::hangs (cwd=');
     expect(result.terminalOutput).not.toContain('fake tests::quick (cwd=');
+  });
+
+  it('emits a completed pre-expiry snapshot or an explicit incomplete capture without waiting for it', async () => {
+    const workspace = await createWorkspace();
+    // Child output drives the fake executor clock; the heartbeat period is not a timing oracle.
+    await workspace.write('snapshot-clock.js', "setInterval(() => console.log('snapshot-clock'), 20);\n");
+    for (const completes of [true, false]) {
+      let pid: number | undefined;
+      let signal: AbortSignal | undefined;
+      const { result } = await onProgressClock(
+        (chunk) => chunk.includes('snapshot-clock\n'),
+        5_000,
+        () =>
+          runBoundedExec(
+            { command: 'node snapshot-clock.js', idleTimeoutMs: 10_000, killAfterMs: 0 },
+            workspace.context,
+            createProcessTreeKiller(),
+            null,
+            null,
+            null,
+            async (request) => {
+              pid = request.pid;
+              signal = request.signal;
+              if (!completes) return new Promise<HangDiagnostics>(() => {});
+              const capturedAtMs = Date.now();
+              return {
+                startedAtMs: capturedAtMs,
+                capturedAtMs,
+                offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
+                outcome: 'holders',
+                text: 'owned pre-signal process observation\n',
+              };
+            },
+          ),
+      );
+      expect(result.success).toBe(false);
+      expect(pid).toBeGreaterThan(0);
+      expect(signal?.aborted).toBe(true);
+      expect(result.terminalOutput).toContain(`Hang diagnostics: runner pid=${pid}`);
+      if (completes) {
+        expect(result.terminalOutput).toContain('outcome=holders capturedAtMs=');
+        expect(result.terminalOutput).toContain('actualExpiryOffsetMs=5000');
+        expect(result.terminalOutput).toContain('owned pre-signal process observation');
+      } else {
+        expect(result.terminalOutput).toContain('capture incomplete at expiry');
+        expect(result.terminalOutput).toContain('no empty-holder conclusion');
+      }
+    }
+  });
+
+  it('discards the previous snapshot when a test finishes and captures the next idle interval', async () => {
+    const workspace = await createWorkspace();
+    // Only observed child output advances the fake clock, never elapsed host time.
+    await workspace.write(
+      'snapshot-progress.js',
+      [
+        "const { existsSync } = require('node:fs');",
+        'let progressed = false;',
+        'setInterval(() => {',
+        "  if (!progressed && existsSync('progress')) {",
+        "    console.log('        PASS [   0.010s] (1/1) fake tests::progress');",
+        '    progressed = true;',
+        '  }',
+        "  console.log('snapshot-clock');",
+        '}, 20);',
+        '',
+      ].join('\n'),
+    );
+    const signals: Array<AbortSignal | undefined> = [];
+    const { result } = await onProgressClock(
+      (chunk) => chunk.includes('snapshot-clock\n'),
+      5_000,
+      () =>
+        runBoundedExec(
+          { command: 'node snapshot-progress.js', idleTimeoutMs: 10_000, killAfterMs: 0 },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+          null,
+          null,
+          async (request) => {
+            signals.push(request.signal);
+            const ordinal = signals.length;
+            if (ordinal === 1) await workspace.write('progress', 'go');
+            const capturedAtMs = Date.now();
+            return {
+              startedAtMs: capturedAtMs,
+              capturedAtMs,
+              offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
+              outcome: 'holders',
+              text: `capture-interval-${ordinal}\n`,
+            };
+          },
+        ),
+    );
+    expect(result.success).toBe(false);
+    expect(signals).toHaveLength(2);
+    expect(signals.every((signal) => signal?.aborted)).toBe(true);
+    expect(result.terminalOutput).not.toContain('capture-interval-1');
+    expect(result.terminalOutput).toContain('capture-interval-2');
   });
 
   it('kills a command whose only output is a heartbeat', async () => {

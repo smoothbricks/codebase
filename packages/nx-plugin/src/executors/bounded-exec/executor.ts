@@ -19,6 +19,8 @@ import {
   sizeRunner,
   type TokenGrant,
 } from './cpu-tokens.js';
+import type { HangDiagnostics } from './hang-diagnostics.js';
+import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import { createRunProgress, withProgressReport } from './progress.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -47,6 +49,10 @@ import {
 
 const DEFAULT_KILL_AFTER_MS = 10_000;
 const REAP_AFTER_FORCE_KILL_MS = 2_000;
+type IdleDiagnosticResult =
+  | { kind: 'pending'; startedAtMs: number | null }
+  | { kind: 'captured'; snapshot: HangDiagnostics }
+  | { kind: 'failed'; detail: string };
 const EXIT_CODE_BY_SIGNAL: Partial<Record<NodeJS.Signals, number>> = {
   SIGHUP: 129,
   SIGINT: 130,
@@ -171,6 +177,7 @@ export async function runBoundedExec(
   tempVolume: TempVolume | null,
   budget: CpuBudget | null,
   inherited: InheritedCpuPool | null = null,
+  captureDiagnostics: typeof captureHangDiagnostics = captureHangDiagnostics,
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
   const directory = context.record?.directory ?? null;
@@ -387,11 +394,59 @@ export async function runBoundedExec(
   // Progress is a finished test, not output: a runner's SLOW warnings and a hung test's heartbeat keep printing.
   const progress = createRunProgress();
   let idleTimer: NodeJS.Timeout | undefined;
+  let captureTimer: NodeJS.Timeout | undefined;
+  let idleCapture: { expiresAtMs: number; controller: AbortController; result: IdleDiagnosticResult } | undefined;
+  const cancelCapture = (): void => {
+    clearTimeout(captureTimer);
+    idleCapture?.controller.abort();
+  };
   const armIdleTimer = (): void => {
     if (idleTimeoutMs === undefined || state.settled || state.expiry !== null) {
       return;
     }
     clearTimeout(idleTimer);
+    cancelCapture();
+    const capture: NonNullable<typeof idleCapture> = {
+      expiresAtMs: Date.now() + idleTimeoutMs,
+      controller: new AbortController(),
+      result: { kind: 'pending', startedAtMs: null },
+    };
+    idleCapture = capture;
+    captureTimer = setTimeout(
+      () => {
+        if (state.settled || state.expiry !== null || idleCapture !== capture) return;
+        const pid = child.pid;
+        if (pid === undefined) {
+          idleCapture.result = { kind: 'failed', detail: 'runner PID unavailable; no holder conclusion' };
+          return;
+        }
+        idleCapture.result = { kind: 'pending', startedAtMs: Date.now() };
+        void Promise.resolve()
+          .then(() =>
+            captureDiagnostics({
+              pid,
+              pgid: process.platform === 'win32' ? null : pid,
+              expiresAtMs: capture.expiresAtMs,
+              deadlineMs: Math.max(0, Math.min(HANG_CAPTURE_MS, capture.expiresAtMs - Date.now())),
+              signal: capture.controller.signal,
+            }),
+          )
+          .then(
+            (snapshot) => {
+              if (idleCapture === capture) idleCapture.result = { kind: 'captured', snapshot };
+            },
+            (error: unknown) => {
+              if (idleCapture === capture) {
+                idleCapture.result = {
+                  kind: 'failed',
+                  detail: error instanceof Error ? error.message : String(error),
+                };
+              }
+            },
+          );
+      },
+      Math.max(0, idleTimeoutMs - HANG_CAPTURE_MS),
+    );
     idleTimer = setTimeout(
       () => expire({ kind: 'idle', limitMs: idleTimeoutMs, tests: progress.inFlight() }),
       idleTimeoutMs,
@@ -425,6 +480,7 @@ export async function runBoundedExec(
   };
   const onTerminationSignal = (signal: NodeJS.Signals): void => {
     removeSignalHandlers();
+    cancelCapture();
     void killChildTree(false)
       .finally(releaseCpu)
       .finally(releaseLease)
@@ -483,6 +539,30 @@ export async function runBoundedExec(
           } (cwd=${cwd}): ${command}\n`
         : `\nCommand timed out after ${elapsedMs}ms (timeoutMs=${bound.limitMs}, cwd=${cwd}): ${command}\n`,
     );
+    if (bound.kind === 'idle') {
+      const observed = idleCapture?.result;
+      appendStderr(
+        `Hang diagnostics: runner pid=${child.pid ?? 'unavailable'} pgid=${
+          process.platform === 'win32' ? 'unavailable' : (child.pid ?? 'unavailable')
+        } expiryAtMs=${Date.now()} scheduledExpiryAtMs=${idleCapture?.expiresAtMs ?? 'unavailable'}\n`,
+      );
+      if (observed?.kind === 'captured') {
+        appendStderr(
+          `Hang diagnostics: outcome=${observed.snapshot.outcome} capturedAtMs=${observed.snapshot.capturedAtMs} actualExpiryOffsetMs=${
+            Date.now() - observed.snapshot.capturedAtMs
+          }\n${observed.snapshot.text}`,
+        );
+      } else {
+        appendStderr(
+          `Hang diagnostics: outcome=incomplete; ${
+            observed?.kind === 'failed'
+              ? `capture failed: ${observed.detail}`
+              : `capture incomplete at expiry (startedAtMs=${observed?.startedAtMs ?? 'not started'})`
+          }; no empty-holder conclusion\n`,
+        );
+      }
+    }
+    cancelCapture();
     termination = terminate();
   };
 
@@ -530,6 +610,7 @@ export async function runBoundedExec(
       return;
     }
     state.grantLost = true;
+    cancelCapture();
     appendStderr(
       `cowshed: cpu-tokens grant lost: its parent pool closed while the command ran; stopping it: ${command}\n`,
     );
@@ -545,6 +626,7 @@ export async function runBoundedExec(
   await termination;
   clearTimeout(totalTimer);
   clearTimeout(idleTimer);
+  cancelCapture();
   removeSignalHandlers();
   // The runner is gone. Its sub-pool closes first, so no descendant still draws on tokens the grant returns;
   // then the grant goes back to its parent or the host.
