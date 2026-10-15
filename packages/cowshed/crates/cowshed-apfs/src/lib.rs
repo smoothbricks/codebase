@@ -144,12 +144,27 @@ pub enum CommandRunFailure {
     /// The child was still running at this deadline and was killed. It *ran*: a hung child is
     /// never reported as one that could not be started.
     Deadline(Duration),
+    /// Refused before spawning: a Disk Arbitration rename
+    /// ([`disk_lease::VolumeRenameRefused`](crate::disk_lease::VolumeRenameRefused)).
+    VolumeRename,
 }
 
 #[derive(Debug)]
 pub struct CommandRunError {
     pub request: CommandRequest,
     pub failure: CommandRunFailure,
+}
+
+impl From<crate::disk_lease::VolumeRenameRefused> for CommandRunError {
+    fn from(refused: crate::disk_lease::VolumeRenameRefused) -> Self {
+        Self {
+            request: CommandRequest {
+                program: refused.program,
+                args: refused.args,
+            },
+            failure: CommandRunFailure::VolumeRename,
+        }
+    }
 }
 
 impl fmt::Display for CommandRunError {
@@ -171,6 +186,11 @@ impl fmt::Display for CommandRunError {
                      deferred for the next pass"
                 )
             }
+            CommandRunFailure::VolumeRename => {
+                f.write_str("refused ")?;
+                fmt_command(f, program, args)?;
+                write!(f, ": {}", crate::disk_lease::VOLUME_RENAME_REFUSAL)
+            }
         }
     }
 }
@@ -179,7 +199,7 @@ impl std::error::Error for CommandRunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.failure {
             CommandRunFailure::Spawn(source) | CommandRunFailure::Wait(source) => Some(source),
-            CommandRunFailure::Deadline(_) => None,
+            CommandRunFailure::Deadline(_) | CommandRunFailure::VolumeRename => None,
         }
     }
 }
@@ -226,12 +246,17 @@ pub trait CommandRunner {
     /// fenced like the lease: once it is dropped, an eject is no longer refused.
     fn pin_raw_device(&self, device: &Path) -> io::Result<Option<Fenced<File>>>;
     /// Hold `mount_point` open and say what the kernel has mounted there ([`mounts::hold_mount`]).
-    /// A rename proves its volume mounted through this under the image's lease, immediately
-    /// before Disk Arbitration renames it by that mount. The default reads the kernel, so a
-    /// recording runner that does not answer from its script refuses every fake device: it
-    /// fails closed, never into a rename.
+    /// A rename proves its volume's root through this ([`OwnedVolumeRoot`]) and names the volume
+    /// through the same descriptor. The default reads the kernel, so a recording runner that does
+    /// not answer from its script refuses every fake device: it fails closed, never into a rename.
     fn hold_mount(&self, mount_point: &Path) -> io::Result<mounts::HeldMount> {
         mounts::hold_mount(mount_point)
+    }
+    /// Name the owned volume `root` holds ([`OwnedVolumeRoot::set_name`]): the one way any code
+    /// names a volume. A recording runner records it; a stated root it did not override names
+    /// nothing and fails.
+    fn name_volume(&self, root: &OwnedVolumeRoot, volume_name: &str) -> io::Result<()> {
+        root.set_name(volume_name)
     }
     /// Current kernel namespace membership of one exact volume device. Unmount calls this
     /// only after host storage admission, while its image lease and raw pin preserve identity.
@@ -406,6 +431,9 @@ impl SystemCommandRunner {
     }
 
     /// Run `request` reading `input` under `policy`, calling `warn` each time a warning is due.
+    /// Every disk child of every entry point spawns here, a caller's own lease
+    /// ([`Self::run_within`]) included, so a Disk Arbitration rename is refused here too
+    /// ([`crate::disk_lease::refuse_volume_rename`]).
     fn run_unleased(
         request: &CommandRequest,
         input: ChildInput,
@@ -413,6 +441,7 @@ impl SystemCommandRunner {
         warn: &mut dyn FnMut(Duration),
     ) -> Result<CommandOutput, CommandRunError> {
         use std::io::Read;
+        crate::disk_lease::refuse_volume_rename(&request.program, &request.args)?;
         let (mut child, output_files) =
             spawn_disk_child(request, input).map_err(|source| CommandRunError {
                 request: request.clone(),
@@ -582,16 +611,38 @@ impl CommandRunner for SystemCommandRunner {
     where
         E: From<CommandRunError> + fmt::Display,
     {
+        /// A guarded run fails by its check's error or by the run's own.
+        enum Guarded<E> {
+            Check(E),
+            Run(CommandRunError),
+        }
+        impl<E: fmt::Display> fmt::Display for Guarded<E> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::Check(error) => error.fmt(f),
+                    Self::Run(error) => error.fmt(f),
+                }
+            }
+        }
+        impl<E> From<crate::disk_lease::VolumeRenameRefused> for Guarded<E> {
+            fn from(refused: crate::disk_lease::VolumeRenameRefused) -> Self {
+                Self::Run(refused.into())
+            }
+        }
         let policy = DeadlinePolicy::for_request(request, DISK_CHILD_DEADLINE);
         let output = crate::disk_lease::leased(&request.program, &request.args, || {
-            if !check()? {
+            if !check().map_err(Guarded::Check)? {
                 return Ok(None);
             }
             Self::run_unleased(request, ChildInput::Null, policy, &mut |elapsed| {
                 warn_outlived(request, DISK_CHILD_DEADLINE, elapsed)
             })
             .map(Some)
-            .map_err(E::from)
+            .map_err(Guarded::Run)
+        })
+        .map_err(|error| match error {
+            Guarded::Check(error) => error,
+            Guarded::Run(error) => E::from(error),
         })?;
         if let Some(output) = &output {
             record_pool_outcome(request, output);
@@ -1138,6 +1189,57 @@ impl AttachedImage {
     }
 }
 
+/// A volume's mount root, held open and proven to be owned media: the pinned volume device of a
+/// verified attachment of an image, never a host disk. It is the only way any code names an APFS
+/// volume ([`CommandRunner::name_volume`]), and only this crate can prove one.
+///
+/// Naming goes through the held descriptor, never a path. Disk Arbitration (`diskutil rename`,
+/// `renameVolume`) names a device through the mount path it recorded, resolved when its queue
+/// reaches the request, and xnu names whatever volume holds a path: a volume force-unmounted in
+/// between leaves a bare directory of the host's Data volume there, and a root Disk Arbitration
+/// renames the Data volume. Measured on nested throwaway images: a kernel-forced unmount before
+/// `DADiskRename` of the inner device renamed the outer volume holding the mountpoint in 16 of
+/// 20 runs. Through the held descriptor, the same forced unmount fails the call instead.
+#[derive(Debug)]
+pub struct OwnedVolumeRoot {
+    volume_device: String,
+    mount_point: PathBuf,
+    held: mounts::HeldMount,
+}
+
+impl OwnedVolumeRoot {
+    /// `held`, at `mount_point`, as `attachment`'s volume root: the image's pinned, proven
+    /// volume device mounted there, at the root. Anything else is handed back for the refusal.
+    fn of_attachment(
+        held: mounts::HeldMount,
+        mount_point: &Path,
+        attachment: &AttachedImage,
+    ) -> Result<Self, mounts::HeldMount> {
+        if held.is_root() && held.source_device() == attachment.volume_device {
+            Ok(Self {
+                volume_device: attachment.volume_device.clone(),
+                mount_point: mount_point.to_owned(),
+                held,
+            })
+        } else {
+            Err(held)
+        }
+    }
+
+    pub fn volume_device(&self) -> &str {
+        &self.volume_device
+    }
+
+    pub fn mount_point(&self) -> &Path {
+        &self.mount_point
+    }
+
+    /// Name this volume through its held root descriptor ([`mounts::HeldMount`]).
+    pub fn set_name(&self, volume_name: &str) -> io::Result<()> {
+        self.held.set_volume_name(volume_name)
+    }
+}
+
 /// The authority that names retained inputs: a validated explicit re-adoption record. The
 /// workspace layer implements it for its record; this layer only asks whether a path is named.
 pub trait RetainedInputs {
@@ -1399,13 +1501,21 @@ pub enum ApfsError {
     InvalidVolumeDevice(String),
     /// A rename's volume is not the one mounted at the path it was found mounted at by the time
     /// the rename would run: the path now lies on `found` (the host's own Data volume, once
-    /// nothing is mounted there), or inside a volume rather than at its root. Disk Arbitration
-    /// renames a mounted volume through its recorded mountpoint, so the rename is refused.
+    /// nothing is mounted there), or inside a volume rather than at its root. The held path is
+    /// no [`OwnedVolumeRoot`] of the image, so nothing is named.
     RenameTargetNotMounted {
         image: PathBuf,
         volume_device: String,
         mount_point: PathBuf,
         found: String,
+    },
+    /// Naming a proven owned volume root through its held descriptor failed: the volume was
+    /// unmounted, even by force, since the proof (its vnode is dead, `ENOTSUP`), or the kernel
+    /// refused the name. Nothing else was named.
+    RenameFailed {
+        volume_device: String,
+        mount_point: PathBuf,
+        source: io::Error,
     },
     CommandRun(CommandRunError),
     CommandFailed {
@@ -1529,6 +1639,15 @@ impl fmt::Display for ApfsError {
                 "refusing to rename {volume_device} of {}: {} is no longer its mount root (the \
                  kernel holds {found} there)",
                 image.display(),
+                mount_point.display()
+            ),
+            Self::RenameFailed {
+                volume_device,
+                mount_point,
+                source,
+            } => write!(
+                f,
+                "could not rename {volume_device} through its held mount root {}: {source}",
                 mount_point.display()
             ),
             Self::CommandRun(error) => error.fmt(f),
@@ -1684,7 +1803,7 @@ impl std::error::Error for ApfsError {
         match self {
             Self::CommandRun(error) => Some(error),
             Self::KernelInventory(source) => Some(source),
-            Self::FileOperation { source, .. } => Some(source),
+            Self::FileOperation { source, .. } | Self::RenameFailed { source, .. } => Some(source),
             Self::Clone(error) => Some(error),
             Self::VerificationAndDetachFailed { detach, .. } => Some(detach),
             Self::ImageCreationAndCleanupFailed { primary, .. } => Some(primary),
@@ -1751,13 +1870,11 @@ pub trait ApfsBackend {
         destination: &Path,
         capture: ImageCapture,
     ) -> Result<(), CloneFileError>;
-    /// Rename `attachment`'s volume, mounted at `mount_point`, through its device, never through
-    /// a path: `diskutil renameVolume` handed a path renames whatever volume holds it, and a path
-    /// nothing is mounted at lies on the host's own volume. Under the image's lease and a raw pin,
-    /// the device is proven still to be that image's, and `mount_point`, held open, proven still
-    /// to be that device's mount root, before the rename runs and until it returns: Disk
-    /// Arbitration renames a mounted volume through the mountpoint it recorded, so a volume
-    /// unmounted since would hand the rename to the directory beneath it.
+    /// Rename `attachment`'s volume, mounted at `mount_point`, through that mount root held open,
+    /// never through a path or Disk Arbitration ([`OwnedVolumeRoot`]). Under the image's lease and
+    /// a raw pin, the device is proven still to be that image's, and `mount_point`, held open,
+    /// proven to be that device's mount root; the name is then set through the held descriptor,
+    /// which an unmount since — even a forced one — fails rather than redirects.
     fn rename_volume(
         &self,
         attachment: &AttachedImage,
@@ -1847,6 +1964,23 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                     source,
                 })
         })
+    }
+
+    /// Name `root`'s volume through the runner ([`CommandRunner::name_volume`]), the one call
+    /// that names any volume. A failure, including the dead descriptor a forced unmount since
+    /// the proof leaves, names nothing and says which root it was.
+    fn name_owned_volume(
+        &self,
+        root: &OwnedVolumeRoot,
+        volume_name: &str,
+    ) -> Result<(), ApfsError> {
+        self.runner
+            .name_volume(root, volume_name)
+            .map_err(|source| ApfsError::RenameFailed {
+                volume_device: root.volume_device.clone(),
+                mount_point: root.mount_point.clone(),
+                source,
+            })
     }
 
     fn pin_attached_volume(
@@ -2999,8 +3133,6 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
         }
         let _lease = self.image_lease(&attachment.image)?;
         let _pin = self.pin_attached_volume(attachment)?;
-        // Every cooperating unmount of this image waits on the lease held here; the held
-        // descriptor makes any other unforced unmount fail busy until the rename returns.
         let held =
             self.runner
                 .hold_mount(mount_point)
@@ -3009,27 +3141,16 @@ impl<R: CommandRunner, S: Sleeper> ApfsBackend for MacOsApfsBackend<R, S> {
                     path: mount_point.to_owned(),
                     source,
                 })?;
-        if !held.is_root() || held.source_device() != attachment.volume_device {
-            return Err(ApfsError::RenameTargetNotMounted {
-                image: attachment.image.clone(),
-                volume_device: attachment.volume_device.clone(),
-                mount_point: mount_point.to_owned(),
-                found: held.source_device().to_owned(),
-            });
-        }
-        let renamed = self.run_checked(
-            "rename APFS volume",
-            CommandRequest::new(
-                DISKUTIL,
-                [
-                    OsString::from("renameVolume"),
-                    OsString::from(&attachment.volume_device),
-                    OsString::from(volume_name),
-                ],
-            ),
-        );
-        drop(held);
-        renamed.map(|_| ())
+        let root =
+            OwnedVolumeRoot::of_attachment(held, mount_point, attachment).map_err(|held| {
+                ApfsError::RenameTargetNotMounted {
+                    image: attachment.image.clone(),
+                    volume_device: attachment.volume_device.clone(),
+                    mount_point: mount_point.to_owned(),
+                    found: held.source_device().to_owned(),
+                }
+            })?;
+        self.name_owned_volume(&root, volume_name)
     }
 
     fn attach_verified(&self, image: &Path) -> Result<AttachedImage, ApfsError> {
@@ -5392,6 +5513,8 @@ mod tests {
         Grow(io::Result<()>),
         /// The device the kernel has at a held mountpoint, and whether it is that mount's root.
         Mount(&'static str, bool),
+        /// What naming a proven owned volume root answers.
+        Named(io::Result<()>),
     }
 
     /// One thing the backend asked the host, in order.
@@ -5401,16 +5524,23 @@ mod tests {
         Inventory,
         Grow(PathBuf, ImageCapacity),
         HoldMount(PathBuf),
+        /// A proven owned root named: its volume device and the name.
+        NameVolume(String, String),
     }
 
     impl Seen {
         fn command(&self) -> &CommandRequest {
             match self {
                 Self::Command(request) => request,
-                Self::Inventory => panic!("expected a command, saw the kernel inventory read"),
+                Self::Inventory => {
+                    panic!("expected a command, saw a kernel inventory read")
+                }
                 Self::Grow(image, _) => panic!("expected a command, saw {} grow", image.display()),
                 Self::HoldMount(path) => {
                     panic!("expected a command, saw {} held", path.display())
+                }
+                Self::NameVolume(device, name) => {
+                    panic!("expected a command, saw {device} named {name:?}")
                 }
             }
         }
@@ -5421,7 +5551,9 @@ mod tests {
             .iter()
             .filter_map(|step| match step {
                 Seen::Command(request) => Some(request.clone()),
-                Seen::Inventory | Seen::Grow(..) | Seen::HoldMount(_) => None,
+                Seen::Inventory | Seen::Grow(..) | Seen::HoldMount(_) | Seen::NameVolume(..) => {
+                    None
+                }
             })
             .collect()
     }
@@ -5530,6 +5662,18 @@ mod tests {
                 other => panic!(
                     "test scripted {other:?} where {} was held",
                     mount_point.display()
+                ),
+            }
+        }
+        fn name_volume(&self, root: &OwnedVolumeRoot, volume_name: &str) -> io::Result<()> {
+            match self.next_reply(Seen::NameVolume(
+                root.volume_device().to_owned(),
+                volume_name.to_owned(),
+            )) {
+                Reply::Named(result) => result,
+                other => panic!(
+                    "test scripted {other:?} where {} was named",
+                    root.volume_device()
                 ),
             }
         }
@@ -7739,16 +7883,15 @@ mod tests {
         (backend, attachment)
     }
 
-    fn renames(backend: &MacOsApfsBackend<RecordingRunner>) -> Vec<CommandRequest> {
+    /// Every volume the backend named, as (volume device, name).
+    fn names(backend: &MacOsApfsBackend<RecordingRunner>) -> Vec<(String, String)> {
         backend
             .runner()
-            .requests()
+            .steps()
             .into_iter()
-            .filter(|request| {
-                request
-                    .args
-                    .first()
-                    .is_some_and(|verb| verb == "renameVolume")
+            .filter_map(|step| match step {
+                Seen::NameVolume(device, name) => Some((device, name)),
+                _ => None,
             })
             .collect()
     }
@@ -7761,13 +7904,16 @@ mod tests {
         Reply::Mount("/dev/disk5s1", true)
     }
 
+    /// A rename proves the device the image's, then holds its mount root, and names the volume
+    /// through that held root: no disk tool runs, so no Disk Arbitration path is ever resolved.
     #[test]
-    fn rename_volume_names_the_attachments_pinned_volume_device() {
+    fn rename_volume_names_only_the_held_root_of_the_attachments_volume() {
         let (backend, attachment) = attached_session([
             holding_verified_volume("session.dmg"),
             session_still_mounted(),
-            ok([]),
+            Reply::Named(Ok(())),
         ]);
+        let attached = backend.runner().requests().len();
 
         backend
             .rename_volume(
@@ -7779,23 +7925,25 @@ mod tests {
 
         let steps = backend.runner().steps();
         assert_eq!(
-            steps[steps.len() - 3..steps.len() - 1],
-            [Seen::Inventory, Seen::HoldMount(SESSION_MOUNT.into())],
-            "the device is proven the image's, then its mount held, before the rename"
+            steps[steps.len() - 3..],
+            [
+                Seen::Inventory,
+                Seen::HoldMount(SESSION_MOUNT.into()),
+                Seen::NameVolume("/dev/disk5s1".into(), "cowshed.acme--widget.main".into()),
+            ],
+            "the device is proven the image's, then its mount root held, then named through it"
         );
-        let rename = steps[steps.len() - 1].command();
-        assert_eq!(rename.program, Path::new(DISKUTIL));
         assert_eq!(
-            argv(rename),
-            ["renameVolume", "/dev/disk5s1", "cowshed.acme--widget.main"]
+            backend.runner().requests().len(),
+            attached,
+            "a rename runs no disk tool"
         );
     }
 
-    /// The mount a label found can be gone by the time the rename holds the image's lease, and
-    /// Disk Arbitration renames a mounted volume through the mountpoint it recorded: the bare
-    /// directory left there lies on the host's Data volume. A held mountpoint answering any other
-    /// device than the image's volume, or a directory inside that volume rather than its root,
-    /// refuses the rename before `diskutil` runs.
+    /// The mount a label found can be gone by the time the rename holds the image's lease: the
+    /// bare directory left there lies on the host's Data volume. A held mountpoint answering any
+    /// other device than the image's volume, or a directory inside that volume rather than its
+    /// root, is no owned root, and nothing is named.
     #[test]
     fn rename_volume_refuses_a_mountpoint_its_volume_left_before_any_rename() {
         for (found, root) in [("/dev/disk3s5", true), ("/dev/disk5s1", false)] {
@@ -7818,7 +7966,7 @@ mod tests {
                 ),
                 "{found} root={root}: {renamed:?}"
             );
-            assert!(renames(&backend).is_empty(), "ran {:?}", renames(&backend));
+            assert!(names(&backend).is_empty(), "named {:?}", names(&backend));
         }
     }
 
@@ -7828,14 +7976,14 @@ mod tests {
         let (backend, attachment) = attached_session([
             holding_verified_volume("session.dmg"),
             session_still_mounted(),
-            ok([]),
+            Reply::Named(Ok(())),
         ]);
 
         backend
             .rename_volume(&attachment, Path::new(SESSION_MOUNT), &name)
             .unwrap();
 
-        assert_eq!(renames(&backend)[0].args[2], OsString::from(name));
+        assert_eq!(names(&backend), [("/dev/disk5s1".to_owned(), name)]);
     }
 
     #[test]
@@ -7866,31 +8014,73 @@ mod tests {
         assert_eq!(backend.runner().steps().len(), attached);
     }
 
+    /// A volume unmounted, even by force, after its root was proven leaves the held descriptor
+    /// dead, and the kernel fails the name (`ENOTSUP`, measured). That failure is the rename's,
+    /// named by device and mountpoint; it is not retried through any other route.
     #[test]
-    fn rename_volume_propagates_checked_diskutil_failure() {
+    fn rename_volume_reports_a_naming_failure_on_its_held_root() {
         let (backend, attachment) = attached_session([
             holding_verified_volume("session.dmg"),
             session_still_mounted(),
-            failed(7, "rename failed"),
+            Reply::Named(Err(io::Error::from_raw_os_error(libc::ENOTSUP))),
         ]);
 
         let error = backend
             .rename_volume(&attachment, Path::new(SESSION_MOUNT), "main")
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            ApfsError::CommandFailed {
-                operation: "rename APFS volume",
-                request,
-                output: CommandOutput {
-                    status: ProcessStatus::Exit(7),
-                    ..
-                },
-            } if request.program == Path::new(DISKUTIL)
-                && argv(&request) == ["renameVolume", "/dev/disk5s1", "main"]
-        ));
-        assert_eq!(renames(&backend).len(), 1);
+        assert!(
+            matches!(
+                &error,
+                ApfsError::RenameFailed { volume_device, mount_point, source }
+                    if volume_device == "/dev/disk5s1"
+                        && mount_point == Path::new(SESSION_MOUNT)
+                        && source.raw_os_error() == Some(libc::ENOTSUP)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(names(&backend).len(), 1, "one naming, never a second route");
+    }
+
+    /// Disk Arbitration's rename is refused for every caller of the system runner, in every case
+    /// spelling diskutil accepts and whatever path names diskutil, before anything spawns. The
+    /// program here does not exist: a rename that got past the refusal would fail to spawn, and
+    /// any other verb of it does.
+    #[test]
+    fn the_system_runner_refuses_disk_arbitration_renames_before_spawning() {
+        let request = |verb: &str| {
+            CommandRequest::new(
+                "/nonexistent/cowshed-test/diskutil",
+                [verb, "/dev/disk3s5", "[cowshed] fixture · dispatch — main"],
+            )
+        };
+        for verb in ["rename", "renameVolume", "RENAMEVOLUME", "ReNaMe"] {
+            for refused in [
+                SystemCommandRunner.run(&request(verb)),
+                SystemCommandRunner.run_with_inherited_input(&request(verb)),
+                SystemCommandRunner
+                    .run_guarded(&request(verb), || Ok::<_, ApfsError>(true))
+                    .map_err(|error| match error {
+                        ApfsError::CommandRun(error) => error,
+                        other => panic!("{other}"),
+                    })
+                    .map(|output| output.expect("a guarded run that was allowed")),
+            ] {
+                let error = refused.expect_err("a Disk Arbitration rename never runs");
+                assert!(
+                    matches!(error.failure, CommandRunFailure::VolumeRename),
+                    "{verb}: {error}"
+                );
+                assert!(error.to_string().contains("/dev/disk3s5"), "{error}");
+            }
+        }
+        let other = SystemCommandRunner
+            .run(&request("info"))
+            .expect_err("the stand-in diskutil does not exist");
+        assert!(
+            matches!(other.failure, CommandRunFailure::Spawn(_)),
+            "only renames are refused: {other}"
+        );
     }
 
     /// A device name is reusable, not an identity. Once the image no longer holds the device its
@@ -7917,12 +8107,12 @@ mod tests {
                 matches!(renamed, Err(ApfsError::InvalidAttachmentInventory(_))),
                 "{renamed:?}"
             );
-            assert!(renames(&backend).is_empty(), "ran {:?}", renames(&backend));
+            assert!(names(&backend).is_empty(), "named {:?}", names(&backend));
         }
     }
 
     /// Pins with a real `flock`ed descriptor, one file per pin, and notes whether the newest pin
-    /// is still held when `renameVolume` runs: a second descriptor's non-blocking lock on the
+    /// is still held when the volume is named: a second descriptor's non-blocking lock on the
     /// same file fails only while the pin's own descriptor is open.
     struct PinWitness {
         recorded: RecordingRunner,
@@ -7974,14 +8164,11 @@ mod tests {
             }
         }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            if request
-                .args
-                .first()
-                .is_some_and(|verb| verb == "renameVolume")
-            {
-                self.held_at_rename.replace(Some(self.newest_pin_held()));
-            }
             self.recorded.run(request)
+        }
+        fn name_volume(&self, root: &OwnedVolumeRoot, volume_name: &str) -> io::Result<()> {
+            self.held_at_rename.replace(Some(self.newest_pin_held()));
+            self.recorded.name_volume(root, volume_name)
         }
         fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
             self.recorded.image_lease(identity)
@@ -8012,7 +8199,7 @@ mod tests {
         }
     }
 
-    /// The rename's raw pin outlives the `diskutil` call. Dropped any earlier, the kernel could
+    /// The rename's raw pin outlives the naming call. Dropped any earlier, the kernel could
     /// recycle the device between the mapping proof and the rename.
     #[test]
     fn rename_volume_holds_its_device_pin_across_the_rename() {
@@ -8022,7 +8209,7 @@ mod tests {
                 .chain([
                     holding_verified_volume("session.dmg"),
                     session_still_mounted(),
-                    ok([]),
+                    Reply::Named(Ok(())),
                 ]),
         )));
         let attachment = backend

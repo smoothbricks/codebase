@@ -1694,6 +1694,15 @@ impl HostError {
     }
 }
 
+/// Root setup runs disk tools through [`cowshed_apfs::disk_lease::leased`] too, so a Disk
+/// Arbitration rename is refused there as everywhere (01a_apfs.md, "Ownership, identity, and the
+/// volume label").
+impl From<cowshed_apfs::disk_lease::VolumeRenameRefused> for HostError {
+    fn from(refused: cowshed_apfs::disk_lease::VolumeRenameRefused) -> Self {
+        Self::new(refused.to_string())
+    }
+}
+
 pub type BlockingJob = Box<dyn FnOnce() -> Result<(), BootstrapExecutionError> + Send + 'static>;
 
 #[async_trait]

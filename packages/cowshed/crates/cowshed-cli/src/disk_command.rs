@@ -75,6 +75,10 @@ fn runner_error(error: CommandRunError) -> CowshedError {
             CowshedError::new(ErrorCode::EnvironmentMissing, message, "cowshed doctor")
         }
         CommandRunFailure::Deadline(_) => CowshedError::conflict(message, "cowshed doctor"),
+        CommandRunFailure::VolumeRename => CowshedError::usage(
+            message,
+            "no disk tool renames a volume; create it under its final name (specs/cowshed/01a_apfs.md, \"Ownership, identity, and the volume label\")",
+        ),
         CommandRunFailure::Spawn(_) | CommandRunFailure::Wait(_) => CowshedError::internal(message),
     }
 }

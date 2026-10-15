@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import {
   createHostCommands,
   type HostCommands,
+  mountsBelow,
   operationDisk,
   type RamDisk,
   type RamTempError,
@@ -42,7 +43,7 @@ function scratchVolume(index: number): { parent: string; paths: RamTempPaths; ca
       mountpoint: join('/Volumes', name),
       lockFile: join(parent, 'v.lock'),
       volumeName: name,
-      stagingName: `${name}-new`,
+      staging: `/private/tmp/${name}-new`,
       user: userInfo().username,
     },
     capacity: 64 * MIB + (process.pid * 4 + index + 1) * 512,
@@ -75,6 +76,20 @@ function expectSandboxed(error: RamTempError): void {
   }
 }
 
+/**
+ * The provisioning step a host call is: `mount_apfs` and `umount` of the private staging mount, or
+ * the `diskutil mount` that places the volume. Null for every other call.
+ */
+function stepOf(file: string, args: readonly string[]): string | null {
+  if (file === '/sbin/mount_apfs') {
+    return 'mount_apfs';
+  }
+  if (file === '/sbin/umount') {
+    return 'unmount';
+  }
+  return file === '/usr/sbin/diskutil' && args[0] === 'mount' ? 'mount' : null;
+}
+
 /** A readonly tree, two directories deep, with a file at each level. */
 function readonlyTree(directory: string): void {
   const tree = join(directory, 'tree');
@@ -100,11 +115,21 @@ async function nativeRamVolume(): Promise<void> {
   mkdirSync(outside);
   writeFileSync(join(outside, 'keep'), 'outside the lease');
   chmodSync(outside, 0o555);
-  // The host's own commands, with one injectable image in the I/O Registry listing.
+  // The host's own commands, with one injectable image in the I/O Registry listing. The steps that
+  // mount, unmount or place the volume are recorded in the order provisioning runs them.
   const host = createHostCommands();
   const attachedBelow: { image: string | null; failInventory: boolean } = { image: null, failInventory: false };
+  const provisioning: string[] = [];
   const commands: HostCommands = {
     async run(file, args) {
+      const step = stepOf(file, args);
+      if (step !== null) {
+        provisioning.push(step);
+      }
+      if (step === 'unmount') {
+        // The volume leaves the staging directory only once its marker is in it.
+        expect(readFileSync(join(paths.staging, '.smoo-ram'), 'utf8')).toBe(`${paths.volumeName}\n`);
+      }
       if (file === '/usr/sbin/ioreg' && attachedBelow.failInventory) {
         attachedBelow.failInventory = false;
         return { status: 1, stdout: '', stderr: 'injected holder inventory failure' };
@@ -173,6 +198,8 @@ async function nativeRamVolume(): Promise<void> {
       throw new Error(`lease over the debris failed: ${JSON.stringify(a)}`);
     }
     expect(a.value.kind).toBe('leased');
+    // Mounted and marked at its staging directory, unmounted, then placed by DiskArbitration: never renamed.
+    expect(provisioning).toEqual(['mount_apfs', 'unmount', 'mount']);
     expect(a.value.lease.mountpoint).toBe(paths.mountpoint);
     expect(readFileSync(join(paths.mountpoint, '.smoo-ram'), 'utf8')).toBe(`${paths.volumeName}\n`);
     expect(existsSync(`${paths.mountpoint} 1`)).toBe(false);
@@ -262,6 +289,53 @@ async function nativeRamVolume(): Promise<void> {
   }
 }
 
+/** The provisioning steps a test fails in turn, each with the step name its failure must report. */
+const FAILING_STEPS = [
+  { injected: 'mount_apfs', reported: 'mount_apfs (staging)' },
+  { injected: 'unmount', reported: 'umount (staging)' },
+  { injected: 'mount', reported: 'diskutil mount' },
+] as const;
+
+/**
+ * A provisioning step that fails leaves nothing under the final name: the failure detaches the whole
+ * disk, with the staging mount on it, and removes the staging directory the attempt made.
+ */
+async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
+  for (const { injected, reported } of FAILING_STEPS) {
+    const { parent, paths, capacity } = scratchVolume(2);
+    const host = createHostCommands();
+    const commands: HostCommands = {
+      async run(file, args, deadlineMs) {
+        if (stepOf(file, args) === injected) {
+          return { status: 1, stdout: '', stderr: 'injected' };
+        }
+        return host.run(file, args, deadlineMs);
+      },
+    };
+    try {
+      const refused = await new RamTempVolume(paths, capacity, commands).acquire();
+      // A cowshed sandbox cannot attach images, so provisioning stops before the injected step.
+      if (!refused.ok && refused.error.kind === 'provision-failed' && refused.error.step !== reported) {
+        expectSandboxed(refused.error);
+        continue;
+      }
+      expect(refused).toMatchObject({ ok: false, error: { kind: 'provision-failed', step: reported } });
+      expect(JSON.stringify(refused)).toContain('injected');
+      const listed = await host.run('/usr/sbin/diskutil', ['list']);
+      expect(listed.status).toBe(0);
+      expect(listed.stdout.split('\n').filter((line) => line.includes(paths.volumeName))).toEqual([]);
+      const table = await host.run('/sbin/mount', []);
+      expect(table.status).toBe(0);
+      expect(mountsBelow(table.stdout, paths.mountpoint)).toEqual([]);
+      expect(mountsBelow(table.stdout, paths.staging)).toEqual([]);
+      expect(existsSync(paths.staging)).toBe(false);
+    } finally {
+      await detachAll(paths, capacity);
+      rmSync(parent, { recursive: true, force: true });
+    }
+  }
+}
+
 /** The non-Darwin executor owns no RAM disk: inherited and target-supplied temp directories stay with their owner. */
 async function inheritedTempDirectory(): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), 'rt-policy-'));
@@ -331,6 +405,11 @@ describe('temporary-directory policy on this host', () => {
       'reclaims what a dead creator left, shares the volume between leases, and detaches it at the last release, never mounting beside it as "<name> 1"',
       nativeRamVolume,
       60_000,
+    );
+    it(
+      'leaves no volume under its final name, and no staging directory, when any provisioning step fails',
+      aFailedStepLeavesNoNamedVolume,
+      180_000,
     );
   } else {
     it(

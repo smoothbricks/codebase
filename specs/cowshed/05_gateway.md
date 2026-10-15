@@ -359,12 +359,13 @@ exists, and that sync does not finish while the mount table keeps changing (01a_
 so attaches stall beside mount churn and stay fast once the two are kept apart. Attaches among themselves only queue on
 `storagekitd`; so the lease is two classes that exclude each other rather than N interchangeable tokens.
 
-- **Storage**: `diskutil` except `renameVolume`, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs` and `umount`.
-  Exact-volume `diskutil unmount` is storage; the image's `mount_apfs` is namespace. Read-only operations (`fsck_apfs`,
-  IORegistry reads) and cosmetic `diskutil renameVolume` take no lease.
-- **A label does not change the disk lifecycle.** A rename keeps a mounted volume's mount-table position and st_dev, and
-  renames neither starve attaches nor delay namespace work. A background cosmetic rename therefore must not hold either
-  phase and make an attach wait behind it.
+- **Storage**: `diskutil`, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs` and `umount`. Exact-volume
+  `diskutil unmount` is storage; the image's `mount_apfs` is namespace. Read-only operations (`fsck_apfs`, IORegistry
+  reads) take no lease.
+- **A label does not change the disk lifecycle.** No disk tool renames a volume: the runner refuses `diskutil rename`
+  and `renameVolume` outright, and a volume is named through its held mount root, a kernel attribute write (01a_apfs.md,
+  "Ownership, identity, and the volume label"). A name keeps a mounted volume's mount-table position and st_dev, so
+  naming takes neither phase and makes no attach wait behind it.
 - Members of one class share the running phase, up to 8 at once. A request of the running class with room in the phase
   and nobody waiting enters at once; an idle gateway starts a phase for it. A request asked `alone` takes all 8 places:
   it enters only a phase that has no other member and runs with none beside it.

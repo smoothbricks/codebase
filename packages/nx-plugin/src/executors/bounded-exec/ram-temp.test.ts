@@ -95,7 +95,7 @@ describe('RAM temp volume output parsing', () => {
       mountpoint: '/Volumes/smoo-ram2-501',
       lockFile: '/private/tmp/smoo-ram2-501.lock',
       volumeName: 'smoo-ram2-501',
-      stagingName: 'smoo-ram2-501-new',
+      staging: '/private/tmp/smoo-ram2-501-new',
       user: 'ada',
     });
   });

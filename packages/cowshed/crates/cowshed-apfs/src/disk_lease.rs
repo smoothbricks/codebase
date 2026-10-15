@@ -35,19 +35,10 @@ use crate::{DISK_CHILD_DEADLINE, HDIUTIL, MOUNT_APFS, NEWFS_APFS};
 
 const UMOUNT: &str = "/sbin/umount";
 
-/// Classify disk-changing commands, not cosmetic labels. `diskutil renameVolume` changes
-/// neither the mount table nor st_dev; concurrent renames did not slow five attach or
-/// mount/unmount probes (05_gateway.md, "Disk-lifecycle lease"), so it takes no lease.
-/// Other `diskutil` verbs, `hdiutil` and `newfs_apfs` use storage; mount tools use namespace.
-pub fn class_of(program: &Path, args: &[impl AsRef<OsStr>]) -> Option<DiskClass> {
+/// Classify disk-changing commands. `diskutil`, `hdiutil` and `newfs_apfs` use storage; mount
+/// tools use namespace. No disk tool renames a volume ([`refuse_volume_rename`]).
+pub fn class_of(program: &Path) -> Option<DiskClass> {
     let program = program.to_str()?;
-    if program == DISKUTIL
-        && args
-            .first()
-            .is_some_and(|argument| argument.as_ref() == "renameVolume")
-    {
-        return None;
-    }
     if [DISKUTIL, HDIUTIL, NEWFS_APFS].contains(&program) {
         Some(DiskClass::Storage)
     } else if [MOUNT_APFS, UMOUNT].contains(&program) {
@@ -57,17 +48,78 @@ pub fn class_of(program: &Path, args: &[impl AsRef<OsStr>]) -> Option<DiskClass>
     }
 }
 
+/// A Disk Arbitration rename (`diskutil rename` or `renameVolume`), refused before it runs.
+///
+/// Disk Arbitration names a device through the mount path it recorded, resolved only when its
+/// queue reaches the request, and the kernel names whatever volume holds a path: a volume
+/// force-unmounted in between hands the name to the volume beneath its bare mountpoint — the
+/// host's Data volume (01a_apfs.md, "Ownership, identity, and the volume label"). A volume is
+/// named only through its held, proven root ([`crate::OwnedVolumeRoot`]).
+#[derive(Debug)]
+pub struct VolumeRenameRefused {
+    pub program: PathBuf,
+    pub args: Vec<std::ffi::OsString>,
+}
+
+/// Why a Disk Arbitration rename is refused, as every refusal of one says it.
+pub(crate) const VOLUME_RENAME_REFUSAL: &str = "Disk Arbitration renames through the mount path \
+     it recorded, which an unmount since hands to the volume beneath; a volume is named only \
+     through its held, owned mount root";
+
+impl fmt::Display for VolumeRenameRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "refused {}: {VOLUME_RENAME_REFUSAL}",
+            describe(&self.program, &self.args)
+        )
+    }
+}
+
+impl std::error::Error for VolumeRenameRefused {}
+
+impl From<VolumeRenameRefused> for io::Error {
+    fn from(refused: VolumeRenameRefused) -> Self {
+        io::Error::new(io::ErrorKind::PermissionDenied, refused)
+    }
+}
+
+/// Refuse `program args` when it is a Disk Arbitration rename: `diskutil rename` or
+/// `renameVolume`, verbs diskutil matches without regard to case, whatever path names diskutil.
+pub fn refuse_volume_rename(
+    program: &Path,
+    args: &[impl AsRef<OsStr>],
+) -> Result<(), VolumeRenameRefused> {
+    let renames = program.file_name() == Some(OsStr::new("diskutil"))
+        && args.first().is_some_and(|verb| {
+            verb.as_ref().to_str().is_some_and(|verb| {
+                verb.eq_ignore_ascii_case("rename") || verb.eq_ignore_ascii_case("renameVolume")
+            })
+        });
+    if renames {
+        Err(VolumeRenameRefused {
+            program: program.to_owned(),
+            args: args.iter().map(|arg| arg.as_ref().to_owned()).collect(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// Run `run`, the disk tool `program args`, under a lease of its class from the host gateway. A
+/// Disk Arbitration rename is refused first, for every caller ([`refuse_volume_rename`]): every
+/// disk tool cowshed runs, the runner's, the root setup's and the tests', passes here. A
 /// program that is no disk tool runs at once, and so does every disk tool for a minute after the
 /// host gateway was found to predate leases; for a minute after it was found to predate `alone`
 /// leases, it is asked shared. Every disk tool is first appended to the command record when
 /// [`COMMAND_RECORD_ENV`] names one, leased or not.
-pub fn leased<T, E: fmt::Display>(
+pub fn leased<T, E: fmt::Display + From<VolumeRenameRefused>>(
     program: &Path,
     args: &[impl AsRef<OsStr>],
     run: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    let Some(class) = class_of(program, args) else {
+    refuse_volume_rename(program, args)?;
+    let Some(class) = class_of(program) else {
         return run();
     };
     let command = describe(program, args);
@@ -569,46 +621,48 @@ mod tests {
 
     #[test]
     fn programs_are_classed_by_what_they_change() {
-        let no_args: [&str; 0] = [];
         for program in [DISKUTIL, HDIUTIL, NEWFS_APFS] {
-            assert_eq!(
-                class_of(Path::new(program), &no_args),
-                Some(DiskClass::Storage)
-            );
+            assert_eq!(class_of(Path::new(program)), Some(DiskClass::Storage));
         }
         for program in [MOUNT_APFS, UMOUNT] {
-            assert_eq!(
-                class_of(Path::new(program), &no_args),
-                Some(DiskClass::Namespace)
-            );
+            assert_eq!(class_of(Path::new(program)), Some(DiskClass::Namespace));
         }
         for program in ["/sbin/fsck_apfs", "/bin/sh", "diskutil"] {
-            assert_eq!(class_of(Path::new(program), &no_args), None, "{program}");
+            assert_eq!(class_of(Path::new(program)), None, "{program}");
         }
     }
 
+    /// Every disk tool cowshed runs passes `leased` — the runner's, root setup's, the tests' — so
+    /// a Disk Arbitration rename is refused there, in every spelling diskutil accepts, before its
+    /// run is ever called; diskutil's other verbs, and other programs' `rename`, go on to run.
     #[test]
-    fn cosmetic_diskutil_renames_do_not_take_a_storage_or_namespace_lease() {
-        assert_eq!(
-            class_of(Path::new(DISKUTIL), &["renameVolume", "/volume", "label"]),
-            None
-        );
-        assert_eq!(
-            class_of(Path::new(DISKUTIL), &["image", "attach", "/image"]),
-            Some(DiskClass::Storage)
-        );
-        assert_eq!(
-            class_of(Path::new(HDIUTIL), &["renameVolume"]),
-            Some(DiskClass::Storage)
-        );
-        assert_eq!(
-            class_of(Path::new(DISKUTIL), &["renameVolumeOther"]),
-            Some(DiskClass::Storage)
-        );
-        assert_eq!(
-            class_of(Path::new(DISKUTIL), &["rename", "/volume", "label"]),
-            Some(DiskClass::Storage)
-        );
+    fn leased_refuses_a_disk_arbitration_rename_without_running_it() {
+        for (program, verb) in [
+            (DISKUTIL, "renameVolume"),
+            (DISKUTIL, "rename"),
+            (DISKUTIL, "RENAMEVOLUME"),
+            ("diskutil", "ReName"),
+        ] {
+            let refused = leased(
+                Path::new(program),
+                &[verb, "/dev/disk3s5", "[cowshed] fixture · dispatch — main"],
+                || -> io::Result<()> { panic!("{program} {verb} ran") },
+            )
+            .expect_err("a Disk Arbitration rename is refused");
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+            assert!(refused.to_string().contains("/dev/disk3s5"), "{refused}");
+        }
+        for (program, verb) in [
+            (DISKUTIL, "info"),
+            (DISKUTIL, "renameVolumes"),
+            ("/bin/echo", "rename"),
+            ("/sbin/fsck_apfs", "renameVolume"),
+        ] {
+            assert!(
+                refuse_volume_rename(Path::new(program), &[verb]).is_ok(),
+                "{program} {verb}"
+            );
+        }
     }
 
     #[test]

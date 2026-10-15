@@ -4,6 +4,7 @@ import { constants } from 'node:fs';
 import {
   type FileHandle,
   lstat,
+  mkdir,
   mkdtemp,
   open,
   readdir,
@@ -80,12 +81,15 @@ import {
  * a lease whose pid is gone is reclaimed by the next task, and the volume is
  * detached when the last lease ends.
  *
- * The volume is formatted and mounted under a staging name, marked, and only
- * then renamed to its own name: `diskutil rename` moves a mounted volume's
- * /Volumes mountpoint with it (measured 2026-10-06). A creator that dies part
- * way leaves debris at the staging name, never an unmarked volume at the
- * mountpoint, which DiskArbitration would make every later volume dodge as
- * "<name> 1". The host's own image list is the only record of what was
+ * The volume is created under its final name and never renamed. It is mounted by `mount_apfs` at a
+ * private staging directory and marked there; the kernel then unmounts it (`umount`) and `diskutil mount`, the
+ * only call that places it at its mountpoint, so it reaches `/Volumes` already marked. A Disk
+ * Arbitration rename names whatever volume holds the path it recorded, and a force-unmounted volume
+ * leaves a bare directory there on the host's Data volume, so no rename is made. `noowners` lets the
+ * marker be written, since a fresh volume's root is owned by root (measured 2026-10-15). A creator that
+ * dies part way leaves debris at the staging directory or as an unmounted volume, never an unmarked
+ * volume at the mountpoint, which DiskArbitration would make every later volume dodge as "<name> 1".
+ * The host's own image list is the only record of what was
  * attached: before creating, a task detaches every RAM disk of this user and
  * this volume's exact size that is mounted nowhere but this volume's names,
  * because a creator killed or deadlined mid-step leaves one behind — measured
@@ -307,8 +311,8 @@ export interface RamTempPaths {
   lockFile: string;
   /** APFS volume name; names the mountpoint. */
   volumeName: string;
-  /** The volume's name while it is formatted and marked, before it is renamed to `volumeName`. */
-  stagingName: string;
+  /** Where the volume is mounted to be marked before Disk Arbitration places it at `mountpoint`. */
+  staging: string;
   /** Login name `hdiutil info` reports as the attaching user of this module's RAM disks. */
   user: string;
 }
@@ -319,7 +323,7 @@ export function ramTempPaths(user: { uid: number; username: string }): RamTempPa
     mountpoint: join('/Volumes', volumeName),
     lockFile: `/private/tmp/${volumeName}.lock`,
     volumeName,
-    stagingName: `${volumeName}-new`,
+    staging: `/private/tmp/${volumeName}-new`,
     user: user.username,
   };
 }
@@ -1150,17 +1154,33 @@ export class RamTempVolume {
       return provisioned;
     }
     const detached = await this.commands.run('/usr/bin/hdiutil', ['detach', '-force', physical]);
-    return detached.status === 0
+    // The detach takes every volume of the disk with it. What it leaves at the staging path is a bare
+    // directory on the host's Data volume: removed here, and already absent is done.
+    const detachFailure =
+      detached.status === 0
+        ? null
+        : `hdiutil detach -force ${physical} then failed (${commandText(detached)}), so it stays attached until the next creator reclaims it`;
+    const stagingFailure = await rmdir(this.paths.staging).then(
+      () => null,
+      (error: unknown) =>
+        errorCode(error) === 'ENOENT' ? null : `rmdir ${this.paths.staging} then failed (${errorText(error)})`,
+    );
+    const failures = [detachFailure, stagingFailure].filter((failure): failure is string => failure !== null);
+    return failures.length === 0
       ? provisioned
-      : failed(
-          provisioned.error.step,
-          `${provisioned.error.detail}; hdiutil detach -force ${physical} then failed (${commandText(detached)}), so it stays attached until the next creator reclaims it`,
-        );
+      : failed(provisioned.error.step, [provisioned.error.detail, ...failures].join('; '));
   }
 
   /**
-   * Format, mount and mark the volume under its staging name, then rename it into place: the
-   * volume reaches the mountpoint already marked, so no crash leaves it there unmarked.
+   * Create the volume under its final name, mount it with `mount_apfs` at the private staging
+   * directory, and mark it there. Then `umount` that private mount and let `diskutil mount` place
+   * the volume at the mountpoint: the only call that does, and it runs after the marker, so the
+   * volume never reaches `/Volumes` unmarked. Nothing is renamed (see the module comment). The
+   * staging mount is the kernel's, so the kernel releases it: a Disk Arbitration unmount waits in
+   * its one queue behind its own probe of the fresh RAM disk (5.1 s for the `zfs` probe alone in
+   * `log stream`; 6.5–6.7 s per unmount against 64–69 ms for `umount`, measured 2026-10-15). A
+   * crash before the final mount leaves the volume attached at the staging directory or
+   * unmounted; the next creator's reclaim detaches either.
    */
   private async provision(physical: string): Promise<Result<void, ProvisionFailed>> {
     const container = await this.commands.run('/usr/sbin/diskutil', ['apfs', 'createContainer', physical]);
@@ -1173,34 +1193,53 @@ export class RamTempVolume {
       'addVolume',
       containerDisk,
       'APFS',
-      this.paths.stagingName,
+      this.paths.volumeName,
       '-nomount',
     ]);
     const volume = operationDisk(added.stdout);
     if (added.status !== 0 || !volume) {
       return failed('diskutil apfs addVolume', commandText(added));
     }
-    // No -mountPoint: see the module comment. DiskArbitration names the mountpoint after the
-    // volume, and appends " 1" when a /Volumes entry already holds the name.
-    const mounted = await this.commands.run('/usr/sbin/diskutil', ['mount', '-mountOptions', 'nobrowse', volume]);
-    if (mounted.status !== 0) {
-      return failed('diskutil mount', commandText(mounted));
+    const staging = this.paths.staging;
+    try {
+      await mkdir(staging, { recursive: true });
+    } catch (error) {
+      return failed('staging directory', errorText(error));
     }
-    const staging = join('/Volumes', this.paths.stagingName);
-    const staged = await this.expectMounted(volume, staging, 'diskutil mount');
-    if (!staged.ok) {
-      return staged;
+    // `noowners`: a fresh volume's root is owned by root, and the marker write is denied without it.
+    const mounted = await this.commands.run('/sbin/mount_apfs', ['-o', 'nobrowse,noowners', `/dev/${volume}`, staging]);
+    if (mounted.status !== 0) {
+      return failed('mount_apfs (staging)', commandText(mounted));
+    }
+    const atStaging = await this.expectMounted(volume, staging, 'mount_apfs (staging)');
+    if (!atStaging.ok) {
+      return atStaging;
     }
     try {
       await writeFile(join(staging, MARKER_FILE), `${this.paths.volumeName}\n`);
     } catch (error) {
       return failed('marker', errorText(error));
     }
-    const renamed = await this.commands.run('/usr/sbin/diskutil', ['rename', volume, this.paths.volumeName]);
-    if (renamed.status !== 0) {
-      return failed('diskutil rename', commandText(renamed));
+    const unmounted = await this.commands.run('/sbin/umount', [staging]);
+    if (unmounted.status !== 0) {
+      return failed('umount (staging)', commandText(unmounted));
     }
-    return await this.expectMounted(volume, this.paths.mountpoint, 'diskutil rename');
+    // No -mountPoint: DiskArbitration names the mountpoint after the volume, and appends " 1" when a
+    // /Volumes entry already holds the name.
+    const placing = await this.commands.run('/usr/sbin/diskutil', ['mount', '-mountOptions', 'nobrowse', volume]);
+    if (placing.status !== 0) {
+      return failed('diskutil mount', commandText(placing));
+    }
+    const placed = await this.expectMounted(volume, this.paths.mountpoint, 'diskutil mount');
+    if (!placed.ok) {
+      return placed;
+    }
+    try {
+      await rmdir(staging);
+    } catch (error) {
+      return failed('staging directory', errorText(error));
+    }
+    return placed;
   }
 
   private async expectMounted(volume: string, expected: string, step: string): Promise<Result<void, ProvisionFailed>> {
@@ -1223,7 +1262,8 @@ export class RamTempVolume {
     const ours = (point: string) => {
       // DiskArbitration's " 1" suffix: a volume that found its name taken.
       const name = point.replace(/ \d+$/, '');
-      return name === this.paths.mountpoint || name === join('/Volumes', this.paths.stagingName);
+      // hdiutil lists a mount by the kernel's path; `staging` is written as that path, so it compares exactly.
+      return name === this.paths.mountpoint || name === this.paths.staging;
     };
     return {
       ok: true,
@@ -1728,7 +1768,7 @@ export function createHostCommands(
       if (disk !== null) {
         return runBounded(cowshed, disk, deadlineMs, false);
       }
-      const diskClass = diskClassOf(file, args);
+      const diskClass = diskClassOf(file);
       const seen = predatesSeen.get(gatewaySocket);
       const predates = seen !== undefined && Date.now() - seen.at < PREDATES_RECHECK_MS ? seen.what : null;
       if (diskClass === null || predates === 'leases') {

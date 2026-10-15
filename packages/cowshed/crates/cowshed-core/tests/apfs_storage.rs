@@ -2159,8 +2159,7 @@ async fn lifecycle_receipts_preserve_exact_revisions_topology_and_checkpoint_pin
         relabels,
         ["rename-volume:[cowshed] acme · widget — main"],
         "a replacement restore relabels its staging volume before publication; create and fork \
-         leave the inherited label to the workspace's supervisor, off the provisioning path, \
-         because relabelling waits in Disk Arbitration's host-wide queue"
+         leave the inherited label to the workspace's supervisor, off the provisioning path"
     );
 
     let restore_events = host.events();

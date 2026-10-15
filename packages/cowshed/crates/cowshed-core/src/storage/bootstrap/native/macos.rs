@@ -110,7 +110,9 @@ fn run_disk_tool(
                 "{:?} produced no result within {deadline:?}; the disk arbitration daemon is unresponsive",
                 command.program()
             )),
-            CommandRunFailure::Spawn(_) | CommandRunFailure::Wait(_) => HostError::new(format!(
+            CommandRunFailure::Spawn(_)
+            | CommandRunFailure::Wait(_)
+            | CommandRunFailure::VolumeRename => HostError::new(format!(
                 "cannot execute {:?} with argv {:?}: {error}",
                 command.program(),
                 command.args()

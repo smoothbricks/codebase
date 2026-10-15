@@ -59,8 +59,6 @@ async function scratchDirectory(): Promise<string> {
 describe('cowshed disk-lifecycle lease client', () => {
   it('classes programs by what they change', () => {
     expect(diskClassOf('/usr/sbin/diskutil')).toBe('storage');
-    expect(diskClassOf('/usr/sbin/diskutil', ['mount', '/dev/disk5s1'])).toBe('storage');
-    expect(diskClassOf('/usr/sbin/diskutil', ['renameVolume', '/dev/disk5s1', 'label'])).toBeNull();
     expect(diskClassOf('/usr/bin/hdiutil')).toBe('storage');
     expect(diskClassOf('/sbin/mount_apfs')).toBe('namespace');
     expect(diskClassOf('/sbin/umount')).toBe('namespace');

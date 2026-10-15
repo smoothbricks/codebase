@@ -508,9 +508,9 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         self.attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
     }
     /// Rename the volume of `attachment`, a verified attachment of an image under the store
-    /// mounted at `mount_point`, through its device: never a path, which names whatever volume
-    /// holds it. `mount_point` is proven still that device's mount root under the image's lease
-    /// before the rename runs.
+    /// mounted at `mount_point`, through that mount root held open (`cowshed_apfs::OwnedVolumeRoot`):
+    /// never a path or Disk Arbitration, which name whatever volume holds a path. `mount_point`
+    /// is proven that device's mount root under the image's lease before the name is set.
     fn rename_volume(
         &self,
         attachment: &Self::Attachment,
@@ -3571,8 +3571,8 @@ pub fn volume_key(repo: &RepoId, workspace: &WorkspaceName) -> String {
 /// An identity change still relabels every volume — but because the label is not an authority, a
 /// relabel interrupted partway leaves nothing but a cosmetic disagreement, which is why recovery
 /// does not have to redo it. Uniform across main and sessions: every volume names its workspace,
-/// a fresh clone from the moment its supervisor first serves rather than from its publication —
-/// relabelling is a Disk Arbitration round trip that a busy host queues for tens of seconds.
+/// a fresh clone from the moment its supervisor first serves rather than from its publication: the
+/// label is cosmetic, so nothing on the provisioning path waits on it.
 pub fn volume_label(repo: &RepoId, workspace: &WorkspaceName) -> String {
     format!(
         "[cowshed] {} · {} — {}",
