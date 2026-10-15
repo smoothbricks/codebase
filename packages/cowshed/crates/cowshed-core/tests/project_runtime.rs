@@ -31,11 +31,12 @@ use cowshed_core::metadata::{
 };
 use cowshed_core::repository::{BoundIdentity, OwnedRepoIds, RepoId, RepositoryBinding};
 use cowshed_core::runtime::job_groups::Birth;
+#[cfg(target_os = "macos")]
+use cowshed_core::runtime::supervisor::NxDaemonRetirement;
 use cowshed_core::runtime::supervisor::{
-    ArtifactStoreSink, CommitmentDraft, CommitmentSink, NxDaemonRetirement, OwnedProcess,
-    ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess, SpawnSink,
-    WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
-    WorkspaceSupervisorHandle,
+    ArtifactStoreSink, CommitmentDraft, CommitmentSink, OwnedProcess, ProcessEvent, ProcessSignal,
+    ProcessSpawnRequest, RunningProcess, SpawnSink, WorkspaceAuthoritySnapshot,
+    WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
 use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::runtime::{

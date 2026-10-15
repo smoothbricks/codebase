@@ -3326,8 +3326,10 @@ mod tests {
     }
 
     /// A private directory under the system temporary root, removed when the guard drops.
+    #[cfg(target_os = "macos")]
     struct TestRoot(std::path::PathBuf);
 
+    #[cfg(target_os = "macos")]
     impl TestRoot {
         fn new(tag: &str) -> Self {
             use std::os::unix::fs::DirBuilderExt as _;
@@ -3346,6 +3348,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl Drop for TestRoot {
         fn drop(&mut self) {
             if let Err(error) = std::fs::remove_dir_all(&self.0)
@@ -3357,11 +3360,13 @@ mod tests {
     }
 
     /// Records the actual actor audit events without changing its admission decisions.
+    #[cfg(target_os = "macos")]
     #[derive(Default)]
     struct UnitAudit {
         events: std::sync::Mutex<Vec<crate::interfaces::AuditEvent>>,
     }
 
+    #[cfg(target_os = "macos")]
     #[async_trait::async_trait]
     impl crate::interfaces::AuditSink for UnitAudit {
         async fn record(
@@ -3378,8 +3383,10 @@ mod tests {
     }
 
     /// The credential store for unit fixtures: every lookup finds no record.
+    #[cfg(target_os = "macos")]
     struct NoCredentials;
 
+    #[cfg(target_os = "macos")]
     #[async_trait::async_trait]
     impl crate::interfaces::CredentialProvider for NoCredentials {
         async fn lookup(
@@ -3392,6 +3399,7 @@ mod tests {
     }
 
     /// A self-signed CA for one fixture session, as the gateway's own tests make theirs.
+    #[cfg(target_os = "macos")]
     fn fixture_ca() -> cowshed_gateway_types::WorkspaceCa {
         let key = rcgen::KeyPair::generate().expect("fixture CA key");
         let mut params = rcgen::CertificateParams::default();
@@ -3406,6 +3414,7 @@ mod tests {
 
     /// The actor built the way `start_runtime` builds it, plus the brokers' tasks, which `finish`
     /// stops. The claimed loopback listeners are held until then, so no other claimant takes them.
+    #[cfg(target_os = "macos")]
     struct TestActor {
         actor: Actor,
         audit: Arc<UnitAudit>,
@@ -3414,6 +3423,7 @@ mod tests {
         claims: Vec<Fenced<std::net::TcpListener>>,
     }
 
+    #[cfg(target_os = "macos")]
     impl TestActor {
         async fn new(root: &TestRoot) -> Self {
             use std::os::unix::fs::DirBuilderExt as _;
@@ -3625,6 +3635,7 @@ mod tests {
     }
 
     /// A bearer-authenticated Nx request intent for one hash.
+    #[cfg(target_os = "macos")]
     fn nx_intent(method: Method, path: &str) -> RequestIntent {
         RequestIntent {
             target: RequestTarget::LocalNx,
@@ -3636,6 +3647,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn unit_backend(repo_id: &str) -> NxCacheBackend {
         NxCacheBackend {
             repo_id: repo_id.to_owned(),
@@ -3646,6 +3658,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn unit_starting(actor: &mut Actor, repo_id: &str) {
         actor.nx_backends.insert(
             repo_id.to_owned(),
@@ -3655,6 +3668,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     async fn unit_child() -> tokio::process::Child {
         use cowshed_os::fork_lock::Spawn as _;
         tokio::process::Command::new("/bin/cat")
@@ -3665,6 +3679,7 @@ mod tests {
             .expect("start the fixture child")
     }
 
+    #[cfg(target_os = "macos")]
     async fn unit_queued_get(
         fixture: &mut TestActor,
         workspace: &str,

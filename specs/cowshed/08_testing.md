@@ -949,6 +949,7 @@ established before the Linux leg gates.
   for the repository's own branches, `ubuntu-latest` for pull requests from forks. There are no macOS runners, no
   Linux+ZFS runner, and no nightly run, so every macOS-only test (APFS, Seatbelt, launchd, the escape tests) runs only
   where a developer runs the gate: `bun nx run-many -t gate` on a Mac, with `bun run check:linux` cross-linting the
-  Linux target.
+  Linux target. The check compiles test targets too; native-only fixture helpers share their callers' platform guards,
+  never warning suppressions.
 - Lint is `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --config 'build.warnings="deny"'` (repo
   rule: fix everything you see — no pre-existing-failure waivers).

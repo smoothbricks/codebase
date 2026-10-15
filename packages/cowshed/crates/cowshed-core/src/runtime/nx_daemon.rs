@@ -680,6 +680,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use super::*;
+    #[cfg(target_os = "macos")]
     use cowshed_os::fork_lock::Run as _;
 
     fn write_record(record: &Path, pid: u32, socket: &Path) {
