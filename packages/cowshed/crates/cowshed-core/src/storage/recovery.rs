@@ -15,6 +15,10 @@ use cowshed_os::fork_lock::Fenced;
 /// Objects in these namespaces are controller implementation details and never canonical listings.
 pub const STAGING_NAMESPACE: &str = ".staging";
 pub const TRASH_NAMESPACE: &str = ".trash";
+/// Extension of the recovery bundle a removal verifies and writes into the trash before it
+/// abandons unlanded work: `sessions/.trash/<ws>-<tip>.bundle`. It is the only copy of those
+/// commits, so only a sweep explicitly authorized for them reclaims it.
+pub const ABANDON_BUNDLE_EXTENSION: &str = "bundle";
 /// Same-parent, hidden mountpoint names retaining root-owned system debris; never workspaces.
 pub const ROOT_HELD_MOUNT_PREFIX: &str = ".root-held-";
 pub const LIFECYCLE_INTENTS_FILE: &str = "lifecycle-intents.json";

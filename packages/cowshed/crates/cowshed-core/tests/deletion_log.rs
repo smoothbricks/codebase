@@ -15,7 +15,7 @@ use cowshed_core::storage::apfs::{ApfsExecutionHost, ApfsSubstrateConfig};
 use cowshed_core::storage::deletion_log::{
     CompanionAbsence, DELETION_LOG_FILE, classify_missing_companion,
 };
-use cowshed_core::storage::lifecycle::StorageGcReason;
+use cowshed_core::storage::lifecycle::{StorageGcOptions, StorageGcReason};
 use cowshed_core::storage::recovery::{
     FenceStep, FenceSteps, LifecycleIntent, LifecycleIntentJournal,
 };
@@ -150,7 +150,9 @@ fn orphan_gc_run_writes_tombstone_and_classifies_missing_companion() {
 
     let host = host(&fixture);
     let config = fixture.config();
-    let plan = host.preview_gc(&config, &repo()).expect("preview");
+    let plan = host
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
+        .expect("preview");
     assert!(
         plan.candidates().iter().any(|candidate| candidate.reason()
             == StorageGcReason::OrphanStagingImage
@@ -203,7 +205,9 @@ fn sweep_removes_stale_empty_session_mountpoint() {
 
     let host = host(&fixture);
     let config = fixture.config();
-    let plan = host.preview_gc(&config, &repo()).expect("preview");
+    let plan = host
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
+        .expect("preview");
     assert!(
         plan.candidates().iter().any(|candidate| candidate.reason()
             == StorageGcReason::OrphanMountpoint
@@ -301,7 +305,9 @@ fn unreadable_log_never_fails_the_op() {
 
     let host = host(&fixture);
     let config = fixture.config();
-    let plan = host.preview_gc(&config, &repo()).expect("preview");
+    let plan = host
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
+        .expect("preview");
     host.execute_gc(&config, plan)
         .expect("op succeeds despite log failure");
     assert!(!image.exists(), "orphan image is still reclaimed");

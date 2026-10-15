@@ -32,7 +32,7 @@ use cowshed_core::storage::apfs::{
 };
 use cowshed_core::storage::lifecycle::{
     AdoptHandoff, AdoptRequest, Destination, LifecyclePlanner, LifecycleWorkspace, MountIntent,
-    MountState, OperationIdentity, Pin, RestoreMode, Revision, Substrate,
+    MountState, OperationIdentity, Pin, RestoreMode, Revision, StorageGcOptions, Substrate,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, WORKSPACE_MARKER_PATH};
 use cowshed_os::fork_lock::Run as _;
@@ -415,7 +415,7 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             .await
             .map_err(|error| std::io::Error::other(format!("reclaim: {error}")))?;
         let gc_plan = substrate
-            .preview_gc(&repo)
+            .preview_gc(&repo, StorageGcOptions::default())
             .await
             .map_err(|error| std::io::Error::other(format!("preview gc: {error}")))?;
         substrate

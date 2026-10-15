@@ -4,8 +4,6 @@ Two surfaces over one core: the `cowshed-core` Rust crate and `@smoothbricks/cow
 is a thin third client of the same core — anything the CLI can do is assembled from the same capability-scoped APIs,
 with identical semantics and error taxonomy.
 
-
-
 ## Authority model (frozen)
 
 Four handle types, one rule: **a handle reachable from inside a sandbox must not authorize escalation or select another
@@ -711,9 +709,9 @@ sample once available, periodic samples even when neither stream advances, then 
 closing. The interval is positive and uses the declaration's bounded duration contract. A slow reader may coalesce
 intermediate samples; terminal evidence and journal bytes are never lost.
 
-A job without a terminal resource sample leaves its span's end-row host, volume and charged-memory cells null and
-states no `job.unattributed` row (13_telemetry.md, "Process-tree spans"). The supervisor does not resample a boundary
-for the span or fabricate a zero sample.
+A job without a terminal resource sample leaves its span's end-row host, volume and charged-memory cells null and states
+no `job.unattributed` row (13_telemetry.md, "Process-tree spans"). The supervisor does not resample a boundary for the
+span or fabricate a zero sample.
 
 `JobHandle::resources()` and the generated N-API `resources()` call use the declared `job.resources` operation directly,
 not a `status()` projection. The supervisor's existing reader takes one canonical sample for a live job and returns its
@@ -1220,11 +1218,12 @@ supervisor that ran the job retires.
 - `DoctorReport = { healthy, findings }`; `Finding = { code, severity, message, hint, path? }`, and severity is
   `"info" | "warning" | "error"`. `GcCandidate = { identity: Sha256Digest, path, bytes, reason }`, where reason is the
   closed
-  `retiredWorkspace | orphanSessionImage | orphanStagingImage | orphanStagingMetadata | orphanStagingMount | orphanMountpoint | expiredCheckpoint`
+  `retiredWorkspace | orphanSessionImage | orphanStagingImage | orphanStagingMetadata | orphanStagingMount | orphanMountpoint | expiredCheckpoint | abandonedBundle`
   enum. `GcReport = { examined, reclaimed, retainedPinned, retainedActive, freedBytes, dryRun, candidates, deferred }`.
   `deferred` contains `{ path, diagnostic }` for each candidate this run left behind; one deferral does not stop later
   candidates. Dry-run candidates are the exact immutable substrate plan and never mutable handles; execution revalidates
-  the plan before the first effect.
+  the plan under the same sweep options before the first effect. `abandonedBundle` names a regular recovery bundle in
+  `sessions/.trash` only when `GcOptions.abandoned` is explicitly true; a default sweep never names or reclaims one.
 - `JobId` is a positive integer no greater than `2^53-1`.
   `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, resources?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
   The command is flattened: exactly one of `argv` and `script` is present, and an `ExecRequest` carries the same field.
@@ -1274,8 +1273,9 @@ supervisor that ran the job retires.
   idempotent, while `true` selects the verified retained-source replacement in 02_workspaces.md §Re-adoption, or, when
   main's image is missing, the plain-checkout recovery in §Missing main image.
   `ForkOptions = { ref?, clean, browse, slot?, register, gitWorktree }`; `AttachOptions = { browse }`;
-  `RemoveOptions = { force }`; `GcOptions = { dryRun }`; `RebaseOptions`, `LandOptions`, and `PushOptions` use the
-  expectation fields shown above. All booleans are explicit in JSON; absence never silently means authority was granted.
+  `RemoveOptions = { force }`; `GcOptions = { dryRun, abandoned }`; `RebaseOptions`, `LandOptions`, and `PushOptions`
+  use the expectation fields shown above. All booleans are explicit in JSON; absence never silently means authority was
+  granted. Both GC options default to false on input; only `abandoned: true` authorizes reclaiming abandon bundles.
   `coordinator.fork { repoId, workspace, source?, options: ForkOptions }` defaults an absent source to main. A ref with
   `clean: false` is a usage refusal; the CLI sets clean for `--ref`. Every fork uses the same mint, carries source edits
   and untracked files by default, and gets its own `cowshed/<ws>` branch. `coordinator.create`, `CreateOptions`, and

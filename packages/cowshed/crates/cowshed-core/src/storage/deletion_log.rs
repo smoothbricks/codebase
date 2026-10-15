@@ -72,6 +72,8 @@ pub enum DeletionOp {
     RemoveOrphanStagingMetadata,
     #[serde(rename = "remove-orphan-mountpoint")]
     RemoveOrphanMountpoint,
+    #[serde(rename = "remove-abandoned-bundle")]
+    RemoveAbandonedBundle,
     #[serde(rename = "release-build-volume")]
     ReleaseBuildVolume,
 }
@@ -86,6 +88,7 @@ impl std::fmt::Display for DeletionOp {
             Self::RemoveStagingMount => "remove-staging-mount",
             Self::RemoveOrphanStagingMetadata => "remove-orphan-staging-metadata",
             Self::RemoveOrphanMountpoint => "remove-orphan-mountpoint",
+            Self::RemoveAbandonedBundle => "remove-abandoned-bundle",
             Self::ReleaseBuildVolume => "release-build-volume",
         };
         formatter.write_str(tag)

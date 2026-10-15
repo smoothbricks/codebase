@@ -217,16 +217,17 @@ The APFS adapter's interrupted image/metadata publication protocol is specified 
 
 ## Retention
 
-Copy-on-write divergence only ever accumulates — checkpoints, idle workspaces, ZFS origin pins (09_substrates.md), and
-APFS image-size ratchet all grow silently. cowshed keeps "storage efficient" from becoming a burden with retention
-_conventions_, enforced by `cowshed gc`, never by a background daemon deleting work unasked:
+Copy-on-write divergence only ever accumulates — checkpoints, idle workspaces, abandon bundles, ZFS origin pins
+(09_substrates.md), and APFS image-size ratchet all grow silently. cowshed keeps "storage efficient" from becoming a
+burden with retention _conventions_, enforced by `cowshed gc`, never by a background daemon deleting work unasked:
 
-| Object                             | Default retention                                                                     | Exempt / override                                                                          |
-| ---------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| Checkpoints                        | all younger than 14 days **plus the newest five per workspace, whichever keeps more** | explicit pin from a label or `cowshed checkpoint --keep`; pins never expire until unpinned |
-| CI failure checkpoints             | same checkpoint rule as above                                                         | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                  |
-| Idle workspaces                    | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**         | landing/removal is always explicit                                                         |
-| Trash images (`sessions/.trash/…`) | drained on next `gc`                                                                  | —                                                                                          |
+| Object                                       | Default retention                                                                     | Exempt / override                                                                          |
+| -------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Checkpoints                                  | all younger than 14 days **plus the newest five per workspace, whichever keeps more** | explicit pin from a label or `cowshed checkpoint --keep`; pins never expire until unpinned |
+| CI failure checkpoints                       | same checkpoint rule as above                                                         | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                  |
+| Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**         | landing/removal is always explicit                                                         |
+| Trash images (`sessions/.trash/…`)           | drained on next `gc`                                                                  | —                                                                                          |
+| Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; the only copy of the commits `rm --abandon` gave up       | explicit `cowshed gc --abandoned`                                                          |
 
 - `cowshed gc` evaluates both checkpoint floors independently: it deletes only an unpinned checkpoint that is at least
   14 days old **and** is not among the newest five for that workspace. A user-supplied label creates an explicit pin;
@@ -238,16 +239,22 @@ _conventions_, enforced by `cowshed gc`, never by a background daemon deleting w
   checkpoints both consume the cap. Exact `<=` boundaries are admitted, while `>` returns `Conflict` before cloning or
   publishing any checkpoint image, fact, or detached metadata. A sibling workspace never consumes this workspace's
   coordinator-owned quota.
-- Garbage collection is two-phase. `preview_gc(repo)` is a read-only enumeration that returns an immutable plan of exact
-  candidates with stable SHA-256 identity, host path, allocated bytes, and closed reason. Pinned checkpoints are
-  retained and never become candidates. `execute_gc(plan)` acquires all plan locks without waiting, re-enumerates at the
-  plan's observation time, and rejects a pin/incarnation/path/byte/concurrency change as stale before any mutation. Only
-  an unchanged plan drains trash, orphan staging/session images and mountpoints, and prunes expired checkpoints;
-  execution reports actual freed bytes. Nothing compacts an image: guest-freed space stays allocated, so an image's
-  allocation tracks its high-water mark ([APFS Images](./01a_apfs.md#images), "Space reclamation"). A candidate whose
-  own cleanup cannot finish is deferred by path and diagnostic while the sweep attempts the others. Uncertain ownership,
-  invalid identity, or a stale whole plan still refuse: proceeding through those could delete data that does not belong
-  to the candidate.
+- Garbage collection is two-phase. `preview_gc(repo, options)` is a read-only enumeration that returns an immutable plan
+  of exact candidates with stable SHA-256 identity, host path, allocated bytes, and closed reason. The plan records its
+  sweep options. Pinned checkpoints are retained and never become candidates. `execute_gc(plan)` acquires all plan locks
+  without waiting, re-enumerates at the plan's observation time under the same options, and rejects a
+  pin/incarnation/path/byte/concurrency change as stale before any mutation. Only an unchanged plan drains trash, orphan
+  staging/session images and mountpoints, prunes expired checkpoints, and, only under `--abandoned`, reclaims abandon
+  bundles; execution reports actual freed bytes. Nothing compacts an image: guest-freed space stays allocated, so an
+  image's allocation tracks its high-water mark ([APFS Images](./01a_apfs.md#images), "Space reclamation"). A candidate
+  whose own cleanup cannot finish is deferred by path and diagnostic while the sweep attempts the others. Uncertain
+  ownership, invalid identity, or a stale whole plan still refuse: proceeding through those could delete data that does
+  not belong to the candidate.
+- Abandon bundles are regular `*.bundle` files directly in `sessions/.trash`; staged `.partial` siblings and symlinks
+  are not bundle candidates. Plain `gc`, opportunistic collection, and `doctor --repair` never authorize their
+  reclamation. Only explicit `--abandoned` (`GcOptions.abandoned: true`) adds the `abandonedBundle` category to the
+  exact plan. `gc --dry-run --abandoned` lists those candidates and their allocated bytes without deleting them.
+  Reclamation is final: preserve the abandoned commits in another repository before requesting it.
 - Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
   one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
   trash image and empty mountpoint. Preview and execution validate the repository, workspace, incarnation, checkpoint

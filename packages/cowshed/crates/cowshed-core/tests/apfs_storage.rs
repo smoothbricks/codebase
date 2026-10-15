@@ -23,7 +23,7 @@ use cowshed_core::storage::lifecycle::{
     AdoptHandoff, AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount,
     KernelMountFact, LifecycleFact, LifecyclePlanner, LifecycleWorkspace, MountIntent, MountState,
     OperationIdentity, Pin, PlanError, ResizeOutcome, RestoreMode, RetiredRef, Revision,
-    StorageFact, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
+    StorageFact, StorageGcOptions, StorageGcPlan, StorageGcReport, Substrate, SubstrateStats,
 };
 use proptest::prelude::*;
 
@@ -1029,6 +1029,7 @@ impl ApfsExecutionHost for FakeHost {
         &self,
         _: &ApfsSubstrateConfig,
         repo: &RepoId,
+        _: StorageGcOptions,
     ) -> Result<StorageGcPlan, ApfsStorageError> {
         self.record("preview-gc");
         Ok(StorageGcPlan::empty(repo.clone()))
@@ -2481,7 +2482,10 @@ async fn retire_reclaim_stats_and_gc_cross_only_the_blocking_lane() {
             pinned_checkpoint_bytes: 2048,
         }
     );
-    let gc_plan = substrate.preview_gc(&repo()).await.expect("GC preview");
+    let gc_plan = substrate
+        .preview_gc(&repo(), StorageGcOptions::default())
+        .await
+        .expect("GC preview");
     assert_eq!(
         substrate
             .execute_gc(gc_plan)
