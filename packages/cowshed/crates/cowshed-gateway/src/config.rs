@@ -18,7 +18,6 @@ use crate::cache::{
 };
 use crate::cpu_budget::CpuBudgetLimits;
 use crate::disk_lease::DiskLeaseLimits;
-use crate::task_server::TaskServerLimits;
 
 pub const CONTROL_TCP_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7_644);
 
@@ -264,8 +263,6 @@ pub struct GatewayConfig {
     pub disk_lease: DiskLeaseLimits,
     /// The host CPU budget served on the control socket (05_gateway.md).
     pub cpu_budget: CpuBudgetLimits,
-    /// The task server that schedules work units on the control socket (05_gateway.md).
-    pub task_server: TaskServerLimits,
     /// SHA-256 of the executable this daemon runs, reported in its status so a client can tell
     /// whether the daemon is running the same build it is.
     pub executable_sha256: Option<String>,
@@ -289,7 +286,6 @@ impl Default for GatewayConfig {
             mirror_cache: MirrorCacheConfig::default(),
             disk_lease: DiskLeaseLimits::default(),
             cpu_budget: CpuBudgetLimits::default(),
-            task_server: TaskServerLimits::default(),
             executable_sha256: None,
             startup: None,
         }
@@ -302,7 +298,6 @@ impl GatewayConfig {
         self.timeouts.validate()?;
         self.mirror_cache.validate()?;
         self.disk_lease.validate()?;
-        self.task_server.validate()?;
         if let Some(path) = &self.control_socket
             && !path.is_absolute()
         {
