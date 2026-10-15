@@ -4510,6 +4510,44 @@ mod tests {
         fixture
     }
 
+    /// What `git status --porcelain=v2 --branch` reports for `root`: the checked-out branch, HEAD's
+    /// object ID and every changed or untracked entry, read in one process. `--no-optional-locks`
+    /// keeps the read from refreshing, and so rewriting, the index it is judging.
+    #[derive(Debug, Eq, PartialEq)]
+    struct TreeState {
+        branch: String,
+        head: String,
+        changes: Vec<String>,
+    }
+
+    fn tree_state(root: &Path) -> TreeState {
+        let report = git_stdout(
+            root,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v2",
+                "--branch",
+            ],
+        );
+        let (mut branch, mut head, mut changes) = (None, None, Vec::new());
+        for line in report.lines() {
+            if let Some(oid) = line.strip_prefix("# branch.oid ") {
+                head = Some(oid.to_owned());
+            } else if let Some(name) = line.strip_prefix("# branch.head ") {
+                branch = Some(name.to_owned());
+            } else if !line.starts_with('#') {
+                changes.push(line.to_owned());
+            }
+        }
+        TreeState {
+            branch: branch
+                .unwrap_or_else(|| panic!("no branch.head for {}: {report}", root.display())),
+            head: head.unwrap_or_else(|| panic!("no branch.oid for {}: {report}", root.display())),
+            changes,
+        }
+    }
+
     #[tokio::test]
     async fn fork_carry_clean_and_ref_preserve_source_bytes_and_index() {
         for linked in [false, true] {
@@ -4567,22 +4605,28 @@ mod tests {
                 fs::write(source.join("stray.txt"), "untracked\n").unwrap();
                 fs::create_dir_all(source.join("ignored")).unwrap();
                 fs::write(source.join("ignored/warm"), "installed build state\n").unwrap();
-                let branch = git_stdout(source, &["branch", "--show-current"]);
-                let status = git_stdout(source, &["status", "--porcelain"]);
-                let head = git_stdout(source, &["rev-parse", "HEAD"]);
+                let before = tree_state(source);
                 assert_ne!(
-                    head.trim(),
-                    baseline,
+                    before.head, baseline,
                     "the ref must differ from the source's HEAD for the ref cells to discriminate"
                 );
                 let index_path = git_stdout(source, &["rev-parse", "--git-path", "index"]);
                 let index_path = source.join(index_path.trim());
                 let index = fs::read(&index_path).unwrap();
-                for (choice, clean, start) in [
+                let every = [
                     ("carry", false, None),
                     ("clean", true, None),
                     ("ref", true, Some(baseline.as_str())),
-                ] {
+                ];
+                // A standalone mint reads its source only for its links and identity and never
+                // compares it with main, so from main the clean and ref cells repeat the session
+                // fixture's. The carry cell keeps the from-main scenario.
+                let choices = if !linked && !session {
+                    &every[..1]
+                } else {
+                    &every[..]
+                };
+                for &(choice, clean, start) in choices {
                     let name = format!("fork-{linked}-{session}-{choice}");
                     let clone = main.with_extension(&name);
                     copy_tree(source, &clone);
@@ -4604,20 +4648,22 @@ mod tests {
                         )
                         .await
                         .unwrap_or_else(|error| panic!("{name}: {error}"));
+                    let forked = tree_state(&clone);
+                    assert_eq!(forked.branch, format!("cowshed/{name}"));
                     assert_eq!(
-                        git_stdout(&clone, &["branch", "--show-current"]).trim(),
-                        format!("cowshed/{name}")
-                    );
-                    assert_eq!(
-                        git_stdout(&clone, &["rev-parse", "HEAD"]).trim(),
-                        start.unwrap_or(head.trim()),
+                        forked.head,
+                        start.unwrap_or(before.head.as_str()),
                         "{name}: HEAD is the ref, or the source's head when none is given"
                     );
                     assert_eq!(
                         fs::read_to_string(clone.join("ignored/warm")).unwrap(),
                         "installed build state\n"
                     );
-                    assert_eq!(clone.join("stray.txt").exists(), !clean);
+                    assert_eq!(
+                        clone.join("stray.txt").exists(),
+                        !clean,
+                        "{name}: the untracked file survives exactly when the fork is not clean"
+                    );
                     if !clean {
                         assert_eq!(
                             fs::read_to_string(clone.join("README")).unwrap(),
@@ -4633,7 +4679,11 @@ mod tests {
                             }
                         );
                     } else {
-                        assert_eq!(git_stdout(&clone, &["status", "--porcelain"]), "");
+                        assert!(
+                            forked.changes.is_empty(),
+                            "{name}: clean leaves nothing to commit: {:?}",
+                            forked.changes
+                        );
                         // The files are the selected commit's: `ref` reverts them to the baseline's,
                         // `clean` keeps the source's head.
                         assert_eq!(
@@ -4646,9 +4696,11 @@ mod tests {
                             "{name}: README is the selected commit's"
                         );
                     }
-                    assert_eq!(git_stdout(source, &["branch", "--show-current"]), branch);
-                    assert_eq!(git_stdout(source, &["rev-parse", "HEAD"]), head);
-                    assert_eq!(git_stdout(source, &["status", "--porcelain"]), status);
+                    assert_eq!(
+                        tree_state(source),
+                        before,
+                        "{name}: the source's branch, HEAD and status never change"
+                    );
                     assert_eq!(
                         fs::read(&index_path).unwrap(),
                         index,
