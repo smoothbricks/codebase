@@ -217,23 +217,23 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
 Parametrized over the substrate the host provides, and never gated off on it: a missing capability is a failure, not a
 skip. On macOS these are the `real_apfs_*` tests, compiled only for macOS: small `.dmg` images (1 GiB caps) under
 `/private/tmp/cowshed-itest-<pid>-<n>-<label>`, driven by the production host — real
-`diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, the live kernel mount table. A mount state a test needs (wrong flags, an
-impostor volume, a busy holder) is produced on a real volume, never by a substitute mount source. Every scratch root
-selects its backing image paths, then calls the same production owned-attachment cleanup used by normal removal,
-recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and staging GC. Each cleanup rereads
-image/whole-device/volume identity and retains each currently-owned mounted volume's raw pin through `diskutil unmount`,
-then runs guarded `hdiutil detach` of the exact physical device under the image's lease. The detach guard rechecks after
-the host lease wait; a previously cached disk number or mountpoint never authorizes an unmount or detach. A failed
-release keeps the scratch tree intact for the next run, rather than deleting a still-attached image's backing files.
-Before any release, a scratch root ends every process working in its tree, selected by the working directory the kernel
-reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a deleted directory): `SIGTERM`, as
-`nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a fixture started detaches from its
-starter, so a failed test's unwinding otherwise never reached it and it kept running in the deleted root. Successful
-cleanup removes the root, and every run first ends the processes working under, then reclaims the roots and attachments
-of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file vdev (`cowshed.itest.<pid>`) with
-datasets destroyed and the pool exported on teardown; the Linux leg also exercises `cowshed-helper` and the
-Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The same flow table runs on
-both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
+`diskutil`/`hdiutil`/`fsck_apfs`/`mount_apfs`, descriptor-native `funmount` and the live kernel mount table. A mount
+state a test needs (wrong flags, an impostor volume, a busy holder) is produced on a real volume, never by a substitute
+mount source. Every scratch root selects its backing image paths, then calls the same production owned-attachment
+cleanup used by normal removal, recovery-marker reads, reverse-order teardown, duplicate-attachment rejection, and
+staging GC. Each cleanup rereads image/whole-device/volume identity and retains each owned volume's raw pin through
+namespace admission and same-root-FD `funmount`, then runs guarded `hdiutil detach` of the exact physical device under
+the image's lease. The detach guard rechecks after storage admission; a cached device number, caller mount set or
+mountpoint never authorizes an effect. A failed release keeps the scratch tree intact for the next run, rather than
+deleting a still-attached image's backing files. Before any release, a scratch root ends every process working in its
+tree, selected by the working directory the kernel reports (`proc_pidinfo` `PROC_PIDVNODEPATHINFO`, which still names a
+deleted directory): `SIGTERM`, as `nx daemon --stop` sends it, then `SIGKILL` after a 10s grace. A stock Nx daemon a
+fixture started detaches from its starter, so a failed test's unwinding otherwise never reached it and it kept running
+in the deleted root. Successful cleanup removes the root, and every run first ends the processes working under, then
+reclaims the roots and attachments of, runs whose owner pid is gone. On Linux: a scratch ZFS pool on a loopback/file
+vdev (`cowshed.itest.<pid>`) with datasets destroyed and the pool exported on teardown; the Linux leg also exercises
+`cowshed-helper` and the Landlock/netns exec path. A suite-level guard reaps leaked `cowshed.itest.*` volumes/pools. The
+same flow table runs on both; substrate-specific assertions (fsck step on APFS, origin-snapshot GC on ZFS) are tagged.
 
 The panic/kill cleanup fixture reads only its own child's stdout pipe. Before ending that child it requires two complete
 line-start image records (RAW, then retained ASIF) and the worker record; neither a sibling's output nor a host
@@ -254,17 +254,21 @@ pre-fsck/pre-mount state from the kernel mount table, then require exact-physica
 not ask an already-unmounted volume to unmount. Mount requires the exact single owned APFS volume, pinned fsck before
 the first mount and that proven raw pin held across the host lease wait; a failed fsck or mount never earns release
 grace or retry. Option controls retain read-only/visibility/owners/noatime and the separate event-store-repair
-`nobrowse,noowners` state. Unmount controls remove the exact volume during simulated storage admission and require a
-post-grant kernel query with no command, while a foreign mounted volume remains untouched. Read errors stay errors, and
-disappearance during grace is never reported as a forced effect. A real mounted image is unmounted twice successfully
-without releasing its image attachment between calls. Release controls retain exact-volume `diskutil unmount`, exact
-physical-device `hdiutil detach`, post-grant guards and the unchanged named-dissenter/busy parsers; permission, general
-and unrecognized refusals remain errors. Real image teardown still proves the complete mounted RAW plus unmounted
-retained-ASIF panic/kill walk. An isolated pass after operator cleanup is not a repair verdict when the unchanged full
-gate repeats the failure; preserve both historical witnesses and exercise the real command cutover. The lease overlap
-fixture also drops B's returned handle before cleanup to prove exact-image recovery. A no-device cleanup control holds
-the backing-file lock: unlink refuses and preserves its bytes until an exclusive no-follow open proves it unlocked, then
-cleanup accepts both that file and an already-absent file without spending an image attach.
+`nobrowse,noowners` state. Unmount controls remove the exact volume during simulated namespace admission and require a
+post-grant kernel query with no native effect. Foreign/non-root held directories and stale filesystem identities refuse
+before mutation. Kernel-read and postcondition failures remain distinct errors; disappearance during grace is never
+reported forced. A fresh real kernel mount is immediately released through the production owner, then unmounted again
+without releasing its image attachment between calls. The real boundary proves the same event-only FD's
+root/source/FSID, descriptor-native naming compatibility, unforced `funmount`, retained post-FD `ENOTSUP` and
+independent original-FSID absence; an errno or constructed fake state alone is not the oracle. Native exact-`EBUSY`
+policy controls retain monotonic grace and intent-specific force authority, while permission and other failures never
+earn grace. Exact physical-device `hdiutil detach`, post-grant guards and unchanged command named-dissenter/busy parsers
+remain covered. Real image teardown still proves the complete mounted RAW plus unmounted retained-ASIF panic/kill walk.
+An isolated pass after operator cleanup is not a repair verdict when the unchanged full gate repeats the failure;
+preserve both historical witnesses and exercise the real command cutover. The lease overlap fixture also drops B's
+returned handle before cleanup to prove exact-image recovery. A no-device cleanup control holds the backing-file lock:
+unlink refuses and preserves its bytes until an exclusive no-follow open proves it unlocked, then cleanup accepts both
+that file and an already-absent file without spending an image attach.
 
 The killed-caller attach fixture captures helper PIDs from the existing I/O Registry creator walker, joined to its exact
 backing image before release. After its own attach/release operations finish, two reads must find no orphan among those

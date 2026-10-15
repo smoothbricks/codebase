@@ -13,6 +13,7 @@ pub mod store_lock;
 pub mod template;
 
 use crate::image::{IMAGE_EXTENSION, ImageCapacity, is_image_path};
+use crate::mounts::{NativeUnmountError, PostUnmountFd, UnmountEffect, UnmountMode};
 use cowshed_os::fork_lock::{Fenced, Spawn as _};
 use cowshed_os::host_load::HostLoad;
 pub use cowshed_os::process::{CommandOutput, ProcessStatus};
@@ -258,13 +259,40 @@ pub trait CommandRunner {
     fn name_volume(&self, root: &OwnedVolumeRoot, volume_name: &str) -> io::Result<()> {
         root.set_name(volume_name)
     }
-    /// Current kernel namespace membership of one exact volume device. Unmount calls this
-    /// only after host storage admission, while its image lease and raw pin preserve identity.
-    /// Recording runners answer from their virtual namespace, like their held mountpoints.
-    fn volume_is_mounted(&self, volume_device: &str) -> io::Result<bool> {
+    /// The exact pinned volume's current kernel mount, read only inside namespace admission.
+    /// Absence is a no-effect result; a mount root is held and proved before any native effect.
+    fn volume_mount(&self, volume_device: &str) -> io::Result<Option<mounts::KernelMountSnapshot>> {
         Ok(mounts::kernel_mounts()?
-            .iter()
-            .any(|mount| mount.source_device == volume_device))
+            .into_iter()
+            .find(|mount| mount.source_device == volume_device))
+    }
+    /// Admit one native unmount, then prove its root. The returned root owns the same descriptor
+    /// through the syscall and compound postcondition. Recording runners explicitly record the
+    /// native operation; an unoverridden stated root has no descriptor and fails closed.
+    fn unmount_guarded<E>(
+        &self,
+        mode: UnmountMode,
+        prove: impl FnOnce() -> Result<Option<OwnedVolumeRoot>, E>,
+    ) -> Result<UnmountEffect, E>
+    where
+        E: From<NativeUnmountError> + fmt::Display,
+    {
+        let operation = match mode {
+            UnmountMode::Normal => "funmount normal",
+            UnmountMode::ForceAfterGrace => "funmount force-after-grace",
+        };
+        disk_lease::namespace(operation, || {
+            let Some(root) = prove()? else {
+                return Ok(UnmountEffect::NoEffect);
+            };
+            cowshed_os::timing::attribute(
+                "apfs-command",
+                format_args!("unmount verified APFS volume"),
+                "filesystem",
+                format_args!("{:?}", root.filesystem_id()),
+            );
+            root.unmount(mode).map_err(E::from)
+        })
     }
     /// Every disk image the kernel has attached right now, read from the I/O Registry.
     ///
@@ -1234,6 +1262,14 @@ impl OwnedVolumeRoot {
         &self.mount_point
     }
 
+    pub fn filesystem_id(&self) -> mounts::FilesystemId {
+        self.held.filesystem_id()
+    }
+
+    fn unmount(&self, mode: UnmountMode) -> Result<UnmountEffect, NativeUnmountError> {
+        self.held.unmount(mode)
+    }
+
     /// Name this volume through its held root descriptor ([`mounts::HeldMount`]).
     pub fn set_name(&self, volume_name: &str) -> io::Result<()> {
         self.held.set_volume_name(volume_name)
@@ -1517,6 +1553,21 @@ pub enum ApfsError {
         mount_point: PathBuf,
         source: io::Error,
     },
+    /// A current mount lookup did not yield this pinned attachment's own filesystem root.
+    UnmountTargetNotMounted {
+        image: PathBuf,
+        volume_device: String,
+        mount_point: PathBuf,
+        found: String,
+        is_root: bool,
+    },
+    /// A descriptor-native unmount failure, with the attachment and exact native cause retained.
+    UnmountFailed {
+        image: PathBuf,
+        volume_device: String,
+        mode: UnmountMode,
+        source: NativeUnmountError,
+    },
     CommandRun(CommandRunError),
     CommandFailed {
         operation: &'static str,
@@ -1649,6 +1700,28 @@ impl fmt::Display for ApfsError {
                 f,
                 "could not rename {volume_device} through its held mount root {}: {source}",
                 mount_point.display()
+            ),
+            Self::UnmountTargetNotMounted {
+                image,
+                volume_device,
+                mount_point,
+                found,
+                is_root,
+            } => write!(
+                f,
+                "refusing to unmount {volume_device} of {}: {} holds {found} (mount root: {is_root}), not its owned root",
+                image.display(),
+                mount_point.display()
+            ),
+            Self::UnmountFailed {
+                image,
+                volume_device,
+                mode,
+                source,
+            } => write!(
+                f,
+                "unmount {volume_device} of {} ({mode:?}) failed: {source}",
+                image.display()
             ),
             Self::CommandRun(error) => error.fmt(f),
             Self::CommandFailed {
@@ -1801,6 +1874,7 @@ impl fmt::Display for ApfsError {
 impl std::error::Error for ApfsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::UnmountFailed { source, .. } => Some(source),
             Self::CommandRun(error) => Some(error),
             Self::KernelInventory(source) => Some(source),
             Self::FileOperation { source, .. } | Self::RenameFailed { source, .. } => Some(source),
@@ -2057,7 +2131,7 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
     }
 
     /// Remove an owned volume from the filesystem namespace before releasing its image.
-    /// The raw IOMedia pin freezes the device identity while diskutil unmounts it.
+    /// The raw IOMedia pin freezes device identity while the same owned root FD is unmounted.
     pub fn unmount_verified(
         &self,
         attachment: &AttachedImage,
@@ -2100,47 +2174,86 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
             .map(|_| ())
     }
 
-    /// `diskutil unmount` the exact attachment volume while its image lease and raw pin hold
-    /// the registry-proven identity. Only a named dissenter earns the existing grace; Release
-    /// then forces once, WithinGrace returns the remaining dissent, and WhenIdle returns it now.
+    /// Remove one exact owned root through its descriptor. Only native EBUSY earns the existing
+    /// grace; Release then forces once, WithinGrace returns the remaining busy refusal, and
+    /// WhenIdle returns it now. The image lease and raw pin outlive every admission and attempt.
     fn unmount_volume_unlocked(
         &self,
         attachment: &AttachedImage,
         intent: DetachIntent,
         operation: &'static str,
     ) -> Result<Unmounted, ApfsError> {
+        enum AttemptError {
+            Proof(ApfsError),
+            Native(NativeUnmountError),
+        }
+        impl fmt::Display for AttemptError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::Proof(error) => error.fmt(f),
+                    Self::Native(error) => error.fmt(f),
+                }
+            }
+        }
+        impl From<NativeUnmountError> for AttemptError {
+            fn from(error: NativeUnmountError) -> Self {
+                Self::Native(error)
+            }
+        }
         let mut waited = Duration::ZERO;
         let mut started = None;
-        let mut force = false;
+        let mut mode = UnmountMode::Normal;
         loop {
-            let mut args = Vec::with_capacity(2 + usize::from(force));
-            args.push(OsString::from("unmount"));
-            if force {
-                args.push(OsString::from("force"));
-            }
-            args.push(OsString::from(&attachment.volume_device));
-            let request = CommandRequest::new(DISKUTIL, args);
             let result = timed_apfs_step(apfs_step_leg(&attachment.image), "unmount", || {
                 cowshed_os::timing::timed("apfs-command", format_args!("{operation}"), || {
-                    let output = self.runner.run_guarded(&request, || {
-                        self.runner
-                            .volume_is_mounted(&attachment.volume_device)
-                            .map_err(|source| ApfsError::FileOperation {
-                                operation: "read kernel mount state before APFS unmount",
-                                path: PathBuf::from(&attachment.volume_device),
+                    self.runner
+                        .unmount_guarded(mode, || {
+                            let mount = self
+                                .runner
+                                .volume_mount(&attachment.volume_device)
+                                .map_err(|source| {
+                                    AttemptError::Native(NativeUnmountError::KernelRead {
+                                        stage: "read kernel mount before APFS unmount",
+                                        source,
+                                    })
+                                })?;
+                            let Some(mount) = mount else {
+                                return Ok(None);
+                            };
+                            let held =
+                                self.runner
+                                    .hold_mount(&mount.mount_point)
+                                    .map_err(|source| {
+                                        AttemptError::Native(NativeUnmountError::KernelRead {
+                                            stage: "hold APFS unmount root",
+                                            source,
+                                        })
+                                    })?;
+                            OwnedVolumeRoot::of_attachment(held, &mount.mount_point, attachment)
+                                .map(Some)
+                                .map_err(|held| {
+                                    AttemptError::Proof(ApfsError::UnmountTargetNotMounted {
+                                        image: attachment.image.clone(),
+                                        volume_device: attachment.volume_device.clone(),
+                                        mount_point: mount.mount_point,
+                                        found: held.source_device().to_owned(),
+                                        is_root: held.is_root(),
+                                    })
+                                })
+                        })
+                        .map_err(|error| match error {
+                            AttemptError::Proof(error) => error,
+                            AttemptError::Native(source) => ApfsError::UnmountFailed {
+                                image: attachment.image.clone(),
+                                volume_device: attachment.volume_device.clone(),
+                                mode,
                                 source,
-                            })
-                    })?;
-                    match output {
-                        Some(output) if !output.succeeded() => {
-                            Err(command_failed(operation, request, output))
-                        }
-                        output => Ok(output),
-                    }
+                            },
+                        })
                 })
             });
             match result {
-                Ok(None) => {
+                Ok(UnmountEffect::NoEffect) => {
                     cowshed_os::timing::attribute(
                         "apfs-command",
                         format_args!("{operation}"),
@@ -2149,16 +2262,28 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
                     );
                     return Ok(Unmounted::Unforced);
                 }
-                Ok(Some(_)) if force => return Ok(Unmounted::Forced),
-                Ok(Some(_)) => return Ok(Unmounted::Unforced),
-                Err(error) if !force && detach_was_dissented(&error) => {
+                Ok(UnmountEffect::Unmounted {
+                    post_fd: PostUnmountFd::Dead(source),
+                }) => {
+                    cowshed_os::timing::attribute(
+                        "apfs-command",
+                        format_args!("{operation}"),
+                        "post-fd",
+                        source,
+                    );
+                    return Ok(match mode {
+                        UnmountMode::Normal => Unmounted::Unforced,
+                        UnmountMode::ForceAfterGrace => Unmounted::Forced,
+                    });
+                }
+                Err(error) if mode == UnmountMode::Normal && detach_was_dissented(&error) => {
                     let started = started.get_or_insert_with(std::time::Instant::now);
                     let expired = self.grace.expired(waited, self.sleeper.elapsed(*started));
                     match (intent, expired) {
                         (DetachIntent::WhenIdle, _) | (DetachIntent::WithinGrace, true) => {
                             return Err(error);
                         }
-                        (DetachIntent::Release, true) => force = true,
+                        (DetachIntent::Release, true) => mode = UnmountMode::ForceAfterGrace,
                         (DetachIntent::Release | DetachIntent::WithinGrace, false) => {
                             self.sleeper.sleep(self.grace.poll);
                             waited = waited.saturating_add(self.grace.poll);
@@ -2660,18 +2785,11 @@ impl<R: CommandRunner, S: Sleeper> MacOsApfsBackend<R, S> {
         Ok(())
     }
 
-    /// Release `image` from every attachment the kernel holds for it: each volume of each
-    /// attachment's container whose device is in `mounted` (the kernel's mount sources) is
-    /// unmounted through its own pinned identity ([`Self::unmount_released`]), then every whole
-    /// device is detached once ([`Self::release_every_attachment`]), taking the unmounted rest.
-    pub fn release_image(
-        &self,
-        image: &Path,
-        mounted: &BTreeSet<String>,
-        intent: DetachIntent,
-    ) -> Result<(), ApfsError> {
+    /// Release every currently owned attachment. The owner resolves each volume's current mount
+    /// inside namespace admission; no caller's cached mounted-device set authorizes or skips it.
+    pub fn release_image(&self, image: &Path, intent: DetachIntent) -> Result<(), ApfsError> {
         for view in self.release_views(image)? {
-            for volume in view.mounted_volumes(mounted) {
+            for volume in view.release_volumes() {
                 self.unmount_released(&volume, intent)?;
             }
         }
@@ -3542,6 +3660,9 @@ fn attachment_capacity(
 /// The image driver reports EBUSY plus its resource-busy diagnostic. Anything else — a bad
 /// device, a missing tool, a spawn failure — is not a dissent and must not be waited on.
 pub fn detach_was_dissented(error: &ApfsError) -> bool {
+    if let ApfsError::UnmountFailed { source, .. } = error {
+        return matches!(source, NativeUnmountError::Busy(_));
+    }
     if let ApfsError::CaptureSourceBusy { refusal, .. } = error {
         return detach_was_dissented(refusal);
     }
@@ -3882,23 +4003,17 @@ impl ReleaseView {
         &self.whole_device
     }
 
-    /// Each volume of the container that `mounted` (the kernel's mount sources) names, as the
-    /// release unmounts it. An unmounted volume goes with the container's detach.
-    pub(crate) fn mounted_volumes<'a>(
-        &'a self,
-        mounted: &'a BTreeSet<String>,
-    ) -> impl Iterator<Item = ReleasedVolume> + 'a {
-        self.volumes
-            .iter()
-            .filter(|volume| mounted.contains(*volume))
-            .map(|volume| {
-                ReleasedVolume(AttachedImage {
-                    image: self.image.clone(),
-                    whole_device: self.whole_device.clone(),
-                    volume_device: volume.clone(),
-                    pin: std::sync::Mutex::new(None),
-                })
+    /// Every owned volume is a candidate. Its current kernel mount is resolved by the unmount
+    /// owner after admission; an absent mount needs no native effect before whole-device detach.
+    pub(crate) fn release_volumes(self) -> impl Iterator<Item = ReleasedVolume> {
+        self.volumes.into_iter().map(move |volume_device| {
+            ReleasedVolume(AttachedImage {
+                image: self.image.clone(),
+                whole_device: self.whole_device.clone(),
+                volume_device,
+                pin: std::sync::Mutex::new(None),
             })
+        })
     }
 }
 
@@ -5515,6 +5630,7 @@ mod tests {
         Mount(&'static str, bool),
         /// What naming a proven owned volume root answers.
         Named(io::Result<()>),
+        Unmount(Result<UnmountEffect, NativeUnmountError>),
     }
 
     /// One thing the backend asked the host, in order.
@@ -5526,6 +5642,7 @@ mod tests {
         HoldMount(PathBuf),
         /// A proven owned root named: its volume device and the name.
         NameVolume(String, String),
+        UnmountVolume(String, mounts::FilesystemId, UnmountMode),
     }
 
     impl Seen {
@@ -5542,6 +5659,9 @@ mod tests {
                 Self::NameVolume(device, name) => {
                     panic!("expected a command, saw {device} named {name:?}")
                 }
+                Self::UnmountVolume(device, _, mode) => {
+                    panic!("expected a command, saw {device} unmounted {mode:?}")
+                }
             }
         }
     }
@@ -5551,9 +5671,11 @@ mod tests {
             .iter()
             .filter_map(|step| match step {
                 Seen::Command(request) => Some(request.clone()),
-                Seen::Inventory | Seen::Grow(..) | Seen::HoldMount(_) | Seen::NameVolume(..) => {
-                    None
-                }
+                Seen::Inventory
+                | Seen::Grow(..)
+                | Seen::HoldMount(_)
+                | Seen::NameVolume(..)
+                | Seen::UnmountVolume(..) => None,
             })
             .collect()
     }
@@ -5562,8 +5684,9 @@ mod tests {
     struct RecordingRunner {
         steps: RefCell<Vec<Seen>>,
         replies: RefCell<VecDeque<Reply>>,
-        // Command scripts start mounted; successful namespace effects update this virtual state.
+        // Scripted native effects and namespace queries are distinct from child output.
         volume_mounts: RefCell<BTreeMap<String, bool>>,
+        mount_roots: RefCell<BTreeMap<PathBuf, String>>,
     }
 
     impl RecordingRunner {
@@ -5572,6 +5695,7 @@ mod tests {
                 steps: RefCell::new(Vec::new()),
                 replies: RefCell::new(replies.into_iter().collect()),
                 volume_mounts: RefCell::default(),
+                mount_roots: RefCell::default(),
             }
         }
         /// Every command and inventory read, in the order the backend made them.
@@ -5612,10 +5736,6 @@ mod tests {
                     if output.succeeded() {
                         let effect = if request.program == Path::new(MOUNT_APFS) {
                             request.args.get(2).map(|device| (device, true))
-                        } else if request.program == Path::new(DISKUTIL)
-                            && request.args.first().is_some_and(|arg| arg == "unmount")
-                        {
-                            request.args.last().map(|device| (device, false))
                         } else {
                             None
                         };
@@ -5630,13 +5750,58 @@ mod tests {
                 other => panic!("test scripted {other:?} where {request:?} ran"),
             }
         }
-        fn volume_is_mounted(&self, volume_device: &str) -> io::Result<bool> {
-            Ok(self
+        fn volume_mount(
+            &self,
+            volume_device: &str,
+        ) -> io::Result<Option<mounts::KernelMountSnapshot>> {
+            if !self
                 .volume_mounts
                 .borrow()
                 .get(volume_device)
                 .copied()
-                .unwrap_or(true))
+                .unwrap_or(true)
+            {
+                return Ok(None);
+            }
+            let mount_point = PathBuf::from("/private/tmp/cowshed-recorded-mount")
+                .join(volume_device.trim_start_matches('/'));
+            self.mount_roots
+                .borrow_mut()
+                .insert(mount_point.clone(), volume_device.to_owned());
+            Ok(Some(mounts::KernelMountSnapshot::new(
+                1,
+                mount_point,
+                volume_device,
+                true,
+                true,
+            )))
+        }
+        fn unmount_guarded<E>(
+            &self,
+            mode: UnmountMode,
+            prove: impl FnOnce() -> Result<Option<OwnedVolumeRoot>, E>,
+        ) -> Result<UnmountEffect, E>
+        where
+            E: From<NativeUnmountError> + fmt::Display,
+        {
+            let Some(root) = prove()? else {
+                return Ok(UnmountEffect::NoEffect);
+            };
+            match self.next_reply(Seen::UnmountVolume(
+                root.volume_device().to_owned(),
+                root.filesystem_id(),
+                mode,
+            )) {
+                Reply::Unmount(result) => {
+                    if result.is_ok() {
+                        self.volume_mounts
+                            .borrow_mut()
+                            .insert(root.volume_device().to_owned(), false);
+                    }
+                    result.map_err(E::from)
+                }
+                other => panic!("test scripted {other:?} where a native unmount ran"),
+            }
         }
         fn image_lease(&self, _: &Path) -> io::Result<Option<Fenced<File>>> {
             Ok(None)
@@ -5657,8 +5822,23 @@ mod tests {
             }
         }
         fn hold_mount(&self, mount_point: &Path) -> io::Result<mounts::HeldMount> {
+            let scripted = matches!(self.replies.borrow().front(), Some(Reply::Mount(..)));
+            if !scripted && let Some(device) = self.mount_roots.borrow().get(mount_point) {
+                self.steps
+                    .borrow_mut()
+                    .push(Seen::HoldMount(mount_point.to_owned()));
+                return Ok(mounts::HeldMount::stated(
+                    device,
+                    true,
+                    mounts::FilesystemId::new([7, 26]),
+                ));
+            }
             match self.next_reply(Seen::HoldMount(mount_point.to_owned())) {
-                Reply::Mount(device, root) => Ok(mounts::HeldMount::stated(device, root)),
+                Reply::Mount(device, root) => Ok(mounts::HeldMount::stated(
+                    device,
+                    root,
+                    mounts::FilesystemId::new([7, 26]),
+                )),
                 other => panic!(
                     "test scripted {other:?} where {} was held",
                     mount_point.display()
@@ -5758,12 +5938,28 @@ mod tests {
         )
     }
 
-    /// Exact named-dissenter output; a generic unmount failure does not earn release grace.
+    /// Native busy is distinct from a disk child's diagnostic output.
     fn unmount_dissent() -> Reply {
-        failed(
-            1,
-            "Volume [cowshed] on disk5s1 failed to unmount: dissented by PID 13258 (/bin/bash)\nDissenter parent PPID 20243 (/usr/bin/python3)\n",
-        )
+        Reply::Unmount(Err(NativeUnmountError::Busy(io::Error::from_raw_os_error(
+            libc::EBUSY,
+        ))))
+    }
+
+    fn unmount_ok() -> Reply {
+        Reply::Unmount(Ok(UnmountEffect::Unmounted {
+            post_fd: PostUnmountFd::Dead(io::Error::from_raw_os_error(libc::ENOTSUP)),
+        }))
+    }
+
+    fn unmounts(runner: &RecordingRunner) -> Vec<(String, mounts::FilesystemId, UnmountMode)> {
+        runner
+            .steps()
+            .into_iter()
+            .filter_map(|step| match step {
+                Seen::UnmountVolume(device, fsid, mode) => Some((device, fsid, mode)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn capacity(value: &str) -> ImageCapacity {
@@ -8194,8 +8390,21 @@ mod tests {
         fn hold_mount(&self, mount_point: &Path) -> io::Result<mounts::HeldMount> {
             self.recorded.hold_mount(mount_point)
         }
-        fn volume_is_mounted(&self, volume_device: &str) -> io::Result<bool> {
-            self.recorded.volume_is_mounted(volume_device)
+        fn volume_mount(
+            &self,
+            volume_device: &str,
+        ) -> io::Result<Option<mounts::KernelMountSnapshot>> {
+            self.recorded.volume_mount(volume_device)
+        }
+        fn unmount_guarded<E>(
+            &self,
+            mode: UnmountMode,
+            prove: impl FnOnce() -> Result<Option<OwnedVolumeRoot>, E>,
+        ) -> Result<UnmountEffect, E>
+        where
+            E: From<NativeUnmountError> + fmt::Display,
+        {
+            self.recorded.unmount_guarded(mode, prove)
         }
     }
 
@@ -8321,8 +8530,11 @@ mod tests {
         fn grow_image(&self, image: &Path, _: ImageCapacity) -> io::Result<()> {
             panic!("mount grew {}", image.display());
         }
-        fn volume_is_mounted(&self, volume_device: &str) -> io::Result<bool> {
-            self.pins.volume_is_mounted(volume_device)
+        fn volume_mount(
+            &self,
+            volume_device: &str,
+        ) -> io::Result<Option<mounts::KernelMountSnapshot>> {
+            self.pins.volume_mount(volume_device)
         }
     }
 
@@ -9606,18 +9818,17 @@ mod tests {
     #[test]
     fn a_release_revalidates_each_volume_it_unmounts_and_refuses_a_stranger() {
         let image = temp_path("two-volume-unmount", IMAGE_EXTENSION);
-        let views = release_views_of(&image, &two_volume_image(&image)).unwrap();
-        let [view] = views.as_slice() else {
-            panic!("one attachment is one release view");
-        };
+        let view = release_views_of(&image, &two_volume_image(&image))
+            .unwrap()
+            .pop()
+            .unwrap();
         assert_eq!(view.whole_device(), "/dev/disk4");
-        let both = BTreeSet::from(["/dev/disk5s1".to_owned(), "/dev/disk5s2".to_owned()]);
-        let volumes: Vec<ReleasedVolume> = view.mounted_volumes(&both).collect();
+        let volumes: Vec<ReleasedVolume> = view.release_volumes().collect();
         let backend = graced_backend([
             Reply::Inventory(Ok(two_volume_image(&image))),
-            ok([]),
+            unmount_ok(),
             Reply::Inventory(Ok(two_volume_image(&image))),
-            ok([]),
+            unmount_ok(),
             Reply::Inventory(Ok(two_volume_image(&image))),
         ]);
         for volume in &volumes {
@@ -9636,14 +9847,25 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&refused, ApfsError::InvalidAttachmentInventory(message)
-                if message.contains("no longer owns /dev/disk4 / /dev/disk5s3")),
+            if message.contains("no longer owns /dev/disk4 / /dev/disk5s3")),
             "{refused}"
         );
-        let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
         assert_eq!(
-            commands,
-            [["unmount", "/dev/disk5s1"], ["unmount", "/dev/disk5s2"]]
+            unmounts(backend.runner()),
+            [
+                (
+                    "/dev/disk5s1".into(),
+                    mounts::FilesystemId::new([7, 26]),
+                    UnmountMode::Normal
+                ),
+                (
+                    "/dev/disk5s2".into(),
+                    mounts::FilesystemId::new([7, 26]),
+                    UnmountMode::Normal
+                ),
+            ]
         );
+        assert!(backend.runner().requests().is_empty());
     }
 
     /// A release unmounts exactly the container's mounted volumes, each under its own
@@ -9656,24 +9878,35 @@ mod tests {
             let backend = graced_backend([
                 Reply::Inventory(Ok(two_volume_image(&image))),
                 Reply::Inventory(Ok(two_volume_image(&image))),
-                ok([]),
+                Reply::Inventory(Ok(two_volume_image(&image))),
+                unmount_ok(),
                 Reply::Inventory(Ok(two_volume_image(&image))),
                 Reply::Inventory(Ok(two_volume_image(&image))),
                 ok([]),
                 no_images(),
+                no_images(),
+                no_images(),
             ]);
-            let mounted = BTreeSet::from(["/dev/disk5s2".to_owned(), "/dev/disk9s1".to_owned()]);
             backend
-                .release_image(&image, &mounted, DetachIntent::Release)
-                .unwrap();
-            let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
+                .runner()
+                .volume_mounts
+                .borrow_mut()
+                .insert("/dev/disk5s1".into(), false);
+            for _ in 0..2 {
+                backend
+                    .release_image(&image, DetachIntent::Release)
+                    .unwrap();
+            }
             assert_eq!(
-                commands,
-                [
-                    vec!["unmount".to_owned(), "/dev/disk5s2".to_owned()],
-                    vec!["detach".into(), "-verbose".into(), "/dev/disk4".into()],
-                ]
+                unmounts(backend.runner()),
+                [(
+                    "/dev/disk5s2".into(),
+                    mounts::FilesystemId::new([7, 26]),
+                    UnmountMode::Normal
+                ),]
             );
+            let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
+            assert_eq!(commands, [["detach", "-verbose", "/dev/disk4"]]);
         }
     }
 
@@ -9685,15 +9918,27 @@ mod tests {
         let backend = graced_backend([
             Reply::Inventory(Ok(two_volume_image(&image))),
             Reply::Inventory(Ok(two_volume_image(&image))),
+            Reply::Inventory(Ok(two_volume_image(&image))),
             unmount_dissent(),
         ]);
-        let mounted = BTreeSet::from(["/dev/disk5s2".to_owned()]);
+        backend
+            .runner()
+            .volume_mounts
+            .borrow_mut()
+            .insert("/dev/disk5s1".into(), false);
         let error = backend
-            .release_image(&image, &mounted, DetachIntent::WhenIdle)
+            .release_image(&image, DetachIntent::WhenIdle)
             .unwrap_err();
         assert!(detach_was_dissented(&error), "{error}");
-        let commands: Vec<Vec<String>> = backend.runner().requests().iter().map(argv).collect();
-        assert_eq!(commands, [["unmount", "/dev/disk5s2"]]);
+        assert_eq!(
+            unmounts(backend.runner()),
+            [(
+                "/dev/disk5s2".into(),
+                mounts::FilesystemId::new([7, 26]),
+                UnmountMode::Normal
+            ),]
+        );
+        assert!(backend.runner().requests().is_empty());
         assert!(backend.sleeper.waits().is_empty());
     }
 
@@ -9796,23 +10041,32 @@ mod tests {
         where
             E: From<CommandRunError> + fmt::Display,
         {
+            self.recorded.run_guarded(request, check)
+        }
+        fn unmount_guarded<E>(
+            &self,
+            mode: UnmountMode,
+            prove: impl FnOnce() -> Result<Option<OwnedVolumeRoot>, E>,
+        ) -> Result<UnmountEffect, E>
+        where
+            E: From<NativeUnmountError> + fmt::Display,
+        {
             self.grants.set(self.grants.get() + 1);
             if self.grants.get() == self.disappear_on_grant {
                 self.mounted.borrow_mut().remove("/dev/disk5s1");
             }
-            if check()? {
-                self.run(request).map(Some).map_err(E::from)
-            } else {
-                Ok(None)
-            }
+            self.recorded.unmount_guarded(mode, prove)
         }
         fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
             self.recorded.run(request)
         }
-        fn volume_is_mounted(&self, volume_device: &str) -> io::Result<bool> {
+        fn volume_mount(
+            &self,
+            volume_device: &str,
+        ) -> io::Result<Option<mounts::KernelMountSnapshot>> {
             assert!(
                 self.grants.get() > 0,
-                "mount state must be read after storage admission"
+                "mount state must be read after namespace admission"
             );
             self.queries.borrow_mut().push(volume_device.to_owned());
             if self.read_failure {
@@ -9821,7 +10075,13 @@ mod tests {
                     "injected kernel mount read failure",
                 ));
             }
-            Ok(self.mounted.borrow().contains(volume_device))
+            if !self.mounted.borrow().contains(volume_device) {
+                return Ok(None);
+            }
+            self.recorded.volume_mount(volume_device)
+        }
+        fn hold_mount(&self, mount_point: &Path) -> io::Result<mounts::HeldMount> {
+            self.recorded.hold_mount(mount_point)
         }
         fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<File>>> {
             self.recorded.image_lease(identity)
@@ -9848,7 +10108,7 @@ mod tests {
 
     #[test]
     fn unmount_twice_succeeds_with_one_namespace_effect() {
-        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([ok([])]));
+        let backend = MacOsApfsBackend::new(RecordingRunner::with_outputs([unmount_ok()]));
         let attachment = unmount_test_attachment();
         for _ in 0..2 {
             assert_eq!(
@@ -9862,13 +10122,19 @@ mod tests {
                 Unmounted::Unforced
             );
         }
-        let requests = backend.runner().requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(argv(&requests[0]), ["unmount", "/dev/disk5s1"]);
+        assert_eq!(
+            unmounts(backend.runner()),
+            [(
+                "/dev/disk5s1".into(),
+                mounts::FilesystemId::new([7, 26]),
+                UnmountMode::Normal
+            )]
+        );
+        assert!(backend.runner().requests().is_empty());
     }
 
     #[test]
-    fn unmount_reads_exact_kernel_mount_state_after_storage_admission() {
+    fn unmount_reads_exact_kernel_mount_state_after_namespace_admission() {
         let backend = MacOsApfsBackend::new(UnmountAdmissionRunner::new(1, false, []));
         let attachment = unmount_test_attachment();
         assert_eq!(
@@ -9881,29 +10147,26 @@ mod tests {
                 .unwrap(),
             Unmounted::Unforced
         );
+        assert!(unmounts(&backend.runner().recorded).is_empty());
         assert!(backend.runner().recorded.requests().is_empty());
         assert_eq!(*backend.runner().queries.borrow(), ["/dev/disk5s1"]);
-        assert!(
-            backend.runner().mounted.borrow().contains("/dev/disk99s1"),
-            "a foreign mounted volume must be untouched"
-        );
     }
 
     #[test]
     fn unmount_kernel_read_failure_is_not_absence_or_dissent() {
         let backend = MacOsApfsBackend::new(UnmountAdmissionRunner::new(1, true, []));
-        let attachment = unmount_test_attachment();
         let error = backend
             .unmount_volume_unlocked(
-                &attachment,
+                &unmount_test_attachment(),
                 DetachIntent::Release,
                 "unmount verified APFS volume",
             )
             .unwrap_err();
         assert!(
-            matches!(&error, ApfsError::FileOperation { operation: "read kernel mount state before APFS unmount", path, source } if path == Path::new("/dev/disk5s1") && source.kind() == io::ErrorKind::PermissionDenied)
+            matches!(&error, ApfsError::UnmountFailed { source: NativeUnmountError::KernelRead { stage: "read kernel mount before APFS unmount", source }, .. } if source.kind() == io::ErrorKind::PermissionDenied)
         );
         assert!(!detach_was_dissented(&error));
+        assert!(unmounts(&backend.runner().recorded).is_empty());
         assert!(backend.runner().recorded.requests().is_empty());
     }
 
@@ -9917,81 +10180,168 @@ mod tests {
                 poll: Duration::from_millis(10),
             },
         );
-        let attachment = unmount_test_attachment();
         assert_eq!(
             backend
                 .unmount_volume_unlocked(
-                    &attachment,
+                    &unmount_test_attachment(),
                     DetachIntent::Release,
                     "unmount verified APFS volume"
                 )
                 .unwrap(),
             Unmounted::Unforced
         );
-        let requests = backend.runner().recorded.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(argv(&requests[0]), ["unmount", "/dev/disk5s1"]);
+        assert_eq!(
+            unmounts(&backend.runner().recorded),
+            [(
+                "/dev/disk5s1".into(),
+                mounts::FilesystemId::new([7, 26]),
+                UnmountMode::Normal
+            )]
+        );
         assert!(backend.sleeper.waits().is_empty());
     }
 
     #[test]
-    fn a_dissented_command_unmount_waits_its_grace_then_forces_only_the_exact_volume() {
-        let attachment = AttachedImage {
-            image: temp_path("unmount-command-dissent", IMAGE_EXTENSION),
-            whole_device: "/dev/disk4".into(),
-            volume_device: "/dev/disk5s1".into(),
-            pin: std::sync::Mutex::new(None),
-        };
+    fn a_busy_native_unmount_waits_its_grace_then_forces_only_the_exact_root() {
         let backend = graced_backend([
             unmount_dissent(),
             unmount_dissent(),
             unmount_dissent(),
-            ok([]),
+            unmount_ok(),
         ]);
         assert_eq!(
             backend
                 .unmount_volume_unlocked(
-                    &attachment,
+                    &unmount_test_attachment(),
                     DetachIntent::Release,
                     "unmount verified APFS volume"
                 )
                 .unwrap(),
             Unmounted::Forced
         );
-        let requests = backend.runner().requests();
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.program == Path::new(DISKUTIL))
-        );
+        let effects = unmounts(backend.runner());
         assert_eq!(
-            requests.iter().map(argv).collect::<Vec<_>>(),
+            effects.iter().map(|(_, _, mode)| *mode).collect::<Vec<_>>(),
             [
-                vec!["unmount", "/dev/disk5s1"],
-                vec!["unmount", "/dev/disk5s1"],
-                vec!["unmount", "/dev/disk5s1"],
-                vec!["unmount", "force", "/dev/disk5s1"],
+                UnmountMode::Normal,
+                UnmountMode::Normal,
+                UnmountMode::Normal,
+                UnmountMode::ForceAfterGrace
             ]
         );
+        assert!(
+            effects
+                .iter()
+                .all(|(device, fsid, _)| device == "/dev/disk5s1"
+                    && *fsid == mounts::FilesystemId::new([7, 26]))
+        );
+        assert!(backend.runner().requests().is_empty());
         assert_eq!(
             *backend.sleeper.waits(),
             [Duration::from_millis(10), Duration::from_millis(10)]
         );
-        for (reply, dissent) in [
-            (unmount_dissent(), true),
-            (failed(1, "Volume disk5s1 failed to unmount"), false),
+    }
+
+    #[test]
+    fn native_busy_intents_preserve_immediate_and_within_grace_refusal() {
+        for (intent, replies, attempts, sleeps) in [
+            (DetachIntent::WhenIdle, vec![unmount_dissent()], 1, 0),
+            (
+                DetachIntent::WithinGrace,
+                vec![unmount_dissent(), unmount_dissent(), unmount_dissent()],
+                3,
+                2,
+            ),
         ] {
-            let backend = graced_backend([reply]);
+            let backend = graced_backend(replies);
             let error = backend
                 .unmount_volume_unlocked(
-                    &attachment,
-                    DetachIntent::WhenIdle,
+                    &unmount_test_attachment(),
+                    intent,
                     "unmount verified APFS volume",
                 )
                 .unwrap_err();
-            assert_eq!(detach_was_dissented(&error), dissent);
-            assert_eq!(backend.runner().requests().len(), 1);
+            assert!(detach_was_dissented(&error));
+            let effects = unmounts(backend.runner());
+            assert_eq!(effects.len(), attempts);
+            assert!(
+                effects
+                    .iter()
+                    .all(|(_, _, mode)| *mode == UnmountMode::Normal)
+            );
+            assert_eq!(backend.sleeper.waits().len(), sleeps);
+        }
+    }
+
+    #[test]
+    fn native_authority_read_postcondition_and_other_failures_never_earn_grace() {
+        let fsid = mounts::FilesystemId::new([7, 26]);
+        for source in [
+            NativeUnmountError::Authority {
+                expected: fsid,
+                found: mounts::FilesystemId::new([8, 26]),
+            },
+            NativeUnmountError::KernelRead {
+                stage: "post-unmount mount table",
+                source: io::Error::from_raw_os_error(libc::EIO),
+            },
+            NativeUnmountError::Postcondition { filesystem: fsid },
+            NativeUnmountError::Failed(io::Error::from_raw_os_error(libc::EPERM)),
+            NativeUnmountError::Failed(io::Error::from_raw_os_error(libc::EINVAL)),
+        ] {
+            let backend = graced_backend([Reply::Unmount(Err(source))]);
+            let error = backend
+                .unmount_volume_unlocked(
+                    &unmount_test_attachment(),
+                    DetachIntent::Release,
+                    "unmount verified APFS volume",
+                )
+                .unwrap_err();
+            assert!(matches!(error, ApfsError::UnmountFailed { .. }));
+            assert!(!detach_was_dissented(&error));
+            assert_eq!(unmounts(backend.runner()).len(), 1);
+            assert!(backend.runner().requests().is_empty());
             assert!(backend.sleeper.waits().is_empty());
+        }
+    }
+
+    #[test]
+    fn unmount_refuses_foreign_and_nonroot_held_paths_before_any_native_effect() {
+        for (device, is_root) in [("/dev/disk99s1", true), ("/dev/disk5s1", false)] {
+            let backend = graced_backend([Reply::Mount(device, is_root)]);
+            let error = backend
+                .unmount_volume_unlocked(
+                    &unmount_test_attachment(),
+                    DetachIntent::Release,
+                    "unmount verified APFS volume",
+                )
+                .unwrap_err();
+            assert!(matches!(error, ApfsError::UnmountTargetNotMounted { .. }));
+            assert!(unmounts(backend.runner()).is_empty());
+            assert!(backend.runner().requests().is_empty());
+            assert!(backend.sleeper.waits().is_empty());
+        }
+    }
+
+    #[test]
+    fn command_unmount_dissent_parser_remains_exact_and_never_recognizes_absence_text() {
+        for (status, text, expected) in [
+            (
+                1,
+                "Volume fixture failed to unmount: dissented by PID 13258 (/bin/bash)",
+                true,
+            ),
+            (1, "Volume fixture failed to unmount", false),
+            (1, "Volume fixture is already unmounted", false),
+            (1, "Permission denied", false),
+            (libc::EBUSY, "Resource busy", false),
+        ] {
+            let error = command_failed(
+                "unmount",
+                CommandRequest::new(DISKUTIL, ["unmount", "/dev/disk5s1"]),
+                CommandOutput::failure(status, text),
+            );
+            assert_eq!(detach_was_dissented(&error), expected, "{text}");
         }
     }
 
@@ -10013,7 +10363,7 @@ mod tests {
             }
             replies.extend([
                 holding_verified_volume(image.to_str().unwrap()),
-                ok([]),
+                unmount_ok(),
                 holding(&image, "/dev/disk4"),
                 holding(&image, "/dev/disk4"),
                 ok([]),
@@ -10036,7 +10386,7 @@ mod tests {
                 ));
             }
             let commands = backend.runner().requests();
-            assert_eq!(commands.len(), 5);
+            assert_eq!(commands.len(), 4);
             assert_eq!(
                 commands
                     .iter()
@@ -10051,10 +10401,16 @@ mod tests {
                     .count(),
                 1
             );
-            assert_eq!(commands[3].program, Path::new(DISKUTIL));
-            assert_eq!(argv(&commands[3]), ["unmount", "/dev/disk5s1"]);
-            assert_eq!(commands[4].program, Path::new(HDIUTIL));
-            assert_eq!(argv(&commands[4]), ["detach", "-verbose", "/dev/disk4"]);
+            assert_eq!(
+                unmounts(backend.runner()),
+                [(
+                    "/dev/disk5s1".into(),
+                    mounts::FilesystemId::new([7, 26]),
+                    UnmountMode::Normal
+                )]
+            );
+            assert_eq!(commands[3].program, Path::new(HDIUTIL));
+            assert_eq!(argv(&commands[3]), ["detach", "-verbose", "/dev/disk4"]);
             fs::remove_dir(mount).unwrap();
         }
     }
@@ -10142,12 +10498,12 @@ mod tests {
         }
         let unformatted = [AttachedDiskImage::file(&image, None, [("/dev/disk4", "")])];
         let views = release_views_of(&image, &unformatted).unwrap();
-        let [view] = views.as_slice() else {
-            panic!("one attachment is one release view");
-        };
+        let view = views
+            .into_iter()
+            .next()
+            .expect("one attachment is one release view");
         assert_eq!(view.whole_device(), "/dev/disk4");
-        let whole = BTreeSet::from(["/dev/disk4".to_owned()]);
-        assert_eq!(view.mounted_volumes(&whole).count(), 0);
+        assert_eq!(view.release_volumes().count(), 0);
     }
 
     #[test]
@@ -10183,9 +10539,21 @@ mod tests {
                 ],
             )]))
         };
-        let backend = graced_backend([inventory(), inventory(), inventory(), ok([]), no_images()]);
+        let backend = graced_backend([
+            inventory(),
+            inventory(),
+            inventory(),
+            inventory(),
+            ok([]),
+            no_images(),
+        ]);
         backend
-            .release_image(&image, &BTreeSet::new(), DetachIntent::Release)
+            .runner()
+            .volume_mounts
+            .borrow_mut()
+            .insert("/dev/disk42s1".into(), false);
+        backend
+            .release_image(&image, DetachIntent::Release)
             .unwrap();
         let requests = backend.runner().requests();
         assert_eq!(requests.len(), 1);

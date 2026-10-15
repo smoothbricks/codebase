@@ -136,11 +136,13 @@ volume before publication or any in-image marker write. A failed attach, malform
 root/device releases only the new owned attachment or reports its cleanup refusal. An already-attached formatted or
 recovered volume uses the same pinned `mount_apfs` boundary. Blank formatting, detached checkpoint verification, resize
 and fixtures deliberately exercising an unmounted state retain `--noMount` and explicit `fsck_apfs -q` where required.
-Namespace-only unmount uses `diskutil unmount` of the exact verified volume. Owned-image release unmounts each exact
-currently-owned mounted volume with `diskutil unmount`, then releases the exact physical whole device with
-`hdiutil detach -verbose`. The raw volume pin preserves unmount authority across its host lease wait; the unpinned
-detach rechecks ownership after its storage lease wait. There is no general-eject or kernel-unmount fallback. Command
-selection does not itself claim Spotlight releases departed media references.
+Namespace-only unmount and owned-image release use `funmount` on the same held, proven `OwnedVolumeRoot` descriptor, not
+a mountpoint path, BSD device name or Disk Arbitration view. The root's filesystem identity comes from `fstatfs` on that
+descriptor. Each ordinary attempt is unforced. The image lease and registry-proven raw volume pin preserve authority
+across namespace admission, the native operation and its compound postcondition. After every owned volume is absent and
+pins are released, guarded `hdiutil detach -verbose` releases the exact physical whole device. There is no
+general-eject, DA-unmount, path/device substitution or automatic fallback. This does not claim Spotlight releases
+departed references.
 
 ### Owned-registry mount boundary
 
@@ -309,22 +311,24 @@ before/after delta was captured for the trace above, so it is not a completed ke
 delta alone nor a successful eject alone proves kernel heap retention or release.
 
 Owned-image release selects the current physical whole IOMedia and its actual APFS volume descendants from the image's
-registered provider tree. Under the image lease it reads kernel mount facts, raw-pins and rechecks each exact owned
-mounted volume, then runs `diskutil unmount <verified-volume-device>` for that volume only. An already-unmounted owned
-volume needs no unmount effect. After the volumes are unmounted and raw pins released,
-`hdiutil detach -verbose <physical-whole-device>` releases that exact image device through the image driver's interface.
-It never selects a BSD-prefix or StorageKit whole-disk cached family and has no `diskutil eject`, kernel-unmount or
-automatic command fallback.
+registered provider tree. Under the image lease it raw-pins and rechecks each exact owned volume. After host namespace
+admission it reads current kernel mount facts and, when mounted, proves the held root with the same `OwnedVolumeRoot`
+used for naming. `funmount` acts on that descriptor, never a cached device or path. Positive kernel absence is a
+no-effect success. The caller supplies no mounted-device snapshot as release authority. After the volumes are absent and
+raw pins released, `hdiutil detach -verbose <physical-whole-device>` releases that exact image through the image
+driver's interface. No BSD-prefix or StorageKit cached family, `diskutil eject`, DA-unmount or automatic fallback
+selects the effect.
 
-`WhenIdle` returns the observed recognized busy/dissenter refusal immediately, without force. `Release` gives the first
-dissent its existing 10 s monotonic wall-clock grace, including command execution and disk-lease waits between attempts,
-then makes the final forced release: `diskutil unmount force` of only the still-owned mounted volumes, followed by
-`hdiutil detach -force -verbose` of the exact physical whole device. `WithinGrace` retries through the same grace
-without forcing and returns the dissent still standing. Requested poll sleeps alone never define that deadline. The
-existing `diskutil unmount` named-dissenter parser and `hdiutil` busy/dissent recognition remain unchanged: permission,
-general and unrecognized failures are authoritative errors, never grace or force authority. Every detach runs
-`-verbose`, and hdiutil's account is retained on the `detach image` span: a refused release prints `dissent=<reason>`,
-and an accepted one slower than 1 s prints `waited=<account>`.
+`WhenIdle` returns a recognized busy refusal immediately, without force. `Release` gives the first recognized busy
+refusal its existing 10 s monotonic wall-clock grace, including native/command execution and disk-lease waits between
+attempts, then makes its existing final forced release: `funmount` with `MNT_FORCE` of only a still-owned root, followed
+by `hdiutil detach -force -verbose` of the exact physical whole device. Force is never the ordinary operation or a
+remedy for cowshed's own held descriptor. `WithinGrace` retries through the same grace without forcing and returns the
+refusal still standing. Requested poll sleeps alone never define that deadline. Native unmount recognizes only actual
+`EBUSY`; it does not infer an external holder or PID from that errno. The existing `diskutil unmount` named-dissenter
+parser and `hdiutil` busy/dissent recognition remain unchanged. Permission, authority, kernel-read, postcondition,
+general and unrecognized failures are errors, never grace or force authority. Every detach runs `-verbose`; the
+`detach image` span retains `dissent=<reason>` on refusal and `waited=<account>` for an accepted detach slower than 1 s.
 
 The existing disk-image child policy warns at 120 s and every 30 s thereafter rather than killing an in-flight
 `hdiutil detach`; neither that policy nor the grace is widened. The kernel's I/O Registry is the one host view that maps
@@ -354,11 +358,11 @@ A release deduplicates whole-device views, so the same attachment is never detac
 The release owner selects the exact backing image, its registered whole device and that device's current provider-tree
 descendants. Only those identities authorize release: a foreign or stale StorageKit cached descendant must neither be
 selected for unmount/detach nor veto release of the owned tree. A reused BSD spelling is not ownership. The owner-layer
-adapter preserves this boundary through exact-volume `diskutil unmount` and exact-physical-device `hdiutil detach`, with
-a registry-proven raw pin across the unmount's host lease wait and a positive registry/image guard after the detach's
-host lease wait, not merely a check of top-level argv before queuing. An unrelated refusal remains an error; the
-boundary is not permission to broaden the dissent parser, force a foreign volume, add an automatic command fallback, or
-weaken a fixture's complete cleanup expectation.
+adapter preserves this boundary through descriptor-native `funmount` of the held owned root and exact-physical-device
+`hdiutil detach`, with a registry-proven raw pin across the unmount's namespace lease wait and a positive registry/image
+guard after the detach's storage lease wait. An unrelated refusal remains an error; the boundary is not permission to
+broaden the dissent parser, force a foreign volume, add an automatic command fallback, or weaken a fixture's complete
+cleanup expectation.
 
 On 2026-10-14 at **20:07:36 +04:00**, the real panic/kill cleanup fixture's retained `second.asif` was joined by the I/O
 Registry to driver **0x100089e2a**, helper **36162**, physical **disk177**, container **disk179** and unmounted,
@@ -416,17 +420,24 @@ no-follow descriptor of the backing file across unlink. Empty registered mapping
 orphan helper's file lock remains a named refusal and preserves the file. Confirmed absence with an unlocked file, or an
 already-absent file, needs no release command. A failed explicit cleanup is never retried from its destructor.
 
-A namespace-only unmount, needed for adopt handoff or a sealed capture without releasing the device, is
-`diskutil unmount <verified-volume-device>`. It holds the image lease and the raw IOMedia pin that proves the exact
-image/whole-device/volume identity across the host lease wait, never a path selected by an untrusted child. After each
-host storage lease wait, the guarded unmount reads the kernel mount table for that exact pinned volume. Confirmed
-absence is an idempotent no-effect success, including a second unmount; no child is spawned and nothing is reported
-forced. An unreadable mount table remains a typed error, never absence. A controller's earlier snapshot cannot authorize
-the command after the wait. Restart-owned mounts additionally require their incarnation marker and matching kernel
-source. `WhenIdle` returns the recognized command dissent without force; `Release` waits the existing grace before
-`diskutil unmount force <verified-volume-device>`. Other errors remain errors. Ordinary image release uses the same
-exact-volume unmount boundary for each currently-owned mounted volume before `hdiutil detach` of the physical whole
-device; namespace-only unmount does not release that device.
+A namespace-only unmount, needed for adopt handoff or a sealed capture without releasing the device, holds the image
+lease and raw IOMedia pin across host namespace admission and the operation. After each admission, the owner reads the
+kernel table for the exact pinned volume. Confirmed absence is an idempotent no-effect success, including a second
+unmount; no native effect runs and nothing is reported forced. A mounted volume's root is held as `O_EVTONLY` with
+`O_DIRECTORY|O_NOFOLLOW`, proved by the same `OwnedVolumeRoot`, and its actual `fstatfs` filesystem identity saved and
+rechecked on that same descriptor before `funmount`. An unreadable table or descriptor, foreign root, non-root directory
+or changed identity is a typed error. A controller's earlier snapshot cannot authorize the effect after admission.
+Restart-owned mounts additionally require their incarnation marker and matching kernel source.
+
+The successful native postcondition is compound: `funmount` succeeds, the same held FD's `fstatfs` returns the measured
+`ENOTSUP` dead-vnode result retained as `PostUnmountFd::Dead`, and an independent kernel mount-table read positively
+establishes absence of the original filesystem identity. `ENOTSUP` alone is never absence. Another descriptor-read
+failure, an unreadable post-table or the original filesystem still present is an error, not success or force authority.
+`O_RDONLY` held roots make ordinary unmount busy; `O_EVTONLY` permits the measured unforced operation while preserving
+same-FD naming and root identity, but does not keep the mount present. Neither a pathname reopen nor an errno waiver
+substitutes for the compound proof. `WhenIdle`, `WithinGrace` and `Release` keep the busy/grace policy above. Ordinary
+image release uses this same boundary for every owned volume before physical-device `hdiutil detach`; namespace-only
+unmount does not release that device.
 
 Attach, verification and every lookup that answers one attachment require exactly one APFS volume in one reported
 container, and refuse anything else by naming what was reported. A release reads each of the image's attachments as its
@@ -705,7 +716,7 @@ What the substrate does about each:
 
 - **Fewest storagekitd round-trips.** Production operations sit at their floor: a mint is one `clonefile` of the store's
   blank template plus one attach ("Images"), a fork or cold mount is one attach, a land with no retire makes no
-  disk-tool call. Release runs `diskutil unmount` only for each exact currently-owned mounted volume, then one
+  disk-tool call. Release unmounts each exact currently-owned mounted volume through its held root FD, then runs one
   `hdiutil detach` for the physical device. The earlier measurements below used one `diskutil eject` per release and do
   not claim latency for the current release mechanism. The mint floor was one `image create` plus a formatting attach
   and `newfs_apfs`. Measured on the same host and tests (CLI adopt and build-volume first touch, `apfs <leg>/mint`
@@ -715,11 +726,11 @@ What the substrate does about each:
   a RAW image's virtual capacity is its file length, read without spawning a storage tool, and an attached image's
   kernel capacity comes from its authoritative IOMedia mapping.
 - **No attach→detach→attach on a success path**, and no verify-by-reattach.
-- **Storage calls and mount-table changes never overlap.** Every disk tool on the host runs under the gateway's
-  disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease"): `diskutil`, `hdiutil` and `newfs_apfs` share one phase,
-  `mount_apfs` and `umount` the other, and the two alternate. Exact-volume `diskutil unmount` belongs to the storage
-  phase; image mounts use the namespace phase. The same eight attach loops beside two mount loops made 106 attaches in
-  43 s with the phases kept apart, at 0.94 s p50 and 1.78 s p95 under load 167–212.
+- **Storage calls and mount-table changes never overlap.** Every disk tool and native unmount runs under the gateway's
+  disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease"): `diskutil`, `hdiutil` and `newfs_apfs` share storage,
+  `mount_apfs`, `umount` and owned-root `funmount` share namespace, and the two alternate. The same eight attach loops
+  beside two mount loops made 106 attaches in 43 s with the phases kept apart, at 0.94 s p50 and 1.78 s p95 under load
+  167–212.
 - **Test images are 1 GiB** and a fixture detaches its images on every exit path it survives, panic included; a killed
   run's images are reclaimed by the next run's sweep (08_testing.md). A leaked image costs one slot of the host's finite
   attach budget for as long as it stays attached. Tests mint one blank template per host user with the production
@@ -790,7 +801,7 @@ A volume is named only through its own mount root, held open and proven to be ow
   Arbitration reporting success. The host's Data volume carried `[cowshed] fixture · intents — slotted` from a rename by
   path, and then `[cowshed] fixture · dispatch — main` twice, the second time on 2026-10-13/14, after the rename by
   device had gained a re-proof under the image's lease, a raw pin and a held mountpoint descriptor. Such a proof cannot
-  close this window: it precedes Disk Arbitration's execution, and a held descriptor stops only unforced unmounts.
+  close this window: it precedes Disk Arbitration's execution rather than binding the eventual attribute write.
 
 So the runner refuses `diskutil rename` and `renameVolume`, in any spelling, for every caller (cowshed's own work and
 `cowshed disk-command` alike, `CommandRunFailure::VolumeRename`), before anything spawns. Nothing outside cowshed's
@@ -802,10 +813,11 @@ host refuses an image outside the store root, and the rename acts only on the vo
 inventory maps that image to. An image no attachment holds names nothing (`NotAttached`); one held twice, or held
 unformatted, is an inventory fault and is refused. One whose volume the kernel mount table does not list names nothing
 (`NotMounted`). Both skips are typed outcomes, not errors, and the supervisor says each one in the daemon log. Under the
-image's lease and a raw IOMedia pin that re-proves the mapping, the mountpoint is opened as a directory
-(`O_DIRECTORY|O_NOFOLLOW`) and the filesystem that descriptor lies on read (`fstatfs`): anything but the image's volume
-device, or a directory inside it rather than its root, is refused (`RenameTargetNotMounted`). A host disk is no
-attachment of any image, so its volumes are never an `OwnedVolumeRoot`.
+image's lease and a raw IOMedia pin that re-proves the mapping, the mountpoint is opened as an event-only directory
+(`O_EVTONLY|O_DIRECTORY|O_NOFOLLOW`) and the filesystem that descriptor lies on read (`fstatfs`), retaining its actual
+filesystem identity. Anything but the image's volume device, or a directory inside it rather than its root, is refused
+(`RenameTargetNotMounted`). A host disk is no attachment of any image, so its volumes are never an `OwnedVolumeRoot`.
+The same descriptor supports naming and native unmount; it does not prevent another unforced unmount.
 
 The name is then set through the held descriptor. The kernel binds it to that descriptor's vnode, not to a path: a
 volume unmounted since the proof, even by force, leaves the vnode dead and the call fails (`ENOTSUP`, measured; typed

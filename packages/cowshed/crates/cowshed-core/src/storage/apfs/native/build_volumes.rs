@@ -387,27 +387,20 @@ where
         // A minted volume is formatted before anything attaches it, so an attachment of a build
         // image is an APFS one; anything else is refused, not released.
         if present && let Some(attachment) = self.backend.existing_attachment(&image)? {
-            let mounted = self
-                .mount_source
-                .mounts()?
-                .into_iter()
-                .any(|mounted| mounted.source_device == attachment.volume_device());
-            if mounted {
-                match self
-                    .backend
-                    .unmount_verified(&attachment, DetachIntent::WhenIdle)
-                {
-                    Ok(()) => {}
-                    Err(error) if cowshed_apfs::detach_was_dissented(&error) => {
-                        let open = holders_of(&mount)?;
-                        let unmounted = self.backend.unmount_within_grace(&attachment)?;
-                        refused = Some(Refusal {
-                            open,
-                            forced: unmounted == cowshed_apfs::Unmounted::Forced,
-                        });
-                    }
-                    Err(error) => return Err(error.into()),
+            match self
+                .backend
+                .unmount_verified(&attachment, DetachIntent::WhenIdle)
+            {
+                Ok(()) => {}
+                Err(error) if cowshed_apfs::detach_was_dissented(&error) => {
+                    let open = holders_of(&mount)?;
+                    let unmounted = self.backend.unmount_within_grace(&attachment)?;
+                    refused = Some(Refusal {
+                        open,
+                        forced: unmounted == cowshed_apfs::Unmounted::Forced,
+                    });
                 }
+                Err(error) => return Err(error.into()),
             }
             self.backend.detach(&attachment, DetachIntent::Release)?;
         }
@@ -519,10 +512,8 @@ where
         }
         let was_mounted = self.mounted_at(&layout.mount(id))?.is_some();
         if let Some(attachment) = self.backend.existing_attachment(&image)? {
-            if was_mounted {
-                self.backend
-                    .unmount_verified(&attachment, DetachIntent::WhenIdle)?;
-            }
+            self.backend
+                .unmount_verified(&attachment, DetachIntent::WhenIdle)?;
             self.backend.detach(&attachment, DetachIntent::WhenIdle)?;
         }
         self.backend.resize_image(&image, capacity)?;

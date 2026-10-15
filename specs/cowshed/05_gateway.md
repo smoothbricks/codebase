@@ -349,19 +349,20 @@ Every request is one line. A one-shot request is followed by the client's EOF an
 
 ## Disk-lifecycle lease
 
-Disk-changing tools cowshed runs on the host — the CLI's, a supervisor's, the gateway's own startup pass, and every
-test's — run under a host-wide lease the gateway schedules. One client path takes it: `SystemCommandRunner` reads the
-command's class from its program and arguments and holds the lease around the actual child; setup uses the same client.
-Mount and unmount retain a registry-proven raw device pin across their lease wait and command. Unpinned detach commands
-recheck positive exact-image/device registry ownership after the lease wait, immediately before spawning, including when
-a command must run unleased. An attach spends most of its time in StorageKit's `syncAllDisks`, after its device already
+Disk-changing tools and descriptor-native unmounts cowshed runs on the host — the CLI's, a supervisor's, the gateway's
+own startup pass, and every test's — run under a host-wide lease the gateway schedules. One client path takes it:
+`SystemCommandRunner` admits disk children by command class and native `funmount` by namespace class through the same
+lease client. Setup uses that client too. Mount and unmount retain a registry-proven raw device pin across their lease
+wait and effect. Native unmount resolves and proves its current held root after admission, including when running
+unleased. Unpinned detach commands recheck positive exact-image/device registry ownership after the lease wait,
+immediately before spawning. An attach spends most of its time in StorageKit's `syncAllDisks`, after its device already
 exists, and that sync does not finish while the mount table keeps changing (01a_apfs.md, "How the APFS host degrades"),
 so attaches stall beside mount churn and stay fast once the two are kept apart. Attaches among themselves only queue on
 `storagekitd`; so the lease is two classes that exclude each other rather than N interchangeable tokens.
 
-- **Storage**: `diskutil`, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs` and `umount`. Exact-volume
-  `diskutil unmount` is storage; the image's `mount_apfs` is namespace. Read-only operations (`fsck_apfs`, IORegistry
-  reads) take no lease.
+- **Storage**: `diskutil`, `hdiutil`, and `newfs_apfs`. **Namespace**: `mount_apfs`, `umount`, and owned-root native
+  `funmount`. Cowshed's image unmount is the native namespace effect, not a DA command. An operator's `diskutil` facade
+  remains storage. Read-only operations (`fsck_apfs`, IORegistry and kernel mount reads) take no lease.
 - **A label does not change the disk lifecycle.** No disk tool renames a volume: the runner refuses `diskutil rename`
   and `renameVolume` outright, and a volume is named through its held mount root, a kernel attribute write (01a_apfs.md,
   "Ownership, identity, and the volume label"). A name keeps a mounted volume's mount-table position and st_dev, so

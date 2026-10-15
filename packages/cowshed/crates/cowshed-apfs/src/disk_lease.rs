@@ -122,9 +122,25 @@ pub fn leased<T, E: fmt::Display + From<VolumeRenameRefused>>(
     let Some(class) = class_of(program) else {
         return run();
     };
-    let command = describe(program, args);
+    leased_class(class, &describe(program, args), run)
+}
+
+/// Admit a descriptor-native namespace operation through the same client as disk children.
+/// The operation record is its real native effect, not an invented executable or second runner.
+pub(crate) fn namespace<T, E: fmt::Display>(
+    operation: &str,
+    run: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    leased_class(DiskClass::Namespace, operation, run)
+}
+
+fn leased_class<T, E: fmt::Display>(
+    class: DiskClass,
+    command: &str,
+    run: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
     if let Some(record) = COMMAND_RECORD.as_ref() {
-        record.append(class, &command);
+        record.append(class, command);
     }
     let share = match predates_recently() {
         Some(Predates::Leases) => return run(),
@@ -132,7 +148,7 @@ pub fn leased<T, E: fmt::Display + From<VolumeRenameRefused>>(
         None => wanted_share(),
     };
     let socket = cowshed_gateway_types::control_socket_path();
-    lease_then(&socket, class, share, &command, remember_predates, run)
+    lease_then(&socket, class, share, command, remember_predates, run)
 }
 
 /// [`leased`] against the control socket at `socket`, for a command already classed and named.
