@@ -8777,7 +8777,10 @@ mod tests {
         for verb in ["rename", "renameVolume", "RENAMEVOLUME", "ReNaMe"] {
             for refused in [
                 SystemCommandRunner.run(&request(verb)),
-                SystemCommandRunner.run_with_inherited_input(&request(verb)),
+                SystemCommandRunner.run_with_inherited_input(
+                    &request(verb),
+                    CommandDeadline::new(DISK_CHILD_DEADLINE),
+                ),
                 SystemCommandRunner
                     .run_guarded(&request(verb), || Ok::<_, ApfsError>(true))
                     .map_err(|error| match error {
