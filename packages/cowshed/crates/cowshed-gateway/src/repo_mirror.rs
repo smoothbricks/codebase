@@ -1784,14 +1784,65 @@ mod tests {
             Err(RepoMirrorError::InvalidRedirect | RepoMirrorError::NotAdmitted)
         ));
         assert_eq!(credentials.calls.load(Ordering::SeqCst), 4);
-        assert!(
-            auditor
-                .events
-                .lock()
-                .expect("events")
-                .iter()
-                .all(|event| event.path.as_deref().is_none_or(|path| !path.contains('@')))
-        );
+        {
+            let events = auditor.events.lock().expect("events");
+            let decisions = events.iter().map(|event| {
+                (
+                    event.workspace_id.as_str(),
+                    event.kind,
+                    event.status,
+                    event.path.as_deref(),
+                )
+            });
+            assert!(
+                decisions.eq([
+                    (
+                        "ws-a",
+                        AuditKind::RepoMirror,
+                        AuditStatus::Denied,
+                        Some("https://git.example.test/outside/repo.git")
+                    ),
+                    (
+                        "ws-a",
+                        AuditKind::RepoMirror,
+                        AuditStatus::Allowed,
+                        Some("https://git.example.test/org/repo.git")
+                    ),
+                    (
+                        "ws-a",
+                        AuditKind::RepoMirror,
+                        AuditStatus::Completed,
+                        Some("https://git.example.test/org/final.git")
+                    ),
+                    (
+                        "ws-b",
+                        AuditKind::RepoMirror,
+                        AuditStatus::Allowed,
+                        Some("https://git.example.test/org/repo.git")
+                    ),
+                    (
+                        "ws-b",
+                        AuditKind::RepoMirror,
+                        AuditStatus::Completed,
+                        Some("https://git.example.test/org/repo.git")
+                    ),
+                    ("ws-a", AuditKind::RepoMirror, AuditStatus::Denied, None),
+                    (
+                        "ws-a",
+                        AuditKind::RepoMirror,
+                        AuditStatus::Allowed,
+                        Some("https://git.example.test/org/redirect.git")
+                    ),
+                    ("ws-a", AuditKind::RepoMirror, AuditStatus::Failed, None),
+                ]),
+                "every mirror decision must retain its workspace, status and safe path: {events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| { event.path.as_deref().is_none_or(|path| !path.contains('@')) })
+            );
+        }
 
         handle.shutdown().await;
         task.await.expect("join");

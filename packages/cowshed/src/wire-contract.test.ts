@@ -108,6 +108,21 @@ describe('napi wire contract', () => {
 
           expect(assertValue(document)).toEqual(document);
           expect(parseValue(JSON.stringify(document))).toEqual(document);
+
+          // Widen records, not their list wrapper; an empty list has no record to widen.
+          const documents: readonly unknown[] = Array.isArray(document) ? document : [document];
+          for (const [index, value] of documents.entries()) {
+            if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+              throw new Error(`${name} ${caseName} has a non-object document at index ${index}`);
+            }
+            const widerValue = { ...value, lingering: true };
+            const wider =
+              caseName === LIST_CASE
+                ? documents.map((entry, position) => (position === index ? widerValue : entry))
+                : widerValue;
+            expect(() => assertValue(wider)).toThrow();
+            expect(() => parseValue(JSON.stringify(wider))).toThrow();
+          }
         });
       }
     });
