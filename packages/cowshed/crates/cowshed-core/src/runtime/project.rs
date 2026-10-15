@@ -7492,7 +7492,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         self.migrate_owned_links_for(&current, &mount).await?;
         // The effective revision covers the project's standing grants too, so a project grant
-        // change relaunches the supervisor exactly as a workspace grant change does.
+        // change advances its served revision exactly as a workspace grant change does.
         let grants = effective_workspace_grants(&self.layout, &current.metadata.grants)?;
         let socket = super::supervisor_socket::socket_path(
             self.descriptor.storage.store(),

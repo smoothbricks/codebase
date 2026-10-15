@@ -122,12 +122,12 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   human by construction. `cp` applies no quarantine xattr (verified), so a Developer-ID drop opens cleanly; ad-hoc trips
   Gatekeeper. Electron/RN-desktop promoted apps point at dev's dev-server over loopback for live iteration. Specs:
   14_nix.md, 02/04/05/06; docs/desktop.md.
-- **Layered sandbox and child invariant**: start closed. Filesystem authority belongs to an immutable supervisor launch
+- **Layered sandbox and child invariant**: start closed. Filesystem authority belongs to an immutable execution
   revision. Every anonymous shell, named session, one-shot, startup hook, and descendant receives a narrower child
   profile before repository-controlled code runs; it denies every mutation beneath `.cowshed/job/**`, and no writable
-  protected-artifact/controller-writer FD is inherited. Effective filesystem grant changes drain/relaunch the
-  supervisor; named sessions pinned to stale revisions conflict. Egress/simulator changes apply at the gateway. No-op
-  and non-filesystem changes do not relaunch.
+  protected-artifact/controller-writer FD is inherited.
+  [11_shell.md, Grant-change propagation](../../specs/cowshed/11_shell.md#grant-change-propagation) owns filesystem
+  revision advances; egress/simulator changes apply at the gateway.
 - **Supervisor, clients, jobs, and stream storage**: one permission-checked persistent Unix socket per workspace
   supports concurrent/reconnecting clients. Every accepted exec gets an unreused positive workspace-local monotonic job
   ID, committed before spawn. Stdout/stderr are separate opaque byte streams under one exact combined quota (default 1
@@ -218,17 +218,17 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
 ## Suggested workflow shape
 
 Phase 1 — `cowshed-core` and `cowshed-shell`: substrate lifecycle, repository binding and policy lookup, markers/grants,
-env wiring, sandbox profile generation, multi-client supervision, jobs, output quotas, and revision-bound relaunch. Unit
-tests cover pure contracts; integration tests use isolated temporary paths. Phase 2 — parallel work on the CLI, gateway,
-N-API bindings, MCP server, and escape suite. Phase 3 — adversarial conformance and sandbox review, confirmed fixes,
-then targeted verification plus the repository's full Rust checks and a CLI transcript against the docs.
+env wiring, sandbox profile generation, multi-client supervision, jobs, output quotas, and revision-bound execution.
+Unit tests cover pure contracts; integration tests use isolated temporary paths. Phase 2 — parallel work on the CLI,
+gateway, N-API bindings, MCP server, and escape suite. Phase 3 — adversarial conformance and sandbox review, confirmed
+fixes, then targeted verification plus the repository's full Rust checks and a CLI transcript against the docs.
 
 ## Acceptance
 
 - `cowshed adopt && cowshed fork x && cowshed exec x -- <build> && cowshed push x && cowshed rm x` works end-to-end on
   each supported host, sandboxed, with caches warm from main.
-- Exit code 6 and a grant hint appear only on authoritative sandbox-denial evidence. After a filesystem grant, the prior
-  supervisor drains and relaunches at the new revision before retry; egress and simulator grants apply immediately.
+- Exit code 6 and a grant hint appear only on authoritative sandbox-denial evidence. Grant propagation follows
+  [11_shell.md, Grant-change propagation](../../specs/cowshed/11_shell.md#grant-change-propagation).
 - `cowshed attach` fast path ≤ 25 ms; `cowshed fork` ≤ 1 s cold; `cowshed rm` returns instantly.
 - Zero host-visible inode growth per workspace beyond the image file + grants file.
 - Substrate parity: the acceptance flow above passes on Linux/ZFS with Landlock enforcement (integration leg; can run in

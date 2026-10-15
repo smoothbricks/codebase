@@ -1272,8 +1272,18 @@ async fn exact_authority_and_session_identity_are_fenced() {
     let (mut h, root) = harness(1, 1024, false, false);
     let old = h.handle.clone();
     let session = open_named(&h.handle, "build").await;
-    let same = open_named(&h.handle, "build").await;
+    let unchanged = h
+        .handle
+        .advance_authority(
+            authority().grant_revision,
+            authority().lifecycle_revision,
+            config(&root).sandbox,
+        )
+        .await
+        .unwrap();
+    let same = open_named(&unchanged, "build").await;
     assert_eq!(session.identity(), same.identity());
+    unchanged.session_snapshot(&session).await.unwrap();
     let advanced = h
         .handle
         .advance_authority(8, 12, config(&root).sandbox)
@@ -4444,7 +4454,19 @@ async fn a_supervisor_that_cannot_start_fails_the_ensure_with_its_own_reason() {
 #[tokio::test]
 async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     use cowshed_core::runtime::{supervisor_manager::SupervisorManager, supervisor_socket};
-    let (mut h, root) = harness(1, 1024, false, false);
+    let (mut h, root) = harness(2, 1024, false, false);
+    let session = open_named(&h.handle, "build").await;
+    let running = h
+        .handle
+        .exec(
+            Some(&session),
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let running_spawn = h.spawned.recv().await.unwrap();
     let store = manager_store();
     let path = supervisor_socket::socket_path(&store, &authority().repo_id, &authority().workspace);
     let listener = supervisor_socket::bind(&path).await.unwrap();
@@ -4497,9 +4519,25 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
         "no second supervisor"
     );
     let remote = supervisor_socket::connect(ensured.socket, ensured.authority);
+    assert_eq!(
+        remote
+            .exec(
+                Some(&session),
+                None,
+                request(StdinSource::Empty),
+                AdmissionSource::Worker,
+            )
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict,
+        "the session opened under the old grants cannot cross revisions"
+    );
+    let current_session = open_named(&remote, "build").await;
+    assert_ne!(current_session.identity(), session.identity());
     let admitted = remote
         .exec(
-            None,
+            Some(&current_session),
             None,
             request(StdinSource::Empty),
             AdmissionSource::Worker,
@@ -4508,7 +4546,29 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
-    remote.wait(admitted).await.unwrap();
+    assert_eq!(
+        remote.wait(admitted).await.unwrap().grant_revision,
+        newer.grant_revision,
+        "new commands use the advanced grant revision while the old job still runs"
+    );
+    assert_eq!(
+        remote
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .find(|job| job.job_id == running)
+            .unwrap()
+            .state,
+        JobState::Running
+    );
+    complete(&running_spawn, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(
+        remote.wait(running).await.unwrap().grant_revision,
+        authority().grant_revision,
+        "the running job retains its original enforced revision"
+    );
+    remote.close_session(current_session).await.unwrap();
     remote.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
