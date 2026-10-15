@@ -46,7 +46,7 @@ export function captureHangDiagnostics(
   source: HangDiagnosticHost = host,
 ): Promise<HangDiagnostics> {
   const startedAtMs = Date.now();
-  const budgetMs = Math.max(0, Math.min(HANG_CAPTURE_MS, request.deadlineMs));
+  const budgetMs = Math.max(0, Math.min(HANG_CAPTURE_MS, request.deadlineMs, request.expiresAtMs - startedAtMs));
   const endsAtMs = startedAtMs + budgetMs;
   const controller = new AbortController();
   const lines = [
@@ -85,6 +85,11 @@ export function captureHangDiagnostics(
     request.signal?.addEventListener('abort', cancelled, { once: true });
     if (request.signal?.aborted) {
       cancelled();
+      return;
+    }
+    if (budgetMs === 0) {
+      lines.push('Capture incomplete: the pre-expiry window already ended or has no budget; no probe started.');
+      finish('incomplete');
       return;
     }
     const probe = async (name: string, file: string, args: readonly string[], limitMs: number) => {
