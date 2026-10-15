@@ -3497,13 +3497,30 @@ fn real_apfs_a_template_mint_releases_every_leftover_staging_attachment() {
     assert_eq!(staging, Vec::<PathBuf>::new());
 }
 
-/// Release the owner's real attachment before cowshed can open its raw volume, then let a
-/// foreign image reuse that volume name. The owner must refuse without another attach or fsck.
+/// Release the owner's real attachment before cowshed can open its raw volume, then attach a
+/// foreign image, so the owner's recorded volume spelling names the foreign volume. The owner must
+/// refuse without another attach or fsck.
+///
+/// The kernel does not promise to hand the freed BSD unit to the next attach: on a shared host
+/// another attach can take it first, or the foreign image can land on a lower free unit. So the
+/// reuse is made exact here rather than hoped for: once the owner is gone, opening the owner's
+/// recorded raw volume opens the foreign replacement's real raw volume, a live descriptor on
+/// foreign media, which is what a recycled spelling hands the pin. Everything else stays the
+/// kernel's: the attachments, the inventory the identity proof reads, the mount table.
 struct EjectAfterAttach {
     owned: PathBuf,
     foreign: PathBuf,
     ejected: AtomicUsize,
     fscks: AtomicUsize,
+    /// The owner's recorded raw volume and the foreign replacement's, once the owner is ejected.
+    reused: Mutex<Option<(PathBuf, PathBuf)>>,
+    /// How many times the owner's recorded raw volume was opened onto the foreign volume.
+    pinned_foreign: AtomicUsize,
+}
+
+/// The raw device node of a `/dev/diskN[sM]` block device.
+fn raw_device(device: &str) -> PathBuf {
+    PathBuf::from(device.replacen("/dev/disk", "/dev/rdisk", 1))
 }
 
 impl CommandRunner for EjectAfterAttach {
@@ -3561,11 +3578,10 @@ impl CommandRunner for EjectAfterAttach {
                 .existing_attachment(&self.foreign)
                 .expect("exact current replacement mapping")
                 .expect("the recorded foreign image is attached");
-            assert_eq!(
-                replacement.volume_device(),
-                owned.volume_device(),
-                "the foreign fixture must actually reuse the owner's former volume name"
-            );
+            *self.reused.lock().expect("reused spelling") = Some((
+                raw_device(owned.volume_device()),
+                raw_device(replacement.volume_device()),
+            ));
         }
         Ok(output)
     }
@@ -3575,7 +3591,13 @@ impl CommandRunner for EjectAfterAttach {
     }
 
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
-        SystemCommandRunner.pin_raw_device(device)
+        match &*self.reused.lock().expect("reused spelling") {
+            Some((recorded, foreign)) if device == recorded => {
+                self.pinned_foreign.fetch_add(1, Ordering::SeqCst);
+                SystemCommandRunner.pin_raw_device(foreign)
+            }
+            _ => SystemCommandRunner.pin_raw_device(device),
+        }
     }
 
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
@@ -3599,6 +3621,8 @@ fn real_apfs_lost_attachment_refuses_without_verifying_foreign_volume() {
         foreign: foreign.clone(),
         ejected: AtomicUsize::new(0),
         fscks: AtomicUsize::new(0),
+        reused: Mutex::new(None),
+        pinned_foreign: AtomicUsize::new(0),
     });
     let refusal = backend
         .attach_verified(&owned)
@@ -3608,6 +3632,11 @@ fn real_apfs_lost_attachment_refuses_without_verifying_foreign_volume() {
         "lost attachment must retain its exact-image ownership refusal: {refusal}"
     );
     assert_eq!(backend.runner().ejected.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        backend.runner().pinned_foreign.load(Ordering::SeqCst),
+        1,
+        "the pin must have opened the foreign volume the reused spelling names"
+    );
     assert_eq!(backend.runner().fscks.load(Ordering::SeqCst), 0);
     assert!(
         !attached(&owned),
