@@ -742,14 +742,15 @@ export class RamTempVolume {
    */
   async reap(lease: RamTempLease): Promise<Result<string[], RamTempError>> {
     try {
-      if ((await readdir(lease.directory)).length === 0) {
+      const entries = await readdir(lease.directory).catch((error: unknown) => {
+        if (errorCode(error) === 'ENOENT') return [];
+        throw error;
+      });
+      if (entries.length === 0) {
         return { ok: true, value: [] };
       }
       return { ok: true, value: await this.processes.stopWorkingIn(lease.directory) };
     } catch (error) {
-      if (errorCode(error) === 'ENOENT') {
-        return { ok: true, value: [] };
-      }
       return failed('reap', errorText(error));
     }
   }
