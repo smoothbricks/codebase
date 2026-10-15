@@ -20,6 +20,7 @@ mod platform;
 mod proxy;
 mod repo_mirror;
 mod sim_broker;
+mod task_server;
 mod telemetry;
 mod tls;
 
@@ -72,3 +73,5 @@ pub use sim_broker::{
     SimProjectConfig, SimRequest, SimResult, SimRunner,
 };
 pub use telemetry::{ArrowAuditConfig, ArrowAuditSink};
+
+pub use task_server::{LeasePlaces, TaskServerLimits};
