@@ -5646,6 +5646,9 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
 /// How long a shed must go unused before its keeper stops the daemon it keeps.
 const NX_IDLE: Duration = Duration::from_secs(5 * 60);
 
+/// How often a shed's keeper looks for a client at work.
+const NX_LOOK: Duration = Duration::from_secs(30);
+
 /// The daemon a start job leaves, as Nx leaves one: a running process its record names, whose
 /// socket accepts. The process stands in for the daemon and is `sleep`, which a `SIGTERM` ends.
 /// The socket is served, as Nx's daemon serves its own: a listener nobody accepts from refuses
@@ -5806,7 +5809,14 @@ async fn a_shed_keeps_its_nx_daemon_while_a_job_runs() {
 }
 
 /// A host shell's Nx run is no job of the supervisor's, but it holds a task database open while
-/// its tasks run, so a shed whose gate runs from a host shell is not idle.
+/// its tasks run, so a shed whose gate runs from a host shell is not idle: the keeper's looks
+/// find the client and restart the idle interval, so the daemon outlives the interval that began
+/// when it came up.
+///
+/// The client lets go before the keeper first tries to stop the daemon, an interval after it came
+/// up. That attempt looks for holders itself and refuses to stop a daemon whose database is held,
+/// so a client still holding then would keep the daemon whether or not the periodic looks counted
+/// it: only a client that is gone by then tells the two apart.
 #[tokio::test(start_paused = true)]
 async fn a_shed_keeps_its_nx_daemon_while_a_client_holds_a_task_database() {
     let (_h, mut daemon, project, _root) = shed_with_live_nx_daemon("pika").await;
@@ -5814,14 +5824,17 @@ async fn a_shed_keeps_its_nx_daemon_while_a_client_holds_a_task_database() {
     let database = project.join(".nx/workspace-data/task-v3.db");
     std::fs::write(&database, b"").unwrap();
     let client = std::fs::File::open(&database).unwrap();
-    tokio::time::sleep(NX_IDLE * 2).await;
-    assert!(daemon.running(), "a client at work keeps the daemon");
-
-    // The last look that found the client was up to a look interval before it ended.
+    // Held for most of the interval the daemon came up with, and let go before it is over.
+    tokio::time::sleep(NX_IDLE - NX_LOOK).await;
     drop(client);
-    tokio::time::sleep(NX_IDLE - Duration::from_secs(60)).await;
+
+    // The daemon was first found live at the keeper's first probe. Unless something restarts its
+    // interval it is stopped one interval later, at about 305 s, when the client is long gone. A
+    // keeper that counts the client stops it one interval after the last look that found the
+    // client, up to a look interval before the client let go: at about 545 s.
+    tokio::time::sleep(NX_LOOK * 5).await;
     assert!(daemon.running(), "the interval starts when the client ends");
-    tokio::time::sleep(Duration::from_secs(120)).await;
+    tokio::time::sleep(NX_LOOK * 6).await;
     assert!(!daemon.running(), "the daemon stops once the shed is idle");
 }
 
