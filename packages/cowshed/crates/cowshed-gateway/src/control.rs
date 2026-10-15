@@ -20,8 +20,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use cowshed_gateway_types::{
     CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
-    EgressMode, HostPattern, JOBSERVER_OP, LeaseClass, LeaseState, MirrorRoute, PhaseShare,
-    TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus, WorkspaceCa,
+    EgressMode, HostPattern, JOBSERVER_OP, LeaseState, MirrorRoute, PhaseShare, WorkspaceCa,
     WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
@@ -336,13 +335,6 @@ enum ControlRequest {
     },
     /// The host CPU budget's ledger.
     CpuBudget,
-    /// One unit's terminal outcome: the fact its dependents read.
-    TaskTerminal {
-        unit: String,
-        outcome: TaskOutcome,
-    },
-    /// The task server's queue.
-    TaskQueue,
 }
 
 /// A request as the control socket reads it: a one-shot [`ControlRequest`] answered and closed,
@@ -364,20 +356,6 @@ enum Incoming {
         checkout: String,
         command: String,
     },
-    TaskAdmit {
-        unit: String,
-        owner: String,
-        incarnation: Option<String>,
-        deps: Vec<String>,
-        leases: Vec<LeaseClass>,
-        want: usize,
-        priority: u32,
-        urgent: bool,
-        class: TaskClass,
-        cost: Option<u64>,
-        deadline: Option<u64>,
-        command: String,
-    },
 }
 
 /// A `disk-lease` request's fields. Its keys are checked against the operation's allowed set
@@ -396,33 +374,6 @@ struct DiskLeaseIn {
 struct CpuTokensIn {
     want: NonZeroUsize,
     checkout: String,
-    command: String,
-}
-
-/// A `task-admit` request's fields, read the way [`CpuTokensIn`] is. A unit with no `want` asks
-/// for no CPU; `deadline` is an absolute cache-domain deadline in epoch milliseconds.
-#[derive(Deserialize)]
-struct TaskAdmitIn {
-    unit: String,
-    owner: String,
-    #[serde(default)]
-    incarnation: Option<String>,
-    #[serde(default)]
-    deps: Vec<String>,
-    #[serde(default)]
-    leases: Vec<LeaseClass>,
-    #[serde(default)]
-    want: usize,
-    #[serde(default)]
-    priority: u32,
-    #[serde(default)]
-    urgent: bool,
-    #[serde(default)]
-    class: TaskClass,
-    #[serde(default)]
-    cost: Option<u64>,
-    #[serde(default)]
-    deadline: Option<u64>,
     command: String,
 }
 
@@ -461,12 +412,6 @@ struct ControlResponse {
     fifo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_budget: Option<CpuBudgetStatus>,
-    /// What a selected task-server unit runs under.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    task_grant: Option<TaskGrant>,
-    /// The task server's queue fold.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    task_queue: Option<TaskQueueStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -710,7 +655,6 @@ pub(crate) struct ControlServices {
     pub startup: Option<Arc<dyn StartupProbe>>,
     pub disk_leases: DiskLeases,
     pub cpu_budget: CpuBudget,
-    pub task_server: crate::task_server::TaskServer,
     pub jobserver: crate::jobserver::JobserverFifos,
 }
 
@@ -739,7 +683,6 @@ impl fmt::Debug for ControlServices {
             .field("startup", &self.startup)
             .field("disk_leases", &self.disk_leases)
             .field("cpu_budget", &self.cpu_budget)
-            .field("task_server", &self.task_server)
             .finish()
     }
 }
@@ -885,52 +828,6 @@ async fn serve<R, W>(
                     .cpu_budget
                     .ask(Arc::from(checkout), want, Claim::new(&command, pid));
             hold_jobserver(reader, writer, stake, granted, services.jobserver.clone()).await;
-        }
-        Ok(Incoming::TaskAdmit {
-            unit,
-            owner,
-            incarnation,
-            deps,
-            leases,
-            want,
-            priority,
-            urgent,
-            class,
-            cost,
-            deadline,
-            command,
-        }) => {
-            let facts = crate::task_server::TaskFacts {
-                unit: Arc::from(unit),
-                owner: Arc::from(owner),
-                incarnation: incarnation.map(Arc::from),
-                deps: deps.into_iter().map(Arc::from).collect(),
-                leases,
-                want,
-                priority,
-                urgent,
-                class,
-                cost,
-                deadline,
-                command: Arc::from(command),
-                pid,
-            };
-            let (tenure, granted) = services.task_server.ask(facts);
-            hold(
-                reader,
-                writer,
-                tenure,
-                granted,
-                |answer| match answer {
-                    Ok(grant) => ControlResponse {
-                        task_grant: Some(grant),
-                        ..lease(LeaseState::Granted)
-                    },
-                    Err(refusal) => failure(ControlFailureCode::Rejected, refusal.to_string()),
-                },
-                "task scheduler",
-            )
-            .await;
         }
         Ok(Incoming::Request(request)) => {
             let request = expect_eof(&mut reader).await.map(|()| request);
@@ -1083,23 +980,6 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "sim-list" => &["op", "repoId"],
         "sim-boot" => &["op", "repoId", "device"],
         "cpu-budget" => &["op"],
-        "task-terminal" => &["op", "unit", "outcome"],
-        "task-queue" => &["op"],
-        TASK_ADMIT_OP => &[
-            "op",
-            "unit",
-            "owner",
-            "incarnation",
-            "deps",
-            "leases",
-            "want",
-            "priority",
-            "urgent",
-            "class",
-            "cost",
-            "deadline",
-            "command",
-        ],
         DISK_LEASE_OP => &["op", "class", "share", "command"],
         CPU_TOKENS_OP => &["op", "want", "checkout", "command"],
         JOBSERVER_OP => &["op", "want", "checkout", "command"],
@@ -1151,48 +1031,6 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 checkout,
                 command,
             }
-        });
-    }
-    if op == TASK_ADMIT_OP {
-        let TaskAdmitIn {
-            unit,
-            owner,
-            incarnation,
-            deps,
-            leases,
-            want,
-            priority,
-            urgent,
-            class,
-            cost,
-            deadline,
-            command,
-        } = serde_json::from_value(value).map_err(encoding)?;
-        for named in [&unit, &owner] {
-            if named.is_empty() || named.len() > MAX_CHECKOUT {
-                return Err(ControlError::Encoding(format!(
-                    "a task-admit unit and owner must name 1 to {MAX_CHECKOUT} bytes"
-                )));
-            }
-        }
-        if deps.len() > 64 {
-            return Err(ControlError::Encoding(
-                "a task-admit request may declare at most 64 dependencies".to_owned(),
-            ));
-        }
-        return Ok(Incoming::TaskAdmit {
-            unit,
-            owner,
-            incarnation,
-            deps,
-            leases,
-            want,
-            priority,
-            urgent,
-            class,
-            cost,
-            deadline,
-            command,
         });
     }
     serde_json::from_value(value)
@@ -1388,26 +1226,6 @@ async fn dispatch(
             },
             None,
         ),
-        ControlRequest::TaskTerminal { unit, outcome } => (
-            match services.task_server.terminal(&unit, outcome).await {
-                Ok(()) => success(),
-                Err(refusal) => failure(ControlFailureCode::NotAdmitted, refusal.to_string()),
-            },
-            None,
-        ),
-        ControlRequest::TaskQueue => (
-            match services.task_server.queue().await {
-                Some(queue) => ControlResponse {
-                    task_queue: Some(queue),
-                    ..success()
-                },
-                None => failure(
-                    ControlFailureCode::Rejected,
-                    "the gateway's task scheduler has stopped".to_owned(),
-                ),
-            },
-            None,
-        ),
     }
 }
 
@@ -1516,8 +1334,6 @@ fn success() -> ControlResponse {
         tokens: None,
         fifo: None,
         cpu_budget: None,
-        task_grant: None,
-        task_queue: None,
     }
 }
 
