@@ -597,6 +597,24 @@ pub enum StorageGcReason {
     /// visible file gc names and keeps.
     OrphanMountpoint,
     ExpiredCheckpoint,
+    /// A `<ws>-<tip>.bundle` file in `sessions/.trash/`: the recovery bundle `rm --abandon`
+    /// verifies and writes there before retiring unlanded work. It is the only copy of the
+    /// commits main does not contain, so it becomes a candidate only under a sweep that
+    /// explicitly authorizes reclaiming them (`StorageGcOptions::abandoned_bundles`) and is
+    /// never reclaimed by a default one.
+    AbandonedBundle,
+}
+
+/// What one sweep is authorized to reclaim beyond the categories that are always garbage.
+///
+/// A plan records the options it was made under, so `execute_gc` re-enumerates the same sweep
+/// an operator asked for, and a plan built under different options is stale like any other
+/// difference between the planned and the observed store.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageGcOptions {
+    /// Also reclaim the project trash's abandon bundles — the `sessions/.trash/<ws>-<tip>.bundle`
+    /// files that are the only copy of the commits their removal abandoned. Never a default.
+    pub abandoned_bundles: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -643,6 +661,7 @@ impl StorageGcCandidate {
 pub struct StorageGcPlan {
     repo: RepoId,
     observed_at: std::time::SystemTime,
+    options: StorageGcOptions,
     candidates: Vec<StorageGcCandidate>,
     lock_paths: Vec<PathBuf>,
     examined: usize,
@@ -705,6 +724,7 @@ impl StorageGcPlan {
     pub(crate) fn new(
         repo: RepoId,
         observed_at: std::time::SystemTime,
+        options: StorageGcOptions,
         candidates: Vec<StorageGcCandidate>,
         lock_paths: Vec<PathBuf>,
         examined: usize,
@@ -714,6 +734,7 @@ impl StorageGcPlan {
         Self {
             repo,
             observed_at,
+            options,
             candidates,
             lock_paths,
             examined,
@@ -726,6 +747,7 @@ impl StorageGcPlan {
         Self::new(
             repo,
             std::time::SystemTime::UNIX_EPOCH,
+            StorageGcOptions::default(),
             Vec::new(),
             Vec::new(),
             0,
@@ -740,6 +762,11 @@ impl StorageGcPlan {
 
     pub const fn observed_at(&self) -> std::time::SystemTime {
         self.observed_at
+    }
+
+    /// What this sweep was authorized to reclaim beyond the always-safe categories.
+    pub const fn options(&self) -> StorageGcOptions {
+        self.options
     }
 
     pub fn candidates(&self) -> &[StorageGcCandidate] {
@@ -1053,6 +1080,10 @@ pub trait Substrate: LifecyclePlanner {
         workspace: &LifecycleWorkspace,
     ) -> Result<DefragmentOutcome, Self::Error>;
     async fn stats(&self, workspace: &LifecycleWorkspace) -> Result<SubstrateStats, Self::Error>;
-    async fn preview_gc(&self, repo: &RepoId) -> Result<StorageGcPlan, Self::Error>;
+    async fn preview_gc(
+        &self,
+        repo: &RepoId,
+        options: StorageGcOptions,
+    ) -> Result<StorageGcPlan, Self::Error>;
     async fn execute_gc(&self, plan: StorageGcPlan) -> Result<StorageGcReport, Self::Error>;
 }

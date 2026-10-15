@@ -33,9 +33,10 @@ use cowshed_core::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, Labelled, MarkerExpectation,
     MetadataPolicy,
 };
+use cowshed_core::storage::deletion_log::DELETION_LOG_FILE;
 use cowshed_core::storage::lifecycle::{
     LifecycleFact, LifecycleWorkspace, OperationIdentity, Pin, RetiredRef, Revision,
-    StorageGcReason, derive_workspaces,
+    StorageGcOptions, StorageGcReason, derive_workspaces,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
 use cowshed_core::workspace_credentials::mint_workspace_credentials;
@@ -751,7 +752,7 @@ fn execute_gc<R>(
 where
     R: CommandRunner + Send + Sync + 'static,
 {
-    let plan = host.preview_gc(config, &repo())?;
+    let plan = host.preview_gc(config, &repo(), StorageGcOptions::default())?;
     host.execute_gc(config, plan)
 }
 
@@ -1180,6 +1181,113 @@ fn gc_sweeps_around_an_unpublished_clone_without_deleting_it() {
     );
 }
 
+/// The abandon bundles `rm --abandon` keeps in the trash are the only copy of the commits that
+/// removal gave up, so a sweep reclaims them only when it is asked to: without the option they
+/// are not candidates and survive a run, with it they are named at their real allocated bytes
+/// and reclaimed, and a bundle that appeared after the preview makes the plan stale instead of
+/// being swept by a plan that never named it.
+#[test]
+fn gc_reclaims_abandon_bundles_only_under_the_abandoned_sweep() {
+    let fixture = Fixture::new("abandon-bundles");
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    let project = layout.project().project_root.clone();
+    let trash = layout.project().sessions.join(".trash");
+    std::fs::create_dir_all(&trash).expect("trash");
+    let bundle = trash.join("raven-0123456789abcdef0123456789abcdef01234567.bundle");
+    std::fs::write(&bundle, vec![b'x'; 512 * 1024]).expect("bundle");
+    // The name `git bundle create` stages under is not a bundle: hidden, `.partial`, and not the
+    // terminal name a removal renames into place.
+    let partial = trash.join(".raven-0123456789abcdef0123456789abcdef01234567.bundle.0f.partial");
+    std::fs::write(&partial, b"half-written").expect("staged bundle");
+    let host = native_host(&fixture, RecordingRunner::default());
+    let config = fixture.config();
+
+    let default_plan = host
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
+        .expect("default preview");
+    assert!(
+        !default_plan
+            .candidates()
+            .iter()
+            .any(|candidate| matches!(candidate.reason(), StorageGcReason::AbandonedBundle)),
+        "a plain sweep never names an abandon bundle: {default_plan:?}"
+    );
+    let report = host.execute_gc(&config, default_plan).expect("plain sweep");
+    assert_eq!(report.freed_bytes, 0, "a plain sweep frees nothing here");
+    assert!(
+        bundle.exists(),
+        "a plain gc leaves the abandoned commits fetchable"
+    );
+
+    let plan = host
+        .preview_gc(
+            &config,
+            &repo(),
+            StorageGcOptions {
+                abandoned_bundles: true,
+            },
+        )
+        .expect("abandoned preview");
+    let candidate = plan
+        .candidates()
+        .iter()
+        .find(|candidate| candidate.reason() == StorageGcReason::AbandonedBundle)
+        .expect("the bundle is a candidate");
+    assert_eq!(candidate.path(), bundle.as_path());
+    assert_eq!(
+        candidate.bytes(),
+        512 * 1024,
+        "the candidate reports the bundle's allocated bytes"
+    );
+
+    // A bundle another removal wrote after the preview is a change to the store the plan names,
+    // so the unchanged-plan rule refuses rather than sweeping around it.
+    let appeared = trash.join("heron-fedcba9876543210fedcba9876543210fedcba98.bundle");
+    std::fs::write(&appeared, b"another abandonment").expect("late bundle");
+    let error = host
+        .execute_gc(&config, plan)
+        .expect_err("a bundle that appeared makes the plan stale");
+    assert!(matches!(error, ApfsStorageError::GcPlanStale));
+    assert!(
+        bundle.exists() && appeared.exists(),
+        "a stale plan reclaims nothing"
+    );
+    std::fs::remove_file(&appeared).expect("retract the late bundle");
+
+    let plan = host
+        .preview_gc(
+            &config,
+            &repo(),
+            StorageGcOptions {
+                abandoned_bundles: true,
+            },
+        )
+        .expect("abandoned preview");
+    let expected = plan
+        .candidates()
+        .iter()
+        .find(|candidate| candidate.reason() == StorageGcReason::AbandonedBundle)
+        .expect("the bundle is a candidate")
+        .bytes();
+    let report = host.execute_gc(&config, plan).expect("abandoned sweep");
+    assert_eq!(report.reclaimed, 1, "the bundle is the only candidate");
+    assert_eq!(
+        report.freed_bytes, expected,
+        "the report names the bytes the bundle held"
+    );
+    assert!(!bundle.exists(), "the abandoned commits are reclaimed");
+    assert!(
+        partial.exists() && !appeared.exists(),
+        "only the bundle the plan named was reclaimed"
+    );
+    let log = std::fs::read_to_string(project.join(DELETION_LOG_FILE)).expect("deletion log");
+    assert!(
+        log.contains("remove-abandoned-bundle")
+            && log.contains(bundle.to_str().expect("bundle path")),
+        "the reclaim is journaled like every other deletion: {log}"
+    );
+}
+
 /// A store written when images could also be SPARSE: `main.sparseimage` and a session's
 /// `x.sparseimage`, each beside a sidecar that names `"imageFormat":"sparse"`. Every image is
 /// `<name>.dmg` now, so store-wide scans never read those files: recovery, listing and GC
@@ -1231,7 +1339,7 @@ fn sparse_images_and_their_sidecars_are_invisible_to_recovery_listing_and_gc() {
     assert_eq!(facts.len(), 1, "only main.dmg is a workspace");
     assert!(facts[0].workspace.name().is_main());
     let plan = host
-        .preview_gc(&config, &repo())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("GC does not read a SPARSE sidecar");
     assert!(
         plan.candidates().is_empty(),
@@ -1291,7 +1399,9 @@ fn listing_skips_sidecarless_session_images_that_gc_names_and_reclaims() {
             .any(|fact| fact.workspace.name().as_str() == "published")
     );
 
-    let plan = host.preview_gc(&config, &repo()).expect("orphan plan");
+    let plan = host
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
+        .expect("orphan plan");
     assert!(
         plan.candidates().iter().any(|candidate| {
             candidate.path() == orphan_raw.as_path()
@@ -1331,7 +1441,7 @@ fn malformed_session_sidecar_is_not_treated_as_a_missing_sidecar_orphan() {
         "a present malformed grants sidecar keeps its integrity refusal"
     );
     let plan = host
-        .preview_gc(&fixture.config(), &repo())
+        .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
         .expect("the malformed image is not an orphan candidate");
     assert!(
         !plan
@@ -1397,7 +1507,9 @@ fn real_apfs_gc_reports_item_local_deferrals_and_reclaims_later_session_images()
 
     let config = fixture.config();
     let host = fixture.host();
-    let plan = host.preview_gc(&config, &repo()).expect("GC plan");
+    let plan = host
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
+        .expect("GC plan");
     assert!(plan.candidates().iter().any(|candidate| {
         candidate.path() == mounted_image.as_path()
             && candidate.reason() == StorageGcReason::OrphanSessionImage
@@ -1488,7 +1600,9 @@ fn gc_defers_an_unreadable_inventory_and_reclaims_later_candidates() {
         SystemKernelMountSource,
     )
     .expect("native APFS host");
-    let plan = host.preview_gc(&config, &repo()).expect("GC plan");
+    let plan = host
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
+        .expect("GC plan");
 
     let report = host
         .execute_gc(&config, plan)
@@ -1518,7 +1632,9 @@ fn gc_stale_orphan_image_identity_preserves_same_size_replacement() {
     std::fs::write(&later, b"fixture").expect("later orphan image");
     let config = fixture.config();
     let host = native_host(&fixture, RecordingRunner::default());
-    let plan = host.preview_gc(&config, &repo()).expect("GC plan");
+    let plan = host
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
+        .expect("GC plan");
     let original = std::fs::metadata(&image).expect("original metadata");
 
     let replacement = layout.project().sessions.join(".replacement");
@@ -1923,9 +2039,11 @@ fn checkpoint_gc_reclaims_only_expired_automatic_regular_files_and_sidecars() {
         8
     );
 
-    let plan = restarted.preview_gc(&config, &repo()).expect("GC preview");
+    let plan = restarted
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
+        .expect("GC preview");
     let repeated = restarted
-        .preview_gc(&config, &repo())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("repeated preview");
     assert_eq!(plan.candidates().len(), 1);
     assert_eq!(
@@ -1981,7 +2099,7 @@ fn checkpoint_gc_reclaims_only_expired_automatic_regular_files_and_sidecars() {
         )
         .expect("restore automatic pin");
     let plan = restarted
-        .preview_gc(&config, &repo())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("fresh preview");
     let report = restarted.execute_gc(&config, plan).expect("checkpoint gc");
     assert_eq!(report.examined, 8);
@@ -2156,7 +2274,7 @@ fn gc_preview_and_reclaim_of_a_retired_workspace_never_read_its_checkpoint_image
     }
 
     let plan = host
-        .preview_gc(&config, &repo())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("a preview over sparse checkpoint images reads none of them");
     let retired = plan
         .candidates()
@@ -2271,7 +2389,7 @@ fn gc_collects_each_stranded_retirement_while_a_live_workspace_reuses_the_name()
     });
 
     let plan = host
-        .preview_gc(&config, &repo())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("a reused name does not block its stranded retirements");
     let retired = plan
         .candidates()
@@ -2341,7 +2459,7 @@ fn gc_reclaims_a_retired_image_whose_sidecar_is_already_gone() {
     std::fs::remove_file(sidecar_path(&unrecorded)).expect("delete the sidecar by hand");
 
     let plan = host
-        .preview_gc(&config, &repo())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("a sidecarless retired image does not fail the preview");
     let retired = plan
         .candidates()
@@ -2473,7 +2591,7 @@ fn retired_gc_revalidates_stale_plans_and_resumes_from_sidecar_authority() {
         .expect("logical retirement");
 
     let stale_plan = host
-        .preview_gc(&config, &repo())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("retired GC preview");
     assert_eq!(stale_plan.candidates().len(), 1);
     assert_eq!(
@@ -2509,7 +2627,7 @@ fn retired_gc_revalidates_stale_plans_and_resumes_from_sidecar_authority() {
 
     let restarted = native_host(&fixture, RecordingRunner::default());
     let plan = restarted
-        .preview_gc(&config, &repo())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("sidecar resumes retired cleanup");
     assert_eq!(plan.candidates().len(), 1);
     assert_eq!(plan.retained_pinned(), 0);
@@ -2552,7 +2670,10 @@ fn malformed_foreign_orphan_checkpoint_is_rejected_without_cleanup_authority() {
     .expect("write foreign fact");
 
     assert!(host.checkpoints(&repo()).is_err());
-    assert!(host.preview_gc(&config, &repo()).is_err());
+    assert!(
+        host.preview_gc(&config, &repo(), StorageGcOptions::default())
+            .is_err()
+    );
     assert!(checkpoint.exists(), "malformed orphan was deleted");
     assert!(sidecar_path(&checkpoint).exists());
     assert!(checkpoint_fact_path(&checkpoint).exists());
@@ -4055,7 +4176,9 @@ fn a_keyless_staged_session_image_is_left_to_gc_instead_of_failing_every_verb() 
         .collect::<Vec<_>>();
     assert_eq!(listed, vec![live], "the live sibling stays enumerable");
 
-    let plan = host.preview_gc(&fixture.config(), &repo()).expect("plan");
+    let plan = host
+        .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
+        .expect("plan");
     let orphans = plan
         .candidates()
         .iter()
@@ -4141,7 +4264,9 @@ fn gc_reclaims_unowned_staging_pairs_and_keeps_a_recoverable_publication() {
         .expect("canonical sidecar of a sidecar-first publication whose rename never ran");
 
     let host = native_host(&fixture, RecordingRunner::default());
-    let plan = host.preview_gc(&fixture.config(), &repo()).expect("plan");
+    let plan = host
+        .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
+        .expect("plan");
     assert_eq!(
         plan.retained_active(),
         1,
@@ -4202,7 +4327,9 @@ fn real_apfs_gc_retires_orphaned_staging_mountpoints_and_detaches_the_ones_still
         .expect("owner lock")
         .expect("blocking owner lock");
 
-    let plan = host.preview_gc(&fixture.config(), &repo()).expect("plan");
+    let plan = host
+        .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
+        .expect("plan");
     let reasons: Vec<_> = plan
         .candidates()
         .iter()
@@ -5545,7 +5672,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
         let work = bare.join(other);
         std::fs::write(&work, b"unique late work").expect("late work");
         let error = host
-            .preview_gc(&fixture.config(), &repo())
+            .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
             .expect_err("mixed entries are not root-held-only");
         assert!(
             error.to_string().contains("mixed with other entries"),
@@ -5569,7 +5696,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
         .expect("mount foreign volume");
     mounts.wait_for(&bare, Mounted);
     let error = host
-        .preview_gc(&fixture.config(), &repo())
+        .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
         .expect_err("a mounted filesystem is never retained aside");
     assert!(error.to_string().contains("mounted filesystem"), "{error}");
     assert!(
@@ -5579,7 +5706,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     unmount(&bare);
     mounts.wait_for(&bare, Unmounted);
     let plan = host
-        .preview_gc(&fixture.config(), &repo())
+        .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
         .expect("root-held event debris must not block a read-only GC preview");
     assert!(bare.exists(), "preview must not rename the bare mountpoint");
     assert_eq!(
@@ -5605,7 +5732,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     unmount(&bare);
     mounts.wait_for(&bare, Unmounted);
     let plan = host
-        .preview_gc(&fixture.config(), &repo())
+        .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
         .expect("fresh unmounted plan");
     let report = host
         .execute_gc(&fixture.config(), plan)

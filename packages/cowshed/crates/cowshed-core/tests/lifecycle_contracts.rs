@@ -283,7 +283,11 @@ impl Substrate for ContractSubstrate {
         }
     }
 
-    async fn preview_gc(&self, repo: &RepoId) -> Result<StorageGcPlan, Self::Error> {
+    async fn preview_gc(
+        &self,
+        repo: &RepoId,
+        _: StorageGcOptions,
+    ) -> Result<StorageGcPlan, Self::Error> {
         Ok(StorageGcPlan::empty(repo.clone()))
     }
 

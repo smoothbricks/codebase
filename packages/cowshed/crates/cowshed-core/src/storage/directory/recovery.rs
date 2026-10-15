@@ -27,7 +27,7 @@ use crate::repository::{
 };
 use crate::storage::apfs::native::{
     CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire, QuarantineTombstone,
-    RESTORE_RECOVERY_FACT_VERSION, RestoreRecoveryFactWire, checkpoint_fact_path,
+    RESTORE_RECOVERY_FACT_VERSION, RestoreRecoveryFactWire, abandon_bundles, checkpoint_fact_path,
     collect_project_directories, collect_restore_sidecars, directory_children,
     gc_candidate_failure_is_fatal, grants_sidecar_missing, image_from_sidecar, io_error,
     metadata_workspace_ref, path_exists, regular_file_children, restore_recovery_fact_path,
@@ -39,8 +39,8 @@ use crate::storage::apfs::{
 };
 use crate::storage::deletion_log::{self, DeletionKind, DeletionOp};
 use crate::storage::lifecycle::{
-    RetiredRef, Revision, StorageGcCandidate, StorageGcDeferred, StorageGcPlan, StorageGcReason,
-    StorageGcReport, StorageGcRetained,
+    RetiredRef, Revision, StorageGcCandidate, StorageGcDeferred, StorageGcOptions, StorageGcPlan,
+    StorageGcReason, StorageGcReport, StorageGcRetained,
 };
 use crate::storage::recovery::{STAGING_NAMESPACE, TRASH_NAMESPACE};
 use crate::storage::{CheckpointLabel, PRE_RESTORE_PREFIX, WORKSPACE_MARKER_PATH};
@@ -1174,6 +1174,7 @@ impl DirectoryExecutionHost {
         repo: &RepoId,
         observed_at: SystemTime,
         held_locks: &[PathBuf],
+        options: StorageGcOptions,
     ) -> Result<StorageGcPlan, ApfsStorageError> {
         let mut candidates = Vec::new();
         let mut lock_paths = Vec::new();
@@ -1224,6 +1225,21 @@ impl DirectoryExecutionHost {
                 &associated,
                 &[],
             )?);
+        }
+
+        // The abandon bundles share the trash with retired payloads but are not payloads, and
+        // each is the only copy of the commits its removal abandoned. Only a sweep explicitly
+        // authorized for them names them; a plain `gc` leaves them to the operator.
+        if options.abandoned_bundles {
+            for bundle in abandon_bundles(&sessions.join(TRASH_NAMESPACE))? {
+                checked_increment(&mut examined)?;
+                candidates.push(gc_candidate(
+                    StorageGcReason::AbandonedBundle,
+                    &bundle,
+                    std::slice::from_ref(&bundle),
+                    &[],
+                )?);
+            }
         }
 
         // Session payloads with no grants sidecar: never published, nothing names them.
@@ -1416,6 +1432,7 @@ impl DirectoryExecutionHost {
         Ok(StorageGcPlan::new(
             repo.clone(),
             observed_at,
+            options,
             candidates,
             lock_paths,
             examined,
@@ -1432,8 +1449,13 @@ impl DirectoryExecutionHost {
         let _guard =
             acquire_image_locks(&self.config.store_root, plan.lock_paths(), LockMode::Try)?
                 .ok_or(ApfsStorageError::GcPlanStale)?;
-        let current =
-            self.preview_gc_project(project, plan.repo(), plan.observed_at(), plan.lock_paths())?;
+        let current = self.preview_gc_project(
+            project,
+            plan.repo(),
+            plan.observed_at(),
+            plan.lock_paths(),
+            plan.options(),
+        )?;
         if current != plan {
             return Err(ApfsStorageError::GcPlanStale);
         }
@@ -1488,6 +1510,19 @@ impl DirectoryExecutionHost {
                             sync_parent_path(path)
                         })
                 }
+                StorageGcReason::AbandonedBundle => fs::remove_file(path)
+                    .map_err(|error| io_error("remove abandon bundle", path, error))
+                    .and_then(|()| {
+                        deletion_log::log_deletion(
+                            project,
+                            DeletionOp::RemoveAbandonedBundle,
+                            DeletionKind::Other,
+                            "",
+                            None,
+                            path,
+                        );
+                        sync_parent_path(path)
+                    }),
                 StorageGcReason::OrphanMountpoint => Err(ApfsStorageError::InvalidPlan(
                     "directory store plans never name orphan mountpoints",
                 )),

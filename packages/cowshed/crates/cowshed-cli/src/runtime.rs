@@ -1685,6 +1685,7 @@ where
             let report = service
                 .gc(GcOptions {
                     dry_run: args.dry_run,
+                    abandoned: args.abandoned,
                 })
                 .await?;
             for deferred in &report.deferred {
@@ -1831,7 +1832,12 @@ where
                     .map_err(output_error)?;
             }
             if args.repair {
-                let swept = service.gc(GcOptions { dry_run: false }).await?;
+                let swept = service
+                    .gc(GcOptions {
+                        dry_run: false,
+                        abandoned: false,
+                    })
+                    .await?;
                 output
                     .guidance(&format!(
                         "repair examined {} objects; reclaimed {}, {} bytes freed, {} retained for a running operation",
@@ -3011,6 +3017,9 @@ const fn gc_reason(reason: GcReason) -> &'static str {
         GcReason::OrphanSessionImage => "orphaned session image without metadata",
         GcReason::OrphanMountpoint => "orphaned mountpoint",
         GcReason::ExpiredCheckpoint => "expired checkpoint",
+        GcReason::AbandonedBundle => {
+            "abandon bundle, the only copy of commits main does not contain"
+        }
         GcReason::UnlinkedBuildVolume => "build volume no checkout links",
         GcReason::SupersededSeed => "seed superseded by its target's latest, or its target retired",
         GcReason::UnrecordedBuildVolume => {

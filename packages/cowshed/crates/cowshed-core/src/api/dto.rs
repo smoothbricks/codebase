@@ -817,6 +817,10 @@ pub enum GcReason {
     OrphanSessionImage,
     OrphanMountpoint,
     ExpiredCheckpoint,
+    /// The `<ws>-<tip>.bundle` recovery bundle `rm --abandon` keeps in `sessions/.trash/`: the
+    /// only copy of the commits that removal abandoned. A candidate only under a sweep that
+    /// explicitly authorizes it (`GcOptions.abandoned`).
+    AbandonedBundle,
     /// A build volume no checkout links (16_build_volumes.md, "Garbage collection").
     UnlinkedBuildVolume,
     /// A seed that is not its target's latest, or whose target retired.
@@ -2790,6 +2794,9 @@ pub struct RemoveOptions {
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct GcOptions {
     pub dry_run: bool,
+    /// Also reclaim the project trash's abandon bundles — `sessions/.trash/<ws>-<tip>.bundle`,
+    /// the only copy of the commits `rm --abandon` gave up (02_workspaces.md). Never implied.
+    pub abandoned: bool,
 }
 
 /// Authorization for removing a whole adopted project (`Coordinator::remove_project`). `force` and

@@ -10501,14 +10501,19 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     }
 
     async fn gc(&mut self, options: GcOptions) -> Result<GcReport> {
-        use crate::storage::lifecycle::{StorageGcReason, Substrate};
+        use crate::storage::lifecycle::{StorageGcOptions, StorageGcReason, Substrate};
 
         self.validate_binding().await?;
         self.retire_abandoned_pending_workspaces(options.dry_run)
             .await?;
         let plan = self
             .substrate
-            .preview_gc(&self.descriptor.repo_id)
+            .preview_gc(
+                &self.descriptor.repo_id,
+                StorageGcOptions {
+                    abandoned_bundles: options.abandoned,
+                },
+            )
             .await
             .map_err(native_storage_error)?;
         let candidates = plan
@@ -10540,6 +10545,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     StorageGcReason::ExpiredCheckpoint => {
                         crate::api::dto::GcReason::ExpiredCheckpoint
                     }
+                    StorageGcReason::AbandonedBundle => crate::api::dto::GcReason::AbandonedBundle,
                 },
             })
             .collect::<Vec<_>>();
@@ -11961,7 +11967,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // second scan that could disagree with the command that forwarded to it. A preview that
         // cannot be taken at all is itself the finding — reporting a healthy host while `gc` refuses
         // leaves the operator with no next move.
-        match self.substrate.preview_gc(&self.descriptor.repo_id).await {
+        match self
+            .substrate
+            .preview_gc(
+                &self.descriptor.repo_id,
+                crate::storage::lifecycle::StorageGcOptions::default(),
+            )
+            .await
+        {
             Ok(plan) => {
                 findings.extend(plan.root_held_mountpoints().iter().map(root_held_finding));
                 let orphaned = plan

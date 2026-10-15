@@ -43,8 +43,8 @@ use super::super::deletion_log::{self, DeletionKind, DeletionOp};
 use super::super::lifecycle::{
     CheckpointFact, DefragmentOutcome, KernelMountFact, LifecycleFact, LifecycleWorkspace,
     OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision, RootHeldMountpoint, StorageFact,
-    StorageGcCandidate, StorageGcDeferred, StorageGcPlan, StorageGcReason, StorageGcReport,
-    StorageGcRetained, SubstrateStats,
+    StorageGcCandidate, StorageGcDeferred, StorageGcOptions, StorageGcPlan, StorageGcReason,
+    StorageGcReport, StorageGcRetained, SubstrateStats,
 };
 use super::super::{
     CheckpointLabel, WORKSPACE_MARKER_PATH, discover_session_images, verify_no_symlinks,
@@ -383,6 +383,7 @@ fn gc_reason_tag(reason: StorageGcReason) -> &'static [u8] {
         StorageGcReason::OrphanSessionImage => b"orphan-session-image",
         StorageGcReason::OrphanMountpoint => b"orphan-mountpoint",
         StorageGcReason::ExpiredCheckpoint => b"expired-checkpoint",
+        StorageGcReason::AbandonedBundle => b"abandoned-bundle",
     }
 }
 pub(in crate::storage) fn gc_candidate_failure_is_fatal(error: &ApfsStorageError) -> bool {
@@ -736,6 +737,23 @@ pub(in crate::storage) fn regular_file_children(
     directory: &Path,
 ) -> Result<Vec<PathBuf>, ApfsStorageError> {
     typed_children(directory, |file_type| file_type.is_file())
+}
+
+/// Every abandon bundle directly in a project's trash, sorted by path: a regular file the
+/// removal wrote as `<ws>-<tip>.bundle` before retiring unlanded work (02_workspaces.md,
+/// "`cowshed rm <ws>`"). Nothing else in the trash is one, whatever its contents, and the
+/// reclamation of these is the one thing a sweep has to be given authority for.
+pub(in crate::storage) fn abandon_bundles(trash: &Path) -> Result<Vec<PathBuf>, ApfsStorageError> {
+    let mut bundles = regular_file_children(trash)?
+        .into_iter()
+        .filter(|path| {
+            path.extension().is_some_and(|extension| {
+                extension == crate::storage::recovery::ABANDON_BUNDLE_EXTENSION
+            })
+        })
+        .collect::<Vec<_>>();
+    bundles.sort();
+    Ok(bundles)
 }
 
 /// True when a directory has no entries. Errors propagate: callers only invoke this on
@@ -2545,6 +2563,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         repo: &RepoId,
         observed_at: std::time::SystemTime,
         held_locks: &[PathBuf],
+        options: StorageGcOptions,
     ) -> Result<StorageGcPlan, ApfsStorageError>
     where
         R: CommandRunner + Send + Sync + 'static,
@@ -2639,6 +2658,23 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 &artifacts,
                 &[],
             )?);
+        }
+        // The abandon bundles live in the same trash as the retired images but are not images,
+        // and each is the only copy of the commits its removal abandoned. They become
+        // candidates only for a sweep explicitly authorized for them: a plain `gc` leaves them
+        // for the operator to fetch or delete.
+        if options.abandoned_bundles {
+            for bundle in abandon_bundles(&trash)? {
+                examined = examined
+                    .checked_add(1)
+                    .ok_or(ApfsStorageError::InvalidPlan("GC examined count overflow"))?;
+                candidates.push(gc_candidate(
+                    StorageGcReason::AbandonedBundle,
+                    &bundle,
+                    std::slice::from_ref(&bundle),
+                    &[],
+                )?);
+            }
         }
         for image in &session_entries {
             let Some(workspace) = session_image_workspace(image) else {
@@ -3032,6 +3068,7 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         Ok(StorageGcPlan::new(
             repo.clone(),
             observed_at,
+            options,
             candidates,
             lock_paths,
             examined,
@@ -3104,8 +3141,13 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         let _guard =
             acquire_image_locks(&self.config.store_root, plan.lock_paths(), LockMode::Try)?
                 .ok_or(ApfsStorageError::GcPlanStale)?;
-        let current =
-            self.preview_gc_project(project, plan.repo(), plan.observed_at(), plan.lock_paths())?;
+        let current = self.preview_gc_project(
+            project,
+            plan.repo(),
+            plan.observed_at(),
+            plan.lock_paths(),
+            plan.options(),
+        )?;
         if current != plan {
             return Err(ApfsStorageError::GcPlanStale);
         }
@@ -3376,6 +3418,40 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                     }
                     StorageGcReason::ExpiredCheckpoint => {
                         self.reclaim_image(candidate.path())?;
+                        report.freed_bytes =
+                            report.freed_bytes.checked_add(candidate.bytes()).ok_or(
+                                ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
+                            )?;
+                    }
+                    StorageGcReason::AbandonedBundle => {
+                        match fs::symlink_metadata(candidate.path()) {
+                            Ok(metadata) if metadata.file_type().is_file() => {}
+                            Ok(_) => {
+                                return Err(ApfsStorageError::Host(
+                                    "abandon bundle is no longer a regular file".to_owned(),
+                                ));
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                            Err(error) => {
+                                return Err(io_error(
+                                    "inspect abandon bundle",
+                                    candidate.path(),
+                                    error,
+                                ));
+                            }
+                        }
+                        fs::remove_file(candidate.path()).map_err(|error| {
+                            io_error("remove abandon bundle", candidate.path(), error)
+                        })?;
+                        deletion_log::log_deletion(
+                            project,
+                            DeletionOp::RemoveAbandonedBundle,
+                            DeletionKind::Other,
+                            "",
+                            None,
+                            candidate.path(),
+                        );
+                        sync_parent_path(candidate.path())?;
                         report.freed_bytes =
                             report.freed_bytes.checked_add(candidate.bytes()).ok_or(
                                 ApfsStorageError::InvalidPlan("GC freed byte accounting overflow"),
@@ -6172,6 +6248,7 @@ where
         &self,
         config: &ApfsSubstrateConfig,
         repo: &RepoId,
+        options: StorageGcOptions,
     ) -> Result<StorageGcPlan, ApfsStorageError> {
         if config.store_root != self.config.store_root {
             return Err(ApfsStorageError::InvalidPlan(
@@ -6179,7 +6256,7 @@ where
             ));
         }
         let project = layout(config, repo)?.project().project_root.clone();
-        self.preview_gc_project(&project, repo, std::time::SystemTime::now(), &[])
+        self.preview_gc_project(&project, repo, std::time::SystemTime::now(), &[], options)
     }
 
     fn execute_gc(
@@ -6669,7 +6746,9 @@ mod tests {
         fs::write(retained, b"retained source evidence").unwrap();
         let config = ApfsSubstrateConfig::new(fixture.store(), &fixture.checkout);
         let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone()).unwrap();
-        let before = host.preview_gc(&config, &repo).unwrap();
+        let before = host
+            .preview_gc(&config, &repo, StorageGcOptions::default())
+            .unwrap();
         for mount in source.staging_mounts() {
             assert!(before.candidates().iter().any(|candidate| {
                 candidate.reason() == StorageGcReason::OrphanStagingMount
@@ -6694,7 +6773,9 @@ mod tests {
         }
         let unrelated = staging.join("readopt-unrecorded-main");
         fs::create_dir_all(&unrelated).unwrap();
-        let protected = host.preview_gc(&config, &repo).unwrap();
+        let protected = host
+            .preview_gc(&config, &repo, StorageGcOptions::default())
+            .unwrap();
         for mount in source.staging_mounts() {
             assert!(
                 protected
@@ -6723,7 +6804,9 @@ mod tests {
             )
         })
         .unwrap();
-        let completed = host.preview_gc(&config, &repo).unwrap();
+        let completed = host
+            .preview_gc(&config, &repo, StorageGcOptions::default())
+            .unwrap();
         for mount in source.staging_mounts() {
             assert!(completed.candidates().iter().any(|candidate| {
                 candidate.reason() == StorageGcReason::OrphanStagingMount

@@ -21,8 +21,8 @@ use super::lifecycle::{
     ImmutablePlan, KernelMountFact, LifecycleBackend, LifecycleFact, LifecyclePlanner,
     LifecycleReceipt, LifecycleWorkspace, MountIntent, MountState, Operation, OperationIdentity,
     Pin, PlanError, PurePlanner, ResizeOutcome, RestoreMode, RestorePlan, RestoreReceipt,
-    RetirePlan, RetiredRef, Revision, StorageFact, StorageGcPlan, StorageGcReport, Substrate,
-    SubstrateStats, execute_checked, revalidate,
+    RetirePlan, RetiredRef, Revision, StorageFact, StorageGcOptions, StorageGcPlan,
+    StorageGcReport, Substrate, SubstrateStats, execute_checked, revalidate,
 };
 use super::{CheckpointLabel, PRE_RESTORE_PREFIX, StorageLayout, StorageLayoutError};
 
@@ -710,6 +710,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         &self,
         config: &ApfsSubstrateConfig,
         repo: &RepoId,
+        options: StorageGcOptions,
     ) -> Result<StorageGcPlan, ApfsStorageError>;
     fn execute_gc(
         &self,
@@ -1981,9 +1982,13 @@ where
         .await
     }
 
-    async fn preview_gc(&self, repo: &RepoId) -> Result<StorageGcPlan, Self::Error> {
+    async fn preview_gc(
+        &self,
+        repo: &RepoId,
+        options: StorageGcOptions,
+    ) -> Result<StorageGcPlan, Self::Error> {
         let repo = repo.clone();
-        self.dispatch_read(move |host, config| host.preview_gc(&config, &repo))
+        self.dispatch_read(move |host, config| host.preview_gc(&config, &repo, options))
             .await
     }
 

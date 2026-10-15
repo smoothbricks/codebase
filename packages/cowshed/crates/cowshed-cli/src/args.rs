@@ -454,6 +454,7 @@ pub struct RekeyArgs {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcArgs {
     pub dry_run: bool,
+    pub abandoned: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -810,7 +811,7 @@ fn cli_command() -> ClapCommand {
         )
         .subcommand(leaf("defrag").arg(positional("workspace", 0..=1)))
         .subcommand(leaf("rekey").arg(positional("workspace", 0..=1)))
-        .subcommand(leaf("gc").arg(flag("dry-run")))
+        .subcommand(leaf("gc").args([flag("dry-run"), flag("abandoned")]))
         .subcommand(leaf("push").arg(positional("workspace", 0..=1)).args([
             value("branch"),
             value("expected-workspace-incarnation"),
@@ -2668,24 +2669,32 @@ const GC: CommandSpec = CommandSpec {
     trailing: "",
     summary: "free storage",
     about: &[
-        "Reclaims six kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedPinned`, `retainedActive` and `freedBytes`. `rm`, `land`, and `restore` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
-        "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars, checkpoints and empty mountpoint. Retirement already ran the containment gate, so these commits are in main or were deliberately abandoned. Safe. Note what is *not* in this category: the `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are never reclaimed, so abandoned commits stay fetchable and their disk use accumulates until you delete them yourself.",
+        "Reclaims seven kinds of garbage in the project selected by the cwd or `--project`, and reports `examined`, `reclaimed`, `retainedPinned`, `retainedActive` and `freedBytes`. Six of them need no flag; the seventh, `abandonedBundle`, is only ever collected under `--abandoned`. `rm`, `land`, and `restore` run it opportunistically, so most of the time it finds nothing left to do. Every category below is named in the `reason` field of each candidate, and `--dry-run` prints the candidates without touching them — run that first if you want to know what a run would cost you.",
+        "`retiredWorkspace` — the image of a workspace already retired by `rm` or `land --retire`, sitting in `sessions/.trash/` with its sidecars, checkpoints and empty mountpoint. Retirement already ran the containment gate, so these commits are in main or were deliberately abandoned. Safe. The `<ws>-<tip>.bundle` files `rm --abandon` writes into the same trash directory are *not* this category and are never reclaimed without `--abandoned`: they are the only copy of the commits that removal gave up, so they stay fetchable and their disk use accumulates until you reclaim them with `--abandoned` or delete them yourself.",
         "`orphanStagingImage` and `orphanStagingMetadata` — a staged image, with or without its grants sidecar, or a sidecar with no image, under the project's `.staging/` in the store. Each is a lifecycle transaction — create, fork, restore — that died between writing the image and publishing it. The one sign a transaction is still running is its workspace lifecycle lock: an entry whose lock is held is retained and counted in `retainedActive`; an entry whose lock is free was never published under a workspace name, so nothing uses it. Safe.",
         "`orphanStagingMount` — a mountpoint under the mount root's `.staging/` whose image is gone or was never published: an empty directory, or a volume an interrupted operation left attached. Attached volumes are detached before the directory goes, so an orphan that held tens of gigabytes stops charging for them. Safe; the same lock rule retains a mountpoint an operation still owns.",
         "`expiredCheckpoint` — an automatic checkpoint that is neither one of the five most recent for its workspace nor younger than fourteen days. This is the category that can delete something you still want: an automatic checkpoint is a real crash-consistent copy of that workspace, and past those two thresholds it goes. Pinned checkpoints are never candidates, and `cowshed checkpoint --keep` or any explicitly labelled checkpoint is pinned; `retainedPinned` in the report counts what was spared for that reason.",
         "`orphanMountpoint` — a directory under the project's mount root that is no workspace's mountpoint: nothing is mounted at it and no image or retirement names it. Hidden files and files the project ignores are what late writers left after a volume went away, and go with the directory; any other file stops the removal and is named, so you move or delete it yourself.",
+        "`abandonedBundle` — under `--abandoned` only, the `<ws>-<tip>.bundle` files in `sessions/.trash/` that `rm --abandon` verified and left behind: each is the only copy of the commits main does not contain, which is why no plain `gc` ever names one. Reclaiming them is final — fetch the bundle into a repository you keep (`git fetch <path> <tip>`) before you ask for this. `--dry-run --abandoned` lists them with their real allocated bytes first.",
         "A bare mountpoint whose only entry is root's `0700` `.fseventsd` is retained aside by an atomic, same-parent `.root-held-<uuid>` rename instead of deleting privileged debris. A mounted filesystem, symlink substitution, rename collision or another entry (hidden included) is never overwritten or moved. The retained log is named with a quoted privileged cleanup hint in `deferred`; it does not fail collection or make doctor unhealthy. Dry-run and doctor report it as information without renaming.",
         "Also collects build volumes no checkout links and superseded seeds. A running job's shared hold or an unfinished create/fork in the lifecycle intent journal defers release; otherwise a refused unforced unmount gets bounded grace, then is forced if needed, naming each initial holder's pid and command. Both gc and opportunistic collection in rm/land say why they skip volumes, and one failed release does not hide later candidates. Dry-run reports these reasons without changing any mount or image.",
     ],
-    options: &[Opt {
-        spelling: "--dry-run",
-        meaning: "report every candidate with its path, byte count, and reason, and delete nothing",
-    }],
+    options: &[
+        Opt {
+            spelling: "--dry-run",
+            meaning: "report every candidate with its path, byte count, and reason, and delete nothing",
+        },
+        Opt {
+            spelling: "--abandoned",
+            meaning: "also reclaim the `sessions/.trash/<ws>-<tip>.bundle` files `rm --abandon` kept — the only copy of the commits those removals gave up, so they are reclaimed only when you ask",
+        },
+    ],
 };
 
 fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
     Ok(Command::Gc(GcArgs {
         dry_run: flagged(matches, "dry-run"),
+        abandoned: flagged(matches, "abandoned"),
     }))
 }
 

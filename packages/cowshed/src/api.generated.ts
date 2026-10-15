@@ -682,6 +682,11 @@ export type GcDeferred = {
 
 export type GcOptions = {
   readonly dryRun?: boolean;
+  /**
+   * Also reclaim the project trash's abandon bundles — `sessions/.trash/<ws>-<tip>.bundle`,
+   * the only copy of the commits `rm --abandon` gave up (02_workspaces.md). Never implied.
+   */
+  readonly abandoned?: boolean;
 };
 
 export type GcReason =
@@ -692,6 +697,7 @@ export type GcReason =
   | 'orphanSessionImage'
   | 'orphanMountpoint'
   | 'expiredCheckpoint'
+  | 'abandonedBundle'
   | 'unlinkedBuildVolume'
   | 'supersededSeed'
   | 'unrecordedBuildVolume';

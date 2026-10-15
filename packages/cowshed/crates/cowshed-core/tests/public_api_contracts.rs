@@ -877,8 +877,19 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         json!({"label":"before-write","keep":true})
     );
     assert_eq!(
-        serde_json::to_value(GcOptions { dry_run: true }).unwrap(),
-        json!({"dryRun":true})
+        serde_json::to_value(GcOptions {
+            dry_run: true,
+            abandoned: false,
+        })
+        .unwrap(),
+        json!({"dryRun":true,"abandoned":false})
+    );
+    assert_eq!(
+        serde_json::from_value::<GcOptions>(json!({"abandoned":true})).unwrap(),
+        GcOptions {
+            dry_run: false,
+            abandoned: true,
+        }
     );
 
     assert_eq!(

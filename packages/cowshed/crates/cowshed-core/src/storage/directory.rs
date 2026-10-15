@@ -66,8 +66,8 @@ use super::apfs::{
 };
 use super::lifecycle::{
     CheckpointFact, DefragmentOutcome, KernelMountFact, LifecycleFact, LifecycleWorkspace,
-    OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcPlan,
-    StorageGcReport, SubstrateStats,
+    OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcOptions,
+    StorageGcPlan, StorageGcReport, SubstrateStats,
 };
 use super::{
     CheckpointLabel, PRE_RESTORE_PREFIX, WORKSPACE_MARKER_PATH, discover_session_images,
@@ -2365,6 +2365,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         &self,
         config: &ApfsSubstrateConfig,
         repo: &RepoId,
+        options: StorageGcOptions,
     ) -> Result<StorageGcPlan, ApfsStorageError> {
         if config.store_root != self.config.store_root {
             return Err(ApfsStorageError::InvalidPlan(
@@ -2372,7 +2373,7 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             ));
         }
         let project = layout(config, repo)?.project().project_root.clone();
-        self.preview_gc_project(&project, repo, std::time::SystemTime::now(), &[])
+        self.preview_gc_project(&project, repo, std::time::SystemTime::now(), &[], options)
     }
 
     fn execute_gc(
