@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'bun:test';
+import { join } from 'node:path';
 import type { ReleasePackageInfo } from '../core.js';
 import { releasePackagesAtRef } from '../index.js';
-import { git, tag, withFixtureRepo, writePackage } from './helpers/fixture-repo.js';
+import { git, gitOutput, tag, withFixtureRepo, writePackage } from './helpers/fixture-repo.js';
 
 const a: ReleasePackageInfo = { name: '@scope/a', projectName: 'a', path: 'packages/a', version: '1.0.0' };
 const b: ReleasePackageInfo = { name: '@scope/b', projectName: 'b', path: 'packages/b', version: '1.0.0' };
@@ -26,6 +27,7 @@ describe('release packages at a ref', () => {
       await git(root, ['commit', '-m', 'chore(release): publish']);
 
       expect(await gitTagsAt(root)).toEqual([]);
+      await expect(gitTagsAt(join(root, 'missing-repository'))).rejects.toThrow();
       await expect(releasePackagesAtRef(root, [a, b], 'HEAD')).resolves.toEqual([{ ...a, version: '1.0.0' }]);
     });
   });
@@ -74,9 +76,7 @@ describe('release packages at a ref', () => {
 });
 
 async function gitTagsAt(root: string): Promise<string[]> {
-  const result = await Bun.$`git tag --points-at HEAD`.cwd(root).quiet().nothrow();
-  return result.stdout
-    .toString()
+  return (await gitOutput(root, ['tag', '--points-at', 'HEAD']))
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
