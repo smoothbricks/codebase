@@ -6,7 +6,7 @@ import { publishFixtureSocketDirectory } from '@smoothbricks/nx-plugin/testing';
 import { mergeEnv } from '../../lib/run.js';
 import type { ReleasePackageInfo } from '../core.js';
 import { releasePackagesAtRef } from '../index.js';
-import { git, tag, withFixtureRepo } from './helpers/fixture-repo.js';
+import { fixtureNxEnv, git, tag, withFixtureRepo } from './helpers/fixture-repo.js';
 
 const REPOSITORY = 'https://github.com/example/version-root.git';
 const a: ReleasePackageInfo = { name: '@scope/a', projectName: 'a', path: 'packages/a', version: '1.0.0' };
@@ -81,6 +81,26 @@ describe('release version against a workspace root named through another path', 
   });
 });
 
+describe('release version graph diagnostics', () => {
+  it('prints the graph plugin cause when the real Nx release child fails', async () => {
+    await withFixtureRepo(async (root) => {
+      await writeReleaseWorkspace(root, ['./broken-graph.mjs']);
+      const cause = 'SB_FORCED_GRAPH_FAILURE: broken graph fixture';
+      await writeFile(
+        join(root, 'broken-graph.mjs'),
+        `export const createNodesV2 = ['**/package.json', async () => { throw new Error(${JSON.stringify(cause)}); }];\n`,
+      );
+      await git(root, ['add', '-A']);
+      await git(root, ['commit', '-m', 'chore: fixture workspace']);
+      const env = fixtureNxEnv(root, { daemon: false }, await publishFixtureSocketDirectory(root));
+
+      await expect(
+        smoo(root, env, ['release', 'version', '--bump', 'patch', '--projects', 'all', '--dry-run', 'false']),
+      ).rejects.toThrow(cause);
+    });
+  });
+});
+
 async function smoo(cwd: string, env: Record<string, string>, args: string[]): Promise<void> {
   const child = Bun.spawn(['bun', SMOO, ...args], { cwd, env, stdout: 'pipe', stderr: 'pipe' });
   const [stdout, stderr, exitCode] = await Promise.all([
@@ -93,7 +113,7 @@ async function smoo(cwd: string, env: Record<string, string>, args: string[]): P
   }
 }
 
-async function writeReleaseWorkspace(root: string): Promise<void> {
+async function writeReleaseWorkspace(root: string, plugins?: string[]): Promise<void> {
   await writeFile(join(root, '.gitignore'), 'node_modules\n.nx\n');
   await writeJson(join(root, 'package.json'), {
     name: '@scope/source',
@@ -103,6 +123,7 @@ async function writeReleaseWorkspace(root: string): Promise<void> {
     repository: { type: 'git', url: REPOSITORY },
   });
   await writeJson(join(root, 'nx.json'), {
+    plugins,
     release: {
       projects: ['tag:npm:public'],
       projectsRelationship: 'independent',

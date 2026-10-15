@@ -885,7 +885,7 @@ async function runNxReleaseVersion(
  * top level git reports from the child's cwd, so the relative path is empty.
  */
 async function runNxRelease(root: string, args: string[]): Promise<void> {
-  await run('nx', ['release', ...args], root, { NX_WORKSPACE_ROOT_PATH: root });
+  await run('nx', ['release', ...args, '--verbose'], root, { NX_WORKSPACE_ROOT_PATH: root });
 }
 
 async function runNxReleaseVersionPreview(root: string, projects: string, bump: string): Promise<ReleasePackage[]> {

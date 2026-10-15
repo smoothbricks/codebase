@@ -285,6 +285,9 @@ root git reports, never to an inherited `NX_WORKSPACE_ROOT_PATH`. Nx reads each 
 otherwise hide every commit's files from the real run and version nothing the dry run planned; with the daemon on, a
 daemon started under one spelling also refuses clients that use the other.
 
+Spawned Nx release commands always pass `--verbose`, so a failed project graph prints Nx's underlying plugin error and
+stack trace before smoo reports the child exit status. Diagnostics never retry versioning or change its mutation flags.
+
 ## Nx Conventions
 
 `smoo` keeps Nx target names predictable and separates tool work from aggregate workflows.
