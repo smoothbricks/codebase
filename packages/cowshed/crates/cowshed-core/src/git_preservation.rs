@@ -1490,10 +1490,13 @@ mod tests {
         repository.git(&["commit", "-qm", "filtered"]);
         // A populated submodule with a filtered README. Its clone is made before any driver is
         // configured, so checkout never runs one. The README is seven bytes, as are the bytes
-        // planted over it below.
+        // planted over it below. Its driver, `subenc`, is named by the submodule's own config
+        // alone: the overrides the filter-free status derives name the superproject's drivers, and
+        // a driver of the same name would be neutralised in the submodule's child status too,
+        // because git hands those overrides on to it.
         let submodule_source = Repository::committed(&[
             ("README", "second\n"),
-            (".gitattributes", "README filter=enc\n"),
+            (".gitattributes", "README filter=subenc\n"),
         ]);
         repository.git(&[
             "-c",
@@ -1517,22 +1520,16 @@ mod tests {
         repository.git(&["config", "filter.enc.clean", driver.as_str()]);
         repository.git(&["config", "filter.enc.process", driver.as_str()]);
         repository.git(&["config", "filter.enc.required", "true"]);
-        // The submodule runs the same failing drivers from its own config, which no probe may run.
-        repository.git(&[
-            "-C",
-            "subdir",
-            "config",
-            "filter.enc.clean",
-            driver.as_str(),
-        ]);
-        repository.git(&[
-            "-C",
-            "subdir",
-            "config",
-            "filter.enc.process",
-            driver.as_str(),
-        ]);
-        repository.git(&["-C", "subdir", "config", "filter.enc.required", "true"]);
+        // The submodule's driver is out of reach of the overrides, so only leaving its worktree
+        // unstatused keeps it from running.
+        for (key, value) in [
+            ("clean", driver.as_str()),
+            ("process", driver.as_str()),
+            ("required", "true"),
+        ] {
+            let name = format!("filter.subenc.{key}");
+            repository.git(&["-C", "subdir", "config", name.as_str(), value]);
+        }
         // Same-size bytes with a new modification time force a child status to hash the file, so
         // an ordinary superproject status would run the submodule's driver.
         let submodule_readme = repository.root.join("subdir/README");
