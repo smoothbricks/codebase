@@ -25,13 +25,22 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Raw Git preservation**: independent real-repository witnesses cover top-level byte drift, submodule bytes and HEAD
   drift, and copy-only paths. Each witness proves configured filters would run under ordinary Git but never during
   capture or copy verification, verifies restored bytes again, and checks both repositories' config/index bytes remain
-  unchanged. Each is an ordinary test that finishes well inside the ordinary 30s slow warning, so the run's progress
-  bound sees it finish; they are not one aggregate of hundreds of serial Git probes. Staging uses the production tree
-  copier, not a fixed host executable path. Allocation-only comparison cases supply distinct loose-size probe
-  observations while retaining the other real Git evidence and fsck refusal; they never require compression or sparse
-  writeback to change the host filesystem's allocated-block count. Companion-retention table rows share one captured
-  real-Git source and reset their disposable project tree per row; every refusal still compares the whole project tree,
-  and every converged row retains its unchanged-replay oracle.
+  unchanged. Each planted refusal names the step that owns it: the one component of the live comparison, the path the
+  raw byte comparison reports, or the path set. A refusal for another reason fails the witness, so no verification
+  between plants is needed to attribute one: each plant's bytes and modification time are asserted back in place, and
+  the copy verifies once more after the last plant. A same-size `.git/description` change, which no Git probe reads, is
+  the plant only the `.git` tree comparison can refuse. A byte plant over a filtered file matches neither the raw bytes
+  nor the blob its clean filter stored, so no racily clean index entry can turn the byte refusal into a live-status one.
+  The dirty submodule's clean driver is named by the submodule's own config alone: the filter-free status overrides the
+  superproject's drivers through environment variables that Git also hands to a submodule's child status, so a driver of
+  the same name would never run even from a status that descended into the submodule, and the marker would prove
+  nothing. Each is an ordinary test that finishes well inside the ordinary 30s slow warning, so the run's progress bound
+  sees it finish; they are not one aggregate of hundreds of serial Git probes. Staging uses the production tree copier,
+  not a fixed host executable path. Allocation-only comparison cases supply distinct loose-size probe observations while
+  retaining the other real Git evidence and fsck refusal; they never require compression or sparse writeback to change
+  the host filesystem's allocated-block count. Companion-retention table rows share one captured real-Git source and
+  reset their disposable project tree per row; every refusal still compares the whole project tree, and every converged
+  row retains its unchanged-replay oracle.
 - **Grant files**: schema round-trip, revision monotonicity, delta application, wildcard egress matching
   (`*.github.com`), port defaults.
 - **Marker files**: round-trip, unknown-version rejection, role transitions (fork/restore).
@@ -776,7 +785,12 @@ The fork tests run from main and from a session with a tracked edit and a nonign
 preserves both on `cowshed/<ws>` without changing the source branch or status. `--clean` removes both; `--ref <commit>`
 implies clean and selects that exact commit. Ignored dependencies and build state remain warm in every case.
 Linked-worktree carry preserves working-tree edits and untracked files, not staged-only state. `new` is rejected as a
-fork argument, and the API rejects a ref with `clean: false`.
+fork argument, and the API rejects a ref with `clean: false`. Main moves past the named baseline in every fork fixture,
+so a mint that ignores the ref fails its ref cell instead of passing because the baseline is the source's HEAD, and the
+clean and ref cells assert the selected commit's files as well as its HEAD. A standalone mint reads its source only for
+its links and identity, so from main only its carry cell runs; its clean and ref cells would repeat the session
+fixture's. A linked-worktree mint from main runs all three, since it replaces the clone's `.git` directory by a
+registration.
 
 ### APFS / Seatbelt (macOS)
 
