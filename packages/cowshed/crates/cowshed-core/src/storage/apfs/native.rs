@@ -1193,15 +1193,9 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         attachment: &AttachedImage,
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
-        if self
-            .mount_source
-            .mounts()?
-            .iter()
-            .any(|mount| mount.source_device == attachment.volume_device())
-        {
-            self.backend.unmount_verified(attachment, intent)?;
-        }
-        Ok(())
+        self.backend
+            .unmount_verified(attachment, intent)
+            .map_err(Into::into)
     }
 
     fn detach_attachment(
@@ -1225,14 +1219,8 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
         intent: DetachIntent,
     ) -> Result<(), ApfsStorageError> {
         self.verify_controller_path(image)?;
-        let mounted: std::collections::BTreeSet<String> = self
-            .mount_source
-            .mounts()?
-            .into_iter()
-            .map(|mount| mount.source_device)
-            .collect();
         self.backend
-            .release_image(image, &mounted, intent)
+            .release_image(image, intent)
             .map_err(Into::into)
     }
 
@@ -7512,6 +7500,13 @@ mod tests {
         image: PathBuf,
         commands: std::sync::Mutex<Vec<cowshed_apfs::CommandRequest>>,
         mounted: std::sync::Mutex<std::collections::BTreeSet<String>>,
+        unmounted: std::sync::Mutex<
+            Vec<(
+                String,
+                cowshed_apfs::mounts::FilesystemId,
+                cowshed_apfs::mounts::UnmountMode,
+            )>,
+        >,
     }
 
     impl TwoVolumeImage {
@@ -7554,20 +7549,70 @@ mod tests {
                 .lock()
                 .expect("recorded commands")
                 .push(request.clone());
-            if request.program == Path::new("/usr/sbin/diskutil")
-                && request.args.first().is_some_and(|arg| arg == "unmount")
-                && let Some(device) = request.args.last().and_then(|arg| arg.to_str())
-            {
-                self.mounted.lock().expect("mounted volumes").remove(device);
-            }
             Ok(cowshed_apfs::CommandOutput::success([]))
         }
-        fn volume_is_mounted(&self, volume_device: &str) -> io::Result<bool> {
+        fn volume_mount(&self, volume_device: &str) -> io::Result<Option<KernelMountSnapshot>> {
             Ok(self
                 .mounted
                 .lock()
                 .expect("mounted volumes")
-                .contains(volume_device))
+                .contains(volume_device)
+                .then(|| {
+                    KernelMountSnapshot::new(
+                        1,
+                        self.image
+                            .parent()
+                            .unwrap()
+                            .join(volume_device.trim_start_matches('/')),
+                        volume_device,
+                        true,
+                        true,
+                    )
+                }))
+        }
+        fn hold_mount(&self, mount_point: &Path) -> io::Result<cowshed_apfs::mounts::HeldMount> {
+            let mounted = self.mounted.lock().expect("mounted volumes");
+            let device = mounted
+                .iter()
+                .find(|device| {
+                    self.image
+                        .parent()
+                        .unwrap()
+                        .join(device.trim_start_matches('/'))
+                        == mount_point
+                })
+                .expect("hold only a recorded volume's current root");
+            Ok(cowshed_apfs::mounts::HeldMount::stated(
+                device,
+                true,
+                cowshed_apfs::mounts::FilesystemId::new([7, 26]),
+            ))
+        }
+        fn unmount_guarded<E>(
+            &self,
+            mode: cowshed_apfs::mounts::UnmountMode,
+            prove: impl FnOnce() -> Result<Option<cowshed_apfs::OwnedVolumeRoot>, E>,
+        ) -> Result<cowshed_apfs::mounts::UnmountEffect, E>
+        where
+            E: From<cowshed_apfs::mounts::NativeUnmountError> + std::fmt::Display,
+        {
+            let Some(root) = prove()? else {
+                return Ok(cowshed_apfs::mounts::UnmountEffect::NoEffect);
+            };
+            self.unmounted.lock().expect("native effects").push((
+                root.volume_device().to_owned(),
+                root.filesystem_id(),
+                mode,
+            ));
+            self.mounted
+                .lock()
+                .expect("mounted volumes")
+                .remove(root.volume_device());
+            Ok(cowshed_apfs::mounts::UnmountEffect::Unmounted {
+                post_fd: cowshed_apfs::mounts::PostUnmountFd::Dead(io::Error::from_raw_os_error(
+                    libc::ENOTSUP,
+                )),
+            })
         }
         fn image_lease(
             &self,
@@ -7635,6 +7680,7 @@ mod tests {
             TwoVolumeImage {
                 image: image.clone(),
                 commands: std::sync::Mutex::new(Vec::new()),
+                unmounted: std::sync::Mutex::new(Vec::new()),
                 mounted: std::sync::Mutex::new(std::collections::BTreeSet::from([
                     "/dev/disk5s2".into()
                 ])),
@@ -7653,10 +7699,24 @@ mod tests {
             .unwrap();
         assert_eq!(
             host.backend().runner().argv(),
-            [
-                vec!["unmount".into(), "/dev/disk5s2".to_owned()],
-                vec!["detach".into(), "-verbose".into(), "/dev/disk4".into()],
-            ]
+            [vec![
+                "detach".to_owned(),
+                "-verbose".to_owned(),
+                "/dev/disk4".to_owned()
+            ]]
+        );
+        assert_eq!(
+            *host
+                .backend()
+                .runner()
+                .unmounted
+                .lock()
+                .expect("native effects"),
+            [(
+                "/dev/disk5s2".to_owned(),
+                cowshed_apfs::mounts::FilesystemId::new([7, 26]),
+                cowshed_apfs::mounts::UnmountMode::Normal
+            ),]
         );
         fs::remove_dir_all(root).unwrap();
     }

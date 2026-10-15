@@ -130,6 +130,15 @@ struct RecordingRunner {
     mounted: Arc<Mutex<std::collections::BTreeMap<PathBuf, String>>>,
     /// Every owned volume root named, as (volume device, name), in order.
     named: Arc<Mutex<Vec<(String, String)>>>,
+    unmounted: Arc<
+        Mutex<
+            Vec<(
+                String,
+                cowshed_apfs::mounts::FilesystemId,
+                cowshed_apfs::mounts::UnmountMode,
+            )>,
+        >,
+    >,
 }
 
 impl Default for RecordingRunner {
@@ -141,6 +150,7 @@ impl Default for RecordingRunner {
             inventory: FakeInventory::default(),
             mounted: Arc::default(),
             named: Arc::default(),
+            unmounted: Arc::default(),
         }
     }
 }
@@ -197,22 +207,13 @@ impl CommandRunner for RecordingRunner {
                 .insert(mount_point, request.args[2].to_string_lossy().into_owned());
             return Ok(CommandOutput::success([]));
         }
-        if (request.program == Path::new("/usr/sbin/diskutil")
+        if request.program == Path::new("/usr/bin/hdiutil")
             && request
                 .args
                 .first()
-                .is_some_and(|argument| argument == "unmount"))
-            || (request.program == Path::new("/usr/bin/hdiutil")
-                && request
-                    .args
-                    .first()
-                    .is_some_and(|argument| argument == "detach"))
+                .is_some_and(|argument| argument == "detach")
         {
-            let expected = if request.program == Path::new("/usr/sbin/diskutil") {
-                "/dev/disk10s1"
-            } else {
-                "/dev/disk9"
-            };
+            let expected = "/dev/disk9";
             assert_eq!(
                 request.args.last().and_then(|arg| arg.to_str()),
                 Some(expected)
@@ -259,19 +260,48 @@ impl CommandRunner for RecordingRunner {
             format!("the recording runner grows no image: {}", image.display()),
         ))
     }
-    fn volume_is_mounted(&self, volume_device: &str) -> std::io::Result<bool> {
+    fn volume_mount(&self, volume_device: &str) -> std::io::Result<Option<KernelMountSnapshot>> {
         Ok(self
             .mounted
             .lock()
             .expect("mounts")
-            .values()
-            .any(|device| device == volume_device))
+            .iter()
+            .find(|(_, device)| device.as_str() == volume_device)
+            .map(|(path, device)| KernelMountSnapshot::new(1, path, device, true, true)))
+    }
+    fn unmount_guarded<E>(
+        &self,
+        mode: cowshed_apfs::mounts::UnmountMode,
+        prove: impl FnOnce() -> Result<Option<cowshed_apfs::OwnedVolumeRoot>, E>,
+    ) -> Result<cowshed_apfs::mounts::UnmountEffect, E>
+    where
+        E: From<cowshed_apfs::mounts::NativeUnmountError> + std::fmt::Display,
+    {
+        let Some(root) = prove()? else {
+            return Ok(cowshed_apfs::mounts::UnmountEffect::NoEffect);
+        };
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.unmounted.lock().expect("native effects").push((
+            root.volume_device().to_owned(),
+            root.filesystem_id(),
+            mode,
+        ));
+        self.mounted
+            .lock()
+            .expect("mounts")
+            .retain(|_, device| device != root.volume_device());
+        Ok(cowshed_apfs::mounts::UnmountEffect::Unmounted {
+            post_fd: cowshed_apfs::mounts::PostUnmountFd::Dead(std::io::Error::from_raw_os_error(
+                libc::ENOTSUP,
+            )),
+        })
     }
     fn hold_mount(&self, mount_point: &Path) -> std::io::Result<cowshed_apfs::mounts::HeldMount> {
         match self.mounted.lock().expect("mounts").get(mount_point) {
             Some(device) => Ok(cowshed_apfs::mounts::HeldMount::stated(
                 device.clone(),
                 true,
+                cowshed_apfs::mounts::FilesystemId::new([7, 26]),
             )),
             None => cowshed_apfs::mounts::hold_mount(mount_point),
         }
@@ -409,18 +439,18 @@ fn fixture_cleanup_removes_a_store_root_replaced_by_a_file() {
 /// driven by the production host (real `hdiutil`/`diskutil`/`mount_apfs`, the live kernel mount
 /// table). Its attachments are detached and its tree removed when the test ends however it
 /// ends, and by the next run's sweep when it could not.
-struct RealFixture {
+pub(super) struct RealFixture {
     scratch: ScratchRoot,
 }
 
 impl RealFixture {
-    fn new(test: &str) -> Self {
+    pub(super) fn new(test: &str) -> Self {
         Self {
             scratch: ScratchRoot::new(test).expect("scratch root"),
         }
     }
 
-    fn root(&self) -> &Path {
+    pub(super) fn root(&self) -> &Path {
         self.scratch.path()
     }
 
@@ -446,7 +476,7 @@ impl RealFixture {
     /// A real one-volume RAW image at `image` (which must end `.dmg`) and nothing beside it,
     /// handed back detached: every verb that grows or replaces it next needs an image nothing
     /// holds. It is a clone of the run's blank image, not a mint of its own.
-    fn blank_image(&self, image: &Path) {
+    pub(super) fn blank_image(&self, image: &Path) {
         blank_image::blank_image(image);
     }
 
@@ -473,7 +503,7 @@ impl RealFixture {
     }
 
     /// Mount the attached `volume_device` at `mount_point` with exactly `options`.
-    fn remount(&self, volume_device: &str, mount_point: &Path, options: &str) {
+    pub(super) fn remount(&self, volume_device: &str, mount_point: &Path, options: &str) {
         std::fs::create_dir_all(mount_point).expect("mount point");
         let mounted = SystemCommandRunner
             .run(&CommandRequest::new(
@@ -518,7 +548,7 @@ fn unmount(mount: &Path) {
 }
 
 /// What the kernel mounts at `mount_point` right now, if anything.
-fn kernel_mount_at(mount_point: &Path) -> Option<KernelMountSnapshot> {
+pub(super) fn kernel_mount_at(mount_point: &Path) -> Option<KernelMountSnapshot> {
     SystemKernelMountSource
         .mounts()
         .expect("getfsstat")
@@ -538,7 +568,7 @@ fn kernel_attachments(image: &Path) -> Vec<AttachedDiskImage> {
 }
 
 /// Whether the kernel holds `image` attached right now.
-fn attached(image: &Path) -> bool {
+pub(super) fn attached(image: &Path) -> bool {
     !kernel_attachments(image).is_empty()
 }
 
@@ -3697,8 +3727,10 @@ fn real_apfs_kernel_mount_facts_survive_host_restart_and_detach_by_mountpoint() 
     assert!(
         matches!(
             &error,
-            ApfsStorageError::Apfs(ApfsError::CommandFailed { operation, .. })
-                if *operation == "unmount verified APFS volume"
+            ApfsStorageError::Apfs(ApfsError::UnmountFailed {
+                source: cowshed_apfs::mounts::NativeUnmountError::Busy(_),
+                ..
+            })
         ),
         "unexpected refusal: {error}"
     );
@@ -6121,8 +6153,10 @@ fn real_apfs_resize_and_defrag_scenario_puts_a_mounted_workspace_back_on_its_mou
     assert!(
         matches!(
             &error,
-            ApfsStorageError::Apfs(ApfsError::CommandFailed { operation, .. })
-                if *operation == "unmount verified APFS volume"
+            ApfsStorageError::Apfs(ApfsError::UnmountFailed {
+                source: cowshed_apfs::mounts::NativeUnmountError::Busy(_),
+                ..
+            })
         ),
         "unexpected refusal: {error}"
     );
@@ -6143,8 +6177,10 @@ fn real_apfs_resize_and_defrag_scenario_puts_a_mounted_workspace_back_on_its_mou
     assert!(
         matches!(
             &error,
-            ApfsStorageError::Apfs(ApfsError::CommandFailed { operation, .. })
-                if *operation == "unmount verified APFS volume"
+            ApfsStorageError::Apfs(ApfsError::UnmountFailed {
+                source: cowshed_apfs::mounts::NativeUnmountError::Busy(_),
+                ..
+            })
         ),
         "unexpected refusal: {error}"
     );
