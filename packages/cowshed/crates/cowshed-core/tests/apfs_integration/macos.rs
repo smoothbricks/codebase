@@ -292,8 +292,8 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             fs::metadata(fork_mount.join("stream.bin"))?.len(),
             u64::try_from(STREAM_MEBIBYTES * 1024 * 1024)?
         );
-        // Provisioning leaves the label the clone inherited: relabelling is a Disk Arbitration
-        // round trip the workspace's supervisor makes later, off the path that creates it.
+        // Provisioning leaves the label the clone inherited: the workspace's supervisor names
+        // the volume later, off the path that creates it.
         assert_eq!(volume_name(&fork_mount)?, BLANK_TEMPLATE_LABEL);
 
         let checkpoint_plan = substrate.plan_checkpoint(

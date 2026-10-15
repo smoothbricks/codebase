@@ -1107,11 +1107,12 @@ The volume mounts at `/Volumes/smoo-ram2-<uid>`, where DiskArbitration puts it: 
 escalates to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd
 refuses a plist from it, so a test that bootstraps a launchd job keeps the plist outside `TMPDIR`.
 
-The volume is formatted, mounted and marked as `smoo-ram2-<uid>-new`, then renamed into place, so a creator that dies
-part way never leaves an unmarked volume at `/Volumes/smoo-ram2-<uid>` for the next one to dodge as `smoo-ram2-<uid> 1`.
-Before creating, a task detaches every RAM disk of the same user and size that is mounted nowhere but those two names:
-the debris of a creator that was killed or ran into its deadline. One that still carries a lease directory, or has
-something attached below it, is named in the task's error instead.
+The volume is created under its final name, `smoo-ram2-<uid>`, and is never renamed. It is mounted and marked at a
+private staging directory, then unmounted and placed at `/Volumes/smoo-ram2-<uid>` by DiskArbitration, so a creator that
+dies part way never leaves an unmarked volume at that mountpoint for the next one to dodge as `smoo-ram2-<uid> 1`.
+Before creating, a task detaches every RAM disk of the same user and size that is mounted nowhere but at those two
+paths: the debris of a creator that was killed or ran into its deadline. One that still carries a lease directory, or
+has something attached below it, is named in the task's error instead.
 
 Every `hdiutil` and `diskutil` execution goes through `cowshed disk-command <tool> -- <args>`, including host-test
 inventory and cleanup. The cowshed is the installed one on `PATH`, which must provide this command, unless
@@ -1124,7 +1125,8 @@ with file-backed output. A caller deadline stops waiting; it never kills the dis
 detach can leak its kernel device until reboot. A still-running command retains its lease and is named in the timeout
 error. Other helpers retain their process-group deadline. A process whose lease waits are recorded
 (`COWSHED_LEASE_WAIT_RECORD`) asks for its phase `alone`; a gateway from before `alone` refuses the field at once and is
-asked shared instead, for a minute.
+asked shared instead, for a minute. Cowshed's runner refuses `diskutil rename` and `renameVolume` for every caller; the
+RAM volume is created under its final name and never renamed.
 
 `bun node_modules/@smoothbricks/nx-plugin/src/disk-command-policy.ts <repository...>` checks tracked and nonignored
 source, tests and scripts for direct disk-tool process calls. SmoothBricks runs it from `tooling:lint-disk-commands`;

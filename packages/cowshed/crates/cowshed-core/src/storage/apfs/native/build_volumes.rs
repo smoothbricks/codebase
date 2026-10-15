@@ -62,8 +62,8 @@ where
     /// caller writes the record last, once the volume holds what it should (a migration's copied
     /// build state); until then the volume is an interrupted creation, which collection deletes
     /// unless a live build link names it. The clone carries the template's label until the
-    /// checkout's supervisor names it after the checkout (16_build_volumes.md, "Substrate"):
-    /// relabelling queues on Disk Arbitration, so it never runs on a provisioning path.
+    /// checkout's supervisor names it after the checkout (16_build_volumes.md, "Substrate"): the
+    /// label is cosmetic, so naming never runs on a provisioning path.
     pub fn create_build_volume(
         &self,
         layout: &BuildVolumeLayout,

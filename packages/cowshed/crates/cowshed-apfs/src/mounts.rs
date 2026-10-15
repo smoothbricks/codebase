@@ -143,10 +143,11 @@ pub fn kernel_mounts() -> io::Result<Vec<KernelMountSnapshot>> {
 /// A directory descriptor held open on a path, and what the kernel says that descriptor is on:
 /// the device mounted there and whether the path is that mount's root. Held, it makes an unforced
 /// unmount of that filesystem fail busy, so the mount it proves stays put while it is held.
+#[derive(Debug)]
 pub struct HeldMount {
     source_device: String,
     is_root: bool,
-    _held: Option<cowshed_os::fork_lock::Fenced<std::fs::File>>,
+    held: Option<cowshed_os::fork_lock::Fenced<std::fs::File>>,
 }
 
 impl HeldMount {
@@ -155,7 +156,7 @@ impl HeldMount {
         Self {
             source_device: source_device.into(),
             is_root,
-            _held: None,
+            held: None,
         }
     }
 
@@ -167,6 +168,78 @@ impl HeldMount {
     /// Whether the held path is that filesystem's mount root, not a directory inside it.
     pub fn is_root(&self) -> bool {
         self.is_root
+    }
+
+    /// Name the volume the held descriptor lies on (`fsetattrlist`, `ATTR_VOL_NAME`). The kernel
+    /// names the mount of the descriptor's own vnode, never a path resolved again: once that
+    /// volume is unmounted, even by force, the vnode is dead and the call fails (`ENOTSUP`,
+    /// measured) rather than reaching the volume beneath. A path-based name (`setattrlist`,
+    /// Disk Arbitration's rename) has no such binding: xnu names `vp->v_mount` of whatever the
+    /// path resolves to, mount root or not, so a bare mountpoint names the host volume holding
+    /// it. Only [`crate::OwnedVolumeRoot`] calls this, once the descriptor is proven to be an
+    /// owned volume's root. A stated mount holds no descriptor and names nothing.
+    pub(crate) fn set_volume_name(&self, name: &str) -> io::Result<()> {
+        let Some(held) = self.held.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "a stated mount of {} holds no descriptor to name its volume through",
+                    self.source_device
+                ),
+            ));
+        };
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let length = u32::try_from(name.len() + 1)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "volume name too long"))?;
+            if name.as_bytes().contains(&0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "volume name contains NUL",
+                ));
+            }
+            let mut request = libc::attrlist {
+                bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+                reserved: 0,
+                commonattr: 0,
+                volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_NAME,
+                dirattr: 0,
+                fileattr: 0,
+                forkattr: 0,
+            };
+            // One attrreference_t (i32 offset from itself, u32 length with the NUL), then the
+            // name. xnu refuses a buffer that ends exactly at the name (`volname >= bufend -
+            // offset - length` is EINVAL), so the buffer keeps a word of slack past it.
+            let reference = std::mem::size_of::<libc::attrreference_t>();
+            let mut buffer = vec![0u8; reference + name.len() + 1 + 4];
+            buffer[..4].copy_from_slice(&(reference as i32).to_ne_bytes());
+            buffer[4..8].copy_from_slice(&length.to_ne_bytes());
+            buffer[reference..reference + name.len()].copy_from_slice(name.as_bytes());
+            // SAFETY: `held` owns a live descriptor, `request` names one settable volume
+            // attribute, and `buffer` is readable for the full length the kernel is told.
+            let status = unsafe {
+                libc::fsetattrlist(
+                    held.as_raw_fd(),
+                    (&raw mut request).cast(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    0,
+                )
+            };
+            if status != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (held, name);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no APFS volume is named off macOS",
+            ))
+        }
     }
 }
 
@@ -203,7 +276,7 @@ pub fn hold_mount(path: &std::path::Path) -> io::Result<HeldMount> {
         Ok(HeldMount {
             source_device,
             is_root: (here.dev(), here.ino()) == (root.dev(), root.ino()),
-            _held: Some(cowshed_os::fork_lock::Fenced::new(held)),
+            held: Some(cowshed_os::fork_lock::Fenced::new(held)),
         })
     }
     #[cfg(not(target_os = "macos"))]

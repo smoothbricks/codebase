@@ -1321,6 +1321,11 @@ when the tool does not exist on this host, 103 when an ordinary verb hit its dea
 waited for or its output could not be delivered to a reader that already left. `--json` and `--project` are usage errors
 (exit 2): ask the tool for structure (`-plist`) instead.
 
+`diskutil rename` and `renameVolume`, in any spelling, are refused before anything runs (exit 101), as they are for
+every caller of cowshed's runner: Disk Arbitration renames through the mount path it recorded, which a forced unmount
+since hands to the volume beneath, the host's Data volume for a bare mountpoint. Create a volume under its final name
+instead ([APFS ownership](../../../specs/cowshed/01a_apfs.md#ownership-identity-and-the-volume-label)).
+
 ### `cowshed gc`
 
 Deletes retired and orphaned images and stale mountpoint dirs, prunes expired checkpoints, and reports what it freed.

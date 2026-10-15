@@ -128,6 +128,8 @@ struct RecordingRunner {
     /// The fake kernel's mounts, by mountpoint, as a held mountpoint answers them. A path not
     /// listed is read from the real kernel, which answers the volume holding that directory.
     mounted: Arc<Mutex<std::collections::BTreeMap<PathBuf, String>>>,
+    /// Every owned volume root named, as (volume device, name), in order.
+    named: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl Default for RecordingRunner {
@@ -138,6 +140,7 @@ impl Default for RecordingRunner {
             volume_name: Arc::new(Mutex::new("cowshed.acme--widget.main".to_owned())),
             inventory: FakeInventory::default(),
             mounted: Arc::default(),
+            named: Arc::default(),
         }
     }
 }
@@ -272,6 +275,18 @@ impl CommandRunner for RecordingRunner {
             )),
             None => cowshed_apfs::mounts::hold_mount(mount_point),
         }
+    }
+    fn name_volume(
+        &self,
+        root: &cowshed_apfs::OwnedVolumeRoot,
+        volume_name: &str,
+    ) -> std::io::Result<()> {
+        self.named
+            .lock()
+            .expect("named")
+            .push((root.volume_device().to_owned(), volume_name.to_owned()));
+        *self.volume_name.lock().expect("volume name") = volume_name.to_owned();
+        Ok(())
     }
 }
 /// Fails the first kernel disk-image inventory read, then reports nothing attached.
@@ -2726,23 +2741,15 @@ fn attach(runner: &RecordingRunner, image: &Path) {
         .push(image.to_string_lossy().into_owned());
 }
 
-fn renames(runner: &RecordingRunner) -> Vec<CommandRequest> {
-    runner
-        .requests()
-        .into_iter()
-        .filter(|request| {
-            request
-                .args
-                .first()
-                .is_some_and(|verb| verb == "renameVolume")
-        })
-        .collect()
+/// Every volume the host named, as (volume device, name). No disk tool names a volume.
+fn renames(runner: &RecordingRunner) -> Vec<(String, String)> {
+    runner.named.lock().expect("named").clone()
 }
 
 const SLOTTED: &str = "[cowshed] fixture · intents — slotted";
 
 #[test]
-fn native_volume_rename_names_the_image_volume_device_never_its_mount_path() {
+fn native_volume_rename_names_the_image_volume_through_its_held_root() {
     let fixture = Fixture::new("rename-volume");
     let runner = RecordingRunner::default();
     let image = slotted_image(&fixture);
@@ -2766,24 +2773,24 @@ fn native_volume_rename_names_the_image_volume_device_never_its_mount_path() {
         Labelled::Renamed
     );
 
-    let renames = renames(&runner);
-    assert_eq!(renames.len(), 1);
-    assert_eq!(renames[0].program, Path::new("/usr/sbin/diskutil"));
     assert_eq!(
-        renames[0].args,
-        [
-            std::ffi::OsString::from("renameVolume"),
-            std::ffi::OsString::from("/dev/disk10s1"),
-            std::ffi::OsString::from(SLOTTED),
-        ]
+        renames(&runner),
+        [("/dev/disk10s1".to_owned(), SLOTTED.to_owned())]
+    );
+    assert!(
+        runner.requests().iter().all(|request| request
+            .args
+            .first()
+            .is_none_or(|verb| verb != "renameVolume" && verb != "rename")),
+        "no disk tool renames: {:?}",
+        runner.requests()
     );
 }
 
 /// The volume a label found mounted is unmounted before its rename runs: the mount table read
 /// still lists it, but its mountpoint is now the bare directory beneath, on the host's own Data
-/// volume, and Disk Arbitration renames a mounted volume through the mountpoint it recorded.
-/// Held under the image's lease, the mountpoint answers the host's device, the real kernel's
-/// answer for that directory, and the rename is refused before `diskutil` runs.
+/// volume. Held under the image's lease, the mountpoint answers the host's device, the real
+/// kernel's answer for that directory, so it is no owned root and nothing is named.
 #[test]
 fn a_volume_unmounted_before_its_rename_is_refused_before_any_rename() {
     let fixture = Fixture::new("rename-unmounted-since");

@@ -572,7 +572,8 @@ the mount is handed back:
 Templates are never mounted and carry no `.fseventsd`; their clones are opted out at their first mount. Mains are opted
 out at their next mount. Seeds are never mounted: a seed is a clone of a live build volume, so it carries the marker
 once that volume has mounted, and every fork of it mounts opted out. The bounded-exec RAM volume (nx-plugin) is already
-unlogged — a fresh volume mounted `nobrowse` once, never remounted — so it plants nothing.
+unlogged and plants nothing: a fresh `nobrowse` volume, mounted on its private staging directory to be marked and then
+once by Disk Arbitration, carried no `.fseventsd` after both mounts (measured 2026-10-15).
 
 Opting out removes the log's work, not the daemon's live delivery work, and does not make delivery reliable on a
 saturated host: a volume's first events after its mount can go missing with no drop flag, logged or not (the first
@@ -768,40 +769,49 @@ clone inherits its source volume's name **and its volume UUID**, so a volume UUI
 workspace from the fork made out of it; that is why cloning rewrites the marker inside the staging fence, before the
 clone is ever published. Volume UUIDs are therefore not recorded and not used. The label is not rewritten there: a clone
 is published under the label it inherited, and the workspace's supervisor, once it serves, reads the file system's own
-name for its image's mounted volume (`getattrlist`, no Disk Arbitration round trip) and relabels it in the background
-when it differs. A rename is a Disk Arbitration round trip, and Disk Arbitration serializes every client on the host —
-measured at 9.5 s and 27.8 s under load against 13–22 ms on a quiet queue — so it stays off the provisioning path.
-Replacement restores and identity changes still relabel synchronously.
+name for its image's mounted volume (`getattrlist`) and relabels it in the background when it differs. The label is
+cosmetic, so nothing on the provisioning path waits on it. Replacement restores and identity changes still relabel
+synchronously.
 
-A rename targets a volume device, never a path. `diskutil renameVolume` handed a path renames whatever volume holds that
-path, and a mountpoint nothing is mounted at (a workspace whose create was refused, one that is detached, one whose
-supervisor outlived its mount) is a plain directory of the host's own Data volume: a supervisor that relabelled by its
-checkout's path once renamed the host's Data volume that way. So every rename (the supervisor's, the build volume's
-after a land, the restore staging relabel, the identity change's) names an image, never a mountpoint. The native host
-refuses an image outside the store root; the backend beneath it renames only through a verified attachment, so its
-target is always some image's volume device, never a host disk. The rename acts only on the volume device that the
-kernel's attachment inventory maps that image to. An image no attachment holds names nothing (`NotAttached`); one held
-twice, or held unformatted, is an inventory fault and is refused. One whose volume the kernel mount table does not list
-names nothing (`NotMounted`). Both skips are typed outcomes, not errors, and the supervisor says each one in the daemon
-log. The rename runs under the image's lease and a raw IOMedia pin that re-proves the mapping, as a release proves it
-before an exact-volume `diskutil unmount` ("Mounts"), and the pin is held across the `diskutil` call. The mount the
-label found is re-proven under them too, immediately before the rename. A device rename is not enough on its own: Disk
-Arbitration names a mounted volume through the mount path it recorded for the disk, not the device node (Apple's
-DiskArbitration source; not measured here), and a volume unmounted between the mount table read and the rename leaves
-that path a bare directory of the host's Data volume — which once carried a fixture's
-`[cowshed] fixture · dispatch — main` label. So the rename opens the mountpoint as a directory and reads the filesystem
-that descriptor lies on (`fstatfs`): anything but that image's volume device, or a directory inside it rather than its
-root, refuses the rename (`RenameTargetNotMounted`) before `diskutil` runs. The descriptor is held across the call, so
-an unforced unmount of that volume fails busy until the rename returns, and every cooperating unmount of the image
-already waits on its lease; only a forced unmount by another process can still land inside the call. No internal disk is
-an attachment of an image under the store, so the device a rename names is never the host's.
+A volume is named only through its own mount root, held open and proven to be owned media (`OwnedVolumeRoot`), with
+`fsetattrlist(ATTR_VOL_NAME)` on that descriptor. Nothing names a volume through a path or through Disk Arbitration:
 
-Open item: the rename holds the image's lease for the whole `diskutil renameVolume` call, and Disk Arbitration's queue
-sits inside that call (9.5–27.8 s under load, bounded by the 120 s disk-child deadline). Meanwhile a mount, unmount or
-detach of the same image waits on the lease. That only delays lifecycle work on one image; it is not a safety problem,
-and no lease wait under a queued rename has been measured. Releasing the lease cannot be split from the wait, because
-the wait is the command itself. Holding only the raw pin across it would turn that wait into the concurrent detach's
-EBUSY refusal, so the trade-off is left as it stands until it is measured.
+- **A path names whatever volume holds it.** xnu's `setattrlist` sets the name of `vp->v_mount` for any path, mount root
+  or not (`vfs_attrlist.c`, `setattrlist_internal`; measured: a plain subdirectory renamed the volume holding it). A
+  mountpoint nothing is mounted at (a workspace whose create was refused, one that is detached, one whose supervisor
+  outlived its mount) is a plain directory of the host's Data volume.
+- **Disk Arbitration renames a device through the path it recorded.** `diskutil rename`/`renameVolume` and
+  `DADiskRename` name the disk through the volume path Disk Arbitration recorded for it, resolved when its queue reaches
+  the request, seconds to minutes later on a loaded host (9.5 s and 27.8 s measured; mounts queued over 300 s on
+  2026-10-15). A volume unmounted in between by anything Disk Arbitration has not yet heard of — a forced unmount, a
+  forced detach — leaves that path a bare directory, and Disk Arbitration, as root, names the volume beneath it.
+  Measured on nested throwaway images (an outer image volume holding the inner's mountpoint): a kernel-forced unmount of
+  the inner volume followed by `DADiskRename` of the inner device renamed the outer volume in 16 of 20 runs, Disk
+  Arbitration reporting success. The host's Data volume carried `[cowshed] fixture · intents — slotted` from a rename by
+  path, and then `[cowshed] fixture · dispatch — main` twice, the second time on 2026-10-13/14, after the rename by
+  device had gained a re-proof under the image's lease, a raw pin and a held mountpoint descriptor. Such a proof cannot
+  close this window: it precedes Disk Arbitration's execution, and a held descriptor stops only unforced unmounts.
+
+So the runner refuses `diskutil rename` and `renameVolume`, in any spelling, for every caller (cowshed's own work and
+`cowshed disk-command` alike, `CommandRunFailure::VolumeRename`), before anything spawns. Nothing outside cowshed's
+store labels renames a volume at all: the `bounded-exec` RAM volume is created under its final name, marked on a private
+`mount_apfs` mount, and only then placed at `/Volumes/<name>` by Disk Arbitration (nx-plugin README). A store image's
+volume (the supervisor's relabel, the build volume's after a land, the restore staging relabel, the identity change's)
+is named through an `OwnedVolumeRoot`, which only `cowshed-apfs` can prove, by image, never by mountpoint. The native
+host refuses an image outside the store root, and the rename acts only on the volume device the kernel's attachment
+inventory maps that image to. An image no attachment holds names nothing (`NotAttached`); one held twice, or held
+unformatted, is an inventory fault and is refused. One whose volume the kernel mount table does not list names nothing
+(`NotMounted`). Both skips are typed outcomes, not errors, and the supervisor says each one in the daemon log. Under the
+image's lease and a raw IOMedia pin that re-proves the mapping, the mountpoint is opened as a directory
+(`O_DIRECTORY|O_NOFOLLOW`) and the filesystem that descriptor lies on read (`fstatfs`): anything but the image's volume
+device, or a directory inside it rather than its root, is refused (`RenameTargetNotMounted`). A host disk is no
+attachment of any image, so its volumes are never an `OwnedVolumeRoot`.
+
+The name is then set through the held descriptor. The kernel binds it to that descriptor's vnode, not to a path: a
+volume unmounted since the proof, even by force, leaves the vnode dead and the call fails (`ENOTSUP`, measured; typed
+`RenameFailed`) instead of reaching the volume beneath, and nothing is retried another way. The call is a kernel
+attribute write, not a Disk Arbitration round trip, so the image's lease is held for microseconds; Disk Arbitration
+learns the new name from the kernel and reports it.
 
 What follows: volume labels are free to be plain, and manual renaming is harmless rather than unsupported. Cowshed still
 derives an internal per-workspace key from `repo_id` and workspace name to pair a storage fact with a kernel mount fact

@@ -1238,12 +1238,12 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
 
     /// Name the volume of `image`, an image under the store, `label` (01a_apfs.md,
     /// "Ownership, identity, and the volume label"). The target is the volume device the kernel's
-    /// attachment inventory maps the image to, re-proved under the image's lease and a raw pin
-    /// when the rename runs, with the mountpoint it was found at held and proven still that
-    /// device's mount root; never a path, which `diskutil` resolves to whatever volume holds it.
-    /// An image the kernel does not hold, or whose volume is mounted nowhere, names nothing; one
-    /// it holds twice, or holds unformatted, is an inventory fault and refused, as is a volume
-    /// unmounted between the mount table read and the rename.
+    /// attachment inventory maps the image to, re-proved under the image's lease and a raw pin,
+    /// with the mountpoint it was found at held and proven still that device's mount root; the
+    /// name is set through that held root, never a path, which the kernel and Disk Arbitration
+    /// resolve to whatever volume holds it. An image the kernel does not hold, or whose volume is
+    /// mounted nowhere, names nothing; one it holds twice, or holds unformatted, is an inventory
+    /// fault and refused, as is a volume unmounted between the mount table read and the rename.
     pub fn label_image_volume(
         &self,
         image: &Path,
@@ -6571,9 +6571,9 @@ pub(crate) fn swap_paths(left: &Path, right: &Path) -> Result<(), ApfsStorageErr
         .map_err(|error| io_error("atomically swap restore images", left, error))
 }
 
-/// Whether the volume mounted at `mount_point` already carries `label`. It is read straight from
-/// the kernel (`getattrlist`), so a name already right costs no Disk Arbitration round trip. A
-/// read that raced an unmount costs only a rename that the device pin then refuses.
+/// Whether the volume mounted at `mount_point` already carries `label`, read straight from the
+/// kernel (`getattrlist`). A read that raced an unmount costs only a rename that the held root's
+/// proof then refuses.
 fn carries_label(mount_point: &Path, label: &str) -> Result<bool, ApfsStorageError> {
     #[cfg(target_os = "macos")]
     {

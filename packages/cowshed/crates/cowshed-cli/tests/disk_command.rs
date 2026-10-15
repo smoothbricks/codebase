@@ -88,6 +88,25 @@ fn usage_refusals_never_reach_a_tool() {
     );
 }
 
+/// The facade is one more caller of the shared runner, so Disk Arbitration's rename is refused
+/// through it as everywhere, before diskutil runs: a usage failure (exit 101) naming the command,
+/// nothing on stdout. The target is a path that does not exist, so a facade that let the rename
+/// through would only see diskutil fail on it.
+#[test]
+fn the_facade_refuses_disk_arbitration_renames() {
+    let target = "/private/tmp/cowshed-disk-command-no-such-volume";
+    for verb in ["renameVolume", "rename", "RENAMEVOLUME"] {
+        let output = disk_command(&["diskutil", "--", verb, target, "renamed"]);
+        assert_eq!(output.status.code(), Some(101), "{verb}: {output:?}");
+        assert!(output.stdout.is_empty(), "{verb}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("refused") && stderr.contains(target),
+            "{verb}: {stderr}"
+        );
+    }
+}
+
 /// A caller that gave up and closed its end of stdout before the tool finished: the tool runs to
 /// its end, and the undeliverable output is the wrapper's internal failure (exit 100), said on
 /// stderr — not a panic, and not the tool's status.

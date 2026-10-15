@@ -190,6 +190,156 @@ fn fixture_cleanup_proves_backing_file_unlock_before_unlink() {
         .expect("an absent backing file needs no unlink");
 }
 
+/// The system runner, except that naming a volume first force-unmounts it, as another process
+/// may (`hdiutil detach -force` past a grace, a fixture teardown after its supervisor was
+/// stopped): the window between proving a volume's root and naming it.
+#[cfg(target_os = "macos")]
+struct ForcedUnmountBeforeNaming;
+
+#[cfg(target_os = "macos")]
+impl CommandRunner for ForcedUnmountBeforeNaming {
+    fn run(
+        &self,
+        request: &CommandRequest,
+    ) -> Result<cowshed_apfs::CommandOutput, cowshed_apfs::CommandRunError> {
+        SystemCommandRunner.run(request)
+    }
+    fn run_guarded<E>(
+        &self,
+        request: &CommandRequest,
+        check: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<cowshed_apfs::CommandOutput>, E>
+    where
+        E: From<cowshed_apfs::CommandRunError> + std::fmt::Display,
+    {
+        SystemCommandRunner.run_guarded(request, check)
+    }
+    fn image_lease(
+        &self,
+        identity: &Path,
+    ) -> io::Result<Option<cowshed_os::fork_lock::Fenced<fs::File>>> {
+        SystemCommandRunner.image_lease(identity)
+    }
+    fn pin_raw_device(
+        &self,
+        device: &Path,
+    ) -> io::Result<Option<cowshed_os::fork_lock::Fenced<fs::File>>> {
+        SystemCommandRunner.pin_raw_device(device)
+    }
+    fn attached_disk_images(&self) -> io::Result<Vec<cowshed_apfs::AttachedDiskImage>> {
+        SystemCommandRunner.attached_disk_images()
+    }
+    fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()> {
+        SystemCommandRunner.grow_image(image, capacity)
+    }
+    fn name_volume(&self, root: &cowshed_apfs::OwnedVolumeRoot, name: &str) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let mount_point = std::ffi::CString::new(root.mount_point().as_os_str().as_bytes())
+            .expect("a mountpoint without NUL");
+        // SAFETY: `mount_point` is NUL-terminated and outlives the call.
+        if unsafe { libc::unmount(mount_point.as_ptr(), libc::MNT_FORCE) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        root.set_name(name)
+    }
+}
+
+/// The kernel's name for the volume holding `path`.
+#[cfg(target_os = "macos")]
+fn name_at(path: &Path) -> String {
+    cowshed_apfs::volume_name(path)
+        .unwrap_or_else(|error| panic!("read the volume name at {}: {error}", path.display()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A volume is named only through its own held mount root. Two real images stand in for the
+/// host: the outer image's volume holds the inner's mountpoint, so every wrong target a rename
+/// could fall back to — the bare directory a departed volume leaves, the volume beneath — is
+/// the outer throwaway volume, never the host's Data volume.
+///
+/// The store image's rename (`rename_volume`) names its own owned volume, refuses the outer
+/// volume's path as the inner's root, and, with the inner volume force-unmounted between the
+/// proof and the name, fails and leaves the outer volume's name as it was. Disk Arbitration's
+/// rename by device took the outer volume's name in that window in 16 of 20 measured runs.
+#[cfg(target_os = "macos")]
+#[test]
+fn real_apfs_a_rename_names_only_its_own_held_volume_root() {
+    const LABEL: &str = "[cowshed] fixture · dispatch — main";
+    let root = ScratchRoot::new("owned-rename").expect("scratch root");
+    let backend = MacOsApfsBackend::new(SystemCommandRunner);
+    let forcing = MacOsApfsBackend::new(ForcedUnmountBeforeNaming);
+    let outer_image = root.path().join("outer").with_extension(IMAGE_EXTENSION);
+    let inner_image = root.path().join("inner").with_extension(IMAGE_EXTENSION);
+    let outer_mount = root.path().join("outer-volume");
+    let inner_mount = outer_mount.join("inner-volume");
+    let _paths = TestPaths(vec![outer_mount.clone()]);
+    let mut outer_cleanup = RealImageCleanup::new(&backend, outer_image.clone());
+    let mut inner_cleanup = RealImageCleanup::new(&backend, inner_image.clone());
+    let result = (|| -> Result<(), ApfsError> {
+        crate::blank_image::blank_image(&outer_image);
+        crate::blank_image::blank_image(&inner_image);
+        let outer = outer_cleanup.track(backend.attach_mounted(
+            &outer_image,
+            &outer_mount,
+            MountAccess::ReadWrite,
+            false,
+        )?);
+        let inner = inner_cleanup.track(backend.attach_mounted(
+            &inner_image,
+            &inner_mount,
+            MountAccess::ReadWrite,
+            false,
+        )?);
+        let outer_name = name_at(&outer_mount);
+        assert_ne!(outer_name, LABEL);
+
+        backend.rename_volume(inner, &inner_mount, LABEL)?;
+        assert_eq!(
+            name_at(&inner_mount),
+            LABEL,
+            "the store rename names its volume"
+        );
+
+        let refused = backend
+            .rename_volume(inner, &outer_mount, LABEL)
+            .expect_err("the outer volume's root is not the inner's");
+        assert!(
+            matches!(
+                &refused,
+                ApfsError::RenameTargetNotMounted { found, .. } if found == outer.volume_device()
+            ),
+            "{refused}"
+        );
+        assert_eq!(name_at(&outer_mount), outer_name);
+
+        let failed = forcing
+            .rename_volume(inner, &inner_mount, "MUST-NOT-LAND")
+            .expect_err("a volume force-unmounted since its proof is not named");
+        assert!(
+            matches!(&failed, ApfsError::RenameFailed { volume_device, .. }
+                if volume_device == inner.volume_device()),
+            "{failed}"
+        );
+        assert_eq!(
+            name_at(&outer_mount),
+            outer_name,
+            "the rename fell back to the volume beneath"
+        );
+        assert_eq!(
+            name_at(&inner_mount),
+            outer_name,
+            "the departed mountpoint is a bare directory of the outer volume"
+        );
+
+        backend.mount(inner, &inner_mount, MountAccess::ReadWrite, false)?;
+        assert_eq!(name_at(&inner_mount), LABEL, "the failed name never landed");
+        Ok(())
+    })();
+    finish_real_image_test(result, inner_cleanup);
+    finish_real_image_test(Ok(()), outer_cleanup);
+}
+
 #[cfg(target_os = "macos")]
 fn lease_test_image(staged_stem: PathBuf, volume_name: &str) -> CreateImageRequest {
     CreateImageRequest {

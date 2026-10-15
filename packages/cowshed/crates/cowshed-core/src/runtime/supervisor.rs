@@ -3996,8 +3996,8 @@ impl SupervisorActor {
     /// Name the checkout's volumes in the background (see [`VolumeLabels`]): its workspace
     /// image's volume when `workspace`, and the build volume mounted at `build` unless this
     /// supervisor already named that one. Each is named by its image, never by the path it is
-    /// mounted at; a Disk Arbitration rename is queued only when the file system's own name
-    /// differs, and the outcome goes to stderr.
+    /// mounted at; a volume is renamed, through its held mount root, only when the file system's
+    /// own name differs, and the outcome goes to stderr.
     fn relabel(&mut self, workspace: bool, build: Option<&Path>) {
         let Some(labels) = &self.volume_labels else {
             return;
