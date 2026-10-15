@@ -227,10 +227,11 @@ idle-keeper cleanup remain outside this ledger-only cutover. Their ownership har
 those paths is claimed here.
 
 The trusted supervisor retains write access to `<workspace mount>/.cowshed/job/**` so it can allocate job IDs, capture
-streams, and write protected job records and lazy spill files. The revision-bound execution profile above applies to
-exec hosts and one-shot commands, not to the supervisor process. Before any anonymous shell, named session, one-shot
-command, shell startup file, direnv hook, repository hook, or other workspace code can run, cowshed installs a **child
-profile** which intersects with the execution profile and only removes authority:
+streams, and write protected job records and lazy spill files. That authority must never reach repository-controlled
+code. The revision-bound execution profile above applies to exec hosts and one-shot commands, not to the supervisor
+process. Before any anonymous shell, named session, one-shot command, shell startup file, direnv hook, repository hook,
+or other workspace code can run, cowshed installs a **child profile** which intersects with the execution profile and
+only removes authority:
 
 ```scheme
 ;; Final filesystem rule in every macOS child profile. No later rule may
@@ -626,7 +627,8 @@ Propagation:
 - **Egress and `sim`**: immediate. The gateway resolves the workspace by its token and consults the current grant file
   per request (`/sim/` verbs included), including requests from jobs launched under an older filesystem revision.
 - **Filesystem**: [11_shell.md, Grant-change propagation](11_shell.md#grant-change-propagation) owns revision advances,
-  exec-host reuse, running-job profiles and stale named-session refusal.
+  exec-host reuse, running-job profiles (a revoke does not cut them; a coordinator needing a hard cut kills them) and
+  stale named-session refusal.
 - **Port block (macOS)**: idle-only, never drained. Current and retained blocks form the Seatbelt connect allowlist; the
   current block alone supplies the job environment (`COWSHED_PORT_BASE`, `COWSHED_PORT_BLOCK_SIZE`), so growth is
   admitted only when the workspace has no active job, checked atomically with the grant; otherwise it is refused at

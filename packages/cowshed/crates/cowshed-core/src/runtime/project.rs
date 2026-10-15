@@ -249,7 +249,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// The project's standing grants from the trusted project policy.
     async fn project_grants(&mut self) -> Result<ProjectGrants>;
     /// Add (or, with `revoke`, remove) project-standing grants; every workspace of the project
-    /// runs under them from its next supervisor launch.
+    /// runs under them from its next command: its supervisor advances in place.
     async fn grant_project(
         &mut self,
         delta: ProjectGrantDelta,

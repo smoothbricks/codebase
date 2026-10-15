@@ -228,7 +228,8 @@ fixes, then targeted verification plus the repository's full Rust checks and a C
 - `cowshed adopt && cowshed fork x && cowshed exec x -- <build> && cowshed push x && cowshed rm x` works end-to-end on
   each supported host, sandboxed, with caches warm from main.
 - Exit code 6 and a grant hint appear only on authoritative sandbox-denial evidence. Grant propagation follows
-  [11_shell.md, Grant-change propagation](../../specs/cowshed/11_shell.md#grant-change-propagation).
+  [11_shell.md, Grant-change propagation](../../specs/cowshed/11_shell.md#grant-change-propagation); egress and
+  simulator grants apply immediately.
 - `cowshed attach` fast path ≤ 25 ms; `cowshed fork` ≤ 1 s cold; `cowshed rm` returns instantly.
 - Zero host-visible inode growth per workspace beyond the image file + grants file.
 - Substrate parity: the acceptance flow above passes on Linux/ZFS with Landlock enforcement (integration leg; can run in
