@@ -579,7 +579,7 @@ describe('Bun installation receipt link admission', () => {
     ]) {
       it(`${ci ? 'CI' : 'local'} refuses ${defect} before writing an install receipt`, async () => {
         await withManagedRepository(options, async ({ root, enterShell: enter }) => {
-          // Establish the genuine lockfile, then remove only this fixture's prior receipt.
+          // Establish a successful entry, then remove only this fixture's prior receipt.
           expect(await enter()).toEqual(HEALTHY);
           const receipt = join(root, 'node_modules', '.smoo-install');
           await rm(receipt);
@@ -629,20 +629,32 @@ describe('Bun installation receipt link admission', () => {
   });
 
   it('records complete scoped/transitive cache links and leaves unchanged entry installed', async () => {
-    await withManagedRepository(options, async ({ root, enterShell: enter }) => {
-      expect(await enter()).toEqual(HEALTHY);
-      const receipt = join(root, 'node_modules', '.smoo-install');
-      const recorded = readFileSync(receipt);
-      expect(JSON.parse(recorded.toString('utf8'))).toEqual({
-        inputs: expect.stringMatching(/^[0-9a-f]{64}$/),
-        lockfiles: {
-          'bun.lock': new Bun.CryptoHasher('sha256').update(readFileSync(join(root, 'bun.lock'))).digest('hex'),
+    // An empty dependency graph need not produce bun.lock. Install a real local package so
+    // this oracle checks the genuine lock digest without changing the install or receipt contract.
+    await withManagedRepository(
+      {
+        ...options,
+        dependencies: { 'fixture-lock-anchor': 'file:vendor/lock-anchor' },
+        files: {
+          ...files,
+          'vendor/lock-anchor/package.json': JSON.stringify({ name: 'fixture-lock-anchor', version: '1.0.0' }),
         },
-      });
-      expect(await enter()).toEqual(HEALTHY);
-      expect(readFileSync(receipt)).toEqual(recorded);
-      expect(readFileSync(join(root, 'integrity-installs'), 'utf8')).toBe('x\n');
-    });
+      },
+      async ({ root, enterShell: enter }) => {
+        expect(await enter()).toEqual(HEALTHY);
+        const receipt = join(root, 'node_modules', '.smoo-install');
+        const recorded = readFileSync(receipt);
+        expect(JSON.parse(recorded.toString('utf8'))).toEqual({
+          inputs: expect.stringMatching(/^[0-9a-f]{64}$/),
+          lockfiles: {
+            'bun.lock': new Bun.CryptoHasher('sha256').update(readFileSync(join(root, 'bun.lock'))).digest('hex'),
+          },
+        });
+        expect(await enter()).toEqual(HEALTHY);
+        expect(readFileSync(receipt)).toEqual(recorded);
+        expect(readFileSync(join(root, 'integrity-installs'), 'utf8')).toBe('x\n');
+      },
+    );
   });
 });
 
