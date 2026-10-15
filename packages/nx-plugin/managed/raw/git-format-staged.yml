@@ -9,8 +9,9 @@ formatters:
       - '!.*' # Exclude hidden files
 
   # Biome for JS/TS family (including CommonJS/CTS and ESM .mjs/.mts)
+  # Biome check --fix silently succeeds on unparsable stdin; format must refuse it.
   biome:
-    command: "biome check --files-ignore-unknown=true --use-editorconfig=true '--stdin-file-path={}' --fix"
+    command: "biome format --files-ignore-unknown=true --use-editorconfig=true '--stdin-file-path={}'"
     patterns:
       - '*.js'
       - '*.cjs'
