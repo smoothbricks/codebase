@@ -1122,7 +1122,10 @@ mod tests {
             live > seeded,
             "an admitted job after Quiet releases must make the seed behind"
         );
-        handle.retire().await.unwrap();
+        handle
+            .retire(crate::runtime::supervisor::NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
         drop(handle);
         drop(replacement);
         drop(landing_hold);
@@ -1982,7 +1985,10 @@ mod tests {
             "the sealed sample is the terminal one"
         );
         handle.quiesce().await.unwrap();
-        handle.retire().await.unwrap();
+        handle
+            .retire(crate::runtime::supervisor::NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
         drop(handle);
         assert_eq!(
             store()

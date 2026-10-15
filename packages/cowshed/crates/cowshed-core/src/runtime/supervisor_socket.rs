@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::process_stream::JobProcessStream;
 use super::supervisor::{
-    CheckpointBarrier, Command, LogChunk, SessionSnapshot, SessionToken,
+    CheckpointBarrier, Command, LogChunk, NxDaemonRetirement, SessionSnapshot, SessionToken,
     WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use crate::api::dto::{
@@ -349,7 +349,10 @@ enum Call {
     Quiesce {
         fail_if_busy: bool,
     },
-    Retire,
+    #[serde(rename_all = "camelCase")]
+    Retire {
+        nx_daemon: NxDaemonRetirement,
+    },
     /// Name the build volume a land or refork moved the checkout's link onto.
     #[serde(rename_all = "camelCase")]
     NameBuildVolume {
@@ -904,7 +907,9 @@ pub async fn serve(
                         return;
                     };
                     let current = supervisor.with_authority(authority);
-                    if current.quiesce().await.is_ok() && current.retire().await.is_ok() {
+                    if current.quiesce().await.is_ok()
+                        && current.retire(NxDaemonRetirement::Recorded).await.is_ok()
+                    {
                         retired.notify_one();
                     }
                 }
@@ -1026,7 +1031,7 @@ async fn serve_call(
         serve_process_events(stream, &caller, job_id, every).await?;
         return Ok(Retirement::Serving);
     }
-    let retiring = matches!(*call, Call::Retire);
+    let retiring = matches!(*call, Call::Retire { .. });
     let (value, bytes) = match answer(&caller, streams, *call, payload).await {
         Ok(answer) => answer,
         Err(error) => {
@@ -1362,8 +1367,8 @@ async fn answer(
             }
             (unit()?, Bytes::new())
         }
-        Call::Retire => {
-            supervisor.retire().await?;
+        Call::Retire { nx_daemon } => {
+            supervisor.retire(nx_daemon).await?;
             (unit()?, Bytes::new())
         }
         Call::NameBuildVolume { build_volume } => {
@@ -2004,8 +2009,13 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 .await,
             );
         }
-        Command::Retire { authority, reply } => {
-            let _ = reply.send(call(path, &authority, Call::Retire, Bytes::new()).await);
+        Command::Retire {
+            authority,
+            nx_daemon,
+            reply,
+        } => {
+            let _ =
+                reply.send(call(path, &authority, Call::Retire { nx_daemon }, Bytes::new()).await);
         }
         Command::NameBuildVolume {
             authority,

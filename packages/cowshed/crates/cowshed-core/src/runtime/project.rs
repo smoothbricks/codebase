@@ -49,6 +49,8 @@ use crate::runtime::job_progress::JobProgressStream;
 use crate::runtime::process_stream::JobProcessStream;
 use crate::runtime::supervisor_socket::AdmissionSource;
 #[cfg(target_os = "macos")]
+use crate::runtime::supervisor::NxDaemonRetirement;
+#[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::RunAsync as _;
 #[cfg(target_os = "macos")]
 use cowshed_os::timing::timed_async;
@@ -4499,7 +4501,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 Err(reason) => return Ok(skipped(reason)),
             }
         }
-        let stopped = self.stop_supervisor_for_removal(workspace, true).await?;
+        let stopped = self
+            .stop_supervisor_with_mode(workspace, true, NxDaemonRetirement::ControllerOwned)
+            .await?;
         require_lost_groups_released(workspace, &stopped, "quiesce").await?;
         for (root, plan) in daemons {
             match plan {
@@ -5656,13 +5660,16 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         workspace: &WorkspaceName,
         initial: &NativeRemovalGitFence,
         force: bool,
+        nx_check: CheckoutNxCheck,
         purpose: RetirementPurpose<'_>,
     ) -> Result<(
         NativeWorkspace,
         NativeRemovalGitFence,
         super::supervisor_socket::BoundSocket,
     )> {
-        let stopped = self.stop_supervisor_for_removal(workspace, force).await?;
+        let stopped = self
+            .stop_supervisor_with_mode(workspace, force, nx_check.supervisor_retirement())
+            .await?;
         require_lost_groups_released(workspace, &stopped, "remove").await?;
         let current = self.current(workspace).await?;
         Self::require_exact_incarnation(&current, &initial.incarnation)?;
@@ -6334,6 +6341,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     &workspace,
                     &initial_fence,
                     options.force,
+                    nx_check,
                     RetirementPurpose::Removal,
                 )
                 .await?;
@@ -7144,7 +7152,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // own to retire, and the hello below says whose it is.
             if self.served.contains_key(name) {
                 old.quiesce().await?;
-                old.retire().await?;
+                old.retire(NxDaemonRetirement::Recorded).await?;
                 self.forget_served(name).await?;
             }
             self.sessions.retain(|(workspace, _), _| workspace != name);
@@ -7505,28 +7513,20 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         &mut self,
         name: &WorkspaceName,
     ) -> Result<super::supervisor_socket::BoundSocket> {
-        self.stop_supervisor_with_mode(name, false).await
-    }
-
-    /// Force removal cannot quiesce first: quiescing waits for running jobs to finish naturally.
-    /// Retiring first closes admission and asks each job to terminate with TERM then KILL.
-    async fn stop_supervisor_for_removal(
-        &mut self,
-        name: &WorkspaceName,
-        force: bool,
-    ) -> Result<super::supervisor_socket::BoundSocket> {
-        self.stop_supervisor_with_mode(name, force).await
+        self.stop_supervisor_with_mode(name, false, NxDaemonRetirement::Recorded)
+            .await
     }
 
     async fn stop_supervisor_handle(
         handle: &super::supervisor::WorkspaceSupervisorHandle,
         terminate_jobs: bool,
+        nx_daemon: NxDaemonRetirement,
     ) -> Result<()> {
         if terminate_jobs {
-            handle.retire().await
+            handle.retire(nx_daemon).await
         } else {
             handle.quiesce().await?;
-            handle.retire().await
+            handle.retire(nx_daemon).await
         }
     }
 
@@ -7534,6 +7534,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         &mut self,
         name: &WorkspaceName,
         terminate_jobs: bool,
+        nx_daemon: NxDaemonRetirement,
     ) -> Result<super::supervisor_socket::BoundSocket> {
         let socket = super::supervisor_socket::socket_path(
             self.descriptor.storage.store(),
@@ -7551,6 +7552,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 )),
                 Ok(None) => None,
                 Err(error) if error.code == ErrorCode::Conflict => {
+                    if nx_daemon == NxDaemonRetirement::ControllerOwned {
+                        // Preserve the typed build refusal. A generic drain could let that
+                        // older actor signal a mutable record nominee before the controller.
+                        return Err(error);
+                    }
                     let stopped = super::supervisor_manager::stop_other_build(&socket).await?;
                     eprintln!(
                         "cowshed: stopped workspace {name}'s supervisor (pid {}) of another cowshed build",
@@ -7564,7 +7570,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             },
         };
         if let Some(handle) = handle {
-            Self::stop_supervisor_handle(&handle, terminate_jobs).await?;
+            Self::stop_supervisor_handle(&handle, terminate_jobs, nx_daemon).await?;
         }
         self.forget_served(name).await?;
         self.sessions.retain(|(workspace, _), _| workspace != name);
@@ -7649,7 +7655,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         // Quiesce first: a command admitted since the last look finishes
                         // before the supervisor retires.
                         actor.quiesce().await?;
-                        break actor.retire().await;
+                        break actor.retire(NxDaemonRetirement::Recorded).await;
                     }
                 }
             }
@@ -7859,7 +7865,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         )
                         .await?;
                         let _stopped = this
-                            .stop_supervisor_for_removal(workspace, options.force)
+                            .stop_supervisor_with_mode(
+                                workspace,
+                                options.force,
+                                NxDaemonRetirement::Recorded,
+                            )
                             .await?;
                         let last = this
                             .removal_git_fence_at(&stage.mount_point, stage.workspace.incarnation())
@@ -9060,7 +9070,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let served: Vec<WorkspaceName> = self.served.keys().cloned().collect();
         for name in served {
             let retired = match self.served.get(&name) {
-                Some(served) => served.actor.retire().await,
+                Some(served) => served.actor.retire(NxDaemonRetirement::Recorded).await,
                 None => continue,
             };
             if let Err(error) = retired {
@@ -9724,7 +9734,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         "cowshed doctor --json",
                     ));
                 }
-                let stopped = self.stop_supervisor_for_removal(&source, false).await?;
+                let stopped = self
+                    .stop_supervisor_with_mode(&source, false, NxDaemonRetirement::Recorded)
+                    .await?;
                 require_lost_groups_released(&source, &stopped, "rename").await?;
                 let source_incarnation = self.clone_source_incarnation(&current).await?;
                 self.commitments
@@ -9782,7 +9794,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 .await?;
             let (_stopped, rename_head) = if let Some(initial) = initial.as_ref() {
                 let (current, fence, stopped) = self
-                    .revalidated_removal_fence(&source, initial, false, RetirementPurpose::Rename { destination: &destination })
+                    .revalidated_removal_fence(&source, initial, false, CheckoutNxCheck::CloseRecorded, RetirementPurpose::Rename { destination: &destination })
                     .await?;
                 if let Some(operation) = fence.in_progress.as_deref() {
                     return Err(CowshedError::conflict(
@@ -14169,8 +14181,8 @@ mod removal_supervisor_tests {
         error::{CowshedError, Result},
         runtime::supervisor::{
             ArtifactSeal, ArtifactSink, ArtifactWrite, CheckpointBarrier, CommitmentDraft,
-            CommitmentSink, ProcessEvent, ProcessSignal, ProcessSpawnRequest, RunningProcess,
-            SpawnSink, WorkspaceSupervisor, WorkspaceSupervisorConfig,
+            CommitmentSink, NxDaemonRetirement, ProcessEvent, ProcessSignal, ProcessSpawnRequest,
+            RunningProcess, SpawnSink, WorkspaceSupervisor, WorkspaceSupervisorConfig,
         },
         storage::job_artifact::{JobEnding, StreamKind},
     };
@@ -14435,7 +14447,7 @@ mod removal_supervisor_tests {
         .await;
         if started.is_err() {
             supervisor
-                .retire()
+                .retire(NxDaemonRetirement::Recorded)
                 .await
                 .expect("clean up test supervisor after start timeout");
         }
@@ -14443,12 +14455,16 @@ mod removal_supervisor_tests {
 
         let stopped = tokio::time::timeout(
             Duration::from_secs(10),
-            NativeProjectRuntimeHost::stop_supervisor_handle(&supervisor, true),
+            NativeProjectRuntimeHost::stop_supervisor_handle(
+                &supervisor,
+                true,
+                NxDaemonRetirement::Recorded,
+            ),
         )
         .await;
         if !matches!(&stopped, Ok(Ok(()))) {
             supervisor
-                .retire()
+                .retire(NxDaemonRetirement::Recorded)
                 .await
                 .expect("clean up test supervisor after force-stop failure");
         }
@@ -17060,6 +17076,13 @@ enum CheckoutNxCheck {
 
 #[cfg(target_os = "macos")]
 impl CheckoutNxCheck {
+    fn supervisor_retirement(self) -> NxDaemonRetirement {
+        match self {
+            Self::Held => NxDaemonRetirement::ControllerOwned,
+            Self::CloseRecorded => NxDaemonRetirement::Recorded,
+        }
+    }
+
     fn busy_action(self) -> &'static str {
         match self {
             Self::Held => "this holder inspection stops no process",

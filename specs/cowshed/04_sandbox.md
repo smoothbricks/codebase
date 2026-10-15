@@ -217,8 +217,11 @@ step 4 a daemon record is a nomination only: the controller signals a process on
 ledger proves that process is a job's own, captured before the supervisor retires. The sandbox grants a job no signal
 right over another process, so this authority is the controller's alone (16_build_volumes.md, Land 4). The default
 land's later workspace retirement only inspects Nx database holders; it never turns a skipped nomination into a
-record-nominated signal (Land 8). The existing record-nominated target daemon stops in Land steps 5 and 6, and the
-non-land stops in detach, rm/retire, workspace rename, re-adoption, resize, rebase carry, migration, reseeding and
+record-nominated signal (Land 8). Both land boundaries carry the required `ControllerOwned` Nx-retirement policy through
+the private supervisor call: the actor relinquishes keeper-record cleanup while still retiring admitted jobs. A
+supervisor of another build that cannot honor this handoff is a typed refusal, never a generic retirement fallback.
+Other callers explicitly select `Recorded`. The existing record-nominated target daemon stops in Land steps 5 and 6, and
+the non-land stops in detach, rm/retire, workspace rename, re-adoption, resize, rebase carry, migration, reseeding and
 idle-keeper cleanup remain outside this ledger-only cutover. Their ownership hardening is open; no safety guarantee for
 those paths is claimed here.
 

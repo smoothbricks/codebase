@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 
 use cowshed_core::runtime::supervisor::{
     ArtifactSeal, ArtifactSink, ArtifactStoreSink, ArtifactWrite, CheckpointBarrier,
-    CommitmentDraft, CommitmentSink, OwnedProcess, ProcessEvent, ProcessSignal,
+    CommitmentDraft, CommitmentSink, NxDaemonRetirement, OwnedProcess, ProcessEvent, ProcessSignal,
     ProcessSpawnRequest, RunningProcess, SessionToken, SpawnCommand, SpawnSink, VolumeLabeller,
     VolumeLabels, WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
     WorkspaceSupervisorHandle,
@@ -980,7 +980,7 @@ async fn host_controller_an_admitted_nix_bun_loads_icu_without_a_nix_project() {
         .log_read(job, StreamKind::Stdout, 0, false)
         .await
         .unwrap();
-    handle.retire().await.unwrap();
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
     assert_eq!(
         info.exit,
         Some(ExitStatus::Exited { code: 0 }),
@@ -1696,7 +1696,11 @@ async fn a_fresh_supervisor_answers_for_a_job_its_predecessor_sealed() {
     .await;
     first.handle.wait(job).await.unwrap();
     first.handle.quiesce().await.unwrap();
-    first.handle.retire().await.unwrap();
+    first
+        .handle
+        .retire(NxDaemonRetirement::Recorded)
+        .await
+        .unwrap();
     drop(first);
 
     let second = real_store_harness(supervisor_config);
@@ -1793,7 +1797,7 @@ async fn a_refused_output_copy_fails_its_callers_after_the_job_ends_truthfully()
         .count();
     assert_eq!(terminals, 1);
     h.handle.quiesce().await.unwrap();
-    h.handle.retire().await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// A job whose terminal record the store refuses has still ended. Its waiters, early and late, and
@@ -1858,7 +1862,7 @@ async fn a_refused_terminal_record_answers_every_caller_and_stays_unterminated()
             .any(|commitment| matches!(commitment, ControllerCommitment::Terminal(_)))
     );
     h.handle.quiesce().await.unwrap();
-    h.handle.retire().await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
     drop(h);
 
     std::fs::set_permissions(&job_root, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1964,7 +1968,7 @@ async fn a_refused_terminal_commitment_keeps_the_sealed_truth_and_fails_its_call
         .unwrap();
     assert_eq!((output.bytes.as_ref(), output.eof), (&b"payload"[..], true));
     handle.quiesce().await.unwrap();
-    handle.retire().await.unwrap();
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// Spawns nothing: hands each job a process group the test owns, observed as its parent observes
@@ -2120,7 +2124,7 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
         .await;
         handle.wait(id).await.unwrap();
     }
-    handle.retire().await.unwrap();
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// A job whose parent could not identify its group leader still runs and reports its pid, but its
@@ -2146,7 +2150,7 @@ async fn an_unidentified_leader_never_enters_the_ledger() {
     let spawned = h.spawned.recv().await.unwrap();
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(job).await.unwrap();
-    h.handle.retire().await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// The groups a lost predecessor left unresolved neither stop the next supervisor from serving
@@ -2244,7 +2248,7 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
     let spawned = h.spawned.recv().await.unwrap();
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second).await.unwrap();
-    h.handle.retire().await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 #[tokio::test]
@@ -2262,7 +2266,7 @@ async fn retire_waits_for_process_tree_stop_and_terminal_persistence() {
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     let handle = h.handle.clone();
-    let retire = tokio::spawn(async move { handle.retire().await });
+    let retire = tokio::spawn(async move { handle.retire(NxDaemonRetirement::Recorded).await });
     assert_eq!(
         h.process.recv().await.unwrap(),
         ProcessObservation::StdinClosed(job)
@@ -2692,7 +2696,7 @@ async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
             .code,
         ErrorCode::Conflict
     );
-    h.handle.retire().await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 #[tokio::test]
@@ -2794,7 +2798,7 @@ async fn a_wait_failure_fails_the_job_without_inventing_an_exit_status() {
     );
 
     // A retire must not hang on a job whose child was never reaped.
-    h.handle.retire().await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// After seal there must be exactly one copy of a job's output, and it must be the store's.
@@ -3538,7 +3542,11 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
     complete(&spawned, b"ran\n", b"", ExitStatus::Exited { code: 0 }).await;
     first.handle.wait(job).await.unwrap();
     first.handle.quiesce().await.unwrap();
-    first.handle.retire().await.unwrap();
+    first
+        .handle
+        .retire(NxDaemonRetirement::Recorded)
+        .await
+        .unwrap();
     drop(first);
 
     let mut second = real_store_harness(supervisor_config);
@@ -3683,7 +3691,11 @@ async fn sealed_reads_preserve_unread_history_without_hiding_readable_jobs() {
         assert_eq!(error.admission_source(), None);
     }
     assert!(empty.spawned.try_recv().is_err());
-    empty.handle.retire().await.unwrap();
+    empty
+        .handle
+        .retire(NxDaemonRetirement::Recorded)
+        .await
+        .unwrap();
     drop(empty);
 
     let mut store = ArtifactStoreSink::open(
@@ -4491,7 +4503,7 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     let spawned = h.spawned.recv().await.unwrap();
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     remote.wait(admitted).await.unwrap();
-    remote.retire().await.unwrap();
+    remote.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// A grant change can land between a controller's read of the grants and its ensure — another
@@ -4564,7 +4576,7 @@ async fn an_ensure_from_a_stale_grant_read_is_answered_by_the_newer_supervisor()
         read.grant_revision + 1,
         "the job runs under the newer grants"
     );
-    remote.retire().await.unwrap();
+    remote.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// Revisions of one incarnation only grow, so the newer revision is the only one a stale read
@@ -4603,7 +4615,7 @@ async fn an_ensure_is_refused_by_a_supervisor_of_another_incarnation() {
         .await
         .unwrap_err();
     assert_eq!(refused.code, ErrorCode::Conflict, "{}", refused.message);
-    h.handle.retire().await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 #[tokio::test]
@@ -5570,7 +5582,7 @@ async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
     assert_eq!(sealed.stderr.bytes, total);
     assert_eq!(sealed.resources.as_ref(), Some(&terminal));
     handle.quiesce().await.unwrap();
-    handle.retire().await.unwrap();
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
     drop(harness);
 
     let successor = warm_harness(supervisor_config);
@@ -6371,7 +6383,7 @@ async fn a_foreground_nx_keeper_does_not_count_as_user_work_and_quiescence_drain
         h.spawned.try_recv().is_err(),
         "quiescence admits no replacement keeper"
     );
-    h.handle.retire().await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// How long a shed must go unused before its keeper stops the daemon it keeps.
@@ -6459,6 +6471,254 @@ impl Drop for LiveDaemon {
             let _ = serving.join();
         }
         let _ = std::fs::remove_dir_all(&self.sockets);
+    }
+}
+
+/// Land hands record cleanup to the controller without surrendering the supervisor's own jobs.
+/// The Recorded arms keep the ordinary retirement behavior as a real, fixture-owned control.
+#[tokio::test]
+async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_locally_and_over_socket()
+ {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use cowshed_core::runtime::{job_groups, supervisor_socket};
+
+    // A real one-process group, held by its actual parent until the supervisor concludes its job.
+    // No sandbox is needed to prove this actor/socket policy boundary, and no output pipe is open.
+    struct GroupSpawner {
+        reaped: mpsc::UnboundedSender<std::process::ExitStatus>,
+    }
+
+    struct HeldGroup {
+        child: std::process::Child,
+        process: OwnedProcess,
+        job: JobId,
+        events: mpsc::Sender<ProcessEvent>,
+        reaped: mpsc::UnboundedSender<std::process::ExitStatus>,
+        reported: bool,
+    }
+
+    #[async_trait]
+    impl SpawnSink for GroupSpawner {
+        async fn spawn(
+            &mut self,
+            request: ProcessSpawnRequest,
+            events: mpsc::Sender<ProcessEvent>,
+        ) -> Result<Box<dyn RunningProcess>> {
+            let SpawnCommand::Argv(argv) = &request.command else {
+                panic!("the fixture admits only its real sleep group");
+            };
+            assert_eq!(argv, &[OsString::from("sleep"), OsString::from("300")]);
+            let child = lone_group();
+            let process = owned(&child, Instant::now());
+            assert!(
+                process.birth.leader().is_some(),
+                "the parent identified its live child"
+            );
+            Ok(Box::new(HeldGroup {
+                child,
+                process,
+                job: request.job_id,
+                events,
+                reaped: self.reaped.clone(),
+                reported: false,
+            }))
+        }
+    }
+
+    impl RunningProcess for HeldGroup {
+        fn process(&self) -> Option<&OwnedProcess> {
+            Some(&self.process)
+        }
+
+        #[cfg(target_os = "macos")]
+        fn observations(&self) -> Option<&cowshed_core::runtime::process_monitor::ProcessMonitor> {
+            None
+        }
+
+        fn try_write_stdin(&mut self, _bytes: Bytes) -> Result<bool> {
+            panic!("the fixture admits only empty stdin");
+        }
+
+        fn close_stdin(&mut self) -> bool {
+            // lone_group starts with /dev/null as stdin; there is no parent write end to close.
+            true
+        }
+
+        fn end_stdin(&mut self) {}
+
+        fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
+            if self.reported {
+                return Ok(());
+            }
+            let pid = i32::try_from(self.child.id()).unwrap();
+            job_groups::signal_unreaped_group(
+                pid,
+                match signal {
+                    ProcessSignal::Term => libc::SIGTERM,
+                    ProcessSignal::Kill => libc::SIGKILL,
+                },
+            )
+            .expect("signal the fixture's held job group");
+            let exit = job_groups::await_exit_unreaped(pid).expect("observe the real job exit");
+            self.events
+                .try_send(ProcessEvent::Exited {
+                    job_id: self.job,
+                    exit,
+                })
+                .expect("publish the observed exit");
+            for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+                self.events
+                    .try_send(ProcessEvent::OutputEof {
+                        job_id: self.job,
+                        stream,
+                    })
+                    .expect("the fixture has no open output pipe");
+            }
+            self.reported = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for HeldGroup {
+        fn drop(&mut self) {
+            if !self.reported {
+                job_groups::signal_unreaped_group(
+                    i32::try_from(self.child.id()).unwrap(),
+                    libc::SIGKILL,
+                )
+                .expect("clean up the fixture's held group");
+            }
+            let exit = self.child.wait().expect("reap the concluded job's leader");
+            if let Err(error) = self.reaped.send(exit) {
+                eprintln!("the job's exit observer is gone: {error}");
+            }
+        }
+    }
+
+    for (name, over_socket) in [("retire-local", false), ("retire-socket", true)] {
+        for policy in [
+            NxDaemonRetirement::ControllerOwned,
+            NxDaemonRetirement::Recorded,
+        ] {
+            let (mut config, root) = nx_project(name);
+            let sockets = over_socket.then(|| TempRoot::new_in(Path::new("/tmp"), "cs-retire"));
+            let mut daemon = LiveDaemon::start(&config.workspace_root);
+            assert!(daemon.running(), "the foreign nominee starts alive");
+            std::os::unix::net::UnixStream::connect(&daemon.socket)
+                .expect("the valid daemon record names a live socket");
+            let ledger = root.join("supervisor.groups");
+            config.group_ledger = Some(ledger.clone());
+            let store = ArtifactStoreSink::open(
+                config.workspace_root.clone(),
+                &config.owned_repo_ids,
+                &config.authority,
+                config.artifacts.clone(),
+            )
+            .expect("open the real job artifact store");
+            let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
+                Box::new(cowshed_core::storage::audit::NullAuditSink),
+                8,
+            )
+            .unwrap();
+            let (reaped, mut exits) = mpsc::unbounded_channel();
+            let handle = WorkspaceSupervisor::start_with_sinks(
+                config,
+                Box::new(GroupSpawner { reaped }),
+                Box::new(store),
+                Box::new(commitments),
+            )
+            .unwrap();
+            let (caller, serving) = if let Some(sockets) = &sockets {
+                let path = sockets.join("s");
+                let bound = supervisor_socket::bind(&path).await.unwrap();
+                let server =
+                    tokio::spawn(supervisor_socket::serve(bound, handle.clone(), None, None));
+                (
+                    supervisor_socket::connect(path.clone(), handle.snapshot().clone()),
+                    Some((path, server)),
+                )
+            } else {
+                (handle.clone(), None)
+            };
+            let job = caller
+                .exec_background(
+                    None,
+                    None,
+                    ExecRequest {
+                        command: ExecCommand::Argv(vec!["sleep".into(), "300".into()]),
+                        cwd: None,
+                        ..request(StdinSource::Empty)
+                    },
+                )
+                .await
+                .unwrap();
+            let leaders = ledger_leaders(&ledger);
+            assert_eq!(leaders.len(), 1, "only the admitted job enters the ledger");
+            assert_eq!(leaders[0].0, job.get());
+            assert!(
+                leaders[0].1.is_some(),
+                "the job has an observed group identity"
+            );
+            assert_eq!(handle.info(job).await.unwrap().state, JobState::Running);
+            assert!(
+                daemon.running(),
+                "admitting a job leaves the foreign nominee alone"
+            );
+
+            caller.retire(policy).await.unwrap();
+
+            assert_eq!(
+                exits
+                    .try_recv()
+                    .expect("retirement reaps its actual owned job")
+                    .signal(),
+                Some(libc::SIGTERM),
+                "{name} {policy:?} retires the real owned group with TERM"
+            );
+            let ended = handle.wait(job).await.unwrap();
+            assert_eq!(ended.state, JobState::Killed);
+            assert_eq!(
+                ended.exit,
+                Some(ExitStatus::Signaled {
+                    signal: libc::SIGTERM,
+                    core_dumped: false
+                })
+            );
+            assert_eq!(
+                handle
+                    .exec(None, None, request(StdinSource::Empty))
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Conflict,
+                "{name} {policy:?} closes job admission"
+            );
+            match policy {
+                NxDaemonRetirement::ControllerOwned => {
+                    assert!(
+                        daemon.running(),
+                        "{name}: controller-owned retirement must not signal a record nominee"
+                    );
+                    std::os::unix::net::UnixStream::connect(&daemon.socket)
+                        .expect("the surviving nominee's recorded socket still accepts");
+                }
+                NxDaemonRetirement::Recorded => {
+                    assert_eq!(
+                        daemon.process.wait().unwrap().signal(),
+                        Some(libc::SIGTERM),
+                        "{name}: ordinary record cleanup still stops the fixture-owned nominee"
+                    );
+                }
+            }
+            if let Some((path, server)) = serving {
+                let replacement = supervisor_socket::bind(&path)
+                    .await
+                    .expect("retirement acknowledgement releases the real socket lease");
+                drop(replacement);
+                server.await.unwrap().unwrap();
+            }
+        }
     }
 }
 
@@ -6707,7 +6967,7 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
     }
     complete(&second, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(second.request.job_id).await.unwrap();
-    h.handle.retire().await.unwrap();
+    h.handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// Main is the operator's own checkout and its Nx daemon the host's: its supervisor starts none.
@@ -7320,7 +7580,7 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
             expected_span(&failed, "span-err", "exited"),
         ],
     );
-    handle.retire().await.unwrap();
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
 /// A job is durable and queued before the gateway grants it anything; the actor answers status
