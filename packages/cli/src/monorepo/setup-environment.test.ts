@@ -570,17 +570,16 @@ describe('Bun installation receipt link admission', () => {
   const CI_SECRETS = { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' };
 
   for (const ci of [false, true]) {
-    for (const defect of [
-      'broken-store',
-      'broken-transitive',
-      'broken-hoist',
-      'missing-manifest',
-      'malformed-manifest',
-    ]) {
-      it(`${ci ? 'CI' : 'local'} refuses ${defect} before writing an install receipt`, async () => {
-        await withManagedRepository(options, async ({ root, enterShell: enter }) => {
-          // Establish a successful entry, then remove only this fixture's prior receipt.
-          expect(await enter()).toEqual(HEALTHY);
+    it(`${ci ? 'CI' : 'local'} refuses each broken dependency topology before writing an install receipt`, async () => {
+      await withManagedRepository(options, async ({ root, enterShell: enter }) => {
+        const defects = ['broken-store', 'broken-transitive', 'broken-hoist', 'missing-manifest', 'malformed-manifest'];
+        expect(defects).toHaveLength(5);
+        for (const defect of defects) {
+          const label = `${ci ? 'CI' : 'local'} refuses ${defect} before writing an install receipt`;
+          // The prepare script rebuilds its topology; retain the unrelated TypeScript API pin.
+          await writeFile(join(root, 'integrity-installs'), '');
+          await writeFile(join(root, 'integrity-mode'), 'healthy');
+          expect(await enter(), label).toEqual(HEALTHY);
           const receipt = join(root, 'node_modules', '.smoo-install');
           await rm(receipt);
           await writeFile(join(root, 'integrity-mode'), defect);
@@ -599,19 +598,19 @@ describe('Bun installation receipt link admission', () => {
               : defect === 'broken-transitive' || defect === 'broken-hoist'
                 ? join(cache, 'missing-child')
                 : join(cache, 'fixture-child@1.0.0', 'node_modules', '@fixture', 'child');
-          expect(refused.exitCode).toBe(ci ? 1 : 0);
-          expect(refused.stderr).toContain('Bun install integrity:');
-          expect(refused.stderr).toContain(actualPath);
-          expect(refused.stderr).toContain(`expected target ${expectedTarget}`);
-          expect(refused.stderr).toContain(ci ? '--- ERROR:' : '--- WARNING:');
-          if (!ci) expect(refused.stderr).toContain('The shell is loaded WITHOUT installed dependencies');
-          expect(refused.stderr).not.toContain('! Failed to install dependencies with frozen lockfile');
-          expect(existsSync(receipt)).toBe(false);
+          expect(refused.exitCode, label).toBe(ci ? 1 : 0);
+          expect(refused.stderr, label).toContain('Bun install integrity:');
+          expect(refused.stderr, label).toContain(actualPath);
+          expect(refused.stderr, label).toContain(`expected target ${expectedTarget}`);
+          expect(refused.stderr, label).toContain(ci ? '--- ERROR:' : '--- WARNING:');
+          if (!ci) expect(refused.stderr, label).toContain('The shell is loaded WITHOUT installed dependencies');
+          expect(refused.stderr, label).not.toContain('! Failed to install dependencies with frozen lockfile');
+          expect(existsSync(receipt), label).toBe(false);
           // The guard is outside CI's frozen-command catch: a refusal cannot trigger another install.
-          expect(readFileSync(join(root, 'integrity-installs'), 'utf8')).toBe('x\nx\n');
-        });
+          expect(readFileSync(join(root, 'integrity-installs'), 'utf8'), label).toBe('x\nx\n');
+        }
       });
-    }
+    });
   }
 
   it('records complete transitive cache links after the normal CI frozen install', async () => {

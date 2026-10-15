@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { BOUNDED_TEST_PER_TEST_TIMEOUT_MS } from '@smoothbricks/nx-plugin/bounded-test-policy';
 import {
   fixtureSocketDirectory,
   nxDaemonProcesses,
@@ -371,10 +372,10 @@ describe('release planning with fixture git repositories', () => {
   it('kills timed-out fixture Git process groups so descendants cannot hold output pipes open', async () => {
     await withFixtureRepo(async (root) => {
       await expect(
-        git(root, ['-c', "alias.hold-pipes=!sh -c 'sleep 30 & exit 0'", 'hold-pipes'], undefined, 100),
+        git(root, ['-c', "alias.hold-pipes=!sh -c 'sleep 120 & exit 0'", 'hold-pipes'], undefined, 100),
       ).rejects.toThrow('timed out after 100ms');
     });
-  }, 5_000);
+  }, 30_000);
 
   it('repairs a scoped package from its project-name release tag without creating a package-name tag', async () => {
     await withFixtureRepo(async (author) => {
@@ -479,6 +480,14 @@ describe('release planning with fixture git repositories', () => {
  * a test that stops awaiting its fixture reaches the same state without
  * waiting out a deadline. `body` sees `root` and may print the pids to check
  * as `ABANDONED_FIXTURE_PIDS`.
+ *
+ * The nested runner is part of the harness, so it is bounded and configured explicitly. The calling test's bound
+ * cannot reach the nested test or its `onTestFinished` retirement, which would otherwise run under Bun's 5 s
+ * default; both get the per-test bound every bounded Bun leg declares. It runs from this package, because the
+ * fixture's socket namespace is the checkout's (`socketNamespace` reads the working directory), but under an
+ * empty config: the nested file imports plain TypeScript and the built nx-plugin, nothing that needs the package
+ * preload (the ttsc transform), so it is not loaded. That preload also isolated this process's Nx environment, so
+ * the nested run gets the environment as this process holds it now.
  */
 async function abandonFixture(body: string): Promise<{ root: string; pids: number[] }> {
   const helper = JSON.stringify(join(import.meta.dir, 'helpers', 'fixture-repo.ts'));
@@ -509,11 +518,17 @@ test('returns without its fixture body', async () => {
 });
 `,
     );
-    const run = Bun.spawn([process.execPath, 'test', testFile], {
-      cwd: join(import.meta.dir, '..', '..', '..'),
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const config = join(scratch, 'bunfig.toml');
+    await writeFile(config, '');
+    const run = Bun.spawn(
+      [process.execPath, 'test', `--config=${config}`, `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`, testFile],
+      {
+        cwd: join(import.meta.dir, '..', '..', '..'),
+        env: process.env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    );
     const [exitCode, stdout, stderr] = await Promise.all([
       run.exited,
       new Response(run.stdout).text(),

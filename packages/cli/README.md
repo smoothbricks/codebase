@@ -315,6 +315,19 @@ ending before its fixture is released prints the fixture's daemon log into the r
 records graph, hashing, and daemon-request phases without changing deadlines, retries, or daemon selection; it does not
 cancel a timed-out test body or claim to repair a stall.
 
+The fixture-Git process-group regression keeps its 100 ms command deadline and exact timeout oracle. Its outer 30 s case
+guard includes real repository initialization and cleanup; it is not the deadline being tested. The descendant holds the
+pipes for 120 s without a group kill, beyond that guard, so natural exit cannot make a broken cleanup pass.
+
+Receipt-admission defects run as one local walk and one CI walk over five labelled rows each. Every row keeps its
+healthy entry, exact refusal and two-install oracles; only the repository and command shims are shared. The fixture's
+prepare script rebuilds its dependency topology between rows without deleting the unrelated TypeScript API pin.
+
+Abandoned-fixture regressions run their nested `bun test` from the package directory, preserving the checkout's socket
+namespace. An explicit empty config omits the unrelated package preload, and the shared per-test bound governs the
+nested case and its retirement hook instead of Bun's implicit 5 s default. The nested runner explicitly inherits the
+outer runner's already-isolated environment.
+
 Nx-backed CLI fixtures declare `cacheDirectory: ".nx/cache"` in their own `nx.json`, keeping the task cache and native
 workspace-data database under the temporary workspace even when caller environment overrides are cleared. Their teardown
 stops the fixture daemon and removes that workspace; it must not leave one `~/.nx/<repoKey>` per fixture run.
