@@ -1155,6 +1155,10 @@ inject either marker. Parent-pool grants record `cpu.inherited: true` and their 
 `inherited=true`. Pool setup, listener and cleanup errors fail rather than bypassing accounting. Command bounds stay
 unchanged.
 
+The absent-parent fixture uses the executor's injectable budget with a real, controlled outer pool as its backing. It
+proves a positive allocation and re-acquires it after the command ends, rather than depending on free tokens in the
+host-wide gateway while the test runner itself holds an allocation. A bare count or unbudgeted success is not proof.
+
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:
 

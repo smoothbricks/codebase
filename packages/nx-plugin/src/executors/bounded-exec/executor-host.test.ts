@@ -258,24 +258,64 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
     });
   }, 30_000);
 
-  it('falls back to the host budget when its named pool is absent, never on the count it names', async () => {
+  it('uses a real backing budget after its named pool is absent and returns the allocation', async () => {
     const root = await createRoot();
     const stale = await withPool(1, async (pool) => pool.environment);
-    const run = await startRunner(
-      root,
-      'stale',
-      {
-        command: `node -e "console.log(String(process.env.${CPU_TOKENS_ENV}))"`,
+    await withPool(1, async (outer) => {
+      const options: BoundedExecOptions = {
+        command: `node -e "console.log('actual-tokens=' + process.env.${CPU_TOKENS_ENV})"`,
         timeoutMs: 20_000,
         parallelism: 1,
-      },
-      join(root, 'stale'),
-      childEnv({ ...stale, [CPU_TOKENS_ENV]: '977' }),
-    );
-    expect(await run.exited, run.stderr()).toBe(0);
-    expect(run.stderr()).toContain('cowshed: cpu-tokens parent pool refused: ');
-    expect(run.stderr()).not.toContain('inherited=true');
-    expect(run.stdout()).not.toContain('977');
+      };
+      const directory = join(root, 'stale');
+      const context = { root, record: { task: { id: 'stale', hash: null }, directory } };
+      const script = join(root, 'stale.mjs');
+      await writeFile(
+        script,
+        [
+          `import assert from 'node:assert/strict';`,
+          `import { availableParallelism } from 'node:os';`,
+          `import { runBoundedExec, createProcessTreeKiller } from ${JSON.stringify(EXECUTOR)};`,
+          `import { readInheritedCpuPool, takeParentCpuTokens } from ${JSON.stringify(join(dirname(EXECUTOR), 'cpu-pool.js'))};`,
+          RESOURCES_HANDLER,
+          `const backing = readInheritedCpuPool(${JSON.stringify(outer.environment)});`,
+          `const stale = readInheritedCpuPool(${JSON.stringify({ ...stale, [CPU_TOKENS_ENV]: '977' })});`,
+          'assert(backing !== null && stale !== null);',
+          `const options = ${JSON.stringify(options)};`,
+          `const context = ${JSON.stringify(context)};`,
+          'const asked = [];',
+          'const allocations = [];',
+          'let released = 0;',
+          'const budget = { async take(want, checkout, command) {',
+          '  asked.push({ want, checkout, command });',
+          '  const grant = await takeParentCpuTokens(backing, want, availableParallelism());',
+          '  assert(grant.granted, grant.reason);',
+          '  allocations.push(grant);',
+          '  return { ...grant, release() { released++; grant.release(); } };',
+          '} };',
+          'const result = await runBoundedExec(options, context, createProcessTreeKiller(), null, budget, stale);',
+          'assert(result.success, result.terminalOutput);',
+          'assert.deepEqual(asked, [{ want: 1, checkout: context.root, command: options.command }]);',
+          'assert.equal(released, 1);',
+          'await allocations[0].closed;',
+          'const returned = await takeParentCpuTokens(backing, 1, availableParallelism());',
+          'assert(returned.granted, returned.reason);',
+          'assert.equal(returned.tokens, 1);',
+          'returned.release();',
+          'await returned.closed;',
+          `console.log('actual-allocation-returned');`,
+          '',
+        ].join('\n'),
+      );
+      const run = startChild(script, childEnv(outer.environment));
+      expect(await run.exited, run.stderr()).toBe(0);
+      expect(run.stderr()).toContain('cowshed: cpu-tokens parent pool refused: ');
+      expect(run.stderr()).toContain('status=ok inherited=true tokens=1/1');
+      expect(run.stdout()).toContain('actual-tokens=1');
+      expect(run.stdout()).toContain('actual-allocation-returned');
+      expect(run.stdout()).not.toContain('977');
+      expect(await readFile(join(directory, VERDICT_FILE), 'utf8')).toMatch(/"tokens":\s*1/);
+    });
   }, 30_000);
 
   it('stops a command whose parent pool closes under it, and fails its run', async () => {
