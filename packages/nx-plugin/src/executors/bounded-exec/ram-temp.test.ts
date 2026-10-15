@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
-import { writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +17,7 @@ import {
   mountsBelow,
   operationDisk,
   RAM_TEMP_CAPACITY_BYTES,
+  RamTempVolume,
   ramDisksIn,
   ramTempPaths,
 } from './ram-temp.js';
@@ -242,6 +243,48 @@ describe('RAM temp volume on this host', () => {
 });
 
 describe('processes a task left working in its RAM lease', () => {
+  it('skips only empty or absent lease directories and reports missing census tools as inspection failures', async () => {
+    const directory = mkdtempSync(join(realpathSync(tmpdir()), 'lease-reap-errors-'));
+    let scans = 0;
+    let failure = Object.assign(new Error('spawn /usr/sbin/lsof ENOENT'), { code: 'ENOENT' });
+    const volume = new RamTempVolume(
+      ramTempPaths({ uid: 0, username: 'fixture' }),
+      1,
+      {
+        async run() {
+          throw new Error('reap must not provision a disk');
+        },
+      },
+      undefined,
+      undefined,
+      {
+        async stopWorkingIn() {
+          scans += 1;
+          throw failure;
+        },
+      },
+    );
+    const lease = { directory, mountpoint: directory, capacityBytes: 1 };
+    try {
+      expect(await volume.reap(lease)).toEqual({ ok: true, value: [] });
+      await rm(directory, { recursive: true });
+      expect(await volume.reap(lease)).toEqual({ ok: true, value: [] });
+      expect(scans).toBe(0);
+      await mkdir(directory);
+      await writeFile(join(directory, 'owned-file'), 'still requires inspection');
+      for (const code of ['ENOENT', 'EACCES']) {
+        failure = Object.assign(new Error(`spawn /usr/sbin/lsof ${code}`), { code });
+        expect(await volume.reap(lease)).toEqual({
+          ok: false,
+          error: { kind: 'provision-failed', step: 'reap', detail: failure.message },
+        });
+      }
+      expect(scans).toBe(2);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   const scratch = (): string => mkdtempSync(join(realpathSync(tmpdir()), 'lease-leftovers-'));
 
   /**
