@@ -6912,8 +6912,11 @@ mod tests {
             ),
         ];
 
+        // Every row retains the same captured real-Git evidence; only its companion tree changes.
+        let fixture = Fixture::new();
         for (label, grants, companion, expect) in CASES {
-            let fixture = Fixture::new();
+            fs::remove_dir_all(&fixture.project).unwrap();
+            fs::create_dir_all(&fixture.project).unwrap();
             let source = fixture.source(None);
             let image = fixture.main_image();
             fs::create_dir_all(image.retained.parent().unwrap()).unwrap();
