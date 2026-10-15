@@ -15,7 +15,10 @@ import {
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { OpContextBinding } from '@smoothbricks/lmao';
+import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
 import {
+  type CommandOutput,
   createHostCommands,
   type HostCommands,
   mountsBelow,
@@ -301,37 +304,82 @@ const FAILING_STEPS = [
  * disk, with the staging mount on it, and removes the staging directory the attempt made.
  */
 async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
+  const trace = useTestSpan<OpContextBinding>();
+  process.stderr.write(`RAM provisioning case started in ${process.pid}\n`);
   for (const { injected, reported } of FAILING_STEPS) {
     const { parent, paths, capacity } = scratchVolume(2);
     const host = createHostCommands();
+    const calls: { file: string; args: readonly string[]; output: CommandOutput }[] = [];
     const commands: HostCommands = {
       async run(file, args, deadlineMs) {
-        if (stepOf(file, args) === injected) {
-          return { status: 1, stdout: '', stderr: 'injected' };
+        const record =
+          stepOf(file, args) !== null ||
+          (file === '/usr/bin/hdiutil' && ['attach', 'detach'].includes(args[0] ?? '')) ||
+          (file === '/usr/sbin/diskutil' && args[0] === 'apfs');
+        const startedAt = Date.now();
+        const starting = JSON.stringify({ injected, phase: 'command-start', file, args });
+        trace.log.info(starting);
+        process.stderr.write(`${starting}\n`);
+        const output =
+          stepOf(file, args) === injected
+            ? { status: 1, stdout: '', stderr: 'injected' }
+            : await host.run(file, args, deadlineMs);
+        if (record) {
+          calls.push({ file, args, output });
         }
-        return host.run(file, args, deadlineMs);
+        const finished = JSON.stringify({
+          injected,
+          phase: 'command-end',
+          file,
+          args,
+          output: record
+            ? output
+            : { status: output.status, stderr: output.stderr, stdoutBytes: Buffer.byteLength(output.stdout) },
+          elapsedMs: Date.now() - startedAt,
+        });
+        trace.log.info(finished);
+        process.stderr.write(`${finished}\n`);
+        return output;
       },
     };
     try {
       const refused = await new RamTempVolume(paths, capacity, commands).acquire();
+      const refusal = JSON.stringify({ injected, refused }, null, 2);
+      trace.log.info(refusal);
+      process.stderr.write(`${refusal}\n`);
       // A cowshed sandbox cannot attach images, so provisioning stops before the injected step.
       if (!refused.ok && refused.error.kind === 'provision-failed' && refused.error.step !== reported) {
         expectSandboxed(refused.error);
         continue;
       }
-      expect(refused).toMatchObject({ ok: false, error: { kind: 'provision-failed', step: reported } });
-      expect(JSON.stringify(refused)).toContain('injected');
+      const detail = JSON.stringify({ injected, refused, calls }, null, 2);
+      expect(refused, detail).toEqual({
+        ok: false,
+        error: { kind: 'provision-failed', step: reported, detail: 'exit 1: injected' },
+      });
+      expect(
+        calls
+          .filter((call) => call.file === '/usr/bin/hdiutil' && call.args[0] === 'detach')
+          .map((call) => call.output.status),
+        detail,
+      ).toEqual([0]);
       const listed = await host.run('/usr/sbin/diskutil', ['list']);
+      const remaining = listed.stdout.split('\n').filter((line) => line.includes(paths.volumeName));
+      const inventory = JSON.stringify({ injected, inventory: { status: listed.status, remaining } }, null, 2);
+      trace.log.info(inventory);
+      process.stderr.write(`${inventory}\n`);
       expect(listed.status).toBe(0);
-      expect(listed.stdout.split('\n').filter((line) => line.includes(paths.volumeName))).toEqual([]);
+      expect(remaining, detail).toEqual([]);
       const table = await host.run('/sbin/mount', []);
       expect(table.status).toBe(0);
       expect(mountsBelow(table.stdout, paths.mountpoint)).toEqual([]);
       expect(mountsBelow(table.stdout, paths.staging)).toEqual([]);
       expect(existsSync(paths.staging)).toBe(false);
     } finally {
+      trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-start' }));
       await detachAll(paths, capacity);
       rmSync(parent, { recursive: true, force: true });
+      trace.log.info(JSON.stringify({ injected, phase: 'test-teardown-done' }));
     }
   }
 }

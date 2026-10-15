@@ -1128,6 +1128,13 @@ recovery over the debris, concurrent leases, failed-acquire lease/claim rollback
 owner detach and reclaim, and the final detach. External symlink targets and held directory modes stay unchanged,
 without duplicate provision and teardown; its 60 s case bound is unchanged and its target has the progress bound.
 
+The host target names both owned files with `./` paths: Bun otherwise interprets a bare path as a filter over recursive
+test discovery. This changes no selected case or timeout. The failed-provisioning regression keeps its exact injected
+refusal and rollback exit-status assertions, then checks the named volume and both mountpoints before test teardown. Its
+trace records command start/end times, refusal, inventory and separate teardown. Commands, refusal and inventory are
+also written to stderr immediately, because a runner timeout can end the process before the harness flushes its trace. A
+reported rollback failure must not be mistaken for a successful detach that left a volume behind.
+
 Whatever still works in a lease when its task ends is a leak, and is stopped before the lease goes. The usual one is a
 fixture's Nx daemon: Nx detaches it into a session of its own, so the process-group kill that ends a timed-out command
 never reaches it, and a test process that is killed runs no teardown. Deleting its root asks the daemon to leave only by
