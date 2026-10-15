@@ -3324,7 +3324,7 @@ pub struct DatabaseHolder {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdoptionCheck {
     pub hits: u64,
-    /// Each Nx task that missed: a defect in the project's build configuration.
+    /// Checked tasks not restored, including uncacheable tasks and absent local results.
     pub misses: Vec<CacheMiss>,
     /// Checks without an attributed source summary: counted neither as hits nor as misses.
     pub unattributed: Vec<UnattributedCheck>,
@@ -3332,7 +3332,7 @@ pub struct AdoptionCheck {
     pub failed: Vec<FailedCheck>,
 }
 
-/// A landed check whose Nx run summary in one of the target's caches was not its own.
+/// A landed check without an attributable run summary in the landing workspace's cache.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UnattributedCheck {
