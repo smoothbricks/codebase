@@ -229,10 +229,11 @@ pub struct Opening {
 
 /// Take, without waiting, the open lock of each task database the volume rooted at `volume`
 /// holds and of each one `next` holds at the same place, which an Nx process opening through
-/// the checkout's link would create in `volume` while the link still names it. Answers the held
-/// locks, or the first database an Nx process is opening right now, after letting go of the
-/// rest. While the locks are held, [`held`] covers every Nx process: one that opened a database
-/// before holds it, and one that had not waits until the locks are let go.
+/// the checkout's link would create in `volume` while the link still names it. For mounted
+/// capture, `next` is `volume` and the returned guards stay alive through publication.
+/// Answers the held locks, or the first database an Nx process is opening right now, after
+/// letting go of the rest. While the locks are held, a final [`held`] check distinguishes
+/// existing database holders from openers waiting until these guards are dropped.
 #[cfg(target_os = "macos")]
 pub fn hold_opens(
     volume: &Path,

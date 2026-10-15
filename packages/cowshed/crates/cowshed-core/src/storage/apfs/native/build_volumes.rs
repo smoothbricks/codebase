@@ -79,14 +79,14 @@ where
     }
 
     /// Clone `source`'s image to the new volume `destination`, with `record`. The clone is not
-    /// attached. A mounted source's volume is flushed first; the caller guarantees nothing
-    /// writes it while it is cloned (a seed has no writer, a landing volume is quiesced). The
-    /// clone is held from before its image exists until its record is written, so a collection
-    /// that lists it in between never releases it as an interrupted creation.
+    /// attached. A mounted source is flushed and captured live under the runtime caller's
+    /// retained Nx/Cargo guards; other contributed paths are exempt. Immutable sources are
+    /// captured detached. The destination is held from before its image exists until its record
+    /// is written, so collection never releases it as an interrupted creation in between.
     ///
-    /// The clone keeps the source's flushed post-restore clock. A mounted source is claimed
-    /// ([`Self::claim_capture_source`]) and held exclusively against job admission until the
-    /// seed is marked; an admitted job after that hold is released makes it behind
+    /// The seed's write mark comes from the captured clone, before its extent-map first write.
+    /// A mounted source is claimed ([`Self::claim_capture_source`]) and held exclusively against
+    /// job admission until publication; a later source write makes the seed behind
     /// (16_build_volumes.md, "Targets and seeds").
     pub fn clone_build_volume(
         &self,
@@ -159,11 +159,11 @@ where
         )
     }
 
-    /// Clone the build volume `claim` holds to `destination`, borrowing that claim for the whole
-    /// capture: the seal, the canonical restore, the freshness mark and the destination's record
-    /// all run under it. A second exclusive claim on the same hold file would conflict with it,
-    /// and an upgrade would reopen admission (16_build_volumes.md, "Targets and seeds"). The source
-    /// is the claim's own volume, so no caller can pair a claim with another volume's id.
+    /// Clone the build volume `claim` holds to `destination`, borrowing that claim through
+    /// capture, the immutable freshness mark and the destination's record. A second exclusive
+    /// claim on the same hold file would conflict with it, and an upgrade would reopen admission
+    /// (16_build_volumes.md, "Targets and seeds"). The runtime caller retains Nx/Cargo guards;
+    /// the source is the claim's own volume, so a claim cannot be paired with another volume.
     pub fn clone_claimed_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -206,11 +206,7 @@ where
             }
             return Err(error);
         }
-        let written = if mount.is_some() {
-            self.build_volume_written(layout, source)?
-        } else {
-            written_at(&to)?
-        };
+        let written = written_at(&to)?;
         // The clone's own extent map, paid here rather than by its first write inside a mount.
         self.write_first(&to)?;
         self.mark_seed_written(layout, destination, written)?;
@@ -235,10 +231,10 @@ where
         written_at(&image)
     }
 
-    /// Record that seed `seed` holds every relevant write its target's live volume had at
-    /// `written`. The canonical restore is flushed under the admission hold before that mark;
-    /// a fork's mount and dropped daemon record likewise do not add reusable build state.
-    /// Admitted jobs can write only after the claim or Quiet's stopped socket lease is released.
+    /// Record the write instant held by seed `seed`, taken from the clone before its own
+    /// extent-map write, never from the live source after capture. A fork's mount and dropped
+    /// daemon record likewise do not add reusable build state. Admitted jobs can write only
+    /// after the claim or Quiet's stopped socket lease is released.
     pub fn mark_seed_written(
         &self,
         layout: &BuildVolumeLayout,
@@ -712,16 +708,17 @@ impl<'a> MountPoint<'a> {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+    use super::super::{KernelMountSource, SystemKernelMountSource};
     use super::*;
     use crate::api::resources::JobAccounting;
     use crate::build_volume::BuildVolumeRole;
     use crate::metadata::WorkspaceName;
     use crate::repository::{ProjectPaths, RepoId};
     use crate::storage::apfs::ApfsSubstrateConfig;
-    use cowshed_apfs::{
-        AttachedDiskImage, CommandOutput, CommandRequest, CommandRunError, SystemCommandRunner,
-    };
-    use cowshed_os::fork_lock::Fenced;
+    use cowshed_apfs::mounts::KernelMountSnapshot;
+    use cowshed_apfs::{CommandRequest, SystemCommandRunner};
+    use std::io::Read;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant, SystemTime};
 
@@ -731,13 +728,16 @@ mod tests {
         MacOsApfsExecutionHost<SystemCommandRunner>,
         BuildVolumeLayout,
     ) {
-        fixture_with(root, SystemCommandRunner)
+        fixture_with(root, SystemKernelMountSource)
     }
 
-    fn fixture_with<R: CommandRunner>(
+    fn fixture_with(
         root: &Path,
-        runner: R,
-    ) -> (MacOsApfsExecutionHost<R>, BuildVolumeLayout) {
+        mount_source: impl KernelMountSource,
+    ) -> (
+        MacOsApfsExecutionHost<SystemCommandRunner>,
+        BuildVolumeLayout,
+    ) {
         let store = root.join("store");
         fs::create_dir_all(&store).unwrap();
         let project = ProjectPaths::with_mount_root(
@@ -746,93 +746,57 @@ mod tests {
             &RepoId::parse("acme/widget").unwrap(),
         )
         .unwrap();
-        let host = MacOsApfsExecutionHost::new(
-            runner,
+        let host = MacOsApfsExecutionHost::with_mount_source(
+            SystemCommandRunner,
             ApfsSubstrateConfig::new(&store, root.join("checkout")),
+            mount_source,
         )
         .unwrap();
         (host, BuildVolumeLayout::new(&project).unwrap())
     }
 
-    struct RestoreAdmissionRunner {
+    /// Observe admission at the mounted-source selection that leads to the live clone, while
+    /// forwarding the real kernel mount table. No remount or command is part of that capture.
+    struct CaptureAdmissionMounts {
         layout: BuildVolumeLayout,
         source: BuildVolumeId,
         socket: Option<(tokio::runtime::Handle, PathBuf)>,
-        armed: AtomicBool,
-        denied: AtomicBool,
+        denied: Arc<AtomicBool>,
     }
 
-    impl CommandRunner for RestoreAdmissionRunner {
-        fn run_guarded<E>(
-            &self,
-            request: &CommandRequest,
-            check: impl FnOnce() -> Result<bool, E>,
-        ) -> Result<Option<CommandOutput>, E>
-        where
-            E: From<CommandRunError> + std::fmt::Display,
-        {
-            SystemCommandRunner.run_guarded(request, check)
-        }
-        fn run(&self, request: &CommandRequest) -> Result<CommandOutput, CommandRunError> {
-            let output = SystemCommandRunner.run(request)?;
-            if request.program == Path::new("/sbin/mount_apfs")
-                && output.succeeded()
-                && request
-                    .args
-                    .last()
-                    .is_some_and(|mount| Path::new(mount) == self.layout.mount(&self.source))
-                && self.armed.swap(false, Ordering::SeqCst)
-            {
+    impl KernelMountSource for CaptureAdmissionMounts {
+        fn mounts(&self) -> Result<Vec<KernelMountSnapshot>, ApfsStorageError> {
+            let mounts = SystemKernelMountSource.mounts()?;
+            if !self.denied.load(Ordering::SeqCst) {
                 if let Some((runtime, socket)) = &self.socket {
                     let refused = runtime
                         .block_on(crate::runtime::supervisor_socket::bind(socket))
-                        .expect_err("replacement admission must stay closed through the seed mark");
+                        .expect_err("replacement admission must stay closed during capture");
                     assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
-                } else {
-                    let refused = self.layout.hold(&self.source).expect_err(
-                        "no job may be admitted after canonical restore and before the seed mark",
-                    );
+                    self.denied.store(true, Ordering::SeqCst);
+                } else if let Err(refused) = self.layout.hold(&self.source) {
+                    // clone_build_volume first checks for a mount before taking its claim.
+                    // Its second census, in clone_claimed_build_volume, must refuse a job.
                     assert_eq!(refused.kind(), io::ErrorKind::ResourceBusy);
+                    self.denied.store(true, Ordering::SeqCst);
                 }
-                self.denied.store(true, Ordering::SeqCst);
             }
-            Ok(output)
-        }
-
-        fn image_lease(&self, identity: &Path) -> io::Result<Option<Fenced<fs::File>>> {
-            SystemCommandRunner.image_lease(identity)
-        }
-
-        fn pin_raw_device(&self, device: &Path) -> io::Result<Option<Fenced<fs::File>>> {
-            SystemCommandRunner.pin_raw_device(device)
-        }
-
-        fn attached_disk_images(&self) -> io::Result<Vec<AttachedDiskImage>> {
-            SystemCommandRunner.attached_disk_images()
-        }
-
-        fn grow_image(&self, image: &Path, capacity: ImageCapacity) -> io::Result<()> {
-            SystemCommandRunner.grow_image(image, capacity)
+            Ok(mounts)
         }
     }
 
     #[test]
-    fn real_apfs_build_seed_restore_is_fresh_until_an_admitted_job_writes() {
+    fn real_apfs_build_seed_live_capture_is_fresh_until_an_admitted_job_writes() {
         let root = crate::scratch_apfs::ScratchRoot::new("seed-admission-clock").unwrap();
         let source = BuildVolumeId::mint();
-        let (_, layout) = fixture(root.path());
-        let runner = RestoreAdmissionRunner {
-            layout: layout.clone(),
-            source: source.clone(),
-            socket: None,
-            armed: AtomicBool::new(false),
-            denied: AtomicBool::new(false),
-        };
-        let (host, layout) = fixture_with(root.path(), runner);
+        let (system, layout) = fixture(root.path());
         crate::blank_image::blank_image(&layout.image(&source));
-        let mount = host.mount_build_volume(&layout, &source).unwrap();
+        let mount = system.mount_build_volume(&layout, &source).unwrap();
         layout.write_record(&source, &linked("main")).unwrap();
         fs::write(mount.join("warm"), b"captured build state\n").unwrap();
+        fs::create_dir(mount.join("cache")).unwrap();
+        fs::write(mount.join("cache/index"), b"captured index state\n").unwrap();
+        let mut reader = fs::File::open(mount.join("cache/index")).unwrap();
         let before = snapshot(&mount);
         let owner = fs::read(layout.record(&source)).unwrap();
         let record = BuildVolumeRecord::new(
@@ -842,24 +806,45 @@ mod tests {
                 incarnation: WorkspaceIncarnation::new("a".repeat(32)).unwrap(),
             },
         );
-        host.backend.runner().armed.store(true, Ordering::SeqCst);
+        let denied = Arc::new(AtomicBool::new(false));
+        let (host, _) = fixture_with(
+            root.path(),
+            CaptureAdmissionMounts {
+                layout: layout.clone(),
+                source: source.clone(),
+                socket: None,
+                denied: Arc::clone(&denied),
+            },
+        );
         let seed = BuildVolumeId::mint();
         host.clone_build_volume(&layout, &source, &seed, &record)
             .unwrap();
-        assert!(host.backend.runner().denied.load(Ordering::SeqCst));
+        assert!(denied.load(Ordering::SeqCst));
+        assert!(
+            host.backend
+                .existing_attachment(&layout.image(&seed))
+                .unwrap()
+                .is_none(),
+            "the live source capture leaves its seed detached"
+        );
+        let mut index = String::new();
+        reader.read_to_string(&mut index).unwrap();
+        assert_eq!(index, "captured index state\n");
+        drop(reader);
         let live = host.build_volume_written(&layout, &source).unwrap();
         let seeded = host.build_volume_written(&layout, &seed).unwrap();
-        eprintln!("canonical restore seed clock={seeded:?}, flushed live={live:?}");
+        let captured_written = seeded;
+        eprintln!("live capture seed clock={seeded:?}, flushed live={live:?}");
         assert!(
             live <= seeded,
-            "own restore must leave a Fresh seed without tolerance"
+            "capture without a later write leaves a Fresh seed without tolerance"
         );
         assert_eq!(snapshot(&mount), before);
         assert_eq!(fs::read(layout.record(&source)).unwrap(), owner);
 
         let admitted = layout
             .hold(&source)
-            .expect("job admission after restore hold release");
+            .expect("job admission after capture hold release");
         let refused_seed = BuildVolumeId::mint();
         let me = i32::try_from(std::process::id()).expect("pid");
         let refused = host.clone_build_volume(&layout, &source, &refused_seed, &record);
@@ -895,6 +880,7 @@ mod tests {
         );
         let live = host.build_volume_written(&layout, &source).unwrap();
         let seeded = host.build_volume_written(&layout, &seed).unwrap();
+        assert_eq!(seeded, captured_written, "the capture mark stays immutable");
         eprintln!("admitted job seed clock={seeded:?}, flushed live={live:?}");
         assert!(
             live > seeded,
@@ -916,14 +902,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_apfs_quiet_seed_restore_refuses_admission_until_the_mark() {
+    async fn real_apfs_quiet_seed_live_capture_refuses_admission_until_publication() {
         use crate::api::dto::{ExecCommand, ExecRequest, ExitStatus, RunSandboxMode, StdinSource};
         use crate::runtime::build_volumes::BuildVolumes;
         use crate::runtime::supervisor::{
             CommitmentPublisher, WorkspaceSupervisor, WorkspaceSupervisorConfig,
         };
         use crate::runtime::supervisor_socket;
-        use std::sync::Arc;
 
         let root = crate::scratch_apfs::ScratchRoot::new("seed-quiet-admission").unwrap();
         let source = BuildVolumeId::mint();
@@ -938,6 +923,9 @@ mod tests {
         layout.write_record(&source, &linked("main")).unwrap();
         crate::build_volume::link::point(&checkout, &mount).unwrap();
         fs::write(mount.join("warm"), b"captured build state\n").unwrap();
+        fs::create_dir(mount.join("cache")).unwrap();
+        fs::write(mount.join("cache/index"), b"captured index state\n").unwrap();
+        let mut reader = fs::File::open(mount.join("cache/index")).unwrap();
         let before = snapshot(&mount);
         let owner = fs::read(layout.record(&source)).unwrap();
         let volumes = BuildVolumes::new(Arc::new(system), layout.clone());
@@ -956,14 +944,16 @@ mod tests {
             .await
             .unwrap()
             .expect("the stopped workspace has no writers");
-        let runner = RestoreAdmissionRunner {
-            layout: layout.clone(),
-            source: source.clone(),
-            socket: Some((tokio::runtime::Handle::current(), socket.clone())),
-            armed: AtomicBool::new(true),
-            denied: AtomicBool::new(false),
-        };
-        let (host, _) = fixture_with(root.path(), runner);
+        let denied = Arc::new(AtomicBool::new(false));
+        let (host, _) = fixture_with(
+            root.path(),
+            CaptureAdmissionMounts {
+                layout: layout.clone(),
+                source: source.clone(),
+                socket: Some((tokio::runtime::Handle::current(), socket.clone())),
+                denied: Arc::clone(&denied),
+            },
+        );
         let host = Arc::new(host);
         let seed = BuildVolumeId::mint();
         let record = BuildVolumeRecord::new(
@@ -983,13 +973,25 @@ mod tests {
             })
         };
         capture.await.unwrap().unwrap();
-        assert!(host.backend.runner().denied.load(Ordering::SeqCst));
+        assert!(denied.load(Ordering::SeqCst));
+        assert!(
+            host.backend
+                .existing_attachment(&layout.image(&seed))
+                .unwrap()
+                .is_none(),
+            "the quiet source capture leaves its seed detached"
+        );
+        let mut index = String::new();
+        reader.read_to_string(&mut index).unwrap();
+        assert_eq!(index, "captured index state\n");
+        drop(reader);
         let live = host.build_volume_written(&layout, &source).unwrap();
         let seeded = host.build_volume_written(&layout, &seed).unwrap();
-        eprintln!("quiet restore seed clock={seeded:?}, flushed live={live:?}");
+        let captured_written = seeded;
+        eprintln!("quiet live capture seed clock={seeded:?}, flushed live={live:?}");
         assert!(
             live <= seeded,
-            "Quiet's restore must leave Fresh without tolerance"
+            "Quiet's live capture leaves Fresh without a later write or tolerance"
         );
         assert_eq!(snapshot(&mount), before);
         assert_eq!(fs::read(layout.record(&source)).unwrap(), owner);
@@ -1077,6 +1079,7 @@ mod tests {
         );
         let live = host.build_volume_written(&layout, &source).unwrap();
         let seeded = host.build_volume_written(&layout, &seed).unwrap();
+        assert_eq!(seeded, captured_written, "the capture mark stays immutable");
         eprintln!("replacement admitted job seed clock={seeded:?}, flushed live={live:?}");
         assert!(
             live > seeded,

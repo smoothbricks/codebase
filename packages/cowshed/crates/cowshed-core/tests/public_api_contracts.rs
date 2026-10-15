@@ -982,6 +982,24 @@ fn seed_capture_skip_shapes_preserve_the_named_writer_and_refusal() {
         building
     );
     assert_eq!(building.name(), "landingBuilding");
+    let opening = AdoptionSkip::LandingOpening {
+        database: PathBuf::from("/build/nx/workspace-data/tasks.db"),
+        holders: vec![DatabaseHolder {
+            pid: 43,
+            command: "node nx build widget".into(),
+        }],
+    };
+    let wire = json!({
+        "kind": "landingOpening",
+        "database": "/build/nx/workspace-data/tasks.db",
+        "holders": [{"pid": 43, "command": "node nx build widget"}]
+    });
+    assert_eq!(serde_json::to_value(&opening).unwrap(), wire);
+    assert_eq!(
+        serde_json::from_value::<AdoptionSkip>(wire).unwrap(),
+        opening
+    );
+    assert_eq!(opening.name(), "landingOpening");
 }
 
 #[test]

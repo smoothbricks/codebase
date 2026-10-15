@@ -124,6 +124,10 @@ export type AdoptionSkip =
       readonly database: string;
       readonly holders: ReadonlyArray<DatabaseHolder>;
     })
+  | ({ readonly kind: 'landingOpening' } & {
+      readonly database: string;
+      readonly holders: ReadonlyArray<DatabaseHolder>;
+    })
   | ({ readonly kind: 'landingDaemonStayed' } & {
       readonly daemon: DatabaseHolder;
     })

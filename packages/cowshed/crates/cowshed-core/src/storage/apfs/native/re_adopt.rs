@@ -463,9 +463,9 @@ where
     }
 
     /// Freeze one seed of main's published build volume, then mount the live volume where main's
-    /// link points. An already-detached source is captured before its first mount, not mounted
-    /// merely to detach and restore it for capture. Admission stays closed through the new seed's
-    /// post-mount freshness mark. A seed an earlier attempt froze keeps its original mark.
+    /// link points. An already-detached source is captured before its first mount. Admission stays
+    /// closed through capture and publication; the immutable freshness mark comes from the clone,
+    /// never a later live-source clock. A seed an earlier attempt froze keeps its original mark.
     fn seed_replacement(
         &self,
         layout: &BuildVolumeLayout,
@@ -498,8 +498,7 @@ where
         );
         self.clone_claimed_build_volume(layout, claim, &destination, &record)?;
         self.mount_build_volume(layout, claim.id())?;
-        let written = self.build_volume_written(layout, claim.id())?;
-        self.mark_seed_written(layout, &destination, written)
+        Ok(())
     }
 
     /// Publish a verified build replacement under its build volume identity: detach it without
@@ -920,7 +919,7 @@ mod tests {
             assert_eq!(
                 self.layout.hold(&self.id).unwrap_err().kind(),
                 io::ErrorKind::ResourceBusy,
-                "job admission stays closed through the mount and freshness mark"
+                "job admission stays closed through capture and mount"
             );
             Err(CommandRunError {
                 request: request.clone(),

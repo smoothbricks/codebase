@@ -1900,11 +1900,14 @@ impl From<CloneFileError> for ApfsError {
     }
 }
 
-/// Source images may be captured live; immutable templates and build seeds are captured only
-/// while their source inode is held against attachment (specs/cowshed/16_build_volumes.md).
+/// Mounted workspace and build sources may be captured live. Runtime retains the named Nx/Cargo
+/// guards for build capture; other contributed paths are exempt. Immutable templates and seed
+/// source images remain held against attachment (specs/cowshed/16_build_volumes.md).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageCapture {
+    /// Descriptor-clone without changing the source's attachment or mount state.
     Live,
+    /// Hold the source inode against attachment throughout the descriptor clone.
     Detached,
 }
 
@@ -1925,8 +1928,8 @@ pub trait ApfsBackend {
     /// Push the latest writes of a source still in use into its image file: flush its volume
     /// when `mount_point` is mounted read-write, then the image file itself. A read-only mount
     /// holds no dirty volume writes and is not flushed. What the flushed file's modification
-    /// time then says is current. Live source captures may follow the flush; build-state captures
-    /// still require detached writer exclusion.
+    /// time then says is current. Live workspace and guarded build-source captures follow this
+    /// flush; the immutable capture mark comes from the clone, not a later live-source clock.
     ///
     /// Only the source is flushed. The host-wide `sync(8)` this replaces also waited for every
     /// other mounted volume's dirty data — measured at 16 s, and at 39 s inside a fork under a
@@ -4415,8 +4418,8 @@ fn raw_device_from(device: &str) -> String {
 }
 
 /// One source inode retained from no-follow open through descriptor cloning. Detached captures
-/// also retain the shared lock that excludes an image driver; live source captures retain no
-/// attachment lock and leave the source mounted.
+/// also retain the shared lock that excludes an image driver. Live workspace and guarded build
+/// captures retain no attachment lock and leave the source mounted; callers own writer admission.
 #[cfg(target_os = "macos")]
 struct ImageSource<'a> {
     file: File,

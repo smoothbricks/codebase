@@ -154,8 +154,8 @@ done. They are independent of each other.
 
 - Governing contract: specs/cowshed/11_shell.md, "Controller/supervisor protocol" (:273-284), defines drain as stopping
   admission, letting running jobs finish, then retiring; retirement releases the listener and lease before
-  acknowledgement (:206-213). specs/cowshed/16_build_volumes.md, "Owned index links" (:161-169), requires non-forced
-  holder exclusion for seed capture and forbids copying an index to the source volume to evade a holder.
+  acknowledgement (:206-213). specs/cowshed/16_build_volumes.md, "Owned index links", names Nx and Cargo writer
+  exclusion for seed capture, exempts other contributed paths, and forbids copying an index onto the source volume.
 - Existing mechanism: runtime/supervisor_socket.rs:345-348 has internal Quiesce/Retire calls; :1317-1327 dispatches
   them. Its drain at :1503-1537 uses the existing cross-build request and verifies the live socket peer's kernel
   identity before retaining its exit watch. runtime/supervisor_manager.rs:205-217 exposes only Ensure/SameBuild,
@@ -170,3 +170,19 @@ done. They are independent of each other.
   remains served. A subsequent seed capture uses the normal non-forced exclusion. Index refresh itself needs no drain:
   it leaves exact fixed links intact or discards a displaced real directory in .cowshed/discard and relinks it, never
   copying index bytes onto the source volume.
+
+## Capture lease before a host Cargo profile exists
+
+- Governing contract: `specs/cowshed/16_build_volumes.md`, "Targets and seeds", known new-host-profile gap. Seed capture
+  retains closed supervised admission and the guards for existing Cargo profiles and Nx state, but uses a mounted
+  block-atomic image clone so an exempt cache reader cannot block it.
+- Current boundary: `packages/cowshed/crates/cowshed-core/src/build_volume/cargo.rs::hold` enumerates existing
+  `.cargo-lock` files. Those locks cannot exclude a host Cargo process that creates a new profile after enumeration.
+  Without the former detached-volume barrier, that host build can put intermediate non-transactional output into a seed.
+- Required separate work: define one producer-side capture lease shared by every Cargo invocation, acquired before any
+  profile creation or output write and retained for the build. Capture takes the exclusive side through snapshot and
+  publication. Thread that contract through both supervised and host Cargo entry points; another holder census does not
+  close the look-to-create race. This finding does not authorize an implementation or a new operator route.
+- Acceptance: an event-coordinated real host Cargo build creates a previously absent profile after capture has
+  enumerated its old profiles; the producer lease must block that creation or refuse the capture before any seed
+  publication. A held existing profile and a live Nx holder still refuse, while an open index reader remains exempt.

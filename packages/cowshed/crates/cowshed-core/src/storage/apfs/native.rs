@@ -3660,111 +3660,28 @@ where
         }
     }
 
-    /// Seal a build-state source before capture: filesystem crash consistency alone cannot make
-    /// half-written Cargo units or Nx databases reusable. Never force a refusal.
+    /// Capture a build source under the caller's retained admission and Nx/Cargo guards. A
+    /// mounted source uses the same flush and live descriptor clone as a workspace image, so
+    /// exempt cache/index handles stay open. Immutable sources retain detached capture.
     fn capture_build_seed(
         &self,
         source: &Path,
         source_mount: Option<&Path>,
         destination: &Path,
     ) -> Result<(), ApfsStorageError> {
-        let Some(mount_point) = source_mount else {
-            return self
-                .backend
-                .clone_image(source, destination, cowshed_apfs::ImageCapture::Detached)
-                .map_err(ApfsError::from)
-                .map_err(ApfsStorageError::from);
+        let capture = if source_mount.is_some() {
+            self.backend.sync_for_freshness(source, source_mount)?;
+            cowshed_apfs::ImageCapture::Live
+        } else {
+            cowshed_apfs::ImageCapture::Detached
         };
-        let Some(attachment) = self.backend.existing_attachment(source)? else {
-            return self
-                .backend
-                .clone_image(source, destination, cowshed_apfs::ImageCapture::Detached)
-                .map_err(ApfsError::from)
-                .map_err(ApfsStorageError::from);
-        };
-        let canonical = fs::canonicalize(mount_point)
-            .map_err(|error| io_error("resolve capture source mount", mount_point, error))?;
-        let mounted = self
-            .mount_source
-            .mounts()?
-            .into_iter()
-            .find(|mount| mount.mount_point == mount_point || mount.mount_point == canonical);
-        let Some(mounted) = mounted else {
-            // An attached-but-unmounted source remains the driver's; the raw clone refuses it.
-            return self
-                .backend
-                .clone_image(source, destination, cowshed_apfs::ImageCapture::Detached)
-                .map_err(ApfsError::from)
-                .map_err(ApfsStorageError::from);
-        };
-        if mounted.source_device != attachment.volume_device() {
-            return Err(ApfsStorageError::Host(format!(
-                "capture source {} is not the image's volume: {} instead of {}",
-                mount_point.display(),
-                mounted.source_device,
-                attachment.volume_device()
-            )));
-        }
-        let access = mounted.access();
-        let browse = mounted.browse();
-        // An unmount the kernel accepted unforced leaves no file open on the volume, so a
-        // dissent at the detach after it is a transient device holder: it is waited out within
-        // the detach grace, never forced (16_build_volumes.md, "Targets and seeds", step 4).
-        let captured = self
-            .backend
-            .unmount_verified(&attachment, DetachIntent::WhenIdle)
-            .map_err(|refusal| self.capture_refusal(source, mount_point, refusal))
-            .and_then(|()| {
-                self.backend
-                    .detach(&attachment, DetachIntent::WithinGrace)
-                    .map_err(|refusal| Self::capture_device_refusal(source, mount_point, refusal))
-            })
-            .and_then(|()| {
-                self.backend
-                    .clone_image(source, destination, cowshed_apfs::ImageCapture::Detached)
-                    .map_err(ApfsError::from)
-                    .map_err(ApfsStorageError::from)
-            });
-        let restored = self.restore_build_source(source, mount_point, access, browse);
-        match (captured, restored) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(primary), Ok(())) => Err(primary),
-            (Err(primary), Err(cleanup)) => Err(ApfsStorageError::Cleanup {
-                operation: "capture and restore source image",
-                primary: Box::new(primary),
-                cleanup: Box::new(cleanup),
-            }),
-            (Ok(()), Err(primary)) => {
-                match fs::remove_file(destination) {
-                    Ok(()) => {
-                        if let Err(cleanup) = sync_parent_path(destination) {
-                            return Err(ApfsStorageError::Cleanup {
-                                operation: "sync removed unpublished capture after source restoration failed",
-                                primary: Box::new(primary),
-                                cleanup: Box::new(cleanup),
-                            });
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(ApfsStorageError::Cleanup {
-                            operation: "remove unpublished capture after source restoration failed",
-                            primary: Box::new(primary),
-                            cleanup: Box::new(io_error(
-                                "remove unpublished capture",
-                                destination,
-                                error,
-                            )),
-                        });
-                    }
-                }
-                Err(primary)
-            }
-        }
+        self.backend
+            .clone_image(source, destination, capture)
+            .map_err(ApfsError::from)
+            .map_err(ApfsStorageError::from)
     }
 
-    /// The seal's unforced unmount was refused: name each process of this user that holds the
-    /// volume.
+    /// A re-adoption detach was refused: name each process of this user that holds the volume.
     fn capture_refusal(
         &self,
         source: &Path,
@@ -3805,55 +3722,6 @@ where
             refusal: Box::new(refusal),
         }
         .into()
-    }
-
-    /// The seal's unmount was accepted, and its detach was still dissented when the detach grace
-    /// ended: no file was open, so the device itself held it, and no process can be named.
-    fn capture_device_refusal(
-        source: &Path,
-        mount_point: &Path,
-        refusal: ApfsError,
-    ) -> ApfsStorageError {
-        if !cowshed_apfs::detach_was_dissented(&refusal) {
-            return refusal.into();
-        }
-        ApfsError::CaptureSourceBusy {
-            image: source.to_owned(),
-            mount_point: mount_point.to_owned(),
-            held: cowshed_apfs::CaptureHold::Device,
-            refusal: Box::new(refusal),
-        }
-        .into()
-    }
-
-    fn restore_build_source(
-        &self,
-        source: &Path,
-        mount_point: &Path,
-        access: MountAccess,
-        browse: bool,
-    ) -> Result<(), ApfsStorageError> {
-        let attachment = match self.backend.existing_attachment(source)? {
-            Some(attachment) => attachment,
-            None => {
-                self.backend
-                    .attach_mounted(source, mount_point, access, browse)?;
-                return Ok(());
-            }
-        };
-        match self.mounted_at(mount_point)? {
-            Some(device) if device == attachment.volume_device() => {}
-            Some(device) => {
-                return Err(ApfsStorageError::Host(format!(
-                    "cannot restore capture source at {}: another volume from {device} is mounted there",
-                    mount_point.display()
-                )));
-            }
-            None => self
-                .backend
-                .mount(&attachment, mount_point, access, browse)?,
-        }
-        Ok(())
     }
 
     /// The one atomic swap behind every handoff of a checkout to main's mountpoint: the checkout
