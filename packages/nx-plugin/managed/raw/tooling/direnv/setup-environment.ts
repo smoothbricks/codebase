@@ -1,16 +1,19 @@
 #!/usr/bin/env bun
-import { dlopen, FFIType } from 'bun:ffi';
+import { dlopen, FFIType, read as ffiRead } from 'bun:ffi';
 import {
   chmodSync,
   closeSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -19,7 +22,7 @@ import {
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { parseArgs } from 'node:util';
+import { getSystemErrorName, parseArgs } from 'node:util';
 import { $ } from 'bun';
 import {
   applyDeclaredLinks,
@@ -171,6 +174,7 @@ const { values: flags } = parseArgs({
     cargo: { type: 'boolean' },
     links: { type: 'boolean' },
     check: { type: 'boolean' },
+    'repair-missing-payload': { type: 'string' },
   },
 });
 const cargoMode = flags.cargo === true;
@@ -183,6 +187,15 @@ const CARGO_WORKSPACE = /^\s*\[workspace\]/m;
 process.chdir(projectRoot);
 
 try {
+  const requestedPayload = flags['repair-missing-payload'];
+  if (requestedPayload !== undefined) {
+    if (flags.links === true || flags.check === true || cargoMode || flags.python !== undefined) {
+      reportSetupFailure(new Error('--repair-missing-payload is an explicit standalone installer transaction'));
+    }
+    const error = await withInstallLock(() => repairMissingPayload(requestedPayload));
+    if (error !== undefined) reportSetupFailure(error);
+    process.exit(0);
+  }
   if (flags.links === true) {
     // CI builds against the published packages its lockfile names; it never links them.
     if (process.env.GITHUB_ACTIONS === 'true') {
@@ -431,6 +444,356 @@ function openInstallLock(lockPath: string): number {
   }
   mkdirSync(path.dirname(lockPath), { recursive: true });
   return openSync(lockPath, 'a');
+}
+
+/** Explicit, locked missing-payload restoration; normal shell entry never scans payload. */
+async function repairMissingPayload(requested: string): Promise<Error | undefined> {
+  let staging: string | undefined;
+  let installed: string | undefined;
+  let replacement: string | undefined;
+  let exchanged = false;
+  let committed = false;
+  const perform = async (): Promise<Error | undefined> => {
+    const request = path.resolve(projectRoot, requested);
+    const relativeRequest = path.relative(projectRoot, request);
+    if (relativeRequest === '..' || relativeRequest.startsWith(`..${path.sep}`) || path.isAbsolute(relativeRequest)) {
+      return new Error(`Missing-payload request is outside this checkout: ${request}`);
+    }
+    let alias = request;
+    while (alias !== projectRoot && !existsSync(path.join(alias, 'package.json'))) alias = path.dirname(alias);
+    if (alias === projectRoot || !path.relative(projectRoot, alias).split(path.sep).includes('node_modules')) {
+      return new Error(`Missing-payload request must name this checkout's installed package alias: ${request}`);
+    }
+    installed = realpathSync(alias);
+    const owned = path.relative(realpathSync(projectRoot), installed);
+    if (owned === '' || owned === '..' || owned.startsWith(`..${path.sep}`) || path.isAbsolute(owned)) {
+      return new Error(`Installed package is not owned by this checkout: ${alias} -> ${installed}`);
+    }
+    const manifest: unknown = JSON.parse(readFileSync(path.join(installed, 'package.json'), 'utf8'));
+    if (!payloadObject(manifest) || typeof manifest.name !== 'string' || typeof manifest.version !== 'string') {
+      return new Error(`Installed package has no name/version: ${alias}`);
+    }
+    const identity = `${manifest.name}@${manifest.version}`;
+    const locked = new Map<string, Buffer>();
+    for (const name of ['bun.lock', 'bun.lockb']) {
+      const bytes = readFileIfPresent(path.join(projectRoot, name));
+      if (bytes !== null) locked.set(name, bytes);
+    }
+    const witnessPath = path.join(projectRoot, 'node_modules', '.smoo-install');
+    const witnessBytes = readFileIfPresent(witnessPath);
+    const witness = readInstallStamp(witnessPath);
+    if (
+      witnessBytes === null ||
+      witness === null ||
+      witness.lockfiles === undefined ||
+      !/^[0-9a-f]{64}$/.test(witness.inputs)
+    ) {
+      return new Error(
+        'Missing-payload repair requires a valid prior successful installation witness; use the canonical installer',
+      );
+    }
+    const witnessedLocks = witness.lockfiles;
+    if (Object.keys(witnessedLocks).length !== locked.size) {
+      return new Error('Prior successful installation witness does not bind the present lockfiles');
+    }
+    for (const [name, bytes] of locked) {
+      if (witnessedLocks[name] !== new Bun.CryptoHasher('sha256').update(bytes).digest('hex')) {
+        return new Error(`Prior successful installation witness does not match ${name}`);
+      }
+    }
+    const lock: unknown = Bun.JSONC.parse(readFileSync(path.join(projectRoot, 'bun.lock'), 'utf8'));
+    if (!payloadObject(lock) || !payloadObject(lock.packages)) return new Error('bun.lock has no package records');
+    const integrities = new Set<string>();
+    for (const entry of Object.values(lock.packages)) {
+      if (Array.isArray(entry) && entry[0] === identity && typeof entry[3] === 'string') integrities.add(entry[3]);
+    }
+    if (integrities.size !== 1) return new Error(`bun.lock does not uniquely bind registry integrity for ${identity}`);
+    const integrity = integrities.values().next().value;
+    if (integrity === undefined) return new Error(`bun.lock omitted registry integrity for ${identity}`);
+    const unchangedLocks = (): Error | undefined => {
+      const currentWitness = readFileIfPresent(witnessPath);
+      if (currentWitness === null || !currentWitness.equals(witnessBytes)) {
+        return new Error('Prior successful installation witness changed during missing-payload repair');
+      }
+      for (const [name, bytes] of locked) {
+        const current = readFileIfPresent(path.join(projectRoot, name));
+        if (current === null || !current.equals(bytes))
+          return new Error(`Missing-payload repair refused changed ${name}`);
+      }
+      for (const name of ['bun.lock', 'bun.lockb']) {
+        if (!locked.has(name) && existsSync(path.join(projectRoot, name))) {
+          return new Error(`Missing-payload repair refused newly created ${name}`);
+        }
+      }
+      return undefined;
+    };
+    const admissionError = verifyInstalledBunLinks(projectRoot);
+    if (admissionError !== undefined) return admissionError;
+    // Let Bun resolve the registry using the checkout's existing npm/bun configuration.
+    const metadata = await runSetupCommand(`bun info ${identity} dist --json`, $`bun info ${identity} dist --json`, {
+      quiet: true,
+    });
+    const dist: unknown = JSON.parse(metadata.stdout);
+    if (
+      !payloadObject(dist) ||
+      typeof dist.tarball !== 'string' ||
+      typeof dist.integrity !== 'string' ||
+      !dist.integrity.split(/\s+/).includes(integrity)
+    ) {
+      return new Error(`Registry dist metadata does not match locked integrity for ${identity}`);
+    }
+    const response = await fetch(dist.tarball);
+    if (!response.ok)
+      return new Error(`Cannot read locked tarball for ${identity}: HTTP ${response.status} ${dist.tarball}`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const integrityError = verifyPayloadIntegrity(bytes, integrity);
+    if (integrityError !== undefined) return integrityError;
+    const stage = mkdtempSync(path.join(path.dirname(installed), '.smoo-payload-'));
+    staging = stage;
+    const publication = path.join(stage, 'published');
+    await new Bun.Archive(bytes).extract(publication);
+    const roots = readdirSync(publication);
+    if (roots.length !== 1 || roots[0] !== 'package' || !lstatSync(path.join(publication, 'package')).isDirectory()) {
+      return new Error(`Locked registry tarball has no single package directory: ${identity}`);
+    }
+    const published = path.join(publication, 'package');
+    const publishedManifest: unknown = JSON.parse(readFileSync(path.join(published, 'package.json'), 'utf8'));
+    if (
+      !payloadObject(publishedManifest) ||
+      publishedManifest.name !== manifest.name ||
+      publishedManifest.version !== manifest.version
+    ) {
+      return new Error(`Locked tarball package identity differs from installed ${identity}`);
+    }
+    const publishedRequest = path.join(published, path.relative(alias, request));
+    if (lstatSync(publishedRequest, { throwIfNoEntry: false }) === undefined) {
+      return new Error(`Requested path is not in the locked published package: ${request}`);
+    }
+    const comparison = comparePublishedPayload(published, installed);
+    if (comparison instanceof Error) return comparison;
+    if (comparison.missing.length > 0 && statSync(request, { throwIfNoEntry: false }) !== undefined) {
+      return new Error(`Repair request is not physically missing: ${request}`);
+    }
+    const original = snapshotPayload(installed);
+    if (original instanceof Error) return original;
+    if (comparison.missing.length > 0) {
+      replacement = path.join(stage, 'replacement');
+      mkdirSync(replacement, { mode: 0o700 });
+      for (const relative of comparison.missing) {
+        const destination = path.join(replacement, relative);
+        mkdirSync(path.dirname(destination), { recursive: true });
+        cpSync(path.join(published, relative), destination, {
+          recursive: true,
+          preserveTimestamps: true,
+          verbatimSymlinks: true,
+          dereference: false,
+          errorOnExist: true,
+          force: false,
+        });
+      }
+      // Copy existing payload once, last: cp -a retains its links and metadata, including parent directory times.
+      await runSetupCommand(
+        'preserve installed package in repair staging',
+        $`cp -a ${`${installed}/.`} ${`${replacement}/`}`,
+        { quiet: true },
+      );
+      const preserved = verifyPayloadSnapshot(replacement, original) ?? verifyPayloadSnapshot(installed, original);
+      if (preserved !== undefined) return preserved;
+      const staged = comparePublishedPayload(published, replacement);
+      if (staged instanceof Error) return staged;
+      if (staged.missing.length !== 0) return new Error(`Repair staging is not published-complete for ${identity}`);
+      const lockError = unchangedLocks();
+      if (lockError !== undefined) return lockError;
+      const swapError = exchangePayloadDirectories(installed, replacement);
+      if (swapError !== undefined) return swapError;
+      exchanged = true;
+    }
+    // Keep the original directory until both postconditions and the existing install receipt succeed.
+    const complete = comparePublishedPayload(published, installed);
+    if (complete instanceof Error) return complete;
+    if (complete.missing.length !== 0) return new Error(`Published payload remains incomplete for ${identity}`);
+    const preserved = verifyPayloadSnapshot(installed, original);
+    if (preserved !== undefined) return preserved;
+    const lockError = unchangedLocks();
+    if (lockError !== undefined) return lockError;
+    // This mode proves one package, never a new whole-install input set. Preserve the prior witness exactly.
+    if (comparison.missingFiles > 0) {
+      const stagedWitness = path.join(stage, 'install-witness');
+      writeFileSync(stagedWitness, witnessBytes, { mode: lstatSync(witnessPath).mode & 0o777 });
+      renameSync(stagedWitness, witnessPath);
+    }
+    committed = true;
+    console.log(
+      JSON.stringify({
+        operation: 'repair-missing-payload',
+        package: identity,
+        requestedPath: request,
+        publishedFiles: complete.files,
+        restoredFiles: comparison.missingFiles,
+        publishedComplete: true,
+        lockedHashesUnchanged: true,
+      }),
+    );
+    return undefined;
+  };
+  let failure: Error | undefined;
+  try {
+    failure = await perform();
+  } catch (cause) {
+    failure = cause instanceof Error ? cause : new Error(String(cause));
+  }
+  if (exchanged && !committed && installed !== undefined && replacement !== undefined) {
+    const rollback = exchangePayloadDirectories(installed, replacement);
+    if (rollback !== undefined) {
+      return new AggregateError(
+        [failure, rollback],
+        `Missing-payload repair rollback failed; retained staging path ${staging}`,
+      );
+    }
+  }
+  if (staging !== undefined) {
+    try {
+      rmSync(staging, { recursive: true });
+    } catch (cause) {
+      const message = committed
+        ? `repair committed; retained staging path ${staging}`
+        : `Repair refused; retained staging path ${staging}`;
+      return new AggregateError(failure === undefined ? [cause] : [failure, cause], message);
+    }
+  }
+  return failure;
+}
+
+function payloadObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function verifyPayloadIntegrity(bytes: Uint8Array, integrity: string): Error | undefined {
+  const [algorithm, digest, extra] = integrity.split('-');
+  if (digest === undefined || extra !== undefined) return new Error(`Invalid locked registry integrity: ${integrity}`);
+  switch (algorithm) {
+    case 'sha1':
+    case 'sha256':
+    case 'sha384':
+    case 'sha512':
+      if (new Bun.CryptoHasher(algorithm).update(bytes).digest('base64') === digest) return undefined;
+      return new Error(`Locked registry tarball integrity mismatch (${algorithm})`);
+    default:
+      return new Error(`Unsupported locked registry integrity algorithm: ${algorithm}`);
+  }
+}
+
+/** Compare only published nodes; installed extra files remain owned metadata, never removal candidates. */
+function comparePublishedPayload(
+  published: string,
+  installed: string,
+): { missing: string[]; files: number; missingFiles: number } | Error {
+  const missingEntries: string[] = [];
+  const result = { missing: missingEntries, files: 0, missingFiles: 0 };
+  const visit = (relative: string, missingParent: boolean): Error | undefined => {
+    const expected = path.join(published, relative);
+    const target = path.join(installed, relative);
+    const source = lstatSync(expected);
+    const actual = missingParent ? undefined : lstatSync(target, { throwIfNoEntry: false });
+    const missing = actual === undefined;
+    if (missing && !missingParent) result.missing.push(relative);
+    if (source.isDirectory()) {
+      if (actual !== undefined && !actual.isDirectory())
+        return new Error(`Existing published payload kind mismatch: ${target}`);
+      for (const child of readdirSync(expected)) {
+        const error = visit(path.join(relative, child), missing);
+        if (error !== undefined) return error;
+      }
+    } else if (source.isFile() || source.isSymbolicLink()) {
+      result.files += 1;
+      if (missing) result.missingFiles += 1;
+      else if (
+        source.isFile()
+          ? !actual.isFile() || !readFileSync(expected).equals(readFileSync(target))
+          : !actual.isSymbolicLink() || readlinkSync(expected) !== readlinkSync(target)
+      ) {
+        return new Error(`Existing published payload mismatch: ${target}`);
+      }
+    } else return new Error(`Unsupported published payload kind: ${expected}`);
+    return undefined;
+  };
+  return visit('', false) ?? result;
+}
+
+function payloadNodeIdentity(file: string): string | Error {
+  const state = lstatSync(file, { bigint: true, throwIfNoEntry: false });
+  if (state === undefined) return new Error(`Existing package entry disappeared: ${file}`);
+  let value: string;
+  if (state.isDirectory()) value = 'directory';
+  else if (state.isSymbolicLink()) value = `symlink:${readlinkSync(file)}`;
+  else if (state.isFile()) value = `file:${new Bun.CryptoHasher('sha256').update(readFileSync(file)).digest('hex')}`;
+  else return new Error(`Unsupported existing package entry: ${file}`);
+  return JSON.stringify([value, String(state.mode), String(state.uid), String(state.gid), String(state.mtimeNs)]);
+}
+
+function snapshotPayload(root: string): Map<string, string> | Error {
+  const entries = new Map<string, string>();
+  const visit = (relative: string): Error | undefined => {
+    const file = path.join(root, relative);
+    const identity = payloadNodeIdentity(file);
+    if (identity instanceof Error) return identity;
+    entries.set(relative, identity);
+    if (lstatSync(file).isDirectory()) {
+      for (const child of readdirSync(file)) {
+        const error = visit(path.join(relative, child));
+        if (error !== undefined) return error;
+      }
+    }
+    return undefined;
+  };
+  return visit('') ?? entries;
+}
+
+function verifyPayloadSnapshot(root: string, entries: ReadonlyMap<string, string>): Error | undefined {
+  for (const [relative, expected] of entries) {
+    const file = path.join(root, relative);
+    const actual = payloadNodeIdentity(file);
+    if (actual instanceof Error) return actual;
+    if (actual !== expected) return new Error(`Existing package bytes, links or metadata changed: ${file}`);
+  }
+  return undefined;
+}
+
+/** Same native exchange as cowshed-os fsio::rename_exchange; failure changes neither directory entry. */
+function exchangePayloadDirectories(source: string, destination: string): Error | undefined {
+  const from = Buffer.from(`${source}\0`);
+  const to = Buffer.from(`${destination}\0`);
+  if (process.platform === 'darwin') {
+    const native = dlopen('/usr/lib/libSystem.B.dylib', {
+      renameatx_np: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+      __error: { args: [], returns: FFIType.ptr },
+    });
+    try {
+      if (native.symbols.renameatx_np(-2, from, -2, to, 2) === 0) return undefined;
+      const pointer = native.symbols.__error();
+      return new Error(
+        `Atomic package exchange failed: ${pointer === null ? 'errno unavailable' : getSystemErrorName(-ffiRead.i32(pointer))}; ${source} <-> ${destination}`,
+      );
+    } finally {
+      native.close();
+    }
+  }
+  if (process.platform === 'linux') {
+    const native = dlopen('libc.so.6', {
+      renameat2: { args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+      __errno_location: { args: [], returns: FFIType.ptr },
+    });
+    try {
+      if (native.symbols.renameat2(-100, from, -100, to, 2) === 0) return undefined;
+      const pointer = native.symbols.__errno_location();
+      return new Error(
+        `Atomic package exchange failed: ${pointer === null ? 'errno unavailable' : getSystemErrorName(-ffiRead.i32(pointer))}; ${source} <-> ${destination}`,
+      );
+    } finally {
+      native.close();
+    }
+  }
+  return new Error(`Atomic package exchange is unsupported on ${process.platform}`);
 }
 
 /**
@@ -1307,6 +1670,11 @@ function reportDeferredSecrets(): void {
 }
 
 function describeFailure(level: 'ERROR' | 'WARNING', error: unknown): void {
+  if (error instanceof AggregateError) {
+    console.error(`--- ${level}: setup-environment.ts failed: ${error.message}`);
+    for (const cause of error.errors) describeFailure(level, cause);
+    return;
+  }
   if (error instanceof CapturedCommandError) {
     console.error(`--- ${level}: setup-environment.ts failed while running: ${error.command}`);
     console.error(`exit code: ${error.exitCode}`);
