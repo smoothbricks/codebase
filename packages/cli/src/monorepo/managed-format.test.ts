@@ -180,6 +180,47 @@ describe('which formatter owns a managed target', () => {
     expect([...BIOME_OWNED_EXTENSIONS].sort()).toEqual(patterns.map((pattern) => pattern.replace('*', '')).sort());
   });
 
+  it('rejects unparsable staged TypeScript without changing the index or source', async () => {
+    const root = await makeConsumerRepo();
+    try {
+      const initialized = spawnSync('git', ['init', '--quiet'], { cwd: root, encoding: 'utf8' });
+      expect(initialized.status, initialized.stderr).toBe(0);
+      await writeFile(join(root, 'broken.ts'), 'export function example() {}\n');
+      for (const args of [
+        ['add', 'broken.ts'],
+        [
+          '-c',
+          'user.name=Formatter Fixture',
+          '-c',
+          'user.email=fixture@example.invalid',
+          'commit',
+          '--quiet',
+          '-m',
+          'fixture',
+        ],
+      ]) {
+        const setup = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+        expect(setup.status, setup.stderr).toBe(0);
+      }
+      const invalid = 'export function {';
+      await writeFile(join(root, 'broken.ts'), invalid);
+      const staged = spawnSync('git', ['add', 'broken.ts'], { cwd: root, encoding: 'utf8' });
+      expect(staged.status, staged.stderr).toBe(0);
+      const index = await readFile(join(root, '.git/index'));
+      const hook = spawnSync('git-format-staged', ['--config', GIT_FORMAT_STAGED_CONFIG, '--no-update-working-tree'], {
+        cwd: root,
+        encoding: 'utf8',
+      });
+      expect(hook.status, hook.stdout + hook.stderr).not.toBe(0);
+      expect(hook.stderr).toContain('broken.ts');
+      expect(hook.stderr).toContain('parse');
+      expect(await readFile(join(root, 'broken.ts'), 'utf8')).toBe(invalid);
+      expect(await readFile(join(root, '.git/index'))).toEqual(index);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it('keeps unsupported bytes through the real stdin hook while formatting supported YAML', async () => {
     const root = await makeConsumerRepo();
     try {
