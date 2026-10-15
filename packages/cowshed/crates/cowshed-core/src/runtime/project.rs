@@ -4394,14 +4394,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
 
     /// Land steps 4–7 (16_build_volumes.md, "Land"): quiesce the landing workspace, close the
     /// target's Nx state and carry the target's cache entries into the landing volume, freeze
-    /// the target's seed from that volume, move the target's build link onto it, and re-run the
-    /// landed checks in the target, where every Nx task should hit.
+    /// the target's seed from that volume, move the target's build link onto it, and restore
+    /// the declared outputs of the Nx runs already validated in the landing workspace.
     async fn land_build_volume(
         &mut self,
         workspace: &WorkspaceName,
         landing: &Path,
         into: &NativeLandingInto,
-        checks: &[String],
+        checks: &CheckedLandChecks,
         retire: bool,
     ) -> Result<crate::api::dto::LandBuildVolume> {
         use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume, LandSeed};
@@ -4628,86 +4628,88 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(peers)
     }
 
-    /// Land step 7 (2b): each landed check re-run in the target on the adopted volume. Hits and
-    /// misses come from the run summary stock Nx writes into the target's cache directory, and
-    /// only from one attributed to the check itself (`nx::attribute`); each miss carries the
-    /// inputs Nx hashes for it.
+    /// Land step 7: restore only the captured Nx runs, without a task runner or check shell.
+    /// A cache miss is reported, never executed. Attribution was established before delivery.
     async fn check_adoption(
         &mut self,
         target: &WorkspaceName,
         mount: &Path,
-        checks: &[String],
+        checks: &CheckedLandChecks,
     ) -> Result<crate::api::dto::AdoptionCheck> {
-        use crate::build_volume::nx::{Attribution, CacheStatus, attribute};
-        let mut result = crate::api::dto::AdoptionCheck::default();
+        let mut result = crate::api::dto::AdoptionCheck {
+            unattributed: checks.unattributed.clone(),
+            ..Default::default()
+        };
+        if checks.runs.is_empty() {
+            return Ok(result);
+        }
         let (handle, build_volume) = self.admit_build_state(target).await?;
-        let state = crate::build_volume::BuildVolumeState::read(
-            &mount.join(crate::build_volume::BUILD_LINK),
-        )?;
-        let caches = state
-            .paths
-            .iter()
-            .filter(|path| {
-                crate::build_volume::BuildStateTool::of(path)
-                    == crate::build_volume::BuildStateTool::Nx
-                    && path.checkout.as_path().file_name() == Some(std::ffi::OsStr::new("cache"))
-            })
-            .map(|path| path.checkout.as_path().to_owned())
-            .collect::<Vec<_>>();
-        for check in checks {
-            let spawned = std::time::SystemTime::now();
-            let job = handle
-                .exec(None, build_volume.clone(), land_check_request(check))
-                .await?;
+        for run in &checks.runs {
+            let root = mount.join(run.cache.parent().and_then(Path::parent).ok_or_else(|| {
+                CowshedError::internal(format!(
+                    "Nx cache has no workspace root: {}",
+                    run.cache.display()
+                ))
+            })?);
+            let request = ExecRequest {
+                command: crate::api::dto::ExecCommand::Argv(vec![
+                    "node".into(),
+                    "-".into(),
+                    root.to_string_lossy().into_owned().into(),
+                    serde_json::to_string(run)
+                        .map_err(|error| CowshedError::internal(error.to_string()))?
+                        .into(),
+                ]),
+                cwd: None,
+                mode: RunSandboxMode::ReadWrite,
+                env: std::collections::HashMap::new(),
+                trace: None,
+                stdin: StdinSource::Inline(bytes::Bytes::from_static(
+                    crate::build_volume::nx::RESTORE_OUTPUTS_SCRIPT.as_bytes(),
+                )),
+                stdout_copy: None,
+                stderr_copy: None,
+                admission_key: None,
+            };
+            let job = handle.exec(None, build_volume.clone(), request).await?;
             let info = handle.wait(job).await?;
-            let exited = std::time::SystemTime::now();
-            match info.exit {
-                Some(crate::api::dto::ExitStatus::Exited { code: 0 }) => {}
-                Some(crate::api::dto::ExitStatus::Exited { code }) => {
+            let restored = match (&info.exit, read_job_stdout(&handle, job).await) {
+                (Some(crate::api::dto::ExitStatus::Exited { code: 0 }), Ok(stdout)) => {
+                    serde_json::from_slice::<crate::build_volume::nx::RestoredOutputs>(&stdout)
+                        .map_err(|error| format!("invalid cache-only restoration answer: {error}"))
+                }
+                (exit, stdout) => Err(format!(
+                    "cache-only restoration of {} ended {exit:?}; stdout: {stdout:?}; stderr: {}",
+                    run.command,
+                    read_job_stderr_tail(&handle, job).await
+                )),
+            };
+            match restored {
+                Ok(restored) => {
+                    result.hits += restored.hits;
+                    for missed in restored.misses {
+                        result.misses.push(
+                            task_inputs(
+                                &handle,
+                                build_volume.clone(),
+                                missed.task,
+                                missed.hash,
+                                missed.reason,
+                            )
+                            .await?,
+                        );
+                    }
+                }
+                Err(error) => {
                     result.failed.push(crate::api::dto::FailedCheck {
-                        check: check.clone(),
-                        exit: Some(code),
+                        check: run.check.clone(),
+                        exit: match info.exit {
+                            Some(crate::api::dto::ExitStatus::Exited { code }) => Some(code),
+                            _ => None,
+                        },
+                        error,
                     });
                 }
-                _ => result.failed.push(crate::api::dto::FailedCheck {
-                    check: check.clone(),
-                    exit: None,
-                }),
-            }
-            let mut unattributed = Vec::new();
-            let mut attributed = false;
-            for cache in &caches {
-                match attribute(&mount.join(cache), check, spawned, exited) {
-                    Attribution::Ours(run) => {
-                        attributed = true;
-                        for task in run.tasks {
-                            match task.cache {
-                                CacheStatus::LocalHit | CacheStatus::RemoteHit => {
-                                    result.hits += 1;
-                                }
-                                CacheStatus::Miss => result.misses.push(
-                                    task_inputs(
-                                        &handle,
-                                        build_volume.clone(),
-                                        task.task_id,
-                                        task.hash,
-                                    )
-                                    .await?,
-                                ),
-                            }
-                        }
-                    }
-                    Attribution::Unattributed(reason) => {
-                        unattributed.push(crate::api::dto::UnattributedCheck {
-                            check: check.clone(),
-                            cache: cache.to_string_lossy().into_owned(),
-                            reason,
-                        });
-                    }
-                }
-            }
-            if !attributed {
-                result.unattributed.extend(unattributed);
             }
         }
         Ok(result)
@@ -11249,7 +11251,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let (handle, build_volume) =
             timed_async("land", "supervisor", self.admit_build_state(&workspace)).await?;
         let checks = options.check.unwrap_or_default();
+        let mut checked = CheckedLandChecks::default();
         for check in &checks {
+            let spawned = std::time::SystemTime::now();
             let job_id = timed_async(
                 "land",
                 "check-exec",
@@ -11257,6 +11261,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             )
             .await?;
             let info = timed_async("land", "check-wait", handle.wait(job_id)).await?;
+            let exited = std::time::SystemTime::now();
             let exit_code = match info.exit {
                 Some(crate::api::dto::ExitStatus::Exited { code }) => Some(code),
                 _ => None,
@@ -11292,6 +11297,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     "fix the workspace and retry land",
                 ));
             }
+            checked.capture(&source_mount, check, spawned, exited)?;
         }
         // Land has no branch-name contract with the workspace: it delivers whatever branch the
         // workspace has checked out, whether an agent named it `cowshed/<ws>`, `wt/<ws>`, or
@@ -11323,7 +11329,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let build_volume = timed_async(
             "land",
             "build-volume",
-            self.land_build_volume(&workspace, &source_mount, &into, &checks, retire),
+            self.land_build_volume(&workspace, &source_mount, &into, &checked, retire),
         )
         .await
         .map_err(|failed| {
@@ -14704,6 +14710,64 @@ fn require_expected_ref(
     }
 }
 
+/// A land retains only its own checks' attributed summaries in memory until output restoration.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct CheckedLandChecks {
+    runs: Vec<crate::build_volume::nx::CheckedRun>,
+    unattributed: Vec<crate::api::dto::UnattributedCheck>,
+}
+
+#[cfg(target_os = "macos")]
+impl CheckedLandChecks {
+    fn capture(
+        &mut self,
+        mount: &Path,
+        check: &str,
+        spawned: std::time::SystemTime,
+        exited: std::time::SystemTime,
+    ) -> Result<()> {
+        use crate::build_volume::nx::{Attribution, attribute};
+        let state = crate::build_volume::BuildVolumeState::read(
+            &mount.join(crate::build_volume::BUILD_LINK),
+        )?;
+        let mut unattributed = Vec::new();
+        let before = self.runs.len();
+        for path in &state.paths {
+            if crate::build_volume::BuildStateTool::of(path)
+                != crate::build_volume::BuildStateTool::Nx
+                || path.checkout.as_path().file_name() != Some(std::ffi::OsStr::new("cache"))
+            {
+                continue;
+            }
+            let cache = path.checkout.as_path();
+            match attribute(&mount.join(cache), check, spawned, exited) {
+                Attribution::Ours(run) => self.runs.push(crate::build_volume::nx::CheckedRun {
+                    check: check.to_owned(),
+                    cache: cache.to_owned(),
+                    command: run.command,
+                    tasks: run
+                        .tasks
+                        .into_iter()
+                        .map(|task| (task.task_id, task.hash))
+                        .collect(),
+                }),
+                Attribution::Unattributed(reason) => {
+                    unattributed.push(crate::api::dto::UnattributedCheck {
+                        check: check.to_owned(),
+                        cache: cache.to_string_lossy().into_owned(),
+                        reason,
+                    })
+                }
+            }
+        }
+        if self.runs.len() == before {
+            self.unattributed.extend(unattributed);
+        }
+        Ok(())
+    }
+}
+
 /// The job one `land --check` command runs as: an ordinary read-write child of the workspace.
 ///
 /// It carries no environment of its own, so a check builds the units an interactive command
@@ -14798,6 +14862,7 @@ async fn task_inputs(
     build_volume: Option<PathBuf>,
     task: String,
     hash: String,
+    reason: String,
 ) -> Result<crate::api::dto::CacheMiss> {
     let request = land_check_request(&format!(
         "exec node_modules/.bin/nx show target inputs '{}' --json",
@@ -14827,6 +14892,7 @@ async fn task_inputs(
     Ok(crate::api::dto::CacheMiss {
         task,
         hash,
+        reason,
         inputs,
         inputs_digest,
         inputs_error,

@@ -1615,6 +1615,11 @@ async fn land_nx_project(
         panic!("the land adopted no build volume: {report:?}");
     };
     let rerun = rerun.clone();
+    assert_eq!(
+        fs::read(fixture.checkout.join("a/generated.txt")).ok(),
+        declared.then(|| b"generated\n".to_vec()),
+        "only declared Nx outputs are materialized in main"
+    );
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
     (
@@ -1646,14 +1651,19 @@ async fn directory_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_s
         ["a:test"],
         "only the undeclared output's task misses: {rerun:?}"
     );
+    assert!(
+        rerun.misses[0].reason.contains("differs from checked hash"),
+        "{rerun:?}"
+    );
+    assert!(
+        !rerun.misses[0].hash.is_empty(),
+        "the finding retains the checked hash"
+    );
     assert_eq!(rerun.unattributed, [], "{rerun:?}");
     assert_eq!(
         rerun.failed,
-        [cowshed_core::api::dto::FailedCheck {
-            check: nx_run_many(&repository_nx().1, "test"),
-            exit: Some(1),
-        }],
-        "main's a:test cannot read the output a:build's hit did not restore: {rerun:?}"
+        [],
+        "a miss is reported without executing a:test: {rerun:?}"
     );
     assert_eq!(
         adoptions
@@ -1679,6 +1689,93 @@ async fn directory_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_s
         "a declared output restores in main and every task hits"
     );
     assert_eq!(adoptions, [], "a hit leaves no landAdoption commitment");
+}
+
+/// Checks run once before delivery. A non-Nx shell and an uncacheable Nx executor both leave
+/// witnesses only in the landing workspace; the cache-only adoption still restores a:build.
+#[tokio::test]
+async fn directory_adoption_never_reexecutes_shell_checks_or_uncacheable_tasks_substrate_lifecycle()
+{
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with_directory(Project::Nx {
+        nx: &nx,
+        node: &node,
+        declared: true,
+    });
+    let project_path = fixture.checkout.join("a/project.json");
+    let mut project: serde_json::Value =
+        serde_json::from_slice(&fs::read(&project_path).unwrap()).unwrap();
+    project["targets"]["test"]["cache"] = serde_json::json!(false);
+    project["targets"]["test"]["options"]["command"] = serde_json::json!(format!(
+        "{} -e \"require('fs').appendFileSync('.cowshed/task-runs','once\\n')\"",
+        node.display()
+    ));
+    fs::write(&project_path, serde_json::to_vec(&project).unwrap()).unwrap();
+    git(&fixture.checkout, &["add", "a/project.json"]);
+    git(
+        &fixture.checkout,
+        &["commit", "-q", "-m", "make validation uncacheable"],
+    );
+    let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &nx_reads).await;
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("a/src.txt"), b"landed input\n").unwrap();
+    git(&topic, &["commit", "-q", "-am", "change input"]);
+    let shell = "printf 'once\\n' >> .cowshed/shell-runs";
+    let test = nx_run_many(&node, "test");
+    let report = land(&mut service, "topic", false, &[shell, &test]).await;
+    let Adoption::Adopted { check, .. } = &report.build_volume.adoption else {
+        panic!("the build volume was not adopted: {report:?}");
+    };
+    assert_eq!(
+        fs::read(topic.join(".cowshed/shell-runs")).unwrap(),
+        b"once\n"
+    );
+    assert_eq!(
+        fs::read(topic.join(".cowshed/task-runs")).unwrap(),
+        b"once\n"
+    );
+    assert!(
+        !fixture.checkout.join(".cowshed/shell-runs").exists(),
+        "the shell check never runs in main"
+    );
+    assert!(
+        !fixture.checkout.join(".cowshed/task-runs").exists(),
+        "the uncacheable executor never runs in main"
+    );
+    assert_eq!(
+        fs::read(fixture.checkout.join("a/generated.txt")).unwrap(),
+        b"generated\n"
+    );
+    assert_eq!(
+        check.hits, 1,
+        "only the dependency's cached output is restored: {check:?}"
+    );
+    assert_eq!(
+        check
+            .misses
+            .iter()
+            .map(|miss| miss.task.as_str())
+            .collect::<Vec<_>>(),
+        ["a:test"]
+    );
+    assert!(
+        check.misses[0].reason.contains("not cacheable"),
+        "{check:?}"
+    );
+    assert!(
+        !check.misses[0].hash.is_empty(),
+        "uncacheable findings retain the checked hash"
+    );
+    assert_eq!(check.failed, [], "{check:?}");
+    assert_eq!(
+        check.unattributed.len(),
+        1,
+        "the shell has no Nx summary: {check:?}"
+    );
+    assert_eq!(check.unattributed[0].check, shell);
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
 }
 
 /// A real-Nx test that fails mid-way leaves no Nx daemon under its root. A daemon started in a
@@ -2279,6 +2376,22 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
         fs::canonicalize(layout.image(&linked_volume(&layout, &fixture.checkout))).unwrap(),
         "main resolves to the directory payload of the volume it adopted"
     );
+
+    assert_eq!(
+        fs::read(main.join("a/generated.txt"))
+            .expect("the landed Nx output is available without running a check"),
+        b"generated\n"
+    );
+    let warm = new_workspace(&mut service, "warm").await;
+    let restored = nx_statuses(&mut service, "warm", &warm, &nx_check).await;
+    assert_eq!(restored.len(), 2, "{restored:?}");
+    assert!(
+        restored
+            .iter()
+            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
+        "a fork immediately consumes the restored outputs and adopted cache: {restored:?}"
+    );
+
     let [(landed_seed, _)] = seeds_of_main(&layout).try_into().expect("one seed of main");
 
     // Main's own work on the adopted volume, after the seed was frozen: a miss in main.
@@ -2956,7 +3069,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
 
 /// A host process outside every cowshed and Nx protocol holding a file of the landing volume open
 /// (as an indexer's MCP server holds its SQLite index) refuses the seal, so main keeps its
-/// previous seed; the swap still runs, the re-run check hits on the adopted volume, and once the
+/// previous seed; the swap still runs, checked outputs restore from the adopted volume, and once the
 /// holder lets go, the next fork refreezes the seed from it (16_build_volumes.md, Land
 /// step 5.6).
 #[tokio::test]

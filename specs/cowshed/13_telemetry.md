@@ -236,7 +236,7 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   of these decisions; a controller that opens a project reads the inventory once and starts.
 - **Controller audit records** — every controller act (workspace introduced/retired, job admission and terminal state,
   checkpoint, fork, restore, each land whose build-volume step completes and returns its actual result, and each cache
-  miss a land's adoption check found) is emitted as one typed `ControllerCommitment` record to an audit sink. A land
+  miss a land's output restoration found) is emitted as one typed `ControllerCommitment` record to an audit sink. A land
   outcome records whether the landing volume seeded the target and whether adoption succeeded or skipped, including the
   exact skip reason and its holders. The records never contain inline output, a protected artifact path, a redirect
   source, or any other raw stdout/stderr payload duplication. **Nothing reads them for a decision.** The sink is

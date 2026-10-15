@@ -671,6 +671,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                     misses: vec![cowshed_core::api::dto::CacheMiss {
                         task: "widget:build".to_owned(),
                         hash: "1234567890".to_owned(),
+                        reason: "no successful local cache result; task was not executed".to_owned(),
                         inputs: [("files".to_owned(), vec!["src/a.ts".to_owned()])]
                             .into_iter()
                             .collect(),
@@ -686,6 +687,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                     }],
                     failed: vec![cowshed_core::api::dto::FailedCheck {
                         check: "bun nx run-many -t lint".to_owned(),
+                        error: "cache-only restoration helper exited 1: unreadable task graph".to_owned(),
                         exit: Some(1),
                     }],
                 },

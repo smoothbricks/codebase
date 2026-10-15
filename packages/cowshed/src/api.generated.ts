@@ -99,7 +99,7 @@ export type Adoption =
     });
 
 /**
- * Step 7: the landed check re-run in the target on the adopted volume. Every Nx task should hit.
+ * Step 7: cache-only output restoration for the Nx runs validated before delivery. No check is rerun.
  */
 export type AdoptionCheck = {
   readonly hits: number & tags.Type<'uint64'>;
@@ -108,12 +108,11 @@ export type AdoptionCheck = {
    */
   readonly misses: ReadonlyArray<CacheMiss>;
   /**
-   * Checks whose run summary was not theirs (Land step 7): counted neither as hits nor as
-   * misses.
+   * Checks without an attributed source summary: counted neither as hits nor as misses.
    */
   readonly unattributed: ReadonlyArray<UnattributedCheck>;
   /**
-   * Checks that exited nonzero in the target.
+   * Cache-only restoration helpers that failed in the target, never rerun check commands.
    */
   readonly failed: ReadonlyArray<FailedCheck>;
 };
@@ -211,7 +210,14 @@ export type BuildVolume = {
  */
 export type CacheMiss = {
   readonly task: string;
+  /**
+   * The hash validated in the landing workspace, never a substituted target hash.
+   */
   readonly hash: string;
+  /**
+   * Why this checked result could not be restored without executing the task.
+   */
+  readonly reason: string;
   /**
    * Each input category Nx reports (`files`, `environment`, `external`, …) and its entries;
    * empty when Nx could not name them, with `inputs_error` saying why.
@@ -531,6 +537,10 @@ export type ExpectedRefHead = { readonly missing: true } | { readonly oid: GitOi
 
 export type FailedCheck = {
   readonly check: string;
+  /**
+   * The cache-only helper failure, including its available stderr.
+   */
+  readonly error: string;
   readonly exit?: number & tags.Type<'int32'>;
 };
 

@@ -928,7 +928,7 @@ pub enum Attribution {
 }
 
 /// Attribute the run summary in `cache` to `check`, spawned at `spawned` and exited at `exited`
-/// (16_build_volumes.md, Land step 7). Stock Nx writes the summary once, at the end of a run, and
+/// (16_build_volumes.md, Land step 7 source capture). Stock Nx writes it once, at the end of a run, and
 /// a check's Nx writes it before the check exits, so the summary is the check's when Nx's own
 /// `run.startTime` is not before the spawn, its `run.endTime` is not after the exit, its command
 /// is one the check spells, and it has a task for every target that command names. A run that
@@ -1130,6 +1130,33 @@ pub fn task_inputs(
     .into_iter()
     .map(|(category, entries)| (category.to_owned(), entries))
     .collect())
+}
+
+/// A successful check's attributed Nx run, kept only for this land's bounded restoration.
+#[derive(serde::Serialize)]
+pub struct CheckedRun {
+    pub check: String,
+    pub cache: PathBuf,
+    pub command: String,
+    pub tasks: std::collections::BTreeMap<String, String>,
+}
+
+/// The cache-only helper never executes a task, including on a missing or uncacheable result.
+pub const RESTORE_OUTPUTS_SCRIPT: &str = include_str!("restore_outputs.js");
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoredOutputs {
+    pub hits: u64,
+    pub misses: Vec<OutputMiss>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputMiss {
+    pub task: String,
+    pub hash: String,
+    pub reason: String,
 }
 
 /// The program that names what the tree at an Nx root looks up: `node - <root>` with this on

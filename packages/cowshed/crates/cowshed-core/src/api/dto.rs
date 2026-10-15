@@ -3319,17 +3319,16 @@ pub struct DatabaseHolder {
     pub command: String,
 }
 
-/// Step 7: the landed check re-run in the target on the adopted volume. Every Nx task should hit.
+/// Step 7: cache-only output restoration for the Nx runs validated before delivery. No check is rerun.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdoptionCheck {
     pub hits: u64,
     /// Each Nx task that missed: a defect in the project's build configuration.
     pub misses: Vec<CacheMiss>,
-    /// Checks whose run summary was not theirs (Land step 7): counted neither as hits nor as
-    /// misses.
+    /// Checks without an attributed source summary: counted neither as hits nor as misses.
     pub unattributed: Vec<UnattributedCheck>,
-    /// Checks that exited nonzero in the target.
+    /// Cache-only restoration helpers that failed in the target, never rerun check commands.
     pub failed: Vec<FailedCheck>,
 }
 
@@ -3411,6 +3410,8 @@ impl fmt::Display for UnattributedRun {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FailedCheck {
     pub check: String,
+    /// The cache-only helper failure, including its available stderr.
+    pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit: Option<i32>,
 }
@@ -3421,7 +3422,10 @@ pub struct FailedCheck {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CacheMiss {
     pub task: String,
+    /// The hash validated in the landing workspace, never a substituted target hash.
     pub hash: String,
+    /// Why this checked result could not be restored without executing the task.
+    pub reason: String,
     /// Each input category Nx reports (`files`, `environment`, `external`, …) and its entries;
     /// empty when Nx could not name them, with `inputs_error` saying why.
     pub inputs: std::collections::BTreeMap<String, Vec<String>>,
