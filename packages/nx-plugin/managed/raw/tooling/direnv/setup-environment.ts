@@ -4,6 +4,7 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -56,6 +57,28 @@ class CapturedCommandError extends Error {
     public readonly stderr: Uint8Array,
   ) {
     super(`${command} failed with exit code ${exitCode}`);
+  }
+}
+
+type BunInstallIntegrityOperation =
+  | 'inspect isolated store'
+  | 'resolve installed path'
+  | 'list installed package aliases'
+  | 'read installed package manifest';
+
+class BunInstallIntegrityError extends Error {
+  readonly code = 'BUN_INSTALL_INTEGRITY';
+
+  constructor(
+    public readonly operation: BunInstallIntegrityOperation,
+    public readonly actualPath: string,
+    public readonly expectedTarget: string,
+    cause: unknown,
+  ) {
+    super(
+      `Bun install integrity: ${operation} failed for ${actualPath}; expected target ${expectedTarget}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause },
+    );
   }
 }
 
@@ -199,7 +222,8 @@ try {
   if (process.env.GITHUB_ACTIONS === 'true' && cargoMode) {
     await withInstallLock(async () => {
       for (const fetch of cargoFetches) {
-        await fetch.install({ quiet: false });
+        const error = await fetch.install({ quiet: false });
+        if (error !== undefined) reportSetupFailure(error);
       }
     });
   } else if (process.env.GITHUB_ACTIONS === 'true') {
@@ -254,9 +278,11 @@ try {
       // ephemeral one restores it from the Actions cache). node_modules/.smoo-install is the one input that
       // goes with node_modules: without it a fresh checkout of the same lockfile found the task current,
       // installed nothing, and the shell's `ttsc` was not there.
-      bunInstallStamp(bunInputs).record();
+      const integrityError = bunInstallStamp(bunInputs).record();
+      if (integrityError !== undefined) reportSetupFailure(integrityError);
       if (uv !== null) {
-        await uv.install({ quiet: false });
+        const error = await uv.install({ quiet: false });
+        if (error !== undefined) reportSetupFailure(error);
       }
     });
   } else if (cargoMode) {
@@ -347,7 +373,8 @@ async function installLocalDependencies(pending: readonly Installer[]): Promise<
   }
   for (const installer of pending) {
     try {
-      await installer.install({ quiet: true });
+      const error = await installer.install({ quiet: true });
+      if (error !== undefined) return error;
     } catch (error) {
       return error;
     }
@@ -418,7 +445,7 @@ function openInstallLock(lockPath: string): number {
  */
 interface Installer {
   isCurrent(): boolean;
-  install(options: { quiet: boolean }): Promise<void>;
+  install(options: { quiet: boolean }): Promise<void | BunInstallIntegrityError>;
 }
 
 interface InstallStamp {
@@ -434,7 +461,10 @@ interface InstallStamp {
  * while the stamp matches and no developer link is stale (bunInstaller), and devenv's smoo:install task lists the file
  * among its inputs, so a checkout without node_modules reads as changed there.
  */
-function bunInstallStamp(inputs: readonly string[]): { isCurrent(): boolean; record(): void } {
+function bunInstallStamp(inputs: readonly string[]): {
+  isCurrent(): boolean;
+  record(): BunInstallIntegrityError | undefined;
+} {
   const stampPath = path.join(projectRoot, 'node_modules', '.smoo-install');
   const identity = ['bun install', Bun.version, Bun.revision];
   const lockDigests = (): Readonly<Record<string, string>> => {
@@ -457,8 +487,76 @@ function bunInstallStamp(inputs: readonly string[]): { isCurrent(): boolean; rec
         Object.entries(locks).every(([name, digest]) => stamp.lockfiles?.[name] === digest)
       );
     },
-    record: () => writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs), lockfiles: lockDigests() }),
+    record: () => {
+      const error = verifyInstalledBunLinks(projectRoot);
+      if (error !== undefined) return error;
+      writeInstallStamp(stampPath, { inputs: inputsDigest(identity, inputs), lockfiles: lockDigests() });
+      return undefined;
+    },
   };
+}
+
+/** Link/manifest admission only, once before an install writes its success receipt. */
+function verifyInstalledBunLinks(root: string): BunInstallIntegrityError | undefined {
+  const store = path.join(root, 'node_modules', '.bun');
+  let actualPath = store;
+  let expectedTarget = store;
+  let operation: BunInstallIntegrityOperation = 'inspect isolated store';
+
+  const select = (candidate: string, symbolicLink: boolean): void => {
+    actualPath = candidate;
+    expectedTarget = candidate;
+    operation = 'resolve installed path';
+    if (symbolicLink) {
+      const target = readlinkSync(candidate);
+      expectedTarget = path.resolve(path.dirname(candidate), target);
+      expectedTarget = path.resolve(realpathSync(path.dirname(candidate)), target);
+    }
+    realpathSync(candidate);
+  };
+  const manifest = (candidate: string, symbolicLink: boolean): void => {
+    select(candidate, symbolicLink);
+    operation = 'read installed package manifest';
+    JSON.parse(readFileSync(path.join(candidate, 'package.json'), 'utf8'));
+  };
+  const aliases = (tree: string, symbolicLink = false): void => {
+    select(tree, symbolicLink);
+    operation = 'list installed package aliases';
+    for (const entry of readdirSync(tree, { withFileTypes: true })) {
+      if (entry.name.startsWith('.')) continue;
+      const candidate = path.join(tree, entry.name);
+      if (entry.name.startsWith('@')) {
+        select(candidate, entry.isSymbolicLink());
+        operation = 'list installed package aliases';
+        for (const scoped of readdirSync(candidate, { withFileTypes: true })) {
+          if (!scoped.name.startsWith('.')) manifest(path.join(candidate, scoped.name), scoped.isSymbolicLink());
+        }
+      } else {
+        manifest(candidate, entry.isSymbolicLink());
+      }
+    }
+  };
+
+  try {
+    const state = lstatSync(store, { throwIfNoEntry: false });
+    // A hoisted install has no isolated store to admit.
+    if (state === undefined) return undefined;
+    select(store, state.isSymbolicLink());
+    operation = 'inspect isolated store';
+    for (const entry of readdirSync(store, { withFileTypes: true })) {
+      if (entry.name.startsWith('.')) continue;
+      const candidate = path.join(store, entry.name);
+      if (entry.name === 'node_modules') {
+        aliases(candidate, entry.isSymbolicLink());
+      } else if (entry.isDirectory() || entry.isSymbolicLink()) {
+        select(candidate, entry.isSymbolicLink());
+        aliases(path.join(candidate, 'node_modules'));
+      }
+    }
+    return undefined;
+  } catch (cause) {
+    return new BunInstallIntegrityError(operation, actualPath, expectedTarget, cause);
+  }
 }
 
 /**
@@ -496,7 +594,7 @@ function bunInstaller(inputs: readonly string[]): Installer {
             : runSetupCommand('bun install --no-summary', $`bun install --no-summary`, { quiet }),
         { relink: ['nx'] },
       );
-      stamp.record();
+      return stamp.record();
     },
   };
 }

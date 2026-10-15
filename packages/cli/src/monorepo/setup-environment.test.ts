@@ -560,6 +560,92 @@ describe('what shell entry installs', () => {
   });
 });
 
+describe('Bun installation receipt link admission', () => {
+  // Only this fixture's private cache is touched. The managed setup runs a real Bun install;
+  // its prepare script plants the on-disk isolated topology the receipt must admit or refuse.
+  const fixture =
+    "import { appendFileSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';\nimport { dirname, join, relative } from 'node:path';\nconst root = process.cwd();\nconst mode = readFileSync('integrity-mode', 'utf8');\nconst store = join(root, 'node_modules', '.bun');\nconst cache = join(dirname(root), 'private-bun-cache');\nconst parentStore = join(cache, 'fixture-parent@1.0.0');\nconst parent = join(parentStore, 'node_modules', '@fixture', 'parent');\nconst child = join(cache, 'fixture-child@1.0.0', 'node_modules', '@fixture', 'child');\nconst storeAlias = join(store, '@fixture+parent@1.0.0');\nconst childAlias = join(parentStore, 'node_modules', '@fixture', 'child');\nconst hoistAlias = join(store, 'node_modules', '@fixture', 'child');\nrmSync(storeAlias, { force: true });\nrmSync(join(store, 'node_modules', '@fixture'), { recursive: true, force: true });\nrmSync(cache, { recursive: true, force: true });\nmkdirSync(parent, { recursive: true });\nmkdirSync(child, { recursive: true });\nmkdirSync(dirname(hoistAlias), { recursive: true });\nwriteFileSync(join(parent, 'package.json'), JSON.stringify({\n  name: '@fixture/parent', version: '1.0.0', dependencies: { '@fixture/child': '1.0.0' },\n  optionalDependencies: { '@fixture/omitted': '1.0.0' },\n}));\nif (mode !== 'missing-manifest') {\n  writeFileSync(join(child, 'package.json'), mode === 'malformed-manifest' ? '{' : JSON.stringify({ name: '@fixture/child', version: '1.0.0' }));\n}\nsymlinkSync(mode === 'broken-store' ? join(cache, 'missing-parent') : parentStore, storeAlias);\nconst childTarget = mode === 'broken-transitive' ? join(cache, 'missing-child') : child;\nsymlinkSync(relative(dirname(childAlias), childTarget), childAlias);\nif (mode === 'healthy' || mode === 'broken-hoist') {\n  symlinkSync(mode === 'broken-hoist' ? join(cache, 'missing-child') : child, hoistAlias);\n}\nappendFileSync('integrity-installs', 'x\\n');\n";
+  const files = { 'integrity-fixture.mjs': fixture, 'integrity-mode': 'healthy' };
+  const options = { prepare: 'bun integrity-fixture.mjs', files };
+  const CI_SECRETS = { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' };
+
+  for (const ci of [false, true]) {
+    for (const defect of [
+      'broken-store',
+      'broken-transitive',
+      'broken-hoist',
+      'missing-manifest',
+      'malformed-manifest',
+    ]) {
+      it(`${ci ? 'CI' : 'local'} refuses ${defect} before writing an install receipt`, async () => {
+        await withManagedRepository(options, async ({ root, enterShell: enter }) => {
+          // Establish the genuine lockfile, then remove only this fixture's prior receipt.
+          expect(await enter()).toEqual(HEALTHY);
+          const receipt = join(root, 'node_modules', '.smoo-install');
+          await rm(receipt);
+          await writeFile(join(root, 'integrity-mode'), defect);
+          const refused = await enter(ci ? { ciSecrets: CI_SECRETS } : {});
+          const cache = join(dirname(root), 'private-bun-cache');
+          const storeAlias = join(root, 'node_modules', '.bun', '@fixture+parent@1.0.0');
+          const actualPath =
+            defect === 'broken-store'
+              ? storeAlias
+              : defect === 'broken-hoist'
+                ? join(root, 'node_modules', '.bun', 'node_modules', '@fixture', 'child')
+                : join(storeAlias, 'node_modules', '@fixture', 'child');
+          const expectedTarget =
+            defect === 'broken-store'
+              ? join(cache, 'missing-parent')
+              : defect === 'broken-transitive' || defect === 'broken-hoist'
+                ? join(cache, 'missing-child')
+                : join(cache, 'fixture-child@1.0.0', 'node_modules', '@fixture', 'child');
+          expect(refused.exitCode).toBe(ci ? 1 : 0);
+          expect(refused.stderr).toContain('Bun install integrity:');
+          expect(refused.stderr).toContain(actualPath);
+          expect(refused.stderr).toContain(`expected target ${expectedTarget}`);
+          expect(refused.stderr).toContain(ci ? '--- ERROR:' : '--- WARNING:');
+          if (!ci) expect(refused.stderr).toContain('The shell is loaded WITHOUT installed dependencies');
+          expect(refused.stderr).not.toContain('! Failed to install dependencies with frozen lockfile');
+          expect(existsSync(receipt)).toBe(false);
+          // The guard is outside CI's frozen-command catch: a refusal cannot trigger another install.
+          expect(readFileSync(join(root, 'integrity-installs'), 'utf8')).toBe('x\nx\n');
+        });
+      });
+    }
+  }
+
+  it('records complete transitive cache links after the normal CI frozen install', async () => {
+    await withManagedRepository(options, async ({ root, enterShell: enter }) => {
+      expect(await enter()).toEqual(HEALTHY);
+      const receipt = join(root, 'node_modules', '.smoo-install');
+      await rm(receipt);
+      const installed = await enter({ ciSecrets: CI_SECRETS });
+      expect(installed.exitCode).toBe(0);
+      expect(installed.stderr).not.toContain('Bun install integrity:');
+      expect(installed.stderr).not.toContain('git diff after install:');
+      expect(existsSync(receipt)).toBe(true);
+      expect(readFileSync(join(root, 'integrity-installs'), 'utf8')).toBe('x\nx\n');
+    });
+  });
+
+  it('records complete scoped/transitive cache links and leaves unchanged entry installed', async () => {
+    await withManagedRepository(options, async ({ root, enterShell: enter }) => {
+      expect(await enter()).toEqual(HEALTHY);
+      const receipt = join(root, 'node_modules', '.smoo-install');
+      const recorded = readFileSync(receipt);
+      expect(JSON.parse(recorded.toString('utf8'))).toEqual({
+        inputs: expect.stringMatching(/^[0-9a-f]{64}$/),
+        lockfiles: {
+          'bun.lock': new Bun.CryptoHasher('sha256').update(readFileSync(join(root, 'bun.lock'))).digest('hex'),
+        },
+      });
+      expect(await enter()).toEqual(HEALTHY);
+      expect(readFileSync(receipt)).toEqual(recorded);
+      expect(readFileSync(join(root, 'integrity-installs'), 'utf8')).toBe('x\n');
+    });
+  });
+});
+
 describe('what a CI install reports and records', () => {
   const MEMBER = 'packages/member/package.json';
   // A CI runner runs no provider command: the job's secret store injects every declared secret.
