@@ -656,7 +656,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         retired: true,
         build_volume: cowshed_core::api::dto::LandBuildVolume {
             seed: cowshed_core::api::dto::LandSeed::SealBusy {
-                reason: "/private/cowshed/store/widget/build/0123.dmg must be detached to be cloned, and its volume is in use by pid 5940 (codegraph serve --mcp); nothing was forced".to_owned(),
+                reason: "build volume /cache/build/0123.dmg is in use by pid 5940 (workspace job); nothing was forced: close what holds it and run the command again".to_owned(),
             },
             adoption: cowshed_core::api::dto::Adoption::Adopted {
                 elapsed_ms: 3,
@@ -718,6 +718,21 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                     database: PathBuf::from("/Users/fixture/Dev/widget/.nx/workspace-data/A-v3.db"),
                     holders: vec![cowshed_core::api::dto::DatabaseHolder {
                         pid: 4343,
+                        command: "node nx build widget".to_owned(),
+                    }],
+                },
+            },
+        },
+        ..land_first.clone()
+    };
+    let landing_opening = LandReport {
+        build_volume: cowshed_core::api::dto::LandBuildVolume {
+            seed: cowshed_core::api::dto::LandSeed::Unchanged,
+            adoption: cowshed_core::api::dto::Adoption::Skipped {
+                reason: cowshed_core::api::dto::AdoptionSkip::LandingOpening {
+                    database: PathBuf::from("/build/nx/workspace-data/tasks.db"),
+                    holders: vec![cowshed_core::api::dto::DatabaseHolder {
+                        pid: 4443,
                         command: "node nx build widget".to_owned(),
                     }],
                 },
@@ -884,6 +899,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
                 ("retired", document("land report", &land_retired)),
                 ("adoptionSkipped", document("land report", &land_held)),
                 ("landingBuilding", document("land report", &land_building)),
+                ("landingOpening", document("land report", &landing_opening)),
                 (
                     "adoptionSkippedOpening",
                     document("land report", &land_opening),

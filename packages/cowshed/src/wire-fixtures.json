@@ -1899,6 +1899,30 @@
       "targetBranch": "main",
       "targetWasCheckedOut": false
     },
+    "landingOpening": {
+      "buildVolume": {
+        "adoption": {
+          "kind": "skipped",
+          "reason": {
+            "database": "/build/nx/workspace-data/tasks.db",
+            "holders": [
+              {
+                "command": "node nx build widget",
+                "pid": 4443
+              }
+            ],
+            "kind": "landingOpening"
+          }
+        },
+        "seed": {
+          "kind": "unchanged"
+        }
+      },
+      "landedHead": "1111111111111111111111111111111111111111",
+      "retired": false,
+      "targetBranch": "main",
+      "targetWasCheckedOut": false
+    },
     "retired": {
       "buildVolume": {
         "adoption": {
@@ -1944,7 +1968,7 @@
         },
         "seed": {
           "kind": "sealBusy",
-          "reason": "/private/cowshed/store/widget/build/0123.dmg must be detached to be cloned, and its volume is in use by pid 5940 (codegraph serve --mcp); nothing was forced"
+          "reason": "build volume /cache/build/0123.dmg is in use by pid 5940 (workspace job); nothing was forced: close what holds it and run the command again"
         }
       },
       "landedHead": "1111111111111111111111111111111111111111",

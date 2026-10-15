@@ -3067,14 +3067,12 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
     fixture.stop_gateway().await;
 }
 
-/// A host process outside every cowshed and Nx protocol holding a file of the landing volume open
-/// (as an indexer's MCP server holds its SQLite index) refuses the seal, so main keeps its
-/// previous seed; the swap still runs, checked outputs restore from the adopted volume, and once the
-/// holder lets go, the next fork refreezes the seed from it (16_build_volumes.md, Land
-/// step 5.6).
+/// An open cache outside the named Nx/Cargo writer exclusion does not delay capture or adoption.
+/// The land replaces main's previous seed while the reader remains alive, and a subsequent fork
+/// inherits the cache bytes without requiring that reader to close (16_build_volumes.md, Land
+/// step 5.6). The real-APFS runtime proof owns block-atomic image and SQLite consistency coverage.
 #[tokio::test]
-async fn directory_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_still_adopts_substrate_lifecycle()
- {
+async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
@@ -3088,7 +3086,7 @@ async fn directory_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_
     fs::write(topic.join("a/src.txt"), b"src, changed\n").unwrap();
     git(&topic, &["commit", "-q", "-am", "change a"]);
     let landed_tree = git_stdout(&topic, &["rev-parse", "HEAD^{tree}"]);
-    // The fork reseeded main first (Fork step 2): that seed is the one the land must keep.
+    // The fork reseeded main first: the land must replace that seed while the reader stays open.
     let [(previous_seed, _)] = seeds_of_main(&layout)
         .try_into()
         .expect("main has one seed");
@@ -3116,41 +3114,56 @@ async fn directory_a_landing_volume_holder_keeps_the_previous_seed_and_the_land_
     .await;
 
     let report = land(&mut service, "topic", true, &[&nx_check]).await;
-    let LandSeed::SealBusy { reason } = &report.build_volume.seed else {
-        panic!("the holder refuses the seal, which keeps main's seed: {report:?}");
-    };
-    assert!(reason.contains(&format!("pid {pid}")), "{reason}");
+    assert_eq!(
+        report.build_volume.seed,
+        LandSeed::Frozen,
+        "an exempt cache reader must not refuse seed capture: {report:?}"
+    );
     match &report.build_volume.adoption {
         Adoption::Adopted { check, .. } => {
             assert_eq!(check.hits, 2, "a:build and a:test hit in main: {report:?}");
             assert_eq!(check.misses, [], "{report:?}");
             assert_eq!(check.failed, [], "{report:?}");
         }
-        Adoption::Skipped { reason } => panic!("a busy seal skipped the adoption: {reason:?}"),
+        Adoption::Skipped { reason } => {
+            panic!("an exempt cache reader skipped adoption: {reason:?}")
+        }
     }
     assert_eq!(linked_volume(&layout, &fixture.checkout), landing);
-    let [(kept, _)] = seeds_of_main(&layout)
+    let [(seed, record)] = seeds_of_main(&layout)
         .try_into()
         .expect("main keeps exactly one seed");
+    assert_ne!(
+        seed, previous_seed,
+        "the land replaces the seed while the exempt reader remains alive"
+    );
     assert_eq!(
-        kept, previous_seed,
-        "a busy seal keeps main's previous seed"
+        record.tree.as_ref().map(|tree| tree.as_str()),
+        Some(landed_tree.as_str()),
+        "the captured seed records the tree main adopted"
     );
     assert!(
         fs::read(&index).is_ok_and(|bytes| bytes == b"an index nothing in the land knows\n"),
         "main's adopted volume carries the index the holder kept open"
     );
 
-    drop(holder);
-    // The next fork reseeds main (Fork step 2) now that the holder has let go.
-    new_workspace(&mut service, "after").await;
-    let [(seed, record)] = seeds_of_main(&layout).try_into().expect("one seed of main");
-    assert_ne!(seed, previous_seed, "the next fork refreezes the kept seed");
+    // A fork captures or reuses main's current seed without waiting for the same reader.
+    let after = new_workspace(&mut service, "after").await;
+    let captured = link::linked(&after)
+        .expect("read the fork's build link")
+        .expect("the fork links its captured build volume");
+    assert_eq!(
+        fs::read(captured.join("codegraph.db")).unwrap().as_slice(),
+        b"an index nothing in the land knows\n",
+        "the fork inherits the actual cache bytes while the original reader remains open"
+    );
+    let [(_, record)] = seeds_of_main(&layout).try_into().expect("one seed of main");
     assert_eq!(
         record.tree.as_ref().map(|tree| tree.as_str()),
         Some(landed_tree.as_str()),
-        "the refrozen seed records the tree main adopted"
+        "the seed records the tree main adopted"
     );
+    drop(holder);
     service.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }

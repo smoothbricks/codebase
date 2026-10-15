@@ -231,7 +231,7 @@ impl DirectoryExecutionHost {
     }
 
     /// Clone `source` to the new volume `destination` with `record`. A bound source is claimed
-    /// against job admission for the whole capture, so nothing writes it while it is cloned.
+    /// against job admission for the whole capture; the runtime caller retains Nx/Cargo guards.
     pub fn clone_build_volume(
         &self,
         layout: &BuildVolumeLayout,
@@ -283,17 +283,9 @@ impl DirectoryExecutionHost {
         let from = layout.image(source);
         let to = layout.image(destination);
         self.require_store_image(&to)?;
-        // A tree copy of a held volume would capture a half-written state: refuse, naming
-        // the holders, as a non-forced detach of the mounted volume would.
-        let open = holders_of(&from)?;
-        if !open.is_empty() {
-            return Err(ApfsStorageError::BuildVolumeHeld {
-                image: from,
-                hold: layout.hold_path(source),
-                holds: Vec::new(),
-                open,
-            });
-        }
+        // Runtime owns the named Nx/Cargo exclusions. Other contributed paths and retained
+        // guard descriptors must not refuse capture. This controlled test substrate copies a
+        // tree; it does not prove the point-in-time atomicity of an APFS image clone.
         let hold = layout.hold_path(destination);
         let _creating = layout
             .hold_new(destination)

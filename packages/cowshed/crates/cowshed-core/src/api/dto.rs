@@ -3011,9 +3011,9 @@ pub enum LandSeed {
     Unchanged,
     /// The target's seed is frozen from the landing volume.
     Frozen,
-    /// A holder outside the Cargo and Nx protocols refused the landing volume's seal, so the
-    /// target keeps its previous seed while the adoption goes ahead; the next fork's reseed
-    /// refreezes it from the target's live volume once that holder lets go.
+    /// Required storage capture admission was refused, so the target retains its previous seed
+    /// while adoption goes ahead. The next fork may capture the adopted volume once that admission
+    /// succeeds; open handles on exempt contributed caches do not refuse capture.
     SealBusy { reason: String },
 }
 
@@ -3217,6 +3217,11 @@ pub enum AdoptionSkip {
         database: PathBuf,
         holders: Vec<DatabaseHolder>,
     },
+    /// An Nx process held or waited on the landing task database's open lock when capture began.
+    LandingOpening {
+        database: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
     /// The landing workspace's Nx daemon outlived its stop.
     LandingDaemonStayed { daemon: DatabaseHolder },
     /// A host Cargo build holds a landing profile's lock immediately before the seed freezes.
@@ -3249,6 +3254,7 @@ impl AdoptionSkip {
             Self::NoLandingVolume => "noLandingVolume",
             Self::NoTargetVolume => "noTargetVolume",
             Self::LandingHeld { .. } => "landingHeld",
+            Self::LandingOpening { .. } => "landingOpening",
             Self::LandingDaemonStayed { .. } => "landingDaemonStayed",
             Self::LandingBuilding { .. } => "landingBuilding",
             Self::TargetHeld { .. } => "targetHeld",
@@ -3309,13 +3315,22 @@ impl fmt::Display for AdoptionSkip {
                 write!(formatter, "the target's {} is open in ", database.display())?;
                 holders(formatter, held)
             }
-            Self::TargetOpening {
+            Self::LandingOpening {
+                database,
+                holders: held,
+            }
+            | Self::TargetOpening {
                 database,
                 holders: held,
             } => {
                 write!(
                     formatter,
-                    "an Nx process was opening the target's {}: ",
+                    "an Nx process was opening the {}'s {}: ",
+                    if matches!(self, Self::LandingOpening { .. }) {
+                        "landing workspace"
+                    } else {
+                        "target"
+                    },
                     database.display()
                 )?;
                 holders(formatter, held)

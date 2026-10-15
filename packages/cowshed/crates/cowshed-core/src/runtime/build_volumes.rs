@@ -170,13 +170,13 @@ impl<H: RuntimeStorageHost> Contended<H> {
     }
 }
 
-/// What [`BuildVolumes::freeze_seed`] did with the target's seed when the landing volume had no
-/// Cargo build (Land step 5.6).
+/// What [`BuildVolumes::freeze_seed`] did with the target's seed after Nx and existing Cargo
+/// profiles admitted capture (Land step 5.6).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Freeze {
-    /// The seed is captured from the sealed landing volume and every older seed retired.
+    /// The seed is captured from the guarded landing volume and every older seed retired.
     Frozen,
-    /// A holder outside the Cargo and Nx protocols refused the seal; the previous seed stays.
+    /// A conflicting storage claim refused capture; the previous seed stays.
     SealBusy { reason: String },
 }
 
@@ -375,8 +375,13 @@ impl std::fmt::Display for LandedSkip {
 /// Why a quiet volume could not be captured as a seed: something still writes it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CaptureSkip {
-    /// A process other than the volume's Nx daemon holds its task database at admission.
+    /// A process holds the volume's task database at admission.
     Held {
+        database: PathBuf,
+        holders: Vec<DatabaseHolder>,
+    },
+    /// An Nx process holds a task database's open lock, before or during its open.
+    Opening {
         database: PathBuf,
         holders: Vec<DatabaseHolder>,
     },
@@ -387,7 +392,7 @@ pub(crate) enum CaptureSkip {
         lock: PathBuf,
         holders: Vec<DatabaseHolder>,
     },
-    /// The source could not be sealed without forcing a filesystem holder off its volume.
+    /// A job or conflicting storage claim holds the source's build hold.
     VolumeBusy { reason: String },
 }
 
@@ -411,6 +416,17 @@ impl std::fmt::Display for CaptureSkip {
             } => {
                 write!(formatter, "{} is open in ", database.display())?;
                 holders(formatter, held)
+            }
+            Self::Opening {
+                database,
+                holders: held,
+            } => {
+                write!(formatter, "{} is being opened", database.display())?;
+                if !held.is_empty() {
+                    formatter.write_str(" by ")?;
+                    holders(formatter, held)?;
+                }
+                Ok(())
             }
             Self::DaemonStayed { daemon } => write!(
                 formatter,
@@ -1171,14 +1187,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         .await
     }
 
-    /// Land step 5.6, under the target's image lock: admit only an idle Cargo volume, seal it
-    /// without force, capture the target's seed, then retire every older seed. A refused seal is
-    /// first put to the landing side's own protocols again: its Nx state is closed once more (a
-    /// recorded daemon stopped, any other task-database holder a skip) and the seal is asked once
-    /// more behind a fresh Cargo admission (a held profile lock a skip). Only a refusal that both
-    /// protocols leave standing is a holder outside them, answered as [`Freeze::SealBusy`]: the
-    /// seal fences only the captured bytes, so the adoption still goes ahead on the restored
-    /// volume with the previous seed kept.
+    /// Land step 5.6, under the target's image lock: close Nx, retain its open locks and the
+    /// existing Cargo profile locks through mounted capture and publication, then retire every
+    /// older seed. Other contributed cache/index handles do not refuse capture. Quiet retains
+    /// the stopped supervisor's admission lease and shared GC hold throughout this operation.
     pub async fn freeze_seed(
         &self,
         locked: &TargetLock<H>,
@@ -1195,26 +1207,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                     incarnation: target.incarnation.clone(),
                 },
             );
-            let previous = seeds_of(layout, &target)?;
-            let sealed = match seal(host, layout, &quiet, &record)? {
-                Ok(Sealed::Refused { .. }) => {
-                    if let Err(busy) = nx::close(&quiet.mount, &quiet.state).map_err(|error| {
-                        io("close the landing volume's Nx state", &quiet.mount, &error)
-                    })? {
-                        return Ok(Err(skip(busy, Side::Landing)));
-                    }
-                    seal(host, layout, &quiet, &record)?
-                }
-                first => first,
-            };
-            match sealed {
-                Ok(Sealed::Captured) => {
-                    retire_seeds(host, layout, &target, previous)?;
-                    Ok(Ok(Freeze::Frozen))
-                }
-                Ok(Sealed::Refused { reason }) => Ok(Ok(Freeze::SealBusy { reason })),
-                Err(skipped) => Ok(Err(skipped)),
-            }
+            seal(host, layout, &quiet, &target, &record)
         })
         .await
     }
@@ -2203,26 +2196,33 @@ fn seeds_of(layout: &BuildVolumeLayout, owner: &Owner) -> Result<Vec<BuildVolume
     Ok(seeds)
 }
 
-/// What one seal of the quiet landing volume did (Land step 5.6).
-enum Sealed {
-    /// The seed is captured from the sealed volume and the volume restored.
-    Captured,
-    /// A filesystem holder refused the non-forced seal; the volume stays mounted.
-    Refused { reason: String },
-}
-
-/// Seal the quiet landing volume once and capture a seed recorded as `record` from it, admitted
-/// only while no Cargo build holds one of its profile locks (a [`AdoptionSkip::LandingBuilding`]
-/// skip). The admission checks existing profiles; it does not fence future ones, so its
-/// descriptors are closed before the unmount and the non-forced detached capture excludes late
-/// writers.
+/// Capture the quiet landing volume under the Nx and existing Cargo profile guards.
+/// Contributed paths outside those protocols are exempt. A host Cargo build can still create
+/// a new profile after enumeration; closing that gap requires a producer-side lease.
 fn seal(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
     quiet: &Quiet,
+    target: &Owner,
     record: &BuildVolumeRecord,
-) -> Result<std::result::Result<Sealed, AdoptionSkip>> {
-    let builds = match cargo::hold(&quiet.mount, &quiet.state)
+) -> Result<std::result::Result<Freeze, AdoptionSkip>> {
+    if let Err(busy) = nx::close(&quiet.mount, &quiet.state)
+        .map_err(|error| io("close the landing volume's Nx state", &quiet.mount, &error))?
+    {
+        return Ok(Err(skip(busy, Side::Landing)));
+    }
+    let _opens = match nx::hold_opens(&quiet.mount, &quiet.state, &quiet.mount)
+        .map_err(|error| io("lock the landing volume's Nx opens", &quiet.mount, &error))?
+    {
+        Ok(opens) => opens,
+        Err(opening) => {
+            return Ok(Err(AdoptionSkip::LandingOpening {
+                database: opening.database,
+                holders: opening.holders.into_iter().map(database_holder).collect(),
+            }));
+        }
+    };
+    let _builds = match cargo::hold(&quiet.mount, &quiet.state)
         .map_err(|error| io("take the landing Cargo profile locks", &quiet.mount, &error))?
     {
         Ok(held) => held,
@@ -2235,23 +2235,29 @@ fn seal(
             }));
         }
     };
-    drop(builds);
+    let previous = seeds_of(layout, target)?;
+    if let Err(busy) = nx::held(&quiet.mount, &quiet.state).map_err(|error| {
+        io(
+            "look at the landing volume's Nx state",
+            &quiet.mount,
+            &error,
+        )
+    })? {
+        return Ok(Err(skip(busy, Side::Landing)));
+    }
     match host.clone_quiet_build_volume(layout, quiet, &BuildVolumeId::mint(), record) {
-        Ok(()) => Ok(Ok(Sealed::Captured)),
-        Err(ApfsStorageError::BuildVolumeHeld { image, open, .. }) => Ok(Ok(Sealed::Refused {
+        Ok(()) => {
+            retire_seeds(host, layout, target, previous)?;
+            Ok(Ok(Freeze::Frozen))
+        }
+        Err(ApfsStorageError::BuildVolumeHeld { image, open, .. }) => Ok(Ok(Freeze::SealBusy {
             reason: volume_busy_reason(&image, &open),
         })),
-        Err(ApfsStorageError::Apfs(error)) if cowshed_apfs::detach_was_dissented(&error) => {
-            Ok(Ok(Sealed::Refused {
-                reason: error.to_string(),
-            }))
-        }
         Err(error) => Err(storage(error)),
     }
 }
 
-/// Why a non-forced capture refused, naming every holder: the directory backend's form of a
-/// dissented detach, in the words the native capture refusal uses.
+/// Why a conflicting storage claim refused capture, naming every reported holder.
 fn volume_busy_reason(image: &Path, open: &[cowshed_os::process::Holder]) -> String {
     let holders = open
         .iter()
@@ -2550,9 +2556,9 @@ fn reseed(
 }
 
 /// Freeze `source`, recorded at `tree`, as `target`'s seed after Nx and existing Cargo profiles
-/// admit capture, then retire every older seed of `target`; the elapsed milliseconds. The
-/// non-forced detach, not profile enumeration or a later holder probe, excludes filesystem
-/// writers while the image is validated and cloned. A skip leaves every seed as it was.
+/// admit capture, then retire every older seed of `target`; the elapsed milliseconds. Their
+/// guards and the exclusive build hold stay alive through mounted capture and publication.
+/// Exempt cache/index handles may stay open. A skip leaves every seed as it was.
 fn capture(
     host: &impl RuntimeStorageHost,
     layout: &BuildVolumeLayout,
@@ -2564,7 +2570,7 @@ fn capture(
     let mount = host.mount_build_volume(layout, source).map_err(storage)?;
     let state = BuildVolumeState::read(&mount)?;
     // Claim before stopping Nx: the source's keeper must not admit a replacement job.
-    // Retain the claim through sealing, canonical restore and immutable seed publication.
+    // Retain the claim through mounted capture and immutable seed publication.
     let claim = match host.claim_build_volume(layout, source).map_err(storage)? {
         BuildVolumeClaim::Claimed(claim) => claim,
         BuildVolumeClaim::Held { open } => {
@@ -2581,7 +2587,18 @@ fn capture(
     {
         return Ok(Err(capture_skip(busy)));
     }
-    let builds = match cargo::hold(&mount, &state)
+    let _opens = match nx::hold_opens(&mount, &state, &mount)
+        .map_err(|error| io("lock the volume's Nx opens", &mount, &error))?
+    {
+        Ok(opens) => opens,
+        Err(opening) => {
+            return Ok(Err(CaptureSkip::Opening {
+                database: opening.database,
+                holders: opening.holders.into_iter().map(database_holder).collect(),
+            }));
+        }
+    };
+    let _builds = match cargo::hold(&mount, &state)
         .map_err(|error| io("take the volume's Cargo build locks", &mount, &error))?
     {
         Ok(held) => held,
@@ -2595,11 +2612,11 @@ fn capture(
         }
     };
     let previous = seeds_of(layout, target)?;
-    // The capture now removes the source from the filesystem namespace without force and
-    // clones only its detached, inode-held image. Our own lock descriptors would keep that
-    // unmount busy. Release them before sealing: a Cargo that gets in first makes unmount
-    // refuse, and no filesystem writer can modify the image after its driver is detached.
-    drop(builds);
+    if let Err(busy) = nx::held(&mount, &state)
+        .map_err(|error| io("look at the volume's Nx state", &mount, &error))?
+    {
+        return Ok(Err(capture_skip(busy)));
+    }
     match host.clone_claimed_build_volume(
         layout,
         &claim,
@@ -2618,14 +2635,8 @@ fn capture(
                 reason: volume_busy_reason(&image, &open),
             }));
         }
-        Err(ApfsStorageError::Apfs(error)) if cowshed_apfs::detach_was_dissented(&error) => {
-            return Ok(Err(CaptureSkip::VolumeBusy {
-                reason: error.to_string(),
-            }));
-        }
         Err(error) => return Err(storage(error)),
     }
-    drop(claim);
     retire_seeds(host, layout, target, previous)?;
     let elapsed_ms = millis(started.elapsed());
     cowshed_os::timing::event("build-volume", || {
@@ -4464,6 +4475,185 @@ mod tests {
         scratch.release_all();
     }
 
+    /// Land and direct capture both keep exempt readers on the mounted source. The seed holds
+    /// exact warm bytes and SQLite rows, including committed WAL state, not a source-side copy.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_seed_capture_preserves_open_contributed_caches() {
+        use crate::build_volume::sqlite::Connection;
+        use std::io::Write as _;
+
+        let scratch = Scratch::new("seed-open-caches");
+        let (checkout, live, mount) = scratch.linked_checkout("topic", 1);
+        let target_checkout = scratch.root.path().join("main");
+        fs::create_dir_all(target_checkout.join(".cowshed")).unwrap();
+        let state = BuildVolumeState {
+            paths: vec![
+                BuildStatePath::new(".codegraph", "codegraph").unwrap(),
+                BuildStatePath::new(".lint-cache", "lint-cache").unwrap(),
+                BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
+                BuildStatePath::new("target", "target").unwrap(),
+            ],
+            fingerprint: None,
+        };
+        state.write(&mount).unwrap();
+        link::link_paths(&checkout, &mount, &state.paths).unwrap();
+        fs::create_dir_all(mount.join("target/debug")).unwrap();
+        fs::write(mount.join("target/debug/.cargo-lock"), b"").unwrap();
+        fs::write(mount.join("nx/workspace-data/T-v3.db"), b"").unwrap();
+        let quiet = scratch
+            .volumes
+            .quiesce(
+                scratch.landing(&checkout),
+                scratch.stopped(&checkout).await,
+                target_checkout,
+            )
+            .await
+            .unwrap()
+            .expect("Nx and Cargo are idle");
+        let target = owner("main", '0');
+        let locked = scratch.lock(&target).await;
+        assert_eq!(
+            scratch
+                .volumes
+                .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+                .await
+                .unwrap(),
+            Ok(Freeze::Frozen)
+        );
+        let mut previous = scratch
+            .layout
+            .seed_of(&target.name, &target.incarnation)
+            .unwrap()
+            .unwrap()
+            .0;
+        let database = checkout.join(".codegraph/codegraph.db");
+        fs::write(&database, b"").unwrap();
+        let holder = Connection::open(&database).unwrap();
+        holder.execute("PRAGMA journal_mode=WAL", &[]).unwrap();
+        holder.execute("PRAGMA wal_autocheckpoint=0", &[]).unwrap();
+        holder
+            .execute("CREATE TABLE evidence (sequence INTEGER, value TEXT)", &[])
+            .unwrap();
+        holder
+            .execute(
+                "INSERT INTO evidence VALUES (1, 'warm-one'), (2, 'warm-two')",
+                &[],
+            )
+            .unwrap();
+        holder.execute("BEGIN", &[]).unwrap();
+        let mut reader = holder
+            .prepare("SELECT sequence, value FROM evidence ORDER BY sequence")
+            .unwrap();
+        assert!(reader.step().unwrap());
+        assert_eq!((reader.integer(0), reader.text(1)), (1, "warm-one".into()));
+        let marker = b"warm unrelated lint cache\n";
+        let cache_path = checkout.join(".lint-cache/warm");
+        let mut cache = fs::File::create(&cache_path).unwrap();
+        cache.write_all(marker).unwrap();
+        cache.sync_all().unwrap();
+
+        let mut quiet = Some(quiet);
+        for digit in ['b', 'c'] {
+            let tree = GitOid::new(digit.to_string().repeat(40)).unwrap();
+            if let Some(quiet) = quiet.take() {
+                assert_eq!(
+                    scratch
+                        .volumes
+                        .freeze_seed(&locked, &quiet, tree.clone())
+                        .await
+                        .unwrap(),
+                    Ok(Freeze::Frozen),
+                    "the landing capture admits exempt open caches"
+                );
+            } else {
+                capture(
+                    &*scratch.host,
+                    &scratch.layout,
+                    &target,
+                    &live,
+                    Some(tree.clone()),
+                )
+                .unwrap()
+                .expect("direct capture admits the same exempt open caches");
+            }
+            let (seed, record) = scratch
+                .layout
+                .seed_of(&target.name, &target.incarnation)
+                .unwrap()
+                .expect("the replacement seed is published");
+            assert_ne!(seed, previous);
+            assert_eq!(record.tree, Some(tree.clone()));
+            assert!(!scratch.layout.image(&previous).exists());
+            assert_eq!(seeds_of(&scratch.layout, &target).unwrap(), [seed.clone()]);
+            let fork = BuildVolumeId::mint();
+            scratch
+                .host
+                .clone_build_volume(
+                    &scratch.layout,
+                    &seed,
+                    &fork,
+                    &BuildVolumeRecord::new(Some(tree), linked("fork")),
+                )
+                .unwrap();
+            let fork_mount = scratch
+                .host
+                .mount_build_volume(&scratch.layout, &fork)
+                .unwrap();
+            assert_eq!(
+                fs::read(fork_mount.join("lint-cache/warm")).unwrap(),
+                marker
+            );
+            let captured = Connection::open(&fork_mount.join("codegraph/codegraph.db")).unwrap();
+            let mut rows = captured
+                .prepare("SELECT sequence, value FROM evidence ORDER BY sequence")
+                .unwrap();
+            let mut values = Vec::new();
+            while rows.step().unwrap() {
+                values.push((rows.integer(0), rows.text(1)));
+            }
+            assert_eq!(
+                values,
+                [(1, "warm-one".to_owned()), (2, "warm-two".to_owned())]
+            );
+            let mut live_rows = holder.prepare("SELECT count(*) FROM evidence").unwrap();
+            assert!(live_rows.step().unwrap());
+            assert_eq!(
+                live_rows.integer(0),
+                2,
+                "the original connection stays live"
+            );
+            previous = seed;
+        }
+        assert!(reader.step().unwrap(), "the original read cursor survives");
+        assert_eq!((reader.integer(0), reader.text(1)), (2, "warm-two".into()));
+        assert!(!reader.step().unwrap());
+        drop(reader);
+        holder.execute("COMMIT", &[]).unwrap();
+        holder
+            .execute("INSERT INTO evidence VALUES (3, 'after capture')", &[])
+            .unwrap();
+        let mut rows = holder.prepare("SELECT count(*) FROM evidence").unwrap();
+        assert!(rows.step().unwrap());
+        assert_eq!(rows.integer(0), 3);
+        cache
+            .write_all(b"still open after both captures\n")
+            .unwrap();
+        assert_eq!(
+            fs::read(&cache_path).unwrap(),
+            b"warm unrelated lint cache\nstill open after both captures\n"
+        );
+        assert_eq!(
+            fs::canonicalize(&database).unwrap(),
+            mount.join("codegraph/codegraph.db")
+        );
+        drop(rows);
+        drop(holder);
+        drop(cache);
+        drop(locked);
+        scratch.release_all();
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn real_apfs_gc_collects_an_imageless_seed_sidecar_and_rechecks_its_image() {
@@ -4829,10 +5019,16 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn directory_seed_freeze_keeps_the_previous_seed_for_a_filesystem_holder_after_quiesce() {
-        let scratch = Scratch::directory("seed-late-holder");
+    async fn directory_seed_freeze_admits_an_open_contributed_cache_after_quiesce() {
+        let scratch = Scratch::directory("seed-open-cache");
         let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
         let (topic_checkout, _, mount) = scratch.linked_checkout("topic", 1);
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".lint-cache", "lint-cache").unwrap()],
+            fingerprint: None,
+        };
+        state.write(&mount).unwrap();
+        fs::create_dir_all(mount.join("lint-cache")).unwrap();
         let quiet = scratch
             .volumes
             .quiesce(
@@ -4845,43 +5041,186 @@ fn main() {
             .expect("the landing volume was quiet");
         let target = owner("main", '0');
         let locked = scratch.lock(&target).await;
-        let mut held = fs::File::create(mount.join("late-writer")).unwrap();
+        let mut held = fs::File::create(mount.join("lint-cache/warm")).unwrap();
+        std::io::Write::write_all(&mut held, b"warm").unwrap();
+        let tree = GitOid::new("a".repeat(40)).unwrap();
         let frozen = scratch
             .volumes
-            .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+            .freeze_seed(&locked, &quiet, tree.clone())
             .await;
         let seed = scratch
             .layout
             .seed_of(&target.name, &target.incarnation)
             .unwrap();
-        // The refused seal left the holder's descriptor live on the still-mounted volume, which
-        // the adoption then moves to the target.
-        let still_open = std::io::Write::write_all(&mut held, b"after the refused seal");
-        let still_mounted = mount.join("late-writer").exists();
+        let still_open = std::io::Write::write_all(&mut held, b" after capture");
+        let contents = fs::read(mount.join("lint-cache/warm")).unwrap();
         drop(held);
         drop(quiet);
         drop(locked);
         scratch.release_all();
-        assert!(seed.is_none(), "a refused seal must publish no seed");
-        let Ok(Freeze::SealBusy { reason }) = frozen.unwrap() else {
-            panic!("the late filesystem holder must keep the previous seed, not skip the land");
-        };
-        assert!(
-            reason.contains(&format!("pid {}", std::process::id())),
-            "{reason}"
+        assert_eq!(frozen.unwrap(), Ok(Freeze::Frozen));
+        assert_eq!(
+            seed.expect("the exempt cache permits publication").1.tree,
+            Some(tree)
         );
-        assert!(reason.contains("nothing was forced"), "{reason}");
-        still_open.expect("the holder's descriptor survives a refused seal");
+        still_open.expect("the cache descriptor survives capture");
+        assert_eq!(contents, b"warm after capture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_capture_names_nx_open_lock_contention_for_land_and_reseed() {
+        use cowshed_os::fork_lock::Spawn as _;
+        use std::io::BufRead as _;
+
+        let scratch = Scratch::directory("seed-nx-opening");
+        let (main_checkout, _, _) = scratch.linked_checkout("main", 1);
+        let (checkout, live, mount) = scratch.linked_checkout("topic", 1);
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
+            fingerprint: None,
+        };
+        state.write(&mount).unwrap();
+        let data = mount.join("nx/workspace-data");
+        fs::create_dir_all(&data).unwrap();
+        let database = data.join("T-v3.db");
+        fs::write(&database, b"").unwrap();
+        let quiet = scratch
+            .volumes
+            .quiesce(
+                scratch.landing(&checkout),
+                scratch.stopped(&checkout).await,
+                main_checkout,
+            )
+            .await
+            .unwrap()
+            .expect("nothing has opened Nx");
+        let target = owner("main", '0');
+        let locked = scratch.lock(&target).await;
+        assert_eq!(
+            scratch
+                .volumes
+                .freeze_seed(&locked, &quiet, GitOid::new("a".repeat(40)).unwrap())
+                .await
+                .unwrap(),
+            Ok(Freeze::Frozen)
+        );
+        let previous = seeds_of(&scratch.layout, &target).unwrap();
+        let lock = database.with_extension("lock");
+        // Stock Nx holds this flock while opening the database. The ready line proves the
+        // real open lock is held, without pretending the database itself is already open.
+        let mut opening = std::process::Command::new("/usr/bin/lockf")
+            .arg("-k")
+            .arg(&lock)
+            .args(["/bin/sh", "-c", "echo held; read _"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let pid = i32::try_from(opening.id()).unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(opening.stdout.as_mut().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "held\n");
+        let tree = GitOid::new("b".repeat(40)).unwrap();
+        let landed = scratch
+            .volumes
+            .freeze_seed(&locked, &quiet, tree.clone())
+            .await;
+        drop(quiet);
+        let direct = capture(&*scratch.host, &scratch.layout, &target, &live, Some(tree));
+        let kept = seeds_of(&scratch.layout, &target).unwrap();
+        drop(opening.stdin.take());
+        opening.wait().unwrap();
+        drop(locked);
+        scratch.release_all();
+        assert_eq!(kept, previous, "neither refusal replaces the seed");
+        let Err(AdoptionSkip::LandingOpening {
+            database: landing_database,
+            holders: landing_holders,
+        }) = landed.unwrap()
+        else {
+            panic!("land names the contended Nx open lock as landingOpening");
+        };
+        let Err(CaptureSkip::Opening {
+            database: direct_database,
+            holders: direct_holders,
+        }) = direct.unwrap()
+        else {
+            panic!("direct capture names the contended Nx open lock as Opening");
+        };
+        for (named, holders) in [
+            (landing_database, landing_holders),
+            (direct_database, direct_holders),
+        ] {
+            assert_eq!(named, database);
+            assert!(
+                holders.iter().any(|holder| {
+                    holder.pid == pid && holder.command.starts_with("/usr/bin/lockf")
+                }),
+                "the refusal names the actual opener: {holders:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directory_capture_refuses_an_open_nx_database_without_replacing_the_seed() {
+        use crate::build_volume::sqlite::Connection;
+
+        let scratch = Scratch::directory("capture-nx-held");
+        let (_, live, mount) = scratch.linked_checkout("main", 1);
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap()],
+            fingerprint: None,
+        };
+        state.write(&mount).unwrap();
+        fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
+        let database = mount.join("nx/workspace-data/T-v3.db");
+        fs::write(&database, b"").unwrap();
+        let target = owner("main", '0');
+        capture(&*scratch.host, &scratch.layout, &target, &live, None)
+            .unwrap()
+            .expect("the initial capture has no holder");
+        let previous = seeds_of(&scratch.layout, &target).unwrap();
+        let holder = Connection::open(&database).unwrap();
+        holder
+            .execute("CREATE TABLE evidence (value TEXT)", &[])
+            .unwrap();
+        let captured = capture(
+            &*scratch.host,
+            &scratch.layout,
+            &target,
+            &live,
+            Some(GitOid::new("a".repeat(40)).unwrap()),
+        );
+        let kept = seeds_of(&scratch.layout, &target).unwrap();
+        holder
+            .execute("INSERT INTO evidence VALUES ('still live')", &[])
+            .unwrap();
+        drop(holder);
+        scratch.release_all();
+        assert_eq!(kept, previous);
+        let Err(CaptureSkip::Held {
+            database: named,
+            holders,
+        }) = captured.unwrap()
+        else {
+            panic!("an Nx database holder is not an exempt index reader");
+        };
+        assert_eq!(named, database);
         assert!(
-            still_mounted,
-            "the refused seal restores the landing volume's mount"
+            holders
+                .iter()
+                .any(|holder| holder.pid == i32::try_from(std::process::id()).unwrap()),
+            "the refusal names the live SQLite holder: {holders:?}"
         );
     }
 
-    /// An Nx client that opens the landing volume's task database after quiesce refuses the seal
-    /// as any holder does, but it is inside the Nx protocol: the refusal is put to that protocol
-    /// again, which names it as a `landingHeld` skip instead of a busy seal that would adopt the
-    /// volume with the client still in it (16_build_volumes.md, Land step 5.6).
+    /// An Nx client that opens the landing volume's task database after quiesce is named by
+    /// capture admission as `landingHeld`, never treated as an exempt contributed cache
+    /// (16_build_volumes.md, Land step 5.6).
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn directory_seed_freeze_skips_a_late_nx_database_holder_after_quiesce() {
@@ -4962,13 +5301,11 @@ fn main() {
     }
 
     /// The landing checkout's own Nx daemon, recorded in the landing volume and started by a
-    /// client after quiesce, holds the volume (its working directory is in it) and refuses the
-    /// seal. The refusal is put to the Nx protocol again, which stops that daemon as step 4 does,
-    /// and the second seal freezes the seed: the daemon is not a holder outside the protocols
+    /// client after quiesce, is stopped again by capture admission before the mounted snapshot
     /// (16_build_volumes.md, Land step 5.6).
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn directory_seed_freeze_stops_a_late_landing_daemon_and_seals_again() {
+    async fn directory_seed_freeze_stops_a_late_landing_daemon_before_capture() {
         use cowshed_os::fork_lock::Spawn as _;
         use std::os::unix::process::ExitStatusExt as _;
 
@@ -5040,15 +5377,21 @@ fn main() {
             Ok(Freeze::Frozen),
             "with its own daemon stopped the landing volume seals"
         );
-        let (_, record) = seed.expect("the second seal publishes the seed");
+        let (_, record) = seed.expect("capture publishes the seed after the daemon stops");
         assert_eq!(record.tree, Some(GitOid::new("a".repeat(40)).unwrap()));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn directory_reseed_skips_a_filesystem_holder_without_retiring_the_previous_seed() {
-        let scratch = Scratch::directory("reseed-late-holder");
+    fn directory_reseed_replaces_the_seed_with_an_open_contributed_cache() {
+        let scratch = Scratch::directory("reseed-open-cache");
         let (_, live, mount) = scratch.linked_checkout("main", 1);
+        let state = BuildVolumeState {
+            paths: vec![BuildStatePath::new(".lint-cache", "lint-cache").unwrap()],
+            fingerprint: None,
+        };
+        state.write(&mount).unwrap();
+        fs::create_dir_all(mount.join("lint-cache")).unwrap();
         let target = owner("main", '0');
         let previous = BuildVolumeId::mint();
         scratch
@@ -5066,16 +5409,18 @@ fn main() {
                 ),
             )
             .unwrap();
-        let held = fs::File::create(mount.join("late-writer")).unwrap();
-        // Clock ordering is supplied explicitly; this test exercises the real holder and
-        // publication boundary, not the independent image-mtime comparison.
+        let mut held = fs::File::create(mount.join("lint-cache/warm")).unwrap();
+        std::io::Write::write_all(&mut held, b"warm").unwrap();
+        let tree = GitOid::new("a".repeat(40)).unwrap();
+        // Clock ordering is supplied explicitly; this exercises admission and publication,
+        // not the independent image-mtime comparison.
         let reseeded = reseed(
             &*scratch.host,
             &scratch.layout,
             &target,
             SeedAge {
                 live,
-                tree: None,
+                tree: Some(tree.clone()),
                 nearness: Nearness::Unknown,
                 written: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
                 seed: Some(Frozen {
@@ -5086,27 +5431,21 @@ fn main() {
                 }),
             },
         );
-        let kept = scratch
+        let (seed, record) = scratch
             .layout
             .seed_of(&target.name, &target.incarnation)
             .unwrap()
-            .unwrap()
-            .0;
+            .unwrap();
+        assert!(!scratch.layout.image(&previous).exists());
+        let still_open = std::io::Write::write_all(&mut held, b" after capture");
+        let contents = fs::read(mount.join("lint-cache/warm")).unwrap();
         drop(held);
         scratch.release_all();
-        assert_eq!(kept, previous);
-        let Refresh::Skipped {
-            reason: CaptureSkip::VolumeBusy { reason },
-            ..
-        } = reseeded.unwrap()
-        else {
-            panic!("a busy source is a reseed skip");
-        };
-        assert!(
-            reason.contains(&format!("pid {}", std::process::id())),
-            "{reason}"
-        );
-        assert!(reason.contains("nothing was forced"), "{reason}");
+        assert!(matches!(reseeded.unwrap(), Refresh::Reseeded { .. }));
+        assert_ne!(seed, previous);
+        assert_eq!(record.tree, Some(tree));
+        still_open.expect("the cache descriptor survives reseeding");
+        assert_eq!(contents, b"warm after capture");
     }
 
     /// Fork `destination` from `main`'s seed refreshed for `aim`, as `fork` does, and read the
