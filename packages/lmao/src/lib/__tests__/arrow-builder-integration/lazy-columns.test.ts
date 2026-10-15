@@ -282,9 +282,6 @@ describe('SpanBuffer Lazy Column Allocation', () => {
     expect(buffer.timestamp).toBeInstanceOf(BigInt64Array);
     expect(buffer.entry_type).toBeDefined();
     expect(buffer.entry_type).toBeInstanceOf(Uint8Array);
-    // Also check public aliases
-    expect(buffer.timestamp).toBe(buffer.timestamp);
-    expect(buffer.entry_type).toBe(buffer.entry_type);
 
     // System schema's message column is EAGER - always allocated
     expect(Array.isArray(buffer.message_values)).toBe(true);

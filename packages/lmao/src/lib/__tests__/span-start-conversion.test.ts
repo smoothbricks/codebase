@@ -113,15 +113,27 @@ describe('convertSpanStartToArrowTable', () => {
     if (opened === undefined || openedChild === undefined) throw new Error('both spans open through the hooks');
     // The root writes neither attribute: its category column has an empty dictionary, so a
     // row read as valid would name index 0 of nothing, which an Arrow reader refuses.
-    for (const table of [convertSpanStartToArrowTable(opened.buffer), convertToArrowTable(opened.buffer)]) {
+    for (const [table, expectedRows] of [
+      [convertSpanStartToArrowTable(opened.buffer), 1],
+      [convertToArrowTable(opened.buffer), 2],
+    ] as const) {
+      expect(table.numRows).toBe(expectedRows);
       expect(table.getChild('user').nullCount).toBe(table.numRows);
       expect(table.getChild('attempt').nullCount).toBe(table.numRows);
     }
     // The child tags its user on its start row alone; its overflow buffer never allocates the
     // column, and its rows are null like every other row the tag did not write.
     expect(openedChild.buffer._overflow).toBeDefined();
-    const users = rowsOf(convertToArrowTable(openedChild.buffer)).map((row) => row.user);
+    const rows = rowsOf(convertToArrowTable(openedChild.buffer));
+    expect(rows).toHaveLength(42);
+    expect(rows[0]).toMatchObject({ entry_type: 'span-start', message: 'child-call' });
+    expect(rows[1]).toMatchObject({ entry_type: 'span-ok' });
+    expect(rows.slice(2).map(({ entry_type, message, attempt }) => ({ entry_type, message, attempt }))).toEqual(
+      Array.from({ length: 40 }, (_, attempt) => ({ entry_type: 'info', message: 'retry', attempt })),
+    );
+    const users = rows.map((row) => row.user);
     expect(users[0]).toBe('ada');
+    expect(users.slice(1)).toHaveLength(41);
     expect(users.slice(1).every((user) => user === null)).toBe(true);
   });
 

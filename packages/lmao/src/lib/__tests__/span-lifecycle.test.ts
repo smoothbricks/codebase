@@ -89,15 +89,20 @@ function getNullableBigintColumnValue(
 
 describe('Span Lifecycle', () => {
   it('should write span-start entry when task begins', async () => {
-    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
+    const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
-    await trace('testTask', async (ctx) => {
+    const result = await tracer.trace('testTask', async (ctx) => {
       return ctx.ok('success');
     });
 
-    // Buffer is internal, but we can verify behavior through side effects
-    // The span-start entry should be written before any other operations
-    expect(true).toBe(true); // Placeholder - real test would inspect buffer
+    expect(result.success).toBe(true);
+    expect(tracer.rootBuffers).toHaveLength(1);
+    const buffer = tracer.rootBuffers[0];
+    if (!buffer) throw new Error('expected a root buffer');
+    expect(buffer._writeIndex).toBe(2);
+    expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+    expect(resolveMessage(buffer, 0)).toBe('testTask');
+    expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
   });
 
   it('should write span-ok entry with ctx.ok()', async () => {
@@ -1070,52 +1075,71 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should start writeIndex at 2 after span-start is written', async () => {
-    // This tests the writeSpanStart function behavior
-    // After writeSpanStart, writeIndex should be 2 (row 0 = span-start, row 1 = pre-init, events at row 2+)
-
-    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
-    await trace('test', async (ctx) => {
-      // At this point, writeSpanStart has been called
-      // Events logged here should go to row 2+
+    const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
+    const result = await tracer.trace('test', async (ctx) => {
+      expect(ctx.buffer._writeIndex).toBe(2);
+      expect(resolveEntryType(ctx.buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+      expect(resolveEntryType(ctx.buffer, 1)).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
       ctx.log.info('first event');
       return ctx.ok('done');
     });
 
-    // The task completed successfully, meaning:
-    // - Row 0 has span-start
-    // - Row 1 has span-ok (from ctx.ok)
-    // - Row 2 would have first event (info)
-    expect(true).toBe(true); // Task completed without error
+    expect(result.success).toBe(true);
+    expect(tracer.rootBuffers).toHaveLength(1);
+    const buffer = tracer.rootBuffers[0];
+    if (!buffer) throw new Error('expected a root buffer');
+    expect(buffer._writeIndex).toBe(3);
+    expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+    expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(resolveEntryType(buffer, 2)).toBe(ENTRY_TYPE_INFO);
+    expect(resolveMessage(buffer, 2)).toBe('first event');
   });
 
   it('should append events starting at row 2', async () => {
-    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
-    const result = await trace('test', async (ctx) => {
+    const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
+    const result = await tracer.trace('test', async (ctx) => {
       ctx.log.info('first event'); // Should be row 2
       ctx.log.info('second event'); // Should be row 3
       return ctx.ok('done');
     });
 
     expect(result.success).toBe(true);
-    // If events were incorrectly written to row 0 or 1, the span lifecycle would be corrupted
-    // The fact that ok() works after logging confirms proper row layout
+    expect(tracer.rootBuffers).toHaveLength(1);
+    const buffer = tracer.rootBuffers[0];
+    if (!buffer) throw new Error('expected a root buffer');
+    expect(buffer._writeIndex).toBe(4);
+    expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+    expect(resolveMessage(buffer, 0)).toBe('test');
+    expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
+    expect([resolveEntryType(buffer, 2), resolveEntryType(buffer, 3)]).toEqual([ENTRY_TYPE_INFO, ENTRY_TYPE_INFO]);
+    expect([resolveMessage(buffer, 2), resolveMessage(buffer, 3)]).toEqual(['first event', 'second event']);
   });
 
   it('should allow duration calculation as timestamps[1] - timestamps[0]', async () => {
-    // This tests the fixed layout enables simple duration calculation
-    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
-    await trace('test', async (ctx) => {
-      // Small delay to ensure non-zero duration
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      return ctx.ok('done');
-    });
+    const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
+    const elapsedNanos = 123_456n;
+    let now = 1_000_000n;
+    const originalHrtime = process.hrtime.bigint;
+    process.hrtime.bigint = () => now;
+    try {
+      const result = await tracer.trace('test', async (ctx) => {
+        now += elapsedNanos;
+        return ctx.ok('done');
+      });
 
-    // The fixed layout means:
-    // - timestamps[0] = span-start time
-    // - timestamps[1] = span-end time
-    // Duration = timestamps[1] - timestamps[0]
-    // This is verified by the fact that the task completed successfully
-    expect(true).toBe(true);
+      expect(result.success).toBe(true);
+      expect(tracer.rootBuffers).toHaveLength(1);
+      const buffer = tracer.rootBuffers[0];
+      if (!buffer) throw new Error('expected a root buffer');
+      expect(buffer._writeIndex).toBe(2);
+      expect(resolveEntryType(buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
+      expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
+      expect(buffer.timestamp[0]).toBe(buffer._traceRoot.anchorEpochNanos);
+      expect(buffer.timestamp[1]).toBe(buffer._traceRoot.anchorEpochNanos + elapsedNanos);
+      expect(buffer.timestamp[1] - buffer.timestamp[0]).toBe(elapsedNanos);
+    } finally {
+      process.hrtime.bigint = originalHrtime;
+    }
   });
 
   it('should export entry type constants for use in tests and consumers', () => {

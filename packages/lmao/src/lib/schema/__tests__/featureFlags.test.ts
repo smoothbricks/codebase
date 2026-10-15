@@ -400,13 +400,14 @@ describe('Feature Flags', () => {
     });
 
     const enabledFlagEvaluator = new InMemoryFlagEvaluator(flags.schema, { darkMode: true });
-    const { trace: enabledTrace } = new TestTracer(enabledCtx, {
+    const enabledTracer = new TestTracer(enabledCtx, {
       ...createTestTracerOptions(),
       flagEvaluator: enabledFlagEvaluator,
     });
 
-    await enabledTrace('test-enabled', async (ctx) => {
+    const enabledResult = await enabledTracer.trace('test-enabled', async (ctx) => {
       const darkMode = ctx.ff.darkMode;
+      expect(darkMode).toBeDefined();
 
       // Truthy check works naturally with undefined/truthy semantics
       if (darkMode) {
@@ -416,6 +417,11 @@ describe('Feature Flags', () => {
 
       return ctx.ok(null);
     });
+    expect(enabledResult.success).toBe(true);
+    expect(enabledTracer.rootBuffers).toHaveLength(1);
+    const enabledBuffer = enabledTracer.rootBuffers[0];
+    if (!enabledBuffer) throw new Error('expected an enabled feature-flag root buffer');
+    expect(countEntryType(enabledBuffer, ENTRY_TYPE_FF_USAGE)).toBe(1);
 
     // Scenario 2: darkMode is disabled
     const disabledCtx = defineOpContext({
@@ -429,16 +435,14 @@ describe('Feature Flags', () => {
       flagEvaluator: disabledFlagEvaluator,
     });
 
-    await disabledTrace('test-disabled', async (ctx) => {
+    const disabledResult = await disabledTrace('test-disabled', async (ctx) => {
       const darkModeDisabled = ctx.ff.darkMode;
 
       // Falsy check works - undefined is falsy
       expect(darkModeDisabled).toBeUndefined();
-      if (!darkModeDisabled) {
-        expect(true).toBe(true);
-      }
 
       return ctx.ok(null);
     });
+    expect(disabledResult.success).toBe(true);
   });
 });
