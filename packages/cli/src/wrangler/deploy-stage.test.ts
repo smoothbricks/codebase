@@ -1107,6 +1107,16 @@ describe('cleanup-pr from stage records', () => {
     const result = await cleanup(await cleanupRoot(), 7, cloudflare);
 
     expect(result.alreadyGone).toBe(7);
+    expect(Object.keys(result.deleted).sort()).toEqual([
+      'd1Databases',
+      'dnsRecords',
+      'domains',
+      'kvNamespaces',
+      'r2Buckets',
+      'r2Objects',
+      'routes',
+      'workers',
+    ]);
     expect(Object.values(result.deleted).every((count) => count === 0)).toBe(true);
     expect(cloudflare.mutations).toEqual(keys.map((key) => `delete-object:${STAGE_RECORDS_BUCKET}:${key}`));
   });

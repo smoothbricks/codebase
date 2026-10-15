@@ -1312,7 +1312,8 @@ token, so only point it at a server you trust.
   A stage with no records is reported as `recorded: 0` with the same warning the sentence carries: no records never
   means the stage's items are gone. On a refusal or a failed delete — an unreadable repository manifest, an invisible
   zone, a delete that stops partway — the command exits nonzero, prints the error to stderr, and prints no JSON at all;
-  `--json` reports only a successful run.
+  `--json` reports only a successful run. The deleting result always includes every deletion counter, including zero
+  counts when all recorded items were already gone; an empty counter object is not an all-zero report.
 - It prints one line, such as `Cleaned pr7 of github.com/acme/app from 23 records: deleted 3 Workers, ...`, or
   `Nothing is recorded for pr7 of github.com/acme/app, so nothing was deleted. ...` when the stage has no records. That
   is expected when the pull request deployed nothing or an earlier cleanup already removed its stage. A stage an older
