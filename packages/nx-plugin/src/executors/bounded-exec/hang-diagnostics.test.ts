@@ -214,7 +214,7 @@ describe('pre-expiry hang diagnostics', () => {
       const ready = descendant.stdout.getReader();
       await ready.read();
       ready.releaseLock();
-      console.log(descendant.pid);
+      console.log('PID=' + descendant.pid);
       process.stdin.resume();
     `,
       ],
@@ -228,17 +228,35 @@ describe('pre-expiry hang diagnostics', () => {
     let descendant: number | undefined;
     const failures: unknown[] = [];
     try {
-      const reader = child.stdout.getReader();
-      const first = await reader.read();
-      const text = new TextDecoder().decode(first.value);
-      descendant = Number(text.trim());
-      expect(Number.isSafeInteger(descendant) && descendant > 0).toBe(true);
+      const reader = child.stdout
+        .pipeThrough(new TextDecoderStream(), { signal: AbortSignal.timeout(10_000) })
+        .getReader();
+      let text = '';
+      try {
+        // Real OS-pipe readiness cannot advance a fake test clock; abort only bounds a missing line.
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) throw new Error('child stdout ended before a complete PID line');
+          text += chunk.value;
+          if (text.includes('\n')) break;
+        }
+      } catch (cause) {
+        throw new Error(`PID readiness failed; observed ${JSON.stringify(text)}`, { cause });
+      } finally {
+        reader.releaseLock();
+      }
+      const line = text.slice(0, text.indexOf('\n'));
+      const match = /^PID=(\d+)$/.exec(line);
+      descendant = match === null ? Number.NaN : Number(match[1]);
+      expect(
+        Number.isSafeInteger(descendant) && descendant > 0,
+        `expected a tagged PID line, observed ${JSON.stringify(line)}`,
+      ).toBe(true);
       const capture = await captureHangDiagnostics({ ...request(), pid: child.pid, pgid: null });
       expect(capture.outcome).toBe('holders');
       expect(capture.text).toContain(String(child.pid));
       expect(capture.text).toContain(String(descendant));
       if (process.platform === 'darwin') expect(capture.text).toContain(held);
-      reader.releaseLock();
     } catch (error) {
       failures.push(error);
     }
