@@ -3682,6 +3682,7 @@ where
     }
 
     /// A re-adoption detach was refused: name each process of this user that holds the volume.
+    #[cfg(target_os = "macos")]
     fn capture_refusal(
         &self,
         source: &Path,
