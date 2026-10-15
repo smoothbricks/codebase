@@ -152,6 +152,8 @@ function candidate(root, scratch) {
   const databases = databaseNames();
   fs.mkdirSync(scratch, { recursive: true });
   const hashes = new Set();
+  const cachedIdentities = new Map();
+  let identityInventoryComplete = true;
   const samples = [];
   let snapshotBytes = 0;
   for (const name of databases) {
@@ -170,9 +172,22 @@ function candidate(root, scratch) {
           .map((row) => row.name),
       );
       if (tables.has('cache_outputs')) {
-        for (const row of db.prepare('SELECT hash FROM cache_outputs WHERE code=0').all()) {
+        const query = tables.has('task_details')
+          ? `SELECT c.hash, d.project, d.target, d.configuration FROM cache_outputs c
+             LEFT JOIN task_details d ON d.hash=c.hash WHERE c.code=0`
+          : 'SELECT hash FROM cache_outputs WHERE code=0';
+        for (const row of db.prepare(query).all()) {
           if (!/^[0-9]+$/.test(row.hash)) throw new Error(`invalid Nx hash ${JSON.stringify(row.hash)} in ${filename}`);
-          if (fs.existsSync(path.join(cache, row.hash))) hashes.add(row.hash);
+          if (!fs.existsSync(path.join(cache, row.hash))) continue;
+          hashes.add(row.hash);
+          if (typeof row.project !== 'string' || typeof row.target !== 'string') {
+            identityInventoryComplete = false;
+            continue;
+          }
+          const key = identity(row);
+          const entries = cachedIdentities.get(key) ?? new Set();
+          entries.add(row.hash);
+          cachedIdentities.set(key, entries);
         }
       }
       if (tables.has('task_history') && tables.has('task_details')) {
@@ -200,7 +215,50 @@ function candidate(root, scratch) {
     if (fs.existsSync(link) && fs.realpathSync(link) !== resolved)
       throw new Error(`busy: candidate link changed: ${link}; no time decision available`);
   }
-  return { root, databases, hashes, samples, snapshotBytes, snapshotSeconds: (performance.now() - started) / 1000 };
+  return {
+    root,
+    databases,
+    hashes,
+    cachedIdentities,
+    identityInventoryComplete,
+    samples,
+    snapshotBytes,
+    snapshotSeconds: (performance.now() - started) / 1000,
+  };
+}
+
+function assess(task, observation) {
+  if (observation.hashes === null) {
+    return { status: 'UNAVAILABLE', basis: 'unavailable-candidate', reason: observation.error };
+  }
+  if (task.hash) {
+    return { status: observation.hashes.has(task.hash) ? 'HIT' : 'MISS', basis: 'current-key', reason: null };
+  }
+  const cachedEntries = observation.cachedIdentities.get(identity(task))?.size ?? 0;
+  if (task.hashMode === 'custom') {
+    return {
+      status: 'UNKNOWN',
+      basis: 'custom-key-unavailable',
+      cachedEntries,
+      reason: 'a custom hasher can return a key unrelated to task identity; identity absence cannot prove a miss',
+    };
+  }
+  if (cachedEntries === 0 && observation.identityInventoryComplete) {
+    return {
+      status: 'MISS',
+      basis: 'identity-absence',
+      cachedEntries,
+      reason: 'no successful cached entry for this identity; any current key would miss',
+    };
+  }
+  return {
+    status: 'UNKNOWN',
+    basis: 'key-unavailable',
+    cachedEntries,
+    reason: cachedEntries
+      ? 'historical entries exist, but their keys do not prove a current hit without the current dependency outputs or other omitted hash inputs'
+      : 'cached entries lack identity metadata, so absence of a matching identity cannot be proved',
+  };
 }
 
 function summarize(selection, own, main) {
@@ -229,11 +287,17 @@ function summarize(selection, own, main) {
     mainMissWorkSeconds: 0,
     ownMeasuredMissWorkSeconds: 0,
     mainMeasuredMissWorkSeconds: 0,
+    ownAssumedMissWorkSeconds: 0,
+    mainAssumedMissWorkSeconds: 0,
+    assumedDifferenceSeconds: 0,
     keylessWorstCaseSeconds: 0,
     weightedKeylessTasks: 0,
     ownUnweightedMisses: 0,
     mainUnweightedMisses: 0,
   };
+  let ownAssessedTasks = 0;
+  let mainAssessedTasks = 0;
+  let assumedTasks = 0;
   let withDuration = 0;
   let resolvedWithDuration = 0;
   const tasks = selection.tasks.map((task) => {
@@ -247,34 +311,40 @@ function summarize(selection, own, main) {
         }
       : null;
     if (weight) withDuration++;
-    const ownHit = task.hash && own.hashes ? own.hashes.has(task.hash) : null;
-    const mainHit = task.hash && main.hashes ? main.hashes.has(task.hash) : null;
+    const ownAssessment = assess(task, own);
+    const mainAssessment = assess(task, main);
+    const ownUnknown = ownAssessment.status === 'UNKNOWN';
+    const mainUnknown = mainAssessment.status === 'UNKNOWN';
+    if (ownAssessment.status === 'HIT' || ownAssessment.status === 'MISS') ownAssessedTasks++;
+    if (mainAssessment.status === 'HIT' || mainAssessment.status === 'MISS') mainAssessedTasks++;
     const classification =
-      ownHit === null || mainHit === null
+      !task.hash || !candidatesUsable
         ? 'UNRESOLVED'
-        : ownHit
-          ? mainHit
+        : ownAssessment.status === 'HIT'
+          ? mainAssessment.status === 'HIT'
             ? 'HIT_BOTH'
             : 'HIT_OWN'
-          : mainHit
+          : mainAssessment.status === 'HIT'
             ? 'HIT_MAIN'
             : 'MISS_BOTH';
     classes[classification]++;
-    const assumedMiss = candidatesUsable && !task.hash;
     if (classification !== 'UNRESOLVED' && weight) resolvedWithDuration++;
-    if (assumedMiss && weight) {
+    if (ownUnknown || mainUnknown) assumedTasks++;
+    if (ownUnknown && mainUnknown && weight) {
       totals.keylessWorstCaseSeconds += weight.meanSeconds;
       totals.weightedKeylessTasks++;
     }
     if (candidatesUsable) {
-      for (const [side, hit] of [
-        ['own', ownHit],
-        ['main', mainHit],
+      if (weight) totals.assumedDifferenceSeconds += (Number(ownUnknown) - Number(mainUnknown)) * weight.meanSeconds;
+      for (const [side, assessment] of [
+        ['own', ownAssessment],
+        ['main', mainAssessment],
       ]) {
-        if (assumedMiss || hit === false) {
+        if (assessment.status === 'MISS' || assessment.status === 'UNKNOWN') {
           if (weight) {
             totals[`${side}MissWorkSeconds`] += weight.meanSeconds;
-            if (!assumedMiss) totals[`${side}MeasuredMissWorkSeconds`] += weight.meanSeconds;
+            const component = assessment.status === 'UNKNOWN' ? 'Assumed' : 'Measured';
+            totals[`${side}${component}MissWorkSeconds`] += weight.meanSeconds;
           } else totals[`${side}UnweightedMisses`]++;
         }
       }
@@ -282,29 +352,62 @@ function summarize(selection, own, main) {
     return {
       ...task,
       reason: task.reason ?? own.error ?? main.error ?? null,
-      own: assumedMiss ? 'ASSUMED_MISS' : ownHit === null ? 'UNRESOLVED' : ownHit ? 'HIT' : 'MISS',
-      main: assumedMiss ? 'ASSUMED_MISS' : mainHit === null ? 'UNRESOLVED' : mainHit ? 'HIT' : 'MISS',
+      own: ownUnknown ? 'ASSUMED_MISS' : ownAssessment.status === 'UNAVAILABLE' ? 'UNRESOLVED' : ownAssessment.status,
+      main: mainUnknown
+        ? 'ASSUMED_MISS'
+        : mainAssessment.status === 'UNAVAILABLE'
+          ? 'UNRESOLVED'
+          : mainAssessment.status,
+      assessment: { own: ownAssessment, main: mainAssessment },
       classification,
       weight,
       cost: {
-        basis: !candidatesUsable ? 'unavailable-candidate' : assumedMiss ? 'worst-case-keyless' : 'cache-lookup',
-        label: assumedMiss ? 'unpriced key, worst case: misses in both' : null,
-        ownSeconds: !candidatesUsable ? null : ownHit === true ? 0 : (weight?.meanSeconds ?? null),
-        mainSeconds: !candidatesUsable ? null : mainHit === true ? 0 : (weight?.meanSeconds ?? null),
+        ownAssumed: ownUnknown,
+        mainAssumed: mainUnknown,
+        label:
+          ownUnknown && mainUnknown
+            ? 'unpriced key, worst case: misses in both'
+            : ownUnknown
+              ? 'unpriced key in own, worst case: miss in own'
+              : mainUnknown
+                ? 'unpriced key in main, worst case: miss in main'
+                : null,
+        ownSeconds:
+          ownAssessment.status === 'UNAVAILABLE'
+            ? null
+            : ownAssessment.status === 'HIT'
+              ? 0
+              : (weight?.meanSeconds ?? null),
+        mainSeconds:
+          mainAssessment.status === 'UNAVAILABLE'
+            ? null
+            : mainAssessment.status === 'HIT'
+              ? 0
+              : (weight?.meanSeconds ?? null),
       },
     };
   });
   const unpriced = tasks
-    .filter((task) => task.cost.basis === 'unavailable-candidate' || !task.weight)
+    .filter((task) => !candidatesUsable || !task.weight)
     .map((task) => ({
       id: task.id,
-      reason:
-        task.cost.basis === 'unavailable-candidate'
-          ? task.reason
-          : 'no successful uncached duration sample for this task identity',
+      reason: !candidatesUsable
+        ? (own.error ?? main.error)
+        : 'no successful uncached duration sample for this task identity',
     }));
   const timeAvailable = hasNxCache && withDuration > 0;
-  const difference = totals.ownMeasuredMissWorkSeconds - totals.mainMeasuredMissWorkSeconds;
+  const determinedDifference = totals.ownMeasuredMissWorkSeconds - totals.mainMeasuredMissWorkSeconds;
+  const difference = determinedDifference + totals.assumedDifferenceSeconds;
+  const differenceRange = timeAvailable
+    ? {
+        minSeconds: determinedDifference - totals.mainAssumedMissWorkSeconds,
+        maxSeconds: determinedDifference + totals.ownAssumedMissWorkSeconds,
+        downwardSwingSeconds: totals.ownAssumedMissWorkSeconds,
+        upwardSwingSeconds: totals.mainAssumedMissWorkSeconds,
+        maxSwingSeconds: Math.max(totals.ownAssumedMissWorkSeconds, totals.mainAssumedMissWorkSeconds),
+        scope: unpriced.length === 0 ? 'all selected tasks' : 'weighted tasks only; unpriced tasks excluded',
+      }
+    : null;
   const observation = ({ root, databases, snapshotBytes, snapshotSeconds, error }) => ({
     root,
     databases,
@@ -317,7 +420,12 @@ function summarize(selection, own, main) {
     candidates: { own: observation(own), main: observation(main) },
     tasks,
     classes,
-    totals: { ...totals, ownMinusMainSeconds: difference, complete: timeAvailable && unpriced.length === 0 },
+    totals: {
+      ...totals,
+      ownMinusMainSeconds: difference,
+      differenceRange,
+      complete: timeAvailable && unpriced.length === 0,
+    },
     decision: {
       basis: timeAvailable ? 'time' : 'space',
       timeDecisionAvailable: timeAvailable,
@@ -328,7 +436,7 @@ function summarize(selection, own, main) {
           ? 'neither candidate has a usable Nx cache; caller must fall back to space'
           : !withDuration
             ? 'no selected task has a duration sample; caller must fall back to space'
-            : 'historical mean weights are usable; keyless tasks assume misses in both candidates',
+            : 'per-candidate historical mean rebuild work is usable; unknown cache outcomes are separately bounded',
     },
     unpriced,
     coverage: {
@@ -336,10 +444,20 @@ function summarize(selection, own, main) {
       withDuration,
       resolvedTasks: tasks.length - classes.UNRESOLVED,
       resolvedWithDuration,
+      ownAssessedTasks,
+      mainAssessedTasks,
+      assumedTasks,
     },
-    unresolved: tasks.filter((task) => task.classification === 'UNRESOLVED').map(({ id, reason }) => ({ id, reason })),
+    unresolved: tasks
+      .filter((task) => task.classification === 'UNRESOLVED')
+      .map(({ id, reason, assessment }) => ({
+        id,
+        reason,
+        own: assessment.own.status,
+        main: assessment.main.status,
+      })),
     caveat:
-      'Historical means estimate serial work, not gate elapsed time. Keyless tasks are charged as misses in both; their common worst-case term is reported separately. Tasks without duration samples remain unpriced.',
+      'Historical means estimate serial work, not gate elapsed time. Unknown cache outcomes use separately reported worst-case misses; the difference interval holds these mean weights fixed and excludes unpriced tasks and runtime variance.',
   };
 }
 
@@ -437,7 +555,8 @@ async function probe(options, scratch) {
   for (const task of cacheable) {
     const runtimeCommands = plans[task.id]?.runtime ?? [];
     let reason = null;
-    if (getCustomHasher(task, configurations)) reason = 'custom hasher may consume dependency outputs';
+    const customHasher = getCustomHasher(task, configurations);
+    if (customHasher) reason = 'custom hasher may consume dependency outputs';
     else if (taskGraph.dependencies[task.id].length && getInputs(task, projectGraph, nxJson).depsOutputs.length)
       reason = 'deferred: dependency outputs are not current until dependencies execute';
     else if (hooks.length) reason = `execution hooks are not run by the advisor: ${hooks.join(', ')}`;
@@ -457,6 +576,7 @@ async function probe(options, scratch) {
       id: task.id,
       project: task.target.project,
       target: task.target.target,
+      hashMode: customHasher ? 'custom' : 'stock',
       configuration: task.target.configuration ?? null,
       hash: null,
       reason,
