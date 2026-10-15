@@ -6,12 +6,13 @@ import { createRequire } from 'node:module';
 import { createConnection, createServer } from 'node:net';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { sendMessage } from 'nx/src/daemon/socket-utils.js';
 import { consumeMessagesFromSocket, parseMessage } from 'nx/src/utils/consume-messages-from-socket.js';
 import typia from 'typia';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
-import { awaitExit, isRunning, type ProcessEntry, processTable, terminate } from './testing.js';
+import { awaitExit, isRunning, type ProcessEntry, processTable, terminate, withDescendants } from './testing.js';
 
 /**
  * Guards the event-driven validity hunk of `patches/nx@23.2.1.patch` (upstream nrwl/nx#37113, fixing nrwl/nx#37112).
@@ -20,8 +21,8 @@ import { awaitExit, isRunning, type ProcessEntry, processTable, terminate } from
  * boundaries, and a 5 s safety poll for events the watcher ignores or drops.
  *
  * Each test runs a real daemon in a fixture workspace and asserts only what a client, a watcher, or the filesystem can
- * observe. Restarts are awaited on the record directory, and readiness on a PING answer after a change in the socket
- * directory. The one real-clock wait is the idle observation window in the last test.
+ * observe. Restarts are awaited on the record directory, and readiness on an actual PING answer, not a filesystem event.
+ * The one real-clock observation window is the idle walk in the last test.
  */
 
 const repositoryRoot = join(import.meta.dir, '../../..');
@@ -340,22 +341,60 @@ async function watchUntil<T>(
   }
 }
 
+/** Capture the expected holder and the current record before fixture retirement removes the evidence. */
+async function daemonDiagnostics(workspace: string, expectedPid: number): Promise<string> {
+  const [record, table] = await Promise.all([daemonRecord(workspace), processTable()]);
+  const expected = table.find(({ pid }) => pid === expectedPid);
+  const processes = withDescendants(table, record === null ? [expectedPid] : [expectedPid, record.processId]);
+  const logPath = join(dirname(recordPath(workspace)), 'daemon.log');
+  let log: string;
+  try {
+    log = await readFile(logPath, 'utf8');
+  } catch (error) {
+    log = `unavailable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  return [
+    `workspace ${workspace}; expected daemon pid ${expectedPid}: ${
+      expected === undefined ? 'absent from process table' : `state=${expected.stat} command=${expected.command}`
+    }`,
+    `current daemon record ${JSON.stringify(record)}`,
+    `daemon processes ${JSON.stringify(processes)}`,
+    `daemon log tail ${logPath}:\n${log.split('\n').slice(-60).join('\n')}`,
+  ].join('\n');
+}
+
 /**
- * Waits until the daemon answers PING with `true`. The daemon claims its record before it listens, so the record is not
- * readiness. A PING that finds no listener waits for the next change in the socket directory, and an answer other than
- * `true` fails at once.
+ * The record and socket path can exist before a daemon can answer. Binding, listening and closing a connection need not
+ * emit another directory event, so readiness probes the protocol itself; only a true PING advances the fixture.
  */
-async function untilServing(socketPath: string, workspace: string): Promise<void> {
-  await watchUntil(dirname(socketPath), `the daemon on ${socketPath} to answer PING`, async () => {
-    const answer = await requestOnce(socketPath, ping(workspace), 'the readiness PING');
-    if (!answer.answered) return null;
-    if (answer.message === true) return true;
-    throw new Error(`the daemon on ${socketPath} answered PING with ${JSON.stringify(answer.message)}, not true`);
-  });
+async function untilServing(record: DaemonRecord, workspace: string): Promise<void> {
+  const { socketPath } = record;
+  const waiting = new AbortController();
+  const serving = async (): Promise<void> => {
+    while (!waiting.signal.aborted) {
+      const answer = await requestOnce(socketPath, ping(workspace), 'the readiness PING');
+      if (answer.answered) {
+        if (answer.message === true) return;
+        throw new Error(`the daemon on ${socketPath} answered PING with ${JSON.stringify(answer.message)}, not true`);
+      }
+      await sleep(50, undefined, { signal: waiting.signal });
+    }
+  };
+  try {
+    await guardEvent(
+      serving(),
+      `the daemon on ${socketPath} to answer PING`,
+      () => daemonDiagnostics(workspace, record.processId),
+      undefined,
+      30_000,
+    );
+  } finally {
+    waiting.abort();
+  }
 }
 
 async function readyDaemon(workspace: string, record: DaemonRecord): Promise<Daemon> {
-  await untilServing(record.socketPath, workspace);
+  await untilServing(record, workspace);
   return { record, entry: await processEntry(record.processId) };
 }
 
@@ -509,6 +548,34 @@ it('has no 20 ms outdated-check loop or lockfile hashing left in the installed d
     expect(source.includes(removed), `${daemonServer} still contains ${removed}`).toBe(false);
   }
 });
+
+it('awaits an answerable daemon after a closed PING without another socket-directory event', async () => {
+  await withNxFixture('nx-daemon-validity-readiness-', async ({ socketDirectory, workspace }) => {
+    await fixtureWorkspace(workspace);
+    await mkdir(socketDirectory, { recursive: true });
+    const socketPath = join(socketDirectory, 'readiness.sock');
+    let requests = 0;
+    const server = createServer((socket) => {
+      socket.once('data', () => {
+        requests += 1;
+        if (requests === 1) socket.end();
+        else sendMessage(socket, true, 'json');
+      });
+    });
+    const listening = Promise.withResolvers<void>();
+    server.once('error', listening.reject);
+    server.listen(socketPath, () => listening.resolve());
+    await listening.promise;
+    try {
+      await untilServing({ processId: process.pid, socketPath }, workspace);
+      expect(requests).toBe(2);
+    } finally {
+      const closed = Promise.withResolvers<void>();
+      server.close(() => closed.resolve());
+      await closed.promise;
+    }
+  });
+}, 45_000);
 
 /** Valid lockfiles keep the real graph usable while the watcher judges byte changes. */
 async function lockContents(

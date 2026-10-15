@@ -110,6 +110,11 @@ those checks into separately rebuilt fixtures.
 Ignored-lockfile validity uses one daemon-successor walk: first refusal at the request boundary, then the successor's
 request-free safety-poll invalidation. Both boundaries keep their original observations without a second fixture start.
 
+Daemon-validity readiness waits for an actual successful PING under its existing 30 s guard, probing every 50 ms;
+socket-directory events are not readiness because a bind/listen or closed-connection transition need not emit another
+one. Expiry reports the expected and current daemon PID, observed process state and descendants, and the daemon log's
+last 60 lines before fixture retirement removes them. The record-change and restart oracles remain event-driven.
+
 ## Cargo Workspace Layouts
 
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:
