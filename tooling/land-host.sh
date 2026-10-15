@@ -82,7 +82,11 @@ gate_workspace() {
   }
   output=$(mktemp "${TMPDIR:-/tmp}/land-gate.XXXXXX")
   gate_status=0
-  workspace_nx run-many -t gate --parallel=2 --nx-bail=false --outputStyle=static-failures-only >"$output" 2>&1 || gate_status=$?
+  # The landing gate is never CPU-limited: it is the run that moves main, so it takes
+  # the whole host (Main's rule, 2026-10-16). A capped gate measured about 1% of this
+  # machine and took 40 minutes, and the resulting timeouts were misread as test
+  # failures. Exploratory runs are the ones that get capped, by being stopped.
+  workspace_nx run-many -t gate --parallel="$(sysctl -n hw.ncpu)" --nx-bail=false --outputStyle=static-failures-only >"$output" 2>&1 || gate_status=$?
   if [ "$gate_status" -ne 0 ]; then
     (cd "$checkout" && direnv exec "$checkout" bun "$here/land-summary.ts" "$output") >&2 || {
       say "failure summary unavailable; complete gate output: $output"

@@ -360,12 +360,17 @@ disk-image target: the two groups never run concurrently. Each nextest group dec
 `.config/nextest.toml` owns their package-scoped selection filters, and the code-time wrapper rules select the same
 tests. Ordinary and exceptions shards exclude those filters. The root `host-e2e` target depends on both groups; the root
 `gate` target depends on every project's `lint`, `test` and `build` plus `host-e2e`. The land wrapper
-(`tooling/land-host.sh`) runs `nx run-many -t gate --parallel=2` after rebasing and stopping the workspace's daemon.
-This reaches the same checks as naming the ordinary targets and both host groups explicitly, but Nx owns the target
-list. Ordinary `test` remains free of the expensive host groups: Rule 2 keeps the inner loop cheap, while the explicit
-land gate includes host coverage and each group replays from cache unless its own inputs changed.
-`nx run-many -t host-e2e` is the focused host proof. Every test has one runner, and non-macOS inference supplies neither
-APFS runner; package-declared placeholders and explicit dependency edges may remain.
+(`tooling/land-host.sh`) runs `nx run-many -t gate --parallel=$(sysctl -n hw.ncpu)` after rebasing and stopping the
+workspace's daemon. **The landing gate is never CPU-limited**: it runs at the core count, at default priority, with no
+`taskpolicy -b` and no outer deadline, because it is the run that moves main. Measured 2026-10-16: the same gate took 40
+minutes capped at `--parallel=2` under `taskpolicy -b` and 4m44s uncapped, and two per-test timeouts that reproduced in
+every capped run did not reproduce once the cap was removed - the failures were the cap, not the tests. Exploratory runs
+are the ones that get limited, and they are limited by being stopped rather than by being niced. This reaches the same
+checks as naming the ordinary targets and both host groups explicitly, but Nx owns the target list. Ordinary `test`
+remains free of the expensive host groups: Rule 2 keeps the inner loop cheap, while the explicit land gate includes host
+coverage and each group replays from cache unless its own inputs changed. `nx run-many -t host-e2e` is the focused host
+proof. Every test has one runner, and non-macOS inference supplies neither APFS runner; package-declared placeholders
+and explicit dependency edges may remain.
 
 The land gate uses `--outputStyle=static-failures-only` and must exit zero before the expected-tip fast-forward and
 workspace retirement. Any failed task, timeout or infrastructure failure stops the land: there is no bound-only retry,
