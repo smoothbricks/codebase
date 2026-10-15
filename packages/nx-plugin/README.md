@@ -726,11 +726,12 @@ dependency-module/file closure (physical targets, aliases, package manifests and
 workspace-resolved TypeScript analyzer. A package-declared dist directory link is proved by its physical tree, including
 every node and the link itself; unreadable required module bytes fail loudly. Unknown plugin input contracts, unresolved
 required packages, directory links whose external graph inputs are unproved, missing or unreadable witnesses, and any
-mismatch require the authoritative graph RPC. No cache-file age or existence decides currentness. Workspace file
-membership, nx.json, project/package manifests and lockfiles have no output exclusions; output writes can therefore
-refresh this conservative graph witness too. Only Nx's current task hashes and matching artifacts decide whether
-anything runs: an unrelated edit does not force cached-log replay, and an actual input edit cannot hit an old source
-snapshot. Argument normalization, per-task environments and plugin pre/post hooks still run.
+mismatch require the authoritative graph RPC. An RPC need not publish a replacement witness when its required pre/post
+evidence is unavailable or changed. No cache-file age or existence decides currentness. Workspace file membership,
+nx.json, project/package manifests and lockfiles have no output exclusions; output writes can therefore refresh this
+conservative graph witness too. Only Nx's current task hashes and matching artifacts decide whether anything runs: an
+unrelated edit does not force cached-log replay, and an actual input edit cannot hit an old source snapshot. Argument
+normalization, per-task environments and plugin pre/post hooks still run.
 
 The daemon's output records are lossy: they are held in memory, tracked per collapsed directory, and erased by writes it
 processes more than two seconds late — including, on a busy daemon, a restore's own writes. When it cannot vouch for a
