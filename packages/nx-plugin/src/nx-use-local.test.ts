@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { chmod, mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, symlink, unlink, writeFile } from 'node:fs/promises';
 import { delimiter, join } from 'node:path';
 import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
@@ -17,7 +17,13 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 const repositoryRoot = join(import.meta.dir, '../../..');
 const PACKAGE_MANAGERS = ['npm', 'npx', 'pnpm', 'yarn'];
 
-async function run(command: string, args: string[], cwd: string, env: Record<string, string>): Promise<string> {
+async function run(
+  command: string,
+  args: string[],
+  cwd: string,
+  env: Record<string, string>,
+  expectedCode = 0,
+): Promise<string> {
   const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
   child.stdout?.setEncoding('utf8').on('data', (text: string) => {
@@ -30,7 +36,7 @@ async function run(command: string, args: string[], cwd: string, env: Record<str
   child.once('error', reject);
   child.once('close', resolve);
   const code = await guardEvent(ended, `${command} ${args.join(' ')} to close`, () => output);
-  expect(code, output).toBe(0);
+  expect(code, output).toBe(expectedCode);
   return output;
 }
 
@@ -65,6 +71,14 @@ it('starts no package manager from a daemon whose clients do not set NX_USE_LOCA
       PATH: `${fakes}${delimiter}${process.env.PATH ?? ''}`,
     };
 
+    const controls: string[] = [];
+    for (const name of PACKAGE_MANAGERS) {
+      await run(name, ['oracle-control'], workspace, env, 1);
+      controls.push(`${name} oracle-control`);
+    }
+    expect(await readFile(marker, 'utf8')).toBe(`${controls.join('\n')}\n`);
+    await unlink(marker);
+
     // A library client (smoo, cowshed's task hashing, ensureBuilt) without the variable starts the daemon, which
     // computes Nx Console's and the AI agents' status in the environment it started with.
     const library = `
@@ -84,6 +98,6 @@ it('starts no package manager from a daemon whose clients do not set NX_USE_LOCA
     // The daemon took the branch that pulled `nx@latest` from the registry; it now resolves the installed Nx.
     expect(log).toContain('[NX-CONSOLE]: Console status check completed');
     expect(log).not.toContain('[LATEST-NX]: Pulling');
-    expect(await readFile(marker, 'utf8').catch(() => '')).toBe('');
+    await expect(readFile(marker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });
