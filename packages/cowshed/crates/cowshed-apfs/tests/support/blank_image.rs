@@ -136,9 +136,9 @@ impl SharedImage {
         &self.volume_device
     }
 
-    /// Mount this image's volume at `mount_point` through Disk Arbitration, as production mounts
-    /// (01a_apfs.md, "Mounts"), with `options` handed verbatim to the filesystem's `mount -o`
-    /// (`diskutil mount -mountOptions`): a mount of an already-attached volume, never an attach.
+    /// Mount this image's exact pool-owned volume at `mount_point` with mount_apfs, as production
+    /// mounts (01a_apfs.md, "Mounts"), with `options` handed verbatim to the filesystem helper:
+    /// a mount of an already-attached volume, never an attach or cached-family selection.
     /// The options are the caller's whole flag set, so a test can mount the one shared volume
     /// under any combination. The returned guard unmounts it; the image stays attached for the
     /// next test.
@@ -146,21 +146,19 @@ impl SharedImage {
         fs::create_dir_all(mount_point)
             .unwrap_or_else(|error| panic!("mount point {}: {error}", mount_point.display()));
         let mounted = disk_tool(
-            "/usr/sbin/diskutil",
+            "/sbin/mount_apfs",
             &[
-                "mount".as_ref(),
-                "-mountOptions".as_ref(),
+                "-o".as_ref(),
                 options.as_ref(),
-                "-mountPoint".as_ref(),
-                mount_point.as_os_str(),
                 self.volume_device.as_ref(),
+                mount_point.as_os_str(),
             ],
         );
         assert!(
             mounted.status.success(),
-            "diskutil mount -mountOptions {options} -mountPoint {} {}: {}",
-            mount_point.display(),
+            "mount_apfs -o {options} {} {}: {}",
             self.volume_device,
+            mount_point.display(),
             String::from_utf8_lossy(&mounted.stderr)
         );
         SharedMount {

@@ -208,7 +208,8 @@ struct Unit {
     ticket: u64,
 }
 
-/// What a [`Ledger`] transition did, for the actor to carry out.
+/// What a [`Ledger`] transition did, for the actor to carry out. Selection effects name the
+/// retained ticket; the ledger owns its facts, so an effect never copies their payload.
 #[derive(Debug)]
 enum Effect {
     /// The unit's turn came: its lease places are held and its run may start. The actor takes
@@ -216,7 +217,6 @@ enum Effect {
     /// client with the grant and the caps its run is sized to.
     Select {
         ticket: u64,
-        facts: TaskFacts,
         attempt: u32,
         band: TaskBand,
         waited: Duration,
@@ -363,15 +363,13 @@ impl Ledger {
             for class in &entry.facts.leases {
                 self.holders.entry(*class).or_default().push(ticket);
             }
-            let facts = entry.facts.clone();
             let waited = now.saturating_duration_since(entry.admitted);
             entry.state = State::Selected {
-                leases: facts.leases.clone(),
+                leases: entry.facts.leases.clone(),
             };
             effects.push(Effect::Select {
                 ticket,
-                band: band_of(&facts, host.busy),
-                facts,
+                band: band_of(&entry.facts, host.busy),
                 attempt,
                 waited,
             });
@@ -846,11 +844,14 @@ async fn run(
                 }
                 Effect::Select {
                     ticket,
-                    facts,
                     attempt,
                     band,
                     waited,
                 } => {
+                    let facts = &ledger
+                        .unit_of(ticket)
+                        .expect("selected ticket remains live")
+                        .facts;
                     cowshed_os::timing::event("task-server", || {
                         format!(
                             "select {} attempt={attempt} owner={} incarnation={} waited={waited:?} band={band:?} want={} leases={:?}",
@@ -939,8 +940,10 @@ mod tests {
 
     impl Clock {
         fn new(age_ms: u64) -> Self {
-            let mut limits = TaskServerLimits::default();
-            limits.age_bound = Duration::from_millis(age_ms);
+            let limits = TaskServerLimits {
+                age_bound: Duration::from_millis(age_ms),
+                ..TaskServerLimits::default()
+            };
             Clock {
                 ledger: Ledger::new(limits),
                 origin: Instant::now(),
@@ -962,7 +965,10 @@ mod tests {
             effects
                 .iter()
                 .filter_map(|effect| match effect {
-                    Effect::Select { facts, .. } => Some(facts.unit.to_string()),
+                    Effect::Select { ticket, .. } => self
+                        .ledger
+                        .unit_of(*ticket)
+                        .map(|unit| unit.facts.unit.to_string()),
                     _ => None,
                 })
                 .collect()
