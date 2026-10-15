@@ -112,9 +112,14 @@ normal coordinator rather than widening authority silently.
 The one JSON report includes per-task keys, independent own/main HIT/MISS, exclusive hit classes, mean miss weights with
 sample count and min/max, coverage, unresolved reasons, serial task-second totals and probe wall time. Positive
 `totals.ownMinusMainSeconds` means main has less estimated missing work. These are historical means, not gate elapsed
-time, and unresolved/unweighted tasks are excluded rather than assumed free. A complete `decision.workScoreSeconds`
-requires `decision.timeDecisionAvailable` to be true; otherwise that score is null, `totals.complete` is false and
-`decision.basis: "space"` explicitly tells the caller to use the space branch, not act on the partial time totals.
+time. Keyless tasks retain their unresolved reason and are labelled "unpriced key, worst case: misses in both", with
+their historical mean charged equally to both candidates as `ASSUMED_MISS`. `totals.keylessWorstCaseSeconds` reports the
+common assumed contribution separately from each candidate's measured miss work.
+
+A time decision remains available with unresolved keys or partial duration coverage, provided the candidate observations
+are usable, an Nx cache exists and at least one selected task has a duration sample. `totals.complete` records full
+duration coverage; missing samples remain explicit in `unpriced`. `decision.basis: "space"` and a null work score are
+reserved for genuine incapacity: no usable cache, no weightable task, or a refused candidate snapshot.
 
 Runtime inputs are denied by default and their exact commands are listed. After inspecting those commands,
 `--runtime=read-only` admits the plugin's fail-closed `runtime-input.sh` commands under kernel-enforced write/network

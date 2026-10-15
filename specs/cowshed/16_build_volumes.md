@@ -941,18 +941,29 @@ error text). A refused runtime/hash pass reports unresolved tasks and its diagno
 distinguishes runtime commands admitted to the hash pass from tasks excluded before it.
 
 Each current hash is looked up in both candidates' successful `cache_outputs` rows, with its cache directory present.
-The report distinguishes `HIT_BOTH`, `HIT_OWN`, `HIT_MAIN`, `MISS_BOTH` and `UNRESOLVED`, and gives each candidate's
-HIT/MISS independently. A task's weight is the arithmetic mean of successful uncached `task_history` execution seconds
-joined to `task_details` by hash and grouped by task identity, not exact current hash. Cache replays and failed/stopped
-attempts are excluded. A UNION-equivalent tuple of identity, hash, start and end de-duplicates histories inherited by
-cloning; sample count and min/max accompany every mean.
+The report distinguishes `HIT_BOTH`, `HIT_OWN`, `HIT_MAIN`, `MISS_BOTH` and `UNRESOLVED`. A keyless task retains
+`UNRESOLVED` classification and its reason, but its candidate costs use explicit `ASSUMED_MISS` statuses, labelled
+"unpriced key, worst case: misses in both". No hash or actual cache result is invented. A task's weight is the
+arithmetic mean of successful uncached `task_history` execution seconds joined to `task_details` by hash and grouped by
+task identity, not exact current hash. Cache replays and failed/stopped attempts are excluded. A UNION-equivalent tuple
+of identity, hash, start and end de-duplicates histories inherited by cloning; sample count and min/max accompany every
+mean.
 
 Totals sum weighted misses for own and main and report `own - main` in serial task-seconds, not future gate wall time.
-Unresolved tasks and tasks without a duration remain explicit and are excluded from those partial totals, never counted
-as free. Coverage includes all cacheable tasks with a duration and the resolved subset with one. A time decision is
-available only when every cacheable task has both a current key and a duration sample; otherwise `totals.complete` is
-false, `decision.workScoreSeconds` is null and `decision.basis` tells the caller to fall back to space. The advisor does
-not implement the space policy or adopt an image. Probe wall time and graph/hash-pass wall time are reported separately.
+Every keyless task with a duration contributes its own historical mean as an assumed miss in both candidates, including
+deferred tasks, omitted hooks and refused runtime inputs. `totals.keylessWorstCaseSeconds` gives that common term once
+(it is included in each candidate's total); `weightedKeylessTasks` counts its tasks. Each candidate's
+`MeasuredMissWorkSeconds` term reports only weighted misses established by current-key lookups. The difference is
+computed from those measured terms so the common assumption cancels without floating-point loss.
+
+Tasks without a duration remain explicitly unpriced, never silently free; `totals.complete` records whether every
+selected task has a usable weight, including worst-case weights for keyless tasks. Coverage reports all cacheable
+identities with a duration and the resolved subset with one. A time decision is available whenever the candidate
+observations are usable, at least one candidate holds an Nx cache entry, and at least one selected task has a duration
+sample. Partial duration coverage does not veto that decision: report the gaps alongside the usable score. Space is the
+fallback for genuine incapacity (no usable Nx cache, no weightable selected task, or a refused candidate observation),
+not merely an unresolved key. The advisor does not implement the space policy or adopt an image. Probe wall time and
+graph/hash-pass wall time are reported separately.
 
 - **Enforced by**: `packages/cowshed/scripts/cache-advisor.test.cjs`, using real stock Nx and a running fixture daemon,
   asymmetric cache entries, cloned histories and a deferred dependency-output task. Candidate state bytes and

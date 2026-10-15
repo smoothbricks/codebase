@@ -135,6 +135,8 @@ test('real Nx: no candidate writes or daemon stop; asymmetric hits, deferred ide
     seed(ownDb, b, [2, 4], false);
     seed(mainDb, b, [2, 4], true);
     seed(ownDb, c, [7], false);
+    seed(ownDb, { ...byId['fixture:deferred'], hash: '123456789012345' }, [2, 14], false);
+    seed(ownDb, { ...byId['fixture:runtime'], hash: '123456789012346' }, [6], false);
     fs.mkdirSync(path.join(workspace, '.nx/cache', a.hash));
     fs.mkdirSync(path.join(main, '.nx/cache', b.hash));
     const beforeOwn = snapshot(path.join(workspace, '.nx'));
@@ -145,14 +147,28 @@ test('real Nx: no candidate writes or daemon stop; asymmetric hits, deferred ide
     assert.equal(rows['fixture:main'].classification, 'HIT_MAIN');
     assert.equal(rows['fixture:missing'].classification, 'MISS_BOTH');
     assert.deepEqual(rows['fixture:own'].weight, { meanSeconds: 4, samples: 3, minSeconds: 1, maxSeconds: 10 });
-    assert.equal(result.totals.ownMissWorkSeconds, 10);
-    assert.equal(result.totals.mainMissWorkSeconds, 11);
+    assert.equal(result.totals.ownMeasuredMissWorkSeconds, 10);
+    assert.equal(result.totals.mainMeasuredMissWorkSeconds, 11);
+    assert.equal(result.totals.keylessWorstCaseSeconds, 14);
+    assert.equal(result.totals.weightedKeylessTasks, 2);
+    assert.equal(result.totals.ownMissWorkSeconds, 24);
+    assert.equal(result.totals.mainMissWorkSeconds, 25);
     assert.equal(result.totals.ownMinusMainSeconds, -1);
-    assert.equal(result.coverage.withDuration, 3);
+    assert.equal(result.coverage.withDuration, 5);
     assert.equal(result.coverage.resolvedWithDuration, 3);
-    assert.equal(result.decision.timeDecisionAvailable, false);
-    assert.equal(result.decision.basis, 'space');
-    assert.equal(result.decision.workScoreSeconds, null);
+    assert.equal(rows['fixture:deferred'].classification, 'UNRESOLVED');
+    assert.equal(rows['fixture:deferred'].own, 'ASSUMED_MISS');
+    assert.equal(rows['fixture:deferred'].main, 'ASSUMED_MISS');
+    assert.deepEqual(rows['fixture:deferred'].cost, {
+      basis: 'worst-case-keyless',
+      label: 'unpriced key, worst case: misses in both',
+      ownSeconds: 8,
+      mainSeconds: 8,
+    });
+    assert.equal(result.decision.timeDecisionAvailable, true);
+    assert.equal(result.decision.basis, 'time');
+    assert.equal(result.decision.workScoreSeconds, -1);
+    assert.equal(result.totals.complete, true);
     assert.deepEqual(
       snapshot(path.join(workspace, '.nx')),
       beforeOwn,
@@ -173,7 +189,7 @@ test('real Nx: no candidate writes or daemon stop; asymmetric hits, deferred ide
     );
     assert.deepEqual(snapshot(path.join(main, '.nx')), beforeMain);
     const verify = new DatabaseSync(ownDb, { readOnly: true });
-    assert.equal(verify.prepare('SELECT count(*) AS count FROM task_details').get().count, 3);
+    assert.equal(verify.prepare('SELECT count(*) AS count FROM task_details').get().count, 5);
     verify.close();
   } finally {
     const stopped = nxCommand(['daemon', '--stop']);
@@ -239,6 +255,29 @@ test('private snapshot includes live WAL-only commits without touching candidate
     assert.equal(noHistory.decision.timeDecisionAvailable, false);
     assert.equal(noHistory.tasks[0].weight, null);
     assert.match(noHistory.unpriced[0].reason, /no successful uncached duration/);
+    const partiallyPriced = summarize(
+      {
+        tasks: [
+          ...selection.tasks,
+          {
+            id: 'fixture:no-history',
+            project: 'fixture',
+            target: 'no-history',
+            configuration: null,
+            hash: '456',
+            reason: null,
+          },
+        ],
+      },
+      observed,
+      observed,
+    );
+    assert.equal(partiallyPriced.decision.timeDecisionAvailable, true);
+    assert.equal(partiallyPriced.totals.complete, false);
+    assert.equal(partiallyPriced.unpriced[0].id, 'fixture:no-history');
+    const noCache = summarize(selection, { ...observed, hashes: new Set() }, { ...observed, hashes: new Set() });
+    assert.equal(noCache.decision.timeDecisionAvailable, false);
+    assert.match(noCache.decision.reason, /neither candidate has a usable Nx cache/);
   } finally {
     db.close();
     fs.rmSync(temp, { recursive: true, force: true });
