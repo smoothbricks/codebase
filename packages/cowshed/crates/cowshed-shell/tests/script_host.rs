@@ -684,6 +684,12 @@ fn a_script_that_does_not_parse_never_runs() {
 #[test]
 fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     let mut host = Host::start("group");
+    eprintln!(
+        "script-group phase=host-started host_pid={} control_fd={} fixture={}",
+        host.child.id(),
+        host.control.as_raw_fd(),
+        host.directory.display()
+    );
     let leader = host.directory.join("leader");
     let descendant = host.directory.join("descendant");
     let hold = host.directory.join("hold");
@@ -711,26 +717,40 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
         ),
         child: None,
     };
+    eprintln!("script-group phase=submitting");
     let Submitted { reply, readers } = submit(&host.control, &host.directory, &rendered);
+    eprintln!("script-group phase=start-reply");
     let (tag, mut fields) = FrameReader::new(&reply).expect("start reply");
     assert_eq!(tag, REPLY_STARTED);
     let birth = fields
         .birth()
         .expect("the real parent observed its unreaped leader");
     fields.finish().expect("start frame");
+    eprintln!("script-group phase=started birth={birth:?}");
     // Each FIFO reports only after that exact process runs. No elapsed delay supplies readiness.
     let pids = [&leader, &descendant].map(|path| {
+        eprintln!("script-group phase=reading-pid fifo={}", path.display());
         let value = std::fs::read_to_string(path).expect("read the actual process's FIFO");
-        value.trim().parse::<i32>().expect("published process PID")
+        let pid = value.trim().parse::<i32>().expect("published process PID");
+        eprintln!(
+            "script-group phase=pid-read fifo={} pid={pid}",
+            path.display()
+        );
+        pid
     });
     assert_eq!(birth.pid(), pids[0].cast_unsigned());
+    eprintln!("script-group phase=reading-members birth={birth:?} pids={pids:?}");
     let members =
         cowshed_core::runtime::job_groups::job_members(&birth).expect("identity-proven live group");
+    for member in &members {
+        eprintln!("script-group phase=member-read pid={}", member.pid());
+    }
     let exits = pids.map(|pid| {
         let member = members
             .iter()
             .find(|member| member.pid() == pid)
             .expect("published process is in the actual owned group");
+        eprintln!("script-group phase=watching-exit pid={pid}");
         let exit = member
             .watch_exit()
             .expect("watch this retained life before killing it");
@@ -738,29 +758,42 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
             !exit.within(Duration::ZERO).expect("current exit readiness"),
             "process {pid} already exited"
         );
+        eprintln!("script-group phase=exit-watched-running pid={pid}");
         exit
     });
     // A real group signal must end both retained lives, not just the leader or its output pipes.
+    eprintln!("script-group phase=signalling signal={}", libc::SIGTERM);
     send_signal(&host.control, libc::SIGTERM);
+    eprintln!("script-group phase=reading-exit");
     let status = read_exit(&host.control);
+    eprintln!("script-group phase=exit-read status={status:?}");
     assert_eq!(signaled(Some(&status)), Some(libc::SIGTERM));
     for (pid, exit) in pids.into_iter().zip(exits) {
+        eprintln!("script-group phase=awaiting-native-exit pid={pid}");
         assert!(
             exit.within(Duration::from_secs(10))
                 .expect("native exit notification"),
             "retained process {pid} of the killed script still runs"
         );
+        eprintln!("script-group phase=native-exit-observed pid={pid}");
     }
+    eprintln!("script-group phase=joining-output-readers");
     let [stdout, stderr] = readers.map(|reader| reader.join().expect("owned output reader"));
+    eprintln!("script-group phase=outputs-ended");
     assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
+    eprintln!("script-group phase=releasing-leader");
     release(&host.control); // Only its actual parent reaps the script's leader.
+    eprintln!("script-group phase=leader-reaped");
     job.control.take();
     assert!(
         host.child.try_wait().expect("host status").is_none(),
         "the host is not in the job's group"
     );
+    eprintln!("script-group phase=reusing-host");
     assert_eq!(host.run(&text("printf again")).stdout, "again");
+    eprintln!("script-group phase=finishing-fixture");
     host.finish().expect("finish the successful host fixture");
+    eprintln!("script-group phase=fixture-finished");
 }
 
 /// The old null-signal oracle called an exited, unreaped child alive. The exit watch must not.
