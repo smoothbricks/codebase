@@ -285,10 +285,29 @@ Nx 23.2.1 hashes a runtime input's stdout and stderr and ignores its exit status
 its error text, one string for every history, toolchain or file it could not read, and a result cached under it is
 replayed for all of them. The script keys on the command's stdout alone and turns a nonzero exit into an Nx error: it
 ends stdout with the byte 0xFF, and Nx refuses output that is not UTF-8
-(`invalid utf-8 sequence of 1 bytes from index N`, exit 1). That message names neither the input nor its cause; run the
-target's runtime inputs (`nx show target <project>:<target> --inputs`) by hand to read the cause.
-`runtime-input.test.ts` plants a failure through real Nx and fails if Nx ever hashes those bytes instead of refusing
-them.
+(`invalid utf-8 sequence of 1 bytes from index N`, exit 1). Nx drops a runtime input's stderr, so a failure that only
+wrote to stderr would be invisible. The wrapper retains each failure under the checkout's
+`.runtime-input-failures/failure.XXXXXXXXXX/`, outside Nx's state and the temporary directory. These private records
+survive `nx reset`, task-cache cleanup and temporary-directory retirement; they remain until the operator removes them.
+The reliable diagnostic after a daemon or headless gate's decoder error is:
+
+```sh
+cat .runtime-input-failures/*/report
+```
+
+Each readable `report` names the command, its indexed arguments, working directory, exit status and original stderr.
+`argv` retains the exact NUL-delimited argument vector (including empty arguments), `stderr` retains the original bytes
+(including trailing newlines), and `exit-status` retains the decimal status. The wrapper also attempts a stderr summary
+naming the command and report path, and displays the report on `/dev/tty` when it can open a controlling terminal.
+Neither display is guaranteed through Nx's daemon or a headless harness: rely on the retained report, not on Nx
+forwarding stderr. A failed terminal write is retained in the record's `terminal-error`. Records can contain arguments
+or stderr with credentials; keep them private and inspect before sharing. Evidence-storage errors name the problem and
+the surviving stderr capture on stderr; they never remove the refusal byte or replace the command's status.
+
+Successful commands still emit only their original stdout bytes, discard stderr and retain no failure record: no
+evidence path, timestamp or diagnostic enters a successful key. `runtime-input.test.ts` compares that byte stream and
+its hash with the previous success path, and plants a failure through real Nx (daemon and daemonless) to prove both
+refusal and retained evidence.
 
 An input that runs inside a cowshed workspace's sandboxed daemon gets the client's environment, a host shell's `HOME`
 included, but not the client's filesystem view (cowshed `04_sandbox.md`). An input that reads the operator's home fails
