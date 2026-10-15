@@ -1,0 +1,228 @@
+#![cfg(target_os = "macos")]
+//! The task server over a real control socket: work units admitted and selected without any
+//! human assignment, the caps applied from the grant, and a queue view that names what waits on
+//! what and who holds each serialization class.
+
+use std::num::NonZeroUsize;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use cowshed_gateway::{
+    AuditError, AuditEvent, AuditSink, AuthorizedTarget, ConnectError, CpuBudgetLimits,
+    CredentialError, CredentialProvider, CredentialQuery, CredentialRecord, Gateway, GatewayConfig,
+    MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
+};
+use cowshed_gateway_types::{TaskAdmitRequest, TaskOutcome, TaskTerminalRequest};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::net::UnixStream;
+use uuid::Uuid;
+
+struct NoCredentials;
+
+#[async_trait]
+impl CredentialProvider for NoCredentials {
+    async fn lookup(
+        &self,
+        _query: &CredentialQuery,
+    ) -> Result<Option<CredentialRecord>, CredentialError> {
+        Ok(None)
+    }
+}
+
+struct NoConnector;
+
+#[async_trait]
+impl UpstreamConnector for NoConnector {
+    async fn health(&self, _target: &cowshed_gateway::CanonicalTarget) -> UpstreamHealth {
+        UpstreamHealth::Unknown
+    }
+
+    async fn connect(
+        &self,
+        _target: &AuthorizedTarget,
+    ) -> Result<UpstreamConnection, ConnectError> {
+        Err(ConnectError::NoAddresses)
+    }
+}
+
+struct DiscardAudit;
+
+#[async_trait]
+impl AuditSink for DiscardAudit {
+    async fn record(&self, _event: AuditEvent) -> Result<(), AuditError> {
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), AuditError> {
+        Ok(())
+    }
+}
+
+/// A gateway with a budget of `tokens` on a socket under `/tmp` (a bind path is capped at
+/// `sun_path`'s 104 bytes), and the root to remove once it has drained.
+async fn gateway(tokens: usize) -> (Gateway, PathBuf, PathBuf) {
+    let id = Uuid::new_v4().simple().to_string();
+    let root = PathBuf::from(format!("/tmp/cstask-{}", &id[..8]));
+    std::fs::create_dir(&root).expect("create fixture root");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+        .expect("secure fixture root");
+    let cache = root.join("cache");
+    std::fs::create_dir(&cache).expect("cache");
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).expect("secure cache");
+    let socket = root.join("gateway.sock");
+    let gateway = Gateway::start(
+        GatewayConfig {
+            control_socket: Some(socket.clone()),
+            mirror_cache: MirrorCacheConfig::new(cache),
+            cpu_budget: CpuBudgetLimits {
+                tokens: NonZeroUsize::new(tokens).unwrap(),
+            },
+            ..GatewayConfig::default()
+        },
+        Arc::new(NoCredentials),
+        Arc::new(NoConnector),
+        Arc::new(DiscardAudit),
+    )
+    .await
+    .expect("start gateway");
+    (gateway, root, socket)
+}
+
+fn admit(unit: &str, deps: &[&str], want: usize) -> String {
+    let mut request = TaskAdmitRequest::new(unit, "workspace-1", want, "nx run gate");
+    request.deps = deps.to_vec();
+    let mut line = serde_json::to_string(&request).expect("encode");
+    line.push('\n');
+    line
+}
+
+fn terminal(unit: &str, outcome: TaskOutcome) -> String {
+    let mut line = serde_json::to_string(&TaskTerminalRequest::new(unit, outcome)).expect("encode");
+    line.push('\n');
+    line
+}
+
+/// One held `task-admit` connection in this process, answered `queued`.
+struct Asker {
+    lines: BufReader<tokio::net::unix::OwnedReadHalf>,
+    _writer: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl Asker {
+    async fn ask(socket: &Path, line: String) -> Self {
+        let stream = UnixStream::connect(socket).await.expect("connect");
+        let (reader, mut writer) = stream.into_split();
+        writer.write_all(line.as_bytes()).await.expect("ask");
+        let mut asker = Self {
+            lines: BufReader::new(reader),
+            _writer: writer,
+        };
+        let queued = asker.answer().await;
+        assert_eq!(queued["lease"], "queued", "{queued}");
+        asker
+    }
+
+    async fn answer(&mut self) -> Value {
+        let mut line = String::new();
+        self.lines.read_line(&mut line).await.expect("answer");
+        serde_json::from_str(&line).expect("an answer is JSON")
+    }
+
+    /// The grant named within `within`, or `None`.
+    async fn granted(&mut self, within: Duration) -> Option<Value> {
+        let answer = tokio::time::timeout(within, self.answer()).await.ok()?;
+        assert_eq!(answer["lease"], "granted", "{answer}");
+        Some(answer["taskGrant"].clone())
+    }
+
+    /// The refusal answered within `within`.
+    async fn refused(&mut self, within: Duration) -> Value {
+        let answer = tokio::time::timeout(within, self.answer())
+            .await
+            .expect("an answer");
+        assert_eq!(answer["ok"], Value::Bool(false), "{answer}");
+        answer
+    }
+}
+
+/// A one-shot control request's answer.
+async fn one_shot(socket: &Path, line: &str) -> Value {
+    let mut stream = UnixStream::connect(socket).await.expect("connect");
+    stream.write_all(line.as_bytes()).await.expect("ask");
+    stream.shutdown().await.expect("half-close");
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).await.expect("answer");
+    serde_json::from_str(answer.trim_end()).expect("an answer is JSON")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what() {
+    let (gateway, root, socket) = gateway(12).await;
+    // unit-a wants 8 tokens and runs; unit-b waits on unit-a and runs after its fact alone.
+    let mut runner = Asker::ask(&socket, admit("unit-a", &[], 8)).await;
+    let mut dependent = Asker::ask(&socket, admit("unit-b", &["unit-a"], 2)).await;
+    let grant = runner
+        .granted(Duration::from_secs(10))
+        .await
+        .expect("unit-a runs");
+    // The caps the server applies: the profile at a grant that can hold it.
+    assert_eq!(grant["unit"], "unit-a");
+    assert_eq!(grant["caps"]["nxParallel"], 2);
+    assert_eq!(grant["caps"]["cargoJobs"], 4);
+    assert_eq!(grant["caps"]["testThreads"], 6);
+    assert_eq!(grant["cpuTokens"], 8, "the CPU is the budget's grant");
+    // The queue view: what runs, what waits on what, and the serialization classes' places.
+    let queue = one_shot(&socket, "{\"op\":\"task-queue\"}\n").await;
+    let queue = &queue["taskQueue"];
+    assert_eq!(queue["running"][0]["unit"], "unit-a");
+    assert_eq!(queue["running"][0]["cpuTokens"], 8);
+    assert_eq!(queue["waiting"][0]["unit"], "unit-b");
+    assert_eq!(queue["waiting"][0]["deps"][0]["unit"], "unit-a");
+    assert_eq!(queue["waiting"][0]["deps"][0]["outcome"], Value::Null);
+    assert_eq!(queue["leases"][2]["class"], "land-publication");
+    assert_eq!(queue["leases"][2]["places"], 1);
+    // unit-a lands: the terminal fact alone advances unit-b, no human in the loop.
+    let settled = one_shot(&socket, &terminal("unit-a", TaskOutcome::Landed)).await;
+    assert_eq!(settled["ok"], Value::Bool(true));
+    let grant = dependent
+        .granted(Duration::from_secs(10))
+        .await
+        .expect("unit-b runs");
+    assert_eq!(grant["unit"], "unit-b");
+    // Its caps clamp to the 2 tokens it asked for.
+    assert_eq!(grant["caps"]["nxParallel"], 2);
+    assert_eq!(grant["caps"]["cargoJobs"], 2);
+    assert_eq!(grant["caps"]["testThreads"], 2);
+    drop(runner);
+    drop(dependent);
+    gateway.drain().await.expect("drain");
+    std::fs::remove_dir_all(root).expect("clean fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_unit_keeps_one_live_attempt_over_the_wire() {
+    let (gateway, root, socket) = gateway(4).await;
+    let mut runner = Asker::ask(&socket, admit("unit", &[], 1)).await;
+    runner
+        .granted(Duration::from_secs(10))
+        .await
+        .expect("the first attempt runs");
+    let mut second = Asker::ask(&socket, admit("unit", &[], 1)).await;
+    let refused = second.refused(Duration::from_secs(10)).await;
+    assert_eq!(refused["code"], "rejected", "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .expect("an error")
+            .contains("live attempt"),
+        "{refused}"
+    );
+    drop(runner);
+    drop(second);
+    gateway.drain().await.expect("drain");
+    std::fs::remove_dir_all(root).expect("clean fixture root");
+}
