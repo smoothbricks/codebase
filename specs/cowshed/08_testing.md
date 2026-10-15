@@ -29,7 +29,9 @@ No mounts, no root, no network — pure functions with table-driven cases:
   bound sees it finish; they are not one aggregate of hundreds of serial Git probes. Staging uses the production tree
   copier, not a fixed host executable path. Allocation-only comparison cases supply distinct loose-size probe
   observations while retaining the other real Git evidence and fsck refusal; they never require compression or sparse
-  writeback to change the host filesystem's allocated-block count.
+  writeback to change the host filesystem's allocated-block count. Companion-retention table rows share one captured
+  real-Git source and reset their disposable project tree per row; every refusal still compares the whole project tree,
+  and every converged row retains its unchanged-replay oracle.
 - **Grant files**: schema round-trip, revision monotonicity, delta application, wildcard egress matching
   (`*.github.com`), port defaults.
 - **Marker files**: round-trip, unknown-version rejection, role transitions (fork/restore).
