@@ -140,6 +140,10 @@ change installed host services or checkout source. The descriptor-inheritance pr
 agent from the generated gateway plist, holds 10000 descriptors with finite `OPEN_MAX`, and unloads that agent on every
 exit path.
 
+An exit-watch fixture waits for an executed-body readiness byte before its parent captures the process identity and
+registers the watch. The parent holds the child's input gate until registration; returning from spawn alone is not
+readiness. Its actual parent retains the child unreaped through the exit observation.
+
 Process-observation fixtures hold a child and grandchild under their root with FIFO gates and independent PID/parent
 oracles. The real served supervisor and trusted N-API embedder read the same retained birth-order records and exec/exit
 events. Dropping a stream leaves the workload running; a later subscriber replays the same history. Their sole
