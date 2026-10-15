@@ -452,6 +452,22 @@ nothing when nothing changed:
   unchanged-entry cost and coverage. The CLI update command installs without writing this receipt and is outside this
   receipt-admission check. Direct `devenv shell` sources `.cowshed/env` in the managed prologue before project hooks,
   just as direnv does, so both entry paths reuse cowshed's CI and pinned compiler-cache environment.
+- A physically missing registry-package payload has one explicit repair route:
+  `bun tooling/direnv/setup-environment.ts --repair-missing-payload <installed-path>`. Name the missing file or
+  directory through this checkout's installed alias. Under the same install lock, the installer binds its name/version
+  and tar integrity to `bun.lock`, verifies that published tar and compares only that package. Existing payload
+  mismatches refuse; only missing published entries are added in a sibling staging directory, preserving existing files,
+  links and metadata, then published with a native atomic directory exchange. Published-complete and unchanged lock
+  bytes are proved before the existing successful-install receipt. Repeating a healthy request installs nothing. A
+  failure before that receipt restores the original package; after it commits, reclamation failure names the retained
+  staging path and explicitly says the repair committed. This does not change normal-entry/status validation, certify
+  all shared-cache payload, repair external developer targets, or add a retry/purge route. See
+  `specs/cowshed/03_caches.md` → "Explicit missing-payload repair".
+
+  The explicit repair preserves the prior successful-install witness and its locked hashes; it never upgrades that
+  witness's input digest from a one-package proof. A stale witness stays stale, and no valid prior witness means
+  refusal.
+
 - A repository whose `devenv.nix` enables `languages.python.uv` gets its uv workspace synced the same way
   (`uv sync --all-packages --all-groups`, `--locked` on a CI runner) into devenv's `UV_PROJECT_ENVIRONMENT`, with the
   interpreter devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and

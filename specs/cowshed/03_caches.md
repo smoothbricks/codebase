@@ -89,6 +89,40 @@ manager's responsibility.
 shared dependency targets. Extending admission to that path requires a separate contract decision and comparable
 measurements of unchanged shell-entry cost and validation coverage; it is not part of receipt-writing admission.
 
+## Explicit missing-payload repair
+
+`bun tooling/direnv/setup-environment.ts --repair-missing-payload <installed-path>` is an explicit transaction in the
+same canonical installer and under the same `withInstallLock`. It is not normal shell-entry validation, a global payload
+scan, a second installer, or Bun's upstream cache repair. The ordinary link/manifest admission and its
+matching-stamp/status boundary above remain unchanged.
+
+The request names a physically missing published file or directory through this checkout's installed package alias. The
+installed package must be physically owned by the checkout; workspace/developer targets outside it are not replacement
+candidates. Its manifest name/version must have one registry integrity binding in `bun.lock`. Bun reads the checkout's
+registry configuration to resolve that exact version's `dist` metadata; the downloaded tar must match the locked
+integrity and contain the same package name/version. An unreadable or authenticated tar download reports the actual
+transport refusal; it does not fall back to another install route.
+
+Require a valid prior successful-install witness whose lock hashes still match. This transaction proves one package, not
+a new full-install input set: publish that **same witness**, preserving its bytes and input digest, only after the
+payload proof. A stale input witness stays stale for ordinary installation to resolve; an absent, invalid or
+lock-drifted prior witness refuses rather than minting a false successful installation.
+
+Compare only that package's published payload. Any existing byte, kind or symlink-target mismatch refuses: this mode
+never overwrites a differing existing published file. Build a sibling staging directory with only missing published
+entries, then archive-copy the existing package over it to preserve its extra files, symlinks, modes, ownership and
+modification times. Verify preservation and published completeness, and require unchanged present/absent lockfiles.
+Publish with the native atomic directory exchange (`cowshed-os::fsio::rename_exchange`), never a missing or partially
+populated live path. Verify the live postconditions and unchanged lock bytes before the existing successful-install
+receipt is written. A repeated healthy request is idempotent and performs no install, force, purge or retry.
+
+Repair failures **before the success receipt** preserve or restore the original live package. Keep the old directory
+until that receipt commits, so failed postconditions or receipt writes can roll back the exchange. After commit,
+reclamation is separate: a failure is reported loudly as `repair committed; retained staging path ...`, with no false
+rollback or host-health claim. A failed rollback retains both directories and reports both causes. No new authority
+ledger is created. The explicit command reports the real published-file/restored-file counts and its completeness and
+lock-preservation proof; ordinary shell entry does not acquire this cost.
+
 ## The reflink-reachability rule
 
 A clone-materializing cache must live where the substrate can reflink from it into the workspace — on APFS, the same
