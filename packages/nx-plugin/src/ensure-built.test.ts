@@ -802,11 +802,137 @@ describe('smoo-nx-exec with a fresh daemon', () => {
     return owner.stdout;
   };
 
-  // The one test here that runs real Nx, because its subject is the daemon:
+  // These integration controls run real Nx because their subject is the daemon:
   // the daemon a probe starts holds no output records, so every output must be
   // vouched for by comparing the working tree with Nx's cache artifact. The
   // daemon it starts is also the one whose socket is in question, so the same
   // lifetime answers where a root entered from another workspace's shell binds.
+  it('reuses authoritative graphs without assuming an unstable generation republishes its witness', async () => {
+    await withNxFixture(
+      'ensure-built-graph-witness-',
+      async ({ root, workspace, socketDirectory }) => {
+        const builds = join(root, 'lib-builds.log');
+        await writeTwoProjectWorkspace(workspace, builds);
+        const built = await run(
+          'node',
+          nxEntry,
+          workspace,
+          ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
+          { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace },
+        );
+        expect(built.code, built.stdout + built.stderr).toBe(0);
+        const reuseEntry = join(root, 'graph-reuse.ts');
+        const resultsPath = join(root, 'graph-checks.json');
+        await writeFile(
+          reuseEntry,
+          `
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { chmod, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const requireNx = createRequire(process.cwd() + '/package.json');
+const { daemonClient } = requireNx('nx/src/daemon/client/client');
+const { workspaceDataDirectoryForWorkspace } = requireNx('nx/src/utils/cache-directory');
+const witness = join(workspaceDataDirectoryForWorkspace(process.cwd()), 'ensure-built-graph.json');
+const savedWitness = ${JSON.stringify(join(root, 'authoritative-graph.json'))};
+const source = join(process.cwd(), 'packages/lib/source.txt');
+const text = await readFile(source, 'utf8');
+const request = daemonClient.getProjectGraphAndSourceMaps.bind(daemonClient);
+let requests = 0;
+let invalidateGeneration = false;
+daemonClient.getProjectGraphAndSourceMaps = async () => {
+  requests += 1;
+  const response = await request();
+  if (invalidateGeneration) {
+    invalidateGeneration = false;
+    await writeFile(source, 'transient graph input');
+    await writeFile(source, text);
+  }
+  return response;
+};
+const results = [];
+async function check(label) {
+  const before = requests;
+  const result = await ensureBuilt({ target: 'app:build', cwd: process.cwd() });
+  results.push({ label, requests: requests - before, disposition: result.disposition, witnessExists: existsSync(witness) });
+}
+await check('establish');
+await check('reuse');
+const added = join(process.cwd(), 'new-graph-input.txt');
+await writeFile(added, 'new');
+await check('created');
+await rm(added);
+await check('deleted');
+const project = join(process.cwd(), 'packages/app/project.json');
+const original = await readFile(project, 'utf8');
+const config = JSON.parse(original);
+config.implicitDependencies = [];
+await writeFile(project, JSON.stringify(config));
+await check('dependency');
+await writeFile(project, original);
+await check('dependency-restored');
+// Save only evidence the real daemon generation actually authorized, outside
+// the workspace: the later missing-witness RPC is not obliged to replace it.
+const authoritativeWitness = await readFile(witness, 'utf8');
+const witnessMode = (await stat(witness)).mode & 0o7777;
+await rename(witness, savedWitness);
+// Equal pre/post bytes do not authorize publication after a write/revert.
+// Count and return the actual RPC response, including the required successor.
+invalidateGeneration = true;
+await check('missing-witness');
+assert.equal(invalidateGeneration, false);
+assert.equal(existsSync(witness), false);
+// Restore that same genuine witness, not synthesized evidence or a retry of
+// the unstable generation, so the unreadable control always runs.
+await rename(savedWitness, witness);
+assert.equal(await readFile(witness, 'utf8'), authoritativeWitness);
+await chmod(witness, 0);
+try {
+  await assert.rejects(readFile(witness), { code: 'EACCES' });
+  await check('unreadable-witness');
+} finally {
+  await chmod(witness, witnessMode);
+}
+await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
+`,
+        );
+        const reused = await run('bun', reuseEntry, workspace, [], {
+          NX_DAEMON: 'true',
+          NX_USE_LOCAL: 'true',
+          NX_WORKSPACE_ROOT_PATH: workspace,
+          NX_SOCKET_DIR: socketDirectory,
+        });
+        expect(reused.code, reused.stdout + reused.stderr).toBe(0);
+        // A changed dependency configuration may legitimately run app:build;
+        // its streamed logs are not the graph-observation protocol.
+        const graphChecks = typia.json.assertParse<
+          { label: string; requests: number; disposition: string; witnessExists: boolean }[]
+        >(await readFile(resultsPath, 'utf8'));
+        expect(graphChecks.find(({ label }) => label === 'reuse')).toEqual({
+          label: 'reuse',
+          requests: 0,
+          disposition: 'hit',
+          witnessExists: true,
+        });
+        for (const label of ['created', 'deleted', 'dependency', 'dependency-restored', 'unreadable-witness']) {
+          expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
+        }
+        expect(graphChecks.find(({ label }) => label === 'missing-witness')).toEqual({
+          label: 'missing-witness',
+          requests: 2,
+          disposition: 'hit',
+          witnessExists: false,
+        });
+        expect(graphChecks.find(({ label }) => label === 'unreadable-witness')?.disposition).toBe('hit');
+        expect(await readFile(builds, 'utf8')).toBe('lib\n');
+        expect(await readFile(join(workspace, 'packages/app/dist/marker.txt'), 'utf8')).toBe('built\nlib\n');
+      },
+      'workspace',
+    );
+  }, 60_000);
+
   it('replays current outputs and refreshes stale snapshots without running unrelated edits', async () => {
     // A socket path has a 95 character budget and macOS's temp directory spends most of it, so the
     // socket directory is made in the short socket namespace the sandbox admits.
@@ -1061,77 +1187,6 @@ console.log(JSON.stringify({ result, requests }));
           expect(generations.requests).toBeGreaterThanOrEqual(2);
           expect(generationRace.stderr).toBe('');
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
-          // Count real graph RPCs, without substituting any response. The
-          // second call must use the graph witness; every membership/config
-          // change must return to the daemon's current generation.
-          const reuseEntry = join(root, 'graph-reuse.ts');
-          await writeFile(
-            reuseEntry,
-            `
-import { createRequire } from 'node:module';
-import { chmod, readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
-const { daemonClient } = createRequire(process.cwd() + '/package.json')('nx/src/daemon/client/client');
-const request = daemonClient.getProjectGraphAndSourceMaps.bind(daemonClient);
-let requests = 0;
-daemonClient.getProjectGraphAndSourceMaps = async () => { requests += 1; return request(); };
-const results = [];
-async function check(label) {
-  const before = requests;
-  const result = await ensureBuilt({ target: 'app:build', cwd: process.cwd() });
-  results.push({ label, requests: requests - before, disposition: result.disposition });
-}
-await check('establish');
-await check('reuse');
-const added = join(process.cwd(), 'new-graph-input.txt');
-await writeFile(added, 'new');
-await check('created');
-await rm(added);
-await check('deleted');
-const project = join(process.cwd(), 'packages/app/project.json');
-const original = await readFile(project, 'utf8');
-const config = JSON.parse(original);
-config.implicitDependencies = [];
-await writeFile(project, JSON.stringify(config));
-await check('dependency');
-await writeFile(project, original);
-await check('dependency-restored');
-const { workspaceDataDirectoryForWorkspace } = createRequire(process.cwd() + '/package.json')('nx/src/utils/cache-directory');
-const witness = join(workspaceDataDirectoryForWorkspace(process.cwd()), 'ensure-built-graph.json');
-await rm(witness);
-await check('missing-witness');
-await chmod(witness, 0);
-try { await check('unreadable-witness'); } finally { await chmod(witness, 0o600); }
-console.log(JSON.stringify(results));
-`,
-          );
-          const reused = await run('bun', reuseEntry, workspace, [], {
-            NX_DAEMON: 'true',
-            NX_USE_LOCAL: 'true',
-            NX_WORKSPACE_ROOT_PATH: workspace,
-            ...ownEnv,
-          });
-          expect(reused.code, reused.stdout + reused.stderr).toBe(0);
-          const graphChecks = typia.json.assertParse<{ label: string; requests: number; disposition: string }[]>(
-            reused.stdout,
-          );
-          expect(graphChecks.find(({ label }) => label === 'reuse')).toEqual({
-            label: 'reuse',
-            requests: 0,
-            disposition: 'hit',
-          });
-          for (const label of [
-            'created',
-            'deleted',
-            'dependency',
-            'dependency-restored',
-            'missing-witness',
-            'unreadable-witness',
-          ]) {
-            expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
-          }
-          expect(await readFile(join(workspace, 'packages/app/dist/marker.txt'), 'utf8')).toBe('built\nlib\n');
           // Coordinate a real write after the real daemon returned its file
           // table. The response is not substituted: this makes the
           // graph→snapshot race deterministic without relying on FSEvents.
