@@ -287,6 +287,7 @@ impl Gateway {
             },
         );
         let actor = tokio::spawn(state.run());
+        let cpu_budget = crate::cpu_budget::CpuBudget::start(config.cpu_budget);
         let control = match &config.control_socket {
             Some(path) => {
                 match ControlRuntime::start(
@@ -299,7 +300,11 @@ impl Gateway {
                         audit_tail: audit_tail.clone(),
                         startup: config.startup.clone(),
                         disk_leases: crate::disk_lease::DiskLeases::start(config.disk_lease),
-                        cpu_budget: crate::cpu_budget::CpuBudget::start(config.cpu_budget),
+                        cpu_budget: cpu_budget.clone(),
+                        task_server: crate::task_server::TaskServer::start(
+                            config.task_server,
+                            cpu_budget,
+                        ),
                         jobserver: crate::jobserver::JobserverFifos::start(
                             path.parent()
                                 .map(|parent| parent.join("jobserver"))

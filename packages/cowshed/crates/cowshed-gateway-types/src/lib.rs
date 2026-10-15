@@ -21,6 +21,7 @@ pub mod policy;
 pub mod repo_id;
 pub mod session;
 pub mod status;
+pub mod task_server;
 
 pub use cpu_budget::{
     CPU_TOKENS_OP, CpuBudgetStatus, CpuCheckoutStatus, CpuTokensRequest, JOBSERVER_OP,
@@ -40,6 +41,13 @@ pub use session::{
     validate_identifier,
 };
 pub use status::{DaemonStatus, SessionStatus, StartupHeal, SupervisorRecovery};
+
+pub use task_server::{
+    LeaseClass, TASK_ADMIT_OP, TASK_QUEUE_OP, TASK_TERMINAL_OP, TaskAdmitRequest, TaskBand,
+    TaskClass, TaskDepWait, TaskGrant, TaskLeaseStatus, TaskLeaseWait, TaskOutcome,
+    TaskQueueStatus, TaskReadyStatus, TaskRunCaps, TaskRunningStatus, TaskTerminalRequest,
+    TaskWaitingStatus,
+};
 
 use std::path::{Path, PathBuf};
 

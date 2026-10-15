@@ -569,6 +569,60 @@ cases, the `want` it sends, and the variables it sets or leaves on each path); a
 foreground grant demotes a running normal job's band and restores it when the foreground job leaves, and an
 opportunistic job admitted in the background band never holds a foreground job's cores.
 
+## The task server schedules work units
+
+Work units admit to the gateway with the facts of their plan — the units they depend on, the owner that runs them, the
+CPU they would use, the serialization windows they hold — and a deterministic scheduler alone decides which ready unit
+runs next. The order derives from the logged facts and the host observations; no operator assignment and no model output
+chooses which ready unit acquires a lease. Strong models propose task boundaries and interfaces; they do not schedule.
+
+- **The order.** Aged waiters first: a unit that has waited the configured age bound outranks fresh priority and runs
+  among the aged in the order they waited, so a stream of fresh urgent work can never starve a queued unit. Then the
+  class band — gate-class work at parity, background-class work demoted behind it while the host is busy (gate work live
+  or no free CPU token) and run at parity when it is not — then the coordinator's `urgent` override, the unit's leverage
+  (the distinct units transitively depending on it), the cache-domain deadline (known deadlines first, soonest first; an
+  unknown deadline sorts behind known ones and is never invented), resource fit (the predicted cost against the free CPU
+  tokens, unknown last), and finally the stable unit id. The schedule is recomputed at every event and at the oldest
+  waiter's age bound; the same facts always produce the same order.
+- **Ownership.** A unit keeps exactly one live attempt: its admission connection is the attempt, held like a CPU-token
+  stake. A second admission of a live unit is refused. A connection that closes without a terminal outcome abandons its
+  attempt, and a delayed holder of a settled attempt can never advance a newer one.
+- **Serialization classes.** A granted run holds its declared classes from its selection until its terminal fact:
+  `cowshed-new` (one `cowshed new` on the host at a time), `image` (a workspace-image mutation window), and
+  `land-publication` (the checked land-authority transition). `land-publication` is a publication fence — it serializes
+  publication only, never a whole-host CPU grant: gate coordinator groups run concurrently in one CPU class and order.
+  Lands queue for the fence in one order — the first claimant in admission order, behind older aged waiters — so an
+  urgent land waits its turn and never overtakes an older claimant. These classes bound the windows the operator keeps
+  by hand today; the disk-lifecycle lease above still spaces every disk command, and the CPU budget below still bounds
+  every runner. A lease-blocked unit holds up nothing beside it.
+- **Caps and bands.** A unit may declare its own parallelism ceiling — the caps its run kind applies to itself
+  (`nx parallel`, `CARGO_BUILD_JOBS`, `--test-threads`) — and the grant reports that ceiling clamped to the CPU tokens
+  it holds, so a run's own parallelism never exceeds its grant. The grant is the only allocation authority and leaf
+  controls derive from it, never from a static profile. The grant also names the run's band: the land turn's holder
+  foreground, gate-class work normal, and demoted background work in the background band until the host quiets.
+  Placement is server-owned; no caller flag raises a band or widens a ceiling.
+- **The CPU budget stays the only allocator.** On selection the scheduler submits the unit's CPU ask to the budget
+  above, in selection order, and the grant reports the tokens the budget gave it. The scheduler holds no token counter:
+  its capacity view folds the budget's own ledger, a capacity observation never mints a grant, and what cannot be
+  observed stays unknown rather than becoming headroom.
+- **Wire.** `task-admit` is held exactly like `cpu-tokens` —
+  `{"op":"task-admit","unit":…,"owner":…,"incarnation": …,"deps":[…],"leases":[…],"want":<n>,"priority":<u32>,"urgent":true,"class":"background","cost":<u64>,"deadline": <epoch-ms>,"command":…}`
+  — answered `queued` at once and a granted `taskGrant` (`unit`, `band`, `caps`, `cpuTokens`) when the scheduler selects
+  it. `task-terminal` is one-shot — `{"op":"task-terminal","unit":…, "outcome":"landed"|"failed"|"abandoned"}` — the
+  fact every dependent reads and the release of the unit's classes and CPU grant; its decision log names the owner and
+  workspace incarnation the lifecycle receipts bind to. `task-queue` is one-shot and answers `taskQueue`: the ready
+  units in selection order (with any lease class they find full and who holds it), the waiting units with each
+  dependency's outcome, the running units with their leases, granted tokens and caps, each class's places and holders,
+  and the CPU ledger as an observation.
+- **Decisions are logged facts.** Every selection and terminal fact is written to the `task-server` timing stream, and
+  `task-queue` reports the live fold; nothing in the scheduler is a second authority over the plan.
+
+Tests: the scheduler's own regressions pin the policy without an agent in the loop — the exact order over a crafted fact
+set, the same order from the same facts however they arrive, a low-priority unit selected at its age bound under a
+stream of fresher urgent arrivals, the serial classes with the urgent land behind a turn in progress, one live attempt
+per unit, and the caps applied and clamped to the grant — plus `tests/task_server.rs` over a real control socket: units
+admitted and advanced by their terminal facts alone, with the caps and the queue view read off the wire.
+
 ## Credentials
 
 - Secrets use macOS Keychain generic passwords under service `dev.cowshed.gateway`; Linux runner credentials use the
