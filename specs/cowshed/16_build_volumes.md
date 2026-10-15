@@ -941,20 +941,41 @@ error text). A refused runtime/hash pass reports unresolved tasks and its diagno
 distinguishes runtime commands admitted to the hash pass from tasks excluded before it.
 
 Each current hash is looked up in both candidates' successful `cache_outputs` rows, with its cache directory present.
-The report distinguishes `HIT_BOTH`, `HIT_OWN`, `HIT_MAIN`, `MISS_BOTH` and `UNRESOLVED`. A keyless task retains
-`UNRESOLVED` classification and its reason, but its candidate costs use explicit `ASSUMED_MISS` statuses, labelled
-"unpriced key, worst case: misses in both". No hash or actual cache result is invented. A task's weight is the
-arithmetic mean of successful uncached `task_history` execution seconds joined to `task_details` by hash and grouped by
-task identity, not exact current hash. Cache replays and failed/stopped attempts are excluded. A UNION-equivalent tuple
-of identity, hash, start and end de-duplicates histories inherited by cloning; sample count and min/max accompany every
-mean.
+The report distinguishes `HIT_BOTH`, `HIT_OWN`, `HIT_MAIN`, `MISS_BOTH` and `UNRESOLVED`. A current key is
+tree/output-dependent, not candidate-dependent: a historical cached identity is not proof of a current HIT. The
+dependency-output rule in Nx's `hash-task.js` defers hashing until dependency outputs are current. Exact deferred HIT
+assessment would require materializing the current dependency artifacts in scratch, a build-output operation rather than
+a database lookup. The advisor deliberately does not perform that materialization or hash stale outputs.
 
-Totals sum weighted misses for own and main and report `own - main` in serial task-seconds, not future gate wall time.
-Every keyless task with a duration contributes its own historical mean as an assumed miss in both candidates, including
-deferred tasks, omitted hooks and refused runtime inputs. `totals.keylessWorstCaseSeconds` gives that common term once
-(it is included in each candidate's total); `weightedKeylessTasks` counts its tasks. Each candidate's
-`MeasuredMissWorkSeconds` term reports only weighted misses established by current-key lookups. The difference is
-computed from those measured terms so the common assumption cancels without floating-point loss.
+Each candidate is assessed separately. A keyless stock-Nx task with no successful cached identity entry is a definite
+MISS in that candidate, whatever its eventual current key is. A keyless task with historical successful entries is
+UNKNOWN in that candidate, never an invented HIT. Missing identity metadata also prevents an absence proof.
+`assessment.own` and `assessment.main` give each verdict, basis and reason; an UNKNOWN is priced as `ASSUMED_MISS` only
+on that side. The task's key remains unresolved, with no invented hash. When both candidates are UNKNOWN, the explicit
+label is "unpriced key, worst case: misses in both". Custom hashers are the narrow qualification: Nx accepts their
+returned value directly, without requiring task identity in the key, so identity absence proves nothing and they stay
+UNKNOWN unless an exact current key is available. The gate's `@smoothbricks/codebase:cargo-test-archive` and
+`cowshed:declaration-model-test` use stock Nx hashing, so the identity-absence proof applies to both; their
+dependency-output deferral does not make them custom hashers.
+
+A task's weight is the arithmetic mean of successful uncached `task_history` execution seconds joined to `task_details`
+by hash and grouped by task identity, not exact current hash. Cache replays and failed/stopped attempts are excluded. A
+UNION-equivalent tuple of identity, hash, start and end de-duplicates histories inherited by cloning; sample count and
+min/max accompany every mean.
+
+For each candidate, rebuild work is the sum of each determined or conservatively assumed miss times that task's mean
+duration. Counts do not decide: two short misses can cost less than one long miss. Report both totals and `own - main`,
+in serial task-seconds, not future gate wall time. Each candidate's `MeasuredMissWorkSeconds` term contains determined
+misses (a current-key lookup or an identity-absence proof); `AssumedMissWorkSeconds` contains its UNKNOWN weights.
+`assumedDifferenceSeconds` reports the assumed portion of the difference. `keylessWorstCaseSeconds` separately gives the
+common term for tasks UNKNOWN in both candidates, included in each total; `weightedKeylessTasks` counts those tasks.
+
+Holding the historical mean weights fixed, the cache-uncertainty interval for the difference is
+`[determinedDifference - mainUnknownWeight, determinedDifference + ownUnknownWeight]`. Report both directional swings
+and their maximum as `totals.differenceRange`, not a falsely precise point verdict. Even a common worst-case term that
+cancels in the point estimate can swing the difference in either direction: UNKNOWN does not mean the actual outcomes
+must match. The interval covers weighted tasks only when duration coverage is incomplete; it does not bound execution
+variance. An interval spanning zero is still a usable time comparison, not a reason to fall back to space.
 
 Tasks without a duration remain explicitly unpriced, never silently free; `totals.complete` records whether every
 selected task has a usable weight, including worst-case weights for keyless tasks. Coverage reports all cacheable

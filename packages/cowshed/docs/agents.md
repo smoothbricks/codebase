@@ -112,9 +112,18 @@ normal coordinator rather than widening authority silently.
 The one JSON report includes per-task keys, independent own/main HIT/MISS, exclusive hit classes, mean miss weights with
 sample count and min/max, coverage, unresolved reasons, serial task-second totals and probe wall time. Positive
 `totals.ownMinusMainSeconds` means main has less estimated missing work. These are historical means, not gate elapsed
-time. Keyless tasks retain their unresolved reason and are labelled "unpriced key, worst case: misses in both", with
-their historical mean charged equally to both candidates as `ASSUMED_MISS`. `totals.keylessWorstCaseSeconds` reports the
-common assumed contribution separately from each candidate's measured miss work.
+time. A current key depends on the tree and current dependency outputs, not the candidate. A historical entry does not
+prove a HIT. For a keyless stock-Nx task, no successful cached identity entry proves a MISS in that candidate;
+historical entries instead mean UNKNOWN there. The report retains the unresolved key and gives each candidate's
+assessment separately. Only UNKNOWN outcomes are conservatively priced as `ASSUMED_MISS`.
+
+Both rebuild-work totals include their own determined and assumed misses. `ownAssumedMissWorkSeconds` and
+`mainAssumedMissWorkSeconds` name the assumed contributions; `keylessWorstCaseSeconds` identifies the common term when
+both candidates are UNKNOWN. Read `totals.differenceRange` alongside the point difference: a common assumed term can
+cancel in the point estimate but still swing the true difference in either direction. The range holds historical means
+fixed, excludes unpriced tasks when coverage is incomplete, and does not bound execution variance. Exact deferred HITs
+would require materializing current dependency artifacts in scratch; this advisor does not do so. Custom hashers can
+return keys unrelated to identity, so identity absence cannot prove a miss for them.
 
 A time decision remains available with unresolved keys or partial duration coverage, provided the candidate observations
 are usable, an Nx cache exists and at least one selected task has a duration sample. `totals.complete` records full

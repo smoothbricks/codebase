@@ -135,10 +135,13 @@ test('real Nx: no candidate writes or daemon stop; asymmetric hits, deferred ide
     seed(ownDb, b, [2, 4], false);
     seed(mainDb, b, [2, 4], true);
     seed(ownDb, c, [7], false);
-    seed(ownDb, { ...byId['fixture:deferred'], hash: '123456789012345' }, [2, 14], false);
+    seed(ownDb, { ...byId['fixture:deferred'], hash: '123456789012345' }, [2, 14], true);
     seed(ownDb, { ...byId['fixture:runtime'], hash: '123456789012346' }, [6], false);
+    seed(mainDb, { ...byId['fixture:runtime'], hash: '123456789012346' }, [6], true);
     fs.mkdirSync(path.join(workspace, '.nx/cache', a.hash));
     fs.mkdirSync(path.join(main, '.nx/cache', b.hash));
+    fs.mkdirSync(path.join(workspace, '.nx/cache/123456789012345'));
+    fs.mkdirSync(path.join(main, '.nx/cache/123456789012346'));
     const beforeOwn = snapshot(path.join(workspace, '.nx'));
     const beforeMain = snapshot(path.join(main, '.nx'));
     const result = run(options);
@@ -147,10 +150,21 @@ test('real Nx: no candidate writes or daemon stop; asymmetric hits, deferred ide
     assert.equal(rows['fixture:main'].classification, 'HIT_MAIN');
     assert.equal(rows['fixture:missing'].classification, 'MISS_BOTH');
     assert.deepEqual(rows['fixture:own'].weight, { meanSeconds: 4, samples: 3, minSeconds: 1, maxSeconds: 10 });
-    assert.equal(result.totals.ownMeasuredMissWorkSeconds, 10);
-    assert.equal(result.totals.mainMeasuredMissWorkSeconds, 11);
-    assert.equal(result.totals.keylessWorstCaseSeconds, 14);
-    assert.equal(result.totals.weightedKeylessTasks, 2);
+    assert.equal(result.totals.ownMeasuredMissWorkSeconds, 16);
+    assert.equal(result.totals.mainMeasuredMissWorkSeconds, 19);
+    assert.equal(result.totals.ownAssumedMissWorkSeconds, 8);
+    assert.equal(result.totals.mainAssumedMissWorkSeconds, 6);
+    assert.equal(result.totals.assumedDifferenceSeconds, 2);
+    assert.equal(result.totals.keylessWorstCaseSeconds, 0);
+    assert.equal(result.totals.weightedKeylessTasks, 0);
+    assert.deepEqual(result.totals.differenceRange, {
+      minSeconds: -9,
+      maxSeconds: 5,
+      downwardSwingSeconds: 8,
+      upwardSwingSeconds: 6,
+      maxSwingSeconds: 8,
+      scope: 'all selected tasks',
+    });
     assert.equal(result.totals.ownMissWorkSeconds, 24);
     assert.equal(result.totals.mainMissWorkSeconds, 25);
     assert.equal(result.totals.ownMinusMainSeconds, -1);
@@ -158,10 +172,15 @@ test('real Nx: no candidate writes or daemon stop; asymmetric hits, deferred ide
     assert.equal(result.coverage.resolvedWithDuration, 3);
     assert.equal(rows['fixture:deferred'].classification, 'UNRESOLVED');
     assert.equal(rows['fixture:deferred'].own, 'ASSUMED_MISS');
-    assert.equal(rows['fixture:deferred'].main, 'ASSUMED_MISS');
+    assert.equal(rows['fixture:deferred'].main, 'MISS');
+    assert.equal(rows['fixture:deferred'].assessment.own.status, 'UNKNOWN');
+    assert.equal(rows['fixture:deferred'].assessment.main.basis, 'identity-absence');
+    assert.equal(rows['fixture:runtime'].assessment.own.basis, 'identity-absence');
+    assert.equal(rows['fixture:runtime'].assessment.main.status, 'UNKNOWN');
     assert.deepEqual(rows['fixture:deferred'].cost, {
-      basis: 'worst-case-keyless',
-      label: 'unpriced key, worst case: misses in both',
+      ownAssumed: true,
+      mainAssumed: false,
+      label: 'unpriced key in own, worst case: miss in own',
       ownSeconds: 8,
       mainSeconds: 8,
     });
@@ -245,6 +264,33 @@ test('private snapshot includes live WAL-only commits without touching candidate
     const priced = summarize(selection, observed, observed);
     assert.equal(priced.decision.basis, 'time');
     assert.equal(priced.decision.workScoreSeconds, 0);
+    const keyless = { tasks: [{ ...selection.tasks[0], hash: null, reason: 'deferred dependency outputs' }] };
+    const bothUnknown = summarize(keyless, observed, observed);
+    assert.equal(bothUnknown.totals.keylessWorstCaseSeconds, 7);
+    assert.equal(bothUnknown.totals.ownMissWorkSeconds, 7);
+    assert.equal(bothUnknown.totals.mainMissWorkSeconds, 7);
+    assert.equal(bothUnknown.totals.assumedDifferenceSeconds, 0);
+    assert.equal(bothUnknown.totals.differenceRange.minSeconds, -7);
+    assert.equal(bothUnknown.totals.differenceRange.maxSeconds, 7);
+    assert.match(bothUnknown.tasks[0].cost.label, /worst case: misses in both/);
+    assert.equal(bothUnknown.tasks[0].assessment.own.status, 'UNKNOWN', 'historical identity is not a HIT');
+    const empty = { ...observed, hashes: new Set(), cachedIdentities: new Map() };
+    const asymmetric = summarize(keyless, empty, observed);
+    assert.equal(asymmetric.tasks[0].assessment.own.status, 'MISS');
+    assert.equal(asymmetric.tasks[0].assessment.main.status, 'UNKNOWN');
+    assert.equal(asymmetric.totals.ownAssumedMissWorkSeconds, 0);
+    assert.equal(asymmetric.totals.mainAssumedMissWorkSeconds, 7);
+    assert.equal(asymmetric.totals.differenceRange.minSeconds, 0);
+    assert.equal(asymmetric.totals.differenceRange.maxSeconds, 7);
+    const missingMetadata = summarize(keyless, { ...empty, identityInventoryComplete: false }, observed);
+    assert.equal(missingMetadata.tasks[0].assessment.own.status, 'UNKNOWN');
+    assert.match(missingMetadata.tasks[0].assessment.own.reason, /lack identity metadata/);
+    const custom = { tasks: [{ ...keyless.tasks[0], hashMode: 'custom' }] };
+    const customUnknown = summarize(custom, empty, observed);
+    assert.equal(customUnknown.tasks[0].assessment.own.status, 'UNKNOWN');
+    assert.equal(customUnknown.tasks[0].assessment.own.basis, 'custom-key-unavailable');
+    const customKeyKnown = summarize({ tasks: [{ ...selection.tasks[0], hashMode: 'custom' }] }, empty, observed);
+    assert.equal(customKeyKnown.tasks[0].assessment.main.status, 'HIT');
     const unavailable = { root, databases: [], hashes: null, samples: [], error: 'busy: fixture WAL changed' };
     const refused = summarize(selection, unavailable, observed);
     assert.equal(refused.decision.basis, 'space');
@@ -282,6 +328,32 @@ test('private snapshot includes live WAL-only commits without touching candidate
     db.close();
     fs.rmSync(temp, { recursive: true, force: true });
   }
+});
+
+test('candidate rebuild work is duration-weighted, not decided by miss counts', () => {
+  const tasks = [
+    ['slow', '900'],
+    ['fast-a', '901'],
+    ['fast-b', '902'],
+  ].map(([target, hash]) => ({
+    id: `fixture:${target}`,
+    project: 'fixture',
+    target,
+    configuration: null,
+    hash,
+    reason: null,
+  }));
+  const samples = tasks.map((task, i) => ({ ...task, start: 0, end: i === 0 ? 300000 : 30000 }));
+  const own = { hashes: new Set(['901', '902']), samples };
+  const main = { hashes: new Set(['900']), samples };
+  const report = summarize({ tasks }, own, main);
+  assert.equal(report.classes.HIT_OWN, 2);
+  assert.equal(report.classes.HIT_MAIN, 1);
+  assert.equal(report.totals.ownMissWorkSeconds, 300);
+  assert.equal(report.totals.mainMissWorkSeconds, 60);
+  assert.equal(report.totals.ownMinusMainSeconds, 240);
+  assert.equal(report.totals.differenceRange.minSeconds, 240);
+  assert.equal(report.totals.differenceRange.maxSeconds, 240);
 });
 
 test('snapshot witness refuses changed, appeared and disappeared DB/WAL/journal files by name', () => {
