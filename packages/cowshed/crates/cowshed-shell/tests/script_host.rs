@@ -713,8 +713,9 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
 #[test]
 fn an_unreaped_zombie_is_exited_even_while_the_null_signal_reaches_it() {
     let child = std::process::Command::new("/bin/sh")
-        .args(["-c", "read -r _"])
+        .args(["-c", "printf r; read -r _"])
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .process_group(0)
         .spawn()
         .expect("owned pipe-held child");
@@ -727,6 +728,16 @@ fn an_unreaped_zombie_is_exited_even_while_the_null_signal_reaches_it() {
         .child
         .as_mut()
         .expect("the guard owns its direct child");
+    // Spawn returning is not executed-body readiness. Keep stdin held until
+    // the shell itself has reached the gate and the exit watch is registered.
+    let mut ready = [0];
+    child
+        .stdout
+        .take()
+        .expect("piped readiness")
+        .read_exact(&mut ready)
+        .expect("the shell reached its input gate");
+    assert_eq!(&ready, b"r", "the held shell's readiness byte");
     let birth = Birth::of(child.id());
     let members = cowshed_core::runtime::job_groups::job_members(&birth).expect("owned group");
     let retained = members
