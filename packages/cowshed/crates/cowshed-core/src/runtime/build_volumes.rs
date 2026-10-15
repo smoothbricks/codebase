@@ -4585,7 +4585,10 @@ mod tests {
             assert_ne!(seed, previous);
             assert_eq!(record.tree, Some(tree.clone()));
             assert!(!scratch.layout.image(&previous).exists());
-            assert_eq!(seeds_of(&scratch.layout, &target).unwrap(), [seed.clone()]);
+            assert_eq!(
+                seeds_of(&scratch.layout, &target).unwrap().as_slice(),
+                std::slice::from_ref(&seed)
+            );
             let fork = BuildVolumeId::mint();
             scratch
                 .host
