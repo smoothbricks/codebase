@@ -1410,6 +1410,10 @@ nx lint @smoothbricks/cli
 smoo monorepo validate
 ```
 
+The release-ref witness distinguishes a successful empty tag list from a failed Git read. Its negative control reads an
+unborn `HEAD` in an existing repository, so Git itself refuses the read; a missing working directory only proves that
+process startup failed.
+
 ## Links
 
 [are-the-types-wrong]: https://github.com/arethetypeswrong/arethetypeswrong.github.io/tree/main/packages/cli
