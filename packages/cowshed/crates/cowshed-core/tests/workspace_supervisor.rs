@@ -1274,12 +1274,10 @@ async fn exact_authority_and_session_identity_are_fenced() {
     let session = open_named(&h.handle, "build").await;
     let mut invalid = config(&root).sandbox;
     invalid.home = PathBuf::from("relative/home");
-    let refused = h
-        .handle
-        .advance_authority(8, 12, invalid)
-        .await
-        .err()
-        .expect("a non-absolute HOME must refuse profile rendering");
+    let refused = match h.handle.advance_authority(8, 12, invalid).await {
+        Ok(_) => panic!("a non-absolute HOME must refuse profile rendering"),
+        Err(error) => error,
+    };
     assert!(
         refused.message.contains("path is not absolute"),
         "{}",
