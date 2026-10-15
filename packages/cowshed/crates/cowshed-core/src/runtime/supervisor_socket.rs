@@ -1740,11 +1740,11 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
     let path = path.as_path();
     match command {
         Command::AdvanceAuthority { reply, .. } => {
-            // A served supervisor runs under the profile it was launched with and cannot widen
-            // it; a grant change drains it and launches another (11_shell.md).
+            // Only the serving runtime can rebuild the sandbox from controller-owned grants.
+            // Remote callers request that through the manager's advance exchange (11_shell.md).
             let _ = reply.send(Err(CowshedError::conflict(
-                "a workspace supervisor process cannot change its grant revision in place",
-                "drain the supervisor; the next command starts one under the new revision",
+                "a remote supervisor handle cannot install a grant snapshot",
+                "ensure the supervisor through its manager to re-read the controller-owned grants",
             )));
         }
         Command::OpenSession {

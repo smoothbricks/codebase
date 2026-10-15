@@ -1734,7 +1734,7 @@ export type ProjectGrants = {
   /**
    * Advanced by every change, never reset. A workspace's effective revision is its own plus
    * this one, so a project change reaches the gateway's strictly increasing session revision
-   * and relaunches every supervisor exactly as a workspace grant change does.
+   * and advances each supervisor's served revision just as a workspace grant change does.
    */
   readonly revision: number & tags.Type<'uint64'>;
   readonly read: ReadonlyArray<string>;

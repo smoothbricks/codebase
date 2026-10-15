@@ -4587,6 +4587,10 @@ impl SupervisorActor {
         }
         // Rendered here, once for the new authority; every job admitted under it shares it.
         let policy = SandboxPolicy::render(sandbox)?;
+        if authority != self.authority {
+            self.sessions.clear();
+            self.named_sessions.clear();
+        }
         self.authority = authority;
         self.policy = policy;
         Ok(())
