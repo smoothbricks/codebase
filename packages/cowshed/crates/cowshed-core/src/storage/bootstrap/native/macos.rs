@@ -7222,12 +7222,22 @@ mod tests {
                     && uuid == &volume_uuid("disk3s9")
                     && mounted_at == Path::new(RETIRED_CACHES_MOUNTPOINT)
         ));
+        assert!(matches!(
+            snapshot.volumes.as_slice(),
+            [volume] if volume.name == APFS_STORE_VOLUME && volume.role == VolumeRole::Store
+        ));
         assert!(
             snapshot
                 .volumes
                 .iter()
                 .all(|volume| volume.name != APFS_CACHES_VOLUME)
         );
+        assert!(matches!(
+            snapshot.classified.as_slice(),
+            [volume] if volume.name == APFS_STORE_VOLUME
+                && volume.volume_uuid == Some(volume_uuid("disk3s8"))
+                && volume.mountpoint == Path::new("/private/cowshed/store")
+        ));
         assert!(
             snapshot
                 .classified
@@ -7237,6 +7247,14 @@ mod tests {
         let PlannedFstab::NeedsPin(pins) = &snapshot.fstab else {
             panic!("{:?}", snapshot.fstab);
         };
+        assert_eq!(
+            pins.as_slice(),
+            &[FstabPin {
+                volume_uuid: volume_uuid("disk3s8"),
+                mountpoint: PathBuf::from("/private/cowshed/store"),
+                label: APFS_STORE_VOLUME.to_owned(),
+            }]
+        );
         assert!(pins.iter().all(|pin| pin.label == APFS_STORE_VOLUME));
         assert!(setup_requires_authorization(&snapshot));
         let public_plan = HostSetupPlan::new(
@@ -7341,6 +7359,13 @@ mod tests {
         let action_host: Arc<dyn BootstrapHost> = Arc::new(ReadOnlyValidationHost::default());
         let (outcomes, failure) = execute_snapshot_actions(&snapshot, action_host).await;
         assert!(failure.is_none());
+        assert!(
+            outcomes
+                .iter()
+                .map(|outcome| &outcome.action)
+                .eq(snapshot.actions.iter()),
+            "each planned fstab pin must have its outcome in order: {outcomes:?}"
+        );
         assert!(
             outcomes
                 .iter()

@@ -46,7 +46,10 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Marker files**: round-trip, unknown-version rejection, role transitions (fork/restore).
 - **CLI/error contract**: stdout shape per command, all `CowshedError` mappings including `Integrity` → own exit 7,
   exec-wrapper 106, MCP -32006, and `next:` hints. A child 7 still passes through unchanged. Golden tests make any
-  taxonomy/shape change explicitly breaking.
+  taxonomy/shape change explicitly breaking. Wire-corpus acceptance also widens each object document, including each
+  object in a list, and requires both generated assertion and parsing to refuse the extra field. Bootstrap tests require
+  the retained Store identity, exact fstab pin and complete action-outcome roster before universal predicates. Mirror
+  audit tests pin each decision's kind, status, workspace and safe path before checking credential redaction.
 - **Env wiring**: exec env allowlist filtering (no `*_TOKEN`/`*_SECRET`/`AWS_*` pass-through), cache exports match
   03_caches.md exactly.
 - **Repository Cargo warmth**: warm the real repository's own config in a managed shell, fork its source/build images to

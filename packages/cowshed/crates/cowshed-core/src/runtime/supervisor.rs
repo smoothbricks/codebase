@@ -7829,16 +7829,24 @@ mod process_death_tests {
         // exited leader still holds its id, so the group is still the job's.
         // SAFETY: the unreaped test child.
         unsafe { libc::kill(pgid, libc::SIGKILL) };
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        fence
+            .exited()
+            .await
+            .expect("the leader exited but remains unreaped");
         fence
             .signal(0)
             .expect("an exited, unreaped leader's group is the job's");
 
         let done = Arc::new(AtomicBool::new(false));
+        let (observed, observation) = oneshot::channel();
         let signaller = {
             let (fence, done) = (Arc::clone(&fence), Arc::clone(&done));
             std::thread::spawn(move || {
-                let mut outcomes = Vec::new();
+                let initial = fence.signal(0).is_ok();
+                let mut outcomes = vec![initial];
+                observed
+                    .send(initial)
+                    .expect("the reaper waits for the signaller");
                 while !done.load(Ordering::SeqCst) {
                     outcomes.push(fence.signal(0).is_ok());
                 }
@@ -7846,6 +7854,12 @@ mod process_death_tests {
                 outcomes
             })
         };
+        assert!(
+            observation
+                .await
+                .expect("the signaller reports before reap"),
+            "the concurrent signaller must succeed before the leader is reaped"
+        );
         let status = fence.wait().await.unwrap();
         // The fence, not std's handle, owns waitpid. A second reaper must find no child left.
         assert_eq!(job.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
