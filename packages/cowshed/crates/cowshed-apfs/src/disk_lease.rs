@@ -955,6 +955,7 @@ mod tests {
             let refused = leased(
                 Path::new(program),
                 &[verb, "/dev/disk3s5", "[cowshed] fixture · dispatch — main"],
+                None,
                 || -> io::Result<()> { panic!("{program} {verb} ran") },
             )
             .expect_err("a Disk Arbitration rename is refused");
