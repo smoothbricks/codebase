@@ -345,7 +345,7 @@ mod tests {
         let fork = command_named("fork").unwrap();
         assert_eq!(
             fork.usage(),
-            "fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree]"
+            "fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree] [--markdown-only]"
         );
         assert_eq!(fork.hint(), format!("cowshed {}", fork.usage()));
 

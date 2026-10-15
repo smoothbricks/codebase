@@ -718,6 +718,7 @@ fn cli_command() -> ClapCommand {
                     value("slot"),
                     flag("register"),
                     flag("git-worktree"),
+                    flag("markdown-only"),
                 ]),
         )
         .subcommand(
@@ -1887,11 +1888,21 @@ const FORK: CommandSpec = CommandSpec {
             spelling: "--git-worktree",
             meaning: "share main's object store through a clone-owned linked-worktree registration",
         },
+        Opt {
+            spelling: "--markdown-only",
+            meaning: "pure-Markdown edit disjoint from code: refuse to mint a shed and edit in place",
+        },
     ],
 };
 
 fn parse_fork(matches: &ArgMatches) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &FORK;
+    if flagged(matches, "markdown-only") {
+        return Err(UsageError::new(
+            "pure-Markdown edit disjoint from code edits in place — no shed minted (drop --markdown-only to mint a workspace)",
+            USAGE,
+        ));
+    }
     let mut workspaces = matches
         .get_many::<OsString>("workspaces")
         .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
@@ -4406,7 +4417,7 @@ mod tests {
         assert_eq!(error.message, "unknown flag `--unknown`");
         assert_eq!(
             error.hint,
-            "cowshed fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree]"
+            "cowshed fork [<src>] <ws> [--clean] [--ref <rev>] [--browse] [--slot <n>] [--register] [--git-worktree] [--markdown-only]"
         );
 
         for spec in COMMANDS {
