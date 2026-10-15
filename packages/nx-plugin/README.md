@@ -101,6 +101,10 @@ On macOS the working-directory holder census invokes `/usr/sbin/lsof` explicitly
 `PATH`. A missing or inaccessible census tool fails cleanup with its command error; it never means no holders. Only
 lsof's exit-1 process-disappearance race retains the partial inventory it produced.
 
+The provider-real-Nx snapshot walk uses asynchronous children so its case timer can run while a producer or capture is
+active. Its 60 s case guard covers one provider, daemon lifecycle and all provenance/refusal checks; it does not split
+those checks into separately rebuilt fixtures.
+
 ## Cargo Workspace Layouts
 
 The plugin discovers Cargo workspaces beside Nx project manifests at any depth:

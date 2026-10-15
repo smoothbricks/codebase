@@ -3,7 +3,6 @@
 // against a provider workspace that real Nx built and cached. No receipt is injected: the hit, the task hash, HEAD
 // and every output byte come from the provider's own Nx, and a provider Nx cannot vouch for is refused unwritten.
 import { describe, expect, it } from 'bun:test';
-import { spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -44,11 +43,21 @@ interface Captured {
   } | null;
 }
 
-function git(workspace: string, ...args: string[]): string {
-  const run = spawnSync(
+async function execute(file: string, args: string[], cwd: string, env = process.env) {
+  const child = Bun.spawn([file, ...args], { cwd, env, stdout: 'pipe', stderr: 'pipe' });
+  const [status, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { status, stdout, stderr };
+}
+
+async function git(workspace: string, ...args: string[]): Promise<string> {
+  const run = await execute(
     'git',
     ['-C', workspace, '-c', 'user.name=Snapshot fixture', '-c', 'user.email=fixture@example.invalid', ...args],
-    { encoding: 'utf8' },
+    workspace,
   );
   expect(run.status, run.stdout + run.stderr).toBe(0);
   return run.stdout.trim();
@@ -56,7 +65,7 @@ function git(workspace: string, ...args: string[]): string {
 
 /** A provider Nx workspace whose `linked-api:build` copies its source into `dist`, committed. */
 async function writeProvider(workspace: string): Promise<string> {
-  git(workspace, 'init', '--quiet');
+  await git(workspace, 'init', '--quiet');
   await writeFile(join(workspace, '.gitignore'), '.nx\nnode_modules\npackages/*/dist\n');
   // The repository's own node_modules, so the fixture resolves the Nx this package is written against.
   await symlink(join(repoRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
@@ -93,8 +102,8 @@ async function writeProvider(workspace: string): Promise<string> {
     }),
   );
   await writeFile(join(api, 'src/index.js'), 'export const value = "first";\n');
-  git(workspace, 'add', '-A');
-  git(workspace, 'commit', '-qm', 'provider');
+  await git(workspace, 'add', '-A');
+  await git(workspace, 'commit', '-qm', 'provider');
   return api;
 }
 
@@ -105,11 +114,12 @@ describe('linked snapshots vouched for by the provider’s real Nx', () => {
       await withNxFixture('linked-snapshot-', async ({ workspace, socketDirectory }) => {
         const source = await writeProvider(workspace);
         const daemonless = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'false' };
-        const built = spawnSync('node', [nxEntry, 'run', 'linked-api:build', '--outputStyle=static'], {
-          cwd: workspace,
-          env: daemonless,
-          encoding: 'utf8',
-        });
+        const built = await execute(
+          'node',
+          [nxEntry, 'run', 'linked-api:build', '--outputStyle=static'],
+          workspace,
+          daemonless,
+        );
         expect(built.status, built.stdout + built.stderr).toBe(0);
 
         // The consumer installs this package's built plugin product, as a workspace installs @smoothbricks/nx-plugin.
@@ -117,41 +127,38 @@ describe('linked snapshots vouched for by the provider’s real Nx', () => {
         await writeFile(join(consumer, 'package.json'), JSON.stringify({ name: 'consumer', private: true }));
         await symlink(packageRoot, join(consumer, 'node_modules/@smoothbricks/nx-plugin'), 'dir');
         const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
-        const capture = (): Captured => {
-          const run = spawnSync(
+        const capture = async (): Promise<Captured> => {
+          const run = await execute(
             process.execPath,
             ['-e', CAPTURE, SNAPSHOTS, JSON.stringify([consumer, source, DECLARATION])],
-            {
-              cwd: consumer,
-              env,
-              encoding: 'utf8',
-            },
+            consumer,
+            env,
           );
           expect(run.status, run.stderr).toBe(0);
           return typia.json.assertParse<Captured>(run.stdout);
         };
 
-        const first = capture();
+        const first = await capture();
         expect(first.binding.kind, first.binding.reason).toBe('snapshot');
-        expect(first.receipt?.provenance.head).toBe(git(workspace, 'rev-parse', 'HEAD'));
-        expect(first.receipt?.provenance.headTree).toBe(git(workspace, 'rev-parse', 'HEAD^{tree}'));
+        expect(first.receipt?.provenance.head).toBe(await git(workspace, 'rev-parse', 'HEAD'));
+        expect(first.receipt?.provenance.headTree).toBe(await git(workspace, 'rev-parse', 'HEAD^{tree}'));
         expect(first.receipt?.provenance.tasks.map(({ id }) => id)).toContain('linked-api:build');
         expect(await readFile(join(first.binding.directory ?? '', 'dist/index.js'), 'utf8')).toBe(
           'export const value = "first";\n',
         );
 
         // The same bytes under another commit are another snapshot with another provenance.
-        git(workspace, 'commit', '-qm', 'same tree', '--allow-empty');
-        const second = capture();
+        await git(workspace, 'commit', '-qm', 'same tree', '--allow-empty');
+        const second = await capture();
         expect(second.binding.kind, second.binding.reason).toBe('snapshot');
         expect(second.binding.id).not.toBe(first.binding.id);
-        expect(second.receipt?.provenance.head).toBe(git(workspace, 'rev-parse', 'HEAD'));
+        expect(second.receipt?.provenance.head).toBe(await git(workspace, 'rev-parse', 'HEAD'));
 
         // Output the producer did not record: refused as not current, and the provider's dist is left as it was.
         const output = join(source, 'dist/index.js');
         await writeFile(output, 'export const value = "tampered";\n');
         const before = await stat(output, { bigint: true });
-        const stale = capture();
+        const stale = await capture();
         expect(stale.binding.kind).toBe('refused');
         expect(stale.binding.reason).toContain('is not current');
         const after = await stat(output, { bigint: true });
@@ -161,5 +168,5 @@ describe('linked snapshots vouched for by the provider’s real Nx', () => {
     } finally {
       await rm(consumer, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 });
