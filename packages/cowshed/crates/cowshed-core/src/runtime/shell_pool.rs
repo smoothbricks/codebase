@@ -662,7 +662,6 @@ mod tests {
     use super::*;
     use crate::runtime::shell_watch::{EvaluationClock, FsInstant, FsSeparation, WatchEntry};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
 
     /// Hosts are numbers; each activation records the fixture's input files.
     struct Fixture {
@@ -847,11 +846,16 @@ mod tests {
         assert_eq!(command(&pool).await, (2, false));
         assert!(settle(&pool).await.spare);
         assert_eq!(fixture.activations.load(Ordering::SeqCst), 3);
-        drop(first);
-
         std::fs::write(&fixture.inputs[0], b"edited").unwrap();
-        // The event alone activates nothing.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Returning the held host drains kernel events, without the acquire-time stat backstop.
+        drop(first);
+        let inspection = pool.inspect().await;
+        assert!(
+            inspection.dirty,
+            "the watched edit was processed before sampling activation count"
+        );
+        assert!(!inspection.warming, "the event starts no spare activation");
+        // The processed event alone activates nothing.
         assert_eq!(fixture.activations.load(Ordering::SeqCst), 3);
         assert_eq!(
             command(&pool).await,

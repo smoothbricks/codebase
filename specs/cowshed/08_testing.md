@@ -430,6 +430,10 @@ Re-executed libtest fixture roles that report a line protocol use `--nocapture -
 waiting for a report at the start of a line then waits forever. Quiet formatting preserves the CPU grant and the exact
 report parser. The held-parent CPU and listening-group regressions must also pass under a one-token runner.
 
+Disk-child warning tests release an owned child after observing the required warnings rather than assuming a wall-clock
+sleep gave the waiter enough turns. Shell-pool tests observe release-time dirty-event processing before asserting that
+no replacement warmed without demand.
+
 **A real-APFS test's class is on its code time.** Every disk command a test's process tree runs first queues for the
 host-wide disk-lifecycle lease (05_gateway.md, "Disk-lifecycle lease") behind every other cowshed process on the host:
 the same warm-fork walk took 37-70s on a loaded host with 0.2-28s of it spent waiting for grants, against a 25s run when
