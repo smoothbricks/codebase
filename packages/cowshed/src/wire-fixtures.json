@@ -79,18 +79,24 @@
           "bytes": 8192,
           "identity": "ca358758f6d27e6cf45272937977a748fd88391db679ceda7dc7bf1f005ee879",
           "path": "/Users/fixture/Dev/.cowshed/gc/7",
-          "reason": "unlinkedBuildVolume"
+          "reason": "abandonedBundle"
         },
         {
           "bytes": 9216,
           "identity": "beead77994cf573341ec17b58bbf7eb34d2711c993c1d976b128b3188dc1829a",
           "path": "/Users/fixture/Dev/.cowshed/gc/8",
-          "reason": "supersededSeed"
+          "reason": "unlinkedBuildVolume"
         },
         {
           "bytes": 10240,
           "identity": "2b4c342f5433ebe591a1da77e013d1b72475562d48578dca8b84bac6651c3cb9",
           "path": "/Users/fixture/Dev/.cowshed/gc/9",
+          "reason": "supersededSeed"
+        },
+        {
+          "bytes": 11264,
+          "identity": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+          "path": "/Users/fixture/Dev/.cowshed/gc/10",
           "reason": "unrecordedBuildVolume"
         }
       ],
