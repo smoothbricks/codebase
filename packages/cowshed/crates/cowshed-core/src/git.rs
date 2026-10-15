@@ -4520,6 +4520,18 @@ mod tests {
                 git(&main, &["add", "."]);
                 git(&main, &["commit", "-qm", "warm baseline"]);
                 let baseline = git_stdout(&main, &["rev-parse", "HEAD"]).trim().to_owned();
+                // Main moves past the baseline, so `--ref <baseline>` names a commit that is not the
+                // source's HEAD in any fixture: a mint that ignored the ref would otherwise pass
+                // whenever the two are the same commit.
+                fs::write(main.join("README"), "main moved on\n").unwrap();
+                git(&main, &["commit", "-qam", "main moves past the baseline"]);
+                // What `repository()` committed, and what the source's HEAD holds.
+                let baseline_readme = "test\n";
+                let committed_readme = if session {
+                    "session committed\n"
+                } else {
+                    "main moved on\n"
+                };
                 let sibling = main.with_extension("source");
                 let source = if session {
                     if linked {
@@ -4558,6 +4570,11 @@ mod tests {
                 let branch = git_stdout(source, &["branch", "--show-current"]);
                 let status = git_stdout(source, &["status", "--porcelain"]);
                 let head = git_stdout(source, &["rev-parse", "HEAD"]);
+                assert_ne!(
+                    head.trim(),
+                    baseline,
+                    "the ref must differ from the source's HEAD for the ref cells to discriminate"
+                );
                 let index_path = git_stdout(source, &["rev-parse", "--git-path", "index"]);
                 let index_path = source.join(index_path.trim());
                 let index = fs::read(&index_path).unwrap();
@@ -4593,7 +4610,8 @@ mod tests {
                     );
                     assert_eq!(
                         git_stdout(&clone, &["rev-parse", "HEAD"]).trim(),
-                        start.unwrap_or(head.trim())
+                        start.unwrap_or(head.trim()),
+                        "{name}: HEAD is the ref, or the source's head when none is given"
                     );
                     assert_eq!(
                         fs::read_to_string(clone.join("ignored/warm")).unwrap(),
@@ -4616,6 +4634,17 @@ mod tests {
                         );
                     } else {
                         assert_eq!(git_stdout(&clone, &["status", "--porcelain"]), "");
+                        // The files are the selected commit's: `ref` reverts them to the baseline's,
+                        // `clean` keeps the source's head.
+                        assert_eq!(
+                            fs::read_to_string(clone.join("README")).unwrap(),
+                            if start.is_some() {
+                                baseline_readme
+                            } else {
+                                committed_readme
+                            },
+                            "{name}: README is the selected commit's"
+                        );
                     }
                     assert_eq!(git_stdout(source, &["branch", "--show-current"]), branch);
                     assert_eq!(git_stdout(source, &["rev-parse", "HEAD"]), head);
