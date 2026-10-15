@@ -638,7 +638,7 @@ it('does not serve a request sent on a connection opened before a lockfile chang
   );
 }, 180_000);
 
-it('stops a daemon at the next request after an ignored lockfile changes', async () => {
+it('stops a daemon at the next request after an ignored lockfile changes, then its successor within its safety poll with no request', async () => {
   await withNxFixture(
     'nx-daemon-validity-ignored-',
     async ({ socketDirectory, workspace }) => {
@@ -648,40 +648,41 @@ it('stops a daemon at the next request after an ignored lockfile changes', async
       await writeFile(lock, 'lock one\n');
       const env = fixtureNxEnv(workspace, socketDirectory);
       const daemon = await startDaemon(workspace, env);
+      // The watcher never reports an ignored lockfile; the next request is what judges this change.
       await writeFile(lock, 'lock two\n');
       assertNotServed(
         await requestOnce(daemon.record.socketPath, ping(workspace), 'a PING sent after the ignored lockfile changed'),
         'a PING sent after the ignored lockfile changed',
       );
-      await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after the ignored lockfile changed`);
-      await replacementAfter({
+      await awaitExit(
+        [daemon.entry],
+        `daemon ${daemon.record.processId} after the ignored lockfile changed and a PING followed`,
+      );
+      const record = await replacementAfter({
         workspace,
         previous: daemon.record.processId,
-        what: 'the daemon to restart after the ignored lockfile changed',
+        what: 'the daemon to restart after the ignored lockfile changed and a PING followed',
       });
-    },
-    FIXTURE_WORKSPACE,
-  );
-}, 180_000);
-
-it('stops a daemon within its safety poll after an ignored lockfile changes with no request', async () => {
-  await withNxFixture(
-    'nx-daemon-validity-poll-',
-    async ({ socketDirectory, workspace }) => {
-      await fixtureWorkspace(workspace);
-      await writeFile(join(workspace, '.gitignore'), 'yarn.lock\n');
-      const lock = join(workspace, 'yarn.lock');
-      await writeFile(lock, 'lock one\n');
-      const env = fixtureNxEnv(workspace, socketDirectory);
-      const daemon = await startDaemon(workspace, env);
+      // The successor booted with 'lock two' on disk, so that is its baseline; a daemon answers a PING only when its
+      // check finds the lock unchanged, and nothing requests this one afterwards.
+      const successor = await readyDaemon(workspace, record);
+      expect(
+        await recordedPid(workspace),
+        'the successor was replaced before the lockfile changed again, so no replacement could show the safety poll',
+      ).toBe(successor.record.processId);
+      // Nothing requests the successor after this write and its watcher ignores the file, so only the 5 s safety
+      // poll can judge 'lock three'.
       await replacementAfter({
         workspace,
-        previous: daemon.record.processId,
-        action: () => writeFile(lock, 'lock two\n'),
-        what: 'a replacement of the daemon within the 5 s safety poll after an ignored lockfile change',
+        previous: successor.record.processId,
+        action: () => writeFile(lock, 'lock three\n'),
+        what: 'a replacement of the successor within the 5 s safety poll after an ignored lockfile change',
         timeoutMs: 20_000,
       });
-      await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after the ignored lockfile changed`);
+      await awaitExit(
+        [successor.entry],
+        `successor ${successor.record.processId} after the ignored lockfile changed with no request`,
+      );
     },
     FIXTURE_WORKSPACE,
   );
