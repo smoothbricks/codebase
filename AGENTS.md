@@ -72,9 +72,22 @@
 16. **Pay for computation once; keep what it proves.** Prefer work that leaves reusable structure: one structure, many
     consumers; compute order once. Derived state (indexes, envelopes, checkpoints, caches) is a byproduct, never a
     second store; units name their authoritative source and why no duplicate store exists. Assess every unit through
-    this byproduct lens.
-17. **First remove work; only cache in the end.** Measure and optimize the real computation before memoizing it; a cache
-    is a last-mile byproduct of an already-fast path, never a substitute for cheaper work.
+    this byproduct lens. Flag these **second-ledger / second-store** shapes by name:
+
+    - **Write ledger:** a second ledger beside the event log.
+    - **Duplicate inventory:** a copy beside the authoritative index.
+    - **Retraction index:** a separately kept store instead of a byproduct of the facts.
+    - **Derivable-byte cache:** derivable bytes kept as a second durable or authoritative store.
+    - **Parallel registry:** another registry of what a manifest already lists.
+    - **Checkpoint store:** live state duplicated into a separate store.
+    - **Summary table:** a second store recomputable from its rows.
+    - **Canonical copy:** another canonical copy beside the live source.
+    - **Shadow config:** a copy beside the declared config.
+
+17. **Remove our work first; cache last. Cache over fork.** Measure and optimize our code before memoizing. If removing
+    the remaining work requires an upstream fork/patch, prefer a boundary cache; name the upstream alternative and its
+    maintenance cost in the design record, and explain why the fork is not worth carrying. Caches stay basis-keyed,
+    recomputable and disposable, never second stores.
 
 ### Conduct
 
