@@ -392,6 +392,11 @@ incomplete evidence, never an empty holder set. Successful observations with res
 matches and incomplete/raced captures remain distinct. An open file is not proof of a contested lock, and an admission
 token count or one CPU/state sample does not establish CPU starvation or its absence.
 
+The real process-snapshot witness keeps its child, grandchild and opened file alive through capture. Its readiness PID
+is a tagged, newline-terminated string, not a console-inspected number that inherited color settings can decorate. The
+reader assembles a complete line across chunks within an abortable readiness bound; EOF and expiry report the text
+observed rather than treating a partial buffer as a PID.
+
 Re-executed libtest fixture roles that report a line protocol use `--nocapture --quiet`. With an inherited
 `RUST_TEST_THREADS=1`, ordinary libtest output prefixes the first report with its unfinished test-name line; a reader
 waiting for a report at the start of a line then waits forever. Quiet formatting preserves the CPU grant and the exact
