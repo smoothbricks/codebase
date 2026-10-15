@@ -59,6 +59,8 @@ Thumbs.db
 .nx/self-healing
 .nx/workspace-data
 .github/instructions/nx.instructions.md
+# Runtime-input refusal evidence is private checkout state, never an Nx cache entry.
+.runtime-input-failures/
 
 # Jest
 test-output
