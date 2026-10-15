@@ -450,10 +450,12 @@ fn move_home(
     if intent == DetachIntent::WhenIdle {
         let open = confirmed_tree_holders(mount_point)?;
         if !open.is_empty() {
-            return Err(ApfsStorageError::Host(format!(
-                "{} is in use and stays mounted: {open:?}",
-                mount_point.display()
-            )));
+            return Err(ApfsStorageError::BuildVolumeHeld {
+                image: image.to_owned(),
+                hold: crate::metadata::append_suffix(image, ".hold"),
+                holds: Vec::new(),
+                open,
+            });
         }
     }
     let sibling = move_sibling(image);

@@ -200,10 +200,11 @@ unit that rebuilt:
 
 - **No fingerprint at all** — the selected seed never held that unit (for example, another Cargo profile or toolchain),
   so the fork builds that delta once. If the target built it after freezing its seed, the next fork refreshes
-  automatically unless a named holder refuses writer exclusion. Close that holder and fork again; no manual reseed or
-  warm step exists. `doctor` reports target-only `seed-age`, `seed-tree-behind` and `target-moved-outside-land`; after
-  an external Git fast-forward, keep the warm landing workspace alive until the next fork can capture its exactly
-  matching tree.
+  automatically unless a named holder refuses writer exclusion. Close that holder and fork again; no manual seed-refresh
+  or warm step exists. `cowshed reseed` only discards a workspace's build state for an existing seed clone, so it cannot
+  make that seed warmer and may require a cold rebuild. `doctor` reports target-only `seed-age`, `seed-tree-behind` and
+  `target-moved-outside-land`; after an external Git fast-forward, keep the warm landing workspace alive until the next
+  fork can capture its exactly matching tree.
 - **`PathToSourceChanged`** — a dependency was built under another `$CARGO_HOME`; see the shared cargo caches above.
 - **`the rerun-if-changed instructions changed`** — a build script watches a path outside its package by absolute path;
   print it relative to the package instead, which is how cargo resolves it.

@@ -42,6 +42,9 @@ use cowshed_apfs::store_lock::LockMode;
 
 type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 
+mod reseed;
+pub(crate) use reseed::ReseedWorkspace;
+
 /// A workspace at one incarnation: whose seed a seed is.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Owner {
@@ -3877,6 +3880,336 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reseed_workspace<H: RuntimeStorageHost>(
+        scratch: &Scratch<H>,
+        owner: Owner,
+        checkout: PathBuf,
+    ) -> ReseedWorkspace {
+        let layout = crate::storage::StorageLayout::with_mount_root(
+            scratch.root.path().join("store"),
+            scratch.root.path().join("mnt"),
+            &RepoId::parse("acme/widget").unwrap(),
+        )
+        .unwrap();
+        let image = layout.canonical_image(&owner.name).unwrap();
+        fs::create_dir_all(image.image().parent().unwrap()).unwrap();
+        fs::write(image.image(), b"source-image-identity").unwrap();
+        ReseedWorkspace {
+            intent_lease: layout
+                .project()
+                .sessions
+                .join(format!("{}.intent.lock", owner.name)),
+            owner,
+            checkout,
+            image,
+        }
+    }
+
+    /// The same public contract runs on real directory payloads and native APFS images.
+    #[cfg(target_os = "macos")]
+    async fn reseed_contract<H: RuntimeStorageHost>(scratch: &Scratch<H>) -> (u64, u64) {
+        use crate::git_preservation;
+        let main = owner("main", '0');
+        let topic = owner("topic", '1');
+        let (main_checkout, main_live, main_mount) = scratch.linked_checkout("main", 1);
+        fs::write(main_mount.join("from-seed"), b"landed incremental state").unwrap();
+        let seed = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &main_live,
+                &seed,
+                &BuildVolumeRecord::new(
+                    Some(GitOid::new("a".repeat(40)).unwrap()),
+                    BuildVolumeRole::Seed {
+                        target: main.name.clone(),
+                        incarnation: main.incarnation.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        // Main has newer live work, deliberately absent from its stale frozen seed.
+        fs::write(main_mount.join("never-refresh-this"), b"live work").unwrap();
+        let seed_record = scratch.layout.read_record(&seed).unwrap();
+        let seed_clock = fs::metadata(scratch.layout.image(&seed))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let (checkout, old, old_mount) = scratch.linked_checkout("topic", 1);
+        fs::write(old_mount.join("accumulated"), vec![7_u8; 262_144]).unwrap();
+        let own_seed = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &old,
+                &own_seed,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Seed {
+                        target: topic.name.clone(),
+                        incarnation: topic.incarnation.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        let own_seed_record = scratch.layout.read_record(&own_seed).unwrap();
+        let own_seed_clock = fs::metadata(scratch.layout.image(&own_seed))
+            .unwrap()
+            .modified()
+            .unwrap();
+        commit(
+            &checkout,
+            &[(".gitignore", ".cowshed/\n"), ("source", "committed\n")],
+        );
+        fs::write(checkout.join("source"), b"dirty tracked source\n").unwrap();
+        fs::write(checkout.join("untracked"), b"untracked source\n").unwrap();
+        let before = git_preservation::capture(&checkout, &checkout).unwrap();
+        let index = fs::read(checkout.join(".git/index")).unwrap();
+        let workspace = reseed_workspace(scratch, topic, checkout.clone());
+        let from = reseed_workspace(scratch, main, main_checkout);
+        let preview = scratch
+            .volumes
+            .preview_reseed(workspace.clone(), from.clone())
+            .await
+            .unwrap();
+        let report = preview.preview();
+        assert!(report.dry_run);
+        assert_eq!(report.freed_bytes, 0);
+        assert!(report.previous_bytes > 0);
+        assert_eq!(scratch.layout.linked(&checkout).unwrap(), Some(old.clone()));
+
+        // Both an admitted job's shared hold and a land/capture's exclusive claim refuse.
+        let job = scratch.layout.hold(&old).unwrap();
+        let refusal = scratch
+            .volumes
+            .execute_reseed(preview.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
+        assert!(
+            refusal.message.contains(&std::process::id().to_string()),
+            "{refusal}"
+        );
+        assert!(refusal.message.contains(".dmg.hold"), "{refusal}");
+        assert!(
+            refusal.message.contains(" ("),
+            "holder command is named: {refusal}"
+        );
+        drop(job);
+        let land = scratch.layout.claim_release(&old).unwrap().unwrap();
+        let refusal = scratch
+            .volumes
+            .execute_reseed(preview.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
+        assert!(
+            refusal.message.contains(&std::process::id().to_string()),
+            "{refusal}"
+        );
+        drop(land);
+        assert_eq!(scratch.layout.linked(&checkout).unwrap(), Some(old.clone()));
+        git_preservation::verify(&checkout, &checkout, &before).unwrap();
+
+        // A filesystem reader is not forcibly evicted either.
+        let open = fs::File::open(old_mount.join("accumulated")).unwrap();
+        let refusal = scratch.volumes.execute_reseed(preview).await.unwrap_err();
+        assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
+        assert!(
+            refusal.message.contains(&std::process::id().to_string()),
+            "{refusal}"
+        );
+        drop(open);
+        assert_eq!(scratch.layout.linked(&checkout).unwrap(), Some(old.clone()));
+        assert!(old_mount.join("accumulated").exists());
+
+        let plan = scratch
+            .volumes
+            .preview_reseed(workspace, from)
+            .await
+            .unwrap();
+        let expected_deleted = plan.preview().previous_bytes;
+        let completed = scratch.volumes.execute_reseed(plan).await.unwrap();
+        let replacement =
+            BuildVolumeId::parse(completed.replacement_volume.as_ref().unwrap()).unwrap();
+        assert_eq!(completed.freed_bytes, completed.previous_bytes);
+        assert!(completed.freed_bytes > 0);
+        assert!(!completed.dry_run);
+        assert_eq!(
+            scratch.layout.linked(&checkout).unwrap(),
+            Some(replacement.clone())
+        );
+        assert!(!scratch.layout.image(&old).exists());
+        assert_eq!(
+            fs::read(scratch.layout.mount(&replacement).join("from-seed")).unwrap(),
+            b"landed incremental state"
+        );
+        assert!(
+            !scratch
+                .layout
+                .mount(&replacement)
+                .join("accumulated")
+                .exists()
+        );
+        assert!(
+            !scratch
+                .layout
+                .mount(&replacement)
+                .join("never-refresh-this")
+                .exists()
+        );
+        assert_eq!(scratch.layout.read_record(&seed).unwrap(), seed_record);
+        assert_eq!(
+            fs::metadata(scratch.layout.image(&seed))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            seed_clock,
+            "reseed neither mounts nor refreshes its source seed"
+        );
+        assert_eq!(
+            scratch.layout.read_record(&own_seed).unwrap(),
+            own_seed_record
+        );
+        assert_eq!(
+            fs::metadata(scratch.layout.image(&own_seed))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            own_seed_clock
+        );
+        git_preservation::verify(&checkout, &checkout, &before).unwrap();
+        assert_eq!(fs::read(checkout.join(".git/index")).unwrap(), index);
+        assert_eq!(
+            fs::read(checkout.join("source")).unwrap(),
+            b"dirty tracked source\n"
+        );
+        assert_eq!(
+            fs::read(checkout.join("untracked")).unwrap(),
+            b"untracked source\n"
+        );
+        let log =
+            fs::read_to_string(scratch.layout.project_root().join("deletion-log.jsonl")).unwrap();
+        assert!(
+            log.contains("release-build-volume") && log.contains(old.as_str()),
+            "{log}"
+        );
+        scratch.release_all();
+        (expected_deleted, completed.freed_bytes)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_reseed_refuses_named_holders_reclaims_and_preserves_git() {
+        let (expected, deleted) =
+            reseed_contract(&Scratch::directory("build-reseed-contract")).await;
+        assert_eq!(
+            deleted, expected,
+            "execution reports exactly the observed allocated image bytes"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_reseed_refuses_named_holders_reclaims_and_preserves_git() {
+        reseed_contract(&Scratch::new("build-reseed-contract")).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_reseed_refuses_absent_seed_forming_intent_and_stale_plan() {
+        use crate::storage::recovery::{
+            LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentJournal,
+        };
+        let scratch = Scratch::directory("build-reseed-refusals");
+        let (checkout, old, _) = scratch.linked_checkout("topic", 1);
+        let (main_checkout, main_live, _) = scratch.linked_checkout("main", 1);
+        let workspace = reseed_workspace(&scratch, owner("topic", '1'), checkout.clone());
+        let from = reseed_workspace(&scratch, owner("main", '0'), main_checkout);
+        let error = scratch
+            .volumes
+            .preview_reseed(workspace.clone(), from.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::NotFound, "{error}");
+        assert_eq!(scratch.layout.linked(&checkout).unwrap(), Some(old.clone()));
+        let seed = BuildVolumeId::mint();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &main_live,
+                &seed,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Seed {
+                        target: from.owner.name.clone(),
+                        incarnation: from.owner.incarnation.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+        let plan = scratch
+            .volumes
+            .preview_reseed(workspace.clone(), from.clone())
+            .await
+            .unwrap();
+        let journal_path = scratch.layout.project_root().join(LIFECYCLE_INTENTS_FILE);
+        let mut journal = LifecycleIntentJournal::default();
+        journal.begin(LifecycleIntent::Fork {
+            source: from.owner.name.clone(),
+            destination: workspace.owner.name.clone(),
+            rename: false,
+        });
+        journal.mark_mutating(&workspace.owner.name).unwrap();
+        crate::metadata::write_json(&journal_path, &journal).unwrap();
+        let error = scratch.volumes.execute_reseed(plan).await.unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::Conflict, "{error}");
+        assert!(
+            error.message.contains("lifecycle journal entry for topic"),
+            "{error}"
+        );
+        assert!(error.message.contains("Fork"), "{error}");
+        journal.clear(&workspace.owner.name);
+        crate::metadata::write_json(&journal_path, &journal).unwrap();
+
+        let plan = scratch
+            .volumes
+            .preview_reseed(workspace.clone(), from.clone())
+            .await
+            .unwrap();
+        let mut record = scratch.layout.read_record(&seed).unwrap();
+        record.tree = Some(GitOid::new("b".repeat(40)).unwrap());
+        scratch.layout.write_record(&seed, &record).unwrap();
+        let error = scratch.volumes.execute_reseed(plan).await.unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::Conflict, "{error}");
+        assert!(error.message.contains("stale"), "{error}");
+        assert_eq!(scratch.layout.linked(&checkout).unwrap(), Some(old.clone()));
+        let plan = scratch
+            .volumes
+            .preview_reseed(workspace, from.clone())
+            .await
+            .unwrap();
+        let locked = scratch
+            .host
+            .lock_images(&[from.image.lock().to_owned()], LockMode::Try)
+            .unwrap()
+            .unwrap();
+        let error = scratch.volumes.execute_reseed(plan).await.unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::Conflict, "{error}");
+        assert!(
+            error.message.contains(&std::process::id().to_string()),
+            "{error}"
+        );
+        assert!(error.message.contains("lifecycle/image lock"), "{error}");
+        drop(locked);
+        assert_eq!(scratch.layout.linked(&checkout).unwrap(), Some(old));
+        scratch.release_all();
     }
 
     #[cfg(target_os = "macos")]

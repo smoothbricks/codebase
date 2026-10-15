@@ -110,9 +110,9 @@ install. `--downgrade` installs the invoking build anyway; it is refused with `-
 `--mount-root`, which install nothing.
 
 The commands that change a workspace or run work in one — `adopt`, `fork`, `mv`, `checkpoint`, `restore`, `path`,
-`exec`, `grant`, `rm`, `attach`, `detach`, `resize`, `defrag`, `rekey`, `gc`, `push`, `rebase`, `land` — first ask the
-daemon whether it runs their build, before they open the project or change anything. A daemon of another build refuses
-them up front (exit 4), naming both builds, with the remedy this verb provides:
+`exec`, `grant`, `rm`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`, `gc`, `push`, `rebase`, `land` — first
+ask the daemon whether it runs their build, before they open the project or change anything. A daemon of another build
+refuses them up front (exit 4), naming both builds, with the remedy this verb provides:
 
 ```
 $ cowshed rm raven
@@ -818,6 +818,41 @@ The copy needs as much free space on the store volume as the image has allocated
 and it keeps that space: clones and checkpoints taken earlier still share the old blocks, so the space comes back only
 as they are removed. Main fragments again as it takes writes while new clones share it; rerun the verb when `doctor`
 warns.
+
+### `cowshed reseed <name|main> [--from <target>] [--dry-run]`
+
+Discard one workspace's live build-volume contents and replace them with a new clone of an existing seed. The target
+defaults to main; `--from <target>` selects another workspace's latest seed in its current incarnation.
+
+```
+cowshed reseed raven --dry-run
+cowshed reseed raven --from main
+cowshed reseed main --from lane-base --dry-run --json
+```
+
+This replaces only rebuildable build-volume state: Cargo targets, Nx cache/workspace data, indexes and declared build
+state reached through the excluded `.cowshed/build` link. Source files, HEAD, the index, dirty and untracked files stay
+untouched; declared outputs on the source volume are not deleted. Any incremental work missing from the selected seed
+must rebuild cold on the next build.
+
+The seed is used as-is, even when stale. A missing seed refuses instead of refreshing it or manufacturing an empty one.
+No seed is refreshed, written or deleted, including the destination workspace's own seed. Automatic seed refresh remains
+part of fork and land; this is not a manual warm/refreeze command
+([16 Build volumes](../../../specs/cowshed/16_build_volumes.md#targets-and-seeds)).
+
+Run while idle. Live job/land holds, filesystem holders, held lifecycle/image locks and unfinished create/fork/adopt
+work refuse before publication, with the volume and holder identity named. Opening for reseed does not complete that
+unfinished work first. Only the old build volume's Nx daemon may be stopped under its exclusive hold; jobs are never
+terminated and the old volume is never forcibly unmounted.
+
+Bare stdout is the removed image's allocated byte count (`0` with `--dry-run`); guidance stays on stderr. `--json`
+returns the frozen success envelope with
+`ReseedResult { workspace, from, previousVolume, seed, replacementVolume?, previousBytes, replacementBytes, freedBytes, dryRun }`.
+Preview changes no link, mount, image or seed: `replacementVolume` is omitted, `replacementBytes` estimates the new
+allocation from the seed and `freedBytes` is zero. Execution reports actual replacement allocation and removed old-image
+allocation. The signed preview reduction is `previousBytes - replacementBytes`, not execution's stdout. These are
+GC-style allocated image bytes, not unique physical bytes: APFS shares extents, so no corresponding increase in physical
+free space is promised.
 
 ### `cowshed rekey <name|main>`
 

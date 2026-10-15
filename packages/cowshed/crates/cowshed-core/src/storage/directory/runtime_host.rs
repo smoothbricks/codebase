@@ -116,6 +116,14 @@ impl RuntimeStorageHost for DirectoryExecutionHost {
         DirectoryExecutionHost::claim_build_volume(self, layout, id)
     }
 
+    fn detach_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+    ) -> Result<(), ApfsStorageError> {
+        DirectoryExecutionHost::detach_claimed_build_volume(self, layout, claim)
+    }
+
     fn release_claimed(
         &self,
         layout: &BuildVolumeLayout,

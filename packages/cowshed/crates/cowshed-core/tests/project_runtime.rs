@@ -776,6 +776,20 @@ impl ProjectRuntimeHost for FakeHost {
         })
     }
 
+    async fn reseed(
+        &mut self,
+        workspace: WorkspaceName,
+        from: WorkspaceName,
+        _dry_run: bool,
+    ) -> Result<cowshed_core::api::dto::ReseedResult> {
+        self.workspace(&workspace)?;
+        self.workspace(&from)?;
+        Err(CowshedError::environment_missing(
+            "this lifecycle test host has no build-volume storage",
+            "use the directory or APFS reseed contract fixture",
+        ))
+    }
+
     async fn checkpoint(
         &mut self,
         workspace: WorkspaceName,

@@ -485,6 +485,34 @@ impl Serves<CoordinatorDefragment> for Coordinator {
     }
 }
 
+impl Serves<CoordinatorReseed> for Coordinator {
+    const BOUND: &'static [&'static str] = &["repoId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<ReseedRequest> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            workspace: WorkspaceName,
+            from: WorkspaceName,
+            dry_run: bool,
+        }
+        let Caller {
+            workspace,
+            from,
+            dry_run,
+        } = decode::<CoordinatorReseed, Caller>(arguments)?;
+        Ok(ReseedRequest {
+            repo_id: owned(authority.repo_id),
+            workspace,
+            from,
+            dry_run,
+        })
+    }
+}
+
 impl Serves<CoordinatorDetach> for Coordinator {
     const BOUND: &'static [&'static str] = &["repoId"];
 
@@ -1305,6 +1333,7 @@ pub(crate) fn each_served(
     check.served::<CoordinatorRestore, _>(coordinator, &[]);
     check.served::<CoordinatorResize, _>(coordinator, &[]);
     check.served::<CoordinatorDefragment, _>(coordinator, &[]);
+    check.served::<CoordinatorReseed, _>(coordinator, &[]);
     check.served::<CoordinatorDetach, _>(coordinator, &[]);
     check.served::<CoordinatorAssignSlot, _>(coordinator, &[]);
     check.served::<CoordinatorDestroy, _>(coordinator, &[]);

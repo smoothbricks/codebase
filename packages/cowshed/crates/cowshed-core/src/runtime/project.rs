@@ -208,6 +208,12 @@ pub trait ProjectRuntimeHost: Send + 'static {
         &mut self,
         workspace: WorkspaceName,
     ) -> Result<crate::api::dto::DefragmentResult>;
+    async fn reseed(
+        &mut self,
+        workspace: WorkspaceName,
+        from: WorkspaceName,
+        dry_run: bool,
+    ) -> Result<crate::api::dto::ReseedResult>;
     async fn checkpoint(
         &mut self,
         workspace: WorkspaceName,
@@ -1244,6 +1250,15 @@ impl ProjectActor {
                 self.require_repo(&params.repo_id)?;
                 respond::<operations::CoordinatorDefragment>(
                     &self.host.defragment(params.workspace).await?,
+                )
+            }
+            Op::CoordinatorReseed(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorReseed>(
+                    &self
+                        .host
+                        .reseed(params.workspace, params.from, params.dry_run)
+                        .await?,
                 )
             }
             Op::CoordinatorDetach(params) => {
@@ -10351,6 +10366,59 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             extents: outcome.extents.get(),
             bytes: outcome.bytes,
         })
+    }
+
+    /// Replace only rebuildable incremental state. Unlike resize, refuse admitted jobs instead
+    /// of stopping them. The supervisor resolves and grants the new build volume at its next
+    /// admission, exactly as it does after land's atomic build-link swap.
+    async fn reseed(
+        &mut self,
+        workspace: WorkspaceName,
+        from: WorkspaceName,
+        dry_run: bool,
+    ) -> Result<crate::api::dto::ReseedResult> {
+        use super::build_volumes::{Owner, ReseedWorkspace};
+        use crate::storage::recovery::INTENT_LEASE_SUFFIX;
+
+        self.validate_binding().await?;
+        let current = self.current(&workspace).await?;
+        if !matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            return Err(CowshedError::conflict(
+                format!("workspace {workspace} is detached, so its build link cannot be read"),
+                format!("cowshed attach {workspace}, then retry the reseed"),
+            ));
+        }
+        let target = self.current(&from).await?;
+        let participant = |name: WorkspaceName, incarnation| -> Result<ReseedWorkspace> {
+            Ok(ReseedWorkspace {
+                checkout: self.workspace_mount_path(&name)?,
+                image: self
+                    .layout
+                    .canonical_image(&name)
+                    .map_err(native_integrity_error)?,
+                intent_lease: self
+                    .layout
+                    .project()
+                    .sessions
+                    .join(format!("{name}{INTENT_LEASE_SUFFIX}")),
+                owner: Owner { name, incarnation },
+            })
+        };
+        let volumes = self.build_volumes()?;
+        let plan = volumes
+            .preview_reseed(
+                participant(workspace, current.derived.workspace.incarnation().clone())?,
+                participant(from, target.derived.workspace.incarnation().clone())?,
+            )
+            .await?;
+        if dry_run {
+            Ok(plan.preview())
+        } else {
+            volumes.execute_reseed(plan).await
+        }
     }
 
     async fn checkpoint(

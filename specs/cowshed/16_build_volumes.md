@@ -289,9 +289,10 @@ volume holds a write the seed does not and is not farther from the fork's tree. 
 writer exclusion: a host Cargo build or editor may still hold the volume. Each target keeps only its latest seed; a
 target's seed is deleted when the target retires.
 
-**No manual reseed or warm step exists.** Every seed refresh is a step of a land or of a fork, and nothing else writes a
-seed: there is no command that refreezes one, no background warm build in the target, and no land script step. A land
-script that fast-forwards the target's branch itself is an external land, and the next fork takes care of it.
+**No manual seed refresh or warm step exists.** Apart from the explicit re-adoption rule below, every seed refresh is a
+step of a land or of a fork: there is no command that refreezes one, no background warm build in the target, and no land
+script step. A land script that fast-forwards the target's branch itself is an external land, and the next fork takes
+care of it. `cowshed reseed` replaces a workspace's live build volume from an existing seed; it never refreshes a seed.
 
 Re-adoption preserves the live BuildVolumeId, its owner record, tree and creation time, and carries its warm filesystem
 into RAW at the capacity recorded from the kernel before detach (02_workspaces.md §Re-adoption). It leaves every
@@ -420,6 +421,59 @@ fast-forward performs no carry, output restoration or adoption.
   stopped socket lease; an admitted shell job after admission reopens writes bytes absent from the seed and makes it
   behind; an already-held admission skips direct capture without mutating images or replacing the old seed, and the skip
   names the process holding the hold.
+
+### Workspace reseed
+
+`cowshed reseed <ws> [--from <target>] [--dry-run]` discards a workspace's accumulated incremental build state and gives
+it a fresh clone of the named target's **existing latest seed at its current incarnation**; `--from` defaults to `main`.
+This is a maintenance verb like resize, not a `gc` option: garbage collection removes images nobody owns, whereas reseed
+explicitly discards state an active workspace owns. The workspace must already be mounted, so its authoritative build
+link can be read. The target need not be mounted. No source image, Git ref, HEAD, index, tracked edit, untracked file or
+declared task output is copied, reset or deleted. Only the excluded `.cowshed/build` link changes.
+
+When selecting whether to reseed, cheaply priced Nx rebuild time decides; when no usable Nx work score exists
+(Cargo-only projects included), space decides and the default is the project's main seed, because unpriced
+workspace-only build state retains private blocks.
+
+The seed is cloned as it stands, even when it is behind the target's live build volume or built at another tree.
+Workspace-specific output is lost: the next build pays a cold rebuild for incremental units or cache entries the seed
+does not contain, with shared content-addressed caches still available. A missing current-incarnation seed refuses
+before replacement; the operation neither creates an empty fallback nor captures the target's live volume. It never
+writes, refreshes, retires or deletes any seed, including the workspace's own seed, and never promotes retained
+old-incarnation evidence into a current seed.
+
+Preview is read-only: no attach, flush, daemon stop, hold-file creation, lifecycle recovery or link mutation. It records
+the workspace and target source-image identities, current build link and record, current seed identity and record, and
+the build images' identities, modification times and allocated bytes. Execution acquires the existing workspace and
+target lifecycle-intent leases and image locks without waiting, re-observes that plan, and refuses a stale observation
+before replacing anything. The target image lock remains held while the seed is cloned, exactly as in a fork, excluding
+a concurrent land or fork's seed replacement. An unfinished create/fork/adopt or re-adopt refuses with its workspace,
+journal path and recorded operation rather than replaying it.
+
+Before stopping the old build volume's Nx daemon, execution takes its `<id>.dmg.hold` **exclusively without waiting**.
+An admitted job's shared hold, a land's hold, or another exclusive claimant refuses and names the hold path and each
+visible holder's PID and command. Held lifecycle/image locks likewise name their paths and holders. No jobs are killed.
+With admission fenced, the existing Nx-close protocol stops only its own daemon; another database holder refuses by PID
+and command. The old build volume then seals without force: a filesystem holder or late writer refuses and is named,
+retaining the original build link. A prepublication failure restores the old canonical build mount.
+
+The replacement has a new BuildVolumeId and is held from before cloning through publication. Its `Linked <ws>` record
+precedes the atomic build-link rename; the old record becomes `Unlinked` and the old image is released under the same
+exclusive claim. A crash on either side of publication therefore leaves the link naming a correctly owned image and at
+most an unreachable image for ordinary collection, using the existing link-reconciliation rules. An already-running
+supervisor grants the replacement at its next job admission, as after a land; it is not restarted to terminate holders.
+
+Byte accounting is the same as build-volume garbage collection: each RAW image contributes `st_blocks * 512`, a
+directory backend its allocated tree bytes. Dry-run reports the old image's allocated bytes and the seed clone's
+allocation estimate; execution reports the actual replacement allocation and the old image's allocation when deleted as
+`freedBytes`. A seal may flush more blocks than preview observed. These are **per-image allocated bytes**, not a promise
+of that much unique physical free space: APFS clones and retained seeds can share extents. Subtracting the replacement
+allocation gives a per-image net estimate, not a container-free-space measurement.
+
+- **Enforced by**: directory-host and real-APFS tests that refuse and name shared job holds, exclusive land claims and
+  filesystem readers; then replace the volume, report deleted allocation and verify dirty tracked source, untracked
+  files, Git state and index bytes unchanged. A stale source seed is used without refreshing or mounting it. Focused
+  directory tests refuse absent seeds, unfinished lifecycle journal entries, held image locks and stale plans.
 
 ## Fork: `cowshed fork [<src>] <ws>`
 

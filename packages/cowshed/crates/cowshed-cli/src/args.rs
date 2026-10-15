@@ -33,6 +33,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &MOUNT,
     &RESIZE,
     &DEFRAG,
+    &RESEED,
     &REKEY,
     &GC,
     &PUSH,
@@ -83,6 +84,7 @@ pub enum Command {
     Mount(MountArgs),
     Resize(ResizeArgs),
     Defrag(DefragArgs),
+    Reseed(ReseedArgs),
     Rekey(RekeyArgs),
     Gc(GcArgs),
     Push(PushArgs),
@@ -131,6 +133,7 @@ impl Command {
             | Self::Attach(_)
             | Self::Resize(_)
             | Self::Defrag(_)
+            | Self::Reseed(_)
             | Self::Rekey(_)
             | Self::Gc(_)
             | Self::Push(_)
@@ -443,6 +446,14 @@ pub struct ResizeArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DefragArgs {
     pub workspace: String,
+}
+
+/// `reseed <ws|main> [--from <target>] [--dry-run]` — discard live build state for a seed clone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReseedArgs {
+    pub workspace: String,
+    pub from: String,
+    pub dry_run: bool,
 }
 
 /// `rekey <ws|main>` — rebuild one keyless workspace's CA identity.
@@ -811,6 +822,12 @@ fn cli_command() -> ClapCommand {
                 .arg(value_once("build")),
         )
         .subcommand(leaf("defrag").arg(positional("workspace", 0..=1)))
+        .subcommand(
+            leaf("reseed")
+                .arg(positional("workspace", 0..=1))
+                .arg(value_once("from"))
+                .arg(flag("dry-run")),
+        )
         .subcommand(leaf("rekey").arg(positional("workspace", 0..=1)))
         .subcommand(leaf("gc").args([flag("dry-run"), flag("abandoned")]))
         .subcommand(leaf("push").arg(positional("workspace", 0..=1)).args([
@@ -983,6 +1000,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "mount" => parse_mount(leaf)?,
         "resize" => parse_resize(leaf)?,
         "defrag" => parse_defrag(leaf)?,
+        "reseed" => parse_reseed(leaf)?,
         "rekey" => parse_rekey(leaf)?,
         "gc" => parse_gc(leaf)?,
         "push" => parse_push(leaf)?,
@@ -2654,6 +2672,39 @@ fn parse_defrag(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
+const RESEED: CommandSpec = CommandSpec {
+    name: "reseed",
+    missing: "reseed requires a workspace",
+    args: "<ws|main>",
+    trailing: "",
+    summary: "replace live build state from an existing seed",
+    about: &[
+        "Discards the workspace's live build-volume contents and replaces them with a new clone of the target's latest existing seed in its current incarnation (default main). The source tree, HEAD, index, dirty and untracked files stay untouched; only the excluded .cowshed/build link changes. Missing incremental work is rebuilt cold next time.",
+        "Never refreshes, writes or deletes any seed, including the workspace's own seed. A stale seed is used as-is; an absent seed refuses. Running jobs, land holds, filesystem holders and unfinished create/fork/adopt work refuse before publication; holders are named by PID and command, never killed or forcibly unmounted.",
+        "Prints reclaimed allocated image bytes (0 for --dry-run); --json returns ReseedResult. Preview reports the old allocation, seed-based replacement estimate and signed estimated reduction on stderr, without changing links, mounts, images or seeds. APFS shared extents mean allocation accounting is not a promise of physical free space.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--from <target>",
+            meaning: "clone this target's latest existing seed instead of main's; never refresh it",
+        },
+        Opt {
+            spelling: "--dry-run",
+            meaning: "report volume identities and allocated-byte estimates without changing build state",
+        },
+    ],
+};
+
+fn parse_reseed(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &RESEED;
+    Ok(Command::Reseed(ReseedArgs {
+        workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
+        from: optional_workspace(matches, "from", false, USAGE)?
+            .unwrap_or_else(|| "main".to_owned()),
+        dry_run: flagged(matches, "dry-run"),
+    }))
+}
+
 const REKEY: CommandSpec = CommandSpec {
     name: "rekey",
     missing: "rekey requires a workspace",
@@ -2943,9 +2994,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manual_reseed_is_not_a_command_or_help_topic() {
-        assert!(parse_args(["reseed", "main"]).is_err());
-        assert!(parse_args(["help", "reseed"]).is_err());
+    fn reseed_parses_existing_seed_selection_and_nonmutating_preview() {
+        assert_eq!(
+            parse_args(["reseed", "raven"]).unwrap().command,
+            Command::Reseed(ReseedArgs {
+                workspace: "raven".into(),
+                from: "main".into(),
+                dry_run: false,
+            })
+        );
+        let cli = parse_args([
+            "reseed",
+            "main",
+            "--from",
+            "lane-base",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.global.json);
+        assert_eq!(
+            cli.command,
+            Command::Reseed(ReseedArgs {
+                workspace: "main".into(),
+                from: "lane-base".into(),
+                dry_run: true,
+            })
+        );
+        for refused in [
+            &["reseed"][..],
+            &["reseed", "raven", "--from"],
+            &["reseed", "raven", "--from", "not/a/name"],
+            &["reseed", "not/a/name"],
+            &["reseed", "raven", "extra"],
+            &["reseed", "raven", "--from", "main", "--from", "lane"],
+            &["reseed", "raven", "--refresh"],
+        ] {
+            assert!(parse_args(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn reseed_help_explains_discard_without_manual_seed_refresh() {
+        for argv in [
+            &["help", "reseed"][..],
+            &["reseed", "--help"],
+            &["reseed", "--from", "--help"],
+        ] {
+            assert_eq!(
+                parse_args(argv.iter().copied()).unwrap().command,
+                Command::Help(Some(&RESEED))
+            );
+        }
+        let page = RESEED
+            .page()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for fact in [
+            "--from <target>",
+            "--dry-run",
+            "rebuilt cold",
+            "absent seed refuses",
+            "Never refreshes",
+            "source tree, HEAD, index",
+            "not a promise of physical free space",
+        ] {
+            assert!(page.contains(fact), "missing {fact}: {page}");
+        }
     }
 
     #[test]
@@ -4390,6 +4506,8 @@ mod tests {
             (&["detach", "--all"], NotUsed),
             (&["resize", "raven", "32GiB"], Required),
             (&["defrag", "main"], Required),
+            (&["reseed", "raven"], Required),
+            (&["reseed", "main", "--from", "lane", "--dry-run"], Required),
             (&["rekey", "raven"], Required),
             (&["gc"], Required),
             (&["push", "raven"], Required),
@@ -4444,6 +4562,7 @@ mod tests {
             (&["detach"], "detach requires a workspace"),
             (&["resize"], "resize requires a workspace"),
             (&["defrag"], "defrag requires a workspace"),
+            (&["reseed"], "reseed requires a workspace"),
             (&["rekey"], "rekey requires a workspace"),
             (&["land"], "land requires a workspace"),
             (&["gateway"], "gateway action is required"),

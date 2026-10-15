@@ -215,6 +215,16 @@ impl Coordinator {
         )
     }
 
+    /// Replaces a workspace's build volume with a clone of an existing target seed.
+    #[napi(js_name = "reseed")]
+    pub fn reseed(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::CoordinatorReseed, _>(
+            env,
+            Arc::clone(&self.inner),
+            arguments,
+        )
+    }
+
     /// Detaches a workspace.
     #[napi(js_name = "detach")]
     pub fn detach(&self, env: Env, arguments: String) -> napi::Result<JsObject> {

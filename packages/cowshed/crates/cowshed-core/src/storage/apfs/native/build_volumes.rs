@@ -362,6 +362,84 @@ where
         }
     }
 
+    /// Seal the live volume before a replacement build link is published, borrowing the existing
+    /// exclusive claim rather than reacquiring or upgrading it (16_build_volumes.md, "Targets
+    /// and seeds"). Unlike release, this never forces or deletes the image, record, hold or
+    /// mountpoint. A refusal after an accepted unmount may leave the volume unmounted: the
+    /// caller restores `layout.mount(claim.id())` before dropping the retained claim.
+    pub fn detach_claimed_build_volume(
+        &self,
+        layout: &BuildVolumeLayout,
+        claim: &ReleaseClaim,
+    ) -> Result<(), ApfsStorageError> {
+        let id = claim.id();
+        let image = layout.image(id);
+        self.verify_controller_path(&image)?;
+        let mount = layout.mount(id);
+        let held = |open| ApfsStorageError::BuildVolumeHeld {
+            image: image.clone(),
+            hold: layout.hold_path(id),
+            holds: Vec::new(),
+            open,
+        };
+        let attachment = {
+            // Wait for cosmetic operations before census, without exempting this process. The
+            // backend re-proves attachment identity under its own lease and raw pin at unmount.
+            let _lease = self.backend.image_lease(&image)?;
+            let Some(attachment) = self.backend.existing_attachment(&image)? else {
+                return Ok(());
+            };
+            let canonical = MountPoint::new(&mount);
+            let mounted = self.mount_source.mounts()?.into_iter().find(|mounted| {
+                mounted.source_device == attachment.volume_device()
+                    || canonical.names(&mounted.mount_point)
+            });
+            if let Some(mounted) = &mounted {
+                if !canonical.names(&mounted.mount_point)
+                    || mounted.source_device != attachment.volume_device()
+                {
+                    return Err(ApfsStorageError::Host(format!(
+                        "cannot seal build volume {id} at {}: {} is mounted at {}, expected {}",
+                        mount.display(),
+                        mounted.source_device,
+                        mounted.mount_point.display(),
+                        attachment.volume_device()
+                    )));
+                }
+                let open = holders_of(&mount)?;
+                if !open.is_empty() {
+                    return Err(held(open));
+                }
+            }
+            attachment
+        };
+        self.backend
+            .unmount_verified(&attachment, DetachIntent::WhenIdle)
+            .map_err(|refusal| {
+                if !cowshed_apfs::detach_was_dissented(&refusal) {
+                    return ApfsStorageError::from(refusal);
+                }
+                let open = self.mounted_at(&mount).and_then(|mounted| match mounted {
+                    Some(device) if device == attachment.volume_device() => holders_of(&mount),
+                    Some(_) | None => Ok(Vec::new()),
+                });
+                match open {
+                    Ok(open) if !open.is_empty() => held(open),
+                    Ok(_) => refusal.into(),
+                    Err(cleanup) => ApfsStorageError::Cleanup {
+                        operation: "name claimed build volume holders",
+                        primary: Box::new(refusal.into()),
+                        cleanup: Box::new(cleanup),
+                    },
+                }
+            })?;
+        // An accepted unforced unmount excludes filesystem holders. Wait out only a transient
+        // device refusal, never escalating to force (16_build_volumes.md, seal step 4).
+        self.backend
+            .detach(&attachment, DetachIntent::WithinGrace)?;
+        Ok(())
+    }
+
     /// [`Self::release_build_volume`] of the volume `claim` claimed. Answers the unforced
     /// unmount's refusal, when there was one. The claim is dropped once the image and its hold
     /// file are gone, so a hold taken after that finds no image. The image's deletion is
@@ -1123,6 +1201,74 @@ mod tests {
     /// "Clones preserve mtimes"), in milliseconds; a volume a job holds refuses release and keeps
     /// everything; one a process merely has a file open in is released past it, the process
     /// named; an idle one is deleted with its record, hold and mountpoint.
+    #[test]
+    fn real_apfs_claimed_build_detach_refuses_holders_and_preserves_storage_and_claim() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = crate::scratch_apfs::ScratchRoot::new("claimed-build-detach").unwrap();
+        let (host, layout) = fixture(root.path());
+        let id = BuildVolumeId::mint();
+        let image = layout.image(&id);
+        crate::blank_image::blank_image(&image);
+        let mount = host.mount_build_volume(&layout, &id).unwrap();
+        layout.write_record(&id, &linked("main")).unwrap();
+        fs::write(mount.join("warm"), b"old build state\n").unwrap();
+        let before = snapshot(&mount);
+        let record = fs::read(layout.record(&id)).unwrap();
+        let claim = host.claim_capture_source(&layout, &id).unwrap();
+        let image_inode = fs::metadata(&image).unwrap().ino();
+        let hold_inode = fs::metadata(layout.hold_path(&id)).unwrap().ino();
+        let device = host.mounted_at(&mount).unwrap().unwrap();
+        let open = fs::File::open(mount.join("warm")).unwrap();
+        let me = i32::try_from(std::process::id()).unwrap();
+
+        let error = host
+            .detach_claimed_build_volume(&layout, &claim)
+            .expect_err("an unmanaged filesystem holder must refuse the seal");
+        let ApfsStorageError::BuildVolumeHeld { open: holders, .. } = &error else {
+            panic!("the refusal must name filesystem holders: {error:?}");
+        };
+        assert!(holders.iter().any(|holder| holder.pid == me), "{holders:?}");
+        assert!(error.to_string().contains(&format!("pid {me} (")));
+        assert_eq!(host.mounted_at(&mount).unwrap(), Some(device));
+        assert_eq!(snapshot(&mount), before);
+        assert_eq!(fs::read(layout.record(&id)).unwrap(), record);
+        assert!(
+            layout.hold(&id).is_err(),
+            "the borrowed claim still fences admission"
+        );
+        drop(open);
+
+        for _ in 0..2 {
+            host.detach_claimed_build_volume(&layout, &claim).unwrap();
+            assert!(host.backend.existing_attachment(&image).unwrap().is_none());
+            assert!(host.mounted_at(&mount).unwrap().is_none());
+            assert!(mount.is_dir(), "detach retains the empty mountpoint");
+            assert_eq!(fs::metadata(&image).unwrap().ino(), image_inode);
+            assert_eq!(
+                fs::metadata(layout.hold_path(&id)).unwrap().ino(),
+                hold_inode
+            );
+            assert_eq!(fs::read(layout.record(&id)).unwrap(), record);
+            assert!(layout.hold(&id).is_err());
+        }
+        host.mount_build_volume(&layout, &id).unwrap();
+        assert_eq!(
+            snapshot(&mount),
+            before,
+            "publication rollback can restore the old volume"
+        );
+        host.detach_claimed_build_volume(&layout, &claim).unwrap();
+        assert_eq!(host.release_claimed(&layout, claim).unwrap(), None);
+        for path in [image, layout.record(&id), layout.hold_path(&id), mount] {
+            assert!(
+                !path.exists(),
+                "ordinary release removes {}",
+                path.display()
+            );
+        }
+    }
+
     #[test]
     fn real_apfs_build_volumes_clone_with_mtimes_and_release_unless_a_job_holds_them() {
         let root = crate::scratch_apfs::ScratchRoot::new("build-volume").expect("scratch root");

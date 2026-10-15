@@ -2766,6 +2766,26 @@ pub struct DefragmentResult {
     pub bytes: u64,
 }
 
+/// Replacing a workspace's live build state with a clone of an existing target seed.
+///
+/// Byte counts are allocated image bytes, like GC accounting, not unique physical bytes:
+/// APFS clones may share extents. A preview estimates replacement allocation from the seed,
+/// names no replacement volume, and frees nothing. No seed is refreshed by this operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReseedResult {
+    pub workspace: WorkspaceName,
+    pub from: WorkspaceName,
+    pub previous_volume: String,
+    pub seed: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement_volume: Option<String>,
+    pub previous_bytes: u64,
+    pub replacement_bytes: u64,
+    pub freed_bytes: u64,
+    pub dry_run: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct CheckpointOptions {
@@ -3692,6 +3712,7 @@ result_bodies!(
     RebaseReport,
     ResizeResult,
     DefragmentResult,
+    ReseedResult,
     SlotResult,
     WorkspaceInfo,
     JobInfo,

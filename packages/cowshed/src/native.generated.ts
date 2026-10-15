@@ -55,6 +55,7 @@ export interface NativeCoordinatorOperations
     NativeCoordinatorRestore,
     NativeCoordinatorResize,
     NativeCoordinatorDefragment,
+    NativeCoordinatorReseed,
     NativeCoordinatorDetach,
     NativeCoordinatorAssignSlot,
     NativeCoordinatorDestroy,
@@ -415,6 +416,24 @@ export async function coordinatorRepoMirror(
   args: CoordinatorRepoMirrorArguments,
 ): Promise<Api.MirrorInfo> {
   return V.parseMirrorInfo(await handle.repoMirror(JSON.stringify(args)));
+}
+
+/** A handle that serves `coordinator.reseed`. */
+export interface NativeCoordinatorReseed {
+  reseed(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `coordinator.reseed` caller names; its handle binds the rest. */
+export type CoordinatorReseedArguments = Pick<Api.ReseedRequest, 'workspace' | 'from' | 'dryRun'>;
+
+/**
+ * Replaces a workspace's build volume with a clone of an existing target seed.
+ */
+export async function coordinatorReseed(
+  handle: NativeCoordinatorReseed,
+  args: CoordinatorReseedArguments,
+): Promise<Api.ReseedResult> {
+  return V.parseReseedResult(await handle.reseed(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.resize`. */
