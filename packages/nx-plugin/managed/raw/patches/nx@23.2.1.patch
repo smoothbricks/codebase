@@ -629,7 +629,7 @@ index c2a2f8f70fe71940e47c97931c5925bac1fbd480..39582a8fc342ae59decd3d4ca25179f2
          (0, file_change_events_1.notifyFileChangeListeners)({ createdFiles, updatedFiles, deletedFiles });
          (0, file_watcher_sockets_1.notifyFileWatcherSockets)(createdFiles, updatedFiles, deletedFiles);
          // Bump generation synchronously so any in-flight compute fails its
-diff --git a/node_modules/nx/dist/src/daemon/server/restart-checks.d.ts b/dist/src/daemon/server/restart-checks.d.ts
+diff --git a/dist/src/daemon/server/restart-checks.d.ts b/dist/src/daemon/server/restart-checks.d.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..65660f0d5f7789d64ad26b0a9644f23949e79831
 --- /dev/null
@@ -644,7 +644,7 @@ index 0000000000000000000000000000000000000000..65660f0d5f7789d64ad26b0a9644f239
 +export declare function restartDaemonIfLockFilesChanged(paths: string[]): boolean;
 +export declare function stopDaemonIfReplaced(events: WatchEvent[]): boolean;
 +export declare function stopDaemonIfOutdated(): boolean;
-diff --git a/node_modules/nx/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
+diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..e45f9d2c918a1d33b6ebb29be76dfb2eecd37b45
 --- /dev/null
@@ -1400,6 +1400,112 @@ index f756066cc6009478b6e16136d8ba4b5a5614c63c..7b0f3b4b5b270650f2ac0a1c28259e84
      }
      // We only care about options, so we don't need to scan source files, and thus
      // `readDirectory` is stubbed for performance.
+diff --git a/dist/src/project-graph/build-project-graph.js b/dist/src/project-graph/build-project-graph.js
+index 28c9655c4612dcc85a881816f172dce98642bb0c..ea65f019024da507dd81f4ace12020914a6f97a1 100644
+--- a/dist/src/project-graph/build-project-graph.js
++++ b/dist/src/project-graph/build-project-graph.js
+@@ -93,7 +93,7 @@ async function buildProjectGraphUsingProjectFileMap(projectRootMap, externalNode
+     try {
+         const context = createContext(projects, nxJson, externalNodes, fileMap, filesToProcess);
+         projectGraph = await buildProjectGraphUsingContext(externalNodes, context, cachedFileData, projectGraphVersion, plugins, sourceMap);
+-        projectFileMapCache = (0, nx_deps_cache_1.createProjectFileMapCache)(nxJson, packageJsonDeps, fileMap, rootTsConfig, externalNodesHash);
++        projectFileMapCache = (0, nx_deps_cache_1.createProjectFileMapCache)(nxJson, packageJsonDeps, fileMap, rootTsConfig, externalNodesHash, projects);
+     }
+     catch (e) {
+         // we need to include the workspace validity errors in the final error
+diff --git a/dist/src/project-graph/nx-deps-cache.d.ts b/dist/src/project-graph/nx-deps-cache.d.ts
+index 5bc1e76b319294101cc9b038dc6eb0ad01036b13..baf7908aeb206f1c4e26ed0c8578465d8b510776 100644
+--- a/dist/src/project-graph/nx-deps-cache.d.ts
++++ b/dist/src/project-graph/nx-deps-cache.d.ts
+@@ -11,6 +11,8 @@ export interface FileMapCache {
+     pluginsConfig?: any;
+     fileMap: FileMap;
+     externalNodesHash?: string;
++    /** Missing only in caches written before package-resolution invalidation. */
++    projectResolution?: string;
+ }
+ export declare const nxProjectGraph: string;
+ export declare const nxFileMap: string;
+@@ -25,7 +27,7 @@ export declare function createProjectFileMapCache(nxJson: NxJsonConfiguration<'*
+             [p: string]: any;
+         };
+     };
+-}, externalNodesHash: string): FileMapCache;
++}, externalNodesHash: string, projects: Record<string, ProjectConfiguration>): FileMapCache;
+ export declare function writeCache(cache: FileMapCache, projectGraph: ProjectGraph, sourceMaps: ConfigurationSourceMaps, errors: ProjectGraphErrorTypes[]): void;
+ /**
+  * Writes the cache only if the on-disk cache file has been modified since
+diff --git a/dist/src/project-graph/nx-deps-cache.js b/dist/src/project-graph/nx-deps-cache.js
+index a880a6620cd7ac46e4bd189bc2034ce58825769a..ef3c99a115e7114ea78da379316a0478e45fbeea 100644
+--- a/dist/src/project-graph/nx-deps-cache.js
++++ b/dist/src/project-graph/nx-deps-cache.js
+@@ -120,7 +120,7 @@ function readSourceMapsCache() {
+     perf_hooks_1.performance.measure('read cache', 'read source-maps:start', 'read source-maps:end');
+     return data ?? null;
+ }
+-function createProjectFileMapCache(nxJson, packageJsonDeps, fileMap, tsConfig, externalNodesHash) {
++function createProjectFileMapCache(nxJson, packageJsonDeps, fileMap, tsConfig, externalNodesHash, projects) {
+     const nxJsonPlugins = getNxJsonPluginsData(nxJson, packageJsonDeps);
+     const newValue = {
+         version: '6.0',
+@@ -131,9 +131,29 @@ function createProjectFileMapCache(nxJson, packageJsonDeps, fileMap, tsConfig, e
+         pluginsConfig: nxJson?.pluginsConfig,
+         fileMap,
+         externalNodesHash,
++        projectResolution: projectResolutionIdentity(projects),
+     };
+     return newValue;
+ }
++// Dependency resolution reads project roots and package metadata, even when
++// the importing files have not changed. Do not key unrelated targets or tags.
++// Preserve enumeration order: package-name collisions are last-writer-wins
++// and wildcard export lookup uses the first matching entry.
++function projectResolutionIdentity(projects) {
++    return JSON.stringify(Object.keys(projects).map((name) => {
++        const project = projects[name];
++        const js = project.metadata?.js;
++        return [
++            name,
++            project.root,
++            js?.packageName,
++            js?.packageVersion,
++            js?.packageExports,
++            js?.packageMain,
++            js?.isInPackageManagerWorkspaces,
++        ];
++    }));
++}
+ /**
+  * Tracks the mtime of the project graph cache file after the last successful
+  * writeCache() call. Used by writeCacheIfStale() to skip redundant writes
+@@ -230,19 +250,19 @@ function shouldRecomputeWholeGraph(cache, packageJsonDeps, projects, nxJson, tsC
+     if (cache.nxVersion !== versions_1.nxVersion) {
+         return true;
+     }
+-    // we have a cached project that is no longer present
+-    const cachedNodes = Object.keys(cache.fileMap.projectFileMap);
+-    if (cachedNodes.some((p) => projects[p] === undefined)) {
++    // Legacy caches have no resolution identity and must be rebuilt once.
++    // A new package can resolve an unchanged import just as a renamed one can.
++    if (cache.projectResolution !== projectResolutionIdentity(projects)) {
+         return true;
+     }
+-    // a path mapping for an existing project has changed
+-    if (Object.keys(cache.pathMappings).some((t) => {
++    // Added aliases can resolve unchanged imports; compare the whole key set.
++    const cachedPaths = Object.keys(cache.pathMappings);
++    const paths = tsConfig?.compilerOptions?.paths || {};
++    if (cachedPaths.length !== Object.keys(paths).length || cachedPaths.some((t) => {
+         const cached = cache.pathMappings && cache.pathMappings[t]
+             ? JSON.stringify(cache.pathMappings[t])
+             : undefined;
+-        const notCached = tsConfig?.compilerOptions?.paths && tsConfig?.compilerOptions?.paths[t]
+-            ? JSON.stringify(tsConfig.compilerOptions.paths[t])
+-            : undefined;
++        const notCached = paths[t] ? JSON.stringify(paths[t]) : undefined;
+         return cached !== notCached;
+     })) {
+         return true;
 diff --git a/dist/src/project-graph/plugins/get-plugins.js b/dist/src/project-graph/plugins/get-plugins.js
 index df153050063fa81b915d3004d3a87cd397f73b19..7d751ed7b895ea88735361b481c9437339ef7ffa 100644
 --- a/dist/src/project-graph/plugins/get-plugins.js
@@ -2372,6 +2478,485 @@ index 42dc80a7a3551c9fe0737f39388670e9a7a475dd..99ac4a74f9cec802360f365d7ca8fc34
          }
      }
      return cycles.size ? cycles : null;
+diff --git a/dist/src/tasks-runner/task-orchestrator.d.ts b/dist/src/tasks-runner/task-orchestrator.d.ts
+index 6d3dd021b050be5c74803555b361b6502f9693c7..92f1a651861326ad9eb912b83981c9ed6bd1ae7e 100644
+--- a/dist/src/tasks-runner/task-orchestrator.d.ts
++++ b/dist/src/tasks-runner/task-orchestrator.d.ts
+@@ -57,11 +57,13 @@ export declare class TaskOrchestrator {
+     private continuousTaskExitHandled;
+     private cleanupPromise;
+     private signalHandlers;
++    private taskOutputLeases;
+     constructor(hasher: TaskHasher, initiatingProject: string | undefined, initiatingTasks: Task[], projectGraph: ProjectGraph, taskGraph: TaskGraph, nxJson: NxJsonConfiguration, options: NxArgs & DefaultTasksRunnerOptions, bail: boolean, daemon: DaemonClient, outputStyle: string, fullTaskGraph?: TaskGraph);
+     init(): Promise<void>;
+     run(): Promise<{
+         [k: string]: TaskStatus;
+     }>;
++    private runTasks;
+     nextBatch(): Batch;
+     /**
+      * Coordinator loop. All batch operations (hashing, cache resolution)
+@@ -105,12 +107,9 @@ export declare class TaskOrchestrator {
+      * cache fetch + lifecycle to the public method. Returns true if any
+      * tasks were resolved.
+      *
+-     * The coordinator relies on this running unconditionally (when cache
+-     * is enabled): tasks dispatched in step 5 via runTaskDirectly skip
+-     * their own cache lookup on the assumption that this has already
+-     * confirmed them as misses. Excluding cacheMissedHashes preserves that
+-     * invariant — every dispatched hash was queried exactly once — but
+-     * don't add other length-based bails.
++     * The coordinator probes a missing key once while it is queued. Output
++     * targets recheck after reacquiring their cross-client writer lease: a
++     * foreign producer may have completed since the coordinator's lookup.
+      */
+     private resolveCachedTasksBulk;
+     /**
+@@ -124,6 +123,7 @@ export declare class TaskOrchestrator {
+     private applyBatchCachedResults;
+     private hashBatchTasks;
+     applyFromCacheOrRunBatch(doNotSkipCache: boolean, batch: Batch, groupId: number): Promise<TaskResult[]>;
++    private runBatchUnderOutputLease;
+     private runBatch;
+     /**
+      * Rendering a batch's output must never change the batch's results. A throw
+@@ -202,12 +202,11 @@ export declare class TaskOrchestrator {
+      * don't actually compete for parallelism.
+      */
+     resolveCachedTasks(doNotSkipCache: boolean, tasks: Task[], groupId: number): Promise<TaskResult[]>;
++    private resolveCachedTasksUnderOutputLease;
+     /**
+      * Fire a discrete-task worker and track it in pendingDiscreteWorkers until
+-     * it settles. Uses runTaskDirectly (not applyFromCacheOrRun*) because
+-     * resolveCachedTasksBulk already confirmed this task is a cache miss —
+-     * another lookup would re-query the DB and (for Nx Cloud users) repeat
+-     * the remote HTTP retrieval.
++     * it settles. Output-producing tasks recheck the cache after taking their
++     * writer lease; tasks without outputs use the coordinator's confirmed miss.
+      */
+     private dispatchDiscreteWorker;
+     /**
+@@ -219,14 +218,15 @@ export declare class TaskOrchestrator {
+      */
+     private handleDiscreteWorkerFailure;
+     /**
+-     * Spawn and wait on a task's child process, unconditionally — no cache
+-     * lookup. Callers must have already confirmed the task is a cache miss
+-     * (or disabled caching entirely).
++     * Own a target's output through cache recheck, execution and capture.
++     * Targets without outputs retain the coordinator's confirmed-miss fast path.
+      */
+     runTaskDirectly(doNotSkipCache: boolean, task: Task, groupId: number): Promise<TaskResult>;
++    private runTaskUnderOutputLease;
+     private runTask;
+     private runTaskInForkedProcess;
+     startContinuousTask(task: Task, groupId: number): Promise<RunningTask | SharedRunningTask>;
++    private startOwnedContinuousTask;
+     private preRunSteps;
+     private postRunSteps;
+     private scheduleNextTasksAndReleaseThreads;
+diff --git a/dist/src/tasks-runner/task-orchestrator.js b/dist/src/tasks-runner/task-orchestrator.js
+index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca5554d744 100644
+--- a/dist/src/tasks-runner/task-orchestrator.js
++++ b/dist/src/tasks-runner/task-orchestrator.js
+@@ -29,6 +29,7 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
+ const task_env_1 = require("./task-env");
+ const tasks_schedule_1 = require("./tasks-schedule");
+ const utils_1 = require("./utils");
++const { TaskOutputLeases } = require("./task-output-lease");
+ /**
+  * Resolve a batch executor's per-task result to a TaskStatus. Prefers an
+  * explicit `status` from the executor; falls back to the `success` boolean
+@@ -79,11 +80,9 @@ class TaskOrchestrator {
+         // underlying real tasks become the anchors.
+         this.initializingTaskIds = (0, utils_1.expandInitiatingTasksThroughNoop)(this.initiatingTasks, this.taskGraph, this.projectGraph);
+         this.processedTasks = new Map();
+-        // Hashes confirmed absent from the cache this run. A confirmed miss can
+-        // only become a hit when the task itself runs — and then it leaves the
+-        // schedule — so a missed hash never needs re-querying. Without this, a
+-        // miss waiting for a worker slot is re-queried (including the remote
+-        // retrieval) on every coordinator cycle.
++        // Probe a queued miss once, not on every coordinator wakeup.
++        // Output producers recheck after taking their cross-client lease: a
++        // foreign client can populate the key while this worker is queued.
+         this.cacheMissedHashes = new Set();
+         this.completedTasks = new Map();
+         this.waitingForTasks = [];
+@@ -106,6 +105,7 @@ class TaskOrchestrator {
+         this.continuousTaskExitHandled = new Map();
+         this.cleanupPromise = null;
+         this.signalHandlers = [];
++        this.taskOutputLeases = new TaskOutputLeases(getThreadPoolSize(this.options, this.taskGraph).total, this.taskInvocationTracker);
+     }
+     async init() {
+         this.setupSignalHandlers();
+@@ -125,6 +125,20 @@ class TaskOrchestrator {
+         }
+     }
+     async run() {
++        try {
++            return await this.runTasks();
++        }
++        finally {
++            try {
++                await this.cleanup();
++                await this.dispose();
++            }
++            finally {
++                await this.taskOutputLeases.close();
++            }
++        }
++    }
++    async runTasks() {
+         await this.init();
+         perf_hooks_1.performance.mark('task-execution:start');
+         const { discrete, continuous, total } = getThreadPoolSize(this.options, this.taskGraph);
+@@ -159,8 +173,6 @@ class TaskOrchestrator {
+         if (!this.stopRequested) {
+             this.cache.removeOldCacheRecords();
+         }
+-        await this.cleanup();
+-        await this.dispose();
+         // Public API (defaultTasksRunner) returns a plain object keyed by
+         // task id. Internal state is a Map for faster lookup.
+         return Object.fromEntries(this.completedTasks);
+@@ -413,12 +425,9 @@ class TaskOrchestrator {
+      * cache fetch + lifecycle to the public method. Returns true if any
+      * tasks were resolved.
+      *
+-     * The coordinator relies on this running unconditionally (when cache
+-     * is enabled): tasks dispatched in step 5 via runTaskDirectly skip
+-     * their own cache lookup on the assumption that this has already
+-     * confirmed them as misses. Excluding cacheMissedHashes preserves that
+-     * invariant — every dispatched hash was queried exactly once — but
+-     * don't add other length-based bails.
++     * The coordinator probes a missing key once while it is queued. Output
++     * targets recheck after reacquiring their cross-client writer lease: a
++     * foreign producer may have completed since the coordinator's lookup.
+      */
+     async resolveCachedTasksBulk() {
+         const { scheduledTasks } = this.tasksSchedule.getAllScheduledTasks();
+@@ -514,6 +523,13 @@ class TaskOrchestrator {
+         await (0, hash_task_1.hashTasks)(this.hasher, this.projectGraph, this.fullTaskGraph, perTaskEnvs, this.taskDetails, tasks);
+     }
+     async applyFromCacheOrRunBatch(doNotSkipCache, batch, groupId) {
++        const tasks = Object.values(batch.taskGraph.tasks);
++        return this.taskOutputLeases.withTasks(tasks, async () => {
++            for (const task of tasks) this.cacheMissedHashes.delete(task.hash);
++            return this.runBatchUnderOutputLease(doNotSkipCache, batch, groupId);
++        });
++    }
++    async runBatchUnderOutputLease(doNotSkipCache, batch, groupId) {
+         const applyFromCacheOrRunBatchStart = perf_hooks_1.performance.mark('TaskOrchestrator-apply-from-cache-or-run-batch:start');
+         const taskEntries = Object.entries(batch.taskGraph.tasks);
+         const tasks = taskEntries.map(([, task]) => task);
+@@ -571,7 +587,7 @@ class TaskOrchestrator {
+         const tasksCompleted = taskEntries.filter(([taskId]) => this.completedTasks.has(taskId));
+         // Batch is still not done, run it again
+         if (tasksCompleted.length !== taskEntries.length) {
+-            await this.applyFromCacheOrRunBatch(doNotSkipCache, {
++            await this.runBatchUnderOutputLease(doNotSkipCache, {
+                 id: batch.id,
+                 executorName: batch.executorName,
+                 taskGraph: (0, utils_1.removeTasksFromTaskGraph)(batch.taskGraph, tasksCompleted.map(([taskId]) => taskId)),
+@@ -810,6 +826,20 @@ class TaskOrchestrator {
+      * don't actually compete for parallelism.
+      */
+     async resolveCachedTasks(doNotSkipCache, tasks, groupId) {
++        if (!doNotSkipCache || tasks.length === 0) return [];
++        // Hold only one independent target while resolving it. Acquiring a set
++        // of unrelated cache-hit leases would block disjoint work behind one
++        // foreign producer, and partial acquisition in different orders deadlocks.
++        const withoutOutputs = tasks.filter((task) => task.outputs.length === 0);
++        const results = await Promise.all([
++            this.resolveCachedTasksUnderOutputLease(doNotSkipCache, withoutOutputs, groupId),
++            ...tasks.filter((task) => task.outputs.length > 0).map((task) =>
++                this.taskOutputLeases.withTasks([task], () =>
++                    this.resolveCachedTasksUnderOutputLease(doNotSkipCache, [task], groupId))),
++        ]);
++        return results.flat();
++    }
++    async resolveCachedTasksUnderOutputLease(doNotSkipCache, tasks, groupId) {
+         if (!doNotSkipCache || tasks.length === 0)
+             return [];
+         const cacheableTasks = tasks.filter((t) => t.cache);
+@@ -836,10 +866,8 @@ class TaskOrchestrator {
+     }
+     /**
+      * Fire a discrete-task worker and track it in pendingDiscreteWorkers until
+-     * it settles. Uses runTaskDirectly (not applyFromCacheOrRun*) because
+-     * resolveCachedTasksBulk already confirmed this task is a cache miss —
+-     * another lookup would re-query the DB and (for Nx Cloud users) repeat
+-     * the remote HTTP retrieval.
++     * it settles. Output-producing tasks recheck the cache after taking their
++     * writer lease; tasks without outputs use the coordinator's confirmed miss.
+      */
+     dispatchDiscreteWorker(doNotSkipCache, task, groupId) {
+         const worker = this.runTaskDirectly(doNotSkipCache, task, groupId)
+@@ -870,11 +898,21 @@ class TaskOrchestrator {
+         await this.postRunSteps([{ task, status: 'failure', terminalOutput }], doNotSkipCache, groupId);
+     }
+     /**
+-     * Spawn and wait on a task's child process, unconditionally — no cache
+-     * lookup. Callers must have already confirmed the task is a cache miss
+-     * (or disabled caching entirely).
++     * Own a target's output through cache recheck, execution and capture.
++     * Targets without outputs retain the coordinator's confirmed-miss fast path.
+      */
+     async runTaskDirectly(doNotSkipCache, task, groupId) {
++        return this.taskOutputLeases.withTasks([task], async () => {
++            if (doNotSkipCache && task.outputs.length > 0) {
++                // A foreign client may have populated this key while we waited.
++                this.cacheMissedHashes.delete(task.hash);
++                const cached = await this.resolveCachedTasksUnderOutputLease(true, [task], groupId);
++                if (cached.length > 0) return cached[0];
++            }
++            return this.runTaskUnderOutputLease(doNotSkipCache, task, groupId);
++        });
++    }
++    async runTaskUnderOutputLease(doNotSkipCache, task, groupId) {
+         // Wait for task to be processed
+         const taskSpecificEnv = await this.processedTasks.get(task.id);
+         await this.preRunSteps([task], { groupId });
+@@ -1086,6 +1124,16 @@ class TaskOrchestrator {
+             await this.scheduleNextTasksAndReleaseThreads();
+             return runningTask;
+         }
++        const release = await this.taskOutputLeases.acquire([task]);
++        try {
++            return await this.startOwnedContinuousTask(task, groupId, release);
++        }
++        catch (error) {
++            await release();
++            throw error;
++        }
++    }
++    async startOwnedContinuousTask(task, groupId, release) {
+         const taskSpecificEnv = await this.processedTasks.get(task.id);
+         await this.preRunSteps([task], { groupId });
+         const pipeOutput = await this.pipeOutputCapture(task);
+@@ -1105,10 +1153,10 @@ class TaskOrchestrator {
+             groupId,
+             ownsRunningTasksService: true,
+         });
+-        this.continuousTaskExitHandled.set(task.id, new Promise((resolve) => {
+-            childProcess.onExit(async (code) => {
+-                await this.handleContinuousTaskExit(code, task, groupId, true);
+-                resolve();
++        this.continuousTaskExitHandled.set(task.id, new Promise((resolve, reject) => {
++            childProcess.onExit((code) => {
++                this.handleContinuousTaskExit(code, task, groupId, true)
++                    .finally(release).then(resolve, reject);
+             });
+         }));
+         await this.scheduleNextTasksAndReleaseThreads();
+@@ -1376,6 +1424,7 @@ class TaskOrchestrator {
+         return this.cleanupPromise;
+     }
+     async performCleanup() {
++        await this.taskOutputLeases.cancelPending();
+         // Mark all running tasks for intentional stop
+         const reason = this.stopRequested ? 'interrupted' : 'fulfilled';
+         for (const entry of this.runningContinuousTasks.values()) {
+diff --git a/dist/src/tasks-runner/task-output-lease.d.ts b/dist/src/tasks-runner/task-output-lease.d.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..468b5ae960880907b0eed7754f7a43d911693c5d
+--- /dev/null
++++ b/dist/src/tasks-runner/task-output-lease.d.ts
+@@ -0,0 +1,10 @@
++import { Task } from '../config/task-graph';
++import { TaskInvocationTracker } from '../native';
++/** A target's cross-client ownership from cache lookup/restore through execution and cache capture. */
++export declare class TaskOutputLeases {
++    constructor(parallelism: number, invocationTracker: TaskInvocationTracker | null);
++    acquire(tasks: readonly Task[]): Promise<() => Promise<void>>;
++    withTasks<T>(tasks: readonly Task[], action: () => Promise<T>): Promise<T>;
++    cancelPending(): Promise<void>;
++    close(): Promise<void>;
++}
+diff --git a/dist/src/tasks-runner/task-output-lease.js b/dist/src/tasks-runner/task-output-lease.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..66cea0bcc92160207843bb011075a07ace014275
+--- /dev/null
++++ b/dist/src/tasks-runner/task-output-lease.js
+@@ -0,0 +1,177 @@
++"use strict";
++const { channel } = require("node:diagnostics_channel");
++const { writeFileSync } = require("node:fs");
++const { join } = require("node:path");
++const { fork } = require("node:child_process");
++const { FileLock, hashArray } = require("../native");
++const { workspaceDataDirectory } = require("../utils/cache-directory");
++const events = channel("nx:task-output-lease");
++
++// FileLock.lock() is synchronous. Reusable helper processes keep a contended
++// lock off the client's event loop. Unlike a worker thread inside a blocking
++// native call, a helper can be cancelled immediately by the kernel. Persistent
++// lock files are never unlinked or replaced.
++if (process.argv[2] === "--nx-task-output-lease-worker") {
++    let held = [];
++    process.on("disconnect", () => process.exit(0));
++    process.on("message", (message) => {
++        try {
++            if (message.type === "acquire") {
++                for (const path of message.paths) {
++                    const lock = new FileLock(path);
++                    lock.lock();
++                    held.push({ lock, path });
++                    writeFileSync(path, JSON.stringify({ pid: process.pid, clientPid: process.ppid, targets: message.targets }));
++                }
++                process.send({ type: "acquired" });
++            }
++            else if (message.type === "release") {
++                for (const { lock, path } of held.reverse()) {
++                    writeFileSync(path, "");
++                    lock.unlock();
++                }
++                held = [];
++                process.send({ type: "released" });
++            }
++        }
++        catch (error) {
++            for (const { lock } of held.reverse()) {
++                lock.unlock();
++            }
++            held = [];
++            process.send({ type: "error", message: error.message, stack: error.stack });
++        }
++    });
++}
++else {
++    class TaskOutputLeases {
++        constructor(parallelism, invocationTracker) {
++            this.invocationTracker = invocationTracker;
++            this.parallelism = Math.max(1, parallelism);
++            this.workers = new Set();
++            this.idle = [];
++            this.waiters = [];
++            this.stopping = false;
++            this.closed = false;
++        }
++        async acquire(tasks) {
++            // Configurations and overrides can publish the same output directory.
++            // They share the project's target lease, not a configuration or hash.
++            const targets = [...new Set(tasks.filter((task) => task.outputs.length > 0)
++                .map((task) => `${task.target.project}:${task.target.target}`))].sort();
++            if (targets.length === 0) {
++                return async () => {};
++            }
++            if (this.stopping) {
++                throw new Error(`Cannot acquire task output lease after disposal: ${targets.join(", ")}`);
++            }
++            // Detect an ancestor that owns the same output before blocking.
++            // Configurations share a lease even when their full task ids differ.
++            if (this.invocationTracker && Number(process.env.NX_INVOCATION_ROOT_PID ?? process.pid) !== process.pid) {
++                const chain = this.invocationTracker.getInvocationChain();
++                const ancestor = chain.find((record) => record.parentPid !== process.pid &&
++                    targets.some((target) => record.taskId === target || record.taskId.startsWith(`${target}:`)));
++                if (ancestor) {
++                    throw new Error(`Recursive task output lease: client ${process.pid} cannot acquire ${targets.join(", ")} while ancestor client ${ancestor.parentPid} runs ${ancestor.taskId}; invocation chain: ${chain.map((record) => record.taskId).join(" -> ")}`);
++                }
++            }
++            const paths = targets.map((target) => join(workspaceDataDirectory, "task-output-leases", `${hashArray([target])}.lock`));
++            events.publish({ phase: "waiting", targets, paths, pid: process.pid });
++            let entry = this.idle.pop();
++            if (!entry && this.workers.size >= this.parallelism) {
++                entry = await new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
++            }
++            if (!entry) {
++                const worker = fork(__filename, ["--nx-task-output-lease-worker"], {
++                    execPath: process.execPath,
++                    execArgv: [],
++                    stdio: ["ignore", "inherit", "inherit", "ipc"],
++                });
++                entry = { worker, pending: null, failed: null, phase: "idle", exited: null };
++                entry.exited = new Promise((resolve) => worker.once("exit", resolve));
++                this.workers.add(entry);
++                worker.on("message", (message) => {
++                    const pending = entry.pending;
++                    entry.pending = null;
++                    if (message.type === "error") {
++                        const error = new Error(`Task output lease for ${entry.targets.join(", ")} at ${entry.paths.join(", ")} failed: ${message.message}`);
++                        error.stack += `\nCaused by lease helper:\n${message.stack}`;
++                        entry.failed = error;
++                        pending?.reject(error);
++                    }
++                    else {
++                        pending?.resolve();
++                    }
++                });
++                worker.on("error", (cause) => {
++                    const error = new Error(`Task output lease helper failed for ${entry.targets.join(", ")} at ${entry.paths.join(", ")}`, { cause });
++                    entry.failed = error;
++                    entry.pending?.reject(error);
++                    entry.pending = null;
++                });
++                worker.on("exit", (code, signal) => {
++                    entry.failed ??= new Error(`Task output lease worker exited (code ${code}, signal ${signal ?? "none"}) for ${entry.targets.join(", ")} at ${entry.paths.join(", ")}`);
++                    entry.pending?.reject(entry.failed);
++                    entry.pending = null;
++                    this.workers.delete(entry);
++                });
++            }
++            entry.targets = targets;
++            entry.paths = paths;
++            entry.phase = "acquiring";
++            await this.exchange(entry, { type: "acquire", targets, paths });
++            entry.phase = "held";
++            events.publish({ phase: "acquired", targets, paths, pid: process.pid });
++            let released = false;
++            return async () => {
++                if (released || this.closed) return;
++                released = true;
++                entry.phase = "releasing";
++                await this.exchange(entry, { type: "release" });
++                entry.phase = "idle";
++                events.publish({ phase: "released", targets, paths, pid: process.pid });
++                const waiter = this.waiters.shift();
++                if (waiter) waiter.resolve(entry);
++                else this.idle.push(entry);
++            };
++        }
++        exchange(entry, message) {
++            if (entry.failed) return Promise.reject(entry.failed);
++            return new Promise((resolve, reject) => {
++                entry.pending = { resolve, reject };
++                entry.worker.send(message);
++            });
++        }
++        async withTasks(tasks, action) {
++            const release = await this.acquire(tasks);
++            try {
++                return await action();
++            }
++            finally {
++                await release();
++            }
++        }
++        async cancelPending() {
++            this.stopping = true;
++            for (const waiter of this.waiters.splice(0)) {
++                waiter.reject(new Error("Task output lease acquisition cancelled during runner cleanup"));
++            }
++            await Promise.all([...this.workers]
++                .filter((entry) => entry.phase === "acquiring")
++                .map((entry) => {
++                    entry.worker.kill("SIGTERM");
++                    return entry.exited;
++                }));
++        }
++        async close() {
++            await this.cancelPending();
++            this.closed = true;
++            await Promise.all([...this.workers].map((entry) => {
++                entry.worker.kill("SIGTERM");
++                return entry.exited;
++            }));
++            this.idle.length = 0;
++        }
++    }
++    exports.TaskOutputLeases = TaskOutputLeases;
++}
 diff --git a/dist/src/utils/installation-directory.d.ts b/dist/src/utils/installation-directory.d.ts
 index dc1784edc9f48944589213847e653720b25990fc..f830bb52acb7f4652e45ea4afb7a24adc4adf7a8 100644
 --- a/dist/src/utils/installation-directory.d.ts
@@ -2788,109 +3373,3 @@ index 74f0682269ede01ee9ee4819e39f38c90a719894..03686ffeeff54286b99386fddeef77d0
 +        }
      }
  }
-diff --git a/dist/src/project-graph/build-project-graph.js b/dist/src/project-graph/build-project-graph.js
-index 28c9655c4612dcc85a881816f172dce98642bb0c..ea65f019024da507dd81f4ace12020914a6f97a1 100644
---- a/dist/src/project-graph/build-project-graph.js
-+++ b/dist/src/project-graph/build-project-graph.js
-@@ -93,7 +93,7 @@ async function buildProjectGraphUsingProjectFileMap(projectRootMap, externalNode
-     try {
-         const context = createContext(projects, nxJson, externalNodes, fileMap, filesToProcess);
-         projectGraph = await buildProjectGraphUsingContext(externalNodes, context, cachedFileData, projectGraphVersion, plugins, sourceMap);
--        projectFileMapCache = (0, nx_deps_cache_1.createProjectFileMapCache)(nxJson, packageJsonDeps, fileMap, rootTsConfig, externalNodesHash);
-+        projectFileMapCache = (0, nx_deps_cache_1.createProjectFileMapCache)(nxJson, packageJsonDeps, fileMap, rootTsConfig, externalNodesHash, projects);
-     }
-     catch (e) {
-         // we need to include the workspace validity errors in the final error
-diff --git a/dist/src/project-graph/nx-deps-cache.d.ts b/dist/src/project-graph/nx-deps-cache.d.ts
-index 5bc1e76b319294101cc9b038dc6eb0ad01036b13..baf7908aeb206f1c4e26ed0c8578465d8b510776 100644
---- a/dist/src/project-graph/nx-deps-cache.d.ts
-+++ b/dist/src/project-graph/nx-deps-cache.d.ts
-@@ -11,6 +11,8 @@ export interface FileMapCache {
-     pluginsConfig?: any;
-     fileMap: FileMap;
-     externalNodesHash?: string;
-+    /** Missing only in caches written before package-resolution invalidation. */
-+    projectResolution?: string;
- }
- export declare const nxProjectGraph: string;
- export declare const nxFileMap: string;
-@@ -25,7 +27,7 @@ export declare function createProjectFileMapCache(nxJson: NxJsonConfiguration<'*
-             [p: string]: any;
-         };
-     };
--}, externalNodesHash: string): FileMapCache;
-+}, externalNodesHash: string, projects: Record<string, ProjectConfiguration>): FileMapCache;
- export declare function writeCache(cache: FileMapCache, projectGraph: ProjectGraph, sourceMaps: ConfigurationSourceMaps, errors: ProjectGraphErrorTypes[]): void;
- /**
-  * Writes the cache only if the on-disk cache file has been modified since
-diff --git a/dist/src/project-graph/nx-deps-cache.js b/dist/src/project-graph/nx-deps-cache.js
-index a880a6620cd7ac46e4bd189bc2034ce58825769a..ef3c99a115e7114ea78da379316a0478e45fbeea 100644
---- a/dist/src/project-graph/nx-deps-cache.js
-+++ b/dist/src/project-graph/nx-deps-cache.js
-@@ -120,7 +120,7 @@ function readSourceMapsCache() {
-     perf_hooks_1.performance.measure('read cache', 'read source-maps:start', 'read source-maps:end');
-     return data ?? null;
- }
--function createProjectFileMapCache(nxJson, packageJsonDeps, fileMap, tsConfig, externalNodesHash) {
-+function createProjectFileMapCache(nxJson, packageJsonDeps, fileMap, tsConfig, externalNodesHash, projects) {
-     const nxJsonPlugins = getNxJsonPluginsData(nxJson, packageJsonDeps);
-     const newValue = {
-         version: '6.0',
-@@ -131,9 +131,29 @@ function createProjectFileMapCache(nxJson, packageJsonDeps, fileMap, tsConfig, e
-         pluginsConfig: nxJson?.pluginsConfig,
-         fileMap,
-         externalNodesHash,
-+        projectResolution: projectResolutionIdentity(projects),
-     };
-     return newValue;
- }
-+// Dependency resolution reads project roots and package metadata, even when
-+// the importing files have not changed. Do not key unrelated targets or tags.
-+// Preserve enumeration order: package-name collisions are last-writer-wins
-+// and wildcard export lookup uses the first matching entry.
-+function projectResolutionIdentity(projects) {
-+    return JSON.stringify(Object.keys(projects).map((name) => {
-+        const project = projects[name];
-+        const js = project.metadata?.js;
-+        return [
-+            name,
-+            project.root,
-+            js?.packageName,
-+            js?.packageVersion,
-+            js?.packageExports,
-+            js?.packageMain,
-+            js?.isInPackageManagerWorkspaces,
-+        ];
-+    }));
-+}
- /**
-  * Tracks the mtime of the project graph cache file after the last successful
-  * writeCache() call. Used by writeCacheIfStale() to skip redundant writes
-@@ -230,19 +250,19 @@ function shouldRecomputeWholeGraph(cache, packageJsonDeps, projects, nxJson, tsC
-     if (cache.nxVersion !== versions_1.nxVersion) {
-         return true;
-     }
--    // we have a cached project that is no longer present
--    const cachedNodes = Object.keys(cache.fileMap.projectFileMap);
--    if (cachedNodes.some((p) => projects[p] === undefined)) {
-+    // Legacy caches have no resolution identity and must be rebuilt once.
-+    // A new package can resolve an unchanged import just as a renamed one can.
-+    if (cache.projectResolution !== projectResolutionIdentity(projects)) {
-         return true;
-     }
--    // a path mapping for an existing project has changed
--    if (Object.keys(cache.pathMappings).some((t) => {
-+    // Added aliases can resolve unchanged imports; compare the whole key set.
-+    const cachedPaths = Object.keys(cache.pathMappings);
-+    const paths = tsConfig?.compilerOptions?.paths || {};
-+    if (cachedPaths.length !== Object.keys(paths).length || cachedPaths.some((t) => {
-         const cached = cache.pathMappings && cache.pathMappings[t]
-             ? JSON.stringify(cache.pathMappings[t])
-             : undefined;
--        const notCached = tsConfig?.compilerOptions?.paths && tsConfig?.compilerOptions?.paths[t]
--            ? JSON.stringify(tsConfig.compilerOptions.paths[t])
--            : undefined;
-+        const notCached = paths[t] ? JSON.stringify(paths[t]) : undefined;
-         return cached !== notCached;
-     })) {
-         return true;
