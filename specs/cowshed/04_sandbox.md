@@ -494,10 +494,12 @@ Controller-owned, host-readable while the image is detached, outside the workspa
   touch, even when a legacy 16-port block grows into an upper-half 32-port block. Cell claims and newly owned kernel
   listeners stay held through the authoritative inventory re-read and durable grant publication. A block is held for the
   workspace's whole life, attached or detached: detach closes the gateway listener on `base` but releases no port, and
-  only retirement frees the block and its retained blocks. The range therefore bounds how many workspaces a host holds
-  at once — 256 at the initial size. It ends just below the macOS ephemeral range (`net.inet.ip.portrange.first`,
-  49152), so no outbound connection's local port falls inside a block. Port blocks already allocated in the earlier
-  range starting at 40960 remain valid.
+  only retirement frees the block and its retained blocks. With one initial-size block per workspace, capacity is
+  `floor(R / S)`, where R is the configured reserved range's port count and S the initial block size. Mixed-size and
+  retained blocks consume their actual port footprint; admission requires a free aligned block, never a fixed
+  workspace-count ceiling. The range ends just below the macOS ephemeral range (`net.inet.ip.portrange.first`, 49152),
+  so no outbound connection's local port falls inside a block. Port blocks already allocated in the earlier range
+  starting at 40960 remain valid; that former range is not a host workspace limit.
 - **Port capacity grows only by grant.** `GrantDelta.service_ports = N` (`cowshed grant <ws> --ports <N>`) requires the
   block to hold at least N service ports, the gateway port excluded: the target size is the smallest power of two of at
   least N+1. Growth is monotone — a count the current block already holds leaves the block, the revision, and the

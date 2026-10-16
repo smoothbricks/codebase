@@ -410,15 +410,15 @@ parser and `hdiutil` busy/dissent recognition remain unchanged. Permission, auth
 general and unrecognized failures are errors, never grace or force authority. Every detach runs `-verbose`; the
 `detach image` span retains `dissent=<reason>` on refusal and `waited=<account>` for an accepted detach slower than 1 s.
 
-The existing disk-image child policy warns at 120 s and every 30 s thereafter rather than killing an in-flight
-`hdiutil detach`; neither that policy nor the grace is widened. The kernel's I/O Registry is the one host view that maps
-an image's path to its devices (`diskutil image info` reports none): one `IOServiceGetMatchingServices("IOMedia")`
-snapshot, each node walked up to its `AppleDiskImageDevice` and that device's `DiskImageURL`. `hdiutil info -plist` is
-not an inventory: while any other image attaches or detaches it answers a truncated image list with nothing marking it
-(a reviewer probe that kept one image attached while churning another saw it missing from 11–89 of every 648–1551 polls,
-and from none of the same polls' registry reads). Reading that omission as absence once skipped a post-format release,
-leaving the image attached for `diskutil image resize` to refuse as busy, and once lost a mounted workspace's attachment
-on restart.
+The disk-image child policy warns at the caller's deadline and reports progress at the caller's configured cadence,
+rather than killing an in-flight `hdiutil detach`; this does not widen the release grace. The kernel's I/O Registry is
+the one host view that maps an image's path to its devices (`diskutil image info` reports none): one
+`IOServiceGetMatchingServices("IOMedia")` snapshot, each node walked up to its `AppleDiskImageDevice` and that device's
+`DiskImageURL`. `hdiutil info -plist` is not an inventory: while any other image attaches or detaches it answers a
+truncated image list with nothing marking it (a reviewer probe that kept one image attached while churning another saw
+it missing from 11–89 of every 648–1551 polls, and from none of the same polls' registry reads). Reading that omission
+as absence once skipped a post-format release, leaving the image attached for `diskutil image resize` to refuse as busy,
+and once lost a mounted workspace's attachment on restart.
 
 The image driver registers an attach's media before `diskutil image attach` reports them, so creation requires the
 reported blank whole device to be the image's exact single-device mapping in one registry read before formatting.
@@ -542,23 +542,23 @@ that image's lease, so independent processes serialize on one image while operat
 is no host-wide device lock. A cooperating process acts on a device only after the inventory positively maps the
 identity to it under the lease (or while a raw pin holds it), and a device is freed only by a detach the same lease
 covers, so no same-user cowshed process recycles it inside the critical section. A contended lease is awaited on a
-helper thread that hands the locked descriptor back when the holder releases it, bounded by the 120 s disk-child
-deadline; expiry names the lease file, the image and the holder's recorded pid. The lease does **not** constrain another
-user's disk tools or a manual eject during the two mutations that cannot run raw-pinned, `newfs_apfs` and
-`hdiutil detach`, because an open raw pin prevents releasing the device. Before `fsck_apfs` or `mount_apfs`, cowshed
-opens the reported raw volume read-only, then verifies that the attachment inventory maps **both** its whole container
-and its volume to the exact image. A verified attachment owns that raw descriptor across the `attach_verified` → `mount`
-method boundary. A mount lookup of an existing attachment likewise takes the image lease before reading inventory and
-returns a handle owning its raw pin through the kernel mount-table read and mount decision. It is released when an
-already-mounted handle is dropped, after `mount_apfs` finishes, before intentional detach, or before the exclusive
-`diskutil apfs resizeContainer` writer, which cannot run with a raw descriptor open. Independent device ejects during
-container resize after pin release are not covered. While held, the descriptor prevents even external
-`diskutil eject force` or `hdiutil detach -force` from releasing the image and recycling its device name. Every attach
-path, including detached verification and retained read-only mounting, attaches once and refuses a reported device lost
-before pinning without retrying. A conflicting or unreadable mapping fails closed, without running fsck on the reported
-device. No live-fsck option authorizes touching a foreign mounted container. Blank-image formatting keeps its
-image-to-whole-device check under the image's lease; its exclusive formatter cannot share a raw-device descriptor with
-another opener.
+helper thread that hands the locked descriptor back when the holder releases it, within the caller's admission budget;
+expiry names the lease file, the image and the holder's recorded pid, and no disk child has started. The lease does
+**not** constrain another user's disk tools or a manual eject during the two mutations that cannot run raw-pinned,
+`newfs_apfs` and `hdiutil detach`, because an open raw pin prevents releasing the device. Before `fsck_apfs` or
+`mount_apfs`, cowshed opens the reported raw volume read-only, then verifies that the attachment inventory maps **both**
+its whole container and its volume to the exact image. A verified attachment owns that raw descriptor across the
+`attach_verified` → `mount` method boundary. A mount lookup of an existing attachment likewise takes the image lease
+before reading inventory and returns a handle owning its raw pin through the kernel mount-table read and mount decision.
+It is released when an already-mounted handle is dropped, after `mount_apfs` finishes, before intentional detach, or
+before the exclusive `diskutil apfs resizeContainer` writer, which cannot run with a raw descriptor open. Independent
+device ejects during container resize after pin release are not covered. While held, the descriptor prevents even
+external `diskutil eject force` or `hdiutil detach -force` from releasing the image and recycling its device name. Every
+attach path, including detached verification and retained read-only mounting, attaches once and refuses a reported
+device lost before pinning without retrying. A conflicting or unreadable mapping fails closed, without running fsck on
+the reported device. No live-fsck option authorizes touching a foreign mounted container. Blank-image formatting keeps
+its image-to-whole-device check under the image's lease; its exclusive formatter cannot share a raw-device descriptor
+with another opener.
 
 For every mounted attachment:
 
@@ -743,26 +743,26 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    finding whose next step is `cowshed doctor`, never "repair storage", and the system runner records the boot's first:
    the boot is spent, with the image devices' counts and the orphaned helpers at that moment when they can be read,
    until a later attach in the same boot succeeds (killing orphans frees the pool without a reboot) or
-   `cowshed doctor --clear-attach-budget` ends it. That first 150's leaked count becomes the ceiling only when no
-   orphaned helper could have caused it; until one does, the ceiling is the observed 1024, and headroom is the ceiling
-   minus the devices leaked now. A ceiling only moves down and survives reboots, so
-   `cowshed doctor --clear-attach-budget` also forgets it, back to the observed 1024, and keeps the last exhaustion as
-   evidence. A record that does not parse proves nothing: it reads as empty with a warning naming the file, the kernel
-   is still reported, and the next write (a 150, a clear) replaces it. A refusal of the lane gate always names what
-   frees enough: the orphaned helpers for a spent boot the leaked devices do not explain,
-   `cowshed doctor --clear-attach-budget` when the recorded ceiling alone is below the need, and otherwise a reboot,
-   never a guessed daemon restart for unrelated departed-volume references. `doctor` reports `disk-image-attach-budget`:
-   the four classes' instances against their registered entries, the ceiling and its source, the headroom, and the
-   disk-image commands an earlier build killed at its former 15-minute hard deadline this boot, each a probable leaked
-   device (the record keeps them until the boot ends; no current build writes one). It is an error while the boot is
-   spent ("attach pool exhausted", with "reboot required" only when the leaked devices account for it), a warning when
-   the headroom falls to a quarter of the ceiling or a command was killed. Its hint names a reboot for leaked image
-   devices and proven orphaned helpers first for a 150 those devices do not explain. `departed-volume-references` is a
-   separate warning from the first departed APFS-volume or IOMedia instance, with exact counts and a root `lsmp`
-   attribution step; it neither spends attach-pool headroom nor prescribes a daemon restart. Orphaned helpers are named
-   only when two reads in a row agree and no `diskutil` or `hdiutil` ran during either, since a helper whose attach is
-   under way has no device yet and killing it mid-attach is what leaks one; killing orphans frees their mappings, never
-   a leaked device.
+   `cowshed doctor --clear-attach-budget` ends it. The exhaustion record is evidence, never a capacity ceiling: leaked
+   devices are the live class-instance count minus the live registered entries, read at each gate, and no remembered
+   count defines headroom or survives a reboot as an admission limit. The harness refuses only a recorded spent boot,
+   not a forecast of how many attaches remain (08_testing.md, "Host limit"). Clearing the spent-boot fact retains the
+   last exhaustion as evidence. A record that does not parse proves nothing: it reads as empty with a warning naming the
+   file, the kernel is still reported, and the next write (a 150, a clear) replaces it. A refusal names the recorded
+   exhaustion and the live facts that explain its next step: proven orphaned helpers first when their mappings can
+   account for it, otherwise a reboot for leaked image devices, never a guessed daemon restart for unrelated
+   departed-volume references. Clearing a record does not repair the kernel and never grants capacity by raising a
+   ceiling. `doctor` reports `disk-image-attach-budget`: the four classes' live instances, registered entries and
+   differences, the current boot's exhaustion evidence, and disk-image commands an earlier build interrupted, each a
+   probable leaked device (the record keeps them until the boot ends; no current build writes one). It is an error while
+   the boot is spent ("attach pool exhausted", with "reboot required" only when the leaked devices account for it), and
+   a warning when a clean run increases a leak count or an earlier build interrupted a command. Its hint names a reboot
+   for leaked image devices and proven orphaned helpers first for a 150 those devices do not explain.
+   `departed-volume-references` is a separate warning from the first departed APFS-volume or IOMedia instance, with
+   exact counts and a root `lsmp` attribution step; it neither defines attach-pool capacity nor prescribes a daemon
+   restart. Orphaned helpers are named only when two reads in a row agree and no `diskutil` or `hdiutil` ran during
+   either, since a helper whose attach is under way has no device yet and killing it mid-attach is what leaks one;
+   killing orphans frees their mappings, never a leaked device.
 
    **A disk-image command is detached from its caller.** A disk-image command is one that creates or releases an image
    device: any `diskutil image …`, any `hdiutil`, and `diskutil eject` (Disk Arbitration's release of an image device,
@@ -776,16 +776,17 @@ are host facts, not cowshed bugs, and every rule that budgets disk-tool calls ex
    is bounded and reported by name, and a stray's detach gets a short bound before the creator reports it and gives the
    create claim back, so one wedged stray cannot hold a chain of creators.
 
-   **No disk-image command is killed.** For a disk-image command the 120 s disk-child deadline is a warning point, not a
-   kill: it is waited for, synchronously and still holding its leases, and names its verb, its target and the time
-   elapsed on stderr every 30 s, until it ends on its own. A late child that succeeds is a success; one that fails is
-   the caller's failure as always, and an attach's own failure path detaches whatever device it produced. Every other
-   disk child (`diskutil info`, `diskutil apfs …`, `mount_apfs`, …) is still killed at 120 s. The trade-off is explicit:
-   a hung DiskImages2 verb wedges its own operation, and the image lease it holds, for as long as it hangs instead of
-   leaking a device until reboot (the gateway evicts it from its disk phase after 10 s, so the host's other disk work
-   goes on; 05_gateway.md, "Disk-lifecycle lease"). Its caller stays cancellable: a caller that stops waiting leaves the
-   detached command to finish. Callers outside cowshed get the same runner through `cowshed disk-command` (06_cli.md).
-   The orphaned-helper `kill -9` does not contradict this: an orphan serves no device, so killing it strands nothing.
+   **No disk-image command is killed.** For a disk-image command the caller's deadline is a warning point, not a kill:
+   it is waited for, synchronously and still holding its leases, and reports its verb, target, elapsed time and observed
+   progress or lack of progress at the caller's configured cadence, until it ends on its own. A late child that succeeds
+   is a success; one that fails is the caller's failure as always, and an attach's own failure path detaches whatever
+   device it produced. Other disk children (`diskutil info`, `diskutil apfs …`, `mount_apfs`, …) use the caller's
+   execution budget, never a second fixed disk-child timeout. A hung DiskImages2 verb keeps its own operation and image
+   lease pending instead of leaking a device until reboot; the gateway's disk-phase eviction lets unrelated host work
+   continue without killing it (05_gateway.md, "Disk-lifecycle lease"). Its caller stays cancellable: a caller that
+   stops waiting leaves the detached command to finish. Callers outside cowshed get the same runner through
+   `cowshed disk-command` (06_cli.md). The orphaned-helper `kill -9` does not contradict this: an orphan serves no
+   device, so killing it strands nothing.
 
 3. **Detach waits on the kernel and holders.** A non-forced unmount of a volume something holds is refused with `EBUSY`
    and retried; a land's target unmount took 12.2 s on its first try and then about 45 retries, and the image detach
@@ -945,11 +946,12 @@ listing `diskutil apfs list -plist` read back an empty root while an unrelated i
 transient projection. A volume mounted somewhere other than its canonical path is attested by `statfs` at that path
 before it is reported as mis-mounted.
 
-Neither planning nor read-only validation spawns `diskutil`. `diskutil info` is answered through Disk Arbitration, which
-congests when many images are attached: on a host with about 130 images attached, a consumer's test harness saw one
-`diskutil info -plist` of the store volume block for 279 s until its own 300 s deadline interrupted it, and gateways and
-cache services run the same validation at startup. The same call answered in 0.43–0.64 s on that host once the
-congestion passed; validation's latency no longer depends on Disk Arbitration at all.
+Neither planning nor read-only validation spawns `diskutil`; validation uses the caller's budget for the kernel reads,
+not a separate storage-command deadline. Historical evidence: `diskutil info` is answered through Disk Arbitration,
+which congests when many images are attached. On a host with about 130 images attached, a consumer's test harness saw
+one `diskutil info -plist` of the store volume block for 279 s before the harness interrupted it. The same call answered
+in 0.43–0.64 s on that host once congestion passed. Gateways and cache services use the same read-only validation at
+startup; its latency no longer depends on Disk Arbitration at all.
 
 FileVault is therefore derived from the registry record. No registry property names a volume's crypto users, and
 `Encrypted` alone is not FileVault: a volume group's Data volume is encrypted at rest with a hardware-bound key and no

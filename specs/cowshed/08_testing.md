@@ -492,8 +492,9 @@ reporter is unavailable replay only its final 64 KiB under a 10-second bound (th
 failure stops the land. The reporter reads the complete file, not the replayed suffix. The pre-rewrite ancestry cutoff
 remains a separate guard before rebase.
 
-Every test target, the groups included, is bounded by progress alone: the run ends when no test has finished for 180s,
-the hang backstop, and names the tests still running; it has no wall-clock ceiling, and no per-test bound kills a test
+Every test target, the groups included, is bounded by progress alone: the run ends when the time since the last finished
+test reaches its configured `idleTimeoutMs` (`BOUNDED_TEST_IDLE_TIMEOUT_MS` in the plugin's test-target policy), and
+names the tests still running. There is no count-multiplied outer wall-clock budget and no per-test bound kills a test
 (`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries `--no-tests=fail`, so a filter that
 selects nothing fails rather than passing a run of no test. The RAM host walk and real-process CPU-pool
 production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing case bounds. The shards
@@ -502,14 +503,14 @@ exclude `*-host.test.ts`; the host target names both owned host files.
 An unfinished test name is not holder attribution. During the final five seconds of an unchanged no-progress interval,
 the executor takes one bounded pre-signal snapshot of its runner, descendants and retained process group. Resumed
 progress discards and cancels that interval's snapshot. At expiry the executor emits the completed observation, or an
-explicit incomplete-capture result, and starts termination immediately without awaiting a probe. The 180s bound is
-unchanged. Capture timestamps, the offset from the scheduled expiry and the actual expiry-to-capture interval accompany
-the observation. Process rows retain PID, PPID, PGID, state, percent CPU, elapsed time, start identity and command. On
-macOS the open-resource probe invokes `/usr/sbin/lsof` through noninteractive sudo, with an explicitly limited
-ordinary-user fallback. A missing tool, denied privilege, timeout, truncated output or changing process identity is
-incomplete evidence, never an empty holder set. Successful observations with resources, successful observations without
-matches and incomplete/raced captures remain distinct. An open file is not proof of a contested lock, and an admission
-token count or one CPU/state sample does not establish CPU starvation or its absence.
+explicit incomplete-capture result, and starts termination immediately without awaiting a probe. Diagnostic capture does
+not extend the configured no-progress deadline. Capture timestamps, the offset from the scheduled expiry and the actual
+expiry-to-capture interval accompany the observation. Process rows retain PID, PPID, PGID, state, percent CPU, elapsed
+time, start identity and command. On macOS the open-resource probe invokes `/usr/sbin/lsof` through noninteractive sudo,
+with an explicitly limited ordinary-user fallback. A missing tool, denied privilege, timeout, truncated output or
+changing process identity is incomplete evidence, never an empty holder set. Successful observations with resources,
+successful observations without matches and incomplete/raced captures remain distinct. An open file is not proof of a
+contested lock, and an admission token count or one CPU/state sample does not establish CPU starvation or its absence.
 
 **Unresolved script-host wedge (2026-10-16).** The isolation case
 `nothing_one_script_does_to_its_process_reaches_the_next` reached the unchanged 180s no-progress bound in a full gate.
@@ -552,27 +553,34 @@ teardown, count once) and their difference, its code time, and warns when that c
 keeps its own exit status. The record cannot undercount a wait whose process died: the start is written before the wait,
 so a start with no end — its process killed while waiting, or still waiting — counts to the test's end and is named. A
 record that cannot be written is said once per process and its waits then count as code time; an end with no start
-counts as code time and is named; a record the wrapper cannot parse fails the test. The classes are declared once, as
-the wrapper rules of `.config/nextest.toml`: 60s for `test(/real_apfs_.*_substrate_lifecycle/)`, and 30s for every other
-group test; the 30s rule names exactly the group's filter. The 60s class is defined by what a test runs: the raw
-substrate lifecycle and every genuine-Nx CLI walk, a test whose fixture installs the repository's pinned Nx and runs it
-or its daemon (`Project::Nx`, or `Project::Build` with Nx), each named with the `_substrate_lifecycle` suffix. For the
-raw lifecycle, 3× its worst idle measurement, 14.8s, is 44.4s, rounded up. The genuine-Nx walks have no idle median; the
-warm-fork walk took about 25s when nothing waited. With their lease waits excluded, one full serial lane at load 15-84
-(median 37) measured them at 2.3-45.4s of code time: land-carries 45.4s, the foreign database opener 38.1s,
-rebase-carries 36.0s, warm fork 30.9s, the foreign database holder 30.2s, against at most 5.8s of lease wait each. Five
-were over 30s, so that class cannot hold them under ordinary host load; 60s holds every measurement. It is below 3×
-their ~25s idle floor (75s): a walk past it on a loaded host is a regression to find, not a class to raise. A class is a
-warning, never a kill or a failure: a test that never returns is ended by its runner's 180s no-progress bound, which
-names it and emits the pre-signal holder observation or explicit capture failure described above. A killed test leaves
-its images attached until the next run's sweep (01a_apfs.md, "How the APFS host degrades" §2).
+counts as code time and is named; a record the wrapper cannot parse fails the test.
+
+**Class policy lives once in configuration.** `.config/nextest.toml` owns class membership and the code-time classes
+passed to the wrapper; this spec does not duplicate their values. The lifecycle class is defined by what a test runs:
+the raw substrate lifecycle and every genuine-Nx CLI walk, a test whose fixture installs the repository's pinned Nx and
+runs it or its daemon (`Project::Nx`, or `Project::Build` with Nx), each named with the `_substrate_lifecycle` suffix.
+The default class covers the rest of the groups' declared filters. A class is the fixture's idle code-time baseline
+multiplied by its configured regression factor, not an envelope fitted to a loaded host's successful runs. Changes to a
+fixture require its baseline and class policy to be reviewed; unexplained code-time growth is a regression to find, not
+a reason to raise the class.
+
+Historical diagnostic evidence, not class policy: the raw lifecycle's worst recorded idle measurement was 14.8s, and the
+warm-fork walk took about 25s with no lease wait. A full serial lane at load 15-84 (median 37), with lease waits
+excluded, measured genuine-Nx walks at 2.3-45.4s of code time: land-carries 45.4s, the foreign database opener 38.1s,
+rebase-carries 36.0s, warm fork 30.9s and the foreign database holder 30.2s, with at most 5.8s of lease wait each. Those
+measurements describe that run's load and work; they do not establish acceptance thresholds.
+
+A class is a warning, never a kill or a failure. Nextest's warning cadence follows configured class policy rather than
+an independent spec duration. A test that never returns is ended only by its runner's configured no-progress bound,
+which names it and emits the pre-signal holder observation or explicit capture failure described above. A killed test
+leaves its images attached until the next run's sweep (01a_apfs.md, "How the APFS host degrades" §2).
 
 The genuine-Nx CLI fixtures use the normal enabled daemon (16_build_volumes.md, "The Nx daemon stays on"). Both halves
 of the declared-versus-undeclared output witness require a seeded, actually adopted build volume through the typed land
 report and assert its step-7 check exactly (16_build_volumes.md, Land step 7): the declared half hits all three Nx tasks
 with no miss, unattributed or failed check; the undeclared half hits two and misses only `a:test` because restoring
-`a:build` supplies no undeclared output, so `a:test`'s recomputed hash differs. No test runs in the target, and that miss
-is sealed as its one `landAdoption` commitment. An empty findings list alone is not evidence that a declared output
+`a:build` supplies no undeclared output, so `a:test`'s recomputed hash differs. No test runs in the target, and that
+miss is sealed as its one `landAdoption` commitment. An empty findings list alone is not evidence that a declared output
 restored and hit: a busy-volume skip, an unattributed run summary or a failed check leaves it empty too.
 
 **Host limit.** The host's disk-image attach pool runs out (01a_apfs.md, "How the APFS host degrades" §2), and the suite
@@ -587,16 +595,17 @@ attach past its registry, whose size — computed in code from the registry itse
 per-test attach fails the lane instead of silently spending the pool. A test whose setup and subject match a neighbour's
 becomes assertions in that neighbour rather than a separate test, and anything that does not need a real device is a
 pure or unit test with no image at all: the real-device lane holds a few scenario tests per fixture, not a test per
-behaviour. Every fixture first passes `attach_budget::harness_gate`, which reads only the boot and the pool record: once
-any test process meets error code 150, the system runner that met it records it, and every later fixture of the run, in
-whichever process, fails with `AttachPoolExhausted` and its `next:` step without attaching. A record the gate cannot
-read proves nothing about the pool, so it warns and the fixture proceeds. The lane stays `--no-fail-fast`, so its
-ordinary failures still run to the end; the refusal is the harness's own error, not a scheduler flag. There is no
-measured attach-count constant and no pre-lane admission gate: the `harness_gate` refusal at the first fixture that
-would spend into a spent pool is the fail-fast behaviour, and it needs no number from the lane. `attach-budget --clear`
-still ends a recorded 150 after the operator freed what spent it. The leaked-device delta across a lane run
-(`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no disk-image
-command still leaks on a clean run; it must be 0.
+behaviour. Every fixture first passes `attach_budget::harness_gate`, which reads the boot and pool record and observes
+the live class-instance counts against registered entries. Those differences are diagnostics, not a capacity estimate or
+an admission threshold. Once any test process meets error code 150, the system runner that met it records it, and every
+later fixture of the run, in whichever process, fails with `AttachPoolExhausted` and its `next:` step without attaching.
+A record the gate cannot read proves nothing about the pool, so it warns and the fixture proceeds. The lane stays
+`--no-fail-fast`, so its ordinary failures still run to the end; the refusal is the harness's own error, not a scheduler
+flag. There is no measured attach-count constant and no pre-lane admission gate: the `harness_gate` refusal at the first
+fixture that would spend into a spent pool is the fail-fast behaviour, and it needs no number from the lane.
+`attach-budget --clear` still ends a recorded 150 after the operator freed what spent it. The leaked-device delta across
+a lane run (`ioclasscount AppleDiskImageDevice` against the registered devices, before and after) is the check that no
+disk-image command still leaks on a clean run; it must be 0.
 
 **The suite spends a finite host budget.** Every attach→detach cycle a test makes can leak an AppleDiskImages2 device
 that the host's live sheds lose until reboot (01a_apfs.md, "How the APFS host degrades" §2), so a test pays the fewest
