@@ -45,7 +45,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
 ```
 /private/cowshed/store/                          # ← the cowshed.store volume, fstab-pinned here (01a_apfs.md, "Dedicated store volume")
   .cowshed-volume.json               # volume marker: its ABSENCE means "not mounted" (01a_apfs.md, mount ordering)
-  host.json                          # host configuration: mount root, credential routes
+  host.json                          # host configuration: credential routes; mount root is derived, never stored
   .staging/                          # port-block reservations held while a workspace's grants are minted
   .blank/                            # APFS blank templates (01a_apfs.md, "Images")
     <bytes>-<uid>-<gid>.dmg          # one formatted, verified, detached image per capacity and owner
@@ -92,20 +92,21 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
   telemetry/                         # ALL telemetry: Arrow IPC segments, day-partitioned (13_telemetry.md)
     <yyyy-mm-dd>/*.arrow             #   lifecycle spans, gateway audit, grant mutations, command debug
   (rebuildable caches are not beneath this tree: each tool keeps its own in the host HOME; see 03_caches.md)
-  (workspaces mount under one host-configured mount root; macOS default and provisioning: 01a_apfs.md, "Stable workspace mount root")
+  (workspaces mount under one fixed per-user root; macOS path and provisioning: 01a_apfs.md, "Stable workspace mount root")
 ```
 
-Workspace mountpoints live under one host-configured **mount root**, settable via `cowshed setup --mount-root <dir>`,
-laid out `<mount-root>/<owner>/<repo>/<workspace>`. The macOS default is `/private/var/folders/cowshed/<uid>/mnt`; its
-provisioning and APFS rationale belong to [Stable workspace mount root](./01a_apfs.md#stable-workspace-mount-root).
-Linux retains `~/.cowshed/mnt`. Existing explicit or legacy configuration is preserved, not silently migrated. The root
-is a plain directory on Data: no volume mounts there, so the masked-mountpoint failure class cannot exist. Git identity
-inheritance follows the anchor of each `includeIf gitdir:` rule — rules anchored at an ancestor of the mount root (for
-example `gitdir:<checkouts>/`) match workspaces with no additional configuration; rules anchored exactly at a project
-root do not, and `cowshed setup`/`doctor` detect that divergence empirically by diffing `git config --show-origin`
-between each adopted checkout and a probe repository under the mount root. Changing the root requires every workspace
-detached; `setup` refuses while any are attached because absolute paths are baked into detached metadata and sandbox
-profiles. This directory is distinct from the in-image `.cowshed/` namespace inside every clone.
+Workspace mountpoints live under a fixed **mount root**, laid out `<mount-root>/<owner>/<repo>/<workspace>`. On macOS
+the canonical root is `/private/var/folders/cowshed/<uid>/mnt`, derived from the invoking numeric UID; Linux uses
+`~/.cowshed/mnt`. There is no mount-path setting in `host.json` or `cowshed setup`. Provisioning, the Spotlight
+admission rationale and the existing-host refusal belong to
+[Stable workspace mount root](./01a_apfs.md#stable-workspace-mount-root). For a preferred access path, the operator
+creates a symlink **at that preferred path pointing to the canonical root**, for example
+`ln -s /private/var/folders/cowshed/$(id -u)/mnt ~/workspaces`. The canonical root remains a real directory, never a
+symlink to another location; mounting through an indexed physical path would defeat the policy. The root is a plain
+directory on Data: no volume mounts there, so the masked-mountpoint failure class cannot exist. Git identity rules must
+cover the canonical mount path, not rely on a symlink alias. `cowshed setup`/`doctor` detect divergent
+`includeIf gitdir:` rules empirically by diffing `git config --show-origin` between each adopted checkout and a probe
+repository under the mount root. This directory is distinct from the in-image `.cowshed/` namespace inside every clone.
 
 <!-- prettier-ignore -->
 ```
@@ -122,10 +123,10 @@ metadata is optional and platform-specific: it is present only for macOS workspa
 not synthesize a base port in persistent metadata.
 
 The Data-volume footprint is limited to the empty `/private/cowshed/store` mountpoint directory, the per-user workspace
-mount root (on macOS, the provisioned `/private/var/folders/cowshed/<uid>/mnt` by default), and cowshed's user cache
-directory `~/Library/Caches/dev.cowshed`, which holds the gateway's registry and repository mirrors. Durable evidence
-lives on the dedicated store volume, outside Data's snapshots, backups, and fsck domain. Layer-3 caches belong to the
-tools and stay where the tools keep them in HOME (03_caches.md).
+mount root (on macOS, the fixed `/private/var/folders/cowshed/<uid>/mnt`), and cowshed's user cache directory
+`~/Library/Caches/dev.cowshed`, which holds the gateway's registry and repository mirrors. Durable evidence lives on the
+dedicated store volume, outside Data's snapshots, backups, and fsck domain. Layer-3 caches belong to the tools and stay
+where the tools keep them in HOME (03_caches.md).
 
 ### Two `.cowshed` namespaces
 

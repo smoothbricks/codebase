@@ -256,11 +256,11 @@ shared store is serving nothing, and the 0% is the consequence rather than the f
 resolved configuration without starting a server, so this is safe to run against a live host.
 
 The fix is `cowshed setup`, which writes and owns the `[cache.disk]` table in sccache's own config file (see
-[cli.md](cli.md#cowshed-setup---uninstall---force---mount-root-dir---downgrade)). Run it and look at the line it prints
-about that file. If it says it **left the file alone**, cowshed found a `cache.disk.dir` it did not write and refused to
-overwrite it; the line names the directory it found. Point that `dir` at `~/Library/Caches/Mozilla.sccache` yourself, or
-delete the `[cache.disk]` table and re-run `setup`. cowshed never resolves this one for you — a cache directory somebody
-chose deliberately is not cowshed's to move.
+[cli.md](cli.md#cowshed-setup---uninstall---force---downgrade)). Run it and look at the line it prints about that file.
+If it says it **left the file alone**, cowshed found a `cache.disk.dir` it did not write and refused to overwrite it;
+the line names the directory it found. Point that `dir` at `~/Library/Caches/Mozilla.sccache` yourself, or delete the
+`[cache.disk]` table and re-run `setup`. cowshed never resolves this one for you — a cache directory somebody chose
+deliberately is not cowshed's to move.
 
 Two symptoms of the same cause worth recognising. **Orphaned stores**: every directory that was ever a wrong destination
 keeps whatever it accumulated, so a host that ran misconfigured for a while has gigabytes in the directories its config
@@ -296,7 +296,7 @@ materializes a clone, reflink, or copy, never a hardlink to protected content.
 
 ## ZFS pool and hierarchy
 
-A ZFS host uses exactly two sibling datasets under the configured root: `<pool>/cowshed/store` at
+A ZFS host uses exactly two sibling datasets under the `<pool>/cowshed` root: `<pool>/cowshed/store` at
 `/private/cowshed/store` and `<pool>/cowshed/projects` for `<owner>/<repo>/{main,ws/...}`. A `<pool>/cowshed/caches`
 dataset from an earlier release is kept mounted at `/private/cowshed/caches` until `cowshed setup` has moved what it
 holds and `cowshed setup --retire-caches-volume` destroys it. If `statfs` does not locate a suitable delegated ZFS

@@ -38,7 +38,7 @@ use crate::error::CowshedError;
 use crate::storage::apfs::native::{KernelMountSource, SystemKernelMountSource};
 use crate::storage::fstab::{COWSHED_FSTAB_TAG, FstabPin, build_fstab};
 use crate::storage::host_config::{
-    HostConfig, MACOS_MOUNT_PREFIX, default_mount_root, macos_mount_root,
+    HostConfig, MACOS_MOUNT_PREFIX, canonical_mount_root, macos_mount_root,
 };
 use cowshed_apfs::mounts::KernelMountSnapshot;
 use cowshed_apfs::{
@@ -521,7 +521,7 @@ fn spotlight_roots(
 ) -> Result<Vec<PathBuf>, NativeBootstrapError> {
     let config = HostConfig::load(roots.store(), home)
         .map_err(|error| NativeBootstrapError::Host(HostError::new(error.to_string())))?;
-    let default_mount = default_mount_root(home);
+    let default_mount = canonical_mount_root(home);
     Ok(BTreeSet::from([
         roots
             .store()
@@ -779,18 +779,14 @@ fn plan_mount_root_directories(
     Ok(needed)
 }
 
-fn add_selected_mount_root_action(
+fn add_canonical_mount_root_action(
     snapshot: &mut SetupSnapshot,
-    selected: &Path,
     config_missing: bool,
     uid: u32,
     gid: u32,
     inspect: impl FnMut(&Path, u32, u32, u32) -> Result<bool, HostError>,
 ) -> Result<(), HostError> {
     let root = macos_mount_root(uid);
-    if selected != root {
-        return Ok(());
-    }
     let needed = plan_mount_root_directories(uid, gid, inspect)?;
     if !needed.is_empty() || config_missing {
         for operation in needed {
@@ -806,8 +802,8 @@ fn add_selected_mount_root_action(
 }
 
 fn add_mount_root_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBootstrapError> {
-    // A detached existing store holds authoritative host.json. Read it only after remount:
-    // post-evidence provisions its chosen root through the already-open authorization session.
+    // Validate legacy host state only after an existing store is remounted; a custom root
+    // refuses before canonical directories or host configuration are published.
     if snapshot.classified.iter().any(|volume| {
         volume.role == VolumeRole::Store
             && !matches!(
@@ -817,7 +813,7 @@ fn add_mount_root_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBoots
     }) {
         return Ok(());
     }
-    let config = HostConfig::load(snapshot.plan.roots().store(), snapshot.plan.home())
+    HostConfig::load(snapshot.plan.roots().store(), snapshot.plan.home())
         .map_err(|error| NativeBootstrapError::Host(HostError::new(error.to_string())))?;
     let config_path = snapshot
         .plan
@@ -835,9 +831,8 @@ fn add_mount_root_action(snapshot: &mut SetupSnapshot) -> Result<(), NativeBoots
             )));
         }
     };
-    add_selected_mount_root_action(
+    add_canonical_mount_root_action(
         snapshot,
-        config.mount_root(),
         config_missing,
         unsafe { libc::getuid() },
         unsafe { libc::getgid() },
@@ -868,39 +863,19 @@ fn publish_setup_mount_root(store: &Path, home: &Path, root: &Path) -> crate::Re
     }
 }
 
-/// Plan only the managed stable-root directory transaction. Other configured roots retain
-/// their existing unprivileged setup behavior; this does not authorize a configuration change.
-pub fn plan_mount_root_provisioning(root: &Path) -> crate::Result<HostSetupPlan> {
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-    if root != macos_mount_root(uid) {
-        return Ok(HostSetupPlan::new(Vec::new(), Vec::new(), false));
-    }
-    let operations = plan_mount_root_directories(uid, gid, owned_directory_current)
-        .map_err(|error| existing_host_storage_error(NativeBootstrapError::Host(error)))?;
-    let actions = if operations.is_empty() {
-        Vec::new()
-    } else {
-        vec![HostAction::EnsureMountRoot {
-            path: root.to_owned(),
-            uid,
-            gid,
-        }]
-    };
-    Ok(HostSetupPlan::new(
-        actions,
-        Vec::new(),
-        !operations.is_empty(),
-    ))
-}
-
-/// Use one authorization session for the stable-root transaction after the caller's
-/// authoritative attached-session fence has passed.
+/// Provision only the fixed physical mount root; an alternative path must be a user-owned alias.
 pub async fn execute_mount_root_provisioning(root: &Path) -> crate::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
-    if root != macos_mount_root(uid) {
-        return Ok(());
+    let required = macos_mount_root(uid);
+    if root != required {
+        return Err(CowshedError::usage(
+            format!(
+                "workspace mount root is fixed at {}; create a symlink at the preferred path pointing to it, never the reverse",
+                required.display()
+            ),
+            "cowshed setup",
+        ));
     }
     let operations = plan_mount_root_directories(uid, gid, owned_directory_current)
         .map_err(|error| existing_host_storage_error(NativeBootstrapError::Host(error)))?;
@@ -912,10 +887,10 @@ pub async fn execute_mount_root_provisioning(root: &Path) -> crate::Result<()> {
                 if error.is_authorization_denied() {
                     CowshedError::sandbox_denied(
                         format!("administrator authorization was declined; workspace mount root {} was not provisioned", root.display()),
-                        "cowshed setup --mount-root <dir>",
+                        "cowshed setup",
                     )
                 } else {
-                    setup_execution_error(NativeBootstrapError::Host(error), "cowshed setup --mount-root <dir>")
+                    setup_execution_error(NativeBootstrapError::Host(error), "cowshed setup")
                 }
             })?;
         let host: Arc<dyn BootstrapHost> = Arc::new(AuthorizedBootstrapHost::new(session));
@@ -923,7 +898,7 @@ pub async fn execute_mount_root_provisioning(root: &Path) -> crate::Result<()> {
             if error.code == crate::error::ErrorCode::SandboxDenied {
                 CowshedError::sandbox_denied(
                     format!("administrator authorization was declined while provisioning workspace mount root {}; earlier directories may have been created or repaired", root.display()),
-                    "cowshed setup --mount-root <dir>",
+                    "cowshed setup",
                 )
             } else {
                 error
@@ -4155,7 +4130,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_mount_root_planning_preserves_explicit_roots_and_healthy_store_still_plans_root() {
+    fn stable_mount_root_planning_repairs_only_the_canonical_root() {
         let mut source = healthy_existing_source();
         let first = prepare_setup_snapshot(
             &mut source,
@@ -4182,33 +4157,17 @@ mod tests {
             CachesVolume::Keep,
         )
         .unwrap();
-        add_selected_mount_root_action(
-            &mut snapshot,
-            Path::new("/Users/alice/.cowshed/mnt"),
-            false,
-            501,
-            20,
-            |_, _, _, _| panic!("legacy root must not be inspected"),
-        )
-        .unwrap();
         assert!(snapshot.actions.is_empty());
         let root = macos_mount_root(501);
         let mut already_current = snapshot.clone();
-        add_selected_mount_root_action(
-            &mut already_current,
-            &root,
-            false,
-            501,
-            20,
-            |_, _, _, _| Ok(true),
-        )
-        .unwrap();
-        assert!(already_current.actions.is_empty());
-        assert!(!setup_requires_authorization(&already_current));
-        add_selected_mount_root_action(&mut already_current, &root, true, 501, 20, |_, _, _, _| {
+        add_canonical_mount_root_action(&mut already_current, false, 501, 20, |_, _, _, _| {
             Ok(true)
         })
         .unwrap();
+        assert!(already_current.actions.is_empty());
+        assert!(!setup_requires_authorization(&already_current));
+        add_canonical_mount_root_action(&mut already_current, true, 501, 20, |_, _, _, _| Ok(true))
+            .unwrap();
         assert!(matches!(
             already_current.actions.as_slice(),
             [HostAction::EnsureMountRoot { .. }]
@@ -4217,10 +4176,8 @@ mod tests {
             !setup_requires_authorization(&already_current),
             "recording an already-correct root needs no approval"
         );
-        add_selected_mount_root_action(&mut snapshot, &root, false, 501, 20, |_, _, _, _| {
-            Ok(false)
-        })
-        .unwrap();
+        add_canonical_mount_root_action(&mut snapshot, false, 501, 20, |_, _, _, _| Ok(false))
+            .unwrap();
         assert_eq!(
             snapshot.actions,
             vec![HostAction::EnsureMountRoot {
@@ -4233,22 +4190,28 @@ mod tests {
     }
 
     #[test]
-    fn fresh_mount_root_selection_is_persisted_without_rewriting_existing_config() {
+    fn setup_never_persists_a_root_and_refuses_existing_custom_configuration() {
         let store = std::env::temp_dir().join(format!("cowshed-root-config-{}", Uuid::new_v4()));
         fs::create_dir_all(&store).unwrap();
         let home = Path::new("/Users/alice");
-        let root = default_mount_root(home);
+        let root = canonical_mount_root(home);
         publish_setup_mount_root(&store, home, &root).unwrap();
         let path = store.join(crate::storage::host_config::HOST_CONFIG_FILE);
         let before = fs::read(&path).unwrap();
-        publish_setup_mount_root(&store, Path::new("/Users/another"), &root).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), before);
-        HostConfig::new("/Users/alice/.cowshed/mnt")
-            .unwrap()
-            .save(&store)
-            .unwrap();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&before)
+                .unwrap()
+                .get("mountRoot")
+                .is_none()
+        );
+        fs::write(
+            &path,
+            br#"{"version":1,"mountRoot":"/Users/alice/.cowshed/mnt"}"#,
+        )
+        .unwrap();
         let legacy = fs::read(&path).unwrap();
-        assert!(publish_setup_mount_root(&store, home, &root).is_err());
+        let error = publish_setup_mount_root(&store, home, &root).unwrap_err();
+        assert!(error.message.contains("retired custom mountRoot"));
         assert_eq!(fs::read(&path).unwrap(), legacy);
         fs::remove_dir_all(store).unwrap();
     }
@@ -4747,7 +4710,7 @@ mod tests {
     }
 
     #[test]
-    fn boot_spotlight_roots_follow_host_configuration() {
+    fn boot_spotlight_roots_are_fixed_and_refuse_custom_configuration() {
         let directory =
             std::env::temp_dir().join(format!("cowshed-spotlight-roots-{}", Uuid::new_v4()));
         let store = directory.join("physical/store");
@@ -4756,7 +4719,7 @@ mod tests {
         let roots = CanonicalRoots::at(store.clone());
         let defaults = spotlight_roots(&roots, &home).unwrap();
         assert!(defaults.contains(&directory.join("physical")));
-        let default_mount = default_mount_root(&home);
+        let default_mount = canonical_mount_root(&home);
         assert!(
             defaults
                 .iter()
@@ -4764,15 +4727,17 @@ mod tests {
         );
         assert!(defaults.contains(&default_mount));
         let custom = directory.join("Dev/.cowshed");
-        HostConfig::new(&custom).unwrap().save(&store).unwrap();
-        let configured = spotlight_roots(&roots, &home).unwrap();
-        assert!(configured.contains(&custom));
-        assert!(
-            configured
-                .iter()
-                .any(|root| root.as_path() == default_mount.parent().unwrap())
-        );
-        assert!(!configured.contains(&default_mount));
+        let path = store.join(crate::storage::host_config::HOST_CONFIG_FILE);
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"version":1,"mountRoot": custom})).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let error = spotlight_roots(&roots, &home).unwrap_err();
+        assert!(error.to_string().contains("retired custom mountRoot"));
+        assert_eq!(fs::read(&path).unwrap(), before);
         fs::remove_dir_all(directory).unwrap();
     }
 

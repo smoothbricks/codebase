@@ -68,12 +68,13 @@ directly, Bun/Node applications use `cowshed-napi`, and shell-based agents use t
   `/private/cowshed/store`, with images, grants, quarantine and telemetry at its root; the volume marker distinguishes
   the mounted store from its bare mountpoint. Layer-3 caches stay at their tools' own HOME defaults (03_caches.md), and
   the gateway's repository mirrors live in `~/Library/Caches/dev.cowshed`. Session mounts use
-  `<mount-root>/<owner>/<repo>/<ws>`, with independently validated and encoded primary repository components. Fresh
-  macOS setup provisions `/private/var/folders/cowshed/<uid>/mnt` as the default root, outside Spotlight's
-  media-reference admission path; existing explicit/legacy roots remain unchanged. The mount root is a plain directory
-  on Data, not the store volume. An existing host changes it only at the detached-session boundary. Durable image churn
-  stays outside Data snapshots and its fsck domain. Spec: 01_storage.md §Directory layout; 01a_apfs.md §Stable workspace
-  mount root and §Dedicated store volume.
+  `<mount-root>/<owner>/<repo>/<ws>`, with independently validated and encoded primary repository components. The root
+  is fixed and derived, never configured: macOS setup provisions `/private/var/folders/cowshed/<uid>/mnt`, outside
+  Spotlight's media-reference admission path, and Linux uses `~/.cowshed/mnt`. A preferred access path is an
+  operator-created symlink to that canonical root, and a legacy custom `mountRoot` in `host.json` is refused on read
+  until the operator detaches at the old root and removes the key. It is a plain directory on Data, not the store
+  volume. Durable image churn stays outside Data snapshots and its fsck domain. Spec: 01_storage.md §Directory layout;
+  01a_apfs.md §Stable workspace mount root and §Dedicated store volume.
 - **Declarative host setup + deployment postures (14_nix.md)**: on nix hosts, `programs.cowshed` (home-manager) owns the
   launchd agents and TM exclusions declaratively — `adopt`/`doctor` VALIDATE and never mutate when HM owns the host
   (detection: HM symlinks resolve into /nix/store); imperative mode stays the non-nix fallback. Volume creation and

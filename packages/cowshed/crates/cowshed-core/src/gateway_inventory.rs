@@ -3254,7 +3254,7 @@ mod tests {
     /// blocks share a port — the same block, or a live 16-port block inside another's 64 —
     /// answer on one port. The store names that as a collision the newer workspace claims, and
     /// the allocator holds every port either names. The attached listing every other reader uses
-    /// (the mount-root guard among them) still lists both; only the gateway's session path
+    /// still lists both; only the gateway's session path
     /// serves the older one alone, at startup and per project, so the gateway stays up.
     #[tokio::test]
     async fn one_port_claimed_twice_is_served_only_to_the_older_workspace() {

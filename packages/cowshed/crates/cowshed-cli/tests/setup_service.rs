@@ -54,7 +54,6 @@ struct FakeHost {
     sccache: ConfigReport,
     /// What the escalating phase fails with, so the decline path is provable without a dialog.
     execute_error: Option<CowshedError>,
-    mount_root_error: Option<CowshedError>,
     /// What reconciling the installed service binaries found, so the drift sentences are
     /// provable without launchd or a real installed copy.
     services: Vec<ServiceBinaryRefresh>,
@@ -140,7 +139,6 @@ impl Default for FakeHost {
                 outcome: ConfigOutcome::AlreadyCurrent,
             },
             execute_error: None,
-            mount_root_error: None,
             services: Vec::new(),
             cli: None,
             sccache_install: SccacheInstall::Running {
@@ -252,30 +250,11 @@ impl HostSetup for FakeHost {
         self.events.push(String::from("retire-caches-volume"));
         Ok(self.retirement.clone())
     }
-
-    async fn plan_mount_root(&mut self, mount_root: &std::path::Path) -> Result<HostSetupPlan> {
-        self.events
-            .push(format!("plan-mount-root:{}", mount_root.display()));
-        match self.mount_root_error.take() {
-            Some(error) => Err(error),
-            None => Ok(self.plan.clone()),
-        }
-    }
-
-    async fn configure_mount_root(&mut self, mount_root: &std::path::Path) -> Result<PathBuf> {
-        self.events
-            .push(format!("configure-mount-root:{}", mount_root.display()));
-        match self.mount_root_error.take() {
-            Some(error) => Err(error),
-            None => Ok(mount_root.to_path_buf()),
-        }
-    }
 }
 
 const REPAIR: SetupArgs = SetupArgs {
     uninstall: false,
     force: false,
-    mount_root: None,
     sccache: false,
     retire_caches_volume: false,
     downgrade: false,
@@ -283,7 +262,6 @@ const REPAIR: SetupArgs = SetupArgs {
 const REPAIR_WITH_SCCACHE: SetupArgs = SetupArgs {
     uninstall: false,
     force: false,
-    mount_root: None,
     sccache: true,
     retire_caches_volume: false,
     downgrade: false,
@@ -291,7 +269,6 @@ const REPAIR_WITH_SCCACHE: SetupArgs = SetupArgs {
 const UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: false,
-    mount_root: None,
     sccache: false,
     retire_caches_volume: false,
     downgrade: false,
@@ -299,7 +276,6 @@ const UNINSTALL: SetupArgs = SetupArgs {
 const FORCED_UNINSTALL: SetupArgs = SetupArgs {
     uninstall: true,
     force: true,
-    mount_root: None,
     sccache: false,
     retire_caches_volume: false,
     downgrade: false,
@@ -505,60 +481,6 @@ async fn setup_root_ownership_failure_reports_exact_path_without_success() {
             .contains("/private/var/folders/cowshed/501/mnt")
     );
     assert!(streams.stderr.contains("NOT set up"));
-}
-
-#[tokio::test]
-async fn setup_explicit_stable_root_announces_provisioning_before_configuration() {
-    let mut host = FakeHost {
-        plan: HostSetupPlan::new(vec![stable_mount_root_action()], Vec::new(), true),
-        ..FakeHost::default()
-    };
-    let args = SetupArgs {
-        mount_root: Some(PathBuf::from("/private/var/folders/cowshed/501/mnt")),
-        ..REPAIR
-    };
-    let streams = run(&mut host, args, false, true).await;
-    assert_eq!(streams.stdout, "/private/var/folders/cowshed/501/mnt\n");
-    assert_eq!(
-        streams
-            .stderr
-            .matches("will request administrator authorization once")
-            .count(),
-        1
-    );
-    assert!(streams.stderr.contains("uid 501, gid 20"));
-    assert_eq!(
-        host.events,
-        [
-            "plan-mount-root:/private/var/folders/cowshed/501/mnt",
-            "configure-mount-root:/private/var/folders/cowshed/501/mnt",
-            "git-identity",
-        ]
-    );
-}
-
-#[tokio::test]
-async fn setup_explicit_stable_root_refuses_attached_sessions_before_announcing_or_provisioning() {
-    let mut host = FakeHost {
-        plan: HostSetupPlan::new(vec![stable_mount_root_action()], Vec::new(), true),
-        mount_root_error: Some(CowshedError::conflict(
-            "workspace mount root cannot change while attached: acme/widget/raven",
-            "detach every attached session, then cowshed setup --mount-root <dir>",
-        )),
-        ..FakeHost::default()
-    };
-    let args = SetupArgs {
-        mount_root: Some(PathBuf::from("/private/var/folders/cowshed/501/mnt")),
-        ..REPAIR
-    };
-    let (streams, error) = failing_run(&mut host, args, true).await;
-    assert_eq!(error.code, ErrorCode::Conflict);
-    assert!(streams.stdout.is_empty());
-    assert!(!streams.stderr.contains("administrator authorization"));
-    assert_eq!(
-        host.events,
-        ["plan-mount-root:/private/var/folders/cowshed/501/mnt"]
-    );
 }
 
 /// The three actions a partial run walks: one succeeded, one failed, one was never reached.
@@ -1983,6 +1905,36 @@ fn setup_never_discovers_a_project_from_any_directory() {
     assert_eq!(error.message, "--project is not valid for setup");
 }
 
+/// The workspace mount root is derived, never configured (01a_apfs.md, "Stable workspace mount
+/// root"): `--mount-root` is not an option of `setup`, whatever value it carries or flag it rides
+/// with. Only the parser runs, so nothing here can reach a live host.
+#[test]
+fn setup_refuses_a_mount_root_option_whatever_it_is_paired_with() {
+    let hint = help::command_named("setup")
+        .expect("setup has a help page")
+        .hint();
+    for argv in [
+        vec!["setup", "--mount-root", "/Users/dev/.cowshed/mnt"],
+        vec!["setup", "--mount-root", "relative/mnt"],
+        vec![
+            "setup",
+            "--uninstall",
+            "--mount-root",
+            "/Users/dev/.cowshed/mnt",
+        ],
+        vec![
+            "setup",
+            "--downgrade",
+            "--mount-root",
+            "/Users/dev/.cowshed/mnt",
+        ],
+    ] {
+        let error = parse_args(argv.clone()).unwrap_err();
+        assert_eq!(error.message, "unknown flag `--mount-root`", "{argv:?}");
+        assert_eq!(error.hint, hint, "{argv:?}");
+    }
+}
+
 /// Guidance can never name a verb the parser does not have (06_cli.md rule 4), and `setup` is now
 /// the verb storage guidance names.
 #[test]
@@ -2005,14 +1957,24 @@ fn setup_is_in_the_command_map_between_adopt_and_fork() {
     );
     assert!(spec.hint().contains("--uninstall"));
     assert!(spec.hint().contains("--force"));
-    assert!(spec.hint().contains("--mount-root"));
+    assert!(!spec.hint().contains("mount-root"));
     let page = spec.page();
     assert!(page.contains("--uninstall"));
     assert!(page.contains("--force"));
-    assert!(page.contains("--mount-root"));
-    assert!(page.contains("/private/var/folders/cowshed/<uid>/mnt"));
-    assert!(page.contains("root:wheel 0755"));
-    assert!(page.contains("Existing configured roots are preserved exactly"));
+    // The root is fixed, so no usage line, option row or map entry offers to change it. The page
+    // says where it is, how to reach it from a preferred path, and what a host that still records
+    // a custom one must do. Prose is rewrapped at the page width, so phrases are matched on words
+    // rather than on line breaks.
+    assert!(!page.contains("mount-root"));
+    assert!(!map.contains("mount-root"));
+    let prose = page.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(prose.contains("/private/var/folders/cowshed/<uid>/mnt"));
+    assert!(prose.contains("~/.cowshed/mnt"));
+    assert!(prose.contains("root:wheel 0755"));
+    assert!(prose.contains("symbolic link at that path pointing to the root"));
+    assert!(prose.contains("ln -s /private/var/folders/cowshed/$(id -u)/mnt ~/workspaces"));
+    assert!(prose.contains("records a custom `mountRoot` is refused when read"));
+    assert!(prose.contains("remove `mountRoot` from `host.json`"));
 
     // `provision` is cowshed's internal word for minting a volume. Parent's rule is that it never
     // reaches a person, and a help page is the most person-facing surface there is.
@@ -2041,78 +2003,8 @@ fn gateway_stop_purge_is_parsed_and_documented() {
     assert!(help::command_map().contains("[--purge]"));
 }
 
-#[tokio::test]
-async fn setup_mount_root_prints_the_configured_path() {
-    let mut host = FakeHost::default();
-    let args = SetupArgs {
-        uninstall: false,
-        force: false,
-        mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
-        sccache: false,
-        retire_caches_volume: false,
-        downgrade: false,
-    };
-    let streams = run(&mut host, args, false, false).await;
-    assert_eq!(streams.exit, 0);
-    assert_eq!(streams.stdout, "/Users/dev/.cowshed/mnt\n");
-    assert!(
-        streams
-            .stderr
-            .contains("workspace mount root is /Users/dev/.cowshed/mnt")
-    );
-    assert_eq!(
-        host.events,
-        [
-            "plan-mount-root:/Users/dev/.cowshed/mnt",
-            "configure-mount-root:/Users/dev/.cowshed/mnt",
-            "git-identity"
-        ]
-    );
-}
-
-#[tokio::test]
-async fn setup_mount_root_json_is_empty_success() {
-    let mut host = FakeHost::default();
-    let args = SetupArgs {
-        uninstall: false,
-        force: false,
-        mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
-        sccache: false,
-        retire_caches_volume: false,
-        downgrade: false,
-    };
-    let streams = run(&mut host, args, true, false).await;
-    assert_eq!(streams.exit, 0);
-    assert_eq!(streams.stdout, "{\"ok\":true,\"result\":{}}\n");
-}
-
-#[tokio::test]
-async fn setup_mount_root_refuses_while_workspaces_are_attached() {
-    let mut host = FakeHost {
-        mount_root_error: Some(CowshedError::conflict(
-            "workspace mount root cannot change while attached: acme/widget/swift, zeta/widget/raven",
-            "detach every attached workspace, then cowshed setup --mount-root <dir>",
-        )),
-        ..FakeHost::default()
-    };
-    let args = SetupArgs {
-        uninstall: false,
-        force: false,
-        mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
-        sccache: false,
-        retire_caches_volume: false,
-        downgrade: false,
-    };
-    let error = refusal(&mut host, args).await;
-    assert_eq!(error.code, ErrorCode::Conflict);
-    assert!(error.message.contains("acme/widget/swift"));
-    assert!(error.message.contains("zeta/widget/raven"));
-    assert!(error.hint.contains("detach"));
-    assert_eq!(host.events, ["plan-mount-root:/Users/dev/.cowshed/mnt"]);
-}
-
-/// Git identity at a workspace depends on the host's git configuration and the mount root, not on
-/// the workspace, so setup — which configures the root — is where each adopted checkout is probed
+/// Git identity at a workspace depends on the host's git configuration and the fixed mount root,
+/// not on the workspace, so setup — the host's repair — is where each adopted checkout is probed
 /// (`fork` never is). Every gap names its project and the pattern that would cover the root; a
 /// checkout that could not be probed says so instead of passing for one without gaps.
 #[tokio::test]
@@ -2149,22 +2041,6 @@ async fn setup_names_every_checkout_config_file_a_workspace_would_not_inherit() 
     assert_eq!(streams.exit, 0);
     assert!(streams.stderr.contains(gap), "{}", streams.stderr);
     assert!(streams.stderr.contains(unprobed), "{}", streams.stderr);
-
-    let mut moved = FakeHost {
-        identity: identity(),
-        ..FakeHost::default()
-    };
-    let args = SetupArgs {
-        mount_root: Some(PathBuf::from("/Users/dev/.cowshed/mnt")),
-        ..REPAIR
-    };
-    let streams = run(&mut moved, args, false, false).await;
-    assert_eq!(streams.exit, 0);
-    assert!(
-        streams.stderr.ends_with(&format!("{gap}{unprobed}")),
-        "{}",
-        streams.stderr
-    );
 
     let mut unknown = FakeHost {
         identity: GitIdentity::Unknown {

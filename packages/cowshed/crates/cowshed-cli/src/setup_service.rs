@@ -34,7 +34,6 @@ use crate::path_entry::PathEntryOutcome;
 use crate::probe::{GitIdentityGap, probe_project};
 use async_trait::async_trait;
 use cowshed_core::AdoptedProject;
-use cowshed_core::api::EmptyResult;
 use cowshed_core::build_volume::BuildStateRefresh;
 use cowshed_core::caches_retirement::{
     self, LeftoverReason, Merge, Owner, RetirementError, RetirementLayout, RetirementReport,
@@ -50,10 +49,6 @@ use cowshed_core::storage::bootstrap::{
     execute_host_setup, execute_host_uninstall, main_cowshed_config, plan_host_setup,
     plan_host_uninstall,
 };
-use cowshed_core::storage::host_config::{
-    AttachedWorkspace, HostConfigError, MountRootChangePlan, execute_mount_root_change,
-    plan_mount_root_change,
-};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
     CowshedError, ErrorCode, NativeGatewayInventory, Result, UnreachableMain,
@@ -61,7 +56,6 @@ use cowshed_core::{
 };
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// The exact sentence a run that may escalate prints before it escalates.
@@ -139,7 +133,7 @@ struct RepairReadiness<'a> {
 ///
 /// Mirrors [`MainMounts`], including its second case: "nobody could check" must never render as
 /// "no gaps". Observed here because the answer depends only on the host's git configuration and
-/// the mount root this verb configures (02_workspaces.md); `doctor` reports the same finding.
+/// the fixed workspace mount root (02_workspaces.md); `doctor` reports the same finding.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitIdentity {
     /// Every adopted project was probed.
@@ -286,10 +280,6 @@ pub trait HostSetup: Send {
     async fn remove_host_services(&mut self) -> Result<Vec<HostArtifactRemoval>>;
     /// Point an sccache client that inherited no cowshed environment at the shared cache.
     async fn configure_sccache_client(&mut self) -> Result<ConfigReport>;
-    /// Record the host session mount root. Refused while any session workspace is attached.
-    async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf>;
-    /// Fence the configuration change before announcing any stable-root provisioning prompt.
-    async fn plan_mount_root(&mut self, mount_root: &Path) -> Result<HostSetupPlan>;
     /// Build the patched sccache from cowshed's own flake, root it, and start its agent.
     ///
     /// Called only for `setup --sccache`; a default run never touches nix. Required rather than
@@ -334,23 +324,6 @@ impl NativeHostSetup {
             home: canonical_home()?,
             downgrade,
         })
-    }
-
-    async fn mount_root_change_plan(&self, mount_root: &Path) -> Result<MountRootChangePlan> {
-        let storage = validate_existing_host_storage(&self.home).await?;
-        let attached = NativeGatewayInventory::new(storage.clone())
-            .all_attached()
-            .await
-            .map_err(|error| {
-                CowshedError::integrity(
-                    format!("could not list attached workspaces: {error}"),
-                    "cowshed doctor --json",
-                )
-            })?
-            .into_iter()
-            .map(|fact| AttachedWorkspace::new(fact.repo_id, fact.workspace))
-            .collect::<Vec<_>>();
-        plan_mount_root_change(storage.store(), mount_root, attached).map_err(host_config_error)
     }
 }
 
@@ -689,26 +662,6 @@ impl HostSetup for NativeHostSetup {
             }),
         }
     }
-
-    async fn configure_mount_root(&mut self, mount_root: &Path) -> Result<PathBuf> {
-        let plan = self.mount_root_change_plan(mount_root).await?;
-        #[cfg(target_os = "macos")]
-        cowshed_core::storage::bootstrap::execute_mount_root_provisioning(mount_root).await?;
-        let config = execute_mount_root_change(&plan).map_err(host_config_error)?;
-        Ok(config.mount_root().to_path_buf())
-    }
-
-    async fn plan_mount_root(&mut self, mount_root: &Path) -> Result<HostSetupPlan> {
-        self.mount_root_change_plan(mount_root).await?;
-        #[cfg(target_os = "macos")]
-        {
-            cowshed_core::storage::bootstrap::plan_mount_root_provisioning(mount_root)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Ok(HostSetupPlan::new(Vec::new(), Vec::new(), false))
-        }
-    }
 }
 
 /// The `[caches] home` paths every adopted project's main declares, for placing a repository's
@@ -815,64 +768,10 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    if let Some(mount_root) = args.mount_root.as_deref() {
-        return set_mount_root(setup, mount_root, json, output).await;
-    }
     if args.uninstall {
         return uninstall(setup, args.force, json, output).await;
     }
     repair(setup, args.sccache, args.retire_caches_volume, json, output).await
-}
-
-async fn set_mount_root<S, W, E>(
-    setup: &mut S,
-    mount_root: &Path,
-    json: bool,
-    output: &mut Output<W, E>,
-) -> Result<i32>
-where
-    S: HostSetup,
-    W: Write + Send,
-    E: Write + Send,
-{
-    let plan = setup.plan_mount_root(mount_root).await?;
-    announce_setup(&plan, output)?;
-    let path = setup.configure_mount_root(mount_root).await?;
-    if json {
-        output.success(EmptyResult {}).map_err(output_error)?;
-    } else {
-        output
-            .bare_line(path.as_os_str().as_bytes())
-            .map_err(output_error)?;
-    }
-    output
-        .guidance(&format!("workspace mount root is {}", path.display()))
-        .map_err(output_error)?;
-    // The root is half of what git identity at a workspace depends on, so a new root is checked at
-    // once rather than at the next workspace that silently loses an identity.
-    emit_git_identity(&setup.git_identity().await?, output)?;
-    Ok(0)
-}
-
-fn host_config_error(error: HostConfigError) -> CowshedError {
-    match error {
-        HostConfigError::WorkspacesAttached { workspaces } => {
-            let names = workspaces
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            CowshedError::conflict(
-                format!("workspace mount root cannot change while attached: {names}"),
-                "detach every attached session, then cowshed setup --mount-root <dir>",
-            )
-        }
-        HostConfigError::InvalidPath { path, reason } => CowshedError::usage(
-            format!("invalid mount root {}: {reason}", path.display()),
-            "cowshed setup --mount-root <dir>",
-        ),
-        other => CowshedError::environment_missing(other.to_string(), "cowshed setup"),
-    }
 }
 
 async fn repair<S, W, E>(

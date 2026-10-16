@@ -7,14 +7,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
 
-use crate::metadata::{GRANTS_SIDECAR_SUFFIX, WorkspaceName};
-use crate::repository::RepoId;
+use crate::metadata::GRANTS_SIDECAR_SUFFIX;
 
 use cowshed_gateway_types::STORE_ROOT;
 
 pub const HOST_CONFIG_FILE: &str = "host.json";
 pub const RETIRED_LAYOUT_HINT: &str =
-    "cowshed setup --mount-root <dir> after detaching every workspace";
+    "cowshed setup after auditing detached metadata and grants against the fixed workspace root";
 const HOST_CONFIG_VERSION: u32 = 1;
 pub(crate) const RETIRED_MOUNT_DIRECTORY: &str = "mnt";
 
@@ -22,7 +21,7 @@ pub(crate) const RETIRED_MOUNT_DIRECTORY: &str = "mnt";
 #[cfg(target_os = "macos")]
 pub(crate) const MACOS_MOUNT_PREFIX: &str = "/private/var/folders/cowshed";
 
-pub(crate) fn default_mount_root(home: &Path) -> PathBuf {
+pub(crate) fn canonical_mount_root(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         let _ = home;
@@ -89,17 +88,14 @@ fn is_environment_name(name: &str) -> bool {
             .all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
-/// Host state every cowshed binary on the machine reads, so unknown keys are TOLERATED.
-///
-/// This file outlives any one build: a workspace image, a daemon, and the CLI on `PATH` can all
-/// be different versions of cowshed at once. A reader that refuses a field a newer writer added
-/// turns one enrolment into every other binary on the host failing to run at all — which is a
-/// far worse failure than ignoring a key it has no use for. `version` is what a genuinely
-/// incompatible layout would bump; additive keys are not that.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Host state tolerates additive unknown keys across installed builds. The retired `mountRoot`
+/// key is not an additive extension: a custom value must refuse rather than strand old mounts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostConfig {
     version: u32,
+    /// Derived by the loader, never a host.json setting.
+    #[serde(skip_serializing)]
     mount_root: PathBuf,
     /// Approved gateway-backed registry routes. Absent in a configuration that has none, so a
     /// host that never enrolled one keeps writing exactly the bytes it wrote before.
@@ -107,17 +103,18 @@ pub struct HostConfig {
     credential_routes: Vec<CredentialRoute>,
 }
 
-impl HostConfig {
-    pub fn new(mount_root: impl Into<PathBuf>) -> Result<Self, HostConfigError> {
-        let mount_root = mount_root.into();
-        validate_absolute_path(&mount_root)?;
-        Ok(Self {
-            version: HOST_CONFIG_VERSION,
-            mount_root,
-            credential_routes: Vec::new(),
-        })
-    }
+/// Read-only recognition of the retired field; no writer can publish it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredHostConfig {
+    version: u32,
+    #[serde(default, rename = "mountRoot")]
+    retired_mount_root: Option<PathBuf>,
+    #[serde(default)]
+    credential_routes: Vec<CredentialRoute>,
+}
 
+impl HostConfig {
     pub fn mount_root(&self) -> &Path {
         &self.mount_root
     }
@@ -162,15 +159,12 @@ impl HostConfig {
         before != self.credential_routes.len()
     }
 
-    /// Publish the configuration atomically at mode 0600, the way the mount root is published.
+    /// Publish credential routes atomically at mode 0600; the mount root is never stored.
     pub fn save(&self, store_root: &Path) -> Result<(), HostConfigError> {
         validate_absolute_path(store_root)?;
         for route in &self.credential_routes {
             route.validate()?;
         }
-        // `write_private_atomic` terminates the file itself; appending here as well wrote a
-        // second newline, so a host that enrolled nothing no longer matched the bytes the
-        // mount-root writer had produced.
         let bytes =
             serde_json::to_vec_pretty(self).map_err(|source| HostConfigError::InvalidConfig {
                 path: store_root.join(HOST_CONFIG_FILE),
@@ -179,23 +173,18 @@ impl HostConfig {
         write_private_atomic(&store_root.join(HOST_CONFIG_FILE), &bytes)
     }
 
-    /// Load the store-owned host configuration, using the documented per-user default when the
-    /// configuration has not been written yet.
+    /// Read host state and derive the fixed per-user root without writing configuration.
     pub fn load(store_root: &Path, home: &Path) -> Result<Self, HostConfigError> {
         validate_absolute_path(store_root)?;
         validate_absolute_path(home)?;
-        Self::load_or_default(store_root, default_mount_root(home))
+        Self::load_with_root(store_root, canonical_mount_root(home))
     }
 
-    /// Resolve configuration for callers that only possess the canonical store root.
-    ///
-    /// Workspace mounts remain a per-user presentation layer even though the evidence volumes are
-    /// machine-global. macOS uses the invoking uid; other platforms derive the default from HOME.
-    /// Explicit fixture stores retain their store-local default. Persisted configuration is always
-    /// authoritative and does not depend on process environment.
+    /// Resolve the invoking host's fixed root. Explicit fixture stores retain their deterministic
+    /// store-local root; neither case reads a configurable mount path.
     pub fn load_for_store(store_root: &Path) -> Result<Self, HostConfigError> {
         validate_absolute_path(store_root)?;
-        let default = if store_root == Path::new(STORE_ROOT) {
+        let root = if store_root == Path::new(STORE_ROOT) {
             #[cfg(target_os = "macos")]
             {
                 macos_mount_root(unsafe { libc::getuid() })
@@ -205,133 +194,57 @@ impl HostConfig {
                 let home = std::env::var_os("HOME").ok_or(HostConfigError::HomeUnavailable)?;
                 let home = PathBuf::from(home);
                 validate_absolute_path(&home)?;
-                default_mount_root(&home)
+                canonical_mount_root(&home)
             }
         } else {
             store_root.join(RETIRED_MOUNT_DIRECTORY)
         };
-        Self::load_or_default(store_root, default)
+        Self::load_with_root(store_root, root)
     }
 
-    fn load_or_default(store_root: &Path, default: PathBuf) -> Result<Self, HostConfigError> {
+    fn load_with_root(store_root: &Path, mount_root: PathBuf) -> Result<Self, HostConfigError> {
         let path = store_root.join(HOST_CONFIG_FILE);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Self::new(default),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    version: HOST_CONFIG_VERSION,
+                    mount_root,
+                    credential_routes: Vec::new(),
+                });
+            }
             Err(source) => return Err(io_error("read host configuration", path, source)),
         };
         require_private_file(&path)?;
-        let config: Self =
+        let stored: StoredHostConfig =
             serde_json::from_slice(&bytes).map_err(|source| HostConfigError::InvalidConfig {
                 path: path.clone(),
                 message: source.to_string(),
             })?;
-        if config.version != HOST_CONFIG_VERSION {
+        if stored.version != HOST_CONFIG_VERSION {
             return Err(HostConfigError::UnsupportedVersion {
                 path,
-                version: config.version,
+                version: stored.version,
             });
         }
-        validate_absolute_path(&config.mount_root)?;
-        for route in &config.credential_routes {
+        if let Some(recorded) = stored.retired_mount_root
+            && recorded != mount_root
+        {
+            return Err(HostConfigError::RetiredMountRoot {
+                path,
+                recorded,
+                required: mount_root,
+            });
+        }
+        for route in &stored.credential_routes {
             route.validate()?;
         }
-        Ok(config)
+        Ok(Self {
+            version: stored.version,
+            mount_root,
+            credential_routes: stored.credential_routes,
+        })
     }
-}
-
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
-pub struct AttachedWorkspace {
-    pub repo_id: RepoId,
-    pub workspace: WorkspaceName,
-}
-
-impl AttachedWorkspace {
-    pub fn new(repo_id: RepoId, workspace: WorkspaceName) -> Self {
-        Self { repo_id, workspace }
-    }
-}
-
-impl std::fmt::Display for AttachedWorkspace {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}/{}", self.repo_id, self.workspace)
-    }
-}
-
-impl std::fmt::Debug for AttachedWorkspace {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, formatter)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MountRootChangePlan {
-    store_root: PathBuf,
-    config: HostConfig,
-}
-
-impl MountRootChangePlan {
-    pub fn store_root(&self) -> &Path {
-        &self.store_root
-    }
-
-    pub fn mount_root(&self) -> &Path {
-        self.config.mount_root()
-    }
-
-    pub fn config_path(&self) -> PathBuf {
-        self.store_root.join(HOST_CONFIG_FILE)
-    }
-}
-
-/// Plan a host mount-root change without touching the filesystem.
-///
-/// The attached list is an authoritative kernel-derived snapshot supplied by the host adapter.
-/// Main is deliberately ignored: direct-mounted mains live at their checkout paths, outside the
-/// configurable session mount root. Session workspaces are sorted and retained in the error so
-/// the CLI can name every mount that actually blocks the change.
-pub fn plan_mount_root_change(
-    store_root: &Path,
-    mount_root: &Path,
-    attached: impl IntoIterator<Item = AttachedWorkspace>,
-) -> Result<MountRootChangePlan, HostConfigError> {
-    validate_absolute_path(store_root)?;
-    let mut attached: Vec<_> = attached
-        .into_iter()
-        .filter(|workspace| !workspace.workspace.is_main())
-        .collect();
-    attached.sort();
-    attached.dedup();
-    if !attached.is_empty() {
-        return Err(HostConfigError::WorkspacesAttached {
-            workspaces: attached,
-        });
-    }
-    Ok(MountRootChangePlan {
-        store_root: store_root.to_path_buf(),
-        config: HostConfig::new(mount_root.to_path_buf())?,
-    })
-}
-
-/// Create the configured mount directory and atomically publish `host.json` with mode 0600.
-pub fn execute_mount_root_change(
-    plan: &MountRootChangePlan,
-) -> Result<HostConfig, HostConfigError> {
-    fs::create_dir_all(plan.mount_root()).map_err(|source| {
-        io_error(
-            "create workspace mount root",
-            plan.mount_root().to_path_buf(),
-            source,
-        )
-    })?;
-    let bytes = serde_json::to_vec_pretty(&plan.config).map_err(|source| {
-        HostConfigError::InvalidConfig {
-            path: plan.config_path(),
-            message: source.to_string(),
-        }
-    })?;
-    write_private_atomic(&plan.config_path(), &bytes)?;
-    Ok(plan.config.clone())
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -362,6 +275,13 @@ pub fn retired_layout_paths(
     if HostConfig::load_for_store(store_root)?.mount_root() == retired_root {
         return Ok(Vec::new());
     }
+    scan_retired_layout_paths(store_root, &retired_root)
+}
+
+fn scan_retired_layout_paths(
+    store_root: &Path,
+    retired_root: &Path,
+) -> Result<Vec<RetiredLayoutRecord>, HostConfigError> {
     let mut records = BTreeSet::new();
     if !store_root.exists() {
         return Ok(Vec::new());
@@ -408,7 +328,7 @@ pub fn retired_layout_paths(
             let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
                 continue;
             };
-            collect_retired_paths(&value, &retired_root, entry.path(), &mut records);
+            collect_retired_paths(&value, retired_root, entry.path(), &mut records);
         }
     }
     Ok(records.into_iter().collect())
@@ -533,8 +453,6 @@ pub enum HostConfigError {
     InvalidConfig { path: PathBuf, message: String },
     #[error("invalid gateway credential route: {reason}")]
     InvalidCredentialRoute { reason: &'static str },
-    #[error("workspace mount root cannot change while attached: {workspaces:?}")]
-    WorkspacesAttached { workspaces: Vec<AttachedWorkspace> },
     #[error("could not scan retired workspace layout at {path}: {message}")]
     Scan { path: PathBuf, message: String },
     #[error("could not {operation} at {path}: {source}")]
@@ -544,11 +462,22 @@ pub enum HostConfigError {
         #[source]
         source: io::Error,
     },
+    #[error(
+        "host configuration {path} records retired custom mountRoot {recorded}; the workspace mount root is fixed at {required}. This read did not change mounts or configuration. Using the previous installed build, stop workspace jobs and daemons and detach every session and build volume at the old root; resolve busy holders and audit detached metadata and sandbox grants. Only then remove mountRoot from {path}, preserving credential routes and mode 0600, and run the new build's cowshed setup. For another access path, create a symlink at the preferred path pointing to {required}, never the reverse"
+    )]
+    RetiredMountRoot {
+        path: PathBuf,
+        recorded: PathBuf,
+        required: PathBuf,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::metadata::WorkspaceName;
+    use crate::repository::RepoId;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -593,7 +522,7 @@ mod tests {
     #[test]
     fn credential_routes_persist_and_answer_per_project() {
         let store = temp_directory("routes");
-        let mut config = HostConfig::new("/Users/tester/.cowshed/mnt").expect("config");
+        let mut config = HostConfig::load(&store, Path::new("/Users/tester")).expect("config");
         config
             .upsert_credential_route(route(
                 "owner/repo",
@@ -621,7 +550,10 @@ mod tests {
             BTreeSet::from(["ROTATED_TOKEN".to_owned()])
         );
         assert!(loaded.credential_env_names("absent/repo").is_empty());
-        assert_eq!(loaded.mount_root(), Path::new("/Users/tester/.cowshed/mnt"));
+        assert_eq!(
+            loaded.mount_root(),
+            canonical_mount_root(Path::new("/Users/tester"))
+        );
 
         let mut without = loaded.clone();
         assert!(without.remove_credential_route("owner/repo", "https://registry.test:443"));
@@ -636,61 +568,53 @@ mod tests {
         fs::remove_dir_all(&store).expect("cleanup");
     }
 
-    /// A host that never enrolled a credential must not be able to tell that this file gained
-    /// the ability to hold one — byte for byte, because the two writers publish the same file.
+    /// Host paths are derived runtime facts, not serialized host configuration.
     #[test]
-    fn a_host_with_no_routes_writes_exactly_what_the_mount_root_writer_writes() {
-        let root = temp_directory("no-routes");
-        let saved_store = root.join("saved");
-        let planned_store = root.join("planned");
-        fs::create_dir_all(&saved_store).expect("saved store");
-        fs::create_dir_all(&planned_store).expect("planned store");
-        let mount_root = root.join("workspaces");
-
-        HostConfig::new(&mount_root)
-            .expect("config")
-            .save(&saved_store)
-            .expect("save");
-        let plan =
-            plan_mount_root_change(&planned_store, &mount_root, []).expect("mount root plan");
-        execute_mount_root_change(&plan).expect("mount root change");
-
-        let saved = fs::read(saved_store.join(HOST_CONFIG_FILE)).expect("saved bytes");
-        let planned = fs::read(planned_store.join(HOST_CONFIG_FILE)).expect("planned bytes");
+    fn host_config_never_serializes_the_derived_mount_root() {
+        let store = temp_directory("no-routes");
+        let config = HostConfig::load_for_store(&store).unwrap();
+        config.save(&store).unwrap();
+        let bytes = fs::read(store.join(HOST_CONFIG_FILE)).unwrap();
         assert_eq!(
-            String::from_utf8_lossy(&saved),
-            String::from_utf8_lossy(&planned)
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!({"version": 1})
         );
-        assert!(!String::from_utf8_lossy(&saved).contains("credentialRoutes"));
-        fs::remove_dir_all(&root).expect("cleanup");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(store.join(HOST_CONFIG_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(store).unwrap();
     }
 
-    /// One machine runs several cowshed builds at once — a workspace image, the daemon, and the
-    /// CLI on `PATH`. A reader that refuses a key a newer writer added makes one enrolment brick
-    /// every other binary on the host, which is exactly what a shared state file must not do.
+    /// Additive unknown keys remain forward compatible; the retired mount key is handled separately.
     #[test]
     fn a_key_this_build_does_not_know_is_ignored_rather_than_fatal() {
         let store = temp_directory("forward-compatible");
-        fs::write(
-            store.join(HOST_CONFIG_FILE),
-            br#"{"version":1,"mountRoot":"/Users/tester/.cowshed/mnt","somethingNewer":{"a":1}}"#,
+        write_private_atomic(
+            &store.join(HOST_CONFIG_FILE),
+            br#"{"version":1,"somethingNewer":{"a":1}}"#,
         )
-        .expect("write");
-        #[cfg(unix)]
-        fs::set_permissions(
-            store.join(HOST_CONFIG_FILE),
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        )
-        .expect("mode");
-
-        let config = HostConfig::load(&store, Path::new("/Users/tester")).expect("load");
-        assert_eq!(config.mount_root(), Path::new("/Users/tester/.cowshed/mnt"));
-        fs::remove_dir_all(&store).expect("cleanup");
+        .unwrap();
+        let config = HostConfig::load(&store, Path::new("/Users/tester")).unwrap();
+        assert_eq!(
+            config.mount_root(),
+            canonical_mount_root(Path::new("/Users/tester"))
+        );
+        fs::remove_dir_all(store).unwrap();
     }
 
     #[test]
     fn a_route_that_could_not_name_a_variable_to_withhold_is_refused() {
-        let mut config = HostConfig::new("/Users/tester/.cowshed/mnt").expect("config");
+        let store = temp_directory("invalid-route");
+        let mut config = HostConfig::load_for_store(&store).expect("config");
         for names in [vec!["lower case"], vec!["1TOKEN"], vec![""]] {
             assert!(
                 config
@@ -709,6 +633,7 @@ mod tests {
                 .is_err()
         );
         assert!(config.credential_routes().is_empty());
+        fs::remove_dir_all(store).unwrap();
     }
     #[test]
     fn absent_config_uses_default_mount_root() {
@@ -718,7 +643,7 @@ mod tests {
         fs::create_dir_all(&store).unwrap();
 
         let config = HostConfig::load(&store, &home).unwrap();
-        assert_eq!(config.mount_root(), default_mount_root(&home));
+        assert_eq!(config.mount_root(), canonical_mount_root(&home));
         assert!(!store.join(HOST_CONFIG_FILE).exists());
         fs::remove_dir_all(root).unwrap();
     }
@@ -728,17 +653,18 @@ mod tests {
     fn macos_default_is_uid_stable_and_keeps_dirhelper_names_above_repo_owners() {
         let uid = unsafe { libc::getuid() };
         let expected = PathBuf::from(format!("/private/var/folders/cowshed/{uid}/mnt"));
-        assert_eq!(default_mount_root(Path::new("/Users/first")), expected);
-        assert_eq!(default_mount_root(Path::new("/Users/second")), expected);
+        assert_eq!(canonical_mount_root(Path::new("/Users/first")), expected);
+        assert_eq!(canonical_mount_root(Path::new("/Users/second")), expected);
         assert_eq!(
             macos_mount_root(501),
             Path::new("/private/var/folders/cowshed/501/mnt")
         );
         let store = temp_directory("stable-layout");
-        HostConfig::new(&expected).unwrap().save(&store).unwrap();
         for owner in ["t", "temporaryitems", "x", "c"] {
             let repo_id = RepoId::parse(&format!("{owner}/widget")).unwrap();
-            let layout = crate::storage::StorageLayout::new(&store, &repo_id).unwrap();
+            let layout =
+                crate::storage::StorageLayout::with_mount_root(&store, &expected, &repo_id)
+                    .unwrap();
             assert_eq!(
                 layout
                     .workspace_mount(&WorkspaceName::session("raven").unwrap())
@@ -765,7 +691,7 @@ mod tests {
     #[test]
     fn non_macos_default_remains_under_home() {
         assert_eq!(
-            default_mount_root(Path::new("/home/tester")),
+            canonical_mount_root(Path::new("/home/tester")),
             Path::new("/home/tester/.cowshed/mnt")
         );
     }
@@ -781,120 +707,71 @@ mod tests {
     }
 
     #[test]
-    fn persisted_legacy_root_remains_authoritative_for_every_loader() {
-        let store = temp_directory("legacy-default");
-        HostConfig::new("/Users/tester/.cowshed/mnt")
-            .unwrap()
-            .save(&store)
-            .unwrap();
-        let before = fs::read(store.join(HOST_CONFIG_FILE)).unwrap();
-        assert_eq!(
-            HostConfig::load(&store, Path::new("/Users/another"))
-                .unwrap()
-                .mount_root(),
-            Path::new("/Users/tester/.cowshed/mnt")
-        );
-        assert_eq!(
-            HostConfig::load_for_store(&store).unwrap().mount_root(),
-            Path::new("/Users/tester/.cowshed/mnt")
-        );
-        assert_eq!(fs::read(store.join(HOST_CONFIG_FILE)).unwrap(), before);
+    fn custom_legacy_root_is_refused_by_both_loaders_without_mutation() {
+        let store = temp_directory("legacy-custom");
+        let home = store.join("home");
+        let old_root = store.join("indexed/custom-root");
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "mountRoot": old_root,
+            "credentialRoutes": [route("owner/repo", "https://registry.test:443", &["TOKEN"])]
+        }))
+        .unwrap();
+        let path = store.join(HOST_CONFIG_FILE);
+        write_private_atomic(&path, &legacy).unwrap();
+        let before = fs::read(&path).unwrap();
+        for (result, required) in [
+            (HostConfig::load(&store, &home), canonical_mount_root(&home)),
+            (HostConfig::load_for_store(&store), store.join("mnt")),
+        ] {
+            let error = result.unwrap_err();
+            let message = error.to_string();
+            assert!(matches!(error, HostConfigError::RetiredMountRoot { .. }));
+            for text in [
+                path.display().to_string(),
+                old_root.display().to_string(),
+                required.display().to_string(),
+                "previous installed build".into(),
+                "detach every session and build volume".into(),
+                "remove mountRoot".into(),
+                "symlink at the preferred path".into(),
+            ] {
+                assert!(message.contains(&text), "{message} lacks {text}");
+            }
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+        assert!(!old_root.exists());
+        assert!(!store.join("mnt").exists());
         fs::remove_dir_all(store).unwrap();
     }
 
     #[test]
-    fn custom_mount_root_round_trips_through_private_host_config() {
-        let root = temp_directory("round-trip");
-        let store = root.join("store");
-        let mount_root = root.join("workspaces");
-        fs::create_dir_all(&store).unwrap();
-
-        let plan = plan_mount_root_change(&store, &mount_root, []).unwrap();
-        execute_mount_root_change(&plan).unwrap();
-        assert_eq!(
-            HostConfig::load(&store, &root.join("home"))
-                .unwrap()
-                .mount_root(),
-            mount_root
-        );
-        assert!(mount_root.is_dir());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(store.join(HOST_CONFIG_FILE))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn direct_mounted_main_does_not_block_mount_root_change() {
-        let root = temp_directory("attached-main");
-        let store = root.join("store");
-        let mount_root = root.join("workspaces");
-        fs::create_dir_all(&store).unwrap();
-
-        let plan = plan_mount_root_change(
-            &store,
-            &mount_root,
-            [AttachedWorkspace::new(
-                RepoId::parse("example-org/example-app").unwrap(),
-                WorkspaceName::new("main").unwrap(),
-            )],
+    fn canonical_legacy_key_is_accepted_but_never_written_back() {
+        let store = temp_directory("legacy-canonical");
+        let home = store.join("home");
+        let required = canonical_mount_root(&home);
+        let path = store.join(HOST_CONFIG_FILE);
+        write_private_atomic(
+            &path,
+            &serde_json::to_vec(&serde_json::json!({
+                "version": 1, "mountRoot": required,
+                "credentialRoutes": [route("owner/repo", "https://registry.test:443", &["TOKEN"])]
+            }))
+            .unwrap(),
         )
-        .expect("main is mounted at its checkout, not below the session mount root");
-        execute_mount_root_change(&plan).unwrap();
-
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        let config = HostConfig::load(&store, &home).unwrap();
+        assert_eq!(config.mount_root(), required);
+        assert_eq!(fs::read(&path).unwrap(), before, "read never rewrites");
+        config.save(&store).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("mountRoot").is_none());
         assert_eq!(
-            HostConfig::load(&store, &root.join("home"))
-                .unwrap()
-                .mount_root(),
-            mount_root
+            HostConfig::load(&store, &home).unwrap().credential_routes(),
+            config.credential_routes()
         );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn mount_root_change_names_every_attached_workspace_and_writes_nothing() {
-        let root = temp_directory("attached");
-        let store = root.join("store");
-        let mount_root = root.join("workspaces");
-        fs::create_dir_all(&store).unwrap();
-        let attached = [
-            AttachedWorkspace::new(
-                RepoId::parse("example-org/example-app").unwrap(),
-                WorkspaceName::new("main").unwrap(),
-            ),
-            AttachedWorkspace::new(
-                RepoId::parse("zeta/widget").unwrap(),
-                WorkspaceName::new("raven").unwrap(),
-            ),
-        ];
-
-        let error = plan_mount_root_change(&store, &mount_root, attached).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "workspace mount root cannot change while attached: [zeta/widget/raven]"
-        );
-        let HostConfigError::WorkspacesAttached { workspaces } = error else {
-            panic!("unexpected error: {error}");
-        };
-        assert_eq!(
-            workspaces
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            ["zeta/widget/raven"]
-        );
-        assert!(!mount_root.exists());
-        assert!(!store.join(HOST_CONFIG_FILE).exists());
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(store).unwrap();
     }
 
     #[test]
@@ -904,8 +781,6 @@ mod tests {
         let project = bind_repository(&store, "acme/widget");
         let metadata = project.join("sessions/raven.dmg.grants.json");
         fs::create_dir_all(metadata.parent().unwrap()).unwrap();
-        let plan = plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
-        execute_mount_root_change(&plan).unwrap();
         let recorded = store.join("mnt/acme/widget/raven");
         fs::write(
             &metadata,
@@ -918,14 +793,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            retired_layout_paths(&store).unwrap(),
+            scan_retired_layout_paths(&store, &store.join("mnt")).unwrap(),
             vec![RetiredLayoutRecord {
                 metadata_path: metadata,
                 recorded_path: store.join("mnt/acme/widget/raven"),
             }]
         );
         assert_eq!(
-            retired_layout_paths(&store).unwrap()[0].doctor_message(),
+            scan_retired_layout_paths(&store, &store.join("mnt")).unwrap()[0].doctor_message(),
             format!(
                 "{} recorded under retired layout, run {RETIRED_LAYOUT_HINT}",
                 store.join("mnt/acme/widget/raven").display()
@@ -962,13 +837,11 @@ mod tests {
         let root = temp_directory("retired-system-directory");
         let store = root.join("store");
         bind_repository(&store, "acme/widget");
-        let plan = plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
-        execute_mount_root_change(&plan).unwrap();
         let spotlight = store.join(".Spotlight-V100");
         fs::create_dir_all(&spotlight).unwrap();
         fs::set_permissions(&spotlight, fs::Permissions::from_mode(0o000)).unwrap();
 
-        let result = retired_layout_paths(&store);
+        let result = scan_retired_layout_paths(&store, &store.join("mnt"));
         fs::set_permissions(&spotlight, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(

@@ -5625,13 +5625,10 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     fixture.remount(attachment.volume_device(), &backing, "nobrowse,noowners");
     mounts.wait_for(&backing, Mounted);
 
-    let mount_root = backing.join("mnt");
-    let change =
-        cowshed_core::storage::host_config::plan_mount_root_change(fixture.root(), &mount_root, [])
-            .expect("plan fixture mount root");
-    cowshed_core::storage::host_config::execute_mount_root_change(&change)
-        .expect("place fixture mount root on the backing filesystem");
-    let layout = fixture.layout();
+    let store = backing.join("store");
+    std::fs::create_dir_all(&store).expect("fixture store on the backing filesystem");
+    let config = ApfsSubstrateConfig::new(&store, fixture.main_mount());
+    let layout = StorageLayout::new(&store, &repo()).expect("fixture-local mount root");
     let name = WorkspaceName::session("retired").expect("workspace");
     let bare = layout.workspace_mount(&name).expect("bare mountpoint");
     std::fs::create_dir_all(&bare).expect("user-owned bare mountpoint");
@@ -5665,14 +5662,15 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
         .project()
         .sessions
         .join(format!(".trash/retired-{INCARNATION}.dmg"));
-    let host = fixture.host();
+    let host =
+        MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone()).expect("native APFS host");
     host.retire_image(canonical.image(), &trash)
         .expect("retire image");
     for other in [".late-data", "work.rs"] {
         let work = bare.join(other);
         std::fs::write(&work, b"unique late work").expect("late work");
         let error = host
-            .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
+            .preview_gc(&config, &repo(), StorageGcOptions::default())
             .expect_err("mixed entries are not root-held-only");
         assert!(
             error.to_string().contains("mixed with other entries"),
@@ -5696,7 +5694,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
         .expect("mount foreign volume");
     mounts.wait_for(&bare, Mounted);
     let error = host
-        .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect_err("a mounted filesystem is never retained aside");
     assert!(error.to_string().contains("mounted filesystem"), "{error}");
     assert!(
@@ -5706,7 +5704,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     unmount(&bare);
     mounts.wait_for(&bare, Unmounted);
     let plan = host
-        .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("root-held event debris must not block a read-only GC preview");
     assert!(bare.exists(), "preview must not rename the bare mountpoint");
     assert_eq!(
@@ -5718,7 +5716,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
         .expect("mount after preview");
     mounts.wait_for(&bare, Mounted);
     let error = host
-        .execute_gc(&fixture.config(), plan)
+        .execute_gc(&config, plan)
         .expect_err("a mount after preview invalidates collection");
     assert!(error.to_string().contains("mounted filesystem"), "{error}");
     assert!(
@@ -5732,10 +5730,10 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     unmount(&bare);
     mounts.wait_for(&bare, Unmounted);
     let plan = host
-        .preview_gc(&fixture.config(), &repo(), StorageGcOptions::default())
+        .preview_gc(&config, &repo(), StorageGcOptions::default())
         .expect("fresh unmounted plan");
     let report = host
-        .execute_gc(&fixture.config(), plan)
+        .execute_gc(&config, plan)
         .expect("collect retired image");
     assert_eq!(report.reclaimed, 1);
     assert!(report.deferred.is_empty(), "{report:?}");
@@ -5778,8 +5776,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     let late = retained.join("later-work.rs");
     std::fs::write(&late, b"preserve work added after retention")
         .expect("late retained-parent writer");
-    let again =
-        execute_gc(&host, &fixture.config()).expect("idempotent retained-debris collection");
+    let again = execute_gc(&host, &config).expect("idempotent retained-debris collection");
     assert_eq!(again.reclaimed, 0);
     assert!(again.deferred.is_empty(), "{again:?}");
     assert_eq!(again.root_held_mountpoints, report.root_held_mountpoints);

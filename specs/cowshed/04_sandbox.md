@@ -260,8 +260,8 @@ Notes:
   `XDG_*` directories and runtime dir are inside its own mount, so the deny takes nothing a child's private home holds.
   A job therefore cannot read another tool's private state under HOME, such as an agent harness's session database or
   `~/Library/Application Support/*`: the broad data allow would otherwise admit any file whose metadata was denied.
-- **Main's checkout is a sibling.** Main mounts at the operator's own checkout path, outside the configured mount root,
-  so the mount-root deny never covered it: a job read main's untracked files, `.cowshed/token` included. Every workspace
+- **Main's checkout is a sibling.** Main mounts at the operator's own checkout path, outside the fixed mount root, so
+  the mount-root deny never covered it: a job read main's untracked files, `.cowshed/token` included. Every workspace
   but main now carries main's canonical mount among its policy denies (`file-read* file-write*`, exact and subpath, the
   shape a sibling's mount gets from the mount-root deny); main keeps its own mount. A grant into main's checkout is
   refused by validation, and project-wide grants are validated against that non-main shape as well as main's. A

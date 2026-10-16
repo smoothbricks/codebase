@@ -24,7 +24,7 @@ use cowshed_core::storage::StorageLayout;
 use cowshed_core::{CowshedError, Result};
 use cowshed_os::fork_lock::Run as _;
 
-const HINT: &str = "add an includeIf gitdir: pattern covering the workspace mount root; cowshed setup --mount-root does not rewrite git identity";
+const HINT: &str = "add an includeIf gitdir: pattern covering the workspace mount root; cowshed setup does not rewrite git identity";
 
 /// One config file Git included in the checkout and not at the candidate workspace path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,9 +67,9 @@ impl GitIdentityGap {
 pub fn probe_project(checkout: &Path, layout: &StorageLayout) -> Result<Vec<GitIdentityGap>> {
     let workspace = WorkspaceName::session("identity-probe")
         .map_err(|error| CowshedError::internal(error.to_string()))?;
-    let candidate = layout.workspace_mount(&workspace).map_err(|error| {
-        CowshedError::environment_missing(error.to_string(), "cowshed setup --mount-root <dir>")
-    })?;
+    let candidate = layout
+        .workspace_mount(&workspace)
+        .map_err(|error| CowshedError::environment_missing(error.to_string(), "cowshed setup"))?;
     probe_git_identity_with_env(checkout, &candidate, &[])
 }
 

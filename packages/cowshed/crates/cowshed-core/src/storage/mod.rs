@@ -678,20 +678,28 @@ mod tests {
     }
 
     #[test]
-    fn configured_host_root_changes_only_workspace_mount_derivation() {
-        let root = temp_store("configured-mount-root");
-        let mount_root = temp_store("configured-mount-root-mounts");
-        let plan = host_config::plan_mount_root_change(&root, &mount_root, []).unwrap();
-        host_config::execute_mount_root_change(&plan).unwrap();
-
-        let layout = layout_under(&root);
-        let raven = WorkspaceName::session("raven").unwrap();
-        assert_eq!(
-            layout.workspace_mount(&raven).unwrap(),
-            mount_root.join("acme/widget/raven")
-        );
-        assert_eq!(layout.project().host_mount_root, *mount_root);
-        assert_eq!(layout.project().project_root, root.join("acme/widget"));
+    fn custom_host_root_is_refused_before_workspace_path_derivation() {
+        let root = temp_store("retired-custom-root");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(host_config::HOST_CONFIG_FILE);
+        fs::write(
+            &path,
+            br#"{"version":1,"mountRoot":"/indexed/custom-root"}"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        let error = StorageLayout::new(&root, &RepoId::parse("acme/widget").unwrap()).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageLayoutError::HostConfig(host_config::HostConfigError::RetiredMountRoot { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!root.join("mnt").exists());
     }
 
     #[test]
