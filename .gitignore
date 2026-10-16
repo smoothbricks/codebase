@@ -4,6 +4,8 @@
 .envrc-local
 dynamodb-local-metadata.json
 opencode.json
+# Preserve the registry-pruning draft locally until package-lock pin protection is repaired.
+/tooling/npm-prune-versions.ts
 
 # LLMs
 .codegraph/
