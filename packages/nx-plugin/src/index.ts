@@ -13,7 +13,7 @@ import {
 } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
-import { parseJsonConfigFileContent, type ParsedCommandLine, readConfigFile, sys as typescriptSys } from 'typescript';
+import { type ParsedCommandLine, parseJsonConfigFileContent, readConfigFile, sys as typescriptSys } from 'typescript';
 
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import {
