@@ -301,49 +301,10 @@ response returns `false`; it does not avoid that work. `skipRemoteCache` disable
 `RemoteCacheV2` type is not an arbitrary provider-injection hook. Public pre/post task lifecycle hooks can wire
 environment variables and capture task results, but expose neither a provider handle nor a prearchive store veto.
 
-A real native-client cost control used filesystem fixtures and an HTTP observation relay forwarding to a real compiled
-artifact service. The native binding was byte-identical to npm `@nx/nx-darwin-arm64@23.2.1`, SHA256
-`28f8f10db132f606420bb8a872c4ac760c2ae2acdd460fff7baafc131ef5f05d`. That is the **native binary hash**, not a
-source-file hash. Three uninstrumented fresh-client repetitions per fixture produced these medians:
-
-| Fixture                      | Read-only native store, including attempted PUT | Start to request headers | Request headers to 403 | Existing-client accepted GET + restore | Subsequent local hit | Completed gzip payload |
-| ---------------------------- | ----------------------------------------------: | -----------------------: | ---------------------: | -------------------------------------: | -------------------: | ---------------------: |
-| 1 MiB random, 1 file         |                                       19.039 ms |                17.732 ms |               1.045 ms |                               9.891 ms |             0.137 ms |            1,049,107 B |
-| 4 MiB random, 64 files       |                                       67.414 ms |                64.796 ms |               2.240 ms |                              34.125 ms |             0.160 ms |            4,204,325 B |
-| 4 MiB compressible, 64 files |                                        8.249 ms |                 7.853 ms |               0.270 ms |                              25.344 ms |             0.207 ms |                8,140 B |
-
-Normal `DbCache.put`, including local materialization and the refused remote attempt, took median 19.502, 74.159 and
-40.966 ms for those fixtures. Accepted remote-restored bytes were checked by SHA256 in both the cache and
-declared-output trees. Subsequent local hits made no HTTP request. WIP was checked as a local hit and a remote miss
-after the denied attempts; it was not independently SHA256 checked.
-
-Separate filesystem instrumentation for each 64-file direct native store observed 64 file opens, two directory opens, 69
-directory entries including dot entries, 129 metadata calls and all 4,194,304 output bytes read. The direct
-archive/store operation performed no filesystem copy or clone. Normal local materialization and accepted-output
-restoration each used 64 successful local APFS clone operations in these same-volume fixtures; this does not establish
-cloning across separate RAW-volume mounts.
-
-#### Attribution and custody limits
-
-- Start-to-request timing includes archive construction plus HTTP setup, connection and scheduling. It is not isolated
-  compression CPU time. The relay also contributes to request timing.
-- Accepted GET + restore timings are for the existing repository-patched `DbCache`, including its `stampRestored`
-  timestamp walk. Only the native HTTP binding is unmodified stock npm code.
-- Completed gzip payload length is exact from `Content-Length` and establishes at least that much archive-buffer payload
-  before PUT. It is not total allocation traffic, vector capacity, or peak memory. Nx uses statically linked
-  `tikv-jemallocator`; libc malloc and malloc-zone counters do not measure its allocations. Total native allocation
-  traffic was unavailable, not zero.
-- Actual process RSS is a separate observation. The 4 MiB random direct-store controls had net RSS increases from
-  622,592 to 6,258,688 B; these are not isolated archive allocation totals.
-- Body bytes observed at the relay depend on the relay and early-response cancellation. A complete archive may already
-  exist even when only part of its body is observed before 403. These are not intrinsic client/backend byte counts or
-  no-relay wire measurements.
-- The measured service binary was subsequently overwritten and no retained original copy was found. The recorded hash
-  identifies the binary observed during the run but does not pin a retained executable or committed source. Refusal
-  timing, zero stored bytes and final store contents from that build **do not qualify the artifact service or gateway**.
-- This is a source/client-cost control, not an installed-feature, trusted-publication, two-workspace landing, adoption,
-  hermeticity, or carry-removal proof. Source/API and attribution claims received independent review; the server-binary
-  custody limitation remains open.
+Measure read-only archive construction and attempted PUT separately from accepted GET/restore and subsequent local hits.
+A dated proof receipt identifies the retained native/client and service executables, separates payload lengths,
+filesystem operations and process RSS, and names relay attribution. Client cost evidence alone does not qualify the
+artifact service, gateway or installed cutover, and cannot enable the removed public publication-control lane.
 
 Primary sources:
 

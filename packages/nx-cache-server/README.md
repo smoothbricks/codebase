@@ -60,8 +60,7 @@ backend takes a nonblocking exclusive kernel `flock` (`LOCK_EX | LOCK_NB`) throu
 (`libc.dylib` on Darwin, `libc.so.6` on Linux; see https://bun.com/docs/runtime/ffi) and holds it through drain and
 stop. Hard death, including SIGKILL, releases it in the kernel. A busy lock fails startup as store-locked before
 listening. Any other errno, or unavailable FFI, fails startup loudly with no fallback. Normal and supervised modes use
-the same lease. Deployed evidence is currently macOS only; Linux release targets use the same syscall semantics, and no
-Linux/ZFS runtime evidence is claimed.
+the same lease.
 
 A busy lock is the only `store-locked` refusal. The root lease is the sole store-exclusion mechanism; EOF changes
 lifecycle only.
@@ -77,8 +76,9 @@ failure also carries `path`. A running server provides `origin`, `port`, `reclai
 `failed`. Terminal outcomes carry `stagingRetained`: admission accounting may be released only after cleanup removed the
 file. `readEntry` returns a pinned inode stream and byte count, `missing`, or `failed`; unlinking an archive cannot
 truncate an already-opened GET. `sweepDirectory(store, capBytes, protectedKey?)` takes an owned `CacheStore`, not a bare
-path, and returns `{ ok: true, outcome }` or `{ ok: false, reason }`. The standalone `gc` CLI acquires the store lease
-and passes its store; callers must not run it beside a live server.
+path, and returns `{ ok: true, outcome }` or `{ ok: false, reason }`. The standalone
+`bun src/gc.ts <entries-dir> <positive-cap-bytes>` CLI acquires the store lease and passes its store; callers must not
+run it beside a live server.
 
 `openCacheStore(directory)` returns `{ ok: true, store }` or `{ ok: false, kind: 'store-locked', path }`. A successful
 store has an async `close()`, and callers must close it after all use. Other low-level IO or errno errors propagate to
@@ -100,18 +100,19 @@ GET/PUT transfers and client archive extraction copy bytes; this is not zero-cop
 
 ## Protocol and publication safety
 
-| Operation                                      | Status                                                                                                                                    |
-| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| GET complete archive                           | 200, `application/octet-stream`, standard chunked complete binary body (pinned stream uses chunked HTTP framing; archive bytes unchanged) |
-| GET missing/evicted archive                    | 404                                                                                                                                       |
-| PUT complete new archive                       | 200                                                                                                                                       |
-| PUT existing key                               | 409, original bytes untouched                                                                                                             |
-| PUT read-only principal or over upload limit   | 403                                                                                                                                       |
-| Missing/unknown bearer                         | 401, exactly `text/plain`, `WWW-Authenticate: Bearer`                                                                                     |
-| Missing declared length                        | 411                                                                                                                                       |
-| Invalid key/length or complete but short body  | 400                                                                                                                                       |
-| Stream/write, link, read, or retention failure | 500, reason logged                                                                                                                        |
-| Cleanup failure after complete publication     | 200, whole archive retained; staging reservation held and fault logged                                                                    |
+| Operation                                         | Status                                                                                                                                    |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| GET complete archive                              | 200, `application/octet-stream`, standard chunked complete binary body (pinned stream uses chunked HTTP framing; archive bytes unchanged) |
+| GET missing/evicted archive                       | 404                                                                                                                                       |
+| PUT complete new archive                          | 200                                                                                                                                       |
+| PUT existing key                                  | 409, original bytes untouched                                                                                                             |
+| PUT read-only principal or over upload limit      | 403                                                                                                                                       |
+| Missing/unknown bearer                            | 401, exactly `text/plain`, `WWW-Authenticate: Bearer`                                                                                     |
+| Missing declared length                           | 411                                                                                                                                       |
+| PUT invalid key/length or complete but short body | 400                                                                                                                                       |
+| GET invalid key                                   | 404                                                                                                                                       |
+| Stream/write, link, read, or retention failure    | 500, reason logged                                                                                                                        |
+| Cleanup failure after complete publication        | 200, whole archive retained; staging reservation held and fault logged                                                                    |
 
 The native Nx client and the current official Nx self-hosted caching OpenAPI
 (https://nx.dev/docs/kb/self-hosted-caching) both use PUT 200, with 409 for existing keys and 403 for read-only or
@@ -127,5 +128,5 @@ responsibility.
 ## Release and consumer cutover
 
 The package is public via `npm:public`; conventional commits drive the normal independent Nx release. Source version
-metadata is not proof of an available release. Existing external consumers keep their working source until a real
-published dependency is available. Only then migrate the consumer and remove its obsolete source in the same cutover.
+metadata is not proof of an available release. Consumer migration follows the single contract in
+[03_caches.md, “Nx accepted-task artifact service”](../../specs/cowshed/03_caches.md#nx-accepted-task-artifact-service).

@@ -462,14 +462,14 @@ cache hits. Startup removes abandoned staging files and reports the count; grace
 leaves only reclaimable staging.
 
 Retention reuses filesystem SIEVE: insertion order is mtime, `atime > mtime` is the visited bit, clearing restores atime
-to mtime, and a sibling `sieve.hand` persists the cursor. A measured real APFS GET left atime unchanged even after
-clearing it to mtime; relying on mount access-clock behavior would turn SIEVE into FIFO. Therefore a successful GET
-explicitly marks the opened inode's visited bit when clear, preserving its modification-time cursor through `utimes`; it
-never retimes a path that could name a replacement inode. No shared live cache database is introduced. Streaming stages
-proceed in parallel. Complete staged values enter one serialized publication section: never-replace hard link, then
-SIEVE sweep, then successful completion. No publication interleaves a sweep's listing and cap enforcement. A sweep also
-runs before listening. Each successful commit restores the configured `capBytes` sum of published archive lengths before
-replying 200. `maxBytes` independently bounds one upload and cannot exceed `capBytes`.
+to mtime, and a sibling `sieve.hand` persists the cursor. Mount access-clock behavior is not relied on; a successful GET
+explicitly marks the opened inode's visited bit when clear so SIEVE does not degrade to FIFO, preserving its
+modification-time cursor through `utimes`; it never retimes a path that could name a replacement inode. No shared live
+cache database is introduced. Streaming stages proceed in parallel. Complete staged values enter one serialized
+publication section: never-replace hard link, then SIEVE sweep, then successful completion. No publication interleaves a
+sweep's listing and cap enforcement. A sweep also runs before listening. Each successful commit restores the configured
+`capBytes` sum of published archive lengths before replying 200. `maxBytes` independently bounds one upload and cannot
+exceed `capBytes`.
 
 The sweep never evicts the archive its own commit just published. The protected just-linked key remains in used-byte
 accounting, while other keys undergo SIEVE. Each PUT 200 still has its own archive immediately retrievable. There is no
@@ -487,8 +487,8 @@ remains an honest miss, and the gateway's post-adoption check requires all accep
 (16_build_volumes.md).
 
 The package follows the repository's public-package release conventions (`npm:public`, generated conventional-commit
-versions, normal build/release targets). Existing external consumers retain their source until a real published
-dependency is available; that cutover removes the old source rather than leaving two permanent implementations.
+versions, normal build/release targets). Each consumer migration adopts the published dependency and deletes the
+superseded source in the same change.
 
 ## Convention table
 
