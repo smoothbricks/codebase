@@ -308,9 +308,10 @@ Failed forks and superseded seeds use the same reclaim rule (16, "Garbage collec
 Both explicit `gc` and opportunistic collection explain deferrals: job holds, unfinished create/fork work, unreadable
 detached checkouts or records, and release failures name the volume and reason; opportunistic collection counts routine
 detached/still-forming deferrals on one line. A project open likewise says its retained legacy images on one line
-(01a_apfs.md) and the unfinished lifecycle operations it leaves to other verbs as one count; `doctor` names each. A
-refusal on one volume does not hide later candidates. `gc --dry-run` reports candidates and reasons without changing
-mounts, labels or images.
+(01a_apfs.md) and the unfinished lifecycle operations it leaves to other verbs as one count, labelled `info` and
+explicitly non-blocking for this command; `doctor` names each. This context is not a refusal and changes neither the
+exit code nor the JSON error's message or hint. A refusal on one volume does not hide later candidates. `gc --dry-run`
+reports candidates and reasons without changing mounts, labels or images.
 
 ### `cowshed ls` detached rows
 
