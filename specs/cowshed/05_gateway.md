@@ -829,6 +829,12 @@ mounts are restored. In order:
    as the step that spent the time.
 4. Restore every attached workspace's session into the gateway from what step 3 mounted.
 
+Positively authorized pending project retirements are excluded from the ordinary heal set. After the control socket and
+supervisor manager are serving, startup resumes those records through the same owned drain, unforced detach and
+preservation transaction as `cowshed forget <repo> --abandon` (02_workspaces.md). It does not infer abandonment from a
+missing checkout, marker or process; a failed or busy retirement remains fenced and is reported without cancelling
+healthy projects' mount restoration.
+
 Until step 4 ends, status carries `healing`: `{ mounting: { projects: N } }` with the projects not yet mounted (never 0;
 a project counts once its sessions are mounted), then `restoringSessions`; it is absent once the pass is over, and
 `cowshed gateway status`, `doctor` (`gateway-starting`), and `gateway start`'s wait say so in those words. Everything

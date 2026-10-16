@@ -724,6 +724,9 @@ mod parity_tests {
             | Command::Skill(_)
             | Command::Setup(_)
             | Command::Mount(_)
+            // Retires a project the controller can no longer open, from store records alone: there
+            // is no controller to call, and the addon deliberately offers no second copy of it.
+            | Command::Forget(_)
             | Command::Rekey(_)
             | Command::Version
             // A read-only lint helper over the checkout's recorded volume state; no controller call.
@@ -803,6 +806,7 @@ mod parity_tests {
         (&["disk-command", "hdiutil", "--", "info"], None),
         (&["skill", "install"], None),
         (&["mount", "main", "--repo-id", "acme/widget"], None),
+        (&["forget", "acme/widget", "--abandon"], None),
         (&["rekey", "parity"], None),
         (&["help"], None),
         (&["setup"], None),

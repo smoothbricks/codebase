@@ -2,6 +2,7 @@ use crate::args::{
     AdoptArgs, Cli, Command, ExecArgs, GrantTarget, MoveDestination, ProjectDiscovery, RevokeArgs,
     RevokeSelection, StdinSource as CliStdinSource,
 };
+use crate::forget;
 use crate::gateway_service;
 use crate::mount_main;
 use crate::output::Output;
@@ -211,6 +212,9 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Grant(_)
         | Command::Revoke(_)
         | Command::Remove(_)
+        // A retirement fences opens and drains supervisors, and only a daemon of a build that
+        // knows the record enforces that fence (06_cli.md, "Project retirement").
+        | Command::Forget(_)
         | Command::Attach(_)
         | Command::Detach(_)
         | Command::Resize(_)
@@ -275,6 +279,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Grant(_)
         | Command::Revoke(_)
         | Command::Remove(_)
+        | Command::Forget(_)
         | Command::Attach(_)
         | Command::Detach(_)
         | Command::Resize(_)
@@ -389,6 +394,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::Credential(_)
         | Command::Identity(_)
         | Command::Mount(_)
+        | Command::Forget(_)
         | Command::Setup(_)
         | Command::Gateway(_)
         | Command::DiskCommand(_)
@@ -1917,6 +1923,9 @@ where
         )),
         Command::Mount(_) => Err(CowshedError::internal(
             "mount must be dispatched by the host service entrypoint",
+        )),
+        Command::Forget(_) => Err(CowshedError::internal(
+            "forget must be dispatched by the host service entrypoint",
         )),
         Command::Skill(_) => Err(CowshedError::internal(
             "skill commands must be dispatched before the runtime bridge",
@@ -4912,6 +4921,11 @@ where
             let backend = mount_main::NativeMainMountBackend::new(storage);
             mount_main::dispatch_mount_main(&backend, &args.repo_id, cli.global.json, output).await
         }
+        Command::Forget(args) => {
+            let storage = host_storage().await?;
+            let backend = forget::NativeForgetBackend::new(storage);
+            forget::dispatch_forget(&backend, &args.repo_id, cli.global.json, output).await
+        }
         Command::List(args) => {
             let mut projects = list_all_adopted_projects().await?;
             sort_project_listing(&mut projects);
@@ -5039,6 +5053,7 @@ mod tests {
         for argv in [
             &["rm", "raven"][..],
             &["rm", "raven", "--force"],
+            &["forget", "acme/widget", "--abandon"],
             &["exec", "raven", "--", "true"],
             &["fork", "raven"],
             &["fork", "raven", "crow"],
@@ -6618,6 +6633,10 @@ mod tests {
                 RuntimeOpenMode::ExistingOnly,
             ),
             (vec!["rm", "raven"], RuntimeOpenMode::ExistingOnly),
+            (
+                vec!["forget", "acme/widget", "--abandon"],
+                RuntimeOpenMode::ExistingOnly,
+            ),
             (vec!["attach", "raven"], RuntimeOpenMode::ExistingOnly),
             (vec!["detach", "raven"], RuntimeOpenMode::ExistingOnly),
             (vec!["gc"], RuntimeOpenMode::ExistingOnly),
@@ -6742,6 +6761,11 @@ mod tests {
         assert_eq!(scope(&["fork", "a", "b"]).unwrap(), names(&["a", "b"]));
         assert_eq!(scope(&["mv", "a", "b"]).unwrap(), names(&["a", "b"]));
         assert_eq!(scope(&["ls"]).unwrap(), names(&[]));
+        // A retirement names a project, never a workspace, and opens no project runtime at all.
+        assert_eq!(
+            scope(&["forget", "acme/widget", "--abandon"]).unwrap(),
+            names(&[])
+        );
         assert_eq!(scope(&["gc"]).unwrap(), RecoveryScope::Store);
         // doctor inspects: its open finishes nothing, not even main's unfinished work, and
         // reclaims nothing. Only an explicit repair opens the way every other verb does.

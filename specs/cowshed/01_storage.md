@@ -51,6 +51,14 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     <bytes>-<uid>-<gid>.dmg          # one formatted, verified, detached image per capacity and owner
     <bytes>-<uid>-<gid>.lock         # flock held only while that template is minted
     <bytes>-<uid>-<gid>-minting-<nonce>.dmg # a template being minted, under a name no minter used before
+  .retirements/<owner>/               # explicit whole-project retirement authority, outside the tree it moves
+    <repo>.json                      # version, operationId, repoId, authorization, phase, registrationSha256
+    <repo>.lock                      # serializes record publication and phase transitions
+    <repo>.lease                     # shared by project actors/healers; exclusive for archival
+    <repo>.run                       # one retirement execution, fenced to the exact recorded generation
+  .retired-projects/                  # preserved, detached evidence; never discovered as live projects
+    <operation-id>/                  # the complete former project store tree, renamed without copying or deleting
+    <operation-id>.json              # completed retirement receipt
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
     repository.json                  # chosen remote binding, alternate identities, and primary designation
     checkout-root.json               # where the checkout was when main was last removed (written then, read to reopen)

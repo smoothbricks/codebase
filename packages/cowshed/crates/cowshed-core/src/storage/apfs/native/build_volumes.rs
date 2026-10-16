@@ -960,7 +960,15 @@ mod tests {
         let mut reader = fs::File::open(mount.join("cache/index")).unwrap();
         let before = snapshot(&mount);
         let owner = fs::read(layout.record(&source)).unwrap();
-        let volumes = BuildVolumes::new(Arc::new(system), layout.clone());
+        let volumes = BuildVolumes::new(
+            Arc::new(system),
+            layout.clone(),
+            crate::project_retirement::acquire_project_reader(
+                &root.path().join("store"),
+                &RepoId::parse("acme/widget").unwrap(),
+            )
+            .unwrap(),
+        );
         let socket = supervisor_socket::socket_path(
             &root.path().join("store"),
             &RepoId::parse("acme/widget").unwrap(),

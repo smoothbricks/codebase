@@ -650,6 +650,8 @@ impl Lent {
 pub(crate) struct BuildVolumes<H: RuntimeStorageHost = Host> {
     host: Arc<H>,
     pub layout: BuildVolumeLayout,
+    /// Blocking work and a cancelled mint's destructor can outlive the project actor.
+    retirement_lease: Arc<crate::project_retirement::ProjectReadLease>,
 }
 
 impl<H: RuntimeStorageHost> Clone for BuildVolumes<H> {
@@ -657,23 +659,35 @@ impl<H: RuntimeStorageHost> Clone for BuildVolumes<H> {
         Self {
             host: Arc::clone(&self.host),
             layout: self.layout.clone(),
+            retirement_lease: Arc::clone(&self.retirement_lease),
         }
     }
 }
 
 impl<H: RuntimeStorageHost> BuildVolumes<H> {
-    pub fn new(host: Arc<H>, layout: BuildVolumeLayout) -> Self {
-        Self { host, layout }
+    pub fn new(
+        host: Arc<H>,
+        layout: BuildVolumeLayout,
+        retirement_lease: crate::project_retirement::ProjectReadLease,
+    ) -> Self {
+        Self {
+            host,
+            layout,
+            retirement_lease: Arc::new(retirement_lease),
+        }
     }
 
     async fn blocking<T: Send + 'static>(
         &self,
         work: impl FnOnce(&H, &BuildVolumeLayout) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let (host, layout) = (Arc::clone(&self.host), self.layout.clone());
-        crate::storage::lifecycle::dispatch_blocking(move || work(&host, &layout))
-            .await
-            .map_err(|error| CowshedError::internal(format!("build volume task failed: {error}")))?
+        let volumes = self.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let _retirement_lease = volumes.retirement_lease;
+            work(&volumes.host, &volumes.layout)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("build volume task failed: {error}")))?
     }
 
     /// `target`'s image lock at `lock`, for its land's steps that delete what a fork or reseed
@@ -3613,7 +3627,15 @@ mod tests {
             .unwrap(),
         );
         let layout = BuildVolumeLayout::new(&project).unwrap();
-        let volumes = BuildVolumes::new(Arc::clone(&host), layout.clone());
+        let volumes = BuildVolumes::new(
+            Arc::clone(&host),
+            layout.clone(),
+            crate::project_retirement::acquire_project_reader(
+                &store,
+                &RepoId::parse("acme/widget").unwrap(),
+            )
+            .unwrap(),
+        );
         let main = Owner {
             name: WorkspaceName::main(),
             incarnation: WorkspaceIncarnation::new("0".repeat(32)).unwrap(),
@@ -3820,7 +3842,15 @@ mod tests {
                 .unwrap(),
             );
             let layout = BuildVolumeLayout::new(&project).unwrap();
-            let volumes = BuildVolumes::new(Arc::clone(&host), layout.clone());
+            let volumes = BuildVolumes::new(
+                Arc::clone(&host),
+                layout.clone(),
+                crate::project_retirement::acquire_project_reader(
+                    &store,
+                    &RepoId::parse("acme/widget").unwrap(),
+                )
+                .unwrap(),
+            );
             Self {
                 root,
                 host,
@@ -3902,6 +3932,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directory_cancelled_build_work_keeps_project_retirement_fenced_until_it_ends() {
+        use crate::project_retirement::{RetirementIntent, acquire_collector};
+        let Scratch { root, volumes, .. } = Scratch::directory("retirement-build-owner");
+        let store = root.path().join("store");
+        let repo = RepoId::parse("acme/widget").unwrap();
+        fs::create_dir_all(volumes.layout.project_root()).unwrap();
+        fs::write(
+            volumes
+                .layout
+                .project_root()
+                .join(crate::repository::REPOSITORY_BINDING_FILE),
+            b"retained fixture binding",
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let caller = tokio::spawn(async move {
+                volumes
+                    .blocking(move |_, _| {
+                        let _ = started.send(());
+                        released
+                            .recv()
+                            .map_err(|error| CowshedError::internal(error.to_string()))?;
+                        Ok(())
+                    })
+                    .await
+            });
+            ready.await.unwrap();
+            RetirementIntent::authorize(&store, &repo).unwrap();
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            assert!(
+                acquire_collector(&store, &repo).is_err(),
+                "the caller is gone, but its blocking task still owns project storage"
+            );
+            release.send(()).unwrap();
+        });
+        // Owned runtime shutdown joins its blocking tasks: no sleeps or PID inference.
+        drop(runtime);
+        assert!(acquire_collector(&store, &repo).is_ok());
     }
 
     #[cfg(target_os = "macos")]
@@ -6403,7 +6482,15 @@ fn main() {
             )
             .unwrap(),
         );
-        let volumes = BuildVolumes::new(host, store.layout.clone());
+        let volumes = BuildVolumes::new(
+            host,
+            store.layout.clone(),
+            crate::project_retirement::acquire_project_reader(
+                &store.root,
+                &RepoId::parse("acme/widget").unwrap(),
+            )
+            .unwrap(),
+        );
         let first = volumes.mint_first(checkout.clone(), checkout.clone()).await;
         let FirstMint::Failed(cause) = &first else {
             panic!("an unreadable capacity fails the mint");

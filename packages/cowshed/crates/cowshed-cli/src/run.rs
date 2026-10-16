@@ -357,6 +357,9 @@ fn runtime_dispatch(command: &args::Command) -> RuntimeDispatch {
         // live checkout, so it must survive a broken cwd like the other host
         // commands rather than ask project discovery to fail first.
         args::Command::Mount(_) => RuntimeDispatch::Host,
+        // `forget` names its project by `<owner/repo>` and exists for the one whose checkout is
+        // gone, so project discovery must never run before it.
+        args::Command::Forget(_) => RuntimeDispatch::Host,
         args::Command::Detach(args) if args.all => RuntimeDispatch::Host,
         args::Command::List(args) if args.all => RuntimeDispatch::Host,
         _ => RuntimeDispatch::Project,
@@ -509,5 +512,24 @@ mod tests {
 
         let detach_all = args::parse_args(["detach", "--all"]).expect("detach --all parses");
         assert_eq!(runtime_dispatch(&detach_all.command), RuntimeDispatch::Host);
+
+        // The project a `forget` retires is the one whose checkout is gone: the verb parses with
+        // no project, is routed to the host entrypoint, and refuses a checkout it could be steered
+        // by, so nothing can make its dispatch depend on one.
+        let forget = args::parse_args(["forget", "acme/widget", "--abandon"])
+            .expect("forget parses without a project");
+        assert_eq!(runtime_dispatch(&forget.command), RuntimeDispatch::Host);
+        assert_eq!(
+            forget.command.project_discovery(),
+            args::ProjectDiscovery::NotUsed
+        );
+        let steered = [
+            "--project",
+            "/vanished/checkout",
+            "forget",
+            "acme/widget",
+            "--abandon",
+        ];
+        assert!(args::parse_args(steered).is_err());
     }
 }

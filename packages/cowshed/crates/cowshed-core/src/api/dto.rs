@@ -4,6 +4,7 @@ pub use crate::metadata::{
     EgressMode, EgressRule, GrantSet, Platform, PortBlock, RepoRule, SimVerb, WorkspaceIncarnation,
     WorkspaceName, WorkspaceRole,
 };
+use crate::project_retirement::ProjectRetirementReport;
 use crate::repository::{BoundIdentity, RepoId};
 use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
 use crate::storage::lifecycle::{DerivedWorkspace, MountState, Pin as LifecyclePin};
@@ -3925,6 +3926,7 @@ result_bodies!(
     IdentityReport,
     HostSetupReport,
     UninstallReport,
+    ProjectRetirementReport,
     Vec<WorkspaceInfo>,
     Vec<ProjectWorkspaces>,
     Vec<JobInfo>,
