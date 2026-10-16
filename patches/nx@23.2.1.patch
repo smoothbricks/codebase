@@ -2479,14 +2479,15 @@ index 42dc80a7a3551c9fe0737f39388670e9a7a475dd..99ac4a74f9cec802360f365d7ca8fc34
      }
      return cycles.size ? cycles : null;
 diff --git a/dist/src/tasks-runner/task-orchestrator.d.ts b/dist/src/tasks-runner/task-orchestrator.d.ts
-index 6d3dd021b050be5c74803555b361b6502f9693c7..92f1a651861326ad9eb912b83981c9ed6bd1ae7e 100644
+index 6d3dd021b050be5c74803555b361b6502f9693c7..81e7fa2f866eb22eeabcc8d2802aec5ee7228d57 100644
 --- a/dist/src/tasks-runner/task-orchestrator.d.ts
 +++ b/dist/src/tasks-runner/task-orchestrator.d.ts
-@@ -57,11 +57,13 @@ export declare class TaskOrchestrator {
+@@ -57,11 +57,14 @@ export declare class TaskOrchestrator {
      private continuousTaskExitHandled;
      private cleanupPromise;
      private signalHandlers;
 +    private taskOutputLeases;
++    private continuousStartupLeases;
      constructor(hasher: TaskHasher, initiatingProject: string | undefined, initiatingTasks: Task[], projectGraph: ProjectGraph, taskGraph: TaskGraph, nxJson: NxJsonConfiguration, options: NxArgs & DefaultTasksRunnerOptions, bail: boolean, daemon: DaemonClient, outputStyle: string, fullTaskGraph?: TaskGraph);
      init(): Promise<void>;
      run(): Promise<{
@@ -2496,7 +2497,7 @@ index 6d3dd021b050be5c74803555b361b6502f9693c7..92f1a651861326ad9eb912b83981c9ed
      nextBatch(): Batch;
      /**
       * Coordinator loop. All batch operations (hashing, cache resolution)
-@@ -105,12 +107,9 @@ export declare class TaskOrchestrator {
+@@ -105,12 +108,9 @@ export declare class TaskOrchestrator {
       * cache fetch + lifecycle to the public method. Returns true if any
       * tasks were resolved.
       *
@@ -2512,7 +2513,7 @@ index 6d3dd021b050be5c74803555b361b6502f9693c7..92f1a651861326ad9eb912b83981c9ed
       */
      private resolveCachedTasksBulk;
      /**
-@@ -124,6 +123,7 @@ export declare class TaskOrchestrator {
+@@ -124,6 +124,7 @@ export declare class TaskOrchestrator {
      private applyBatchCachedResults;
      private hashBatchTasks;
      applyFromCacheOrRunBatch(doNotSkipCache: boolean, batch: Batch, groupId: number): Promise<TaskResult[]>;
@@ -2520,7 +2521,7 @@ index 6d3dd021b050be5c74803555b361b6502f9693c7..92f1a651861326ad9eb912b83981c9ed
      private runBatch;
      /**
       * Rendering a batch's output must never change the batch's results. A throw
-@@ -202,12 +202,11 @@ export declare class TaskOrchestrator {
+@@ -202,12 +203,11 @@ export declare class TaskOrchestrator {
       * don't actually compete for parallelism.
       */
      resolveCachedTasks(doNotSkipCache: boolean, tasks: Task[], groupId: number): Promise<TaskResult[]>;
@@ -2536,7 +2537,7 @@ index 6d3dd021b050be5c74803555b361b6502f9693c7..92f1a651861326ad9eb912b83981c9ed
       */
      private dispatchDiscreteWorker;
      /**
-@@ -219,14 +218,15 @@ export declare class TaskOrchestrator {
+@@ -219,14 +219,16 @@ export declare class TaskOrchestrator {
       */
      private handleDiscreteWorkerFailure;
      /**
@@ -2551,12 +2552,13 @@ index 6d3dd021b050be5c74803555b361b6502f9693c7..92f1a651861326ad9eb912b83981c9ed
      private runTask;
      private runTaskInForkedProcess;
      startContinuousTask(task: Task, groupId: number): Promise<RunningTask | SharedRunningTask>;
++    private startContinuousTaskUnderStartupLease;
 +    private startOwnedContinuousTask;
      private preRunSteps;
      private postRunSteps;
      private scheduleNextTasksAndReleaseThreads;
 diff --git a/dist/src/tasks-runner/task-orchestrator.js b/dist/src/tasks-runner/task-orchestrator.js
-index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca5554d744 100644
+index 0b446cbce811319a741165e42a0100e0570e0a2f..1fbd5f47637dd6fb1a7e7b073d062069df31384c 100644
 --- a/dist/src/tasks-runner/task-orchestrator.js
 +++ b/dist/src/tasks-runner/task-orchestrator.js
 @@ -29,6 +29,7 @@ const shared_running_task_1 = require("./running-tasks/shared-running-task");
@@ -2582,15 +2584,17 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
          this.cacheMissedHashes = new Set();
          this.completedTasks = new Map();
          this.waitingForTasks = [];
-@@ -106,6 +105,7 @@ class TaskOrchestrator {
+@@ -106,6 +105,9 @@ class TaskOrchestrator {
          this.continuousTaskExitHandled = new Map();
          this.cleanupPromise = null;
          this.signalHandlers = [];
-+        this.taskOutputLeases = new TaskOutputLeases(getThreadPoolSize(this.options, this.taskGraph).total, this.taskInvocationTracker);
++        const leaseParallelism = getThreadPoolSize(this.options, this.taskGraph).total;
++        this.taskOutputLeases = new TaskOutputLeases(leaseParallelism, this.taskInvocationTracker, "output");
++        this.continuousStartupLeases = new TaskOutputLeases(leaseParallelism, this.taskInvocationTracker, "continuous-startup");
      }
      async init() {
          this.setupSignalHandlers();
-@@ -125,6 +125,20 @@ class TaskOrchestrator {
+@@ -125,6 +127,20 @@ class TaskOrchestrator {
          }
      }
      async run() {
@@ -2603,7 +2607,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
 +                await this.dispose();
 +            }
 +            finally {
-+                await this.taskOutputLeases.close();
++                await Promise.all([this.taskOutputLeases.close(), this.continuousStartupLeases.close()]);
 +            }
 +        }
 +    }
@@ -2611,7 +2615,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
          await this.init();
          perf_hooks_1.performance.mark('task-execution:start');
          const { discrete, continuous, total } = getThreadPoolSize(this.options, this.taskGraph);
-@@ -159,8 +173,6 @@ class TaskOrchestrator {
+@@ -159,8 +175,6 @@ class TaskOrchestrator {
          if (!this.stopRequested) {
              this.cache.removeOldCacheRecords();
          }
@@ -2620,7 +2624,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
          // Public API (defaultTasksRunner) returns a plain object keyed by
          // task id. Internal state is a Map for faster lookup.
          return Object.fromEntries(this.completedTasks);
-@@ -413,12 +425,9 @@ class TaskOrchestrator {
+@@ -413,12 +427,9 @@ class TaskOrchestrator {
       * cache fetch + lifecycle to the public method. Returns true if any
       * tasks were resolved.
       *
@@ -2636,7 +2640,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
       */
      async resolveCachedTasksBulk() {
          const { scheduledTasks } = this.tasksSchedule.getAllScheduledTasks();
-@@ -514,6 +523,13 @@ class TaskOrchestrator {
+@@ -514,6 +525,13 @@ class TaskOrchestrator {
          await (0, hash_task_1.hashTasks)(this.hasher, this.projectGraph, this.fullTaskGraph, perTaskEnvs, this.taskDetails, tasks);
      }
      async applyFromCacheOrRunBatch(doNotSkipCache, batch, groupId) {
@@ -2650,7 +2654,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
          const applyFromCacheOrRunBatchStart = perf_hooks_1.performance.mark('TaskOrchestrator-apply-from-cache-or-run-batch:start');
          const taskEntries = Object.entries(batch.taskGraph.tasks);
          const tasks = taskEntries.map(([, task]) => task);
-@@ -571,7 +587,7 @@ class TaskOrchestrator {
+@@ -571,7 +589,7 @@ class TaskOrchestrator {
          const tasksCompleted = taskEntries.filter(([taskId]) => this.completedTasks.has(taskId));
          // Batch is still not done, run it again
          if (tasksCompleted.length !== taskEntries.length) {
@@ -2659,7 +2663,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
                  id: batch.id,
                  executorName: batch.executorName,
                  taskGraph: (0, utils_1.removeTasksFromTaskGraph)(batch.taskGraph, tasksCompleted.map(([taskId]) => taskId)),
-@@ -810,6 +826,20 @@ class TaskOrchestrator {
+@@ -810,6 +828,20 @@ class TaskOrchestrator {
       * don't actually compete for parallelism.
       */
      async resolveCachedTasks(doNotSkipCache, tasks, groupId) {
@@ -2680,7 +2684,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
          if (!doNotSkipCache || tasks.length === 0)
              return [];
          const cacheableTasks = tasks.filter((t) => t.cache);
-@@ -836,10 +866,8 @@ class TaskOrchestrator {
+@@ -836,10 +868,8 @@ class TaskOrchestrator {
      }
      /**
       * Fire a discrete-task worker and track it in pendingDiscreteWorkers until
@@ -2693,7 +2697,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
       */
      dispatchDiscreteWorker(doNotSkipCache, task, groupId) {
          const worker = this.runTaskDirectly(doNotSkipCache, task, groupId)
-@@ -870,11 +898,21 @@ class TaskOrchestrator {
+@@ -870,11 +900,21 @@ class TaskOrchestrator {
          await this.postRunSteps([{ task, status: 'failure', terminalOutput }], doNotSkipCache, groupId);
      }
      /**
@@ -2718,7 +2722,18 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
          // Wait for task to be processed
          const taskSpecificEnv = await this.processedTasks.get(task.id);
          await this.preRunSteps([task], { groupId });
-@@ -1086,6 +1124,16 @@ class TaskOrchestrator {
+@@ -1063,6 +1103,10 @@ class TaskOrchestrator {
+         }
+     }
+     async startContinuousTask(task, groupId) {
++        return this.continuousStartupLeases.withTasks([task], () =>
++            this.startContinuousTaskUnderStartupLease(task, groupId));
++    }
++    async startContinuousTaskUnderStartupLease(task, groupId) {
+         if (this.runningTasksService &&
+             this.runningTasksService.getRunningTasks([task.id]).length) {
+             await this.preRunSteps([task], { groupId });
+@@ -1086,6 +1130,16 @@ class TaskOrchestrator {
              await this.scheduleNextTasksAndReleaseThreads();
              return runningTask;
          }
@@ -2735,7 +2750,7 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
          const taskSpecificEnv = await this.processedTasks.get(task.id);
          await this.preRunSteps([task], { groupId });
          const pipeOutput = await this.pipeOutputCapture(task);
-@@ -1105,10 +1153,10 @@ class TaskOrchestrator {
+@@ -1105,10 +1159,10 @@ class TaskOrchestrator {
              groupId,
              ownsRunningTasksService: true,
          });
@@ -2750,17 +2765,17 @@ index 0b446cbce811319a741165e42a0100e0570e0a2f..7dc28b1dfd5d8cdd5104d66623b7c0ca
              });
          }));
          await this.scheduleNextTasksAndReleaseThreads();
-@@ -1376,6 +1424,7 @@ class TaskOrchestrator {
+@@ -1376,6 +1430,7 @@ class TaskOrchestrator {
          return this.cleanupPromise;
      }
      async performCleanup() {
-+        await this.taskOutputLeases.cancelPending();
++        await Promise.all([this.taskOutputLeases.cancelPending(), this.continuousStartupLeases.cancelPending()]);
          // Mark all running tasks for intentional stop
          const reason = this.stopRequested ? 'interrupted' : 'fulfilled';
          for (const entry of this.runningContinuousTasks.values()) {
 diff --git a/dist/src/tasks-runner/task-output-lease.d.ts b/dist/src/tasks-runner/task-output-lease.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..468b5ae960880907b0eed7754f7a43d911693c5d
+index 0000000000000000000000000000000000000000..ab141ad0de874122b363f2fd1894dcbde6ac52a4
 --- /dev/null
 +++ b/dist/src/tasks-runner/task-output-lease.d.ts
 @@ -0,0 +1,10 @@
@@ -2768,7 +2783,7 @@ index 0000000000000000000000000000000000000000..468b5ae960880907b0eed7754f7a43d9
 +import { TaskInvocationTracker } from '../native';
 +/** A target's cross-client ownership from cache lookup/restore through execution and cache capture. */
 +export declare class TaskOutputLeases {
-+    constructor(parallelism: number, invocationTracker: TaskInvocationTracker | null);
++    constructor(parallelism: number, invocationTracker: TaskInvocationTracker | null, purpose: 'output' | 'continuous-startup');
 +    acquire(tasks: readonly Task[]): Promise<() => Promise<void>>;
 +    withTasks<T>(tasks: readonly Task[], action: () => Promise<T>): Promise<T>;
 +    cancelPending(): Promise<void>;
@@ -2776,10 +2791,10 @@ index 0000000000000000000000000000000000000000..468b5ae960880907b0eed7754f7a43d9
 +}
 diff --git a/dist/src/tasks-runner/task-output-lease.js b/dist/src/tasks-runner/task-output-lease.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..66cea0bcc92160207843bb011075a07ace014275
+index 0000000000000000000000000000000000000000..9f8639b22d29c8a4aca18a0efaec7a264ff2485c
 --- /dev/null
 +++ b/dist/src/tasks-runner/task-output-lease.js
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,180 @@
 +"use strict";
 +const { channel } = require("node:diagnostics_channel");
 +const { writeFileSync } = require("node:fs");
@@ -2803,7 +2818,7 @@ index 0000000000000000000000000000000000000000..66cea0bcc92160207843bb011075a07a
 +                    const lock = new FileLock(path);
 +                    lock.lock();
 +                    held.push({ lock, path });
-+                    writeFileSync(path, JSON.stringify({ pid: process.pid, clientPid: process.ppid, targets: message.targets }));
++                    writeFileSync(path, JSON.stringify({ pid: process.pid, clientPid: process.ppid, purpose: message.purpose, targets: message.targets }));
 +                }
 +                process.send({ type: "acquired" });
 +            }
@@ -2827,7 +2842,8 @@ index 0000000000000000000000000000000000000000..66cea0bcc92160207843bb011075a07a
 +}
 +else {
 +    class TaskOutputLeases {
-+        constructor(parallelism, invocationTracker) {
++        constructor(parallelism, invocationTracker, purpose) {
++            this.purpose = purpose;
 +            this.invocationTracker = invocationTracker;
 +            this.parallelism = Math.max(1, parallelism);
 +            this.workers = new Set();
@@ -2857,8 +2873,8 @@ index 0000000000000000000000000000000000000000..66cea0bcc92160207843bb011075a07a
 +                    throw new Error(`Recursive task output lease: client ${process.pid} cannot acquire ${targets.join(", ")} while ancestor client ${ancestor.parentPid} runs ${ancestor.taskId}; invocation chain: ${chain.map((record) => record.taskId).join(" -> ")}`);
 +                }
 +            }
-+            const paths = targets.map((target) => join(workspaceDataDirectory, "task-output-leases", `${hashArray([target])}.lock`));
-+            events.publish({ phase: "waiting", targets, paths, pid: process.pid });
++            const paths = targets.map((target) => join(workspaceDataDirectory, "task-output-leases", `${hashArray([this.purpose, target])}.lock`));
++            events.publish({ phase: "waiting", purpose: this.purpose, targets, paths, pid: process.pid });
 +            let entry = this.idle.pop();
 +            if (!entry && this.workers.size >= this.parallelism) {
 +                entry = await new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
@@ -2901,9 +2917,9 @@ index 0000000000000000000000000000000000000000..66cea0bcc92160207843bb011075a07a
 +            entry.targets = targets;
 +            entry.paths = paths;
 +            entry.phase = "acquiring";
-+            await this.exchange(entry, { type: "acquire", targets, paths });
++            await this.exchange(entry, { type: "acquire", purpose: this.purpose, targets, paths });
 +            entry.phase = "held";
-+            events.publish({ phase: "acquired", targets, paths, pid: process.pid });
++            events.publish({ phase: "acquired", purpose: this.purpose, targets, paths, pid: process.pid });
 +            let released = false;
 +            return async () => {
 +                if (released || this.closed) return;
@@ -2911,7 +2927,7 @@ index 0000000000000000000000000000000000000000..66cea0bcc92160207843bb011075a07a
 +                entry.phase = "releasing";
 +                await this.exchange(entry, { type: "release" });
 +                entry.phase = "idle";
-+                events.publish({ phase: "released", targets, paths, pid: process.pid });
++                events.publish({ phase: "released", purpose: this.purpose, targets, paths, pid: process.pid });
 +                const waiter = this.waiters.shift();
 +                if (waiter) waiter.resolve(entry);
 +                else this.idle.push(entry);
@@ -2941,7 +2957,9 @@ index 0000000000000000000000000000000000000000..66cea0bcc92160207843bb011075a07a
 +            await Promise.all([...this.workers]
 +                .filter((entry) => entry.phase === "acquiring")
 +                .map((entry) => {
-+                    entry.worker.kill("SIGTERM");
++                    // Interrupt the native wait unconditionally. This owned
++                    // helper holds only kernel leases, never task work.
++                    entry.worker.kill("SIGKILL");
 +                    return entry.exited;
 +                }));
 +        }
@@ -2949,7 +2967,7 @@ index 0000000000000000000000000000000000000000..66cea0bcc92160207843bb011075a07a
 +            await this.cancelPending();
 +            this.closed = true;
 +            await Promise.all([...this.workers].map((entry) => {
-+                entry.worker.kill("SIGTERM");
++                entry.worker.kill("SIGKILL");
 +                return entry.exited;
 +            }));
 +            this.idle.length = 0;

@@ -184,8 +184,8 @@ it('leases a target across clients through producer completion, cache capture an
 }, 120_000);
 
 it('shares ownership across configurations without blocking independent targets, and cancels lock waiters', async () => {
-  const owner = new TaskOutputLeases(2, null);
-  const other = new TaskOutputLeases(2, null);
+  const owner = new TaskOutputLeases(2, null, 'output');
+  const other = new TaskOutputLeases(2, null, 'output');
   const task = {
     id: 'lease:build:first',
     target: { project: `lease-${crypto.randomUUID()}`, target: 'build', configuration: 'first' },
@@ -223,10 +223,15 @@ it('shares ownership across configurations without blocking independent targets,
     // The failed producer's finally released ownership, so another client can acquire it.
     const heldAgain = await owner.acquire([task]);
     try {
-      const cancelled = other.acquire([task]);
-      const rejected = expect(cancelled).rejects.toThrow('worker exited');
+      const refused = other.acquire([task]).then(
+        () => null,
+        (error: unknown) => error,
+      );
       await other.cancelPending();
-      await rejected;
+      const reason = await refused;
+      expect(reason).toBeInstanceOf(Error);
+      if (!(reason instanceof Error)) throw new Error('the cancelled waiter unexpectedly acquired ownership');
+      expect(reason.message).toContain('worker exited');
     } finally {
       await heldAgain();
     }
@@ -275,6 +280,128 @@ it('refuses an ancestor-owned target before waiting for its output lease', async
     } finally {
       if (child.exitCode === null) child.kill('SIGKILL');
       await child.exited;
+    }
+  });
+}, 60_000);
+
+it('shares one continuous producer between simultaneous cold clients without waiting for its lifetime lease', async () => {
+  await withNxFixture('nx-task-output-continuous-', async ({ workspace, socketDirectory }) => {
+    const entered = new Set<string>();
+    const bothEntered = Promise.withResolvers<void>();
+    const start = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<URL>();
+    const shared = Promise.withResolvers<URL>();
+    const events: string[] = [];
+    using server = await bindListener((port) =>
+      Bun.serve({
+        hostname: '127.0.0.1',
+        port,
+        async fetch(request) {
+          const url = new URL(request.url);
+          const client = url.searchParams.get('client') ?? '';
+          events.push(`${url.pathname}:${client}`);
+          if (url.pathname === '/enter') {
+            entered.add(client);
+            if (entered.size === 2) bothEntered.resolve();
+            await start.promise;
+          } else if (url.pathname === '/started') {
+            started.resolve(url);
+            await finish.promise;
+          } else if (url.pathname === '/shared') {
+            shared.resolve(url);
+          }
+          return new Response('ok');
+        },
+      }),
+    );
+    await mkdir(join(workspace, 'app'));
+    await symlink(join(repoRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+    await writeFile(join(workspace, 'nx.json'), '{}');
+    await writeFile(
+      join(workspace, 'app/project.json'),
+      JSON.stringify({
+        name: 'app',
+        targets: {
+          serve: {
+            executor: 'nx:run-commands',
+            continuous: true,
+            cache: false,
+            outputs: ['{projectRoot}/dist'],
+            options: { command: 'bun serve.ts' },
+          },
+        },
+      }),
+    );
+    await writeFile(
+      join(workspace, 'serve.ts'),
+      String.raw`import { mkdirSync, writeFileSync } from 'node:fs';
+mkdirSync('app/dist', {recursive:true});
+writeFileSync('app/dist/pid', String(process.pid));
+await fetch(process.env.LEASE_PROBE + '/started?client=' + process.env.LEASE_CLIENT + '&pid=' + process.pid);`,
+    );
+    await writeFile(
+      join(workspace, 'continuous-probe.cjs'),
+      String.raw`const {TaskOrchestrator} = require('nx/src/tasks-runner/task-orchestrator');
+const {SharedRunningTask} = require('nx/src/tasks-runner/running-tasks/shared-running-task');
+const event = (phase) => fetch(process.env.LEASE_PROBE + '/' + phase + '?client=' + process.env.LEASE_CLIENT);
+const originalStart = TaskOrchestrator.prototype.startContinuousTask;
+TaskOrchestrator.prototype.startContinuousTask = async function(...args) {
+  await event('enter');
+  return originalStart.apply(this, args);
+};
+const originalWait = SharedRunningTask.prototype.waitForTaskToFinish;
+SharedRunningTask.prototype.waitForTaskToFinish = async function(...args) {
+  await event('shared');
+  return originalWait.apply(this, args);
+};`,
+    );
+    const children: Subprocess<'ignore', 'pipe', 'pipe'>[] = [];
+    const env = fixtureNxEnv(workspace, socketDirectory);
+    const run = (client: string) => {
+      const child = Bun.spawn(
+        ['bun', '--preload', join(workspace, 'continuous-probe.cjs'), nx, 'run', 'app:serve', '--outputStyle=static'],
+        {
+          cwd: workspace,
+          env: { ...env, LEASE_PROBE: server.url.origin, LEASE_CLIENT: client },
+          stdin: 'ignore',
+          stdout: 'pipe',
+          stderr: 'pipe',
+        },
+      );
+      children.push(child);
+      return Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    };
+    try {
+      const first = run('A');
+      const second = run('B');
+      await guardEvent(bothEntered.promise, 'both cold continuous clients at the startup boundary', () =>
+        events.join('\n'),
+      );
+      start.resolve();
+      const [producerEvent, sharedEvent] = await guardEvent(
+        Promise.all([started.promise, shared.promise]),
+        'one continuous producer and one shared waiter while the producer is alive',
+        () => events.join('\n'),
+      );
+      expect(entered.size).toBe(2);
+      expect(producerEvent.searchParams.get('client')).not.toBe(sharedEvent.searchParams.get('client'));
+      expect(events.filter((event) => event.startsWith('/started:'))).toHaveLength(1);
+      expect(await readFile(join(workspace, 'app/dist/pid'), 'utf8')).toBe(producerEvent.searchParams.get('pid'));
+      finish.resolve();
+      const results = await guardEvent(
+        Promise.all([first, second]),
+        'both continuous clients to finish after their one producer exits',
+        () => events.join('\n'),
+      );
+      for (const [status, stdout, stderr] of results) expect(status, `${stdout}${stderr}`).toBe(0);
+    } finally {
+      start.resolve();
+      finish.resolve();
+      for (const child of children) {
+        if (child.exitCode === null) child.kill('SIGTERM');
+      }
+      await Promise.all(children.map((child) => child.exited));
     }
   });
 }, 60_000);

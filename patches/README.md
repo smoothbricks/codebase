@@ -101,18 +101,28 @@ Discrete, batch and continuous task lifetimes therefore own the lease at the orc
 acquired in sorted order; a continuous task retains ownership until its exit is handled, while clients sharing the
 already-running task do not acquire another writer lease.
 
+A continuous target's short startup guard covers both the `RunningTasksService` check and the winner's registration. Two
+cold clients therefore cannot both observe "absent" before one takes lifetime ownership. The loser joins
+`SharedRunningTask`, consumes the winner's output and waits for that producer to finish, not for its lifetime lock.
+Startup and output locks use separate purpose namespaces and bounded pools: a one-worker output pool cannot deadlock by
+holding its startup slot while requesting another slot for lifetime ownership.
+
 Nx's native `FileLock.lock()` blocks synchronously, so a bounded, reusable helper-process pool holds leases without
 blocking the client's event loop. A helper can be cancelled even while blocked inside the native call; a worker thread
 cannot. Lock files are never unlinked or replaced; their contents name the holder and client PIDs and target names, and
 helper death releases kernel ownership. Runner cleanup cancels pending acquisitions before stopping owned producers,
 then releases held leases. The `nx:task-output-lease` diagnostics channel reports waiting, acquired and released
-transitions with target names and lock paths.
+transitions with the lock purpose, target names and lock paths. Cancellation uses `SIGKILL` only on the client's owned
+lock helpers, which execute no task work, to interrupt a blocking native wait without depending on a JavaScript signal
+handler. Producers retain their existing shutdown protocol.
 
 `packages/nx-plugin/src/nx-task-output-lease.test.ts` exercises two actual Nx clients against one output tree, pauses
 the real cache capture while another producer attempts to publish, checks both complete byte-exact artifacts, then
 restores one through a dependent runtime-input hash. Binary file content is hashed as bytes by its producer; the
-runtime-input wrapper's deliberate non-UTF-8 failure sentinel is unchanged. Drop these hunks only when the installed
-upstream orchestrator protects the same complete lifetime, retaining the regression.
+runtime-input wrapper's deliberate non-UTF-8 failure sentinel is unchanged. The suite also starts two cold continuous
+clients at the same barrier, requires one real producer and one shared waiter while that producer is alive, and requires
+both clients to complete after it exits. Drop these hunks only when the installed upstream orchestrator protects the
+same complete lifetime and atomic startup, retaining the regressions.
 
 ## Dependency-graph resolution cache identity
 
