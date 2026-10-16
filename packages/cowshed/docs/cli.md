@@ -585,6 +585,11 @@ Marks the workspace deleted and returns immediately; detach and image deletion h
 Removing a workspace destroys its image, and the image is where its commits live — so `rm` refuses (exit 4) unless
 `main` already contains the workspace's `HEAD`. The refusal names main's tip and points at `cowshed land <ws>`.
 
+The project-open `cowshed: info: leaving … unfinished lifecycle operations …` line concerns other workspaces outside
+this command's recovery scope. It explicitly says those operations do not block this command; `cowshed doctor` lists
+them. A refusal is reported separately with its own `next:` hint and exit code. With `--json`, the refusal is
+`error.message` and `error.hint` on stdout, never that informational stderr line.
+
 The two overrides authorize different losses and neither substitutes for the other:
 
 | Flag        | Overrides                                                         | Does **not** override    |
@@ -606,6 +611,7 @@ even a deliberate abandonment is recoverable:
 
 ```
 $ cowshed rm raven
+cowshed: info: leaving 4 unfinished lifecycle operations outside this command's recovery scope; these do not block this command; cowshed doctor lists each
 cowshed: workspace raven head 9b2e77d… is not contained by main (main is at 6f3a2c1…)
 next: land the workspace: cowshed land raven
 

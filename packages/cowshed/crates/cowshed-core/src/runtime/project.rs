@@ -3702,7 +3702,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         if !left.is_empty() {
             let plural = if left.len() == 1 { "" } else { "s" };
             eprintln!(
-                "cowshed: leaving {} unfinished lifecycle operation{plural} to the verbs that name them; cowshed doctor lists each",
+                "cowshed: info: leaving {} unfinished lifecycle operation{plural} outside this command's recovery scope; these do not block this command; cowshed doctor lists each",
                 left.len()
             );
         }
