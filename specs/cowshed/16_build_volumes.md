@@ -521,8 +521,10 @@ an integration workspace; "the target" is whichever one it is.
    stops the workspace's jobs and its sandboxed Nx daemon, and the stopped supervisor socket lease stays with the quiet
    volume through capture and adoption, refusing a replacement supervisor's job admission. The landing build volume's Nx
    task database must have no open file descriptors. If it still does, adoption is **skipped** and reported, as for the
-   target below. This settles supervised jobs and Nx; the later seed seal keeps host builds and other filesystem holders
-   out of the seed.
+   target below. This settles supervised jobs and Nx; the later seed capture retains Nx open locks and existing
+   Cargo-profile guards through capture and publication. Other contributed paths remain exempt under the named-list rule
+   (Owned index links). Mounted capture replaces the former detach-and-seal barrier; the new-host-profile gap remains as
+   documented in Targets and seeds.
 5. **Close the target, carry, and freeze the seed.** Under the same lock (rule "The adoption needs the target's Nx
    database closed"):
    1. **stage the carry** (below) while the target still runs: copy into the landing volume the target's Nx cache
@@ -552,16 +554,16 @@ an integration workspace; "the target" is whichever one it is.
    before the build-link swap. No retry or wider target-lock interval substitutes for this identity handoff.
 
    The land holds the target's image lock from 5.6 until 6.4 has renamed the target's link and a kept workspace has its
-   fresh clone of the target's latest seed (the new one, or the previous one a busy seal kept). Every fork of the target
-   holds the same lock from before it reads the target's seed and link until it links its own (Fork steps 1 to 3), and
-   so does every reseed, so neither reads a seed or a volume the land deletes. Without it, a land that freezes main's
-   seed and releases main's previous volume while a fork of main is under way deletes the seed the fork has read, and
-   the fork fails (`sync source image …: No such file or directory`). A land that finds the lock held says so on stderr
-   and waits for it. It waits with the target's daemon already stopped (5.3), so the longer it waits, the likelier an Nx
-   client restarts it and 6.2 skips the swap, reported as any skip is.
+   fresh clone of the target's latest seed (the new one, or the previous one retained by a skipped capture). Every fork
+   of the target holds the same lock from before it reads the target's seed and link until it links its own (Fork steps
+   1 to 3), and so does every reseed, so neither reads a seed or a volume the land deletes. Without it, a land that
+   freezes main's seed and releases main's previous volume while a fork of main is under way deletes the seed the fork
+   has read, and the fork fails (`sync source image …: No such file or directory`). A land that finds the lock held says
+   so on stderr and waits for it. It waits with the target's daemon already stopped (5.3), so the longer it waits, the
+   likelier an Nx client restarts it and 6.2 skips the swap, reported as any skip is.
 
-   A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap. A busy seal at 5.6 keeps
-   the previous seed and still swaps.
+   A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap. A skipped capture at 5.6
+   keeps the previous seed and still swaps.
 
 6. **Adopt the build volume.** Still under the lock:
    1. take, without waiting, stock Nx's open lock of each of the target's task databases (the database's path with the
