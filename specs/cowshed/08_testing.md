@@ -345,6 +345,10 @@ locks, the newly-created-profile control, seed preservation and native/Directory
 inherited single-thread libtest formatting cannot prefix its actual-PID record. Its kernel-holder, forced-release
 diagnostics, checkout-label ownership and reclamation assertions remain exact.
 
+Launcher case fixtures clear both inherited `BOUNDED_EXEC_CPU_POOL` and `BOUNDED_EXEC_CPU_TOKENS` before selecting their
+case-local inputs. A runner's live pool must not turn the count-only sizing case into parent-pool admission; the real
+gateway grant, FIFO lifetime, kill and refusal oracles remain unchanged.
+
 Directory build-state freshness uses observed filesystem change times, not synthetic wall-clock marks. If a listed child
 or subtree disappears during a live scan, the nearest surviving ancestor records that removal; the root uses its
 modification time so binding renames do not count as build writes. A missing root still refuses, and other I/O errors
