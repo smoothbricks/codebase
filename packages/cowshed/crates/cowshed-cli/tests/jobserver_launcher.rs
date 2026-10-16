@@ -161,6 +161,7 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
         "RUST_TEST_THREADS",
         "NEXTEST_TEST_THREADS",
         "BOUNDED_EXEC_CPU_TOKENS",
+        "BOUNDED_EXEC_CPU_POOL",
         "FAKE_CARGO_SLEEP",
     ] {
         unset(name);
