@@ -5,26 +5,39 @@
 
 use async_trait::async_trait;
 use cowshed_core::gateway_sessions::{
-    ControlRefusal, GatewayControl, GatewayInstaller, GatewayStatusError, SessionInventory,
-    SessionRestoreRefusal, install_all_sessions, policy_from_grants, project_session_prefix,
-    reconcile_against_status, reconcile_project, stable_workspace_id,
+    ControlRefusal, GatewayControl, GatewayInstaller, GatewayPortReallocator, GatewayStatusError,
+    SessionInventory, SessionRestoreRefusal, WorkspaceSessionSnapshot, install_all_sessions,
+    policy_from_grants, project_session_prefix, reconcile_against_status, reconcile_project,
+    reconcile_project_with_reallocator, reconcile_workspace, stable_workspace_id,
+    workspace_session_prefix,
 };
-use cowshed_core::metadata::{EgressMode, EgressRule, GrantSet, WorkspaceIncarnation};
+use cowshed_core::metadata::{
+    EgressMode, EgressRule, GrantSet, WorkspaceIncarnation, WorkspaceName,
+};
 use cowshed_core::repository::RepoId;
 use cowshed_core::{CowshedError, Result};
 use cowshed_gateway_types::{
     CanonicalTarget, DaemonStatus, EgressMode as GatewayEgressMode, SessionStatus, TargetScheme,
     WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-fn workspace_id(repo: &RepoId, workspace: &str, incarnation: u8) -> String {
-    let incarnation =
-        WorkspaceIncarnation::new(format!("{incarnation:032x}")).expect("fixture incarnation");
-    stable_workspace_id(repo, workspace, &incarnation)
+fn incarnation(value: u8) -> WorkspaceIncarnation {
+    WorkspaceIncarnation::new(format!("{value:032x}")).expect("fixture incarnation")
+}
+
+fn session_snapshot(session: WorkspaceSession, value: u8) -> WorkspaceSessionSnapshot {
+    WorkspaceSessionSnapshot {
+        incarnation: incarnation(value),
+        session,
+    }
+}
+
+fn workspace_id(repo: &RepoId, workspace: &str, value: u8) -> String {
+    stable_workspace_id(repo, workspace, &incarnation(value))
 }
 
 fn session(identity: &str, revision: u64, token_byte: u8) -> WorkspaceSession {
@@ -98,6 +111,7 @@ struct FakeControl {
     installs: Mutex<Vec<(String, u64)>>,
     removes: Mutex<Vec<(String, u64)>>,
     refuse_installs: Mutex<Vec<String>>,
+    occupied_ports: Mutex<BTreeSet<u16>>,
 }
 
 #[async_trait]
@@ -115,6 +129,18 @@ impl GatewayControl for FakeControl {
     }
 
     async fn install(&self, session: &WorkspaceSession) -> std::result::Result<(), ControlRefusal> {
+        if let WorkspaceEndpoint::Tcp { address, .. } = &session.endpoint
+            && self
+                .occupied_ports
+                .lock()
+                .expect("port lock")
+                .contains(&address.port())
+        {
+            return Err(ControlRefusal::AddressInUse(format!(
+                "port {} is occupied",
+                address.port()
+            )));
+        }
         if self
             .refuse_installs
             .lock()
@@ -143,6 +169,315 @@ impl GatewayControl for FakeControl {
             .push((workspace_id.to_owned(), expected_revision));
         Ok(())
     }
+}
+
+struct SelectedInventory {
+    repo: RepoId,
+    workspace: WorkspaceName,
+    target: Mutex<Option<WorkspaceSessionSnapshot>>,
+}
+
+#[async_trait]
+impl SessionInventory for SelectedInventory {
+    async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>> {
+        Err(CowshedError::integrity(
+            "unrelated removed or malformed session grants must not be read",
+            "cowshed doctor --json",
+        ))
+    }
+
+    async fn project_sessions(&self, _: &RepoId) -> Result<Vec<WorkspaceSession>> {
+        Err(CowshedError::integrity(
+            "unrelated removed or malformed session grants must not be read",
+            "cowshed doctor --json",
+        ))
+    }
+
+    async fn workspace_session(
+        &self,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<WorkspaceSessionSnapshot>> {
+        assert_eq!(repo, &self.repo);
+        assert_eq!(workspace, &self.workspace);
+        Ok(self.target.lock().expect("selected session").take())
+    }
+}
+
+#[test]
+fn stable_workspace_namespace_fences_repository_name_and_incarnation() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let other = RepoId::parse("other/widget").expect("other repo");
+    let prefix = workspace_session_prefix(&repo, "raven");
+    let current = workspace_id(&repo, "raven", 2);
+    assert!(current.starts_with(&prefix));
+    assert!(workspace_id(&repo, "raven", 1).starts_with(&prefix));
+    assert_ne!(current, workspace_id(&repo, "raven", 1));
+    assert!(!workspace_id(&repo, "raven-more", 2).starts_with(&prefix));
+    assert!(!workspace_id(&other, "raven", 2).starts_with(&prefix));
+    assert!(current.starts_with(&project_session_prefix(&repo)));
+    cowshed_gateway_types::validate_identifier("workspace_id", &current).expect("valid identity");
+}
+
+#[tokio::test]
+async fn workspace_reconcile_ignores_unrelated_grants_and_preserves_sibling_sessions() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let target = workspace_id(&repo, "raven", 2);
+    let prior = workspace_id(&repo, "raven", 1);
+    let sibling = workspace_id(&repo, "raven-more", 1);
+    let removed = workspace_id(&repo, "retired", 1);
+    let control = FakeControl {
+        status: Mutex::new(Some(Ok(status(vec![
+            installed(&prior, 7),
+            installed_at(&sibling, 9, 40_976),
+            installed_at(&removed, 10, 40_992),
+        ])))),
+        ..FakeControl::default()
+    };
+    let inventory = SelectedInventory {
+        repo: repo.clone(),
+        workspace: WorkspaceName::new("raven").expect("workspace"),
+        target: Mutex::new(Some(session_snapshot(session(&target, 8, 1), 2))),
+    };
+    let report = reconcile_workspace(
+        &control,
+        &inventory,
+        &repo,
+        &inventory.workspace,
+        &incarnation(2),
+        501,
+    )
+    .await
+    .expect("only the selected grant is consulted");
+    assert_eq!(report.installed, 1);
+    assert_eq!(report.removed, 1);
+    assert_eq!(*control.removes.lock().expect("removes"), vec![(prior, 7)]);
+    assert_eq!(
+        *control.installs.lock().expect("installs"),
+        vec![(target, 8)]
+    );
+}
+
+#[tokio::test]
+async fn absent_workspace_work_refuses_and_maintenance_retires_only_stale_sessions() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let target = workspace_id(&repo, "raven", 1);
+    let sibling = workspace_id(&repo, "other", 1);
+    let control = FakeControl {
+        status: Mutex::new(Some(Ok(status(vec![
+            installed(&target, 7),
+            installed_at(&sibling, 9, 40_976),
+        ])))),
+        ..FakeControl::default()
+    };
+    let inventory = SelectedInventory {
+        repo: repo.clone(),
+        workspace: WorkspaceName::new("raven").expect("workspace"),
+        target: Mutex::new(None),
+    };
+    let error = reconcile_workspace(
+        &control,
+        &inventory,
+        &repo,
+        &inventory.workspace,
+        &incarnation(1),
+        501,
+    )
+    .await
+    .expect_err("a retired work capability has no cleanup authority");
+    assert_eq!(error.code, cowshed_core::ErrorCode::NotFound);
+    assert!(control.removes.lock().expect("removes").is_empty());
+    assert!(control.installs.lock().expect("installs").is_empty());
+
+    let maintenance = FakeControl {
+        status: Mutex::new(Some(Ok(status(vec![
+            installed(&target, 7),
+            installed_at(&sibling, 9, 40_976),
+        ])))),
+        ..FakeControl::default()
+    };
+    let report = reconcile_project(
+        &maintenance,
+        &host_with(vec![session_at(&sibling, 9, 2, 40_976)]),
+        &repo,
+        501,
+    )
+    .await
+    .expect("project maintenance retires the stale session");
+    assert_eq!(report.removed, 1);
+    assert_eq!(
+        *maintenance.removes.lock().expect("removes"),
+        vec![(target, 7)]
+    );
+    assert!(maintenance.installs.lock().expect("installs").is_empty());
+}
+
+#[tokio::test]
+async fn workspace_reconcile_never_evicts_a_sibling_endpoint_owner() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let other = RepoId::parse("other/widget").expect("other repo");
+    for owner in [
+        workspace_id(&repo, "other", 1),
+        workspace_id(&other, "raven", 1),
+    ] {
+        let control = FakeControl {
+            status: Mutex::new(Some(Ok(status(vec![installed(&owner, 7)])))),
+            ..FakeControl::default()
+        };
+        let inventory = SelectedInventory {
+            repo: repo.clone(),
+            workspace: WorkspaceName::new("raven").expect("workspace"),
+            target: Mutex::new(Some(session_snapshot(
+                session(&workspace_id(&repo, "raven", 1), 8, 1),
+                1,
+            ))),
+        };
+        let error = reconcile_workspace(
+            &control,
+            &inventory,
+            &repo,
+            &inventory.workspace,
+            &incarnation(1),
+            501,
+        )
+        .await
+        .expect_err("a workspace job cannot decide another session's ownership");
+        assert_eq!(error.code, cowshed_core::ErrorCode::Integrity);
+        assert!(error.message.contains(&owner));
+        assert!(control.removes.lock().expect("removes").is_empty());
+        assert!(control.installs.lock().expect("installs").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn recreated_workspace_is_refused_before_any_gateway_mutation() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let workspace = WorkspaceName::new("raven").expect("workspace");
+    let prior = workspace_id(&repo, workspace.as_str(), 1);
+    let current = workspace_id(&repo, workspace.as_str(), 2);
+    let control = FakeControl {
+        status: Mutex::new(Some(Ok(status(vec![installed(&prior, 7)])))),
+        ..FakeControl::default()
+    };
+    let inventory = SelectedInventory {
+        repo: repo.clone(),
+        workspace: workspace.clone(),
+        target: Mutex::new(Some(session_snapshot(session(&current, 8, 1), 2))),
+    };
+    let error = reconcile_workspace(
+        &control,
+        &inventory,
+        &repo,
+        &workspace,
+        &incarnation(1),
+        501,
+    )
+    .await
+    .expect_err("a held old incarnation cannot reconcile a recreated name");
+    assert_eq!(error.code, cowshed_core::ErrorCode::Conflict);
+    assert!(
+        matches!(error.fence_source(), Some(cowshed_core::error::FenceRefusal::IncarnationMoved { workspace: found, observed }) if found == &workspace && observed == &incarnation(2))
+    );
+    assert!(control.installs.lock().expect("installs").is_empty());
+    assert!(control.removes.lock().expect("removes").is_empty());
+}
+
+#[derive(Default)]
+struct RecordingReallocator {
+    rejected: Mutex<Vec<BTreeSet<u16>>>,
+}
+
+#[async_trait]
+impl GatewayPortReallocator for RecordingReallocator {
+    async fn reallocate(
+        &self,
+        session: &WorkspaceSession,
+        rejected: &BTreeSet<u16>,
+    ) -> Result<WorkspaceSession> {
+        self.rejected
+            .lock()
+            .expect("rejected")
+            .push(rejected.clone());
+        let WorkspaceEndpoint::Tcp { address, .. } = &session.endpoint else {
+            panic!("the fixture has a TCP endpoint");
+        };
+        Ok(session_at(
+            &session.workspace_id,
+            session.revision + 1,
+            1,
+            address.port() + 16,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn project_reallocation_runs_only_after_address_in_use_and_retains_rejected_ports() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let identity = workspace_id(&repo, "raven", 1);
+    let inventory = AttachingInventory {
+        status_read: Arc::new(AtomicBool::new(true)),
+        attached: identity.clone(),
+    };
+    for occupied in [BTreeSet::new(), BTreeSet::from([40_960, 40_976])] {
+        let attempts = occupied.len();
+        let control = FakeControl {
+            status: Mutex::new(Some(Ok(status(Vec::new())))),
+            occupied_ports: Mutex::new(occupied),
+            ..FakeControl::default()
+        };
+        let reallocator = RecordingReallocator::default();
+        let report =
+            reconcile_project_with_reallocator(&control, &inventory, &repo, 501, &reallocator)
+                .await
+                .expect("project port publication succeeds");
+        assert_eq!(report.installed, 1);
+        assert_eq!(
+            *control.installs.lock().expect("installs"),
+            vec![(
+                identity.clone(),
+                6 + u64::try_from(attempts).expect("small attempt count")
+            )]
+        );
+        let rejected = reallocator.rejected.lock().expect("rejected");
+        assert_eq!(rejected.len(), attempts);
+        if attempts != 0 {
+            assert_eq!(rejected[0], BTreeSet::from([40_960]));
+            assert_eq!(rejected[1], BTreeSet::from([40_960, 40_976]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn workspace_address_in_use_is_a_typed_refusal_without_host_allocation() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let identity = workspace_id(&repo, "raven", 1);
+    let inventory = SelectedInventory {
+        repo: repo.clone(),
+        workspace: WorkspaceName::new("raven").expect("workspace"),
+        target: Mutex::new(Some(session_snapshot(session(&identity, 8, 1), 1))),
+    };
+    let control = FakeControl {
+        status: Mutex::new(Some(Ok(status(Vec::new())))),
+        occupied_ports: Mutex::new(BTreeSet::from([40_960])),
+        ..FakeControl::default()
+    };
+    let error = reconcile_workspace(
+        &control,
+        &inventory,
+        &repo,
+        &inventory.workspace,
+        &incarnation(1),
+        501,
+    )
+    .await
+    .expect_err("jobs cannot enter host-wide allocation even after AddrInUse");
+    assert_eq!(error.code, cowshed_core::ErrorCode::Conflict);
+    assert!(error.message.contains("AddrInUse"));
+    assert!(error.message.contains(&identity));
+    assert!(error.message.contains("127.0.0.1:40960"));
+    assert_eq!(error.hint, "cowshed doctor --repair");
+    assert!(control.removes.lock().expect("removes").is_empty());
+    assert!(control.installs.lock().expect("installs").is_empty());
 }
 
 #[tokio::test]
@@ -301,6 +636,47 @@ async fn status_protocol_failures_are_not_reported_as_gateway_absence() {
         "{}",
         error.message
     );
+}
+
+#[tokio::test]
+async fn workspace_status_refusals_precede_any_named_inventory_read() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let workspace = WorkspaceName::new("raven").expect("workspace");
+    let mounting = cowshed_gateway_types::StartupHeal::Mounting {
+        projects: std::num::NonZeroUsize::new(4).expect("four"),
+    };
+    for (response, exit) in [
+        (Err(GatewayStatusError::Absent), 5),
+        (
+            Err(GatewayStatusError::Control("invalid status".to_owned())),
+            1,
+        ),
+        (
+            Ok(DaemonStatus {
+                healing: Some(mounting),
+                ..status(Vec::new())
+            }),
+            4,
+        ),
+    ] {
+        let control = FakeControl {
+            status: Mutex::new(Some(response)),
+            ..FakeControl::default()
+        };
+        let error = reconcile_workspace(
+            &control,
+            &untouched_host(),
+            &repo,
+            &workspace,
+            &incarnation(1),
+            501,
+        )
+        .await
+        .expect_err("status refuses before any inventory method is reached");
+        assert_eq!(error.exit_code(), exit);
+        assert!(control.removes.lock().expect("removes").is_empty());
+        assert!(control.installs.lock().expect("installs").is_empty());
+    }
 }
 
 #[tokio::test]
@@ -539,6 +915,17 @@ impl SessionInventory for AttachingInventory {
             Vec::new()
         })
     }
+
+    async fn workspace_session(
+        &self,
+        _: &RepoId,
+        _: &WorkspaceName,
+    ) -> Result<Option<WorkspaceSessionSnapshot>> {
+        Ok(self
+            .status_read
+            .load(Ordering::SeqCst)
+            .then(|| session_snapshot(session(&self.attached, 6, 1), 1)))
+    }
 }
 
 /// Every session a reconcile sees in gateway status was installed from an inventory snapshot older
@@ -565,6 +952,79 @@ async fn a_reconcile_never_revokes_a_session_installed_after_its_inventory_snaps
         .expect("the attached workspace's own revision stays installable");
 
     assert_eq!(gateway.live(), BTreeMap::from([(raven, 6)]));
+}
+
+#[tokio::test]
+async fn workspace_reconcile_reads_status_before_its_named_snapshot() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let workspace = WorkspaceName::new("raven").expect("workspace");
+    let identity = workspace_id(&repo, workspace.as_str(), 1);
+    let gateway = FencedGateway::holding(&identity, 6);
+    let inventory = AttachingInventory {
+        status_read: Arc::clone(&gateway.status_read),
+        attached: identity.clone(),
+    };
+    reconcile_workspace(
+        &gateway,
+        &inventory,
+        &repo,
+        &workspace,
+        &incarnation(1),
+        501,
+    )
+    .await
+    .expect("first workspace reconcile");
+    reconcile_workspace(
+        &gateway,
+        &inventory,
+        &repo,
+        &workspace,
+        &incarnation(1),
+        501,
+    )
+    .await
+    .expect("the current revision was not tombstoned");
+    assert_eq!(gateway.live(), BTreeMap::from([(identity, 6)]));
+}
+
+#[tokio::test]
+async fn workspace_reconcile_preserves_superseded_install_and_removal_fences() {
+    let repo = RepoId::parse("acme/widget").expect("repo");
+    let workspace = WorkspaceName::new("raven").expect("workspace");
+    let identity = workspace_id(&repo, workspace.as_str(), 1);
+    for removing in [false, true] {
+        let gateway = FencedGateway {
+            concurrent: Mutex::new(Some((identity.clone(), 7))),
+            ..if removing {
+                FencedGateway::holding(&identity, 6)
+            } else {
+                FencedGateway::default()
+            }
+        };
+        let report = if removing {
+            reconcile_project(&gateway, &host_with(Vec::new()), &repo, 501).await
+        } else {
+            let inventory = SelectedInventory {
+                repo: repo.clone(),
+                workspace: workspace.clone(),
+                target: Mutex::new(Some(session_snapshot(session(&identity, 6, 1), 1))),
+            };
+            reconcile_workspace(
+                &gateway,
+                &inventory,
+                &repo,
+                &workspace,
+                &incarnation(1),
+                501,
+            )
+            .await
+        }
+        .expect("the newer decision stands");
+        assert_eq!(report.superseded, 1);
+        assert_eq!(report.installed, 0);
+        assert_eq!(report.removed, 0);
+        assert_eq!(gateway.live(), BTreeMap::from([(identity.clone(), 7)]));
+    }
 }
 
 /// A reconcile's writes race every other reconcile of the project: one that read a newer snapshot
@@ -633,8 +1093,22 @@ impl SessionInventory for FakeInventory {
             .ok_or_else(|| CowshedError::internal("inventory called twice"))
     }
 
-    async fn project_sessions(&self, _repo_id: &RepoId) -> Result<Vec<WorkspaceSession>> {
-        Err(CowshedError::internal("project inventory not expected"))
+    async fn project_sessions(&self, repo_id: &RepoId) -> Result<Vec<WorkspaceSession>> {
+        let prefix = project_session_prefix(repo_id);
+        Ok(self
+            .all_sessions()
+            .await?
+            .into_iter()
+            .filter(|session| session.workspace_id.starts_with(&prefix))
+            .collect())
+    }
+
+    async fn workspace_session(
+        &self,
+        _: &RepoId,
+        _: &WorkspaceName,
+    ) -> Result<Option<WorkspaceSessionSnapshot>> {
+        Err(CowshedError::internal("workspace inventory not expected"))
     }
 }
 

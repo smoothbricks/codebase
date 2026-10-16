@@ -60,10 +60,12 @@ TCP sessions on Linux. A namespace-local connector is never a TCP gateway-sessio
 
 The allocator's publication marker excludes other cowshed creators while it binds all ports in the candidate block.
 Those listeners are released only after the image and grant are published. A separate host process can still claim a
-port before the daemon installs the session: `AddrInUse` is a typed control refusal, not a stale-grant success. The
-project controller chooses a new unassigned block under the same reservation and inventory check, publishes a higher
-grant revision, rereads the authoritative session, and retries. A refused base is excluded for that reconciliation, so a
-retry cannot alternate between occupied ports. Other installation errors remain errors.
+port before the daemon installs the session: `AddrInUse` is a typed control refusal, not a stale-grant success.
+Workspace job reconciliation returns that refusal with the maintenance remedy; it never reads host-wide grants to find a
+new block. Only project lifecycle/maintenance reconciliation chooses a new unassigned block under the same reservation
+and inventory check, publishes a higher grant revision, rereads the authoritative session, and retries. A refused base
+is excluded for that reconciliation, so a retry cannot alternate between occupied ports. Other installation errors
+remain errors.
 
 Every data-plane request additionally carries exactly `Proxy-Authorization: Bearer <opaque-token>`. The token is 32
 random bytes encoded as unpadded base64url, lives at `.cowshed/token` mode 0600, and is defense in depth rather than the
@@ -423,12 +425,24 @@ and every attach advances. An install must exceed every revision that workspace 
 revision behind as a tombstone — and a removal must name the installed revision; either refusal is `revision-fence`, and
 a removal of a session that is already gone is `not-installed`.
 
-Every controller that needs the gateway reconciles its project first, so reconciles of one project run concurrently.
-Each reads gateway status before its inventory snapshot: every installed session came from an older snapshot, so a
-removal never revokes a newer decision, which would leave a tombstone refusing the workspace's own revision until its
-next attach. A write refused with `revision-fence` or `not-installed` lost a race to a reconcile that read a newer
-snapshot; that decision stands, and the write counts as superseded rather than failing the command that ran the
-reconcile.
+Core's project runtime owns workspace gateway preparation: after the decoded route's `AdmissionSource::admit` and live
+workspace-incarnation validation, and before exec, session opening or checked-land work, it reconciles only the selected
+workspace. Both `worker.exec` and trusted `coordinator.exec` use this boundary; connection role never substitutes for
+route admission. The scoped inventory revalidates the held incarnation after reading gateway status. A missing or
+recreated workspace refuses before gateway installation or removal; it never retargets the request. Jobs read no sibling
+session or grants record, evict no foreign session, and never allocate a replacement port block. Job observation, stdin,
+logs and status do not prepare gateway sessions. Project-wide reconciliation and port repair belong to lifecycle and
+maintenance verbs.
+
+The runtime owns one control client constructed from its validated host storage through the existing `GatewayControl`
+trait. The CLI supplies the transport at construction; core does not link the daemon or select an ambient control
+socket, and no default or no-op client can silently bypass preparation. Workspace operations borrow that client.
+
+Concurrent reconciles read gateway status before their scoped inventory snapshot: every installed session came from an
+older snapshot, so a removal never revokes a newer decision, which would leave a tombstone refusing the workspace's own
+revision until its next attach. A write refused with `revision-fence` or `not-installed` lost a race to a reconcile that
+read a newer snapshot; that decision stands, and the write counts as superseded rather than failing the command that ran
+the reconcile.
 
 Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a
 `disk-lease`, `cpu-tokens` or `jobserver` request is held for as long as its client keeps the connection open.

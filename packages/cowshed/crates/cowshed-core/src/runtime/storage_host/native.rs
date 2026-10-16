@@ -8,6 +8,30 @@ impl<R> RuntimeStorageHost for MacOsApfsExecutionHost<R>
 where
     R: CommandRunner + Send + Sync + 'static,
 {
+    fn canonical_metadata(
+        &self,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<DetachedWorkspaceMetadata>, ApfsStorageError> {
+        MacOsApfsExecutionHost::canonical_metadata(self, repo, workspace)
+    }
+
+    fn pending_publications_for(
+        &self,
+        repo: &RepoId,
+        workspaces: Option<&std::collections::BTreeSet<WorkspaceName>>,
+    ) -> Result<Vec<crate::storage::apfs::PendingPublicationFact>, ApfsStorageError> {
+        MacOsApfsExecutionHost::pending_publications_for(self, repo, workspaces)
+    }
+
+    fn workspace_snapshot(
+        &self,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<(DerivedWorkspace, DetachedWorkspaceMetadata)>, ApfsStorageError> {
+        MacOsApfsExecutionHost::workspace_snapshot(self, repo, workspace)
+    }
+
     fn label_image_volume(&self, image: &Path, label: &str) -> Result<Labelled, ApfsStorageError> {
         MacOsApfsExecutionHost::label_image_volume(self, image, label)
     }

@@ -923,6 +923,27 @@ impl ApfsExecutionHost for FakeHost {
             .collect())
     }
 
+    fn workspace_mount_state(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<MountState, ApfsStorageError> {
+        let state = self.state.lock().expect("fake state");
+        let key = (workspace.repo().clone(), workspace.name().clone());
+        if !state
+            .published
+            .get(&key)
+            .is_some_and(|fact| &fact.workspace == workspace)
+        {
+            return Err(ApfsStorageError::InvalidPlan("workspace is not published"));
+        }
+        Ok(match state.mounted.get(&key) {
+            Some(mount) => MountState::Mounted {
+                mount_id: mount.mount_id,
+            },
+            None => MountState::Detached,
+        })
+    }
+
     fn pending_publications(
         &self,
         repo: &RepoId,

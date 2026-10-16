@@ -3,15 +3,12 @@
 //! Every workspace's gateway session — its endpoint (port block), token, CA, and egress policy
 //! from the grants file — is derived from the machine-global store under
 //! `/private/cowshed/store`; the running gateway only caches those sessions so it can answer
-//! data-plane connections. Reconcile repairs
-//! the cache from the inventory: the project's stale sessions are removed by identity, a session a
-//! deleted project left holding a port block this project now owns is evicted once no live
-//! workspace claims it, a live collision is an integrity refusal naming both, and installs are
-//! independent so one refusal does not abandon the rest. Every controller that needs the gateway
-//! runs it first — the CLI before a gateway-requiring verb, a supervising runtime before an exec —
-//! so reconciles of one project run concurrently: each reads gateway status before its inventory
-//! snapshot, and a write the gateway refuses because a newer reconcile overtook it is superseded,
-//! not failed.
+//! data-plane connections. Reconcile removes the selected workspace's stale incarnations by
+//! identity before a job starts.
+//! Project lifecycle and maintenance additionally evict a deleted project's session holding a
+//! reclaimed port block once no live workspace claims it. Workspace jobs never inspect or remove
+//! sibling sessions. Reconciles read gateway status before their inventory snapshot, and a write
+//! refused because a newer reconcile overtook it is superseded, not failed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -30,7 +27,9 @@ use crate::error::{CowshedError, Result};
 use crate::gateway_inventory::{
     GatewaySessionFact, NativeGatewayInventory, PortCollision, served_sessions,
 };
-use crate::metadata::{EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation};
+use crate::metadata::{
+    EgressMode as CoreEgressMode, GrantSet, WorkspaceIncarnation, WorkspaceName,
+};
 use crate::repository::RepoId;
 use crate::storage::bootstrap::ValidatedHostStorage;
 
@@ -91,6 +90,10 @@ pub trait GatewayControl: Send + Sync {
     ) -> std::result::Result<(), ControlRefusal>;
 }
 
+/// The composition root constructs one owned control client from validated host storage.
+/// The runtime borrows it for work; construction does not supply a default or a no-op gateway.
+pub type GatewayControlFactory = fn(&ValidatedHostStorage) -> Result<Box<dyn GatewayControl>>;
+
 /// Reassign a persisted workspace port block after the gateway reports `AddrInUse`, returning
 /// the new authoritative session. `rejected` includes every candidate the kernel refused in this
 /// reconciliation, so the allocator cannot bounce between a pair of occupied ports.
@@ -103,10 +106,23 @@ pub trait GatewayPortReallocator: Send + Sync {
     ) -> Result<WorkspaceSession>;
 }
 
+/// One named authoritative session observation. The incarnation is retained from the host fact,
+/// not reconstructed from a cache identifier, so work can fence it before any gateway mutation.
+#[derive(Debug)]
+pub struct WorkspaceSessionSnapshot {
+    pub incarnation: WorkspaceIncarnation,
+    pub session: WorkspaceSession,
+}
+
 #[async_trait]
 pub trait SessionInventory {
     async fn all_sessions(&self) -> Result<Vec<WorkspaceSession>>;
     async fn project_sessions(&self, repo_id: &RepoId) -> Result<Vec<WorkspaceSession>>;
+    async fn workspace_session(
+        &self,
+        repo_id: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<WorkspaceSessionSnapshot>>;
 }
 
 pub struct NativeSessionInventory {
@@ -177,6 +193,19 @@ impl SessionInventory for NativeSessionInventory {
                 .iter()
                 .any(|collision| collision.claims(&fact.repo_id, &fact.workspace))
         }))
+    }
+
+    async fn workspace_session(
+        &self,
+        repo_id: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<WorkspaceSessionSnapshot>> {
+        self.inventory
+            .workspace_attached(repo_id, workspace)
+            .await
+            .map_err(inventory_error)?
+            .map(session_snapshot_from_fact)
+            .transpose()
     }
 }
 
@@ -262,6 +291,20 @@ pub fn project_session_prefix(repo_id: &RepoId) -> String {
     format!("p{}.", hex_lower(&digest[..16]))
 }
 
+/// Exact-name namespace shared only by incarnations of one workspace in one repository.
+pub fn workspace_session_prefix(repo_id: &RepoId, workspace: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(repo_id.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(workspace.as_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "{}w{}.",
+        project_session_prefix(repo_id),
+        hex_lower(&digest[..16])
+    )
+}
+
 /// Stable for one workspace incarnation. Restore and re-adopt rotate the identity so the gateway's
 /// replay-protection tombstone cannot reject a legitimate lifecycle reset.
 pub fn stable_workspace_id(
@@ -269,15 +312,9 @@ pub fn stable_workspace_id(
     workspace: &str,
     incarnation: &WorkspaceIncarnation,
 ) -> String {
-    let prefix = project_session_prefix(repo_id);
-    let mut hasher = Sha256::new();
-    hasher.update(repo_id.as_str().as_bytes());
-    hasher.update([0]);
-    hasher.update(workspace.as_bytes());
-    hasher.update([0]);
-    hasher.update(incarnation.as_str().as_bytes());
-    let digest = hasher.finalize();
-    format!("{prefix}w{}", hex_lower(&digest[..16]))
+    let prefix = workspace_session_prefix(repo_id, workspace);
+    let digest = Sha256::digest(incarnation.as_str().as_bytes());
+    format!("{prefix}i{}", hex_lower(&digest[..16]))
 }
 
 /// Explicit egress grants plus anonymous public npm reads on HTTPS port 443.
@@ -330,6 +367,10 @@ pub fn policy_from_grants(grants: &GrantSet) -> Result<WorkspacePolicy> {
 /// port-block topology, not the runner's platform; the gateway validates the current host
 /// again at installation, where Linux continues to require a Unix endpoint.
 pub fn session_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSession> {
+    session_snapshot_from_fact(fact).map(|snapshot| snapshot.session)
+}
+
+fn session_snapshot_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSessionSnapshot> {
     let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, fact.port_block.base()));
     let token = WorkspaceToken::parse(fact.credentials.token()).map_err(|error| {
         CowshedError::integrity(
@@ -381,7 +422,10 @@ pub fn session_from_fact(fact: GatewaySessionFact) -> Result<WorkspaceSession> {
                 "cowshed doctor --json",
             )
         })?;
-    Ok(session)
+    Ok(WorkspaceSessionSnapshot {
+        incarnation: fact.incarnation,
+        session,
+    })
 }
 
 pub fn sessions_from_facts(
@@ -436,18 +480,7 @@ where
     C: GatewayControl + ?Sized,
     I: SessionInventory + ?Sized,
 {
-    let status = control.status().await.map_err(|error| match error {
-        GatewayStatusError::Absent => gateway_absent(uid),
-        GatewayStatusError::Control(message) => {
-            CowshedError::internal(format!("gateway status failed: {message}"))
-        }
-    })?;
-    // The daemon restores every attached workspace's session from the mounts its startup pass
-    // heals: until then the attachments this snapshot would read are still moving, and a session
-    // installed now would race that restore.
-    if let Some(heal) = status.healing {
-        return Err(CowshedError::healing(heal));
-    }
+    let status = reconciliation_status(control, uid).await?;
     let desired = inventory.project_sessions(repo_id).await?;
     reconcile_against_status_inner(
         control,
@@ -456,8 +489,77 @@ where
         desired,
         status,
         reallocator,
+        true,
     )
     .await
+}
+
+/// Reconcile only the selected workspace's namespace, with status before its named snapshot.
+/// Sibling endpoint owners remain untouched: only project maintenance can establish that a
+/// foreign owner is stale, because doing so requires host-wide inventory.
+/// An occupied listener is a typed conflict requiring project maintenance, never a reason for a
+/// workspace job to enumerate host-wide port grants.
+pub async fn reconcile_workspace<C, I>(
+    control: &C,
+    inventory: &I,
+    repo_id: &RepoId,
+    workspace: &WorkspaceName,
+    incarnation: &WorkspaceIncarnation,
+    uid: u32,
+) -> Result<ReconcileReport>
+where
+    C: GatewayControl + ?Sized,
+    I: SessionInventory + ?Sized,
+{
+    let status = reconciliation_status(control, uid).await?;
+    let observed = inventory
+        .workspace_session(repo_id, workspace)
+        .await?
+        .ok_or_else(|| {
+            CowshedError::not_found(
+                format!("workspace {workspace} incarnation {incarnation} has no attached gateway session"),
+                "attach the selected workspace or reacquire its worker handle",
+            )
+        })?;
+    if observed.incarnation != *incarnation {
+        return Err(CowshedError::fence_refusal(
+            crate::error::FenceRefusal::IncarnationMoved {
+                workspace: workspace.clone(),
+                observed: observed.incarnation,
+            },
+            format!(
+                "workspace {workspace} incarnation {incarnation} changed before gateway reconciliation"
+            ),
+            "reacquire the worker handle and retry",
+        ));
+    }
+    reconcile_against_status_inner(
+        control,
+        inventory,
+        &workspace_session_prefix(repo_id, workspace.as_str()),
+        [observed.session],
+        status,
+        None,
+        false,
+    )
+    .await
+}
+
+async fn reconciliation_status<C: GatewayControl + ?Sized>(
+    control: &C,
+    uid: u32,
+) -> Result<DaemonStatus> {
+    let status = control.status().await.map_err(|error| match error {
+        GatewayStatusError::Absent => gateway_absent(uid),
+        GatewayStatusError::Control(message) => {
+            CowshedError::internal(format!("gateway status failed: {message}"))
+        }
+    })?;
+    // Startup attachments are still moving until the daemon finishes restoring its sessions.
+    if let Some(heal) = status.healing {
+        return Err(CowshedError::healing(heal));
+    }
+    Ok(status)
 }
 
 /// Bring the gateway's sessions for one project in line with that project's inventory.
@@ -484,16 +586,17 @@ where
     C: GatewayControl + ?Sized,
     I: SessionInventory + ?Sized,
 {
-    reconcile_against_status_inner(control, host, project_prefix, desired, status, None).await
+    reconcile_against_status_inner(control, host, project_prefix, desired, status, None, true).await
 }
 
 async fn reconcile_against_status_inner<C, I>(
     control: &C,
     host: &I,
-    project_prefix: &str,
-    desired: Vec<WorkspaceSession>,
+    scope_prefix: &str,
+    desired: impl IntoIterator<Item = WorkspaceSession>,
     status: DaemonStatus,
     reallocator: Option<&dyn GatewayPortReallocator>,
+    reconcile_foreign: bool,
 ) -> Result<ReconcileReport>
 where
     C: GatewayControl + ?Sized,
@@ -502,9 +605,13 @@ where
     let mut desired_by_id = BTreeMap::new();
     for session in desired {
         let identity = session.workspace_id.clone();
-        if !identity.starts_with(project_prefix) {
+        if !identity.starts_with(scope_prefix) {
             return Err(CowshedError::integrity(
-                "gateway session is outside the reconciled project namespace",
+                if reconcile_foreign {
+                    "gateway session is outside the reconciled project namespace"
+                } else {
+                    "gateway session is outside the reconciled workspace namespace"
+                },
                 "cowshed doctor --json",
             ));
         }
@@ -519,7 +626,7 @@ where
     let installed_by_id: BTreeMap<_, _> = status
         .sessions
         .iter()
-        .filter(|session| session.workspace_id.starts_with(project_prefix))
+        .filter(|session| session.workspace_id.starts_with(scope_prefix))
         .map(|session| (session.workspace_id.as_str(), session))
         .collect();
     let mut report = ReconcileReport::default();
@@ -527,7 +634,7 @@ where
     for installed in status
         .sessions
         .iter()
-        .filter(|session| session.workspace_id.starts_with(project_prefix))
+        .filter(|session| session.workspace_id.starts_with(scope_prefix))
     {
         if !desired_ids.contains(installed.workspace_id.as_str()) {
             match control
@@ -552,7 +659,7 @@ where
     let foreign_owners: Vec<_> = status
         .sessions
         .iter()
-        .filter(|session| !session.workspace_id.starts_with(project_prefix))
+        .filter(|session| !session.workspace_id.starts_with(scope_prefix))
         .filter_map(|session| {
             desired_endpoints
                 .get(&session.endpoint)
@@ -560,6 +667,16 @@ where
         })
         .collect();
     if !foreign_owners.is_empty() {
+        if !reconcile_foreign {
+            let (owner, claimant) = foreign_owners[0];
+            return Err(CowshedError::integrity(
+                format!(
+                    "gateway endpoint {} for workspace {claimant} is held by session {} outside the selected workspace; project maintenance must resolve its ownership",
+                    owner.endpoint, owner.workspace_id
+                ),
+                "cowshed doctor --repair",
+            ));
+        }
         let live: BTreeSet<String> = host
             .all_sessions()
             .await?
@@ -616,6 +733,15 @@ where
                     break;
                 }
                 Err(ControlRefusal::AddressInUse(error)) => {
+                    if !reconcile_foreign {
+                        return Err(CowshedError::conflict(
+                            format!(
+                                "gateway session {identity} cannot bind {} (AddrInUse): {error}",
+                                attempted.endpoint
+                            ),
+                            "cowshed doctor --repair",
+                        ));
+                    }
                     let WorkspaceEndpoint::Tcp { address, .. } = &attempted.endpoint else {
                         failures.push(format!(
                             "could not install gateway session {identity}: {error}"

@@ -48,6 +48,13 @@ pub use cowshed_core::gateway_sessions::{
 pub use cowshed_gateway_types::control_socket_path;
 use std::collections::BTreeSet;
 
+/// Bind the runtime's gateway dependency once, without making a control request during open.
+pub fn runtime_control(storage: &ValidatedHostStorage) -> Result<Box<dyn GatewayControl>> {
+    Ok(Box::new(ControlSocket::at(
+        storage.store().join("gateway.sock"),
+    )?))
+}
+
 /// A running daemon reached over its control socket.
 ///
 /// Reconciliation lives in `cowshed-core` and is a pure function of host inventory plus the three
@@ -3055,6 +3062,15 @@ mod tests {
             }
 
             async fn project_sessions(&self, _: &RepoId) -> Result<Vec<WorkspaceSession>> {
+                Err(CowshedError::internal("the inventory was read"))
+            }
+
+            async fn workspace_session(
+                &self,
+                _: &RepoId,
+                _: &cowshed_core::metadata::WorkspaceName,
+            ) -> Result<Option<cowshed_core::gateway_sessions::WorkspaceSessionSnapshot>>
+            {
                 Err(CowshedError::internal("the inventory was read"))
             }
         }

@@ -418,7 +418,12 @@ impl ActorBridge {
         project_root: &Path,
         requested_repo_id: Option<RepoId>,
     ) -> Result<Self> {
-        let runtime = ProjectRuntime::open_for_adopt(project_root, requested_repo_id).await?;
+        let runtime = ProjectRuntime::open_for_adopt(
+            project_root,
+            requested_repo_id,
+            gateway_service::runtime_control,
+        )
+        .await?;
         Self::from_runtime(project_root, runtime, GatewayStoreBackend::Native).await
     }
 
@@ -431,7 +436,12 @@ impl ActorBridge {
         let runtime = cowshed_os::timing::timed_async(
             "controller-open",
             "runtime",
-            ProjectRuntime::open_for_adopt_at(project_root, requested_repo_id, storage),
+            ProjectRuntime::open_for_adopt_at(
+                project_root,
+                requested_repo_id,
+                storage,
+                gateway_service::runtime_control,
+            ),
         )
         .await?;
         Self::from_runtime(project_root, runtime, GatewayStoreBackend::Native).await
@@ -442,7 +452,13 @@ impl ActorBridge {
         scope: RecoveryScope,
         storage: ValidatedHostStorage,
     ) -> Result<Self> {
-        let runtime = ProjectRuntime::open_existing_at(project_root, scope, storage).await?;
+        let runtime = ProjectRuntime::open_existing_at(
+            project_root,
+            scope,
+            storage,
+            gateway_service::runtime_control,
+        )
+        .await?;
         Self::from_runtime(project_root, runtime, GatewayStoreBackend::Native).await
     }
 
@@ -452,9 +468,13 @@ impl ActorBridge {
         requested_repo_id: Option<RepoId>,
         storage: ValidatedHostStorage,
     ) -> Result<Self> {
-        let runtime =
-            ProjectRuntime::open_directory_for_adopt_at(project_root, requested_repo_id, storage)
-                .await?;
+        let runtime = ProjectRuntime::open_directory_for_adopt_at(
+            project_root,
+            requested_repo_id,
+            storage,
+            gateway_service::runtime_control,
+        )
+        .await?;
         Self::from_runtime(project_root, runtime, GatewayStoreBackend::Directory).await
     }
 
@@ -464,19 +484,30 @@ impl ActorBridge {
         scope: RecoveryScope,
         storage: ValidatedHostStorage,
     ) -> Result<Self> {
-        let runtime =
-            ProjectRuntime::open_directory_existing_at(project_root, scope, storage).await?;
+        let runtime = ProjectRuntime::open_directory_existing_at(
+            project_root,
+            scope,
+            storage,
+            gateway_service::runtime_control,
+        )
+        .await?;
         Self::from_runtime(project_root, runtime, GatewayStoreBackend::Directory).await
     }
 
     pub async fn open_existing(project_root: &Path, scope: RecoveryScope) -> Result<Self> {
-        let runtime = ProjectRuntime::open_existing(project_root, scope).await?;
+        let runtime =
+            ProjectRuntime::open_existing(project_root, scope, gateway_service::runtime_control)
+                .await?;
         Self::from_runtime(project_root, runtime, GatewayStoreBackend::Native).await
     }
 
     /// [`Self::open_existing`] for the identity-change verb alone (`cowshed mv … --repo-id`).
     pub async fn open_existing_for_identity_change(project_root: &Path) -> Result<Self> {
-        let runtime = ProjectRuntime::open_existing_for_identity_change(project_root).await?;
+        let runtime = ProjectRuntime::open_existing_for_identity_change(
+            project_root,
+            gateway_service::runtime_control,
+        )
+        .await?;
         Self::from_runtime(project_root, runtime, GatewayStoreBackend::Native).await
     }
 
@@ -1277,9 +1308,6 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    if requires_gateway_before_dispatch(&cli.command) {
-        service.reconcile_gateway().await?;
-    }
     let json = cli.global.json;
     match cli.command {
         Command::Adopt(args) => {
@@ -1936,16 +1964,6 @@ where
         Command::Version => Err(CowshedError::internal(
             "version is answered before the runtime bridge",
         )),
-    }
-}
-
-fn requires_gateway_before_dispatch(command: &Command) -> bool {
-    // Landing checks execute directly through the supervisor, bypassing Exec's dispatch path.
-    // Refresh their gateway authority before any check runs; checkless land needs no preflight.
-    match command {
-        Command::Exec(_) => true,
-        Command::Land(args) => !args.checks.is_empty(),
-        _ => false,
     }
 }
 
@@ -5020,25 +5038,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn egress_revoke_recovery_skips_gateway_reconciliation() {
-        for argv in [
-            vec!["revoke", "raven", "--egress", "api.example.test:443"],
-            vec![
-                "revoke",
-                "--project-wide",
-                "--egress",
-                "api.example.test:443",
-            ],
-            vec!["revoke", "raven", "--all"],
-            vec!["revoke", "--project-wide", "--all"],
-        ] {
-            let cli = crate::args::parse_args(argv).expect("supported recovery");
-            assert!(!requires_gateway_before_dispatch(&cli.command));
-            assert!(needs_daemon_of_this_build(&cli.command));
-        }
-    }
-
     /// The defect: a daemon of another build refused `cowshed rm`'s supervisor ensure *after* the
     /// removal had stopped the workspace's supervisor and journaled its intent, and the path that
     /// would put that back was refused too — "state restoration also failed", a workspace half
@@ -5070,6 +5069,15 @@ mod tests {
             &["rebase", "raven"],
             &["push", "raven", "--branch", "review"],
             &["gc"],
+            &["revoke", "raven", "--egress", "api.example.test:443"],
+            &[
+                "revoke",
+                "--project-wide",
+                "--egress",
+                "api.example.test:443",
+            ],
+            &["revoke", "raven", "--all"],
+            &["revoke", "--project-wide", "--all"],
         ] {
             assert!(needs(argv), "{argv:?} changes state through the daemon");
         }

@@ -40,6 +40,19 @@ Every `worker.*`, `job.*`, and `session.*` request is fenced by the immutable
 strings or paths. Recreating a workspace does not retarget an old handle: the old handle continues to send its original
 incarnation and the controller rejects it as stale before effects.
 
+The controller validates that fence from the named workspace's authoritative snapshot, never a project-wide listing. A
+missing or corrupt sibling session/grants record cannot refuse another workspace's admission, job observation, stdin,
+logs, resources, or session operations. Project enumeration still reports its own inventory faults. Mount assurance and
+publication recovery on a workspace request use that same scope: held canonical image locks select the exact workspaces
+to recover before any sidecar is read. Store-wide recovery is an explicit startup/maintenance pass, not a dependency of
+a live job's supervisor lookup.
+
+A cold `Workspaces` or `Removal` opening observes main and its explicitly selected names, filtering pending and retired
+records before reading their sidecars. It additionally observes the invocation-origin workspace only to validate its
+host-backed marker against authoritative facts; that extra observation grants no publication-recovery lock or intent
+replay. Selected identity, marker, project binding and active-versus-trash checks remain mandatory. `Store`, `Inspect`
+and explicit project enumeration retain full inventory reads and their diagnostic failures.
+
 ## cowshed-core (Rust)
 
 Design rules: async (tokio), no global state, no interior config lookup — everything reachable from an explicit handle;

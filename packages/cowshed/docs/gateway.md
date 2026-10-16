@@ -171,22 +171,22 @@ survives the restart. A daemon of another build also refuses every command that 
 (`exec`, `rm`, `fork`, `land`, …): the CLI asks it before the command changes anything, so the refusal — "the cowshed
 daemon is build X; this cowshed is build Y" — leaves the host as it was, and its hint is the same `cowshed setup`.
 
-Every ordinary `exec`, `attach`, and `doctor` invocation reconciles the current project before use. Attach, detach,
-restore, removal, and other lifecycle publication paths reconcile again before success is printed, replacing changed
+Workspace jobs (`exec`, shells, and job observation) inspect only their selected workspace. Starting work reconciles
+only that workspace's gateway session; a missing or corrupt sibling grants file cannot refuse its admission or polling.
+Attach, detach, restore, removal, and other lifecycle/maintenance paths reconcile the current project, replacing changed
 revisions/tokens and removing stale project sessions. The gateway's session table is a cache of host inventory, never an
-authority of its own: a session left behind by a project deleted out of band keeps its port block in the gateway while
-the host-global allocator hands that block to the next workspace, so reconcile also evicts a foreign-project session
-that holds an endpoint the current project's inventory assigns — but only after confirming no live workspace anywhere
-still claims that identity; two live workspaces on one block is an integrity refusal pointing at
-`cowshed doctor --json`, never a silent eviction. Installs are independent: one workspace that cannot be installed is
-reported, it does not abandon the rest of the project. A kernel `AddrInUse` during installation is different from an
-inventory collision: the owning controller chooses a new free block, atomically publishes its next grant revision,
-re-reads the session from the store, and retries. Each refused base is excluded from that reconciliation's remaining
-candidates. The allocator binds every port in a candidate block until its image publication is complete; a process
-claiming a port between publication and installation still triggers the retry rather than stranding the workspace. The
-CLI and embedded controller pass their already-validated host roots to `gateway_service::reconcile_native_project`; they
-do not resolve `HOME` again. The shared `cowshed-core` `reconcile_project_with_reallocator` drives the control and
-inventory boundaries. Gateway absence is exit 5 with:
+authority of its own: project maintenance may evict a foreign-project session holding a newly assigned endpoint, but
+only after confirming no live workspace anywhere still claims that identity. A workspace job never enumerates foreign
+sessions to authorize an eviction; an endpoint conflict is an integrity refusal pointing at `cowshed doctor --json`.
+Project installs are independent: one failed install is reported without abandoning the others. A workspace job's kernel
+`AddrInUse` returns a typed refusal naming the maintenance remedy; no job invokes the host-global allocator. For project
+lifecycle/maintenance reconciliation, the owning controller chooses a new free block and publishes its next grant
+revision, re-reads the session from the store, and retries. Each refused base is excluded from that reconciliation's
+remaining candidates. The allocator binds every port in a candidate block until its image publication is complete; a
+process claiming a port between publication and installation still triggers the retry rather than stranding the
+workspace. The CLI and embedded controllers pass their already-validated host roots to the selected-workspace or project
+reconcile; they do not resolve `HOME` again. Both reuse the shared `cowshed-core` control and inventory boundaries and
+revision fences. Gateway absence is exit 5 with:
 
 ```text
 next: launchctl kickstart -k gui/<uid>/dev.cowshed.gateway

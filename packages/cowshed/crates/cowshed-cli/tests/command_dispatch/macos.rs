@@ -970,6 +970,10 @@ async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without
 
     phase("restart gateway");
     fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("restore project sessions after fixture gateway restart");
     phase("checked land");
     let (landed, _, stderr) = run(
         &mut service,
@@ -5987,6 +5991,7 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
             WorkspaceName::new("links").expect("workspace name"),
         ])),
         fixture.storage.clone(),
+        cowshed_cli::gateway_service::runtime_control,
     )
     .await
     .expect("reopen the project runtime");
@@ -6090,3 +6095,6 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
     runtime.shutdown().await.expect("stop the runtime");
     fixture.stop_gateway().await;
 }
+
+#[path = "workspace_isolation.rs"]
+mod workspace_isolation;

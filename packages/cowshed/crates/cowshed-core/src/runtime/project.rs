@@ -140,6 +140,8 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// outlives the runtime (04_sandbox.md). Supervisors another process serves are its own.
     async fn shutdown(&mut self) {}
     async fn snapshots(&mut self) -> Result<Vec<WorkspaceSnapshot>>;
+    /// Inspect exactly one workspace; worker and job fences never enumerate sibling state.
+    async fn workspace_snapshot(&mut self, workspace: WorkspaceName) -> Result<WorkspaceSnapshot>;
     async fn workspace_at(&mut self, path: PathBuf) -> Result<WorkspaceSnapshot>;
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot>;
@@ -531,6 +533,20 @@ enum IntentReplay {
 
 #[cfg(target_os = "macos")]
 impl RecoveryScope {
+    /// Read selection for a named opening. `None` deliberately retains full Store/Inspect
+    /// diagnostics; the main binding is always part of a name-scoped project observation.
+    fn observation_names(&self) -> Option<std::collections::BTreeSet<WorkspaceName>> {
+        match self {
+            Self::Store | Self::Inspect => None,
+            Self::Workspaces(names) => {
+                let mut names = names.clone();
+                names.insert(WorkspaceName::main());
+                Some(names)
+            }
+            Self::Removal(name) => Some([WorkspaceName::main(), name.clone()].into()),
+        }
+    }
+
     fn replay(&self, workspace: &WorkspaceName) -> IntentReplay {
         match self {
             Self::Inspect => IntentReplay::Leave,
@@ -711,6 +727,12 @@ fn rename_selected_by_source(
     }
 }
 
+/// Runtime collaborators supplied once by the composition root, moved into the native host.
+struct RuntimeServices {
+    continuity: crate::storage::audit::ContinuityAudit,
+    gateway_factory: crate::gateway_sessions::GatewayControlFactory,
+}
+
 impl ProjectRuntime {
     /// Opens the production runtime with foreground provisioning authority.
     ///
@@ -718,12 +740,16 @@ impl ProjectRuntime {
     pub async fn open_for_adopt(
         project_root: impl AsRef<Path>,
         requested_repo_id: Option<RepoId>,
+        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
         Self::open_native(
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::Provision,
             requested_repo_id,
-            continuity_from_environment()?,
+            RuntimeServices {
+                continuity: continuity_from_environment()?,
+                gateway_factory,
+            },
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             None,
@@ -741,12 +767,16 @@ impl ProjectRuntime {
     pub async fn open_existing(
         project_root: impl AsRef<Path>,
         scope: RecoveryScope,
+        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
         Self::open_native(
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
             None,
-            continuity_from_environment()?,
+            RuntimeServices {
+                continuity: continuity_from_environment()?,
+                gateway_factory,
+            },
             BindingRemoteValidation::Strict,
             scope,
             None,
@@ -760,12 +790,18 @@ impl ProjectRuntime {
     /// Only the parsed `cowshed mv … --repo-id` command may call this entrypoint: it relaxes the
     /// binding's remote check to [`BindingRemoteValidation::ForIdentityChange`] so the verb stays
     /// reachable after the remote already moved to the identity it is about to record.
-    pub async fn open_existing_for_identity_change(project_root: impl AsRef<Path>) -> Result<Self> {
+    pub async fn open_existing_for_identity_change(
+        project_root: impl AsRef<Path>,
+        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
+    ) -> Result<Self> {
         Self::open_native(
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
             None,
-            continuity_from_environment()?,
+            RuntimeServices {
+                continuity: continuity_from_environment()?,
+                gateway_factory,
+            },
             BindingRemoteValidation::ForIdentityChange,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             None,
@@ -781,12 +817,16 @@ impl ProjectRuntime {
     pub async fn open_existing_with_audit(
         project_root: impl AsRef<Path>,
         continuity: crate::storage::audit::ContinuityAudit,
+        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
         Self::open_native(
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
             None,
-            continuity,
+            RuntimeServices {
+                continuity,
+                gateway_factory,
+            },
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             None,
@@ -800,12 +840,16 @@ impl ProjectRuntime {
         project_root: impl AsRef<Path>,
         requested_repo_id: Option<RepoId>,
         storage: crate::storage::bootstrap::ValidatedHostStorage,
+        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
         Self::open_native(
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::Provision,
             requested_repo_id,
-            continuity_from_environment()?,
+            RuntimeServices {
+                continuity: continuity_from_environment()?,
+                gateway_factory,
+            },
             BindingRemoteValidation::Strict,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             Some(storage),
@@ -818,12 +862,16 @@ impl ProjectRuntime {
         project_root: impl AsRef<Path>,
         scope: RecoveryScope,
         storage: crate::storage::bootstrap::ValidatedHostStorage,
+        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
         Self::open_native(
             project_root.as_ref(),
             crate::storage::bootstrap::native::NativeBootstrapMode::ExistingOnly,
             None,
-            continuity_from_environment()?,
+            RuntimeServices {
+                continuity: continuity_from_environment()?,
+                gateway_factory,
+            },
             BindingRemoteValidation::Strict,
             scope,
             Some(storage),
@@ -839,6 +887,7 @@ impl ProjectRuntime {
         project_root: impl AsRef<Path>,
         requested_repo_id: Option<RepoId>,
         storage: crate::storage::bootstrap::ValidatedHostStorage,
+        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
         Self::open_directory(
             project_root.as_ref(),
@@ -846,6 +895,7 @@ impl ProjectRuntime {
             requested_repo_id,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             storage,
+            gateway_factory,
         )
         .await
     }
@@ -855,6 +905,7 @@ impl ProjectRuntime {
         project_root: impl AsRef<Path>,
         scope: RecoveryScope,
         storage: crate::storage::bootstrap::ValidatedHostStorage,
+        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
         Self::open_directory(
             project_root.as_ref(),
@@ -862,6 +913,7 @@ impl ProjectRuntime {
             None,
             scope,
             storage,
+            gateway_factory,
         )
         .await
     }
@@ -872,6 +924,7 @@ impl ProjectRuntime {
         requested_repo_id: Option<RepoId>,
         scope: RecoveryScope,
         storage: crate::storage::bootstrap::ValidatedHostStorage,
+        gateway_factory: crate::gateway_sessions::GatewayControlFactory,
     ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
@@ -879,7 +932,10 @@ impl ProjectRuntime {
                 project_root,
                 mode,
                 requested_repo_id.as_ref(),
-                continuity_from_environment()?,
+                RuntimeServices {
+                    continuity: continuity_from_environment()?,
+                    gateway_factory,
+                },
                 BindingRemoteValidation::Strict,
                 scope,
                 Some(storage),
@@ -890,7 +946,14 @@ impl ProjectRuntime {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (project_root, mode, requested_repo_id, scope, storage);
+            let _ = (
+                project_root,
+                mode,
+                requested_repo_id,
+                scope,
+                storage,
+                gateway_factory,
+            );
             Err(CowshedError::environment_missing(
                 "the cowshed directory project runtime currently requires macOS",
                 "run the controller on macOS",
@@ -902,7 +965,7 @@ impl ProjectRuntime {
         project_root: &Path,
         mode: crate::storage::bootstrap::native::NativeBootstrapMode,
         requested_repo_id: Option<RepoId>,
-        continuity: crate::storage::audit::ContinuityAudit,
+        services: RuntimeServices,
         validation: BindingRemoteValidation,
         recovery_scope: RecoveryScope,
         storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
@@ -913,7 +976,7 @@ impl ProjectRuntime {
                 project_root,
                 mode,
                 requested_repo_id.as_ref(),
-                continuity,
+                services,
                 validation,
                 recovery_scope,
                 storage,
@@ -933,7 +996,8 @@ impl ProjectRuntime {
                 project_root,
                 mode,
                 requested_repo_id,
-                continuity,
+                services.continuity,
+                services.gateway_factory,
                 validation,
                 recovery_scope,
                 storage,
@@ -1528,7 +1592,7 @@ impl ProjectActor {
         workspace: &WorkspaceName,
     ) -> Result<WorkspaceSnapshot> {
         self.require_repo(repo_id)?;
-        let snapshot = take_workspace(self.host.snapshots().await?, workspace)?;
+        let snapshot = self.host.workspace_snapshot(workspace.clone()).await?;
         self.validate_worker_snapshot(authority, &snapshot)?;
         Ok(snapshot)
     }
@@ -1599,9 +1663,11 @@ impl ProjectActor {
     /// the incarnation, so a name recreated meanwhile never answers for the one the caller holds.
     async fn workspace_build_volume(&mut self, params: WorkerScope) -> Result<BuildVolume> {
         self.require_repo(&params.repo_id)?;
-        let snapshots = self.host.snapshots().await?;
-        let snapshot = find_workspace(&snapshots, &params.workspace)?;
-        Self::require_held_incarnation(snapshot, &params.workspace_incarnation)?;
+        let snapshot = self
+            .host
+            .workspace_snapshot(params.workspace.clone())
+            .await?;
+        Self::require_held_incarnation(&snapshot, &params.workspace_incarnation)?;
         if snapshot.info.state != WorkspaceState::Attached {
             return Err(CowshedError::conflict(
                 format!(
@@ -1973,9 +2039,8 @@ impl ProjectActor {
         workspace: &WorkspaceName,
     ) -> Result<()> {
         self.require_repo(repo_id)?;
-        let snapshots = self.host.snapshots().await?;
-        let snapshot = find_workspace(&snapshots, workspace)?;
-        self.validate_worker_snapshot(authority, snapshot)
+        let snapshot = self.host.workspace_snapshot(workspace.clone()).await?;
+        self.validate_worker_snapshot(authority, &snapshot)
     }
 
     fn validate_worker_snapshot(
@@ -2067,37 +2132,6 @@ fn require_coordinator(authority: &ConnectionAuthority) -> Result<()> {
             "request coordinator authority from the controller owner",
         ))
     }
-}
-
-fn find_workspace<'a>(
-    snapshots: &'a [WorkspaceSnapshot],
-    workspace: &WorkspaceName,
-) -> Result<&'a WorkspaceSnapshot> {
-    snapshots
-        .iter()
-        .find(|snapshot| &snapshot.info.workspace == workspace)
-        .ok_or_else(|| {
-            CowshedError::not_found(
-                format!("workspace {workspace} does not exist"),
-                "list workspaces and retry with a published name",
-            )
-        })
-}
-
-/// The named workspace's snapshot, taken out of the listing it was found in.
-fn take_workspace(
-    snapshots: Vec<WorkspaceSnapshot>,
-    workspace: &WorkspaceName,
-) -> Result<WorkspaceSnapshot> {
-    snapshots
-        .into_iter()
-        .find(|snapshot| &snapshot.info.workspace == workspace)
-        .ok_or_else(|| {
-            CowshedError::not_found(
-                format!("workspace {workspace} does not exist"),
-                "list workspaces and retry with a published name",
-            )
-        })
 }
 
 fn workspace_view(snapshot: WorkspaceSnapshot) -> WorkspaceView {
@@ -2274,6 +2308,8 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     substrate_config: crate::storage::apfs::ApfsSubstrateConfig,
     substrate: crate::storage::apfs::ApfsSubstrate<H>,
     host_factory: StorageHostFactory<H>,
+    gateway_control: Box<dyn crate::gateway_sessions::GatewayControl>,
+    gateway_inventory: crate::gateway_sessions::NativeSessionInventory,
     commitments: super::supervisor::CommitmentPublisherHandle,
     /// The handle each workspace's commands go through: to the supervisor serving the
     /// workspace's socket, whichever process serves it.
@@ -3044,20 +3080,24 @@ fn verified_recovery_facts<'a>(
 impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     #[allow(
         clippy::too_many_arguments,
-        reason = "one project open: root, bootstrap mode, repository, continuity, validation, \
-                  recovery scope, supplied storage and the backend's host constructor"
+        reason = "one project open: root, bootstrap mode, repository, runtime services, validation, \
+                  recovery scope, supplied storage and the backend constructor"
     )]
     async fn open(
         project_root: &Path,
         bootstrap_mode: crate::storage::bootstrap::native::NativeBootstrapMode,
         requested_repo_id: Option<&RepoId>,
-        continuity: crate::storage::audit::ContinuityAudit,
+        services: RuntimeServices,
         validation: BindingRemoteValidation,
         recovery_scope: RecoveryScope,
         supplied_storage: Option<crate::storage::bootstrap::ValidatedHostStorage>,
         host_factory: StorageHostFactory<H>,
     ) -> Result<Self> {
         use cowshed_os::timing::spanned;
+        let RuntimeServices {
+            continuity,
+            gateway_factory,
+        } = services;
 
         // A re-adoption interrupted between retiring the replaced main and mounting its
         // replacement leaves the checkout an empty mountpoint, where no repository is discovered.
@@ -3122,6 +3162,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 )
             }
         };
+        let gateway_control = gateway_factory(&storage)?;
+        let gateway_inventory = crate::gateway_sessions::NativeSessionInventory::with_backend(
+            storage.clone(),
+            if H::HAS_PHYSICAL_VOLUMES {
+                crate::gateway_inventory::GatewayStoreBackend::Native
+            } else {
+                crate::gateway_inventory::GatewayStoreBackend::Directory
+            },
+        );
         let home = storage.home().to_path_buf();
         let existing_only = matches!(
             &bootstrap_mode,
@@ -3306,6 +3355,25 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let recovery_sessions = layout.project().sessions.clone();
         let recovery_span = cowshed_os::timing::span("open", "inventory");
         let repairs = recovery_scope.repairs();
+        let recovery_names = recovery_scope.observation_names();
+        let publication_locks = recovery_names
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .map(|workspace| {
+                layout
+                    .canonical_image(workspace)
+                    .map(|image| image.lock().to_path_buf())
+                    .map_err(native_integrity_error)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut observation_names = recovery_names;
+        if let (Some(names), Some(origin)) = (&mut observation_names, origin.as_ref()) {
+            // Host-backed validation needs the invocation's named origin even when the command
+            // names no workspace yet. It grants no recovery mutation of that extra name.
+            names.insert(origin.workspace.clone());
+        }
+        let retired_names = observation_names.clone();
         let (host, facts, pending, legacy, lifecycle_intents) =
             crate::storage::lifecycle::dispatch_blocking(move || {
                 let lifecycle_intents = match replay_journal {
@@ -3321,19 +3389,61 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 {
                     return Err(error);
                 }
-                // Store-wide completion of interrupted publications; an inspecting open reads the
-                // store as it stands, and doctor names what this would have completed.
+                // Only explicit store maintenance completes unrelated publications. A scoped
+                // opening holds its selected image locks before recovery reads any sidecar.
                 if repairs {
-                    host.recover_pending(&recovery_config, &[])
+                    let _guard = if publication_locks.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            host.lock_images(
+                                &publication_locks,
+                                cowshed_apfs::store_lock::LockMode::Wait,
+                            )
+                            .map_err(native_storage_error)?
+                            .ok_or_else(|| {
+                                CowshedError::internal("blocking image lock unavailable")
+                            })?,
+                        )
+                    };
+                    host.recover_pending(&recovery_config, &publication_locks)
                         .map_err(native_storage_error)?;
                 }
-                let facts = host.list(&recovery_repo).map_err(native_storage_error)?;
+                let facts = match &observation_names {
+                    None => host.list(&recovery_repo).map_err(native_storage_error)?,
+                    Some(names) => {
+                        let mut facts = Vec::with_capacity(names.len());
+                        for name in names {
+                            if let Some(metadata) = host
+                                .canonical_metadata(&recovery_repo, name)
+                                .map_err(native_storage_error)?
+                                && metadata.publication_state
+                                    == crate::metadata::PublicationState::Active
+                            {
+                                facts.push(crate::storage::lifecycle::StorageFact {
+                                    workspace:
+                                        crate::storage::apfs::native::metadata_workspace_ref(
+                                            &metadata,
+                                        )
+                                        .map_err(native_storage_error)?,
+                                    volume_key: crate::storage::apfs::volume_key(
+                                        &recovery_repo,
+                                        name,
+                                    ),
+                                });
+                            }
+                        }
+                        facts
+                    }
+                };
                 let pending = host
-                    .pending_publications(&recovery_repo)
+                    .pending_publications_for(&recovery_repo, observation_names.as_ref())
                     .map_err(native_storage_error)?;
-                let legacy =
-                    crate::storage::apfs::native::LegacyImageReport::read(&recovery_sessions)
-                        .map_err(native_storage_error)?;
+                let legacy = crate::storage::apfs::native::LegacyImageReport::read(
+                    &recovery_sessions,
+                    observation_names.as_ref(),
+                )
+                .map_err(native_storage_error)?;
                 Ok::<_, CowshedError>((host, facts, pending, legacy, lifecycle_intents))
             })
             .await
@@ -3350,7 +3460,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             "open",
             "retired",
             crate::storage::lifecycle::dispatch_blocking(move || {
-                retired_refs::<H>(&retired_project_root, &retired_repo)
+                retired_refs::<H>(&retired_project_root, &retired_repo, retired_names.as_ref())
             }),
         )
         .await
@@ -3447,6 +3557,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             substrate_config: config,
             substrate,
             host_factory,
+            gateway_control,
+            gateway_inventory,
             commitments,
             supervisors: std::collections::BTreeMap::new(),
             served: std::collections::BTreeMap::new(),
@@ -4065,13 +4177,44 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .await
     }
 
-    async fn authoritative_allowing_detached_main_relocation(
-        &self,
-    ) -> Result<Vec<NativeWorkspace>> {
-        self.authoritative_with_project_root_validation(
-            ProjectRootValidation::AllowDetachedMainRelocation,
-        )
+    async fn recovery_workspaces(&self) -> Result<Vec<NativeWorkspace>> {
+        let Some(names) = self.recovery_scope.observation_names() else {
+            return self
+                .authoritative_with_project_root_validation(
+                    ProjectRootValidation::AllowDetachedMainRelocation,
+                )
+                .await;
+        };
+        let host = self.substrate.shared_host();
+        let repo = self.descriptor.repo_id.clone();
+        let root = self.descriptor.git_root.clone();
+        let layout = self.layout.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let mut workspaces = Vec::with_capacity(names.len());
+            for name in names {
+                let Some((derived, metadata)) = host.workspace_snapshot(&repo, &name)? else {
+                    continue;
+                };
+                validate_workspace_controller_root(
+                    &derived,
+                    &metadata,
+                    &root,
+                    ProjectRootValidation::AllowDetachedMainRelocation,
+                )?;
+                let image = layout.canonical_image(&name)?.image().to_owned();
+                workspaces.push(NativeWorkspace {
+                    derived,
+                    metadata,
+                    image,
+                });
+            }
+            Ok::<_, crate::storage::apfs::ApfsStorageError>(workspaces)
+        })
         .await
+        .map_err(|error| {
+            CowshedError::internal(format!("scoped recovery inventory task failed: {error}"))
+        })?
+        .map_err(native_storage_error)
     }
 
     async fn authoritative_with_project_root_validation(
@@ -4128,16 +4271,37 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 
     async fn current(&self, name: &WorkspaceName) -> Result<NativeWorkspace> {
-        self.authoritative()
-            .await?
-            .into_iter()
-            .find(|workspace| workspace.derived.workspace.name() == name)
-            .ok_or_else(|| {
-                CowshedError::not_found(
-                    format!("workspace {name} does not exist"),
-                    "list published workspaces and retry",
-                )
-            })
+        let host = self.substrate.shared_host();
+        let repo_id = self.descriptor.repo_id.clone();
+        let workspace = name.clone();
+        let project_root = self.descriptor.git_root.clone();
+        let layout = self.layout.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let Some((derived, metadata)) = host.workspace_snapshot(&repo_id, &workspace)? else {
+                return Ok(None);
+            };
+            validate_workspace_controller_root(
+                &derived,
+                &metadata,
+                &project_root,
+                ProjectRootValidation::Strict,
+            )?;
+            let image = layout.canonical_image(&workspace)?.image().to_path_buf();
+            Ok(Some(NativeWorkspace {
+                derived,
+                metadata,
+                image,
+            }))
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("workspace read task failed: {error}")))?
+        .map_err(native_storage_error)?
+        .ok_or_else(|| {
+            CowshedError::not_found(
+                format!("workspace {name} does not exist"),
+                "list published workspaces and retry",
+            )
+        })
     }
 
     async fn pending_metadata(
@@ -4993,6 +5157,44 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             eprintln!("cowshed: {name}: {finding}");
         }
         Ok(refresh)
+    }
+
+    /// Core owns gateway preparation after the decoded route and live workspace fences. A
+    /// prepared supervisor cannot retarget a held capability to a recreated name, and the
+    /// scoped inventory checks that same incarnation again after reading gateway status.
+    async fn reconcile_gateway_for_work(
+        &self,
+        workspace: &WorkspaceName,
+        incarnation: &WorkspaceIncarnation,
+        supervisor: &super::supervisor::WorkspaceSupervisorHandle,
+    ) -> Result<()> {
+        let observed = &supervisor.snapshot().workspace_incarnation;
+        if observed != incarnation {
+            return Err(CowshedError::fence_refusal(
+                crate::error::FenceRefusal::IncarnationMoved {
+                    workspace: workspace.clone(),
+                    observed: observed.clone(),
+                },
+                format!(
+                    "workspace {workspace} incarnation moved from {incarnation} to {observed} while preparing work"
+                ),
+                "reacquire the worker handle and retry",
+            ));
+        }
+        cowshed_os::timing::spanned(
+            "gateway",
+            "workspace",
+            crate::gateway_sessions::reconcile_workspace(
+                self.gateway_control.as_ref(),
+                &self.gateway_inventory,
+                &self.descriptor.repo_id,
+                workspace,
+                incarnation,
+                crate::gateway_sessions::effective_uid(),
+            ),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Before a job of `workspace` is admitted: its supervisor, its build state refreshed, and
@@ -9143,12 +9345,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // repository at its recorded checkout by definition; its session marker and persisted
         // binding were validated during open, so querying remotes there would prevent the move
         // operation that repairs it. Every other state retains the ordinary live-Git check.
-        let authoritative = cowshed_os::timing::spanned(
-            "recover",
-            "inventory",
-            self.authoritative_allowing_detached_main_relocation(),
-        )
-        .await?;
+        let authoritative =
+            cowshed_os::timing::spanned("recover", "inventory", self.recovery_workspaces()).await?;
         let detached_direct_main = authoritative.iter().any(|workspace| {
             workspace.derived.workspace.name().is_main()
                 && matches!(
@@ -9184,6 +9382,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .iter()
             .map(|workspace| self.snapshot(workspace))
             .collect()
+    }
+
+    async fn workspace_snapshot(&mut self, workspace: WorkspaceName) -> Result<WorkspaceSnapshot> {
+        self.validate_binding().await?;
+        let current = self.current(&workspace).await?;
+        self.snapshot(&current)
     }
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
@@ -10147,7 +10351,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let main = main_name();
         let source = self.substrate_config.checkout_path.clone();
         let current = self
-            .authoritative_allowing_detached_main_relocation()
+            .authoritative_with_project_root_validation(
+                ProjectRootValidation::AllowDetachedMainRelocation,
+            )
             .await?
             .into_iter()
             .find(|workspace| workspace.derived.workspace.name() == &main)
@@ -11613,6 +11819,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             Err(error) => Some(error.message),
         };
         let checks = options.check.unwrap_or_default();
+        if !checks.is_empty() {
+            self.reconcile_gateway_for_work(
+                &workspace,
+                current.derived.workspace.incarnation(),
+                &handle,
+            )
+            .await?;
+        }
         let mut checked = CheckedLandChecks::default();
         for check in &checks {
             let spawned = std::time::SystemTime::now();
@@ -12545,6 +12759,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         let handle = self.ensure_supervisor(&workspace).await?;
+        self.reconcile_gateway_for_work(&workspace, &incarnation, &handle)
+            .await?;
         let token = handle.open_session(name.clone()).await?;
         let reopened = token.identity();
         if let Some(previous) = self.sessions.insert((workspace.clone(), name), token)
@@ -12599,6 +12815,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         Self::require_exact_incarnation(&current, &incarnation)?;
         let token = self.session(&workspace, &session).cloned();
         let (handle, build_volume) = self.admit_build_state(&workspace).await?;
+        self.reconcile_gateway_for_work(&workspace, &incarnation, &handle)
+            .await?;
         handle
             .exec(token.as_ref(), build_volume, request, source)
             .await
@@ -16355,6 +16573,7 @@ struct RetiredTrash {
 fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
     project_root: &Path,
     repo_id: &RepoId,
+    workspaces: Option<&std::collections::BTreeSet<WorkspaceName>>,
 ) -> Result<RetiredTrash> {
     use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceRole, sidecar_path};
     use crate::storage::lifecycle::{LifecycleWorkspace, RetiredRef, Revision};
@@ -16385,6 +16604,16 @@ fn retired_refs<H: crate::storage::apfs::ApfsExecutionHost>(
     let mut images = entries
         .into_iter()
         .filter(|entry| is_image_path(&entry.path()))
+        .filter(|entry| {
+            workspaces.is_none_or(|names| {
+                entry
+                    .path()
+                    .file_stem()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .and_then(crate::storage::apfs::split_retired_stem)
+                    .is_some_and(|(name, _)| names.contains(&name))
+            })
+        })
         .collect::<Vec<_>>();
     images.sort_by_key(std::fs::DirEntry::file_name);
 
@@ -16541,7 +16770,7 @@ mod retired_recovery_tests {
 
         let retired = retired_refs::<
             crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
-        >(&project_root, &repo_id)
+        >(&project_root, &repo_id, None)
         .unwrap()
         .recorded;
         assert_eq!(retired.len(), 1);
@@ -16598,7 +16827,7 @@ mod retired_recovery_tests {
 
         let retired = retired_refs::<
             crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
-        >(&project_root, &repo_id)
+        >(&project_root, &repo_id, None)
         .expect("retired pending image is recoverable from its exact trash identity")
         .recorded;
         assert_eq!(retired.len(), 1);
@@ -16617,7 +16846,7 @@ mod retired_recovery_tests {
             .expect("change metadata identity");
         retired_refs::<
             crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
-        >(&project_root, &repo_id)
+        >(&project_root, &repo_id, None)
         .expect_err("a mismatched workspace identity cannot authorize reclamation");
         mismatched.workspace = name.clone();
         mismatched
@@ -16634,7 +16863,7 @@ mod retired_recovery_tests {
             .expect("new canonical metadata");
         let retired = retired_refs::<
             crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
-        >(&project_root, &repo_id)
+        >(&project_root, &repo_id, None)
         .expect("new use of the name cannot invalidate old retired trash")
         .recorded;
         assert_eq!(retired[0].workspace().incarnation(), &incarnation);
@@ -16687,7 +16916,7 @@ mod retired_recovery_tests {
 
         let retired = retired_refs::<
             crate::storage::apfs::native::MacOsApfsExecutionHost<cowshed_apfs::SystemCommandRunner>,
-        >(&project_root, &repo_id)
+        >(&project_root, &repo_id, None)
         .unwrap()
         .recorded;
         assert_eq!(retired.len(), 1);
@@ -16808,7 +17037,7 @@ mod retired_recovery_tests {
                 crate::storage::apfs::native::MacOsApfsExecutionHost<
                     cowshed_apfs::SystemCommandRunner,
                 >,
-            >(&project_root, &repo_id)
+            >(&project_root, &repo_id, None)
             .unwrap();
             assert_eq!(retired.recorded.len(), 1, "the retired image is found");
             finish_store_residue(
@@ -16873,7 +17102,7 @@ mod retired_recovery_tests {
                 crate::storage::apfs::native::MacOsApfsExecutionHost<
                     cowshed_apfs::SystemCommandRunner,
                 >,
-            >(&project_root, &repo_id)
+            >(&project_root, &repo_id, None)
             .expect("a sidecarless trash image does not fail the open");
             assert!(retired.recorded.is_empty());
             assert_eq!(retired.unrecorded, std::slice::from_ref(&image));

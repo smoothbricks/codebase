@@ -1122,11 +1122,16 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    remote if one was registered, and its worktree registration if it is a git-worktree workspace (remove, then prune).
    This is the one piece of teardown that lives where the user can see it — a remote or a registration naming a trashed
    mount is a broken fetch and a broken `git worktree list` in the user's own checkout.
-4. Logically retire: atomically rename the image and its detached grants/CA companions to
-   `sessions/.trash/<ws>-<incarnation>.dmg`. The canonical image disappears from enumeration and the command returns
-   here (typically well under a second; a stubborn process tree delays it by at most the kill grace). Valid checkpoint
-   facts left behind during this asynchronous phase neither republish the workspace nor authorize deletion by
-   themselves; malformed, foreign, and duplicate facts remain integrity errors.
+4. Logically retire at one publication point: prepare complete detached grants/CA companions at
+   `sessions/.trash/<ws>-<incarnation>.dmg`, durably link them from the canonical record, then atomically rename the
+   image there and sync both parent directories. The image rename is the sole commit: before it the canonical grants/key
+   remain valid; after it the canonical image is absent and trash already holds complete recovery authority. Unlink the
+   old CA companion before the old grants sidecar. A retry before commit validates the exact canonical identity and
+   rebuilds any imageless prepared trash companions; those companions alone never authorize reclamation. The canonical
+   image disappears from enumeration and the command returns here (typically well under a second; a stubborn process
+   tree delays it by at most the kill grace). Valid checkpoint facts left behind during this asynchronous phase neither
+   republish the workspace nor authorize deletion by themselves; malformed, foreign, and duplicate facts remain
+   integrity errors.
 5. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s monotonic wall-clock grace,
    including disk-lease and command waits, not merely poll sleeps), unlink the trashed image and companions, every
    checkpoint (including pinned checkpoints), every pre-restore undo image and companion/fact, then the empty checkpoint

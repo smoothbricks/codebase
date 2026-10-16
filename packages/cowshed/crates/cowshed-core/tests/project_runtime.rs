@@ -54,8 +54,12 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
 use url::Url;
 
+#[cfg(not(target_os = "macos"))]
+#[path = "support/refusing_gateway.rs"]
+mod refusing_gateway;
 #[path = "support/temp_parent.rs"]
 mod temp_parent;
+
 #[path = "support/temp_root.rs"]
 mod temp_root;
 use temp_root::TempRoot;
@@ -67,6 +71,7 @@ mod scratch_apfs;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Event {
     SnapshotBatch,
+    NamedSnapshot(WorkspaceName),
     SecretScan,
     Initialize(WorkspaceName),
     Publish(WorkspaceName),
@@ -257,6 +262,7 @@ struct FakeHost {
     descriptor: ProjectDescriptor,
     state_path: PathBuf,
     state: DurableState,
+    refuse_snapshot_batch: bool,
     events: mpsc::UnboundedSender<Event>,
     fail_create_initializer: bool,
     fail_restore_fence_once: bool,
@@ -311,6 +317,7 @@ impl FakeHost {
             },
             state_path: root.join("durable.json"),
             state: DurableState::default(),
+            refuse_snapshot_batch: false,
             events,
             fail_create_initializer,
             fail_restore_fence_once,
@@ -554,12 +561,26 @@ impl ProjectRuntimeHost for FakeHost {
 
     async fn snapshots(&mut self) -> Result<Vec<WorkspaceSnapshot>> {
         self.events.send(Event::SnapshotBatch).ok();
+        if self.refuse_snapshot_batch {
+            return Err(CowshedError::integrity(
+                "foreign session grants are missing",
+                "cowshed doctor --json",
+            ));
+        }
         Ok(self
             .state
             .workspaces
             .iter()
             .map(|workspace| self.snapshot(workspace))
             .collect())
+    }
+
+    async fn workspace_snapshot(&mut self, workspace: WorkspaceName) -> Result<WorkspaceSnapshot> {
+        self.events
+            .send(Event::NamedSnapshot(workspace.clone()))
+            .ok();
+        self.workspace(&workspace)
+            .map(|workspace| self.snapshot(workspace))
     }
 
     async fn build_volume(&mut self, workspace: WorkspaceName) -> Result<Option<PathBuf>> {
@@ -1745,7 +1766,10 @@ async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
         .unwrap(),
         json!(1)
     );
-    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::NamedSnapshot(WorkspaceName::main()))
+    );
     let Some(Event::Exec {
         workspace,
         mount,
@@ -2089,7 +2113,10 @@ async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
             .unwrap(),
         json!(1)
     );
-    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::NamedSnapshot(WorkspaceName::main()))
+    );
     let process = spawned.recv().await.expect("the admitted job spawned once");
     assert!(events.try_recv().is_err());
 
@@ -2110,7 +2137,10 @@ async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
         .unwrap(),
         json!(1)
     );
-    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::NamedSnapshot(WorkspaceName::main()))
+    );
     assert_eq!(
         events.recv().await,
         Some(Event::JobByKey(
@@ -2132,7 +2162,10 @@ async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
         .unwrap(),
         Value::Null
     );
-    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::NamedSnapshot(WorkspaceName::main()))
+    );
     assert_eq!(
         events.recv().await,
         Some(Event::JobByKey(
@@ -2149,7 +2182,10 @@ async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
             .unwrap_err(),
         CowshedError::conflict("stale workspace incarnation", "reacquire a worker handle")
     );
-    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::NamedSnapshot(WorkspaceName::main()))
+    );
     assert!(
         events.try_recv().is_err(),
         "a stale lookup reached no store"
@@ -2169,7 +2205,10 @@ async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
         .code,
         ErrorCode::NotFound
     );
-    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::NamedSnapshot(WorkspaceName::new("missing").unwrap()))
+    );
     assert!(
         events.try_recv().is_err(),
         "a missing workspace reached no store"
@@ -2203,6 +2242,106 @@ async fn router_carries_an_admission_key_to_exec_and_routes_job_by_key() {
             .unwrap();
     }
     supervisor.wait(JobId::new(1).unwrap()).await.unwrap();
+}
+
+/// A broken foreign inventory remains diagnosable without becoming a job's dependency.
+/// The real supervisor and directory artifact store hold all 100 jobs live while status is read.
+#[tokio::test]
+async fn one_hundred_live_jobs_never_enumerate_foreign_workspace_snapshots() {
+    let root = test_root();
+    let (spawn_tx, mut spawned) = mpsc::unbounded_channel();
+    let supervisor = scripted_supervisor(&root, spawn_tx);
+    let (event_tx, mut events) = mpsc::unbounded_channel();
+    let mut host = FakeHost::new(&root, event_tx, false, false, Vec::new());
+    host.refuse_snapshot_batch = true;
+    host.supervisors
+        .insert(WorkspaceName::main(), supervisor.clone());
+    let repo = host.descriptor.repo_id.clone();
+    let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+    let router = runtime.router();
+    let adopted = adopt(&router, &repo).await;
+    while events.try_recv().is_ok() {}
+    let incarnation = adopted["info"]["workspaceIncarnation"].clone();
+
+    let inventory_error = route(
+        &router,
+        coordinator(repo.clone()),
+        "project.list",
+        json!({ "repoId": repo }),
+    )
+    .await
+    .expect_err("the foreign inventory fault remains visible to project diagnostics");
+    assert_eq!(inventory_error.code, ErrorCode::Integrity);
+    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+
+    let mut processes = Vec::with_capacity(100);
+    for expected in 1..=100 {
+        let id = route(
+            &router,
+            coordinator(repo.clone()),
+            "worker.exec",
+            json!({
+                "repoId": repo,
+                "workspace": "main",
+                "workspaceIncarnation": incarnation,
+                "argv": [{"encoding":"utf8","data":"hold"}],
+                "mode": "readWrite",
+                "env": {},
+                "stdin": {"kind":"empty"},
+                "stdoutCopy": null,
+                "stderrCopy": null
+            }),
+        )
+        .await
+        .expect("a workspace admission reads no foreign grants");
+        assert_eq!(id, json!(expected));
+        processes.push(spawned.recv().await.expect("live scripted process"));
+    }
+    for expected in 1..=100 {
+        let status = route(
+            &router,
+            coordinator(repo.clone()),
+            "job.status",
+            json!({
+                "repoId": repo,
+                "workspace": "main",
+                "workspaceIncarnation": incarnation,
+                "jobId": expected
+            }),
+        )
+        .await
+        .expect("live observation reads only its workspace");
+        assert_eq!(status["jobId"], json!(expected));
+    }
+    let mut observations = 0;
+    while let Ok(event) = events.try_recv() {
+        assert_eq!(event, Event::NamedSnapshot(WorkspaceName::main()));
+        observations += 1;
+    }
+    assert_eq!(
+        observations, 200,
+        "one scoped snapshot per admission and poll"
+    );
+    for (offset, process) in processes.into_iter().enumerate() {
+        let job_id = JobId::new(u64::try_from(offset).unwrap() + 1).unwrap();
+        process
+            .send(ProcessEvent::Exited {
+                job_id,
+                exit: cowshed_core::api::ExitStatus::Exited { code: 0 },
+            })
+            .await
+            .unwrap();
+        for stream in [StreamKind::Stdout, StreamKind::Stderr] {
+            process
+                .send(ProcessEvent::OutputEof { job_id, stream })
+                .await
+                .unwrap();
+        }
+        supervisor
+            .wait(job_id)
+            .await
+            .expect("terminal artifact sealed");
+    }
 }
 
 #[tokio::test]
@@ -5206,7 +5345,10 @@ async fn workspace_at_uses_active_mount_facts_and_attach_preserves_exec_mount() 
     )
     .await
     .expect("session exec");
-    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::NamedSnapshot(WorkspaceName::new("task").unwrap()))
+    );
     let Some(Event::Exec {
         workspace,
         mount: exec_mount,
@@ -5878,7 +6020,10 @@ async fn stale_incarnation_and_revision_reject_before_mutation() {
     .await
     .expect_err("stale incarnation");
     assert_eq!(error.code, ErrorCode::Conflict);
-    assert_eq!(events.recv().await, Some(Event::SnapshotBatch));
+    assert_eq!(
+        events.recv().await,
+        Some(Event::NamedSnapshot(WorkspaceName::main()))
+    );
     assert!(events.try_recv().is_err());
 
     let error = route(
@@ -6520,15 +6665,18 @@ async fn controller_startup_names_exhausted_lifecycle_fact() {
 #[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn production_open_modes_return_typed_environment_error_off_macos() {
-    let adopt_error = match ProjectRuntime::open_for_adopt("/tmp/project", None).await {
-        Ok(_) => panic!("non-macOS adopt open must fail"),
-        Err(error) => error,
-    };
+    let adopt_error =
+        match ProjectRuntime::open_for_adopt("/tmp/project", None, refusing_gateway::connect).await
+        {
+            Ok(_) => panic!("non-macOS adopt open must fail"),
+            Err(error) => error,
+        };
     assert_eq!(adopt_error.code, ErrorCode::EnvironmentMissing);
 
     let existing_error = match ProjectRuntime::open_existing(
         "/tmp/project",
         cowshed_core::runtime::RecoveryScope::Store,
+        refusing_gateway::connect,
     )
     .await
     {

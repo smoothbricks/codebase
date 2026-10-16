@@ -22,9 +22,12 @@ pub async fn dispatch<W: std::io::Write + Send, E: std::io::Write + Send>(
 ) -> Result<i32> {
     // The binding belongs to the project, not to a workspace: the open finishes only `main`'s
     // unfinished lifecycle work.
-    let runtime =
-        ProjectRuntime::open_existing(project_root, RecoveryScope::Workspaces(Default::default()))
-            .await?;
+    let runtime = ProjectRuntime::open_existing(
+        project_root,
+        RecoveryScope::Workspaces(Default::default()),
+        crate::gateway_service::runtime_control,
+    )
+    .await?;
     let outcome = match command {
         IdentityCommand::Add { remote } => {
             bind_remote_identity(runtime.descriptor(), &remote).await

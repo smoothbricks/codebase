@@ -498,6 +498,7 @@ impl HostSetup for NativeHostSetup {
             &project.project_root,
             RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
             validate_existing_host_storage(&self.home).await?,
+            crate::gateway_service::runtime_control,
         )
         .await?;
         let result = runtime.refresh_build_state(&WorkspaceName::main()).await;

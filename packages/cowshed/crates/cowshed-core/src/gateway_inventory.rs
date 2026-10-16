@@ -26,8 +26,8 @@ use crate::storage::apfs::{
 use crate::storage::bootstrap::ValidatedHostStorage;
 use crate::storage::directory::DirectoryExecutionHost;
 use crate::storage::lifecycle::{
-    CheckpointFact, DerivationError, KernelMountFact, LifecycleWorkspace, MountIntent, MountState,
-    StorageFact, Substrate, derive_workspaces,
+    CheckpointFact, DerivationError, DerivedWorkspace, KernelMountFact, LifecycleWorkspace,
+    MountIntent, MountState, StorageFact, Substrate, derive_workspaces,
 };
 use crate::storage::{StorageLayout, verify_no_symlinks};
 use crate::workspace_credentials::{
@@ -252,16 +252,22 @@ struct DerivedInventory {
 trait InventorySource: Send + Sync {
     /// The workspaces one project's records publish, read without the kernel mount table: what a
     /// workspace holds attached or detached (its port blocks) is decided from these alone.
-    fn project_storage(
+    fn project_metadata(
         &self,
         storage: &ValidatedHostStorage,
         repo: &RepoId,
-    ) -> Result<Vec<StorageFact>, GatewayInventoryError>;
+    ) -> Result<Vec<DetachedWorkspaceMetadata>, GatewayInventoryError>;
     fn project_facts(
         &self,
         storage: &ValidatedHostStorage,
         repo: &RepoId,
     ) -> Result<ProjectInventoryFacts, GatewayInventoryError>;
+    fn workspace_snapshot(
+        &self,
+        storage: &ValidatedHostStorage,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<(DerivedWorkspace, DetachedWorkspaceMetadata, PathBuf)>, GatewayInventoryError>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -279,13 +285,30 @@ impl KernelMountSource for CapturedKernelMountSource {
 }
 
 impl InventorySource for NativeInventorySource {
-    fn project_storage(
+    fn project_metadata(
         &self,
         storage: &ValidatedHostStorage,
         repo: &RepoId,
-    ) -> Result<Vec<StorageFact>, GatewayInventoryError> {
-        let (_, config) = project_layout_and_config(storage, repo)?;
-        Ok(MacOsApfsExecutionHost::new(SystemCommandRunner, config)?.list(repo)?)
+    ) -> Result<Vec<DetachedWorkspaceMetadata>, GatewayInventoryError> {
+        let config = project_substrate_config(
+            storage,
+            storage
+                .store()
+                .join("gateway")
+                .join(UNRESOLVED_CHECKOUT_PATH),
+        );
+        // One host for the complete pass, not a mount-registry thread per captured image.
+        let host = MacOsApfsExecutionHost::new(SystemCommandRunner, config)?;
+        let published = host.list(repo)?;
+        let mut records = Vec::with_capacity(published.len());
+        for fact in published {
+            // The listing is not authority after retirement; a recreated name owns its current
+            // grants, and an image already retired owns no ports.
+            if let Some(metadata) = host.canonical_metadata(repo, fact.workspace.name())? {
+                records.push(metadata);
+            }
+        }
+        Ok(records)
     }
 
     fn project_facts(
@@ -314,6 +337,42 @@ impl InventorySource for NativeInventorySource {
             mount_paths,
         })
     }
+
+    fn workspace_snapshot(
+        &self,
+        storage: &ValidatedHostStorage,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<(DerivedWorkspace, DetachedWorkspaceMetadata, PathBuf)>, GatewayInventoryError>
+    {
+        let layout = StorageLayout::new(storage.store(), repo).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: storage.store().to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        // A session workspace's mount is independent of main. Only a request for main reads
+        // main's recorded checkout; a job must never inspect a sibling's detached metadata.
+        let checkout = if workspace.is_main() {
+            authoritative_checkout_path(&layout, repo)?
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            storage
+                .store()
+                .join("gateway")
+                .join(UNRESOLVED_CHECKOUT_PATH)
+        });
+        let mount = workspace_mountpoint(&layout, &checkout, workspace)?;
+        let host = MacOsApfsExecutionHost::new(
+            SystemCommandRunner,
+            project_substrate_config(storage, checkout),
+        )?;
+        Ok(host
+            .workspace_snapshot(repo, workspace)?
+            .map(|(derived, metadata)| (derived, metadata, mount)))
+    }
 }
 
 /// Inventory over a caller-owned directory store, selected explicitly by the directory
@@ -324,13 +383,27 @@ impl InventorySource for NativeInventorySource {
 struct DirectoryInventorySource;
 
 impl InventorySource for DirectoryInventorySource {
-    fn project_storage(
+    fn project_metadata(
         &self,
         storage: &ValidatedHostStorage,
         repo: &RepoId,
-    ) -> Result<Vec<StorageFact>, GatewayInventoryError> {
-        let (_, config) = project_layout_and_config(storage, repo)?;
-        Ok(DirectoryExecutionHost::new(config)?.list(repo)?)
+    ) -> Result<Vec<DetachedWorkspaceMetadata>, GatewayInventoryError> {
+        let config = project_substrate_config(
+            storage,
+            storage
+                .store()
+                .join("gateway")
+                .join(UNRESOLVED_CHECKOUT_PATH),
+        );
+        let host = DirectoryExecutionHost::new(config)?;
+        let published = host.list(repo)?;
+        let mut records = Vec::with_capacity(published.len());
+        for fact in published {
+            if let Some(metadata) = host.canonical_metadata(repo, fact.workspace.name())? {
+                records.push(metadata);
+            }
+        }
+        Ok(records)
     }
 
     fn project_facts(
@@ -350,6 +423,37 @@ impl InventorySource for DirectoryInventorySource {
             checkpoints,
             mount_paths,
         })
+    }
+
+    fn workspace_snapshot(
+        &self,
+        storage: &ValidatedHostStorage,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<(DerivedWorkspace, DetachedWorkspaceMetadata, PathBuf)>, GatewayInventoryError>
+    {
+        let layout = StorageLayout::new(storage.store(), repo).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: storage.store().to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        let checkout = if workspace.is_main() {
+            authoritative_checkout_path(&layout, repo)?
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            storage
+                .store()
+                .join("gateway")
+                .join(UNRESOLVED_CHECKOUT_PATH)
+        });
+        let mount = workspace_mountpoint(&layout, &checkout, workspace)?;
+        let host = DirectoryExecutionHost::new(project_substrate_config(storage, checkout))?;
+        Ok(host
+            .workspace_snapshot(repo, workspace)?
+            .map(|(derived, metadata)| (derived, metadata, mount)))
     }
 }
 
@@ -936,6 +1040,22 @@ impl NativeGatewayInventory {
         .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
     }
 
+    /// Read only the selected workspace, including its exact detached grant and mount identity.
+    pub async fn workspace_attached(
+        &self,
+        repo_id: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<GatewaySessionFact>, GatewayInventoryError> {
+        let inventory = self.clone();
+        let repo_id = repo_id.clone();
+        let workspace = workspace.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            inventory.workspace_attached_blocking(&repo_id, &workspace)
+        })
+        .await
+        .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
     /// The recorded projects a startup heal works through, in inventory order.
     ///
     /// Taken apart from [`Self::heal`] so the daemon knows how many there are before it answers
@@ -1504,15 +1624,13 @@ impl NativeGatewayInventory {
                 }
             }
             // A block is held attached or detached: kernel mount faults do not refuse every new.
-            let published = self.source.project_storage(&self.storage, &repo)?;
+            let published = self.source.project_metadata(&self.storage, &repo)?;
             let active_names = published
                 .iter()
-                .map(|fact| fact.workspace.name())
+                .map(|metadata| &metadata.workspace)
                 .collect::<BTreeSet<_>>();
-            for fact in &published {
-                let image = canonical_image_paths(&layout, &fact.workspace)?;
-                let metadata = read_current_metadata(store, image.image(), &fact.workspace)?;
-                claim_granted_blocks(&mut claims, &repo, &metadata, &ClaimRecord::Published)?;
+            for metadata in &published {
+                claim_granted_blocks(&mut claims, &repo, metadata, &ClaimRecord::Published)?;
             }
             // Incomplete clones cannot be served, but a canonical pending payload owns its
             // stored grant even after its creator exits.
@@ -1629,11 +1747,19 @@ impl NativeGatewayInventory {
             );
             return Ok(None);
         }
-        let metadata = DetachedWorkspaceMetadata::read_for_image(image).map_err(|error| {
-            GatewayInventoryError::InvalidMetadata {
-                path: sidecar.clone(),
-                message: error.to_string(),
-            }
+        // Read the record before checking publication, just like canonical storage inventory.
+        // Retirement commits at image removal; leftover or concurrently removed companions
+        // cannot reserve a port block once that canonical image has vanished.
+        let metadata = DetachedWorkspaceMetadata::read_for_image(image);
+        if !image
+            .try_exists()
+            .map_err(|source| io_error("inspecting pending image publication", image, source))?
+        {
+            return Ok(None);
+        }
+        let metadata = metadata.map_err(|error| GatewayInventoryError::InvalidMetadata {
+            path: sidecar.clone(),
+            message: error.to_string(),
         })?;
         if metadata.repo_id != *repo || metadata.workspace != *workspace {
             return Err(GatewayInventoryError::InvalidMetadata {
@@ -1690,6 +1816,52 @@ impl NativeGatewayInventory {
         let mut facts = self.load_project(repo_id)?;
         facts.sort_by(|left, right| left.workspace.cmp(&right.workspace));
         Ok(facts)
+    }
+
+    fn workspace_attached_blocking(
+        &self,
+        repo_id: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<GatewaySessionFact>, GatewayInventoryError> {
+        if !validate_requested_repository(self.storage.store(), repo_id)? {
+            return Ok(None);
+        }
+        let Some((derived, metadata, mount)) =
+            self.source
+                .workspace_snapshot(&self.storage, repo_id, workspace)?
+        else {
+            return Ok(None);
+        };
+        if !matches!(derived.mount_state, MountState::Mounted { .. }) {
+            return Ok(None);
+        }
+        let layout = StorageLayout::new(self.storage.store(), repo_id).map_err(|error| {
+            GatewayInventoryError::InvalidMetadata {
+                path: self.storage.store().to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        let owned_repo_ids = load_binding_candidate(
+            self.storage.store(),
+            &layout.project().project_root,
+            &layout.project().repository_binding,
+        )?;
+        let project_policy = &layout.project().policy;
+        let project_grants = crate::project_policy::ProjectPolicy::read(project_policy)
+            .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                path: project_policy.clone(),
+                message: error.to_string(),
+            })?
+            .grants;
+        self.load_session_fact(
+            &layout,
+            &owned_repo_ids,
+            &project_grants,
+            derived,
+            metadata,
+            &mount,
+        )
+        .map(Some)
     }
 
     fn load_derived(&self, repo_id: &RepoId) -> Result<DerivedInventory, GatewayInventoryError> {
@@ -1780,9 +1952,9 @@ impl NativeGatewayInventory {
             .grants;
         let mut facts = Vec::new();
         for workspace in derived {
-            let MountState::Mounted { mount_id } = workspace.mount_state else {
+            if !matches!(workspace.mount_state, MountState::Mounted { .. }) {
                 continue;
-            };
+            }
             let volume = crate::storage::apfs::volume_key(repo_id, workspace.workspace.name());
             let mount =
                 mount_paths
@@ -1801,37 +1973,66 @@ impl NativeGatewayInventory {
             // (`expected_mount_paths`) — main at the adopted checkout, every other workspace under
             // `mnt/<owner>/<repo>/` — and `ApfsExecutionHost::mounts` only reports a volume as
             // mounted when the kernel has it at exactly that path.
-            let port_block = metadata.grants.port_block.ok_or_else(|| {
-                GatewayInventoryError::MissingPortBlock {
-                    repo: repo_id.clone(),
-                    workspace: workspace.workspace.name().clone(),
-                }
-            })?;
-            let credentials = read_gateway_workspace_credentials(
+            facts.push(self.load_session_fact(
+                &layout,
                 &owned_repo_ids,
-                &workspace.workspace,
+                &project_grants,
+                workspace,
+                metadata,
                 mount,
-                image_paths.ca_private_key(),
-            )?;
-            let grants = crate::project_policy::effective_grants(&metadata.grants, &project_grants)
-                .map_err(|error| GatewayInventoryError::InvalidMetadata {
-                    path: project_policy.clone(),
-                    message: error.to_string(),
-                })?;
-            facts.push(GatewaySessionFact {
-                repo_id: repo_id.clone(),
-                workspace: workspace.workspace.name().clone(),
-                incarnation: workspace.workspace.incarnation().clone(),
-                revision: grants.revision,
-                created_at: metadata.info_snapshot.created_at.clone(),
-                mount_id,
-                mount: mount.clone(),
-                grants,
-                port_block,
-                credentials,
-            });
+            )?);
         }
         Ok(facts)
+    }
+
+    fn load_session_fact(
+        &self,
+        layout: &StorageLayout,
+        owned_repo_ids: &OwnedRepoIds,
+        project_grants: &crate::project_policy::ProjectGrants,
+        workspace: DerivedWorkspace,
+        metadata: DetachedWorkspaceMetadata,
+        mount: &Path,
+    ) -> Result<GatewaySessionFact, GatewayInventoryError> {
+        let MountState::Mounted { mount_id } = workspace.mount_state else {
+            return Err(GatewayInventoryError::InvalidMetadata {
+                path: mount.to_owned(),
+                message: "gateway session workspace is not mounted".to_owned(),
+            });
+        };
+        let image_paths = canonical_image_paths(layout, &workspace.workspace)?;
+        let port_block =
+            metadata
+                .grants
+                .port_block
+                .ok_or_else(|| GatewayInventoryError::MissingPortBlock {
+                    repo: workspace.workspace.repo().clone(),
+                    workspace: workspace.workspace.name().clone(),
+                })?;
+        let credentials = read_gateway_workspace_credentials(
+            owned_repo_ids,
+            &workspace.workspace,
+            mount,
+            image_paths.ca_private_key(),
+        )?;
+        let project_policy = &layout.project().policy;
+        let grants = crate::project_policy::effective_grants(&metadata.grants, project_grants)
+            .map_err(|error| GatewayInventoryError::InvalidMetadata {
+                path: project_policy.clone(),
+                message: error.to_string(),
+            })?;
+        Ok(GatewaySessionFact {
+            repo_id: workspace.workspace.repo().clone(),
+            workspace: workspace.workspace.name().clone(),
+            incarnation: workspace.workspace.incarnation().clone(),
+            revision: grants.revision,
+            created_at: metadata.info_snapshot.created_at.clone(),
+            mount_id,
+            mount: mount.to_owned(),
+            grants,
+            port_block,
+            credentials,
+        })
     }
 }
 
@@ -2459,15 +2660,52 @@ mod tests {
                     message: format!("missing fixture for {repo}"),
                 })
         }
+        fn canonical_metadata(
+            &self,
+            storage: &ValidatedHostStorage,
+            repo: &RepoId,
+            workspace: &WorkspaceName,
+        ) -> Result<Option<DetachedWorkspaceMetadata>, GatewayInventoryError> {
+            let layout = StorageLayout::new(storage.store(), repo).expect("fixture layout");
+            let image = layout
+                .canonical_image(workspace)
+                .expect("fixture canonical image");
+            if !image.image().exists() {
+                return Ok(None);
+            }
+            let metadata =
+                DetachedWorkspaceMetadata::read_for_image(image.image()).map_err(|error| {
+                    GatewayInventoryError::InvalidMetadata {
+                        path: sidecar_path(image.image()),
+                        message: error.to_string(),
+                    }
+                })?;
+            if metadata.repo_id != *repo || metadata.workspace != *workspace {
+                return Err(GatewayInventoryError::InvalidMetadata {
+                    path: sidecar_path(image.image()),
+                    message: "fixture metadata names another workspace".to_owned(),
+                });
+            }
+            Ok(Some(metadata))
+        }
     }
 
     impl InventorySource for FixtureSource {
-        fn project_storage(
+        fn project_metadata(
             &self,
-            _storage: &ValidatedHostStorage,
+            storage: &ValidatedHostStorage,
             repo: &RepoId,
-        ) -> Result<Vec<StorageFact>, GatewayInventoryError> {
-            self.recorded(repo).map(|facts| facts.storage)
+        ) -> Result<Vec<DetachedWorkspaceMetadata>, GatewayInventoryError> {
+            let published = self.recorded(repo)?.storage;
+            let mut records = Vec::with_capacity(published.len());
+            for fact in published {
+                if let Some(metadata) =
+                    self.canonical_metadata(storage, repo, fact.workspace.name())?
+                {
+                    records.push(metadata);
+                }
+            }
+            Ok(records)
         }
 
         fn project_facts(
@@ -2488,6 +2726,42 @@ mod tests {
                 )));
             }
             self.recorded(repo)
+        }
+
+        fn workspace_snapshot(
+            &self,
+            storage: &ValidatedHostStorage,
+            repo: &RepoId,
+            workspace: &WorkspaceName,
+        ) -> Result<
+            Option<(DerivedWorkspace, DetachedWorkspaceMetadata, PathBuf)>,
+            GatewayInventoryError,
+        > {
+            let recorded = self.recorded(repo)?;
+            let Some(fact) = recorded
+                .storage
+                .into_iter()
+                .find(|fact| fact.workspace.name() == workspace)
+            else {
+                return Ok(None);
+            };
+            let layout = StorageLayout::new(storage.store(), repo).expect("fixture layout");
+            let image = canonical_image_paths(&layout, &fact.workspace)?;
+            if !image.image().exists() {
+                return Ok(None);
+            }
+            let metadata = read_current_metadata(storage.store(), image.image(), &fact.workspace)?;
+            let mounts: Vec<_> = recorded
+                .mounts
+                .into_iter()
+                .filter(|mount| mount.volume_key == fact.volume_key)
+                .collect();
+            let mount =
+                workspace_mountpoint(&layout, &metadata.info_snapshot.project_root, workspace)?;
+            let derived = derive_workspaces(vec![fact], mounts, Vec::new())?
+                .pop()
+                .expect("one selected workspace");
+            Ok(Some((derived, metadata, mount)))
         }
     }
 
@@ -3040,6 +3314,274 @@ mod tests {
             .expect("invalid reserved binding");
         }
         (repo_a, repo_b, source)
+    }
+
+    #[tokio::test]
+    async fn workspace_inventory_ignores_malformed_and_removed_sibling_grants() {
+        let fixture = Fixture::new("named-session");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let selected = WorkspaceName::new("raven").expect("selected");
+        let sibling = WorkspaceName::new("retired").expect("sibling");
+        let source = Arc::new(FixtureSource::default());
+        let mut facts = ProjectInventoryFacts {
+            storage: Vec::new(),
+            mounts: Vec::new(),
+            checkpoints: Vec::new(),
+            mount_paths: BTreeMap::new(),
+        };
+        for (name, incarnation) in [
+            (WorkspaceName::main(), "11111111111111111111111111111111"),
+            (selected.clone(), "22222222222222222222222222222222"),
+            (sibling.clone(), "33333333333333333333333333333333"),
+        ] {
+            let (storage, mounted) = fixture.workspace(&repo, name, incarnation, 7, true);
+            let (mount, path) = mounted.expect("mounted");
+            facts.mount_paths.insert(mount.volume_key.clone(), path);
+            facts.mounts.push(mount);
+            facts.storage.push(storage);
+        }
+        source
+            .projects
+            .lock()
+            .expect("source")
+            .insert(repo.clone(), facts);
+        let inventory = NativeGatewayInventory::with_source(fixture.storage.clone(), source);
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        let main = layout
+            .canonical_image(&WorkspaceName::main())
+            .expect("main");
+        let removed = layout.canonical_image(&sibling).expect("sibling image");
+        fs::write(sidecar_path(main.image()), b"malformed sibling grants").expect("bad main");
+        fs::remove_file(sidecar_path(removed.image())).expect("remove sibling grants");
+        assert!(inventory.project_attached(&repo).await.is_err());
+        let fact = inventory
+            .workspace_attached(&repo, &selected)
+            .await
+            .expect("siblings do not refuse the selected session")
+            .expect("selected session is mounted");
+        assert_eq!(fact.workspace, selected);
+        assert_eq!(fact.revision, 7);
+        fs::remove_file(removed.image()).expect("retire sibling image");
+        assert!(
+            inventory
+                .workspace_attached(&repo, &selected)
+                .await
+                .expect("retired sibling is not read")
+                .is_some()
+        );
+
+        // Scoped inventory still refuses corrupt authority and the selected workspace's grants.
+        let policy = &layout.project().policy;
+        fs::write(policy, b"malformed project policy").expect("bad policy");
+        assert!(
+            inventory
+                .workspace_attached(&repo, &selected)
+                .await
+                .is_err()
+        );
+        fs::remove_file(policy).expect("remove bad policy");
+        let binding = &layout.project().repository_binding;
+        let original_binding = fs::read(binding).expect("binding bytes");
+        fs::write(binding, b"malformed owned binding").expect("bad binding");
+        assert!(
+            inventory
+                .workspace_attached(&repo, &selected)
+                .await
+                .is_err()
+        );
+        fs::write(binding, original_binding).expect("restore binding");
+        let selected_image = layout.canonical_image(&selected).expect("selected image");
+        fs::write(
+            sidecar_path(selected_image.image()),
+            b"malformed own grants",
+        )
+        .expect("bad own grants");
+        assert!(
+            inventory
+                .workspace_attached(&repo, &selected)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn port_reservations_skip_retired_captured_facts_but_refuse_missing_live_grants() {
+        let fixture = Fixture::new("retired-port-owner");
+        let (repo, _, source) = two_project_store(&fixture);
+        let inventory = NativeGatewayInventory::with_source(fixture.storage.clone(), source);
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        let image = layout
+            .canonical_image(&WorkspaceName::main())
+            .expect("main image");
+        fs::remove_file(sidecar_path(image.image())).expect("remove grants");
+        assert!(
+            inventory.all_reserved_port_blocks().await.is_err(),
+            "a live canonical image without grants is still an integrity error"
+        );
+        fs::remove_file(image.image()).expect("retire image");
+        assert_eq!(
+            inventory
+                .all_reserved_port_blocks()
+                .await
+                .expect("retired captured owner no longer reserves ports")
+                .blocks()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pending_port_scan_skips_captured_images_retired_before_the_record_read() {
+        let fixture = Fixture::new("retired-pending-port-owner");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        for (name, state, incarnation) in [
+            (
+                "active",
+                PublicationState::Active,
+                "11111111111111111111111111111111",
+            ),
+            (
+                "pending",
+                PublicationState::PendingFence,
+                "22222222222222222222222222222222",
+            ),
+        ] {
+            let workspace = WorkspaceName::new(name).expect("workspace");
+            let (fact, _) = fixture.workspace(&repo, workspace.clone(), incarnation, 7, false);
+            let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+            let image = canonical_image_paths(&layout, &fact.workspace).expect("captured image");
+            let mut metadata =
+                DetachedWorkspaceMetadata::read_for_image(image.image()).expect("metadata");
+            metadata.publication_state = state;
+            metadata.write_for_image(image.image()).expect("state");
+            if state == PublicationState::PendingFence {
+                let pending = NativeGatewayInventory::pending_metadata(
+                    fixture.storage.store(),
+                    &repo,
+                    &workspace,
+                    image.image(),
+                )
+                .expect("live pending owner reads its block")
+                .expect("live pending metadata");
+                let mut claims = Vec::new();
+                claim_granted_blocks(
+                    &mut claims,
+                    &repo,
+                    &pending,
+                    &ClaimRecord::PendingFence(sidecar_path(image.image())),
+                )
+                .expect("live pending owner reserves its block");
+                let mut reserved = ReservedPortBlocks::default();
+                for claim in claims {
+                    reserved.insert(claim.block);
+                }
+                assert_eq!(reserved.blocks().count(), 1);
+            }
+            fs::remove_file(image.image()).expect("commit retirement after directory capture");
+            assert!(
+                NativeGatewayInventory::pending_metadata(
+                    fixture.storage.store(),
+                    &repo,
+                    &workspace,
+                    image.image(),
+                )
+                .expect("retained sidecar cannot reserve a retired image's block")
+                .is_none()
+            );
+            fs::write(sidecar_path(image.image()), b"record disappeared mid-read")
+                .expect("bad retired record");
+            assert!(
+                NativeGatewayInventory::pending_metadata(
+                    fixture.storage.store(),
+                    &repo,
+                    &workspace,
+                    image.image(),
+                )
+                .expect("a failed read of a retired companion contributes no block")
+                .is_none()
+            );
+            fs::write(image.image(), b"recreated image").expect("restore canonical publication");
+            assert!(
+                NativeGatewayInventory::pending_metadata(
+                    fixture.storage.store(),
+                    &repo,
+                    &workspace,
+                    image.image(),
+                )
+                .is_err(),
+                "malformed metadata beside a present image remains an error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn port_reservations_use_current_recreated_owner_not_captured_incarnation() {
+        let fixture = Fixture::new("recreated-port-owner");
+        let (repo, _, source) = two_project_store(&fixture);
+        let inventory = NativeGatewayInventory::with_source(fixture.storage.clone(), source);
+        let layout = StorageLayout::new(fixture.storage.store(), &repo).expect("layout");
+        let image = layout
+            .canonical_image(&WorkspaceName::main())
+            .expect("main image");
+        let mut metadata =
+            DetachedWorkspaceMetadata::read_for_image(image.image()).expect("metadata");
+        let old = metadata.grants.port_block.expect("old block");
+        let replacement = PortBlock::new(40_960, NEW_PORT_BLOCK_SIZE).expect("replacement block");
+        metadata.workspace_incarnation =
+            WorkspaceIncarnation::new("ffffffffffffffffffffffffffffffff").expect("new incarnation");
+        metadata.grants.port_block = Some(replacement);
+        metadata
+            .write_for_image(image.image())
+            .expect("publish recreated metadata");
+        let reserved = inventory
+            .all_reserved_port_blocks()
+            .await
+            .expect("current port owners");
+        assert_eq!(reserved.overlapping(replacement), Some(replacement));
+        assert_eq!(reserved.overlapping(old), None);
+    }
+
+    #[tokio::test]
+    async fn workspace_inventory_omits_absent_and_detached_targets() {
+        let fixture = Fixture::new("detached-selected");
+        let repo = RepoId::parse("acme/widget").expect("repo");
+        fixture.bind(&repo);
+        let workspace = WorkspaceName::new("raven").expect("workspace");
+        let (fact, mounted) = fixture.workspace(
+            &repo,
+            workspace.clone(),
+            "11111111111111111111111111111111",
+            7,
+            false,
+        );
+        assert!(mounted.is_none());
+        let source = Arc::new(FixtureSource::default());
+        source.projects.lock().expect("source").insert(
+            repo.clone(),
+            ProjectInventoryFacts {
+                storage: vec![fact],
+                mounts: Vec::new(),
+                checkpoints: Vec::new(),
+                mount_paths: BTreeMap::new(),
+            },
+        );
+        let inventory = NativeGatewayInventory::with_source(fixture.storage.clone(), source);
+        assert!(
+            inventory
+                .workspace_attached(&repo, &workspace)
+                .await
+                .expect("detached target")
+                .is_none()
+        );
+        assert!(
+            inventory
+                .workspace_attached(&repo, &WorkspaceName::new("absent").expect("name"))
+                .await
+                .expect("absent target")
+                .is_none()
+        );
     }
 
     #[tokio::test]
