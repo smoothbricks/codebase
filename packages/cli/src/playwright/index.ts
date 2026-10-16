@@ -1,14 +1,24 @@
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { run } from '../lib/run.js';
 
 const HOST_CACHE_ROOT = '/var/cache/ci';
+const CHROME_NAMES = ['google-chrome', 'chromium-browser', 'chromium'] as const;
 const SYSTEM_CHROME_PATHS = [
   '/usr/bin/google-chrome',
   '/usr/bin/chromium-browser',
   '/usr/bin/chromium',
   '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
 ] as const;
+
+/** Absolute candidates first, then the same names resolved through PATH: NixOS installs no browser under /usr/bin. */
+function chromeCandidates(env: Readonly<Record<string, string | undefined>>): string[] {
+  const fromPath = (env.PATH ?? '')
+    .split(delimiter)
+    .filter((directory) => directory !== '')
+    .flatMap((directory) => CHROME_NAMES.map((name) => join(directory, name)));
+  return [...SYSTEM_CHROME_PATHS, ...fromPath];
+}
 
 export interface ChromiumSetupDependencies {
   readonly env: Readonly<Record<string, string | undefined>>;
@@ -60,10 +70,11 @@ export async function ensureChromium(
   }
 
   if (githubActions) {
-    const executablePath = SYSTEM_CHROME_PATHS.find(exists);
+    const candidates = chromeCandidates(env);
+    const executablePath = candidates.find(exists);
     if (!executablePath) {
       throw new Error(
-        `GitHub-hosted runner has no preinstalled Chromium. Refusing to download; searched: ${SYSTEM_CHROME_PATHS.join(', ')}`,
+        `GitHub-hosted runner has no preinstalled Chromium. Refusing to download; searched: ${candidates.join(', ')}`,
       );
     }
     console.log(`Using preinstalled Chromium: ${executablePath}`);

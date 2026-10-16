@@ -37,6 +37,23 @@ describe('ensureChromium', () => {
     expect(calls).toEqual([]);
   });
 
+  it('finds a NixOS Chromium through PATH when no /usr/bin candidate exists', async () => {
+    const calls: RunCall[] = [];
+    const executablePath = '/nix/store/fixture-chromium/bin/chromium';
+
+    const result = await ensureChromium(
+      '/workspace/package',
+      setupDependencies(
+        { GITHUB_ACTIONS: 'true', PATH: '/nix/store/fixture-chromium/bin:/bin' },
+        [executablePath],
+        calls,
+      ),
+    );
+
+    expect(result).toEqual({ mode: 'system', executablePath });
+    expect(calls).toEqual([]);
+  });
+
   it('uses the configured Nix browser instead of downloading an incompatible host binary', async () => {
     const calls: RunCall[] = [];
     const executablePath = '/nix/store/fixture-chromium/bin/chromium';
