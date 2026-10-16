@@ -324,13 +324,15 @@ setInterval(() => console.log('running'), 10);
           async kill(pid, signal) {
             ownedProcessGroups.add(pid);
             armed ??= readFile(ready, 'utf8').then((text) => {
-              const observed = spawnSync('/bin/ps', ['-o', 'pid=,pgid=,stat=', '-p', String(pid)], {
+              // Bare `ps` through PATH: NixOS has no /bin/ps, and a failed spawn leaves stdout null.
+              const observed = spawnSync('ps', ['-o', 'pid=,pgid=,stat=', '-p', String(pid)], {
                 encoding: 'utf8',
               });
-              const detail = `abort-report handler pid=${pid} signal=${signal} ready=${JSON.stringify(text)} state=${observed.stdout.trim()} status=${observed.status} stderr=${observed.stderr} error=${observed.error}`;
+              const observedStdout = observed.stdout ?? '';
+              const detail = `abort-report handler pid=${pid} signal=${signal} ready=${JSON.stringify(text)} state=${observedStdout.trim()} status=${observed.status} stderr=${observed.stderr} error=${observed.error}`;
               expect(text, detail).toBe(`ready pid=${pid}\n`);
               expect(observed.status, detail).toBe(0);
-              const [seenPid, pgid, state] = observed.stdout.trim().split(/\s+/);
+              const [seenPid, pgid, state] = observedStdout.trim().split(/\s+/);
               expect(Number(seenPid), detail).toBe(pid);
               expect(Number(pgid), detail).toBe(pid);
               expect(state !== undefined && !state.startsWith('Z'), detail).toBe(true);

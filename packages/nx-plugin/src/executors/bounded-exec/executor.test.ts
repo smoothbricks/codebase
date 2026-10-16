@@ -1307,10 +1307,12 @@ async function armedPid(path: string, pgid: number, subject: string): Promise<nu
   const pid = Number(match?.[1]);
   const detail = `${subject}: ready=${JSON.stringify(text)} fifo=${path} pid=${pid} expected pgid=${pgid}`;
   expect(Number.isSafeInteger(pid) && pid > 0, `${detail}; state=unobserved (invalid readiness PID)`).toBe(true);
-  const observed = spawnSync('/bin/ps', ['-o', 'pid=,ppid=,pgid=,stat=', '-p', String(pid)], { encoding: 'utf8' });
-  const state = `${detail}; state=${observed.stdout.trim()} status=${observed.status} stderr=${observed.stderr} error=${observed.error}`;
+  // Bare `ps` through PATH: NixOS has no /bin/ps, and a failed spawn leaves stdout null.
+  const observed = spawnSync('ps', ['-o', 'pid=,ppid=,pgid=,stat=', '-p', String(pid)], { encoding: 'utf8' });
+  const observedStdout = observed.stdout ?? '';
+  const state = `${detail}; state=${observedStdout.trim()} status=${observed.status} stderr=${observed.stderr} error=${observed.error}`;
   expect(observed.status, state).toBe(0);
-  const [seenPid, , seenGroup, stat] = observed.stdout.trim().split(/\s+/);
+  const [seenPid, , seenGroup, stat] = observedStdout.trim().split(/\s+/);
   expect(Number(seenPid), state).toBe(pid);
   expect(Number(seenGroup), state).toBe(pgid);
   expect(stat !== undefined && !stat.startsWith('Z'), state).toBe(true);
