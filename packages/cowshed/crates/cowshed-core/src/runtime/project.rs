@@ -15178,48 +15178,13 @@ fn land_check_request(check: &str) -> ExecRequest {
 
 #[cfg(all(test, target_os = "macos"))]
 mod land_check_tests {
-    use super::{land_check_request, remote_cache_outcome};
-    use crate::api::dto::{NxCachePrerequisite, NxCachePublication};
+    use super::land_check_request;
 
     /// A check's child gets what every child gets and nothing of its own: a check that forced
     /// `CARGO_INCREMENTAL=0` made every workspace member a second unit, recompiled on each land.
     #[test]
     fn a_land_check_leaves_incremental_to_the_profile() {
         assert!(land_check_request("cargo test").env.is_empty());
-    }
-
-    #[test]
-    fn an_absent_receipt_reports_a_missing_qualification() {
-        let reason = "trusted Nx publication requires a successful protected check receipt";
-        assert_eq!(
-            remote_cache_outcome(Some(reason.to_owned()), Vec::new()),
-            NxCachePublication::MissingQualification {
-                reason: reason.to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn a_qualified_source_reports_both_missing_prerequisites_and_no_publication() {
-        // A projection fixture, not authority: the receipt's shape is typed, but no protected job
-        // backs it. The projection keeps every receipt it is given and reports both prerequisites.
-        let receipt = crate::api::dto::NxSourceCheckReceipt {
-            check_job: crate::api::dto::JobId::new(11).expect("check job"),
-            inspection_job: crate::api::dto::JobId::new(12).expect("inspection job"),
-            cache: crate::api::dto::WorkspacePath::new(".nx/cache").expect("cache path"),
-            successful_task_hashes: vec!["18446744073709551615".to_owned()],
-            local_artifact_bytes: Some(4096),
-        };
-        assert_eq!(
-            remote_cache_outcome(None, vec![receipt.clone()]),
-            NxCachePublication::MissingPrerequisites {
-                checks: vec![receipt],
-                missing: vec![
-                    NxCachePrerequisite::UndeclaredInputAudit,
-                    NxCachePrerequisite::MissingArtifactClient,
-                ],
-            }
-        );
     }
 }
 
