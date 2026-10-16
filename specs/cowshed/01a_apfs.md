@@ -101,9 +101,9 @@ This companion owns the macOS/APFS implementation.
   from where the backing image lives and from the in-image marker; see "Ownership, identity, and the volume label"
   below. A minted image carries its template's label, `[cowshed]`, until its workspace's supervisor relabels it off the
   provisioning path; a build volume keeps it, since nothing mounts one browsable.
-- **Spotlight**: the root storage service merges the configured store and mount roots into the Data volume's Spotlight
-  Search Privacy `Exclusions` at setup and boot, preserving other entries. These exclusions and the image marker express
-  indexing policy, not media-reference ownership. In mds **2418.6.3.9.400 arm64e**, an admitted mounted
+- **Spotlight**: the root storage service merges the fixed store and per-user mount roots into the Data volume's
+  Spotlight Search Privacy `Exclusions` at setup and boot, preserving other entries. These exclusions and the image
+  marker express indexing policy, not media-reference ownership. In mds **2418.6.3.9.400 arm64e**, an admitted mounted
   `AppleAPFSVolume` reaches a constructor path that acquires an owned IOKit port and forgets its name without releasing
   the send right. Ordinary unmount/eject cannot recover that ownership; a process reap releases it, not an indexing
   exclusion or reload. The constructor admission, branch evidence, controls and host mitigation are specified in
@@ -234,16 +234,17 @@ references.
 
 ### Stable workspace mount root
 
-On macOS the default session mount root is `/private/var/folders/cowshed/<uid>/mnt`, where `<uid>` is the invoking
-user's numeric UID. `/var/folders` is its familiar spelling; the stored path is canonical. The path deliberately reaches
-the pre-constructor exclusion above, before mds can acquire the port. It is a real mount directory, not an index-policy
-flag, a fake OS-update path or a renamed volume. A main still mounts at its original checkout path; this default does
-not relocate existing checkouts or release references mds already holds. Explicit roots outside the exclusion retain the
-measured risk.
+On macOS the session mount root is fixed at `/private/var/folders/cowshed/<uid>/mnt`, where `<uid>` is the invoking
+user's numeric UID. `/var/folders` is its familiar spelling; cowshed derives the canonical path, never stores or accepts
+a configured alternative. The path deliberately reaches the pre-constructor exclusion above, before mds can acquire the
+port. It is a real mount directory, not an index-policy flag, a fake OS-update path or a renamed volume. A main still
+mounts at its original checkout path; this policy does not relocate existing checkouts or release references mds already
+holds. An indexed custom root also lets Spotlight hold workspace mounts busy during detachment, as observed during host
+migration: the fixed physical path must avoid Spotlight admission, not merely have a different spelling.
 
 `cowshed setup` provisions the root in its existing privileged transaction: `/private/var/folders/cowshed` is root:wheel
 mode **0755**, and its `<uid>` and `mnt` directories are owned by the invoker with mode **0700**. Setup creates missing
-directories idempotently, attests ownership and type, reports the selected path, and refuses a symlink, non-directory or
+directories idempotently, attests ownership and type, reports the fixed path, and refuses a symlink, non-directory or
 foreign owner rather than writing through it. No separate operator mkdir, daemon bounce or automatic move of an attached
 workspace is required. Ordinary session and build mountpoints are created beneath `mnt` on demand.
 
@@ -255,12 +256,20 @@ across boots; cowshed therefore provisions its own stable subtree, outside those
 recreated without moving the backing images. This is not a new Time Machine policy: backup inclusion remains a
 per-volume decision.
 
-There is **one configured session root per host**, selected at setup. Existing explicit and legacy root configuration
-continues to mean exactly the same path; installing a new binary neither rewrites it nor moves live sessions. The new
-default applies when selecting an unconfigured root. An operator who wants an existing host to switch first leaves no
-sessions attached, then runs `cowshed setup --mount-root /private/var/folders/cowshed/$(id -u)/mnt`. Setup retains its
-attached-session refusal because absolute paths are baked into detached metadata and sandbox profiles. The operator
-chooses that maintenance boundary; cowshed does not bypass it. Linux retains its own default.
+There is **no mount-root configuration** and `setup` has no `--mount-root` option. Linux likewise derives its fixed
+`~/.cowshed/mnt` root. The supported way to use another access path is an operator-created symlink **from the preferred
+path to the canonical root**, for example `ln -s /private/var/folders/cowshed/$(id -u)/mnt ~/workspaces`. Never replace
+the canonical root with a link to an indexed directory: the kernel-resolved physical mount path is what mds admits.
+Cowshed's probe and workspace jobs use canonical mount paths; identity rules anchored only at an alias are not reliable.
+
+An existing `host.json` with a custom `mountRoot` is refused on read, with the configuration file, recorded root and
+required fixed root named. The reader neither ignores the value nor rewrites the file, moves mounts or attaches at the
+new path. The operator uses the previous installed build to stop workspace jobs/daemons and detach every session and
+build volume at the old root, resolves busy holders (including Spotlight), and audits path-bearing detached metadata and
+sandbox grants before reattachment. Only after that explicit maintenance boundary does the operator remove `mountRoot`
+from `host.json`, preserving credential routes and mode 0600, and run the new build's ordinary `cowshed setup`. There is
+no automatic live migration and no requirement to move backing images. A legacy `mountRoot` already equal to the derived
+root is harmless to read and is omitted on the next ordinary configuration save.
 
 The 2026-10-14 production-provisioning proof created the root with the ownership/modes above, then ran the real CLI
 parser/dispatcher against an isolated scratch host: adopt, doctor, fork, rm, doctor. Fork published the expected payload
@@ -482,8 +491,8 @@ another opener.
 
 For every mounted attachment:
 
-- Session workspaces mount under the host-configured mount root at `<mount-root>/<owner>/<repo>/<workspace>`.
-  `-nobrowse` keeps every cowshed volume out of Finder, the Desktop, and the sidebar regardless of Finder preferences.
+- Session workspaces mount under the fixed per-user root at `<mount-root>/<owner>/<repo>/<workspace>`. `-nobrowse` keeps
+  every cowshed volume out of Finder, the Desktop, and the sidebar regardless of Finder preferences.
 - The **main workspace mounts at the checkout's original path** (written `<project-root>` below; 02_workspaces.md). The
   user's path is the real thing, and sibling workspaces live under the shared mount root.
 - Mountpoint directories are created before attach and removed by `cowshed gc`. An unmounted main mountpoint is empty:
@@ -972,14 +981,13 @@ builds already keep them (03_caches.md).
 ### One herd, multiple users
 
 There is one cowshed per machine, anchored to no account. `/private/cowshed/store` is a plain directory on Data created
-once at provision; it exists only as a mountpoint and fstab target. Workspace mounts use the host-configured root,
-defaulting to `/private/var/folders/cowshed/<uid>/mnt` on macOS; see
-[Stable workspace mount root](#stable-workspace-mount-root). Existing configured roots remain unchanged. No cowshed
-evidence, sandbox profile, or metadata path derives from `$HOME`. Workspace images remain on the store volume while
-their live mounts appear under `<mount-root>/…`, so per-image `clonefile` semantics, locks, and lifecycle are unchanged
-by sharing; concurrent multi-user mutation of one workspace stays serialized by the same `<image>.lock` flocks, and
-cross-user `gc` policy is deliberately blunt: any user may retire any shed, because `noowners` already made the trust
-model explicit.
+once at provision; it exists only as a mountpoint and fstab target. Workspace mounts use the fixed per-user root
+`/private/var/folders/cowshed/<uid>/mnt` on macOS; see [Stable workspace mount root](#stable-workspace-mount-root),
+including refusal of legacy custom configuration. No cowshed evidence, sandbox profile, or metadata path on macOS
+derives from `$HOME`. Workspace images remain on the store volume while their live mounts appear under `<mount-root>/…`,
+so per-image `clonefile` semantics, locks, and lifecycle are unchanged by sharing; concurrent multi-user mutation of one
+workspace stays serialized by the same `<image>.lock` flocks, and cross-user `gc` policy is deliberately blunt: any user
+may retire any shed, because `noowners` already made the trust model explicit.
 
 ## Restore publication custody
 
@@ -1024,7 +1032,7 @@ detach first; RAW has no outer map ("Images"). A case-insensitive volume was rej
 flag at creation and nothing afterwards.
 
 **`/Volumes` mount root rejected.** DiskArbitration-managed mountpoints save a mkdir/rmdir pair but put cowshed paths in
-a shared namespace where Finder surfaces them and name collisions get renamed (`widget 1`). The configured mount root
+a shared namespace where Finder surfaces them and name collisions get renamed (`widget 1`). The fixed canonical root
 gives short, stable, hidden paths cowshed fully owns.
 
 **`~/Library/Application Support` rejected.** The Apple-idiomatic location puts multi-GB churning images on the Data

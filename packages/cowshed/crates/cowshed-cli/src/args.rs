@@ -228,9 +228,6 @@ pub struct SetupArgs {
     /// Proceed with `--uninstall` although the volumes still hold workspaces, or although their
     /// occupancy could not be established at all.
     pub force: bool,
-    /// Host-configured session mount root (`<mount-root>/<owner>/<repo>/<ws>`). Settable only
-    /// when every session workspace is detached; direct-mounted mains are unaffected.
-    pub mount_root: Option<PathBuf>,
     /// Build the patched sccache from cowshed's own nix flake, root the result, and start its
     /// LaunchAgent. Opt-in because not every cowshed user writes Rust and it requires nix.
     pub sccache: bool,
@@ -717,7 +714,6 @@ fn cli_command() -> ClapCommand {
             flag("sccache"),
             flag("retire-caches-volume"),
             flag("downgrade"),
-            value("mount-root"),
         ]))
         .subcommand(
             leaf("fork")
@@ -1779,7 +1775,9 @@ const SETUP: CommandSpec = CommandSpec {
         "Setup installs the invoking build as the host's cowshed — the CLI and the daemon alike, as one artifact. The build is copied to a content-addressed file beside the plists' volume, `~/Library/Application Support/dev.cowshed/bin/cowshed-<sha256>`; the stable name `cowshed` there becomes a link to it; the gateway agent runs that name; and the first `cowshed` on your `PATH`, when it is a symbolic link — what `bun link` of the package or a link made by hand leaves — is pointed at it too. The `cowshed` you type and the daemon are then the same bytes, and only `cowshed setup` changes them: rebuilding a checkout changes nothing on `PATH` until a setup runs from that build. A setup run from the installed copy therefore installs nothing; install another build by running that build's own `cowshed setup` — a checkout's `packages/cowshed/bin/cowshed`, or its `dist/bin/<platform>/cowshed`. A gateway that answers while running other bytes than the installed copy is restarted onto it, and a stale installed copy is replaced through the same atomic plan `gateway start` uses, with the previous build put back if the agent cannot be activated. A service left running a binary from before this build is host drift a repair ends — setup never reports such a host as set up. Run setup from a release build — the platform `cli-*` target's `production` configuration (`nx run cowshed:cli-arm64-macos:production` on Apple silicon) or `cargo build --release -p cowshed-cli`; `nx run cowshed:build` builds a debug one, and a debug build is refused as the supervised binary.",
         "Release builds record the commit they were made from, and the installed cowshed keeps the record of its build. Setup refuses to install a build older than the installed one — or one that records nothing, which cannot show it is not older — naming the binary it would have installed, and exits non-zero after repairing everything else. A stale checkout's build on `PATH` is how a host once lost a landed gateway feature without anyone asking for it. `--downgrade` installs the invoking build anyway.",
         "After successful storage repair, setup refreshes every adopted main's build state through the same path jobs use. It announces rebuild-only migration before discarding contributed incremental directories, protects tracked source files, and links an empty build volume for the next build to repopulate. No build state is copied. One refusing project does not hide later projects: each is reported on stderr, then setup exits with the first typed failure and a count. Uninstall never migrates build state.",
-        "`--mount-root <dir>` sets the one host session workspace mount root. Fresh macOS setup defaults to `/private/var/folders/cowshed/<uid>/mnt` (also spelled `/var/folders/cowshed/<uid>/mnt`), using the invoking numeric uid, not HOME or a random temporary directory; Linux keeps `~/.cowshed/mnt`. Setup creates or repairs the stable macOS prefix root:wheel 0755 and its user directories uid:gid 0700 through the same single authorization, refusing symlinks, non-directories and foreign ownership. Existing configured roots are preserved exactly. Session workspaces mount at `<mount-root>/<owner>/<repo>/<ws>`, and build volumes also derive from that root. The root can change only while every session workspace is detached; mains stay mounted directly at their checkout paths.",
+        "The host session workspace mount root is fixed, and setup has no option or setting to change it. On macOS it is `/private/var/folders/cowshed/<uid>/mnt` (also spelled `/var/folders/cowshed/<uid>/mnt`), using the invoking numeric uid, not HOME or a random temporary directory; on Linux it is `~/.cowshed/mnt`. Setup creates or repairs the stable macOS prefix root:wheel 0755 and its user directories uid:gid 0700 through the same single authorization, refusing symlinks, non-directories and foreign ownership. Session workspaces mount at `<root>/<owner>/<repo>/<ws>`, and build volumes also derive from that root; mains stay mounted directly at their checkout paths.",
+        "To reach workspaces through a preferred path, make a symbolic link at that path pointing to the root, for example `ln -s /private/var/folders/cowshed/$(id -u)/mnt ~/workspaces` (on Linux, point it at `~/.cowshed/mnt`). The link runs from the preferred path to the root, never the other way round: the root stays a real directory, because the kernel-resolved physical mount path is what Spotlight's indexer admits. Cowshed's identity probe and workspace jobs use canonical mount paths; identity rules anchored only at an alias are not reliable.",
+        "A `host.json` that still records a custom `mountRoot` is refused when read, naming that file, the recorded root and the required root. The refusal does not ignore the value, rewrite the file, move a mount or attach at the new path, and there is no automatic migration: with the previously installed build, stop workspace jobs and daemons, detach every session and build volume at the old root, resolve busy holders (Spotlight included), and audit path-bearing detached metadata and sandbox grants before reattaching. Only then remove `mountRoot` from `host.json`, keeping credential routes and mode 0600, and run this build's ordinary `cowshed setup`. A recorded root equal to the fixed root is harmless and is omitted the next time the file is saved.",
         "`--uninstall` is the same transaction backwards, and deliberately narrower: it removes the machine presence — the cowshed-tagged `/etc/fstab` pins, the gateway and sccache LaunchAgents, and the installed binaries they ran — and touches no volume, no image, and no workspace. Nothing it removes holds data; everything it leaves does. It refuses while the volumes still hold workspaces, or while their occupancy cannot be established, until `--force` says the caller means it anyway.",
         "`--sccache` builds the patched sccache from the flake this package ships at `nix/sccache`, registers a nix GC root for the result under cowshed's support directory, and starts a LaunchAgent running that exact store path. It is opt-in: not every cowshed user writes Rust, and it needs nix. A host without nix is told so and the rest of the run still repairs storage. The plist names the resolved `/nix/store` path rather than the GC root symlink, so a rebuild is a plist change — and therefore an explicit restart — instead of a different binary appearing under a loaded agent.",
         "`--retire-caches-volume` deletes the retired caches volume, removes its `/etc/fstab` pin and drops it from the storage mount service, inside the same single authorization. It refuses while the volume holds anything but its marker.",
@@ -1792,10 +1790,6 @@ const SETUP: CommandSpec = CommandSpec {
         Opt {
             spelling: "--force",
             meaning: "`--uninstall` only: proceed although workspaces remain, or although occupancy could not be established",
-        },
-        Opt {
-            spelling: "--mount-root <dir>",
-            meaning: "set the host session mount root; refused while any session workspace is attached",
         },
         Opt {
             spelling: "--sccache",
@@ -1815,28 +1809,17 @@ const SETUP: CommandSpec = CommandSpec {
 /// `setup` takes no project: a host whose volumes are missing has no adopted checkout to select,
 /// so silently accepting `--project` would promise a scope the verb does not have. `--force`
 /// without `--uninstall` is refused rather than ignored — it confirms a refusal that the forward
-/// direction never makes, so accepting it would answer a question nobody asked. `--mount-root`
-/// is a third direction and cannot combine with teardown, and neither can `--sccache`: teardown
-/// releases the GC root an install registers, so asking for both in one command line names two
-/// opposite intents.
+/// direction never makes, so accepting it would answer a question nobody asked. `--sccache`
+/// cannot combine with teardown: teardown releases the GC root an install registers, so asking
+/// for both in one command line names two opposite intents.
 fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
     const USAGE: &CommandSpec = &SETUP;
     reject_project(global, USAGE, "--project is not valid for setup")?;
     let uninstall = flagged(matches, "uninstall");
     let force = flagged(matches, "force");
-    let mount_root = match os(matches, "mount-root") {
-        Some(value) => Some(absolute_mount_root(&value, USAGE)?),
-        None => None,
-    };
     let sccache = flagged(matches, "sccache");
     let retire_caches_volume = flagged(matches, "retire-caches-volume");
     let downgrade = flagged(matches, "downgrade");
-    if mount_root.is_some() && (uninstall || force) {
-        return Err(UsageError::new(
-            "--mount-root cannot be combined with --uninstall",
-            USAGE,
-        ));
-    }
     if sccache && (uninstall || force) {
         return Err(UsageError::new(
             "--sccache installs sccache; --uninstall removes it",
@@ -1849,9 +1832,9 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
             USAGE,
         ));
     }
-    if downgrade && (uninstall || force || mount_root.is_some()) {
+    if downgrade && (uninstall || force) {
         return Err(UsageError::new(
-            "--downgrade installs a build; --uninstall and --mount-root install none",
+            "--downgrade installs a build; --uninstall installs none",
             USAGE,
         ));
     }
@@ -1864,7 +1847,6 @@ fn parse_setup(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, 
     Ok(Command::Setup(SetupArgs {
         uninstall,
         force,
-        mount_root,
         sccache,
         retire_caches_volume,
         downgrade,
@@ -2012,17 +1994,6 @@ fn parse_move(matches: &ArgMatches) -> Result<Command, UsageError> {
         source,
         destination,
     }))
-}
-
-fn absolute_mount_root(value: &OsStr, usage: &'static CommandSpec) -> Result<PathBuf, UsageError> {
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        return Err(UsageError::new(
-            "the workspace mount root must be an absolute path",
-            usage,
-        ));
-    }
-    Ok(path)
 }
 
 /// A checkout destination is a path, and the only thing the parser can decide about it is that it
@@ -3803,7 +3774,6 @@ mod tests {
         const REPAIR: SetupArgs = SetupArgs {
             uninstall: false,
             force: false,
-            mount_root: None,
             sccache: false,
             retire_caches_volume: false,
             downgrade: false,
@@ -3826,7 +3796,6 @@ mod tests {
             Command::Setup(SetupArgs {
                 uninstall: true,
                 force: false,
-                mount_root: None,
                 sccache: false,
                 retire_caches_volume: false,
                 downgrade: false,
@@ -3839,7 +3808,6 @@ mod tests {
             Command::Setup(SetupArgs {
                 uninstall: true,
                 force: true,
-                mount_root: None,
                 sccache: false,
                 retire_caches_volume: false,
                 downgrade: false,
@@ -3853,7 +3821,6 @@ mod tests {
             Command::Setup(SetupArgs {
                 uninstall: false,
                 force: false,
-                mount_root: None,
                 sccache: true,
                 retire_caches_volume: false,
                 downgrade: false,
@@ -3893,26 +3860,13 @@ mod tests {
         let error = parse_args(["setup", "--downgrade", "--uninstall"]).unwrap_err();
         assert_eq!(
             error.message,
-            "--downgrade installs a build; --uninstall and --mount-root install none"
+            "--downgrade installs a build; --uninstall installs none"
         );
-
-        let Command::Setup(configured) =
-            parse_args(["setup", "--mount-root", "/Users/dev/.cowshed/mnt"])
-                .unwrap()
-                .command
-        else {
-            panic!("expected setup")
-        };
-        assert_eq!(
-            configured.mount_root.as_deref(),
-            Some(std::path::Path::new("/Users/dev/.cowshed/mnt"))
-        );
-        assert!(!configured.uninstall);
 
         let error = parse_args(["setup", "--project", "/repo"]).unwrap_err();
         assert_eq!(error.message, "--project is not valid for setup");
         assert!(error.hint.contains("cowshed setup"));
-        assert!(error.hint.contains("--mount-root"));
+        assert!(error.hint.contains("--downgrade"));
 
         let error = parse_args(["setup", "--force"]).unwrap_err();
         assert_eq!(
@@ -3920,20 +3874,55 @@ mod tests {
             "--force only confirms --uninstall; setup never refuses to repair a host"
         );
 
-        let error = parse_args(["setup", "--uninstall", "--mount-root", "/tmp/mnt"]).unwrap_err();
-        assert_eq!(
-            error.message,
-            "--mount-root cannot be combined with --uninstall"
-        );
-
-        let error = parse_args(["setup", "--mount-root", "relative/mnt"]).unwrap_err();
-        assert_eq!(
-            error.message,
-            "the workspace mount root must be an absolute path"
-        );
-
         assert!(parse_args(["setup", "extra"]).is_err());
         assert!(parse_args(["setup", "--purge"]).is_err());
+    }
+
+    /// The workspace mount root is derived (01a_apfs.md, "Stable workspace mount root"), so
+    /// `--mount-root` is not an option of `setup`: the parser refuses it as it refuses any unknown
+    /// flag, whatever value it carries and whatever flag rides with it, and no usage line or help
+    /// surface names it. Only the parser runs; nothing here can reach a live host.
+    #[test]
+    fn setup_has_no_mount_root_option() {
+        let spec = help::command_named("setup").expect("setup has a help page");
+        let refused: &[&[&str]] = &[
+            &["setup", "--mount-root", "/Users/dev/.cowshed/mnt"],
+            &["setup", "--mount-root", "relative/mnt"],
+            &["setup", "--mount-root=/Users/dev/.cowshed/mnt"],
+            &["setup", "--mount-root"],
+            &["setup", "--uninstall", "--mount-root", "/tmp/mnt"],
+            &[
+                "setup",
+                "--uninstall",
+                "--force",
+                "--mount-root",
+                "/tmp/mnt",
+            ],
+            &["setup", "--mount-root", "/tmp/mnt", "--downgrade"],
+            &["setup", "--sccache", "--mount-root", "/tmp/mnt"],
+            &[
+                "setup",
+                "--retire-caches-volume",
+                "--mount-root",
+                "/tmp/mnt",
+            ],
+            &["--json", "setup", "--mount-root", "/tmp/mnt"],
+        ];
+        for argv in refused {
+            let error = parse_args(argv.iter().copied()).unwrap_err();
+            assert_eq!(error.kind, UsageErrorKind::InvalidArguments, "{argv:?}");
+            assert_eq!(error.message, "unknown flag `--mount-root`", "{argv:?}");
+            assert_eq!(error.hint, spec.hint(), "{argv:?}");
+        }
+
+        assert!(!spec.hint().contains("mount-root"));
+        assert!(
+            spec.options
+                .iter()
+                .all(|option| !option.spelling.contains("mount-root"))
+        );
+        assert!(!spec.page().contains("mount-root"));
+        assert!(!help::command_map().contains("mount-root"));
     }
 
     /// `--purge` belongs to `gateway stop` alone: it names bytes to delete, and deleting them

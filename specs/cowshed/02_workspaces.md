@@ -222,13 +222,14 @@ images are retained inputs to this transaction; ordinary runtime image enumerati
 ## Checkout layouts
 
 Main mounts at the checkout's original path — one layout, no per-project choice to record — and every other workspace
-mounts at `<mount-root>/<owner>/<repo>/<workspace>`, where the mount root is host configuration, set via
-`cowshed setup --mount-root` (01_storage.md). The macOS default is `/private/var/folders/cowshed/<uid>/mnt`; its
-provisioning and Spotlight admission rule are specified in [01a_apfs.md](./01a_apfs.md#stable-workspace-mount-root).
-Linux retains `~/.cowshed/mnt`, and existing explicit or legacy configuration is preserved. The root holds only
+mounts at `<mount-root>/<owner>/<repo>/<workspace>`, where the mount root is the fixed per-user root of 01_storage.md
+("Directory layout"): `/private/var/folders/cowshed/<uid>/mnt` on macOS, derived from the invoking numeric UID, and
+`~/.cowshed/mnt` on Linux. It is derived, never configured or stored, and `setup` has no option for it; its
+provisioning, the Spotlight admission rule and the refusal of a legacy custom `mountRoot` in `host.json` are specified
+in [01a_apfs.md](./01a_apfs.md#stable-workspace-mount-root). The one supported access alias is an operator-created
+symlink at a preferred path pointing to the canonical root; every mount stays at the canonical path. The root holds only
 mountpoint directories (empty when detached) and is plain per-user directories on Data; nothing is written inside any
-checkout, so no Git exclusion is required for them. Changing the root requires every workspace detached and is refused
-otherwise.
+checkout, so no Git exclusion is required for them.
 
 **Direct mount.** `main` mounts at the checkout's original path. Publication renames the original tree to
 `<root>.pre-cowshed`, recreates an empty directory as the mountpoint without any shell hook, and attaches there. The
@@ -242,18 +243,21 @@ path-conditional rule anchored at the original checkout would stop applying, and
 because the checkout's own resolved gitdir would already live inside the store. Identity must sit where the user's rules
 look for it; direct mount is the only faithful option.
 
-Git identity inheritance follows each `includeIf gitdir:` rule's anchor. Rules anchored at an ancestor shared by both
-the checkout and the mount root (for example `gitdir:<checkouts>/` when checkouts live in `<checkouts>` and the root is
-`<checkouts>/.cowshed`) match workspaces with zero additional configuration — the expected setup. Rules anchored exactly
-at a project root do not reach into the mount root; cowshed surfaces that divergence instead of letting identities
-silently drift: `cowshed setup` (every adopted checkout, after a repair and after `--mount-root`) and `cowshed doctor`
-(the current project) run `git config --list --show-origin` in the checkout and in a throwaway probe repository under
-the mount root, and any config file included only in the checkout is reported by name with the pattern that would
-restore it. The repository's own config travels with every clone, so a file it includes by a relative path inside the
-repository (`include.path = ../tooling/workspace.gitconfig`, which Git lists as `.git/../tooling/workspace.gitconfig`)
-resolves in each clone and is never reported; a relative include that climbs out of the repository lands elsewhere for a
-mount and is. The answer depends only on the host's git configuration and the mount root, never on a workspace, so
-`fork` does not repeat it.
+Git identity inheritance follows each `includeIf gitdir:` rule's anchor. Cowshed's probe and workspace jobs use the
+canonical mount path (01_storage.md, "Directory layout"), so rules must cover it and not rely on a symlink alias of the
+root; a rule anchored only at the alias is not reliable. A rule anchored at an ancestor of both the checkout and the
+canonical root matches workspaces with no further configuration: on Linux `gitdir:~/` covers checkouts under HOME and
+`~/.cowshed/mnt` alike, while the macOS root lies outside HOME and needs a rule that names
+`/private/var/folders/cowshed/<uid>/mnt/` or an ancestor of it. Rules anchored exactly at a project root do not reach
+into the mount root; cowshed surfaces that divergence instead of letting identities silently drift: `cowshed setup`
+(every adopted checkout, after a repair) and `cowshed doctor` (the current project) run
+`git config --list --show-origin` in the checkout and in a throwaway probe repository under the mount root, and any
+config file included only in the checkout is reported by name with the pattern that would restore it. The repository's
+own config travels with every clone, so a file it includes by a relative path inside the repository
+(`include.path = ../tooling/workspace.gitconfig`, which Git lists as `.git/../tooling/workspace.gitconfig`) resolves in
+each clone and is never reported; a relative include that climbs out of the repository lands elsewhere for a mount and
+is. The answer depends only on the host's git configuration and the fixed mount root, never on a workspace, so `fork`
+does not repeat it.
 
 Linked Git worktrees share their primary checkout's config. Managed shell setup retains that primary checkout's
 repo-relative `tooling/workspace.gitconfig` include; it never retargets the shared config to the linked caller's foreign

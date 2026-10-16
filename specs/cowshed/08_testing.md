@@ -283,15 +283,19 @@ foreign orphan is excluded and that an owned helper whose user client disappeare
 census remains a doctor/host-limit observation, never this fixture's acceptance oracle.
 
 The manual macOS example `cargo run -p cowshed-cli --example stable_mount_root -- <new-receipt-directory>` exercises
-setup's production mount-root authorization transaction, then the real CLI parser/dispatcher and APFS controller on an
-isolated scratch host: adopt, doctor, fork, rm, doctor. It requires operator approval and a quiet native-fixture window,
-rather than a skipped test or an administrator prompt in ordinary CI. The fresh fixture selects and persists the default
-through `HostConfig`; existing live host configuration is checked byte-for-byte and never changed. No installed daemon
-is replaced. It records actual directory ownership/modes, four-class kernel censuses, mount/device mappings, registry
-IDs, and the running mds process's rights before fork, after publication, and after rm. Growth in any departed-object
-class fails the proof; retained raw records permit per-image attribution when another host process interferes. Teardown
-releases only this fixture's images and refuses to delete a remaining mount. Passing this example proves fresh
-stable-root placement, not migration of an already-configured host or repair of historical leaked objects.
+setup's production fixed-root authorization transaction, then the production APFS backend directly: it mounts a scratch
+image beneath the fixed root, reads a payload written there back through a preferred-path symlink that points to the
+canonical root, and detaches the image. No CLI parser, project controller or gateway runs: the controller's no-follow
+validation refuses a symlink beneath a fixture store, so the alias lives in the receipt directory. The fixture persists
+no host configuration; the root under test is the one `HostConfig` derives, and existing live host configuration is
+checked byte-for-byte and never changed. The example requires operator approval and a quiet native-fixture window,
+rather than a skipped test or an administrator prompt in ordinary CI. It records the provisioned directories' actual
+ownership/modes and, before mount, while mounted and after detach, four-class kernel censuses, mount/device mappings,
+registry IDs, and the running mds process's PID and rights. Growth in any departed-object class, or an mds restart,
+fails the proof; retained raw records permit per-image attribution when another host process interferes. Teardown
+releases only this fixture's images and refuses to delete a remaining mount. Passing this example proves fixed-root
+placement and preferred-path alias reads for a production-backend mount, not a CLI lifecycle, operator migration of a
+retired custom root or repair of historical leaked objects.
 
 Lifecycle integration that does not assert a physical-volume property uses the same project controller and lifecycle
 executor with `DirectoryExecutionHost`. Its workspaces and build volumes are real directory payloads, cloned through the

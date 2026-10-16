@@ -377,13 +377,13 @@ gets no `main` remote (nothing to fetch from); and refuses `cowshed checkpoint` 
 history lives outside its image. Each refusal names the command that resolves it (02).
 
 `--slot <n>` (on `cowshed fork`) mounts the workspace at a stable, recycled path
-(`<mount-root>/<owner>/<repo>/slot@<n>`) instead of a name-derived one. The host root defaults to
-`/private/var/folders/cowshed/<uid>/mnt` on macOS and `~/.cowshed/mnt` on Linux; an existing configured root is
-unchanged (01a_apfs.md, "Stable workspace mount root"). `owner` and `repo` are the separately validated and encoded
-components of the primary `repo_id`, never an unsplit path value. Successive workspaces in the same slot inherit each
-other's **path-keyed** cache warmth (Xcode DerivedData, and whatever a build records by absolute path; cargo's own
-fingerprints are package-relative and need no slot) — opt-in, because it trades workspace-path uniqueness for warmth and
-only one workspace may hold a slot at a time (exit 4 if occupied).
+(`<mount-root>/<owner>/<repo>/slot@<n>`) instead of a name-derived one. The host root is fixed, derived and never
+configured: `/private/var/folders/cowshed/<uid>/mnt` on macOS and `~/.cowshed/mnt` on Linux (01a_apfs.md, "Stable
+workspace mount root"). `owner` and `repo` are the separately validated and encoded components of the primary `repo_id`,
+never an unsplit path value. Successive workspaces in the same slot inherit each other's **path-keyed** cache warmth
+(Xcode DerivedData, and whatever a build records by absolute path; cargo's own fingerprints are package-relative and
+need no slot) — opt-in, because it trades workspace-path uniqueness for warmth and only one workspace may hold a slot at
+a time (exit 4 if occupied).
 
 ## Self-driving conventions
 

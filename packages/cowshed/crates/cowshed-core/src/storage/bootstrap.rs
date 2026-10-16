@@ -17,14 +17,14 @@ use cowshed_os::process::fmt_command_failure;
 use super::fstab::FstabPin;
 
 pub mod native;
+#[cfg(target_os = "macos")]
+pub use native::execute_mount_root_provisioning;
 pub use native::{
     CachesVolume, FstabOutcome, HostAction, HostActionOutcome, HostActionResult, HostSetupPlan,
     HostSetupReport, HostUninstallPlan, UninstallFstabOutcome, UninstallReport,
     UninstallServiceOutcome, VolumeOutcome, VolumeState, execute_host_setup,
     execute_host_uninstall, plan_host_setup, plan_host_uninstall,
 };
-#[cfg(target_os = "macos")]
-pub use native::{execute_mount_root_provisioning, plan_mount_root_provisioning};
 
 pub const VOLUME_MARKER_FILE: &str = ".cowshed-volume.json";
 pub const APFS_STORE_VOLUME: &str = "cowshed.store";

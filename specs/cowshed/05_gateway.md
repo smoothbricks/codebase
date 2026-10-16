@@ -167,9 +167,9 @@ themselves; an installed build with no record — installed before records exist
 `cowshed setup --downgrade` from this build installs it anyway". `setup` reports it once for the gateway and the CLI,
 repairs everything else, and exits non-zero with that `Conflict`; `gateway start` refuses before it installs anything.
 `setup --downgrade` installs the invoking build anyway, and is valid only for a run that installs: not with
-`--uninstall`, `--force` or `--mount-root`. An unreadable installed record is `Integrity`. This exists because twice a
-`cowshed setup` run through a launcher that resolved to a stale checkout build put back a gateway without a landed
-feature, and nothing said so.
+`--uninstall` or `--force`. An unreadable installed record is `Integrity`. This exists because twice a `cowshed setup`
+run through a launcher that resolved to a stale checkout build put back a gateway without a landed feature, and nothing
+said so.
 
 **Uninstall.** `setup --uninstall` and `gateway stop --purge` remove, after the agent is gone, the stable name first (so
 nothing launchd could start dangles), then every stored copy with its `.build` record, and every `cowshed` on `PATH`

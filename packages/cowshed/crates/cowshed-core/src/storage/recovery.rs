@@ -1221,8 +1221,8 @@ impl RepositoryIdentityIntent {
                 )));
             }
         }
-        // `<mount-root>/<owner>/<repo>` on both sides, so the shared grandparent is the configured
-        // mount root itself.
+        // `<mount-root>/<owner>/<repo>` on both sides, so the shared grandparent is the fixed
+        // per-user mount root itself.
         if self.old_mount_root.parent().and_then(Path::parent)
             != self.new_mount_root.parent().and_then(Path::parent)
         {

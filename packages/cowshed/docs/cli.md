@@ -35,7 +35,7 @@ The JSON envelope is uniform:
 
 ```
 $ cowshed fork raven --json
-{"ok":true,"result":{"workspace":"raven","mount":"<project-root>/.cowshed/raven","baseCommit":"6f3a2c1"}}
+{"ok":true,"result":{"workspace":"raven","mount":"<mount-root>/<owner>/<repo>/raven","baseCommit":"6f3a2c1"}}
 
 $ cowshed path nonesuch --json
 {"ok":false,"error":{"code":"not-found",
@@ -73,7 +73,7 @@ repairs an adopted identity with `cowshed mv main --repo-id`.
 
 ## Lifecycle
 
-### `cowshed setup [--uninstall] [--force] [--mount-root <dir>] [--downgrade]`
+### `cowshed setup [--uninstall] [--force] [--downgrade]`
 
 Idempotent host repair, runnable from any directory and needing no repository: its subject is the machine. It creates an
 absent store volume, remounts a detached or mis-mounted one at its canonical path, FileVault-encrypts an unencrypted
@@ -106,8 +106,8 @@ Release builds record the commit they were built from. Setup refuses to replace 
 older commit, or with one that records no commit (it cannot show it is not older), naming the binary it would have
 installed and both builds; it repairs everything else, prints the reason and the remedy, and exits non-zero with a
 `conflict`. An installed cowshed that records nothing — installed before builds recorded their commit — never blocks an
-install. `--downgrade` installs the invoking build anyway; it is refused with `--uninstall`, `--force` and
-`--mount-root`, which install nothing.
+install. `--downgrade` installs the invoking build anyway; it is refused with `--uninstall` and `--force`, which install
+nothing.
 
 The commands that change a workspace or run work in one — `adopt`, `fork`, `mv`, `checkpoint`, `restore`, `path`,
 `exec`, `grant`, `rm`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`, `gc`, `push`, `rebase`, `land` — first
@@ -124,27 +124,39 @@ next: run `cowshed setup` from the cowshed you mean to use: it installs that bui
 `disk-command`, `--version` and `--help` do not ask: `doctor` diagnoses the disagreement, and `setup` ends it. No daemon
 answering is not a disagreement.
 
-`--mount-root <dir>` sets the one host session workspace mount root. Fresh macOS setup defaults to
-`/private/var/folders/cowshed/<uid>/mnt`, using the invoking numeric UID; Linux retains `~/.cowshed/mnt`. Sessions mount
-at `<mount-root>/<owner>/<repo>/<ws>`. Setup provisions the stable macOS prefix as root:wheel 0755 and its UID/mnt
-directories as the invoking user, 0700, through the existing single privileged approval; it reports the path and refuses
-symlinks, non-directories and foreign ownership.
+Setup provisions the one fixed session workspace mount root. It takes no mount-root option and `host.json` holds no
+mount-root setting: the root is derived from the invoking user, `/private/var/folders/cowshed/<uid>/mnt` on macOS, where
+`<uid>` is that user's numeric UID, and `~/.cowshed/mnt` on Linux. Sessions mount at `<mount-root>/<owner>/<repo>/<ws>`.
+Setup creates the stable macOS prefix as root:wheel 0755 and its `<uid>` and `mnt` directories as the invoking user,
+0700, through the existing single privileged approval. It creates what is missing, reports the path, and refuses a
+symlink, a non-directory or a foreign owner rather than writing through it. The fixed physical path avoids Spotlight's
+media-reference acquisition before indexing policy is considered; it is not a temporary `T` directory or a
+daemon-restart workaround. See [APFS mount-root policy](../../../specs/cowshed/01a_apfs.md#stable-workspace-mount-root).
 
-Existing explicit or legacy root configuration is preserved, and existing workspaces are never moved by an upgrade. The
-root can change only while no sessions are attached; otherwise setup names them and refuses. To switch an existing host
-at that maintenance boundary, run `cowshed setup --mount-root /private/var/folders/cowshed/$(id -u)/mnt`. Stdout is the
-configured root. The path must be absolute. The stable canonical path avoids Spotlight's media-reference acquisition
-before indexing policy is considered; it is not a temporary `T` directory or a daemon-restart workaround. See
-[APFS mount-root policy](../../../specs/cowshed/01a_apfs.md#stable-workspace-mount-root).
+To reach workspaces through a path of your choosing, create a symlink at that path pointing to the canonical root, for
+example `ln -s /private/var/folders/cowshed/$(id -u)/mnt ~/workspaces` (on Linux, point it at `~/.cowshed/mnt`). The
+canonical root stays a real directory and is never replaced by a link to another location: the kernel-resolved physical
+mount path is what Spotlight's mds admits, so mounting through an indexed directory would defeat the policy.
 
-After a repair, and after `--mount-root`, setup probes git identity for every adopted checkout: it runs
-`git config --list --show-origin` in the checkout and in a throwaway repository under the mount root
-(`<mount-root>/<owner>/<repo>/`), then diffs the observed origins. A config file included only in the checkout is
-reported on stderr, prefixed with its project, by name with the `includeIf` condition that pulled it in, plus the
-remedy: add a pattern covering the mount root. A file the repository's own config includes by a relative path inside the
+A `host.json` written by an earlier build can record a custom `mountRoot`. Reading it is refused, naming the file, the
+recorded root and the required fixed root; the value is neither ignored nor rewritten, and nothing is attached at the
+new path. There is no automatic live migration: no mount is moved, and no backing image has to move. At a maintenance
+boundary, use the previous installed build to stop the workspace jobs and daemons and to detach every session and build
+volume at the old root, resolve any busy holders (Spotlight included), and audit path-bearing detached metadata and
+sandbox grants before reattaching. Only then remove the `mountRoot` key from `/private/cowshed/store/host.json`, keeping
+its credential routes and mode 0600, and run the new build's ordinary `cowshed setup`. A `mountRoot` already equal to
+the fixed root is harmless to read and is dropped the next time the configuration is saved.
+
+After a repair, setup probes git identity for every adopted checkout: it runs `git config --list --show-origin` in the
+checkout and in a throwaway repository under the mount root (`<mount-root>/<owner>/<repo>/`), then diffs the observed
+origins. A config file included only in the checkout is reported on stderr, prefixed with its project, by name with the
+`includeIf` condition that pulled it in, plus the remedy: add a pattern covering the canonical mount root, such as
+`[includeIf "gitdir:/private/var/folders/cowshed/<uid>/mnt/"]` on macOS. Git identity rules must cover the canonical
+mount path and not rely on a symlink alias: the probe and workspace jobs use canonical paths, so a pattern anchored only
+at the preferred path is not reliable. A file the repository's own config includes by a relative path inside the
 repository (`include.path = ../tooling/workspace.gitconfig`) travels with every clone and is not reported.
 `cowshed doctor` reports the same finding for the current project. `fork` does not probe: the answer depends only on
-your git configuration and the mount root.
+your git configuration and the fixed mount root.
 
 Anything that can escalate happens inside one authorization session, and **the exact intent for every volume is printed
 before the dialog appears** — name, UUID, size, and where it is going. When the plan creates and deletes nothing, that
@@ -482,7 +494,7 @@ workspace name, state, branch, mountpoint (empty when detached).
 ```
 $ cowshed ls
 main   mounted   main           <project-root>
-raven  mounted   cowshed/raven  <project-root>/.cowshed/raven
+raven  mounted   cowshed/raven  <mount-root>/<owner>/<repo>/raven
 fox    detached  cowshed/fox
 ```
 
@@ -495,7 +507,7 @@ first column and keeps projects contiguous:
 ```
 $ cowshed ls --all
 acme/api  main   mounted  main           ~/src/api
-acme/api  raven  mounted  cowshed/raven  ~/src/api/.cowshed/raven
+acme/api  raven  mounted  cowshed/raven  <mount-root>/acme/api/raven
 acme/web  main   mounted  main           ~/src/web
 ```
 
@@ -510,8 +522,8 @@ path is always live; pass `--no-attach` to skip the remount and get the would-be
 ### `cowshed path --slot <n>` — build slots and compiler-cache reuse
 
 A **build slot** is one stable mount path, occupied by one workspace at a time. `cowshed fork <ws> --slot 3` binds slot
-3, and that workspace mounts at `<project-root>/.cowshed/slot-3` instead of `.../<name>`. When it is removed or renamed
-the slot is released, and the next workspace to take slot 3 mounts at exactly the same absolute path.
+3, and that workspace mounts at `<mount-root>/<owner>/<repo>/slot@3` instead of `.../<name>`. When it is removed or
+renamed the slot is released, and the next workspace to take slot 3 mounts at exactly the same absolute path.
 
 Path identity was once the entire feature, because both halves of the compiler cache keyed on absolute paths. Neither
 does any more:
@@ -891,7 +903,7 @@ next: cowshed exec raven -- <retry your command>
   policy root, or a credential-bearing hard-deny is rejected before the grants file changes.
 - Grants are recorded in `<image>.grants.json`, **outside the volume** — a sandboxed process cannot edit its own grants.
 - A path is recorded under its resolved spelling; `grant` says so when that differs from what was typed. A symlink
-  planted beside the workspace mount so `../<name>` resolves (`<shed>/<org>/<project>/<name>` pointing at a sibling
+  planted beside the workspace mount so `../<name>` resolves (`<mount-root>/<owner>/<repo>/<name>` pointing at a sibling
   repository) sits inside the mount-root deny, and the profile carves the link back as a readable literal exactly when
   its target is granted — grant the target, and the workspace reaches it through the link.
 - Filesystem grants take effect at the next `exec`: Seatbelt profiles are fixed at process launch, and every launch
@@ -1094,19 +1106,19 @@ control socket is healthy. The generated mode-0600 plist names `~/Library/Applic
 `RunAtLoad`, `KeepAlive`, and stable pre-tracer stderr at `~/Library/Logs/cowshed/daemon-stderr.log`. That path is on
 the volume carrying `~/Library/LaunchAgents` itself, so launchd can still reach the program after a reboot. It is the
 stable name of the installed cowshed: a symbolic link to `cowshed-<sha256>` beside it, a content-addressed copy of a
-build. `start` installs the running executable the way
-[`cowshed setup`](#cowshed-setup---uninstall---force---mount-root-dir---downgrade) does — copying it in when no stored
-copy holds its bytes, whatever volume it came from, and moving the link to it in one rename — but leaves the `cowshed`
-on your `PATH` alone. A build inside a workspace or the nix store is copied rather than refused — the copy is precisely
-what makes the agent independent of a path that only exists once cowshed has mounted it. A debug build is refused, and
-so is a build of an older commit than the installed one (or one that records no commit), before anything is installed;
-`start` has no `--downgrade`, which is `setup`'s. A failed activation puts the previous build back. `stop` boots out the
-agent and removes the plist, leaving the installed cowshed — host state rather than agent state, and keeping it makes
-the next `start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it too — the stable name,
-every stored copy and its build record, and the `cowshed` links on your `PATH` that name the stable name — for a host
-that is done with the gateway rather than pausing it; `cowshed setup --uninstall` removes the system storage daemon,
-both user agents, the installed cowshed with its `PATH` links and sccache's nix GC root at once. All of these are
-idempotent, and a `--purge` with nothing installed says so rather than failing.
+build. `start` installs the running executable the way [`cowshed setup`](#cowshed-setup---uninstall---force---downgrade)
+does — copying it in when no stored copy holds its bytes, whatever volume it came from, and moving the link to it in one
+rename — but leaves the `cowshed` on your `PATH` alone. A build inside a workspace or the nix store is copied rather
+than refused — the copy is precisely what makes the agent independent of a path that only exists once cowshed has
+mounted it. A debug build is refused, and so is a build of an older commit than the installed one (or one that records
+no commit), before anything is installed; `start` has no `--downgrade`, which is `setup`'s. A failed activation puts the
+previous build back. `stop` boots out the agent and removes the plist, leaving the installed cowshed — host state rather
+than agent state, and keeping it makes the next `start` a plist write instead of a fresh multi-megabyte copy.
+`stop --purge` deletes it too — the stable name, every stored copy and its build record, and the `cowshed` links on your
+`PATH` that name the stable name — for a host that is done with the gateway rather than pausing it;
+`cowshed setup --uninstall` removes the system storage daemon, both user agents, the installed cowshed with its `PATH`
+links and sccache's nix GC root at once. All of these are idempotent, and a `--purge` with nothing installed says so
+rather than failing.
 
 `status` and `doctor` call the gateway healthy only when the daemon runs the same bytes as the CLI asking; a daemon
 running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
@@ -1318,11 +1330,10 @@ the cargo `[env]` guidance); the Seatbelt profile admits exactly that socket and
 daemon-write-only. `sccache --show-stats` works from any shell with the export set — it speaks to the same server.
 
 A client with no export set at all is `cowshed setup`'s business rather than this verb's: it reads sccache's own config
-file, which `setup` writes and owns (see
-[`cowshed setup`](#cowshed-setup---uninstall---force---mount-root-dir---downgrade) above). `sccache --show-stats` run
-from such a shell — no `SCCACHE_DIR`, no `SCCACHE_CONF`, outside every workspace — is the check that the file took
-effect: `Cache location` must read `Local disk: "<your home>/Library/Caches/Mozilla.sccache"`. It reports the resolved
-configuration without starting a server, so it is safe to run against a live host.
+file, which `setup` writes and owns (see [`cowshed setup`](#cowshed-setup---uninstall---force---downgrade) above).
+`sccache --show-stats` run from such a shell — no `SCCACHE_DIR`, no `SCCACHE_CONF`, outside every workspace — is the
+check that the file took effect: `Cache location` must read `Local disk: "<your home>/Library/Caches/Mozilla.sccache"`.
+It reports the resolved configuration without starting a server, so it is safe to run against a live host.
 
 ### `cowshed controller`
 

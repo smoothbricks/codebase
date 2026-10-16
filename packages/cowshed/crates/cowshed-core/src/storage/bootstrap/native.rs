@@ -21,7 +21,7 @@ pub use shared::{
 pub use macos::{
     bootstrap_system_storage, execute_host_setup, execute_host_uninstall,
     execute_mount_root_provisioning, plan_host_setup, plan_host_uninstall,
-    plan_mount_root_provisioning, validate_existing_host_storage,
+    validate_existing_host_storage,
 };
 
 #[cfg(not(target_os = "macos"))]

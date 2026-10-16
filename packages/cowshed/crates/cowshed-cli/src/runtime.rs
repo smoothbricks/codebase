@@ -40,7 +40,9 @@ use cowshed_core::storage::bootstrap::{
     RETIRED_CACHES_MOUNTPOINT, VOLUME_MARKER_FILE, ValidatedHostStorage, VolumeRole, VolumeState,
     execute_host_setup, plan_host_setup,
 };
-use cowshed_core::storage::host_config::{RETIRED_LAYOUT_HINT, retired_layout_paths};
+use cowshed_core::storage::host_config::{
+    RETIRED_LAYOUT_HINT, RetiredLayoutRecord, retired_layout_paths,
+};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, repair_workspace_record_sequences};
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
 use cowshed_core::storage::{StorageLayout, discover_session_images};
@@ -2983,9 +2985,8 @@ fn dirent_is_plain_dir(entry: &fs::DirEntry) -> bool {
 }
 
 fn git_identity_findings(bridge: &ActorBridge) -> Result<Vec<Finding>> {
-    let layout = StorageLayout::new(bridge.store_root()?, bridge.repo_id()?).map_err(|error| {
-        CowshedError::environment_missing(error.to_string(), "cowshed setup --mount-root <dir>")
-    })?;
+    let layout = StorageLayout::new(bridge.store_root()?, bridge.repo_id()?)
+        .map_err(|error| CowshedError::environment_missing(error.to_string(), "cowshed setup"))?;
     let gaps = probe::probe_project(bridge.git_root()?, &layout)?;
     let mount_root = &layout.project().host_mount_root;
     Ok(gaps.iter().map(|gap| gap.finding(mount_root)).collect())
@@ -4096,18 +4097,21 @@ fn no_adopted_checkout_finding(repo: &RepoId, store_root: &Path) -> Finding {
     }
 }
 
+/// One detached-metadata record naming a path under the retired `<store>/mnt` layout. An error,
+/// not advice: the record has to be audited against the fixed workspace root before reattachment.
+fn retired_layout_finding(record: RetiredLayoutRecord) -> Finding {
+    Finding {
+        code: "retired-mount-layout".into(),
+        severity: FindingSeverity::Error,
+        message: record.doctor_message(),
+        hint: RETIRED_LAYOUT_HINT.into(),
+        path: Some(record.metadata_path),
+    }
+}
+
 fn retired_mount_layout_findings(store_root: &Path) -> Vec<Finding> {
     match retired_layout_paths(store_root) {
-        Ok(records) => records
-            .into_iter()
-            .map(|record| Finding {
-                code: "retired-mount-layout".into(),
-                severity: FindingSeverity::Error,
-                message: record.doctor_message(),
-                hint: RETIRED_LAYOUT_HINT.into(),
-                path: Some(record.metadata_path),
-            })
-            .collect(),
+        Ok(records) => records.into_iter().map(retired_layout_finding).collect(),
         Err(error) => vec![Finding {
             code: "retired-mount-layout-scan".into(),
             severity: FindingSeverity::Error,
@@ -6722,45 +6726,36 @@ mod tests {
         );
     }
 
+    /// Detached metadata that still records a path under the retired layout is a critical finding.
+    /// The record's own sentence and metadata path travel unchanged, the hint is the audit step,
+    /// and no setup option is named: the root is fixed, so there is none to run.
     #[test]
     fn retired_mount_metadata_is_a_critical_host_doctor_finding() {
-        use cowshed_core::storage::host_config::{
-            execute_mount_root_change, plan_mount_root_change,
+        let record = RetiredLayoutRecord {
+            metadata_path: PathBuf::from(
+                "/private/cowshed/store/acme/widget/sessions/raven.dmg.grants.json",
+            ),
+            recorded_path: PathBuf::from("/private/cowshed/store/mnt/acme/widget/raven"),
         };
 
-        let root = std::env::temp_dir().join(format!(
-            "cowshed-retired-layout-doctor-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = root.join("store");
-        let project = bind_test_repository(&store, "acme/widget");
-        let metadata = project.join("sessions/raven.dmg.grants.json");
-        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
-        let plan = plan_mount_root_change(&store, &root.join("configured-mount-root"), []).unwrap();
-        execute_mount_root_change(&plan).unwrap();
-        let recorded = store.join("mnt/acme/widget/raven");
-        std::fs::write(
-            &metadata,
-            serde_json::to_vec(&serde_json::json!({ "write": [recorded] })).unwrap(),
-        )
-        .unwrap();
+        let finding = retired_layout_finding(record.clone());
 
-        let findings = retired_mount_layout_findings(&store);
-        assert_eq!(findings.len(), 1);
-        let finding = &findings[0];
         assert_eq!(finding.code, "retired-mount-layout");
         assert_eq!(finding.severity, FindingSeverity::Error);
+        assert_eq!(finding.message, record.doctor_message());
         assert!(
             finding
                 .message
-                .contains("recorded under retired layout, run cowshed setup --mount-root <dir>")
+                .contains("/private/cowshed/store/mnt/acme/widget/raven")
         );
         assert_eq!(finding.hint, RETIRED_LAYOUT_HINT);
-        assert_eq!(finding.path.as_deref(), Some(metadata.as_path()));
-        assert!(!doctor_report(findings).healthy);
-
-        std::fs::remove_dir_all(root).unwrap();
+        assert!(!finding.message.contains("--mount-root"));
+        assert!(!finding.hint.contains("--mount-root"));
+        assert_eq!(
+            finding.path.as_deref(),
+            Some(record.metadata_path.as_path())
+        );
+        assert!(!doctor_report(vec![finding]).healthy);
     }
 
     #[test]
@@ -6807,28 +6802,6 @@ mod tests {
         assert!(conflict.message.contains("acme/widget"));
 
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    fn bind_test_repository(store: &Path, repo_id: &str) -> PathBuf {
-        let repo_id =
-            cowshed_core::repository::RepoId::parse(repo_id).expect("repository identity");
-        let paths = cowshed_core::storage::StorageLayout::new(store, &repo_id)
-            .expect("project paths")
-            .project()
-            .clone();
-        std::fs::create_dir_all(&paths.project_root).expect("project root");
-        let binding = cowshed_core::repository::RepositoryBinding::new(vec![
-            cowshed_core::repository::BoundIdentity {
-                repo_id,
-                remote_name: None,
-                remote_url: None,
-                primary: true,
-            },
-        ])
-        .expect("repository binding");
-        cowshed_core::metadata::write_json(&paths.repository_binding, &binding)
-            .expect("binding file");
-        paths.project_root
     }
 
     fn write_session_image(

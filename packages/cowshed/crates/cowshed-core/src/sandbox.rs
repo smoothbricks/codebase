@@ -877,9 +877,8 @@ pub fn seatbelt_profile(
     for path in &write_grants {
         push_subpath_rule(&mut profile, "allow file-read* file-write*", path)?;
     }
-    // The machine-global evidence layer and the host-configured mount tree are separate protected
-    // roots. The latter may live anywhere on Data, so it must keep its own deny rather than relying
-    // on the fixed `/private/cowshed` boundary.
+    // The machine-global evidence layer and the fixed per-user mount tree are separate protected
+    // roots. The mount tree needs its own deny, outside the `/private/cowshed` boundary.
     push_subpath_rule(&mut profile, "deny file-read* file-write*", cowshed)?;
     push_subpath_rule(
         &mut profile,
@@ -1015,7 +1014,7 @@ pub fn seatbelt_profile(
         push_exact_and_subpath_rule(&mut profile, "deny file-read* file-write*", deny.as_ref())?;
     }
 
-    // After every deny that would otherwise close it: the configured mount-root deny covers
+    // After every deny that would otherwise close it: the mount-root deny covers
     // main under the symlink layout, and policy denies the project root under direct mount. The
     // carve-back is narrowed to `.git`, never main's working tree, which stays as unreachable as
     // any sibling workspace.

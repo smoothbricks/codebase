@@ -3536,7 +3536,7 @@ fn retired_image_path(
     ))
 }
 
-/// Main mounts at the user's checkout path; every other workspace under the host-configured
+/// Main mounts at the user's checkout path; every other workspace under the fixed per-user
 /// `<mount-root>/<owner>/<repo>/`.
 fn mount_point(
     config: &ApfsSubstrateConfig,

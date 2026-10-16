@@ -6719,7 +6719,6 @@ mod tests {
     fn forming_re_adoption_fences_staging_gc_without_a_prefix_waiver() {
         use crate::storage::StorageLayout;
         use crate::storage::apfs::ApfsExecutionHost;
-        use crate::storage::host_config::HostConfig;
         use crate::storage::recovery::{
             LifecycleIntentCompletion, LifecycleIntentJournal, STAGING_NAMESPACE,
             re_adopt_tests::Fixture,
@@ -6728,11 +6727,6 @@ mod tests {
 
         let fixture = Fixture::new();
         let repo = RepoId::parse("acme/widget").unwrap();
-        let mount_root = fixture.checkout.parent().unwrap().join("mounts");
-        HostConfig::new(&mount_root)
-            .unwrap()
-            .save(fixture.store())
-            .unwrap();
         let storage = StorageLayout::new(fixture.store(), &repo).unwrap();
         let staging = storage.project().mount_root.join(STAGING_NAMESPACE);
         let fixture = fixture.with_staging(staging.clone());
