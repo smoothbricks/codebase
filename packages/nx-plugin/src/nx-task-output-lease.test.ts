@@ -9,6 +9,11 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { runtimeInput } from './runtime-input.js';
 import { bindListener } from './testing.js';
 
+interface ProbeEvent {
+  readonly promise: Promise<URL>;
+  resolve(value: URL): void;
+}
+
 const repoRoot = join(import.meta.dir, '../../..');
 const nx = join(repoRoot, 'node_modules/.bin/nx');
 const binary = Buffer.from([0xff, 0xfe, 0x80, 0, 42]);
@@ -52,7 +57,7 @@ DbCache.prototype.put = async function(task, ...args) {
 
 it('leases a target across clients through producer completion, cache capture and restore', async () => {
   await withNxFixture('nx-task-output-lease-', async ({ workspace, socketDirectory }) => {
-    const observed = new Map<string, PromiseWithResolvers<URL>>();
+    const observed = new Map<string, ProbeEvent>();
     const events: string[] = [];
     const signal = (name: string) => {
       let event = observed.get(name);
@@ -387,7 +392,9 @@ SharedRunningTask.prototype.waitForTaskToFinish = async function(...args) {
       expect(entered.size).toBe(2);
       expect(producerEvent.searchParams.get('client')).not.toBe(sharedEvent.searchParams.get('client'));
       expect(events.filter((event) => event.startsWith('/started:'))).toHaveLength(1);
-      expect(await readFile(join(workspace, 'app/dist/pid'), 'utf8')).toBe(producerEvent.searchParams.get('pid'));
+      const producerPid = producerEvent.searchParams.get('pid');
+      if (producerPid === null) throw new Error(`continuous producer omitted its pid: ${producerEvent}`);
+      expect(await readFile(join(workspace, 'app/dist/pid'), 'utf8')).toBe(producerPid);
       finish.resolve();
       const results = await guardEvent(
         Promise.all([first, second]),
