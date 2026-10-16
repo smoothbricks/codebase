@@ -899,9 +899,10 @@ A workspace's daemon executes the project-graph plugins of the workspace's check
 only inside the sandbox, and Nx 23.2.1 has no setting that makes a client connect to a live daemon without ever starting
 one. A workspace's supervisor therefore keeps that daemon alive itself. At start, and every 5 s while it admits jobs, it
 probes the record: present, its process alive, its socket accepting. When the probe fails it runs
-`<project>/node_modules/.bin/nx daemon --start` as an ordinary read-write background job, at most one at a time, and
-reports a start that failed on its own stderr; the next probe tries again. The daemon runs detached, in its own process
-group inside that job's sandbox, and a host client in the workspace finds it live through the shared record and connects
+`node <project>/node_modules/nx/dist/src/daemon/server/start.js` as one ordinary read-write background maintenance job,
+at most one at a time. The foreground process stays owned by that job's real birth and group and keeps its shared
+build-volume hold for its lifetime (16_build_volumes.md, "The Nx daemon stays on"). A failed start is reported on the
+supervisor's stderr; the next probe tries again. A host client finds the daemon through the shared record and connects
 to it instead of starting one outside the sandbox. Main's supervisor keeps no daemon: main is the operator's checkout,
 and its daemon is the host's. A fork deletes the record from the build volume; a land deletes the landing workspace's
 and gives the adopted volume the target's record of a live unsandboxed daemon in its place (16_build_volumes.md). A

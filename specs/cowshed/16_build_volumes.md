@@ -403,6 +403,14 @@ than any count. Fork step 2 decides, under the target's image lock:
    Both at the same tree: the target ran tasks on the adopted volume after its land.
 
 A skip names each holder and leaves the seed as it was: the fork is colder, never wrong, and the next fork tries again.
+
+A foreground keeper is an admitted holder. While it holds the source volume, fork takes this busy-skip cold-seed path;
+it does not stop the keeper, bypass its hold, or wait synchronously for its release. The warm path becomes reachable
+after the keeper's ordinary release, and a subsequent fork can then refresh the seed and hit the latest run. Waiting
+outside fork for normal idle release can cost the keeper's remaining five-minute idle lifetime; continued use can extend
+it. A bounded test cannot replace this distinction with a real five-minute wait under the unchanged 180s no-progress
+limit (08_testing.md).
+
 `cowshed doctor` reports seed age only for main and live fork sources (workspaces with dependants), not every leaf. It
 compares the image modification times, never tool-file statistics. `seed-tree-behind` names the seed's tree and the
 target's `HEAD^{tree}` (and the number of commits since a matching tree when available); `target-moved-outside-land`
@@ -410,14 +418,15 @@ names both recorded volume trees when neither equals HEAD. A next fork tries tre
 fast-forward performs no carry, output restoration or adoption.
 
 - **Enforced by**: a real-APFS test in which main runs an Nx task after adopting a landed volume and a fork reseeds main
-  and hits that task; a real-APFS test in which a fork of a shed reseeds it while the shed's daemon keeper runs and hits
-  the shed's latest run; a real-APFS test in which main's branch moves externally to the tree of a workspace whose
-  volume holds a marker output, a fork of main at that tree inherits the marker without building, the same fork with no
-  candidate lacks it, and a candidate whose tree moved is refused with the old seed kept; a real-APFS land whose landing
-  volume a host process holds a file of open, which keeps main's previous seed, still adopts with every checked Nx
-  output restored from cache, and whose next fork after the holder exits refreezes the seed at the landed tree; unit
-  tests of the nearness order; real Cargo build-script rendezvous tests for both an existing profile and a profile
-  created after quiescence and lock enumeration; and the sealed-source holder and attachment-exclusion tests.
+  and hits that task; a keeper-held fork that reports a busy skip, keeps the existing seed and takes the cold path,
+  paired with the no-keeper warm-fork hit oracle; a real-APFS test in which main's branch moves externally to the tree
+  of a workspace whose volume holds a marker output, a fork of main at that tree inherits the marker without building,
+  the same fork with no candidate lacks it, and a candidate whose tree moved is refused with the old seed kept; a
+  real-APFS land whose landing volume a host process holds a file of open, which keeps main's previous seed, still
+  adopts with every checked Nx output restored from cache, and whose next fork after the holder exits refreezes the seed
+  at the landed tree; unit tests of the nearness order; real Cargo build-script rendezvous tests for both an existing
+  profile and a profile created after quiescence and lock enumeration; and the sealed-source holder and
+  attachment-exclusion tests.
 - **Freshness boundary enforced by**: real APFS capture without a job write remains Fresh without tolerance; actual job
   admission is refused during canonical restore, both by a direct capture's exclusive claim and a land's retained
   stopped socket lease; an admitted shell job after admission reopens writes bytes absent from the seed and makes it
