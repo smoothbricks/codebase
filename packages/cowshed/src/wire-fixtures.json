@@ -2086,6 +2086,26 @@
       "targetBranch": "main",
       "targetWasCheckedOut": false
     },
+    "landingDaemonUnverifiable": {
+      "buildVolume": {
+        "adoption": {
+          "kind": "skipped",
+          "reason": {
+            "kind": "landingDaemonUnverifiable",
+            "reason": "the daemon record is unreadable; no signal was sent",
+            "record": "/fixture/Dev/widget/.nx/workspace-data/d/server-process.json"
+          }
+        },
+        "seed": {
+          "kind": "unchanged"
+        }
+      },
+      "kind": "landed",
+      "landedHead": "1111111111111111111111111111111111111111",
+      "retired": false,
+      "targetBranch": "main",
+      "targetWasCheckedOut": false
+    },
     "landingOpening": {
       "buildVolume": {
         "adoption": {
@@ -2106,49 +2126,6 @@
         }
       },
       "kind": "landed",
-      "landedHead": "1111111111111111111111111111111111111111",
-      "retired": false,
-      "targetBranch": "main",
-      "targetWasCheckedOut": false
-    },
-    "landingDaemonUnverifiable": {
-      "buildVolume": {
-        "adoption": {
-          "kind": "skipped",
-          "reason": {
-            "kind": "landingDaemonUnverifiable",
-            "reason": "the daemon record is unreadable; no signal was sent",
-            "record": "/fixture/Dev/widget/.nx/workspace-data/d/server-process.json"
-          }
-        },
-        "seed": {
-          "kind": "unchanged"
-        }
-      },
-      "landedHead": "1111111111111111111111111111111111111111",
-      "retired": false,
-      "targetBranch": "main",
-      "targetWasCheckedOut": false
-    },
-    "landingOpening": {
-      "buildVolume": {
-        "adoption": {
-          "kind": "skipped",
-          "reason": {
-            "database": "/build/nx/workspace-data/tasks.db",
-            "holders": [
-              {
-                "command": "node nx build widget",
-                "pid": 4443
-              }
-            ],
-            "kind": "landingOpening"
-          }
-        },
-        "seed": {
-          "kind": "unchanged"
-        }
-      },
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
       "targetBranch": "main",

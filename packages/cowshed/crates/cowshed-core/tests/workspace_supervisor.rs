@@ -3712,6 +3712,7 @@ async fn sealed_reads_preserve_unread_history_without_hiding_readable_jobs() {
             config.authority.grant_revision,
             &request(StdinSource::Empty).command,
             None,
+            JobScheduling::default(),
         )
         .unwrap();
     store
@@ -3783,7 +3784,12 @@ async fn sealed_reads_preserve_unread_history_without_hiding_readable_jobs() {
     // own state answers: NotFound with no admission refusal, on the direct and socket paths alike.
     let admitted = resumed
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = resumed.spawned.recv().await.unwrap();
@@ -6493,6 +6499,8 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
         child: std::process::Child,
         process: OwnedProcess,
         job: JobId,
+        /// The nice the spawn was asked for, standing in for the one a real spawn observes.
+        nice: i32,
         events: mpsc::Sender<ProcessEvent>,
         reaped: mpsc::UnboundedSender<std::process::ExitStatus>,
         reported: bool,
@@ -6519,6 +6527,7 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                 child,
                 process,
                 job: request.job_id,
+                nice: request.cpu.nice,
                 events,
                 reaped: self.reaped.clone(),
                 reported: false,
@@ -6529,6 +6538,10 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
     impl RunningProcess for HeldGroup {
         fn process(&self) -> Option<&OwnedProcess> {
             Some(&self.process)
+        }
+
+        fn nice(&self) -> Option<i32> {
+            Some(self.nice)
         }
 
         #[cfg(target_os = "macos")]
@@ -6650,6 +6663,7 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                         cwd: None,
                         ..request(StdinSource::Empty)
                     },
+                    AdmissionSource::Worker,
                 )
                 .await
                 .unwrap();
@@ -6687,7 +6701,12 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
             );
             assert_eq!(
                 handle
-                    .exec(None, None, request(StdinSource::Empty))
+                    .exec(
+                        None,
+                        None,
+                        request(StdinSource::Empty),
+                        AdmissionSource::Worker,
+                    )
                     .await
                     .unwrap_err()
                     .code,
@@ -7980,7 +7999,11 @@ async fn a_host_gate_records_only_public_environment_without_restricting_executi
                 .any(|window| window == PRIVATE.as_bytes())
         );
         first.handle.quiesce().await.unwrap();
-        first.handle.retire().await.unwrap();
+        first
+            .handle
+            .retire(NxDaemonRetirement::Recorded)
+            .await
+            .unwrap();
         drop(first);
         let mut second = real_store_harness(config);
         assert_eq!(
