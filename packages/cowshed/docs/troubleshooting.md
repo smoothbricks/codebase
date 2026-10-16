@@ -7,6 +7,10 @@ is the truth.
 
 ## Mounts
 
+**A setup mount probe runs out of budget or cannot start.** Its error preserves the named command, admission/execute
+budget and actual termination outcome. An admission wait, spawn failure or child deadline is not proof that Disk
+Arbitration is wedged. Setup propagates that failure; it does not signal or restart a system daemon on that evidence.
+
 **Workspace missing after reboot.** Mounts don't survive reboots; images do. Reattach explicitly:
 
 ```sh

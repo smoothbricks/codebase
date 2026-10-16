@@ -50,7 +50,6 @@ use cowshed_os::fsio::AnchoredDirectory;
 
 const DISKUTIL_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const DISKUTIL_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
-const KILLALL: &str = "/usr/bin/killall";
 const MKDIR: &str = "/bin/mkdir";
 const RM: &str = "/bin/rm";
 const RMDIR: &str = "/bin/rmdir";
@@ -136,11 +135,7 @@ impl BootstrapHost for SystemBootstrapHost {
         ensure_supported_host()?;
         if is_diskutil_mount(command) {
             let device = command.args().last().expect("mount argv carries a device");
-            arbitration_probe(device).map_err(|_| {
-                HostError::new(
-                    "disk arbitration daemon did not answer within 5s; it is wedged and needs a restart (cowshed setup performs this)",
-                )
-            })?;
+            arbitration_probe(device)?;
             return run_disk_tool(command, DISKUTIL_MOUNT_DEADLINE);
         }
         if command.program() == DISKUTIL {
@@ -248,17 +243,9 @@ impl BootstrapHost for AuthorizedBootstrapHost {
     fn run_command(&self, command: &HostCommand) -> Result<HostCommandOutput, HostError> {
         if is_diskutil_mount(command) {
             let device = command.args().last().expect("mount argv carries a device");
-            if arbitration_probe(device).is_err() {
-                // The daemon is wedged. Restart it through the already-open authorization
-                // session (killall needs root; launchd respawns it on demand), wait out the
-                // respawn, and prove responsiveness before re-attempting the mount.
-                let restart = HostCommand::new(KILLALL, ["diskarbitrationd"]);
-                self.session()?.execute(&restart)?;
-                std::thread::sleep(Duration::from_secs(3));
-                arbitration_probe(device).map_err(|_| {
-                    HostError::new("disk arbitration daemon remained unresponsive after a restart")
-                })?;
-            }
+            // Admission and execution share the probe's budget. Failure is evidence about
+            // that owned command, never authority to signal a system daemon.
+            arbitration_probe(device)?;
         }
         if [DISKUTIL, INSTALL, LAUNCHCTL, RM, SECURITY].contains(&command.program()) {
             return self.session()?.execute(command);
@@ -8226,9 +8213,9 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         );
     }
 
-    /// The bootstrap's own disk-tool calls go through the shared runner: an answering child
-    /// completes, and an ordinary one past its deadline is killed and reported as an
-    /// unresponsive disk arbitration daemon.
+    /// Bootstrap preserves the shared runner's actual outcome. A total deadline may expire
+    /// during admission before execution, or after a child starts and is reaped; neither
+    /// outcome proves that Disk Arbitration is wedged.
     #[test]
     fn run_disk_tool_completes_when_the_child_answers() {
         let output = run_disk_tool(
@@ -8240,7 +8227,21 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     }
 
     #[test]
-    fn run_disk_tool_reports_unresponsiveness_and_kills_the_child() {
+    fn a_mount_probe_refusal_preserves_command_evidence_without_guessing_a_restart() {
+        // NUL cannot be passed to exec, so this reaches the real consumer without running
+        // diskutil, touching a mount, requesting authorization or signalling any daemon.
+        let error = SystemBootstrapHost
+            .run_command(&HostCommand::new(DISKUTIL, ["mount", "invalid\0device"]))
+            .expect_err("the probe cannot execute its native argv");
+        let message = error.to_string();
+        assert!(message.contains("diskutil"), "{message}");
+        assert!(!message.contains("unresponsive"), "{message}");
+        assert!(!message.contains("wedged"), "{message}");
+        assert!(!message.contains("restart"), "{message}");
+    }
+
+    #[test]
+    fn run_disk_tool_preserves_its_total_deadline_without_inventing_daemon_failure() {
         let started = std::time::Instant::now();
         let error = run_disk_tool(
             &HostCommand::new("/bin/sleep", ["30"]),
@@ -8248,7 +8249,17 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
         )
         .expect_err("deadline");
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(error.to_string().contains("unresponsive"), "{error}");
+        assert_eq!(error.kind, crate::storage::bootstrap::HostErrorKind::Other);
+        let message = error.to_string();
+        assert!(
+            message.contains("produced no result within 250ms"),
+            "{message}"
+        );
+        assert!(
+            message.contains("child reaped with") || message.contains("no disk tool was started"),
+            "{message}"
+        );
+        assert!(!message.contains("arbitration"), "{message}");
     }
 }
 
