@@ -1143,7 +1143,8 @@ The native lifecycle walk also observes its real working-directory census throug
 retaining start/end times and the original error's exit code, signal and killed flag before rethrowing it unchanged.
 This locates whether a census was outstanding at a case timeout without substituting a fake process inventory. Its real
 host-command delegate records the same timestamps from case entry, retaining the actual argv, requested deadline and
-result without changing them; this covers the work before the first process census.
+result without changing them; this covers the work before the first process census. Observation before delegation is
+timed separately from the delegate's wait, so logging cost is never presented as child execution time.
 
 Whatever still works in a lease when its task ends is a leak, and is stopped before the lease goes. The usual one is a
 fixture's Nx daemon: Nx detaches it into a session of its own, so the process-group kill that ends a timed-out command
