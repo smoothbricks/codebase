@@ -55,6 +55,7 @@ async fn serve(arguments: &[OsString]) -> Result<()> {
     let runtime = ProjectRuntime::open_existing(
         PathBuf::from(project),
         RecoveryScope::Workspaces(std::collections::BTreeSet::from([workspace.clone()])),
+        crate::gateway_service::runtime_control,
     )
     .await?;
     let served = runtime.serve_supervisor(&workspace).await;

@@ -7,31 +7,23 @@
 //! this process, exactly as any verb opens it, and the embedder speaks the controller protocol to
 //! it over the inherited socket, as `Cowshed::connect` and the N-API `coordinatorEndpoint` do.
 //!
-//! The one thing a verb does around the router that the router does not do itself is reconcile
-//! the project's gateway sessions before work that needs them (05_gateway.md "Control plane"). The
-//! CLI does that before `exec` and a checked `land`; this verb does it before the calls those
-//! commands make, so an embedder's jobs meet the gateway state a CLI user's would.
+//! Gateway reconciliation belongs to Core work admission after route and live-incarnation
+//! fences (05_gateway.md "Control plane"). This relay forwards both worker and coordinator
+//! execution unchanged; it performs no preflight effects before Core authorizes the request.
 
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
-use std::sync::Arc;
 
-use cowshed_core::api::EmptyResult;
-use cowshed_core::api::operations::{self, OperationRequest, SlotRequest};
 use cowshed_core::api::server::{
     ConnectionAuthority, RouterCommand, RouterHandle, serve_controller_connection,
 };
-use cowshed_core::metadata::WorkspaceName;
-use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
-use cowshed_core::{CowshedError, Result, ValidatedHostStorage};
+use cowshed_core::{CowshedError, Result};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-
-use crate::gateway_service;
 
 /// How many calls wait between the connection and the relay; the connection itself holds at most
 /// 64 open, so this is never the bound a caller meets.
@@ -96,24 +88,20 @@ pub fn take_inherited_socket() -> Result<OwnedFd> {
 /// Serve one coordinator connection for the project at `project_root` on `socket` until its peer
 /// closes it, then shut the project down.
 pub async fn serve(project_root: &Path, socket: OwnedFd) -> Result<()> {
-    // The controller finishes only `main`'s unfinished lifecycle work on open: residue another
-    // workspace left belongs to `gc` or to the verb that names it, and must not delay or fail the
-    // controller every workspace is waiting on.
+    // Only this controller's selected recovery runs during open; workspace requests are fenced
+    // by the Core actor before its job path reconciles any gateway state.
     let runtime = ProjectRuntime::open_existing(
         project_root,
         RecoveryScope::Workspaces(std::collections::BTreeSet::new()),
+        crate::gateway_service::runtime_control,
     )
     .await?;
-    let repo_id = runtime.descriptor().repo_id.clone();
-    let storage = Arc::new(runtime.descriptor().storage.clone());
     let authority = ConnectionAuthority::Coordinator {
-        repo_id: repo_id.clone(),
+        repo_id: runtime.descriptor().repo_id.clone(),
     };
     let (router, calls) = RouterHandle::channel(RELAY_CAPACITY);
-    let relay = tokio::spawn(relay(calls, runtime.router(), repo_id, storage));
+    let relay = tokio::spawn(relay(calls, runtime.router()));
     let served = serve_controller_connection(socket, authority, router).await;
-    // The connection held every sender; with it gone the relay ends, abandoning what the peer
-    // left unanswered just as the connection did.
     let relayed = relay
         .await
         .map_err(|error| CowshedError::internal(format!("the controller relay failed: {error}")));
@@ -121,20 +109,15 @@ pub async fn serve(project_root: &Path, socket: OwnedFd) -> Result<()> {
     served.and(relayed).and(shutdown)
 }
 
-/// Hand each call to the project's router as it arrives, each on a task of its own so a job wait
-/// never holds the calls behind it.
-async fn relay(
-    mut calls: mpsc::Receiver<RouterCommand>,
-    router: RouterHandle,
-    repo_id: RepoId,
-    storage: Arc<ValidatedHostStorage>,
-) {
+/// Forward calls independently so a job wait never holds the calls behind it. Core owns
+/// admission and gateway preparation for both decoded execution routes.
+async fn relay(mut calls: mpsc::Receiver<RouterCommand>, router: RouterHandle) {
     let mut open = JoinSet::new();
     loop {
         tokio::select! {
             call = calls.recv() => match call {
                 Some(call) => {
-                    open.spawn(answer(call, router.clone(), repo_id.clone(), Arc::clone(&storage)));
+                    open.spawn(answer(call, router.clone()));
                 }
                 None => return,
             },
@@ -147,68 +130,10 @@ async fn relay(
     }
 }
 
-struct RouterPortSlotAssigner<'a> {
-    router: &'a RouterHandle,
-    repo_id: &'a RepoId,
-}
-
-#[async_trait::async_trait]
-impl gateway_service::PortSlotAssigner for RouterPortSlotAssigner<'_> {
-    async fn assign_port_slot(&self, workspace: &str, slot: u32) -> Result<()> {
-        let workspace = WorkspaceName::new(workspace).map_err(|error| {
-            CowshedError::usage(error.to_string(), "use a valid cowshed workspace name")
-        })?;
-        self.router
-            .call::<operations::CoordinatorAssignSlot>(
-                ConnectionAuthority::Coordinator {
-                    repo_id: self.repo_id.clone(),
-                },
-                SlotRequest {
-                    repo_id: self.repo_id.clone(),
-                    workspace,
-                    slot,
-                },
-            )
-            .await
-            .map(|EmptyResult {}| ())
-    }
-}
-
-async fn answer(
-    call: RouterCommand,
-    router: RouterHandle,
-    repo_id: RepoId,
-    storage: Arc<ValidatedHostStorage>,
-) {
+async fn answer(call: RouterCommand, router: RouterHandle) {
     let (request, reply) = call.into_parts();
-    let response = async {
-        if needs_gateway(request.operation()) {
-            let assigner = RouterPortSlotAssigner {
-                router: &router,
-                repo_id: &repo_id,
-            };
-            gateway_service::reconcile_native_project(&repo_id, &storage, &assigner).await?;
-        }
-        let (authority, operation, upload, steps) = request.into_parts();
-        router.route(authority, operation, upload, steps).await
-    }
-    .await;
+    let (authority, operation, upload, steps) = request.into_parts();
+    let response = router.route(authority, operation, upload, steps).await;
     // A peer that has gone away no longer wants the answer; its connection already dropped it.
     let _ = reply.send(response);
-}
-
-/// The calls that start work in a workspace: an exec, a shell, and a land that runs checks. A land
-/// without checks runs nothing in the workspace, as `cowshed land` without `--check` does not.
-fn needs_gateway(operation: &OperationRequest) -> bool {
-    match operation {
-        OperationRequest::WorkerExec(_)
-        | OperationRequest::CoordinatorExec(_)
-        | OperationRequest::WorkerShell(_) => true,
-        OperationRequest::CoordinatorLand(request) => request
-            .options
-            .check
-            .as_ref()
-            .is_some_and(|checks| !checks.is_empty()),
-        _ => false,
-    }
 }

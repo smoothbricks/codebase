@@ -14,7 +14,14 @@ async fn native_dispatch_refuses_unsupported_host_before_opening_storage() {
         PathBuf::from("/tmp"),
         CanonicalRoots::at(PathBuf::from("/tmp/store")),
     );
-    match ProjectRuntime::open_for_adopt_at("/unused", None, storage).await {
+    match ProjectRuntime::open_for_adopt_at(
+        "/unused",
+        None,
+        storage,
+        cowshed_cli::gateway_service::runtime_control,
+    )
+    .await
+    {
         Err(error) => assert_eq!(error.code, ErrorCode::EnvironmentMissing),
         Ok(runtime) => {
             runtime.shutdown().await.expect("stop unexpected runtime");

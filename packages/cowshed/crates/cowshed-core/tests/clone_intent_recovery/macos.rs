@@ -25,6 +25,9 @@ use cowshed_core::{CowshedError, Result};
 use cowshed_os::fork_lock::Run as _;
 use serde_json::{Value, json};
 
+#[path = "../support/refusing_gateway.rs"]
+mod refusing_gateway;
+
 #[path = "../support/scratch_directory.rs"]
 mod scratch_directory;
 
@@ -73,6 +76,7 @@ impl Fixture {
             &self.checkout,
             Some(self.repo.clone()),
             self.storage.clone(),
+            refusing_gateway::connect,
         )
         .await
         .expect("open project runtime on the directory store");
@@ -102,6 +106,7 @@ impl Fixture {
             &self.checkout,
             RecoveryScope::Store,
             self.storage.clone(),
+            refusing_gateway::connect,
         )
         .await
         .expect("store-scope recovery opens the project")
@@ -114,6 +119,7 @@ impl Fixture {
             &self.checkout,
             RecoveryScope::Workspaces([name(workspace)].into()),
             self.storage.clone(),
+            refusing_gateway::connect,
         )
         .await
     }
@@ -124,6 +130,7 @@ impl Fixture {
             &self.checkout,
             RecoveryScope::Removal(name(workspace)),
             self.storage.clone(),
+            refusing_gateway::connect,
         )
         .await
     }
@@ -453,6 +460,122 @@ fn missing_revision() -> ForkOptions {
         ..ForkOptions::default()
     }
 }
+#[tokio::test]
+async fn cold_named_open_reads_selected_authority_and_preserves_full_diagnostics() {
+    use cowshed_core::metadata::sidecar_path;
+    let fixture = Fixture::new("cold-named-scope");
+    let runtime = fixture.adopt().await;
+    for workspace in ["selected", "broken"] {
+        fixture
+            .mint(&runtime, workspace, ForkOptions::default())
+            .await
+            .expect("publish fixture workspace");
+    }
+    runtime.shutdown().await.expect("stop initial controller");
+    let layout = fixture.layout();
+    let broken = layout
+        .canonical_image(&name("broken"))
+        .expect("broken image")
+        .image()
+        .to_owned();
+    let broken_sidecar = sidecar_path(&broken);
+    let original = fs::read(&broken_sidecar).expect("preserve broken fixture metadata");
+    let selected = layout
+        .canonical_image(&name("selected"))
+        .expect("selected image")
+        .image()
+        .to_owned();
+    let selected_sidecar = sidecar_path(&selected);
+    let selected_original =
+        fs::read(&selected_sidecar).expect("preserve selected fixture metadata");
+
+    for corrupt in [true, false] {
+        if corrupt {
+            fs::write(&broken_sidecar, b"{ broken sibling").unwrap();
+        } else {
+            fs::remove_file(&broken_sidecar).unwrap();
+        }
+        let named = fixture
+            .open_naming("selected")
+            .await
+            .expect("cold named open ignores a broken neighbour");
+        let view = fixture
+            .call(
+                &named,
+                "project.workspace",
+                json!({"repoId": fixture.repo, "workspace": "selected"}),
+            )
+            .await
+            .expect("selected authoritative snapshot");
+        assert_eq!(view["info"]["workspace"], "selected");
+        if corrupt {
+            assert!(
+                fixture
+                    .call(&named, "project.list", json!({"repoId": fixture.repo}))
+                    .await
+                    .is_err(),
+                "full inventory still reports malformed sibling authority"
+            );
+        }
+        named.shutdown().await.expect("stop selected controller");
+        let removing = fixture
+            .open_removing("selected")
+            .await
+            .expect("cold removal open has the same selected read scope");
+        removing.shutdown().await.expect("stop removal controller");
+
+        // A session-origin invocation is host-validated even when the command has not named a
+        // job. That one extra observation must not make the bad sibling a recovery dependency.
+        let mount = layout
+            .workspace_mount(&name("selected"))
+            .expect("selected mount");
+        let origin = ProjectRuntime::open_directory_existing_at(
+            &mount,
+            RecoveryScope::Workspaces(Default::default()),
+            fixture.storage.clone(),
+            refusing_gateway::connect,
+        )
+        .await
+        .expect("valid selected invocation origin is included in cold observations");
+        origin.shutdown().await.expect("stop origin controller");
+
+        if corrupt {
+            for scope in [RecoveryScope::Store, RecoveryScope::Inspect] {
+                match ProjectRuntime::open_directory_existing_at(
+                    &fixture.checkout,
+                    scope,
+                    fixture.storage.clone(),
+                    refusing_gateway::connect,
+                )
+                .await
+                {
+                    Err(_) => {}
+                    Ok(unexpected) => {
+                        unexpected
+                            .shutdown()
+                            .await
+                            .expect("stop unexpected full open");
+                        panic!("full Store/Inspect must retain malformed sibling diagnostics");
+                    }
+                }
+            }
+        }
+        fs::write(&broken_sidecar, &original).expect("restore sibling fixture metadata");
+    }
+    fs::write(&selected_sidecar, b"{ broken selected").unwrap();
+    match fixture.open_naming("selected").await {
+        Err(_) => {}
+        Ok(unexpected) => {
+            unexpected
+                .shutdown()
+                .await
+                .expect("stop unexpected selected open");
+            panic!("selected metadata corruption must still refuse");
+        }
+    }
+    fs::write(&selected_sidecar, selected_original).expect("restore selected fixture metadata");
+}
+
 #[tokio::test]
 async fn a_create_interrupted_after_its_pending_clone_exists_still_resumes() {
     // One adopted project proves both journal spellings (08_testing.md, "Host limit"): the

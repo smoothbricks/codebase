@@ -123,6 +123,18 @@ No mounts, no root, no network — pure functions with table-driven cases:
   expected workspace incarnation, source head, and destination ref head (including expected-missing). A mismatch is a
   `Conflict` that preserves the old destination exactly and leaves the source live; success reports one source object ID
   and a destination ref resolving to that exact ID. DTO goldens pin the Rust, JSON, N-API, and MCP spellings.
+- **Foreign-session isolation and atomic retirement**: directory-backed fixtures keep sibling grants missing or corrupt
+  while the selected workspace remains inspectable and reconciles without evicting sibling gateway sessions. The
+  controller admits and observes 100 live jobs while project enumeration refuses its foreign inventory fault. Retirement
+  interruption/retry fixtures require complete trash grants/CA authority at the image rename commit point and no
+  published canonical image whose grants are missing. The directory cutover also runs the real controller and gateway
+  with corrupt/missing sibling grants, named mount/marker fences and held-lock recovery, plus prepared-retirement retry
+  and post-commit recovery on directory payloads. Cold named and removal opens must ignore corrupt or missing sibling
+  sidecars, preserve session-origin validation, and still refuse selected corruption; full Store/Inspect opens and
+  project enumeration retain their malformed-inventory refusals. Ordinary worker and trusted Gate exec share the core
+  scoped preparation boundary. A fixture restarting a bare gateway explicitly restores project sessions through
+  maintenance before work; job admission never repairs port allocation. These witnesses acquire no physical disk-image
+  capability.
 - **MCP capability/auth codecs**: coordinator authority can be read only from the designated inherited FD/socketpair and
   never argv/environment/stderr; worker descriptors are 256-bit, 30-second, one-use, memory-only, atomic-consume,
   restart-invalidated, workspace/socket/peer-bound. Missing, expired, replayed, mismatched, or insufficient authority

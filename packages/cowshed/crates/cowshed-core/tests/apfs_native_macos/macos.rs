@@ -35,7 +35,7 @@ use cowshed_core::storage::apfs::{
 };
 use cowshed_core::storage::deletion_log::DELETION_LOG_FILE;
 use cowshed_core::storage::lifecycle::{
-    LifecycleFact, LifecycleWorkspace, OperationIdentity, Pin, RetiredRef, Revision,
+    LifecycleFact, LifecycleWorkspace, MountState, OperationIdentity, Pin, RetiredRef, Revision,
     StorageGcOptions, StorageGcReason, derive_workspaces,
 };
 use cowshed_core::storage::{CheckpointLabel, StorageLayout, StorageLayoutError};
@@ -1842,20 +1842,31 @@ fn retirement_moves_image_and_sidecar_atomically_and_reclaim_is_idempotent() {
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
     let canonical = layout.main_image().expect("canonical");
     create_image(canonical.image());
-    let trash = layout.project().sessions.join(".trash/main-retired.dmg");
+    let record = std::fs::read(sidecar_path(canonical.image())).expect("canonical record");
+    let key = std::fs::read(ca_key_path(canonical.image())).expect("canonical key");
+    let trash = layout
+        .project()
+        .sessions
+        .join(".trash/main-00000000000000000000000000000001.dmg");
     let host = native_host(&fixture, RecordingRunner::default());
 
     host.retire_image(canonical.image(), &trash)
         .expect("retire");
     assert!(!canonical.image().exists());
     assert!(!sidecar_path(canonical.image()).exists());
+    assert!(!ca_key_path(canonical.image()).exists());
     assert!(trash.exists());
-    assert!(sidecar_path(&trash).exists());
+    assert_eq!(
+        std::fs::read(sidecar_path(&trash)).expect("trash record"),
+        record
+    );
+    assert_eq!(std::fs::read(ca_key_path(&trash)).expect("trash key"), key);
 
     host.reclaim_image(&trash).expect("first reclaim");
     host.reclaim_image(&trash).expect("idempotent reclaim");
     assert!(!trash.exists());
     assert!(!sidecar_path(&trash).exists());
+    assert!(!ca_key_path(&trash).exists());
 }
 
 #[test]
@@ -7394,3 +7405,6 @@ mod build_mount_races {
         assert_eq!(mount_commands(&recorded), 1);
     }
 }
+
+#[path = "workspace_isolation.rs"]
+mod workspace_isolation;

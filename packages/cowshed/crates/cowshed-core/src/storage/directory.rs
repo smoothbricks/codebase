@@ -54,10 +54,10 @@ use super::apfs::native::{
     CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire, RESTORE_RECOVERY_FACT_VERSION,
     RestoreRecoveryFactWire, checkout_mountpoint_staging_path, checkpoint_fact_path,
     clone_lineage_from, directory_children, empty_mountpoint, grants_sidecar_missing, io_error,
-    metadata_workspace_ref, path_exists, pre_cowshed_path, read_dir_paths,
+    metadata_workspace_ref, path_exists, pre_cowshed_path, read_canonical_record, read_dir_paths,
     remove_checkout_staging_mountpoint, restore_adopted_checkout_paths, restore_recovery_fact,
-    restore_recovery_fact_path, swap_paths, sync_parent_path, warn_missing_session_sidecar,
-    warn_session_image_issue,
+    restore_recovery_fact_path, retire_payload, swap_paths, sync_parent_path,
+    warn_missing_session_sidecar, warn_session_image_issue, workspace_checkpoint_facts,
 };
 use super::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
@@ -65,9 +65,10 @@ use super::apfs::{
     companion_path, layout, main_aware_mount_point, volume_key,
 };
 use super::lifecycle::{
-    CheckpointFact, DefragmentOutcome, KernelMountFact, LifecycleFact, LifecycleWorkspace,
-    OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision, StorageFact, StorageGcOptions,
-    StorageGcPlan, StorageGcReport, SubstrateStats,
+    CheckpointFact, DefragmentOutcome, DerivedWorkspace, KernelMountFact, LifecycleFact,
+    LifecycleWorkspace, MountState, OperationIdentity, Pin, ResizeOutcome, RetiredRef, Revision,
+    StorageFact, StorageGcOptions, StorageGcPlan, StorageGcReport, SubstrateStats,
+    derive_workspaces,
 };
 use super::{
     CheckpointLabel, PRE_RESTORE_PREFIX, WORKSPACE_MARKER_PATH, discover_session_images,
@@ -641,17 +642,157 @@ impl DirectoryExecutionHost {
             .canonical_image(workspace)?
             .image()
             .to_owned();
-        if !path_exists(&image)? {
-            return Ok(None);
+        Ok(read_canonical_record(repo, workspace, &image)?.map(|metadata| (image, metadata)))
+    }
+
+    /// Read pending restores before any sibling sidecar is touched; global maintenance passes
+    /// `None`, while named opens pass their explicit observation selection.
+    pub(crate) fn pending_publications_for(
+        &self,
+        repo: &RepoId,
+        workspaces: Option<&BTreeSet<WorkspaceName>>,
+    ) -> Result<Vec<PendingPublicationFact>, ApfsStorageError> {
+        let storage = layout(&self.config, repo)?;
+        let pending_fact = |image: &Path, metadata: &DetachedWorkspaceMetadata| {
+            let fact = restore_recovery_fact(&self.config, image, metadata)?;
+            Ok::<_, ApfsStorageError>(PendingPublicationFact {
+                workspace: metadata_workspace_ref(metadata)?,
+                mount_point: self.expected_mount_point(metadata)?,
+                source_checkpoint: fact.source_checkpoint.to_string(),
+                source_incarnation: fact.source_incarnation,
+                replaced_incarnation: fact.replaced_incarnation,
+                destination_incarnation: fact.destination_incarnation,
+                image: image.to_owned(),
+            })
+        };
+        let mut pending = Vec::new();
+        let main = WorkspaceName::main();
+        if workspaces.is_none_or(|names| names.contains(&main))
+            && let Some((image, metadata)) = self.find_canonical_image(repo, &main)?
+            && metadata.publication_state == PublicationState::PendingFence
+            && path_exists(&restore_recovery_fact_path(&image))?
+        {
+            pending.push(pending_fact(&image, &metadata)?);
         }
-        let metadata = read_metadata(&image)?;
-        if metadata.repo_id != *repo || metadata.workspace != *workspace {
-            return Err(ApfsStorageError::Host(format!(
-                "detached metadata identity mismatch for {}",
-                image.display()
-            )));
+        let entries = match workspaces {
+            None => read_dir_paths(
+                &storage.project().sessions,
+                "enumerate pending session payloads",
+            )?,
+            Some(names) => names
+                .iter()
+                .filter(|name| !name.is_main())
+                .map(|name| {
+                    storage
+                        .canonical_image(name)
+                        .map(|image| image.image().to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        for discovered in discover_session_images(entries) {
+            if !path_exists(discovered.path())? {
+                continue;
+            }
+            if grants_sidecar_missing(discovered.path())? {
+                warn_missing_session_sidecar(discovered.path());
+                continue;
+            }
+            if !path_exists(&restore_recovery_fact_path(discovered.path()))? {
+                continue;
+            }
+            let metadata = read_metadata(discovered.path())?;
+            if metadata.publication_state != PublicationState::PendingFence {
+                continue;
+            }
+            if metadata.repo_id != *repo || metadata.workspace != *discovered.workspace() {
+                return Err(ApfsStorageError::Host(format!(
+                    "pending detached metadata identity mismatch for {}",
+                    discovered.path().display()
+                )));
+            }
+            pending.push(pending_fact(discovered.path(), &metadata)?);
         }
-        Ok(Some((image, metadata)))
+        Ok(pending)
+    }
+
+    /// Storage-only named observation, independent of all mount and checkpoint records.
+    pub fn canonical_metadata(
+        &self,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<DetachedWorkspaceMetadata>, ApfsStorageError> {
+        Ok(self
+            .find_canonical_image(repo, workspace)?
+            .map(|(_, metadata)| metadata))
+    }
+
+    /// Derive only this workspace from its canonical record, proven directory binding and checkpoints.
+    pub fn workspace_snapshot(
+        &self,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<(DerivedWorkspace, DetachedWorkspaceMetadata)>, ApfsStorageError> {
+        let storage = layout(&self.config, repo)?;
+        let image = storage.canonical_image(workspace)?.image().to_owned();
+        let mount_point = main_aware_mount_point(&self.config, repo, workspace)?;
+        let checkpoints = storage.project().checkpoints.join(workspace.as_str());
+        let published = || {
+            self.canonical_metadata(repo, workspace).map(|record| {
+                record.filter(|metadata| metadata.publication_state == PublicationState::Active)
+            })
+        };
+        loop {
+            let Some(metadata) = published()? else {
+                return Ok(None);
+            };
+            let derived = (|| {
+                let fact = StorageFact {
+                    workspace: metadata_workspace_ref(&metadata)?,
+                    volume_key: volume_key(repo, workspace),
+                };
+                let mut mounts = Vec::with_capacity(1);
+                if let Some(current) = observed_mount(&image)? {
+                    if current != mount_point
+                        || !self.marker_names(
+                            &current,
+                            repo,
+                            workspace,
+                            &metadata.workspace_incarnation,
+                        )
+                    {
+                        return Err(ApfsStorageError::Host(format!(
+                            "workspace mount identity mismatch: {} is mounted at {}, expected {} for {}/{} incarnation {}",
+                            image.display(),
+                            current.display(),
+                            mount_point.display(),
+                            repo,
+                            workspace,
+                            metadata.workspace_incarnation,
+                        )));
+                    }
+                    mounts.push(KernelMountFact {
+                        mount_id: binding_id(&image)?,
+                        volume_key: fact.volume_key.clone(),
+                    });
+                }
+                let mut checkpoint_facts = Vec::new();
+                workspace_checkpoint_facts(
+                    repo,
+                    workspace,
+                    Self::checkpoint_payloads(&checkpoints)?,
+                    &mut checkpoint_facts,
+                )?;
+                derive_workspaces([fact], mounts, checkpoint_facts)?
+                    .pop()
+                    .ok_or(ApfsStorageError::InvalidPlan(
+                        "one canonical record derived no workspace",
+                    ))
+            })();
+            if published()?.as_ref() != Some(&metadata) {
+                continue;
+            }
+            return derived.map(|derived| Some((derived, metadata)));
+        }
     }
 
     fn expected_mount_point(
@@ -706,13 +847,11 @@ impl DirectoryExecutionHost {
                     continue;
                 }
             }
-            let metadata = read_metadata(discovered.path())?;
-            if metadata.repo_id != *repo || metadata.workspace != *discovered.workspace() {
-                return Err(ApfsStorageError::Host(format!(
-                    "detached metadata identity mismatch for {}",
-                    discovered.path().display()
-                )));
-            }
+            let Some(metadata) =
+                read_canonical_record(repo, discovered.workspace(), discovered.path())?
+            else {
+                continue;
+            };
             if metadata.publication_state == PublicationState::PendingFence {
                 continue;
             }
@@ -886,27 +1025,6 @@ impl DirectoryExecutionHost {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_error("remove detached metadata", &sidecar, error)),
         }
-    }
-
-    fn rename_sidecar(
-        source_image: &Path,
-        destination_image: &Path,
-    ) -> Result<(), ApfsStorageError> {
-        let source = sidecar_path(source_image);
-        if !path_exists(&source)? {
-            return Ok(());
-        }
-        let destination = sidecar_path(destination_image);
-        ensure_parent(&destination)?;
-        if path_exists(&destination)? {
-            return Err(ApfsStorageError::Host(format!(
-                "metadata destination already exists: {}",
-                destination.display()
-            )));
-        }
-        fs::rename(&source, &destination)
-            .map_err(|error| io_error("rename detached metadata", &source, error))?;
-        sync_parent_path(&destination)
     }
 
     fn remove_companion(image: &Path) -> Result<(), ApfsStorageError> {
@@ -2057,32 +2175,11 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
     fn retire_image(&self, canonical: &Path, trash: &Path) -> Result<(), ApfsStorageError> {
         self.require_store_image(canonical)?;
         self.require_store_image(trash)?;
-        // The trash holds payloads, never mount records: the caller unmounts first.
+        // Retirement moves the payload, never its mounted binding record.
         require_home(canonical)?;
         ensure_parent(trash)?;
-        let canonical_companion = companion_path(canonical);
-        let trash_companion = companion_path(trash);
-        if path_exists(trash)? || path_exists(&trash_companion)? {
-            return Err(ApfsStorageError::Host(format!(
-                "retired payload artifacts already exist: {}",
-                trash.display()
-            )));
-        }
-        self.validate_staged_companion(&canonical_companion)?;
-        fs::rename(canonical, trash).map_err(|error| io_error("retire payload", trash, error))?;
-        let roll_back_payload = || {
-            fs::rename(trash, canonical)
-                .map_err(|error| io_error("roll back retirement", canonical, error))
-        };
-        if let Err(primary) = Self::rename_sidecar(canonical, trash) {
-            return combine_cleanup("retire payload", primary, roll_back_payload());
-        }
-        if let Err(error) = fs::rename(&canonical_companion, &trash_companion) {
-            let primary = io_error("retire CA key", &trash_companion, error);
-            let cleanup = Self::rename_sidecar(trash, canonical).and_then(|()| roll_back_payload());
-            return combine_cleanup("retire payload", primary, cleanup);
-        }
-        sync_parent_path(trash)
+        self.validate_staged_companion(&companion_path(canonical))?;
+        retire_payload(canonical, trash)
     }
 
     fn reclaim_image(&self, image: &Path) -> Result<(), ApfsStorageError> {
@@ -2148,52 +2245,17 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         &self,
         repo: &RepoId,
     ) -> Result<Vec<PendingPublicationFact>, ApfsStorageError> {
-        let storage = layout(&self.config, repo)?;
-        let pending_fact = |image: &Path, metadata: &DetachedWorkspaceMetadata| {
-            let fact = restore_recovery_fact(&self.config, image, metadata)?;
-            Ok::<_, ApfsStorageError>(PendingPublicationFact {
-                workspace: metadata_workspace_ref(metadata)?,
-                mount_point: self.expected_mount_point(metadata)?,
-                source_checkpoint: fact.source_checkpoint.to_string(),
-                source_incarnation: fact.source_incarnation,
-                replaced_incarnation: fact.replaced_incarnation,
-                destination_incarnation: fact.destination_incarnation,
-                image: image.to_owned(),
-            })
-        };
-        let mut pending = Vec::new();
-        if let Some((image, metadata)) = self.find_canonical_image(repo, &WorkspaceName::main())?
-            && metadata.publication_state == PublicationState::PendingFence
-            && path_exists(&restore_recovery_fact_path(&image))?
-        {
-            pending.push(pending_fact(&image, &metadata)?);
+        self.pending_publications_for(repo, None)
+    }
+
+    fn workspace_mount_state(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<MountState, ApfsStorageError> {
+        match self.workspace_snapshot(workspace.repo(), workspace.name())? {
+            Some((derived, _)) if derived.workspace == *workspace => Ok(derived.mount_state),
+            _ => Err(ApfsStorageError::InvalidPlan("workspace is not published")),
         }
-        let entries = read_dir_paths(
-            &storage.project().sessions,
-            "enumerate pending session payloads",
-        )?;
-        for discovered in discover_session_images(entries) {
-            if grants_sidecar_missing(discovered.path())? {
-                warn_missing_session_sidecar(discovered.path());
-                continue;
-            }
-            // A pending create or fork is resumed by its lifecycle intent, not here.
-            if !path_exists(&restore_recovery_fact_path(discovered.path()))? {
-                continue;
-            }
-            let metadata = read_metadata(discovered.path())?;
-            if metadata.publication_state != PublicationState::PendingFence {
-                continue;
-            }
-            if metadata.repo_id != *repo || metadata.workspace != *discovered.workspace() {
-                return Err(ApfsStorageError::Host(format!(
-                    "pending detached metadata identity mismatch for {}",
-                    discovered.path().display()
-                )));
-            }
-            pending.push(pending_fact(discovered.path(), &metadata)?);
-        }
-        Ok(pending)
     }
 
     /// Every published workspace mounted at its own mountpoint, whose tree carries its marker.
@@ -2251,31 +2313,12 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
             else {
                 continue;
             };
-            for image in Self::checkpoint_payloads(&workspace_directory)? {
-                let fact_path = checkpoint_fact_path(&image);
-                if !path_exists(&fact_path)? {
-                    continue;
-                }
-                let wire: CheckpointFactWire =
-                    crate::metadata::read_json(&fact_path).map_err(host_error)?;
-                if wire.version != CHECKPOINT_FACT_VERSION
-                    || wire.repo_id != *repo
-                    || wire.workspace != workspace_name
-                    || wire.label.as_str() != Self::checkpoint_label(&image)?
-                {
-                    return Err(ApfsStorageError::Host(format!(
-                        "checkpoint fact does not match payload path: {}",
-                        fact_path.display()
-                    )));
-                }
-                facts.push(CheckpointFact {
-                    repo: wire.repo_id,
-                    workspace: wire.workspace,
-                    label: wire.label,
-                    revision: Revision::new(wire.revision),
-                    pin: Pin::from(wire.pin),
-                });
-            }
+            workspace_checkpoint_facts(
+                repo,
+                &workspace_name,
+                Self::checkpoint_payloads(&workspace_directory)?,
+                &mut facts,
+            )?;
         }
         facts.sort_by(|left, right| {
             (&left.workspace, &left.label).cmp(&(&right.workspace, &right.label))

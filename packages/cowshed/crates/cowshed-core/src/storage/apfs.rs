@@ -690,6 +690,11 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         image: &Path,
     ) -> Result<(), ApfsStorageError>;
     fn list(&self, repo: &RepoId) -> Result<Vec<StorageFact>, ApfsStorageError>;
+    /// Revalidate one published workspace's identity and mount without reading sibling records.
+    fn workspace_mount_state(
+        &self,
+        workspace: &LifecycleWorkspace,
+    ) -> Result<MountState, ApfsStorageError>;
     fn pending_publications(
         &self,
         repo: &RepoId,
@@ -1741,8 +1746,8 @@ where
     }
 
     /// Reclaims a trash image whose grants sidecar is gone, under the lock of the name its
-    /// `<workspace>-<incarnation>` file name carries: a retirement holds that lock between moving
-    /// the image and moving its sidecar, so waiting on it means never deleting one mid-flight.
+    /// `<workspace>-<incarnation>` file name carries. Retirement holds that same lock while
+    /// preparing the complete trash record and committing its image, so collection cannot interleave.
     pub async fn reclaim_unrecorded_retired(
         &self,
         repo: &RepoId,
@@ -1860,18 +1865,8 @@ where
 
     async fn mount_state(&self, workspace: &LifecycleWorkspace) -> Result<MountState, Self::Error> {
         let workspace = workspace.clone();
-        self.dispatch_read(move |host, _| {
-            let storage = host.list(workspace.repo())?;
-            let mounts = host.mounts(workspace.repo())?;
-            let checkpoints = host.checkpoints(workspace.repo())?;
-            let derived = super::lifecycle::derive_workspaces(storage, mounts, checkpoints)?;
-            derived
-                .into_iter()
-                .find(|candidate| candidate.workspace == workspace)
-                .map(|candidate| candidate.mount_state)
-                .ok_or(ApfsStorageError::InvalidPlan("workspace is not published"))
-        })
-        .await
+        self.dispatch_read(move |host, _| host.workspace_mount_state(&workspace))
+            .await
     }
 
     async fn ensure_mounted(
@@ -1888,15 +1883,7 @@ where
         self.dispatch_with_locks(lock_paths, true, move |host, config| {
             let mount_point = mount_point(&config, &workspace)?;
             host.heal_mount(&workspace, &mount_point)?;
-            let storage = host.list(workspace.repo())?;
-            let mounts = host.mounts(workspace.repo())?;
-            let checkpoints = host.checkpoints(workspace.repo())?;
-            let derived = super::lifecycle::derive_workspaces(storage, mounts, checkpoints)?;
-            let state = derived
-                .into_iter()
-                .find(|candidate| candidate.workspace == workspace)
-                .map(|candidate| candidate.mount_state)
-                .ok_or(ApfsStorageError::InvalidPlan("workspace is not published"))?;
+            let state = host.workspace_mount_state(&workspace)?;
             if matches!(state, MountState::Mounted { .. }) {
                 host.validate_marker(&mount_point, &MarkerExpectation::owned(&config, &workspace))?;
                 host.ensure_linked_build_volume(&workspace, &mount_point)?;
@@ -3516,7 +3503,7 @@ pub(super) fn retired_image_below(
 
 /// Splits a `<name>-<incarnation>` trash stem: the exact inverse of the stem written by
 /// [`retired_image_below`], kept adjacent so neither side can change the separator alone.
-pub(super) fn split_retired_stem(stem: &str) -> Option<(WorkspaceName, WorkspaceIncarnation)> {
+pub(crate) fn split_retired_stem(stem: &str) -> Option<(WorkspaceName, WorkspaceIncarnation)> {
     let (name, incarnation) = stem.rsplit_once('-')?;
     Some((
         WorkspaceName::new(name).ok()?,

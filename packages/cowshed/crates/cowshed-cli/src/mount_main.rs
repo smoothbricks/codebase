@@ -207,6 +207,7 @@ impl MainMountBackend for NativeMainMountBackend {
                 &resolved.checkout_path,
                 cowshed_core::runtime::RecoveryScope::Workspaces(Default::default()),
                 self.storage.clone(),
+                crate::gateway_service::runtime_control,
             )
             .await?;
             runtime.shutdown().await?;

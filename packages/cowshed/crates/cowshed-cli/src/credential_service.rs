@@ -40,9 +40,12 @@ pub async fn dispatch<W: std::io::Write + Send, E: std::io::Write + Send>(
 ) -> Result<i32> {
     // Credentials are per project and name no workspace: the open finishes only `main`'s
     // unfinished lifecycle work, never another workspace's.
-    let runtime =
-        ProjectRuntime::open_existing(project_root, RecoveryScope::Workspaces(Default::default()))
-            .await?;
+    let runtime = ProjectRuntime::open_existing(
+        project_root,
+        RecoveryScope::Workspaces(Default::default()),
+        crate::gateway_service::runtime_control,
+    )
+    .await?;
     let repo_id = runtime.descriptor().repo_id.clone();
     let store_root = runtime.descriptor().storage.store().to_path_buf();
     match command {

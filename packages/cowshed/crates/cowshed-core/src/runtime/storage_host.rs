@@ -7,8 +7,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::build_volume::{BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, ReleaseClaim};
+use crate::metadata::{DetachedWorkspaceMetadata, WorkspaceName};
+use crate::repository::RepoId;
 use crate::storage::apfs::native::{BuildVolumeClaim, BuildVolumeRefusal, BuildVolumeRelease};
 use crate::storage::apfs::{ApfsExecutionHost, ApfsStorageError, Labelled};
+use crate::storage::lifecycle::DerivedWorkspace;
 use crate::storage::lifecycle::ResizeOutcome;
 use crate::storage::recovery::ReAdoptSource;
 use cowshed_apfs::image::ImageCapacity;
@@ -22,6 +25,23 @@ mod native;
 /// never a successful disk result. The capability flag keeps optional cosmetic labels and job
 /// volume sampling out of those backends; their resource samples report unconfigured volumes.
 pub(crate) trait RuntimeStorageHost: ApfsExecutionHost<LockGuard: Sync> {
+    fn canonical_metadata(
+        &self,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<DetachedWorkspaceMetadata>, ApfsStorageError>;
+    fn pending_publications_for(
+        &self,
+        repo: &RepoId,
+        workspaces: Option<&std::collections::BTreeSet<WorkspaceName>>,
+    ) -> Result<Vec<crate::storage::apfs::PendingPublicationFact>, ApfsStorageError>;
+
+    fn workspace_snapshot(
+        &self,
+        repo: &RepoId,
+        workspace: &WorkspaceName,
+    ) -> Result<Option<(DerivedWorkspace, DetachedWorkspaceMetadata)>, ApfsStorageError>;
+
     fn label_image_volume(&self, image: &Path, label: &str) -> Result<Labelled, ApfsStorageError>;
 
     fn create_build_volume(

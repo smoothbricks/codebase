@@ -26,12 +26,13 @@ use crate::repository::{
     CHECKPOINTS_DIRECTORY, EXEC_TEMP_DIRECTORY, QUARANTINE_DIRECTORY, RepoId, SESSIONS_DIRECTORY,
 };
 use crate::storage::apfs::native::{
-    CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire, QuarantineTombstone,
-    RESTORE_RECOVERY_FACT_VERSION, RestoreRecoveryFactWire, abandon_bundles, checkpoint_fact_path,
-    collect_project_directories, collect_restore_sidecars, directory_children,
-    gc_candidate_failure_is_fatal, grants_sidecar_missing, image_from_sidecar, io_error,
-    metadata_workspace_ref, path_exists, regular_file_children, restore_recovery_fact_path,
-    swap_paths, sync_parent_path, validate_restore_recovery_lineage, warn_session_image_issue,
+    CHECKPOINT_FACT_VERSION, CheckpointFactWire, CheckpointPinWire, HeldScope, QuarantineTombstone,
+    RESTORE_RECOVERY_FACT_VERSION, RestoreRecoveryFactWire, abandon_bundles,
+    canonical_recovery_sidecars, checkpoint_fact_path, collect_restore_sidecars,
+    directory_children, gc_candidate_failure_is_fatal, grants_sidecar_missing, image_from_sidecar,
+    io_error, metadata_workspace_ref, path_exists, regular_file_children,
+    restore_recovery_fact_path, swap_paths, sync_parent_path, validate_restore_recovery_lineage,
+    warn_session_image_issue,
 };
 use crate::storage::apfs::{
     ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, companion_path, layout,
@@ -335,10 +336,12 @@ impl DirectoryExecutionHost {
         config: &ApfsSubstrateConfig,
         held_locks: &[PathBuf],
     ) -> Result<(), ApfsStorageError> {
-        for project in collect_project_directories(&config.store_root)? {
-            self.recover_canonical_sidecars(config, &project, held_locks)?;
-            self.recover_staged_sidecars(config, &project, held_locks)?;
-            self.recover_restores(config, &project, held_locks)?;
+        for (project, workspaces) in HeldScope::of_held_locks(&config.store_root, held_locks)?
+            .projects(&config.store_root)?
+        {
+            self.recover_canonical_sidecars(config, &project, workspaces.as_ref(), held_locks)?;
+            self.recover_staged_sidecars(config, &project, workspaces.as_ref(), held_locks)?;
+            self.recover_restores(config, &project, workspaces.as_ref(), held_locks)?;
         }
         Ok(())
     }
@@ -347,11 +350,12 @@ impl DirectoryExecutionHost {
         &self,
         config: &ApfsSubstrateConfig,
         project: &Path,
+        workspaces: Option<&BTreeSet<WorkspaceName>>,
         held_locks: &[PathBuf],
     ) -> Result<(), ApfsStorageError> {
         let sessions = project.join(SESSIONS_DIRECTORY);
         for directory in [project, sessions.as_path()] {
-            for canonical_sidecar in regular_file_children(directory)? {
+            for canonical_sidecar in canonical_recovery_sidecars(directory, project, workspaces)? {
                 if !is_grants_sidecar(&canonical_sidecar) {
                     continue;
                 }
@@ -412,6 +416,7 @@ impl DirectoryExecutionHost {
         &self,
         config: &ApfsSubstrateConfig,
         project: &Path,
+        workspaces: Option<&BTreeSet<WorkspaceName>>,
         held_locks: &[PathBuf],
     ) -> Result<(), ApfsStorageError> {
         let staging = project.join(STAGING_NAMESPACE);
@@ -421,6 +426,15 @@ impl DirectoryExecutionHost {
             }
             let staged = image_from_sidecar(&path)?;
             if !is_image_path(&staged) {
+                continue;
+            }
+            if let Some(workspaces) = workspaces
+                && !staged
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(split_retired_stem)
+                    .is_some_and(|(workspace, _)| workspaces.contains(&workspace))
+            {
                 continue;
             }
             let metadata = read_metadata(&staged)?;
@@ -477,10 +491,11 @@ impl DirectoryExecutionHost {
         &self,
         config: &ApfsSubstrateConfig,
         project: &Path,
+        workspaces: Option<&BTreeSet<WorkspaceName>>,
         held_locks: &[PathBuf],
     ) -> Result<(), ApfsStorageError> {
         let mut undo_sidecars = Vec::new();
-        collect_restore_sidecars(project, &mut undo_sidecars)?;
+        collect_restore_sidecars(project, workspaces, &mut undo_sidecars)?;
         undo_sidecars.sort();
         for undo_sidecar in undo_sidecars {
             let undo = image_from_sidecar(&undo_sidecar)?;
