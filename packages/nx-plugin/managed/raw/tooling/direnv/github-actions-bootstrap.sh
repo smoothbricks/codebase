@@ -77,22 +77,28 @@ install_devenv() {
   # `nix profile remove --all` on a host would take the fleet's other roots with
   # it. SMOO_HOST_RUNNER comes from setup-devenv's runner-kind detection.
   #
-  # With none present these runners install from the FLOATING branch, not the
-  # locked rev, which is the one place this script deliberately accepts drift.
-  # The pin exists to make the ephemeral runners' cached devenv reproducible;
-  # a host installs into a long-lived shared profile whose blast radius is the
-  # whole fleet, and pinning it down to an older CLI than the fleet had been
-  # running broke it: run 34374650577 segfaulted the Rust linker
+  # With none present these runners install a devenv RELEASE, not the locked
+  # rev. The lock pin exists to make the ephemeral runners' cached devenv
+  # reproducible; a host installs into a long-lived shared profile whose blast
+  # radius is the whole fleet, and pinning it down to an older CLI than the
+  # fleet had been running broke it: run 34374650577 segfaulted the Rust linker
   # (devenv-rust-linker, clang exit 139) building cowshed-cli tests, where run
   # 34371205556 on the same commit range was green with floating 2a399e9.
   # 190959a is TWO COMMITS OLDER than what these hosts had been getting, so the
-  # pin was moving them backwards. A host's toolchain moves when its image or
-  # the lock moves, not when a repository decides to hold it back.
+  # pin was moving them backwards.
+  #
+  # Floating `github:cachix/devenv` (devenv's main) was no better: on
+  # 2026-10-16 main moved to a nix 2.35.2 that devenv.cachix.org does not
+  # serve, every host compiled 65 derivations, and nix-store-2.35.2 failed to
+  # build — CI went red fleet-wide with no commit here to bisect. A release
+  # tag fixes both: devenv.cachix.org pins every release from v2.0.4 on for
+  # good, so it always substitutes, and it moves only when this line does.
+  # Keep it at or above what the consuming locks name.
   if [ "${SMOO_HOST_RUNNER:-false}" = true ]; then
     if command -v devenv >/dev/null 2>&1; then
       echo "using host devenv: $(command -v devenv) ($(devenv version))"
     else
-      flake="${DEVENV_FLAKE:-github:cachix/devenv}"
+      flake="${DEVENV_FLAKE:-github:cachix/devenv/v2.4.0}"
       echo "host runner has no devenv; nix profile add ${flake}"
       nix profile add --accept-flake-config "$flake"
     fi
