@@ -969,8 +969,10 @@ function verifyInstalledBunLinks(root: string): BunInstallIntegrityError | undef
  * copy-on-write clone — is installed exactly when this one is. Besides the
  * stamp, the TypeScript API package must still resolve through its link, the
  * one package every managed repository installs, which catches a cache that
- * was pruned out from under node_modules. A dangling developer target, or a live link to Nx, also invalidates a
- * matching stamp, so the normal install replaces it: Nx is the lockfile's, and the install relinks it.
+ * was pruned out from under node_modules. The native compiler binary ttsc
+ * runs is witnessed the same way when the manifest declares it: a pruned
+ * restore that kept the stamp and the API package but lost that binary
+ * otherwise reads as current and no install ever repairs it. A dangling developer target, or a live link to Nx, also invalidates a
  *
  * Frozen: shell entry installs what bun.lock records and never rewrites it. An unfrozen install migrated a
  * repository's lockfile format and re-resolved its ranges, a lockfile diff nobody asked for. A manifest that needs a
@@ -983,6 +985,8 @@ function bunInstaller(inputs: readonly string[]): Installer {
     isCurrent: () =>
       stamp.isCurrent() &&
       findInstalledTypeScriptApiPackage(projectRoot) !== null &&
+      (!declaresNativeTypeScript(projectRoot) ||
+        existsSync(path.join(projectRoot, 'node_modules', '@typescript', 'native', 'bin', 'tsc'))) &&
       !hasStaleDeveloperLinks(projectRoot, ['nx']),
     install: async ({ quiet }) => {
       await keepDeveloperLinks(
@@ -1356,24 +1360,7 @@ function ensureTypeScriptApiPackage(root: string): void {
   }
 
   const nativeBin = path.join(root, 'node_modules', '@typescript', 'native', 'bin', 'tsc');
-  const rootPackageJson = path.join(root, 'package.json');
-  const declaresNative =
-    existsSync(rootPackageJson) &&
-    (() => {
-      try {
-        const pkg = JSON.parse(readFileSync(rootPackageJson, 'utf8')) as {
-          devDependencies?: Record<string, string>;
-          dependencies?: Record<string, string>;
-        };
-        return (
-          typeof pkg.devDependencies?.['@typescript/native'] === 'string' ||
-          typeof pkg.dependencies?.['@typescript/native'] === 'string'
-        );
-      } catch {
-        return false;
-      }
-    })();
-  if (declaresNative && !existsSync(nativeBin)) {
+  if (declaresNativeTypeScript(root) && !existsSync(nativeBin)) {
     throw new Error(
       `Missing ${nativeBin}. package.json declares @typescript/native but it is not installed. ` +
         'Run bun install (or direnv reload). @typescript/native is the TypeScript 7 native compiler for ttsc.',
@@ -1381,6 +1368,23 @@ function ensureTypeScriptApiPackage(root: string): void {
   }
 }
 
+/** Whether the root manifest declares the native compiler, in either dependency field. */
+function declaresNativeTypeScript(root: string): boolean {
+  const rootPackageJson = path.join(root, 'package.json');
+  if (!existsSync(rootPackageJson)) return false;
+  try {
+    const pkg = JSON.parse(readFileSync(rootPackageJson, 'utf8')) as {
+      devDependencies?: Record<string, string>;
+      dependencies?: Record<string, string>;
+    };
+    return (
+      typeof pkg.devDependencies?.['@typescript/native'] === 'string' ||
+      typeof pkg.dependencies?.['@typescript/native'] === 'string'
+    );
+  } catch {
+    return false;
+  }
+}
 function findInstalledTypeScriptApiPackage(root: string): string | null {
   const bunStore = path.join(root, 'node_modules', '.bun');
   if (!existsSync(bunStore)) {
