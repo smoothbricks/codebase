@@ -267,9 +267,9 @@ under that transaction. The ordinary worker cannot create or replace the receipt
 obtain backend write credentials. A changed head or failed, forged, missing, or foreign receipt refuses publication.
 Land without qualification reports it explicitly and does not publish.
 
-The publication control operation is deferred until a qualified production caller exists. The actor holds only a
-hash-scoped publication capability installed by an in-process caller. No production caller exists, so it is reachable
-only from tests until the qualified land caller lands; it does not itself verify a land plan or protected receipt.
+The public publication-control lane remains removed. The actor accepts only a hash-scoped capability installed by an
+in-process caller; it does not verify a land plan or protected receipt. Publication authority remains controller-owned,
+never a public workspace operation or a standing worker grant.
 
 The controller revokes the temporary authority on completion, refusal, cancellation, or interrupted land. It is not
 written to `.cowshed/env`, shell configuration, source, or a later job's environment. Main's adoption checks and every
