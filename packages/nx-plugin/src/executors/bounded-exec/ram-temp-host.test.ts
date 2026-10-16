@@ -347,6 +347,49 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
       const refusal = JSON.stringify({ injected, refused }, null, 2);
       trace.log.info(refusal);
       process.stderr.write(`${refusal}\n`);
+      const failedDetach = calls.find(
+        (call) => call.file === '/usr/bin/hdiutil' && call.args[0] === 'detach' && call.output.status !== 0,
+      );
+      if (failedDetach !== undefined) {
+        const mountTable = await host.run('/sbin/mount', [], 1_000);
+        const filesystemHolders = await host.run(
+          '/usr/bin/sudo',
+          ['-n', '/usr/sbin/lsof', '-nP', '+f', '--', paths.staging],
+          1_000,
+        );
+        const added = calls.find(
+          (call) => call.file === '/usr/sbin/diskutil' && call.args[0] === 'apfs' && call.args[1] === 'addVolume',
+        );
+        const volume = added === undefined ? null : operationDisk(added.output.stdout);
+        const devices = failedDetach.args.filter((argument) => argument.startsWith('/dev/disk'));
+        if (volume !== null) devices.push(`/dev/${volume}`);
+        if (devices.length === 0) throw new Error('rollback detach recorded no device for its diagnostic probe');
+        const devicePaths: string[] = [];
+        for (const device of devices) devicePaths.push(device, device.replace('/dev/', '/dev/r'));
+        const deviceHolders = await host.run(
+          '/usr/bin/sudo',
+          ['-n', '/usr/sbin/lsof', '-nP', '--', ...devicePaths],
+          1_000,
+        );
+        const observations = JSON.stringify(
+          {
+            injected,
+            phase: 'rollback-refused-observations',
+            mountTable: {
+              status: mountTable.status,
+              stderr: mountTable.stderr,
+              matching: mountTable.stdout.split('\n').filter((line) => line.includes(paths.staging)),
+            },
+            filesystemHolders,
+            devicePaths,
+            deviceHolders,
+          },
+          null,
+          2,
+        );
+        trace.log.info(observations);
+        process.stderr.write(`${observations}\n`);
+      }
       // A cowshed sandbox cannot attach images, so provisioning stops before the injected step.
       if (!refused.ok && refused.error.kind === 'provision-failed' && refused.error.step !== reported) {
         expectSandboxed(refused.error);
