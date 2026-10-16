@@ -110,7 +110,8 @@ export function captureHangDiagnostics(
       return result;
     };
     const census = async (name: string): Promise<ObservedProcess[] | null> => {
-      const result = await probe(name, '/bin/ps', ['-A', '-o', PS_FIELDS], 1_000);
+      // Bare `ps`, resolved through PATH like testing.ts's processTable: NixOS has no /bin/ps.
+      const result = await probe(name, 'ps', ['-A', '-o', PS_FIELDS], 1_000);
       if (finished) return null;
       if (result.status !== 'exited' || result.code !== 0) {
         lines.push(`${name}: could not inspect the process table; not an empty process tree.`);
