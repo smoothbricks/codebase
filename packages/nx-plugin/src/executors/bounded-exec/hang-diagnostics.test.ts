@@ -52,7 +52,7 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain('/fixture/held-file');
     expect(capture.text).toContain('not proof of a contested lock');
     expect(capture.text).toContain('pid=101 pgid=101');
-    expect(calls.map((call) => call.file)).toEqual(['/bin/ps', '/usr/bin/sudo', '/bin/ps']);
+    expect(calls.map((call) => call.file)).toEqual(['ps', '/usr/bin/sudo', 'ps']);
     expect(calls[1]?.args).toEqual(['-n', '/usr/sbin/lsof', '-nP', '-p', '101,202,303,404']);
     expect(capture.offsetFromExpiryMs).toBeGreaterThan(0);
     expect(capture.capturedAtMs).toBeGreaterThanOrEqual(capture.startedAtMs);
@@ -194,7 +194,7 @@ describe('pre-expiry hang diagnostics', () => {
     const capture = await captureHangDiagnostics(request(), { ...host, platform: 'linux' });
     expect(capture.outcome).toBe('holders');
     expect(capture.text).toContain('observations below name processes only');
-    expect(calls.map((call) => call.file)).toEqual(['/bin/ps', '/bin/ps']);
+    expect(calls.map((call) => call.file)).toEqual(['ps', 'ps']);
   });
 
   it('captures a real child, its grandchild, and an actually open file before either is stopped', async () => {
