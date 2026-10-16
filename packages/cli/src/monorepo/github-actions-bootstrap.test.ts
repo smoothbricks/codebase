@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
 import { printCommandOutput } from '../lib/run.js';
 
@@ -56,6 +56,7 @@ function runBuildShell(): BuildShellRun {
       env: {
         PATH: `${bin}:${process.env.PATH ?? ''}`,
         HOME: dir,
+        TMPDIR: dir,
         GITHUB_ENV: githubEnv,
         GITHUB_PATH: githubPath,
         // Present before the shell and changed by it → must persist as the
@@ -162,7 +163,7 @@ function runInstallDevenv(lock: string, options: { devenvVersion?: string; hostR
       // A bare PATH on purpose: an ambient devenv would decide these cases
       // instead of the stub.
       env: {
-        PATH: `${bin}:${dirname(REAL_NIX)}:/usr/bin:/bin`,
+        PATH: `${bin}:/usr/bin:/bin`,
         HOME: join(dir, 'home'),
         NIX_CALLS: nixCalls,
         REAL_NIX,
