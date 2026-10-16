@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use cowshed_core::api::Coordinator;
 use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus, StaleDaemonBinary};
 use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
+use cowshed_core::project_retirement::ProjectRetirementReport;
 use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor_manager::{
     self, ProgramSpawner, SocketPeers, SupervisorManager,
@@ -974,9 +975,13 @@ async fn run_daemon() -> Result<()> {
     // and nothing below waits for it.
     drop(recovery.start(Arc::new(SocketPeers)));
     let handle = OwnedGateway::new(gateway.handle());
-    let inventory = NativeSessionInventory::new(storage);
     let started = async {
         serve_supervisors(&store_root, manager).await?;
+        // Both host sockets are serving before storage recovery can wait on an owned process.
+        // Only pre-existing positive authorizations resume; a refusal leaves that project
+        // fenced and cannot prevent unrelated projects from healing.
+        resume_project_retirements(&storage).await;
+        let inventory = NativeSessionInventory::new(storage);
         heal_recorded_projects(&heal_inventory, repositories, &heal).await;
         heal_sccache_daemon().await;
         report_session_restore(&install_all_sessions(&inventory, &handle).await?);
@@ -1040,6 +1045,61 @@ async fn serve_supervisors(store_root: &Path, manager: Arc<SupervisorManager>) -
         }
     });
     Ok(())
+}
+
+/// Resume every explicit project retirement an earlier run recorded and left unfinished,
+/// reporting rather than raising.
+///
+/// Only a durable, positive `--abandon` record is resumed (`cowshed forget`): a missing checkout,
+/// a dead pid or an old registration authorizes nothing, and nothing here writes a record. A
+/// retirement that cannot finish stays fenced for the operator to retry, and it must never stop
+/// the gateway from healing and serving every other project (05_gateway.md).
+async fn resume_project_retirements(storage: &ValidatedHostStorage) {
+    let resumed =
+        cowshed_core::project_retirement::native::resume_retirements(storage.clone()).await;
+    for line in retirement_resume_lines(&resumed) {
+        eprintln!("{line}");
+    }
+}
+
+/// What the startup pass says about the retirements it resumed: one line for each project, and
+/// after each failure the message and hint the CLI would have printed for it.
+fn retirement_resume_lines(
+    resumed: &Result<Vec<(RepoId, Result<ProjectRetirementReport>)>>,
+) -> Vec<String> {
+    fn failure(lines: &mut Vec<String>, what: String, error: &CowshedError) {
+        lines.push(format!("cowshed: {what}: {}", error.message));
+        if !error.hint.is_empty() {
+            lines.push(format!("next: {}", error.hint));
+        }
+    }
+
+    let mut lines = Vec::new();
+    match resumed {
+        Err(error) => failure(
+            &mut lines,
+            "could not read the recorded project retirements at gateway startup".to_owned(),
+            error,
+        ),
+        Ok(outcomes) => {
+            for (repo_id, outcome) in outcomes {
+                match outcome {
+                    Ok(report) => lines.push(format!(
+                        "cowshed: resumed at gateway startup: {}",
+                        crate::forget::retired(report)
+                    )),
+                    Err(error) => failure(
+                        &mut lines,
+                        format!(
+                            "could not finish retiring {repo_id} at gateway startup; it stays fenced"
+                        ),
+                        error,
+                    ),
+                }
+            }
+        }
+    }
+    lines
 }
 
 /// Heal every one of `repositories`, mains before sessions, counting each one down in `heal` and
@@ -3305,5 +3365,67 @@ mod tests {
     fn the_start_deadline_outlasts_a_multi_project_heal() {
         assert!(START_DEADLINE >= Duration::from_secs(120));
         assert!(START_DEADLINE > START_PROGRESS_INTERVAL * 4);
+    }
+
+    /// A retirement that cannot finish is a line and its hint for that project and nothing more:
+    /// the outcomes after it are reported too, and a failure to read the records at all is lines
+    /// as well, never an error the startup pass has to carry.
+    #[test]
+    fn startup_reports_every_resumed_retirement_and_names_each_refusal() {
+        let repo = |name: &str| RepoId::parse(name).expect("repository");
+        let report = |name: &str, images| ProjectRetirementReport {
+            repo_id: repo(name),
+            archive: PathBuf::from(format!("/store/.retired-projects/{name}")),
+            images,
+        };
+        let resumed: Result<Vec<(RepoId, Result<ProjectRetirementReport>)>> = Ok(vec![
+            (repo("acme/api"), Ok(report("acme/api", 1))),
+            (
+                repo("acme/web"),
+                Err(CowshedError::conflict(
+                    "workspace raven has not finished draining",
+                    "cowshed forget acme/web --abandon",
+                )),
+            ),
+            (repo("acme/worker"), Ok(report("acme/worker", 3))),
+        ]);
+        let lines = retirement_resume_lines(&resumed);
+        assert_eq!(
+            lines,
+            [
+                "cowshed: resumed at gateway startup: retired acme/api: 1 image detached; its whole project tree is preserved at /store/.retired-projects/acme/api",
+                "cowshed: could not finish retiring acme/web at gateway startup; it stays fenced: workspace raven has not finished draining",
+                "next: cowshed forget acme/web --abandon",
+                "cowshed: resumed at gateway startup: retired acme/worker: 3 images detached; its whole project tree is preserved at /store/.retired-projects/acme/worker",
+            ]
+        );
+        for line in &lines {
+            assert!(!line.contains("delet"), "{line}");
+        }
+
+        let unreadable: Result<Vec<(RepoId, Result<ProjectRetirementReport>)>> = Err(
+            CowshedError::integrity("a retirement record is damaged", "inspect the record"),
+        );
+        assert_eq!(
+            retirement_resume_lines(&unreadable),
+            [
+                "cowshed: could not read the recorded project retirements at gateway startup: a retirement record is damaged",
+                "next: inspect the record",
+            ]
+        );
+
+        let hintless: Result<Vec<(RepoId, Result<ProjectRetirementReport>)>> = Ok(vec![(
+            repo("acme/api"),
+            Err(CowshedError::new(ErrorCode::Internal, "stopped", "")),
+        )]);
+        assert_eq!(
+            retirement_resume_lines(&hintless),
+            [
+                "cowshed: could not finish retiring acme/api at gateway startup; it stays fenced: stopped"
+            ]
+        );
+
+        let nothing: Result<Vec<(RepoId, Result<ProjectRetirementReport>)>> = Ok(Vec::new());
+        assert!(retirement_resume_lines(&nothing).is_empty());
     }
 }

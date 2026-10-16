@@ -22,6 +22,7 @@ pub mod inherited_links;
 pub mod landing;
 pub mod metadata;
 pub mod project_policy;
+pub mod project_retirement;
 pub mod repository;
 pub mod resident;
 pub mod runtime;
@@ -76,6 +77,7 @@ pub use gateway_inventory::{
     NativeGatewayInventory, ProjectHealOutcome, SessionHealOutcome, StartupHealState,
     UnreachableMain, forming_re_adoption_checkout,
 };
+pub use project_retirement::ProjectRetirementReport;
 pub use storage::bootstrap::ValidatedHostStorage;
 pub use storage::bootstrap::native::validate_existing_host_storage;
 pub use workspace_credentials::GatewayWorkspaceCredentials;

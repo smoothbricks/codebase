@@ -110,9 +110,9 @@ install. `--downgrade` installs the invoking build anyway; it is refused with `-
 nothing.
 
 The commands that change a workspace or run work in one — `adopt`, `fork`, `mv`, `checkpoint`, `restore`, `path`,
-`exec`, `grant`, `rm`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`, `gc`, `push`, `rebase`, `land` — first
-ask the daemon whether it runs their build, before they open the project or change anything. A daemon of another build
-refuses them up front (exit 4), naming both builds, with the remedy this verb provides:
+`exec`, `grant`, `rm`, `forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`, `gc`, `push`, `rebase`,
+`land` — first ask the daemon whether it runs their build, before they open the project or change anything. A daemon of
+another build refuses them up front (exit 4), naming both builds, with the remedy this verb provides:
 
 ```
 $ cowshed rm raven
@@ -650,6 +650,55 @@ run reports no abandoned work; the bundle the interrupted run reported stays whe
 Nothing on stdout — `rm` has no answer to give. With `--json`, the result is `{}`, or
 `{"abandoned":{"head":…,"targetBranch":"main","targetHead":…,"unlandedCommits":9,"bundle":…}}` after an abandonment. For
 main, `targetBranch` is the retained checkout's branch (`HEAD` when it is detached).
+
+### `cowshed forget <owner/repo> --abandon`
+
+Retires a project registration cowshed can no longer open — the checkout was deleted, or the marker, lease or repository
+record is corrupt — without needing any of them. The project is named only by `<owner/repo>`, so the command works from
+any directory, accepts no `--project`, and never opens or remounts the project. Like `rm`, it first asks the daemon
+whether it runs this build: the fence below is enforced only by a daemon that knows about it, and `cowshed setup` ends a
+disagreement.
+
+`--abandon` is required, and it is your authorization, not something cowshed works out. A missing checkout, marker or
+lease, a dead PID, a path prefix or an age never retires a project, and nothing retires one automatically. Without the
+flag the command exits 2 and the hint is the completed command line:
+
+```
+$ cowshed forget acme/widget
+cowshed: forget retires acme/widget only with an explicit --abandon; a missing checkout, marker, pid or path prefix never authorizes it
+next: cowshed forget acme/widget --abandon
+
+$ cowshed forget acme/widget --abandon
+cowshed: retiring acme/widget on your explicit --abandon: new opens are refused, running supervisors drained, each backing image detached without force, then its whole project tree preserved in an archive
+/private/cowshed/store/.retired-projects/3f6c2b0e-9d41-4a7a-8e55-0c1d7b9a2e64
+cowshed: retired acme/widget: 2 images detached; its whole project tree is preserved at /private/cowshed/store/.retired-projects/3f6c2b0e-9d41-4a7a-8e55-0c1d7b9a2e64
+next: cowshed ls --all
+```
+
+The command records that authorization first, durably, outside the project tree, in `.retirements/<owner>/<repo>.json`
+in the store; from then on nothing opens, heals or re-adopts the project. Then, in recorded phases — `fenced`,
+`drained`, `detached`, `archived` — it asks every running supervisor of the project to drain and requires each one's
+positive receipt, detaches each of the project's backing images **without force**, and renames the whole project tree
+into `.retired-projects/<operation-id>` in the store. That tree holds the Git repositories inside the images, the grants
+and the resource evidence, unchanged: nothing is deleted, rewritten or copied, and an archive that already exists is
+never overwritten. The images stay in it, detached, so no disk space is freed. An archive is reserved host storage — no
+cowshed command lists, heals or reclaims it.
+
+Nothing is forced. A supervisor that has not finished draining, an owner that still holds the project, or a holder that
+keeps an image busy — an open file, a working directory, a running job — refuses its step with exit 4 and leaves the
+project fenced. Stop or wait for what holds it, then run the same command again: the retry resumes from the recorded
+phase instead of starting over, and run after it finished it reports the archive that retirement made. A repository the
+store never registered is refused as not found (exit 3). The gateway daemon finishes a recorded retirement the same way
+at its next start, before it heals any project, so one interrupted by a crash or a reboot completes without being typed
+again; it resumes only a record that already holds your `--abandon` and never writes one.
+
+stdout is the archive path. With `--json` it is the ordinary envelope around `ProjectRetirementReport`, where `images`
+counts the backing images the preserved tree carries, all of them detached:
+
+```
+$ cowshed forget acme/widget --abandon --json
+{"ok":true,"result":{"repoId":"acme/widget","archive":"/private/cowshed/store/.retired-projects/3f6c2b0e-9d41-4a7a-8e55-0c1d7b9a2e64","images":2}}
+```
 
 ## Daily work
 

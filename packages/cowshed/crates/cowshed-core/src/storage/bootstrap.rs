@@ -64,6 +64,15 @@ pub fn is_reserved_store_namespace(name: &str) -> bool {
     name.starts_with('.') || RESERVED_STORE_NAMESPACES.contains(&name)
 }
 
+/// Explicit project retirement records, `<owner>/<repo>.json` beside that project's lease files,
+/// kept outside the project tree they fence so they outlive it (`project_retirement`). Dotted, so
+/// [`is_reserved_store_namespace`] already keeps every owner walker out of it.
+pub const RETIREMENTS_NAMESPACE: &str = ".retirements";
+/// Whole project trees an explicit retirement preserved, one `<operation-id>` directory each,
+/// beside its final record `<operation-id>.json`. Reserved host storage: never a project, never
+/// re-discovered or healed, and nothing in cowshed reclaims it.
+pub const RETIRED_PROJECTS_NAMESPACE: &str = ".retired-projects";
+
 pub(crate) use cowshed_apfs::device::DISKUTIL;
 const ZFS: &str = "/usr/sbin/zfs";
 const MARKER_VERSION: u32 = 1;
@@ -2010,7 +2019,10 @@ pub enum BootstrapExecutionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{VOLUME_MARKER_FILE, is_reserved_store_namespace};
+    use super::{
+        RETIRED_PROJECTS_NAMESPACE, RETIREMENTS_NAMESPACE, VOLUME_MARKER_FILE,
+        is_reserved_store_namespace,
+    };
 
     /// One grammar for every store-root walker. `cache` and `temp` are the near-misses that have
     /// to stay usable as repository owners, and the empty name is not a namespace at all.
@@ -2027,6 +2039,8 @@ mod tests {
             VOLUME_MARKER_FILE,
             ".staging",
             ".trash",
+            RETIREMENTS_NAMESPACE,
+            RETIRED_PROJECTS_NAMESPACE,
         ] {
             assert!(is_reserved_store_namespace(name), "{name}");
         }

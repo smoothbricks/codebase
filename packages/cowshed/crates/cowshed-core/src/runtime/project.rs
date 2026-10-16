@@ -2307,6 +2307,8 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     /// The image reclamations this host started in the background and has not yet seen finish:
     /// what `settle_reclaims` waits for. Finished ones are dropped as new ones start.
     reclaims: Vec<JoinHandle<()>>,
+    /// Retirement may archive this project's storage only after every actor and healer releases it.
+    _retirement_lease: crate::project_retirement::ProjectReadLease,
 }
 
 /// Who runs a workspace's supervisor.
@@ -3184,8 +3186,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
         let mut replay_journal = None;
         let binding_span = cowshed_os::timing::span("open", "binding");
-        let (repo_id, layout, binding) = if let Some(resolved) = session_project {
-            resolved
+        let (repo_id, layout, binding, retirement_lease) = if let Some((repo_id, layout, binding)) =
+            session_project
+        {
+            let lease =
+                crate::project_retirement::acquire_project_reader(storage.store(), &repo_id)?;
+            (repo_id, layout, binding, lease)
         } else {
             let recorded = match binding_repo_id.as_ref() {
                 Some(repo_id) => project_owning_repo_id(storage.store(), repo_id).await?,
@@ -3202,6 +3208,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         .map_err(native_integrity_error)?
                         .repo_id
                         .clone();
+                    let lease = crate::project_retirement::acquire_project_reader(
+                        storage.store(),
+                        &repo_id,
+                    )?;
                     let binding = if let Some(discovery_error) = undiscovered.as_ref() {
                         // A missing checkout cannot answer Git's remotes. Skip that query only
                         // for the validated, exact replacement record owning this repo/root;
@@ -3237,7 +3247,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             Some(_) | None => binding,
                         }
                     };
-                    (repo_id, layout, binding)
+                    (repo_id, layout, binding, lease)
                 }
                 // Nothing adopted under this identity: the remotes are the only source left, and
                 // this is the adoption path that derives an identity from them for the first time.
@@ -3251,10 +3261,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         .map_err(native_integrity_error)?
                         .repo_id
                         .clone();
+                    let lease = crate::project_retirement::acquire_project_reader(
+                        storage.store(),
+                        &repo_id,
+                    )?;
                     let layout = crate::storage::StorageLayout::new(storage.store(), &repo_id)
                         .map_err(native_integrity_error)?;
                     let binding = load_or_validate_binding(&layout, candidate, &git).await?;
-                    (repo_id, layout, binding)
+                    (repo_id, layout, binding, lease)
                 }
             }
         };
@@ -3451,6 +3465,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             binding_remote_validation: validation,
             recovery_scope,
             reclaims: Vec::new(),
+            _retirement_lease: retirement_lease,
         })
     }
     /// Apply `change` to the journal on disk under its lock and adopt the result, which also
@@ -4011,6 +4026,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// enforce is exactly the one `mv … --repo-id` exists to supersede. An inspecting host checks
     /// the pairing and writes nothing; doctor reports the move.
     async fn validate_binding(&mut self) -> Result<()> {
+        crate::project_retirement::require_project_active(
+            self.descriptor.storage.store(),
+            &self.descriptor.repo_id,
+        )?;
         if self.binding_remote_validation == BindingRemoteValidation::ForIdentityChange {
             return Ok(());
         }
@@ -4343,6 +4362,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(super::build_volumes::BuildVolumes::new(
             self.substrate.shared_host(),
             self.build_volume_layout()?,
+            crate::project_retirement::acquire_project_reader(
+                self.descriptor.storage.store(),
+                &self.descriptor.repo_id,
+            )?,
         ))
     }
 
@@ -5082,6 +5105,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         binding: RepositoryBinding,
         layout: crate::storage::StorageLayout,
     ) -> Result<()> {
+        let retirement_lease = crate::project_retirement::acquire_project_reader(
+            self.descriptor.storage.store(),
+            &repo_id,
+        )?;
         // The config carries no identity: `owned_repo_ids` reads the binding beside the project
         // directory, which the namespace move has already put in place. Rebuilding the triple is
         // still required, because the layout the host derives paths from has changed.
@@ -5090,6 +5117,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         self.layout = layout;
         self.descriptor.repo_id = repo_id;
         self.descriptor.binding = std::sync::Arc::new(binding);
+        self._retirement_lease = retirement_lease;
         self.lifecycle_intents_path = self
             .layout
             .project()
@@ -7970,10 +7998,30 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     fn reclaim_in_background(&mut self, retired: crate::storage::lifecycle::RetiredRef) {
         use crate::storage::lifecycle::Substrate;
 
+        // The task can outlive this actor. Its own shared lease must exclude whole-project
+        // archival until it ends; once retirement is fenced, keep the trash as archive evidence.
+        let retirement_lease = match crate::project_retirement::acquire_project_reader(
+            self.descriptor.storage.store(),
+            &self.descriptor.repo_id,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                eprintln!(
+                    "cowshed: retaining {} for later reclamation: {}",
+                    retired.workspace().name(),
+                    error.message
+                );
+                return;
+            }
+        };
+        let workspace = retired.workspace().name().clone();
         let substrate = self.substrate.clone();
         self.reclaims.retain(|reclaim| !reclaim.is_finished());
         self.reclaims.push(tokio::spawn(async move {
-            let _ = substrate.reclaim(retired).await;
+            let _retirement_lease = retirement_lease;
+            if let Err(error) = substrate.reclaim(retired).await {
+                eprintln!("cowshed: retaining retired workspace {workspace} for later reclamation: {error}");
+            }
         }));
     }
 
@@ -17922,7 +17970,7 @@ fn seed_age_finding(
 /// groups whose leader it cannot identify. Ordinary admission remains safe, but replacing or
 /// destroying their image would cut the substrate out from under an unaccounted-for writer.
 #[cfg(target_os = "macos")]
-async fn require_lost_groups_released(
+pub(crate) async fn require_lost_groups_released(
     workspace: &WorkspaceName,
     socket: &super::supervisor_socket::BoundSocket,
     operation: &str,

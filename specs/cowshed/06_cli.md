@@ -73,15 +73,15 @@ Two verbs own the host story, both runnable from any directory:
   that same single session, refusing while anything but the marker is left (03_caches.md "Retiring the caches volume").
 
 The verbs that change workspace or lifecycle state or run a job through a workspace supervisor — `adopt`, `fork`, `mv`,
-`checkpoint`, `restore`, `path`, `exec`, `grant`, `rm`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`, `gc`,
-`push`, `rebase`, `land` — first ask the host daemon's supervisor manager whether it runs this CLI's build (`sameBuild`,
-11_shell.md), before the project is opened, so not even recovery mutates anything. A daemon of another build is refused
-up front with "the cowshed daemon is build X; this cowshed is build Y" and the hint "run `cowshed setup` from the
-cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on PATH"; no daemon answering is
-not a disagreement. `ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`, `controller`, `credential`, `identity`,
-`sccache`, `skill`, `--version` and `--help` are not asked: `doctor` diagnoses the disagreement, and `setup` and
-`gateway` end it. `gateway status` and `doctor` (`gateway-stale-binary`) name `cowshed setup` as the remedy for a daemon
-running other bytes than the CLI.
+`checkpoint`, `restore`, `path`, `exec`, `grant`, `rm`, `forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`,
+`rekey`, `gc`, `push`, `rebase`, `land` — first ask the host daemon's supervisor manager whether it runs this CLI's
+build (`sameBuild`, 11_shell.md), before the project is opened, so not even recovery mutates anything. A daemon of
+another build is refused up front with "the cowshed daemon is build X; this cowshed is build Y" and the hint "run
+`cowshed setup` from the cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on PATH";
+no daemon answering is not a disagreement. `ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`, `controller`,
+`credential`, `identity`, `sccache`, `skill`, `--version` and `--help` are not asked: `doctor` diagnoses the
+disagreement, and `setup` and `gateway` end it. `gateway status` and `doctor` (`gateway-stale-binary`) name
+`cowshed setup` as the remedy for a daemon running other bytes than the CLI.
 
 The stranded-user journey this contract exists for: after a reboot with locked or unmounted volumes, `cowshed doctor`
 explains the exact divergence (volume present but locked, or at macOS's default `/Volumes/<name>` instead of its
@@ -124,8 +124,9 @@ detach/kill, and successful policy mutations with no additional observation retu
 `EmptyResult` (never `null`, `true`, or a message string). `doctor` returns `DoctorReport { healthy, findings }`; each
 `Finding` has `code`, `severity`, `message`, `hint`, and optional `path`. `ls` returns `WorkspaceInfo[]`; `attach`
 returns `MountResult` for one workspace and `WorkspaceInfo[]` for several; `gc` returns `GcReport`; `identity add`
-returns `IdentityReport { repoId, added, identity, identities }`. Exec and job commands return the frozen job DTOs in
-07_api.md. Commands whose normal stdout is a scalar use a named one-field body (`CheckpointResult { label }`,
+returns `IdentityReport { repoId, added, identity, identities }`; `forget` returns
+`ProjectRetirementReport { repoId, archive, images }`. Exec and job commands return the frozen job DTOs in 07_api.md.
+Commands whose normal stdout is a scalar use a named one-field body (`CheckpointResult { label }`,
 `RevisionResult { oid }`, `SlotResult { slot }`) so JSON never changes shape when another field is added.
 
 `reseed` returns
@@ -237,6 +238,7 @@ never errors).
 | `cowshed checkpoint <ws> [label]`                   | label                                            | Supervisor artifact barrier + manifest/commitment, then crash-consistent image snapshot; omitted label generates UTC timestamp. `--keep` exempts from gc.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `cowshed restore <ws> <label>`                      | mount path                                       | Label required; validates manifest/commitment before the fresh-incarnation publication fence. Previous image remains `pre-restore-…` (02).                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `cowshed rm <ws>`                                   | — (no stdout)                                    | Perceived-instant (02). Requires HEAD contained in live main; `--force` does not waive that check. `--abandon` preserves unlanded commits in a verified bundle. Named removal also handles unpublished clones without activating them.                                                                                                                                                                                                                                                                                                                                                                  |
+| `cowshed forget <owner/repo> --abandon`             | the preserved archive path                       | Retire a project registration the ordinary verbs can no longer open, from store records alone: no checkout, no `--project`. `--abandon` is the operator's explicit authorization, never inferred from a missing checkout, marker, lease or PID. Fences new opens, drains supervisors, detaches each image without force and renames the whole project tree to `.retired-projects/<operation-id>`; nothing is deleted. A busy holder refuses and the same command resumes (Project retirement). `--json`: `ProjectRetirementReport { repoId, archive, images }`.                                         |
 | `cowshed mv <ws> <new-name>`                        | new mount path                                   | Rename a workspace, or move the project checkout with `cowshed mv main <new-path>` — the source decides whether the destination reads as a name or a path. Owns the unmount/republish/remount cycle, symmetric with `rm` (02). The rename carries uncommitted work and refuses an in-progress Git operation, a running job, or an untracked nested repository (`conflict` naming its directory, with commit, move-out, exclude and retry as the way out); the checkout move refuses a relative, occupied, parentless, or storage-overlapping destination — each naming the command that clears it (02). |
 | `cowshed du [ws]`                                   | `--json`: written/referenced per ws + checkpoint | CoW-aware usage; lists checkpoints per workspace (01).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `cowshed logs`                                      | human table (`--json`/`--ndjson`: events)        | Controller telemetry (13). `--ws`, `--kind`, `--since`, `--follow`. Wraps `lmao-inspect` over the store segments.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -335,6 +337,40 @@ detached/still-forming deferrals on one line. A project open likewise says its r
 explicitly non-blocking for this command; `doctor` names each. This context is not a refusal and changes neither the
 exit code nor the JSON error's message or hint. A refusal on one volume does not hide later candidates. `gc --dry-run`
 reports candidates and reasons without changing mounts, labels or images.
+
+### Project retirement
+
+`cowshed forget <owner/repo> --abandon` retires a project registration that the ordinary verbs can no longer open: its
+checkout is gone, or its in-image marker, resource lease or repository record is corrupt. It resolves the project from
+the store by `<owner/repo>` alone and needs no checkout, working directory or project: `--project` is a usage error,
+project discovery never runs, and the host's existing validated storage is used without opening or remounting the
+project. Like every verb that changes lifecycle state it first asks the daemon whether it runs this CLI's build, because
+only a daemon that implements the fence enforces it.
+
+`--abandon` is the operator's explicit authorization, and the only one. Without it the command is a usage error (exit 2)
+whose hint is the completed command line. Nothing else stands in for it: a missing checkout, marker or lease, a dead
+PID, a path prefix or an age never authorizes a retirement, and nothing retires a project automatically. Before any side
+effect the authorization is persisted as an immutable record outside the project tree,
+`.retirements/<owner>/<repo>.json` in the store, and from then on no open, heal or adoption of the project is admitted.
+The retirement then advances through recorded phases (02_workspaces.md; the record's layout is 01_storage.md): `fenced`,
+`drained`, `detached`, `archived`. It drains every running supervisor of the project and requires each one's positive
+receipt, detaches each of the project's backing images without force, and renames the whole project tree — the Git
+repositories inside the images, grants and resource evidence — unchanged to `.retired-projects/<operation-id>` in the
+store. Nothing is deleted, rewritten or copied, and the retained image bytes are not freed: the archive is the
+preservation artifact. An archive is reserved host storage that no verb discovers, heals or reclaims, and one that
+already exists is never overwritten.
+
+A supervisor that has not finished draining, an owner that still holds the project and a holder that keeps an image busy
+each refuse their step as a `conflict` (exit 4), and nothing is forced: the project stays fenced, and the same command
+run again resumes from the recorded phase. The gateway daemon finishes a recorded retirement the same way at its next
+start, before it heals any project; it resumes only a record that already holds the explicit authorization and never
+writes one. Run again after it finished, the command reports the archive the finished retirement made.
+
+stdout is the archive path. `--json` returns `ProjectRetirementReport { repoId, archive, images }` through the ordinary
+envelope, where `images` counts the backing images the preserved tree carries, all of them detached. Before its first
+side effect the command states on stderr the `--abandon` that confirmed it and what will happen; afterwards it names the
+repository, the detached image count and the archive, says the tree is preserved — never that bytes were deleted — and
+hints `next: cowshed ls --all`.
 
 ### `cowshed ls` detached rows
 

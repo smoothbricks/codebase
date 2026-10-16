@@ -1,0 +1,21 @@
+{
+  "nextestRunId": "8816130c-c1ce-46e2-963c-659764c3f6d3",
+  "test": "project_retirement::native::macos::tests::real_apfs_forget_refuses_a_busy_image_then_preserves_it_detached",
+  "command": "cargo nextest run --frozen -j 1 -p cowshed-core --lib -E 'test(=project_retirement::native::macos::tests::real_apfs_forget_refuses_a_busy_image_then_preserves_it_detached)' --stress-count 10 --success-output immediate --no-output-indent",
+  "classes": ["AppleDiskImageDevice", "DIDeviceIOUserClient", "AppleAPFSVolume", "IOMedia"],
+  "cycles": [
+    { "cycle": 1, "before": [163, 163, 2185, 176], "after": [163, 163, 2186, 176] },
+    { "cycle": 2, "before": [163, 163, 2186, 176], "after": [163, 163, 2187, 176] },
+    { "cycle": 3, "before": [163, 163, 2187, 176], "after": [163, 163, 2188, 176] },
+    { "cycle": 4, "before": [163, 163, 2188, 176], "after": [163, 163, 2189, 176] },
+    { "cycle": 5, "before": [163, 163, 2189, 176], "after": [163, 163, 2190, 176] },
+    { "cycle": 6, "before": [163, 163, 2190, 176], "after": [163, 163, 2191, 176] },
+    { "cycle": 7, "before": [163, 163, 2191, 176], "after": [163, 163, 2192, 176] },
+    { "cycle": 8, "before": [163, 163, 2192, 176], "after": [163, 163, 2193, 176] },
+    { "cycle": 9, "before": [163, 163, 2193, 176], "after": [163, 163, 2194, 176] },
+    { "cycle": 10, "before": [163, 163, 2194, 176], "after": [163, 163, 2195, 176] }
+  ],
+  "totalDelta": [0, 0, 10, 0],
+  "result": "10/10 passed; every cycle refused a busy image without forcing, then detached and archived it after the holder closed",
+  "scope": "Host-wide ioclasscount observations. No daemon restart or helper kill was performed by this measurement. The retained APFSVolume instances are separate from image-device/client leaks and do not mean that image bytes were reclaimed."
+}

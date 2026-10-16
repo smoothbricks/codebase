@@ -424,6 +424,13 @@ impl HealSource for NativeHealSource {
         storage: &ValidatedHostStorage,
         repo: &RepoId,
     ) -> Result<Arc<dyn ProjectMounts>, GatewayInventoryError> {
+        let retirement_lease =
+            crate::project_retirement::acquire_project_reader(storage.store(), repo).map_err(
+                |error| GatewayInventoryError::InvalidMetadata {
+                    path: storage.store().to_owned(),
+                    message: error.to_string(),
+                },
+            )?;
         let layout = StorageLayout::new(storage.store(), repo).map_err(|error| {
             GatewayInventoryError::InvalidMetadata {
                 path: storage.store().to_owned(),
@@ -441,6 +448,7 @@ impl HealSource for NativeHealSource {
         Ok(Arc::new(NativeProjectMounts {
             repo: repo.clone(),
             substrate: ApfsSubstrate::new(config, host),
+            _retirement_lease: retirement_lease,
         }))
     }
 }
@@ -448,6 +456,7 @@ impl HealSource for NativeHealSource {
 struct NativeProjectMounts {
     repo: RepoId,
     substrate: ApfsSubstrate<MacOsApfsExecutionHost<SystemCommandRunner>>,
+    _retirement_lease: crate::project_retirement::ProjectReadLease,
 }
 
 #[async_trait]
@@ -466,6 +475,14 @@ impl ProjectMounts for NativeProjectMounts {
         &self,
         workspace: &LifecycleWorkspace,
     ) -> Result<PathBuf, GatewayInventoryError> {
+        crate::project_retirement::require_project_active(
+            &self.substrate.config().store_root,
+            &self.repo,
+        )
+        .map_err(|error| GatewayInventoryError::InvalidMetadata {
+            path: self.substrate.config().store_root.clone(),
+            message: error.to_string(),
+        })?;
         Ok(self
             .substrate
             .ensure_mounted(workspace, MountIntent { browse: false })
@@ -926,9 +943,21 @@ impl NativeGatewayInventory {
     pub async fn recorded_projects(&self) -> Result<Vec<RepoId>, GatewayInventoryError> {
         let store = self.storage.store().to_owned();
         cowshed_os::timing::timed_async(HEAL_SCOPE, "discover", async move {
-            crate::storage::lifecycle::dispatch_blocking(move || discover_repositories(&store))
-                .await
-                .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+            crate::storage::lifecycle::dispatch_blocking(move || {
+                let mut repositories = discover_repositories(&store)?;
+                // Only a positive pending authorization removes a project from ordinary heal.
+                // An unreadable record remains a per-project open failure, not a silent skip or
+                // a reason to stop every other project's startup.
+                repositories.retain(|repo| {
+                    !matches!(
+                        crate::project_retirement::retirement_blocks_open(&store, repo),
+                        Ok(true)
+                    )
+                });
+                Ok(repositories)
+            })
+            .await
+            .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
         })
         .await
     }

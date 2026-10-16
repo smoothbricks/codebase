@@ -317,6 +317,56 @@ unbound — its own open-time recovery may have finished the pending restore —
 between the last two removals leaves an unbound store directory holding only `checkout-root.json`; nothing bound reads
 it, and a later adoption's main image outranks it.
 
+## `cowshed forget <owner/repo> --abandon` — retire from store authority
+
+An orphaned or corrupt registration cannot depend on opening its missing checkout to be retired. `forget` names the
+exact repository identity and requires explicit `--abandon`; it does not take `--project`. It does not infer authority
+from a fixture-name prefix, an absent process, a missing resource-owner marker, or a temporary root that disappeared.
+Ordinary fixture teardown still proves resource retirement through its owning waits. `forget` is a separate, explicit
+operator authorization to stop serving a registered project while preserving its evidence.
+
+The positive authority is the durable **`authorization: "explicitAbandon"`** field in
+`.retirements/<owner>/<repo>.json`. The record also binds its operation UUID, exact repository identity and SHA-256 of
+the original `repository.json` bytes. A valid binding naming another project refuses; a corrupt binding is preserved
+byte-for-byte rather than silently replaced. No positive record means no collection.
+
+The monotonic phases are:
+
+1. **`fenced`**: publish authorization before effects. Project actors and startup healers take shared kernel leases
+   before binding writes or mounting, and refuse a pending retirement. Existing actors keep their leases; admitted
+   blocking build/seed work, cancelled mint cleanup and background reclamation retain their own holds until they finish,
+   even if their caller is gone. A separate run lease excludes concurrent execution and rejects a stale operation
+   generation.
+2. **`drained`**: the exact workspace supervisors answer the existing drain protocol, and kernel socket-peer exit
+   watches prove they ended. Their socket leases and the existing lost-job-group reconciliation remain held. An unknown
+   response, unresolved group, active controller, or held lifecycle intent refuses; a PID lookup cannot substitute for
+   those receipts. The collector takes the project's exclusive lease only after the owners release their shared holds.
+3. **`detached`**: release each exact backing image with `WhenIdle`, never forcing an unmount or eject. A shared
+   no-follow inode hold prevents reattachment between release and archival. Registration drift, changed image identity
+   or any remaining attachment refuses and preserves the record.
+4. **`archived`**: atomically rename the complete project store tree into `.retired-projects/<operation-id>`, preserving
+   its images, dirty Git state inside them, checkpoints, build state, grants, keys and diagnostic records. Preservation
+   and removal from the live registration namespace are one rename; neither the missing checkout nor its `.pre-cowshed`
+   tree is deleted. Record the completed receipt after syncing the directory changes.
+
+Retry resumes the recorded operation. A crash after rename but before the final phase write is recognized by the exact
+archive and registration digest, not by absence alone. Startup discovery excludes positively pending retirements from
+ordinary mount healing. After the gateway binds successfully, it resumes only already-authorized records before that
+healing; it never writes an abandonment because a fixture vanished, and one refusal cannot prevent unrelated projects
+from healing. Completed archive receipts remain, but do not reserve a repository identity against a subsequent
+deliberate adoption; a new retirement has a new operation UUID.
+
+This releases mounted devices and removes the live registration; it does **not** claim to free the retained image bytes.
+The reported archive is the preservation artifact. `gc` does not discover that reserved namespace as a live project or
+silently delete its evidence. Normal `rm main --restore` and its verified Git-containment rules remain unchanged.
+
+The native qualification runs ten complete attach/mount/busy-refusal/holder-close/forget cycles. Every cycle records
+`ioclasscount` before and after and proves that the owned image is no longer registered while its archive remains. The
+[recorded run](../../packages/cowshed/docs/project-retirement-counts.json) kept `AppleDiskImageDevice` and
+`DIDeviceIOUserClient` at 163 in every pair, and `IOMedia` at 176; `AppleAPFSVolume` grew by one per detach, 2185
+to 2195. That departed-volume retention is separate from image-device leaks and from retained archive bytes; the run
+performed no daemon restart or helper kill and does not claim to fix Disk Arbitration's retained volume references.
+
 ## `cowshed reseed` — replace only accumulated build state
 
 `cowshed reseed <ws> [--from <target>] [--dry-run]` leaves the workspace's source and Git state in place and replaces

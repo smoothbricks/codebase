@@ -51,6 +51,14 @@ Fix the remote or explicitly select/rebind the intended identity; discovery only
 repositories must be adopted with `--repo-id owner/repo`. Moving a checkout is not a conflict. Trusted policy is read
 only from `/private/cowshed/store/<owner>/<repo>/policy.json`, never from the checkout.
 
+**An abandoned project's checkout or marker is gone, so ordinary removal cannot open it.** Use
+`cowshed forget <owner/repo> --abandon` only when you explicitly intend to stop serving that exact registration. It
+records positive abandonment authority, drains owned supervisors, refuses busy images without forcing, and preserves the
+complete project store tree at the reported `.retired-projects/<operation-id>` archive before unbinding. Retry the same
+command after a refusal; startup also resumes already-authorized records. A missing fixture marker or PID is not
+permission to retire anything. This frees live mounts/registration ownership, **not the retained disk bytes**. It does
+not delete the missing checkout's siblings or substitute for normal fixture resource-retirement proofs.
+
 **`cowshed resize` or `cowshed defrag` says the image `is still attached as /dev/diskN with nothing mounted`.** The
 kernel still holds the workspace's image, but nothing is mounted at its mount point — an attachment an interrupted
 process or an outside tool left behind. Neither verb can grow or rewrite an image the kernel holds (the image file stays

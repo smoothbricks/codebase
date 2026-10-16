@@ -30,6 +30,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &GRANT,
     &REVOKE,
     &REMOVE,
+    &FORGET,
     &ATTACH,
     &DETACH,
     &MOUNT,
@@ -82,6 +83,10 @@ pub enum Command {
     Grant(GrantArgs),
     Revoke(RevokeArgs),
     Remove(RemoveArgs),
+    /// Retire one project's registration on the operator's explicit `--abandon`, from store
+    /// records alone. Its subject is the project named `<owner/repo>`, so it takes no checkout
+    /// and no `--project`: the checkout is what an abandoned project no longer has.
+    Forget(ForgetArgs),
     Attach(AttachArgs),
     Detach(DetachArgs),
     Mount(MountArgs),
@@ -123,6 +128,7 @@ impl Command {
             Self::Attach(args) if args.all => ProjectDiscovery::NotUsed,
             Self::Detach(_) => ProjectDiscovery::NotUsed,
             Self::Mount(_) => ProjectDiscovery::NotUsed,
+            Self::Forget(_) => ProjectDiscovery::NotUsed,
             Self::Adopt(_)
             | Self::Fork(_)
             | Self::Move(_)
@@ -432,6 +438,16 @@ pub struct RemoveArgs {
     /// under `abandon` its abandon bundles) — `Coordinator::remove_project`.
     pub purge: bool,
 }
+
+/// `forget <owner/repo> --abandon` — the one project to retire.
+///
+/// The parser refuses a `forget` without `--abandon`, so this type carries no flag for it: a
+/// `Command::Forget` that exists was explicitly authorized by the operator who typed it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForgetArgs {
+    pub repo_id: RepoId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttachArgs {
     pub workspace: Option<String>,
@@ -842,6 +858,11 @@ fn cli_command() -> ClapCommand {
             flag("purge"),
         ]))
         .subcommand(
+            leaf("forget")
+                .arg(positional("repo", 0..=1))
+                .arg(flag("abandon")),
+        )
+        .subcommand(
             leaf("attach")
                 .arg(positional("workspace", 0..=1))
                 .args([flag("all"), flag("browse")]),
@@ -1040,6 +1061,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "grant" => parse_grant(leaf)?,
         "revoke" => parse_revoke(leaf)?,
         "rm" => parse_remove(leaf)?,
+        "forget" => parse_forget(leaf, &global)?,
         "attach" => parse_attach(leaf)?,
         "detach" => parse_detach(leaf)?,
         "mount" => parse_mount(leaf)?,
@@ -1132,6 +1154,10 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
                 Some(spec) if spec.name == "exec" && !token.starts_with('-') => {
                     UsageError::new("exec requires `--` before the child argv", spec)
                 }
+                Some(spec) if spec.name == "forget" && !token.starts_with('-') => UsageError::new(
+                    format!("forget names exactly one owner/repo; got an extra `{token}`"),
+                    spec,
+                ),
                 Some(spec) if spec.name == "disk-command" && !token.starts_with('-') => {
                     UsageError::new(
                         "disk-command requires `--` before the tool's arguments",
@@ -2736,6 +2762,50 @@ fn parse_remove(matches: &ArgMatches) -> Result<Command, UsageError> {
         abandon,
         purge,
     }))
+}
+
+const FORGET: CommandSpec = CommandSpec {
+    name: "forget",
+    missing: "forget requires an owner/repo",
+    args: "<owner/repo> --abandon",
+    trailing: "",
+    summary: "retire an abandoned project, keeping its tree",
+    about: &[
+        "Retires one project's registration from the host's own store records, for a project the ordinary verbs can no longer open: its checkout is gone, or its marker, lease or repository record is corrupt. It needs no checkout, no cwd and no `--project` — the project is named only by `<owner/repo>`, so the answer is the same from any directory — and it neither opens nor remounts the project.",
+        "`--abandon` is required, and it is the operator's own authorization. cowshed never infers it from a missing checkout, a missing marker or lease, a dead pid, a path prefix or an age, and nothing retires a project automatically. The authorization is recorded durably before anything else happens, outside the project tree, in `.retirements/<owner>/<repo>.json` in the store; from then on nothing opens, heals or re-adopts that project.",
+        "Then, in recorded phases — fenced, drained, detached, archived — it asks every running supervisor of the project to drain and requires each one's positive receipt, detaches each of the project's backing images without force, and moves the whole project tree into `.retired-projects/<operation-id>` in the store. That tree holds the Git repositories inside the images, the grants and the resource evidence, and it is preserved as it was: nothing is deleted or rewritten. stdout is the archive path; `--json` reports `repoId`, `archive` and `images`, the number of images detached.",
+        "A supervisor that has not finished draining, or a holder that keeps an image busy — an open file, a working directory, a running job — refuses that step with exit 4 and nothing is forced: the project stays fenced, so stop or wait for what holds it and run the same command again. A run that was refused or interrupted resumes from its recorded phase, and an archive that already exists is left intact: it is reserved host storage that no verb discovers, heals or deletes.",
+        "The gateway daemon finishes a recorded retirement at its next start, before it heals any project, so one interrupted by a crash or a reboot completes without being typed again; it never begins one.",
+    ],
+    options: &[],
+};
+
+/// `forget` names no checkout, so `--project` would promise a scope the verb does not have, and
+/// the identity is validated here rather than discovered: a malformed `<owner/repo>` is refused
+/// before any store record is read. The explicit `--abandon` is checked last so the refusal's
+/// hint can be the completed command line, built from an identity already known to be valid.
+fn parse_forget(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &FORGET;
+    reject_project(
+        global,
+        USAGE,
+        "--project is not valid for forget: it retires the project named by <owner/repo>, which needs no checkout",
+    )?;
+    let named = os(matches, "repo").ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    let text = named
+        .to_str()
+        .ok_or_else(|| UsageError::new("forget requires a UTF-8 owner/repo", USAGE))?;
+    let repo_id = RepoId::parse(text)
+        .map_err(|error| UsageError::new(format!("invalid owner/repo `{text}`: {error}"), USAGE))?;
+    if !flagged(matches, "abandon") {
+        return Err(UsageError::with_hint(
+            format!(
+                "forget retires {repo_id} only with an explicit --abandon; a missing checkout, marker, pid or path prefix never authorizes it"
+            ),
+            format!("cowshed forget {repo_id} --abandon"),
+        ));
+    }
+    Ok(Command::Forget(ForgetArgs { repo_id }))
 }
 
 const ATTACH: CommandSpec = CommandSpec {
@@ -4935,6 +5005,7 @@ mod tests {
             (&["path", "raven"], Required),
             (&["exec", "raven", "--", "true"], Required),
             (&["rm", "raven"], Required),
+            (&["forget", "acme/widget", "--abandon"], NotUsed),
             (&["attach", "raven"], Required),
             (&["detach", "raven"], NotUsed),
             (&["detach", "--all"], NotUsed),
@@ -4993,6 +5064,7 @@ mod tests {
             (&["restore"], "restore requires a workspace"),
             (&["exec", "--", "true"], "exec requires a workspace"),
             (&["rm"], "rm requires a workspace"),
+            (&["forget"], "forget requires an owner/repo"),
             (&["detach"], "detach requires a workspace"),
             (&["resize"], "resize requires a workspace"),
             (&["defrag"], "defrag requires a workspace"),
