@@ -7809,7 +7809,7 @@ mod process_death_tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         // The OwnedGroup test idiom keeps cleanup around the assertions, not after them.
-        struct OwnedGroup(std::process::Child);
+        struct OwnedGroup(std::process::Child, Option<std::process::ChildStdin>);
         impl Drop for OwnedGroup {
             fn drop(&mut self) {
                 let pgid = i32::try_from(self.0.id()).expect("owned child pid");
@@ -7830,6 +7830,7 @@ mod process_death_tests {
                 {
                     eprintln!("observe owned signal-test group {pgid} output closure: {error}");
                 }
+                drop(self.1.take());
             }
         }
         struct OwnedSignaller {
@@ -7848,12 +7849,22 @@ mod process_death_tests {
         }
         let mut job = OwnedGroup(
             std::process::Command::new("/bin/sh")
-                .args(["-c", "(trap '' TERM; echo READY; exec sleep 300) & wait"])
-                .stdin(std::process::Stdio::null())
+                .args([
+                    "-c",
+                    "exec 3<&0; (trap '' TERM; echo READY; IFS= read -r release <&3) & wait",
+                ])
+                .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .process_group(0)
                 .spawn_locked()
                 .unwrap(),
+            None,
+        );
+        // Child::wait closes Child.stdin, so retain the lifetime writer in its owner instead.
+        job.1 = job.0.stdin.take();
+        assert!(
+            job.1.is_some(),
+            "the owner retains descendant stdin across wait"
         );
         let pgid = i32::try_from(job.0.id()).unwrap();
         let mut ready = String::new();
