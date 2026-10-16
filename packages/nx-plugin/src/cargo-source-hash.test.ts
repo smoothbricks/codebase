@@ -164,7 +164,6 @@ it('failed runtime inputs have the same key at different checkout paths and stil
   const root = await mkdtemp(join(tmpdir(), 'cargo-hash-refusal-'));
   try {
     const bin = join(import.meta.dir, '../dist/bin/smoo-nx-cargo-hash.js');
-    const causes: string[] = [];
     for (const directory of ['first', 'second']) {
       const workspace = join(root, directory);
       await mkdir(workspace);
@@ -181,12 +180,11 @@ it('failed runtime inputs have the same key at different checkout paths and stil
         new Response(child.stderr).text(),
       ]);
       expect({ exitCode, stdout }).toEqual({ exitCode: 1, stdout: 'cargo-input-unavailable\n' });
-      // Cargo's own refusal reaches the reader of the failed input, without
-      // the checkout path Nx would otherwise hash into the key.
+      // The verdict is the key; stderr must retain Cargo's cause without the
+      // checkout path, but may also contain an unrelated native-loader warning.
       expect(stderr).toContain('unclosed table');
       expect(stderr).not.toContain(workspace);
       expect(stderr).not.toContain(await realpath(workspace));
-      causes.push(stderr);
       // The cause is not the verdict: the real producer still refuses the
       // manifest with Cargo's operational cause.
       const producer = Bun.spawn(['cargo', 'build', '--locked', '--offline'], {
@@ -203,7 +201,6 @@ it('failed runtime inputs have the same key at different checkout paths and stil
       expect(producerCode).not.toBe(0);
       expect(producerError).toContain('Cargo.toml');
     }
-    expect(causes[1]).toBe(causes[0]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
