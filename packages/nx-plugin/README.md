@@ -397,6 +397,8 @@ nonzero, and `runtime-input.sh` turns that into an Nx error. Its stderr names th
 with the checkout's absolute path written as a relative one and Cargo's timing-dependent lock-wait lines dropped;
 refused arguments write nothing. The Cargo target, run by hand, still refuses the missing dependency or manifest with
 Cargo's own cause.
+Only stdout supplies the cache-key result. Stderr retains the operational cause and may also contain native-loader
+warnings; those diagnostics are not required to be byte-identical across checkouts.
 
 Cargo resolution failures (no `cargo` on PATH, a stale `Cargo.lock`, or an unavailable locked dependency) fail graph
 inference with `CargoMetadataError`, including the manifest path and Cargo's cause. A member inside the workspace
