@@ -5701,13 +5701,13 @@ fn main() {
             state.write(mount).unwrap();
             fs::create_dir_all(mount.join("nx/workspace-data")).unwrap();
             let made = std::process::Command::new("/usr/bin/sqlite3")
-                .arg(mount.join("nx/workspace-data/task.db"))
+                .arg(mount.join("nx/workspace-data/task-v3.db"))
                 .arg(schema)
                 .output_locked()
                 .unwrap();
             assert!(made.status.success(), "{made:?}");
         }
-        let source_database = from.join("nx/workspace-data/task.db");
+        let source_database = from.join("nx/workspace-data/task-v3.db");
         let seeded = std::process::Command::new("/usr/bin/sqlite3")
             .arg(&source_database)
             .arg("INSERT INTO task_details VALUES ('1', 'a', 'build', NULL); INSERT INTO cache_outputs (hash,code,size) VALUES ('1',0,4);")
@@ -5793,7 +5793,7 @@ fn main() {
         let attempted = fs::read_to_string(&admission).unwrap_or_default();
         let output = fs::read(into.join("nx/cache/1/output")).ok();
         let rows = std::process::Command::new("/usr/bin/sqlite3")
-            .arg(into.join("nx/workspace-data/task.db"))
+            .arg(into.join("nx/workspace-data/task-v3.db"))
             .arg("SELECT count(*) FROM cache_outputs WHERE hash = '1';")
             .output_locked()
             .unwrap();

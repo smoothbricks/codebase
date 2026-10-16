@@ -1930,7 +1930,7 @@ mod tests {
     /// selection, carry 0 because nothing is missing.
     #[test]
     fn rebase_from_a_target_that_indexes_nothing_is_unindexed_not_carried_zero() {
-        let target = |fixture: &Fixture| fixture.from.join("nx/workspace-data/task.db");
+        let target = |fixture: &Fixture| fixture.from.join("nx/workspace-data/task-v3.db");
         let empty = Fixture::new();
         assert_eq!(
             empty.stage(&["1"]).unindexed(),

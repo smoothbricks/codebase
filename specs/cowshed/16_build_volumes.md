@@ -476,6 +476,7 @@ allocation gives a per-image net estimate, not a container-free-space measuremen
   filesystem readers; then replace the volume, report deleted allocation and verify dirty tracked source, untracked
   files, Git state and index bytes unchanged. A stale source seed is used without refreshing or mounting it. Focused
   directory tests refuse absent seeds, unfinished lifecycle journal entries, held image locks and stale plans.
+
 ## Fork: `cowshed fork [<src>] <ws>`
 
 A fork names its source: absent `<src>` defaults to main; an explicit source may be any session or integration
@@ -681,11 +682,18 @@ closed only for as long as it was before:
 Entries cross from one image to another, so they are copied, never cloned. Their volume is the delta of what other lands
 and the target ran since the landing workspace forked, which is what a fork would otherwise rebuild. Copies run before
 the target's database is closed and cost no window; a failed copy (a full volume) stops the carry, keeps every entry
-carried until then, and is reported (`carried.stopped`); the land still succeeds. A landing Nx state with no task
-database never ran Nx, and first takes a copy of the target's database without its cache rows (`VACUUM INTO`, one
-consistent snapshot), so the carry has a schema Nx wrote to index into; one whose database has another name runs an Nx
-of another schema and gets nothing. A carry that crashes leaves only `.carry/`, which the next stage on that volume
-deletes before it starts.
+carried until then, and is reported (`carried.stopped`); the land still succeeds.
+
+A landing Nx root with no task database never ran Nx. After build-state admission and before checks or fast-forward,
+each detected Nx root is initialized through its checkout's own pinned Nx 23.2.1 `DbCache`, constructed with
+`{nxCloudRemoteCache: null, skipRemoteCache: true}`. Nx owns the complete schema initialization; the adapter never
+invokes remote initialization. An initialization failure or a different Nx version stops only Nx-entry carry, naming the
+failure or found version in `carried.stopped`; validation, fast-forward and adoption policy are unchanged.
+
+Carry requires an existing Nx-initialized v3 database and refuses one it cannot recognize. It writes no DDL or `VACUUM`,
+and copies no schema, header, journal, version or task-history metadata from the target. Initialization is Nx-owned, not
+a `VACUUM INTO` copy of another checkout's schema. A carry that crashes leaves only `.carry/`, which the next stage on
+that volume deletes before it starts.
 
 - **Enforced by**: a real-APFS test in which one workspace lands and warms an Nx task in main, a second, forked before
   that land and changing nothing the task hashes, lands without running it, and a fork of main hits the task.
@@ -1115,7 +1123,6 @@ Stacks also limit fragmentation (02_workspaces.md "Lanes"): units clone the stac
 close-out writes main. With build volumes, each level adopts its units' build volumes and reseeds ("Stacks and merge
 queues" above), and main's source image is written once per stack close-out. Stacks remain a coordinator choice; build
 volumes do not require them.
-
 
 ## Open questions
 
