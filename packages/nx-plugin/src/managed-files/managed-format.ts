@@ -111,13 +111,7 @@ export async function formatManagedContent(root: string, target: string, content
  * command to that config.
  */
 export function biomeHookArguments(stdinFilePath: string): string[] {
-  return [
-    'check',
-    '--files-ignore-unknown=true',
-    '--use-editorconfig=true',
-    `--stdin-file-path=${stdinFilePath}`,
-    '--fix',
-  ];
+  return ['format', '--files-ignore-unknown=true', '--use-editorconfig=true', `--stdin-file-path=${stdinFilePath}`];
 }
 
 /** The missing-Biome diagnostic is one line per process, not one per file written. */
