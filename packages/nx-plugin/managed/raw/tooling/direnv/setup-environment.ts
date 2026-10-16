@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { dlopen, FFIType, read as ffiRead } from 'bun:ffi';
 import {
+  type Dirent,
   chmodSync,
   closeSync,
   cpSync,
@@ -940,20 +941,145 @@ function verifyInstalledBunLinks(root: string): BunInstallIntegrityError | undef
     }
   };
 
+  // A restored store can carry a superseded peer variant of a package the install also wrote
+  // intact under another variant: its link points into the install cache of the machine that
+  // wrote it and dangles here. That variant is tolerated only when all three hold: an intact
+  // entry of the same package and version stands beside it (realpath and a readable manifest,
+  // not realpath alone), this entry is not the intact one, and no link in the installed tree
+  // still resolves into it. A referenced or sole dangling variant still refuses: same package
+  // and version is not reachability proof.
+  const identityOf = (name: string): string | null => /^(.+@\d[^+]*)(\+.*)?$/.exec(name)?.[1] ?? null;
+  const isMissing = (cause: unknown): boolean => cause instanceof Error && 'code' in cause && cause.code === 'ENOENT';
+  const storeAbs = path.resolve(store);
+  const manifestReadable = (dir: string): boolean => {
+    try {
+      JSON.parse(readFileSync(path.join(dir, 'package.json'), 'utf8'));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const entryIntact = (entryPath: string): boolean => {
+    try {
+      const real = realpathSync(entryPath);
+      for (const pkg of readdirSync(path.join(real, 'node_modules'), { withFileTypes: true })) {
+        if (pkg.name.startsWith('.')) continue;
+        if (pkg.name.startsWith('@')) {
+          const scoped = readdirSync(path.join(real, 'node_modules', pkg.name), { withFileTypes: true });
+          if (scoped.some((child) => manifestReadable(path.join(real, 'node_modules', pkg.name, child.name))))
+            return true;
+        } else if (manifestReadable(path.join(real, 'node_modules', pkg.name))) {
+          return true;
+        }
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  };
   try {
     const state = lstatSync(store, { throwIfNoEntry: false });
     // A hoisted install has no isolated store to admit.
     if (state === undefined) return undefined;
     select(store, state.isSymbolicLink());
     operation = 'inspect isolated store';
-    for (const entry of readdirSync(store, { withFileTypes: true })) {
-      if (entry.name.startsWith('.')) continue;
+    const entries = readdirSync(store, { withFileTypes: true }).filter((entry) => !entry.name.startsWith('.'));
+    const intactIdentities = new Set<string>();
+    const intactEntries = new Set<string>();
+    for (const entry of entries) {
+      if (entry.name === 'node_modules' || !(entry.isDirectory() || entry.isSymbolicLink())) continue;
+      const identity = identityOf(entry.name);
+      if (identity === null || !entryIntact(path.join(store, entry.name))) continue;
+      intactIdentities.add(identity);
+      intactEntries.add(entry.name);
+    }
+    // Every link in the installed tree that resolves into a store entry makes that entry live.
+    const referenced = new Set<string>();
+    const scanLinks = (dir: string, owner: string | null): void => {
+      let children: Dirent[];
+      try {
+        children = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const child of children) {
+        if (child.name.startsWith('.')) continue;
+        const childPath = path.join(dir, child.name);
+        if (child.name.startsWith('@') && child.isDirectory() && !child.isSymbolicLink()) {
+          scanLinks(childPath, owner);
+          continue;
+        }
+        if (!child.isSymbolicLink()) continue;
+        let target: string;
+        try {
+          target = readlinkSync(childPath);
+        } catch {
+          continue;
+        }
+        const entryName = path.relative(storeAbs, path.resolve(path.dirname(childPath), target)).split(path.sep)[0];
+        if (
+          entryName !== undefined &&
+          entryName !== '' &&
+          entryName !== '..' &&
+          entryName !== 'node_modules' &&
+          entryName !== owner
+        )
+          referenced.add(entryName);
+      }
+    };
+    scanLinks(path.join(root, 'node_modules'), null);
+    scanLinks(path.join(store, 'node_modules'), null);
+    for (const entry of entries) {
+      if (entry.name === 'node_modules' || !(entry.isDirectory() || entry.isSymbolicLink())) continue;
+      scanLinks(path.join(store, entry.name, 'node_modules'), entry.name);
+    }
+    // Root aliases are what every consumer actually resolves: each package they name must
+    // resolve to a readable manifest, wherever it points — into the store, into the install
+    // cache, or at a workspace member. No identity waiver applies here: a root alias whose
+    // target does not exist is a broken import, however intact a same-version sibling is.
+    const rootModules = path.join(root, 'node_modules');
+    const rootChildren = readdirSync(rootModules, { withFileTypes: true });
+    const checkRootPackage = (candidate: string, symbolicLink: boolean): void => {
+      try {
+        // Only a plain metadata file is skipped; a package alias that resolves to a regular
+        // file is a broken package and manifest() refuses it below.
+        if (!symbolicLink && !statSync(candidate).isDirectory()) return;
+      } catch {
+        // Dangling: manifest() refuses it with the path named.
+      }
+      manifest(candidate, symbolicLink);
+    };
+    for (const child of rootChildren) {
+      if (child.name.startsWith('.')) continue;
+      const childPath = path.join(rootModules, child.name);
+      if (child.name.startsWith('@')) {
+        // A scope is a namespace, symlinked or not: the same strict alias walk as the store's.
+        aliases(childPath, child.isSymbolicLink());
+      } else {
+        checkRootPackage(childPath, child.isSymbolicLink());
+      }
+    }
+    for (const entry of entries) {
       const candidate = path.join(store, entry.name);
       if (entry.name === 'node_modules') {
         aliases(candidate, entry.isSymbolicLink());
       } else if (entry.isDirectory() || entry.isSymbolicLink()) {
-        select(candidate, entry.isSymbolicLink());
-        aliases(path.join(candidate, 'node_modules'));
+        try {
+          select(candidate, entry.isSymbolicLink());
+          aliases(path.join(candidate, 'node_modules'));
+        } catch (cause) {
+          const identity = identityOf(entry.name);
+          if (
+            isMissing(cause) &&
+            identity !== null &&
+            intactIdentities.has(identity) &&
+            !intactEntries.has(entry.name) &&
+            !referenced.has(entry.name)
+          ) {
+            continue;
+          }
+          throw cause;
+        }
       }
     }
     return undefined;
