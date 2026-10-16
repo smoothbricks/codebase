@@ -17,6 +17,7 @@ import {
   type RepositoryInfo,
   readPackageJson,
   repositoryInfo,
+  runtimeDependencyFields,
   workspaceDependencyFields,
 } from '../lib/workspace.js';
 import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
@@ -25,8 +26,6 @@ import { withPublishManifest } from '../monorepo/publish-manifest.js';
 import { loadNxProjects, type NxProjects, projectTargetsFromNxProjects } from '../nx/index.js';
 
 const parseReleasePackManifestText = typia.json.createIsParse<ReleasePackManifest>();
-/** Runtime dependency fields expanded when computing the artifact closure. */
-const runtimeDependencyFields = ['dependencies', 'optionalDependencies', 'peerDependencies'] as const;
 
 export interface ReleasePackOptions {
   projects: string;

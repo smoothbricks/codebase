@@ -53,6 +53,9 @@ export const workspaceDependencyFields = [
 
 export type WorkspaceDependencyField = (typeof workspaceDependencyFields)[number];
 
+/** Runtime dependency fields shared by release closure selection and packed pin freshness. */
+export const runtimeDependencyFields = ['dependencies', 'optionalDependencies', 'peerDependencies'] as const;
+
 export const publishableNpmTags = ['npm:public', 'npm:private'] as const;
 
 export type PublishableNpmTag = (typeof publishableNpmTags)[number];

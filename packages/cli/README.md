@@ -171,12 +171,16 @@ It checks:
 - Nx target conventions and inferred-task setup.
 - GitHub Actions workflows, composite actions, and Dependabot configuration with [`jactionlint`].
 - [`sherif`] package hygiene, with warnings treated as validation failures.
-- Packed public package artifacts with [`publint`].
-- Packed public package type resolution with the [`attw`][are-the-types-wrong] CLI.
+- Packed publishable package artifacts with [`publint`].
+- Packed publishable package type resolution with the [`attw`][are-the-types-wrong] CLI.
 
 The packed-package checks validate what [npm] users will install, not only the source tree. `smoo` packs each
-`npm:public` package with [Bun], runs [`publint`] on the tarball, then runs [`attw`][are-the-types-wrong] on the same
-tarball.
+publishable package (`npm:public` or `npm:private`) with [Bun], runs [`publint`] on the tarball, then runs
+[`attw`][are-the-types-wrong] on the same tarball.
+
+Packed dependency freshness uses the same runtime closure as release packing: `dependencies`, `optionalDependencies`,
+and `peerDependencies`. Development workspace dependencies retain their workspace-range conversion and packed-manifest
+checks, but do not require publication of private build or test helpers that consumers never install.
 
 The [`attw`][are-the-types-wrong] check uses the `node16` profile and ignores the CJS-to-ESM warning. SmoothBricks
 packages are [ESM]-first, so [CommonJS] consumers can use dynamic import. Node 10-only subpath failures are
