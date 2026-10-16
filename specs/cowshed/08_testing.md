@@ -51,7 +51,8 @@ No mounts, no root, no network — pure functions with table-driven cases:
   the retained Store identity, exact fstab pin and complete action-outcome roster before universal predicates. Mirror
   audit tests pin each decision's kind, status, workspace and safe path before checking credential redaction. The
   concurrent reaper fixture joins its signaller and ends its owned process group even when the pre-reap assertion
-  unwinds.
+  unwinds. An independently owned stdin pipe, retained outside `Child::wait`, holds the descendant until owner cleanup
+  or owner death, rather than a lifetime timer.
 - **Env wiring**: exec env allowlist filtering (no `*_TOKEN`/`*_SECRET`/`AWS_*` pass-through), cache exports match
   03_caches.md exactly.
 - **Repository Cargo warmth**: warm the real repository's own config in a managed shell, fork its source/build images to
