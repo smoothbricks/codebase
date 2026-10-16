@@ -658,18 +658,21 @@ const ROOT_PROBE: &str = "COWSHED_NX_PUBLICATION_ROOT_PROBE";
 
 /// The repository root is resolved from the manifest directory at runtime, never baked in at
 /// compile time: a child test process whose `CARGO_MANIFEST_DIR` names another fixture resolves
-/// that fixture. The child is given its environment on its own `Command`, so no test mutates the
-/// shared environment that parallel tests read.
+/// that fixture. A private file carries the exact native path bytes independently of libtest's
+/// stdout formatting. The child gets its environment on its own `Command`, so no test mutates
+/// the shared environment that parallel tests read.
 #[test]
 fn repository_root_resolves_the_manifest_at_runtime_not_at_compile_time() {
-    if std::env::var_os(ROOT_PROBE).is_some() {
-        println!("probe-root {}", repository_root().display());
+    if let Some(probe) = std::env::var_os(ROOT_PROBE) {
+        std::fs::write(probe, repository_root().as_os_str().as_encoded_bytes())
+            .expect("write the resolved root probe");
         return;
     }
     let fixture = fixture();
     let manifest = fixture.join("packages/cowshed/crates/cowshed-core");
     std::fs::create_dir_all(&manifest).expect("fixture manifest directory");
     let expected = std::fs::canonicalize(&*fixture).expect("canonical fixture root");
+    let probe = fixture.join("resolved-root");
     let output = Command::new(std::env::current_exe().expect("this test binary"))
         .args([
             "--exact",
@@ -677,16 +680,13 @@ fn repository_root_resolves_the_manifest_at_runtime_not_at_compile_time() {
             "--nocapture",
         ])
         .env("CARGO_MANIFEST_DIR", &manifest)
-        .env(ROOT_PROBE, "1")
+        .env(ROOT_PROBE, &probe)
         .output_locked()
         .expect("run the root probe child");
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{}", text(&output));
-    let resolved = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("probe-root "))
-        .unwrap_or_else(|| panic!("the probe reported no root: {stdout}"));
-    assert_eq!(resolved, expected.display().to_string());
+    let resolved = std::fs::read(&probe)
+        .unwrap_or_else(|error| panic!("read root probe {}: {error}", probe.display()));
+    assert_eq!(resolved.as_slice(), expected.as_os_str().as_encoded_bytes());
 }
 
 fn read_manifest(path: &Path) -> Value {
