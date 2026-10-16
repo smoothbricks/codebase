@@ -1328,11 +1328,10 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 Some(target) => {
                     let mount = host.mount_build_volume(layout, &target).map_err(storage)?;
                     let state = BuildVolumeState::read(&mount)?;
-                    let staged = match stopped {
+                    match stopped {
                         Some(reason) => carry::Staged::stopped(reason),
                         None => carry::stage(&mount, &state, &quiet.mount, &quiet.state),
-                    };
-                    staged
+                    }
                 }
                 None => stopped.map_or_else(carry::Staged::default, carry::Staged::stopped),
             };
