@@ -253,3 +253,25 @@ async fn one_unit_keeps_one_live_attempt_over_the_wire() {
     gateway.drain().await.expect("drain");
     std::fs::remove_dir_all(root).expect("clean fixture root");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_band_units_share_cpu_without_exclusive_root_admission() {
+    let (gateway, root, socket) = gateway(2).await;
+    // Both requests retain TaskAdmitRequest's Gate class. Their grants must coexist:
+    // a task band is not an exclusive JobserverClass::Gate root.
+    let mut first = Asker::ask(&socket, admit("first", &[], 1, None)).await;
+    let mut second = Asker::ask(&socket, admit("second", &[], 1, None)).await;
+    for runner in [&mut first, &mut second] {
+        let grant = runner
+            .granted(Duration::from_secs(10))
+            .await
+            .expect("independent gate-band work shares available CPU");
+        assert_eq!(grant["cpuTokens"], 1);
+    }
+    let queue = one_shot(&socket, "{\"op\":\"task-queue\"}\n").await;
+    assert_eq!(queue["taskQueue"]["running"].as_array().unwrap().len(), 2);
+    drop(first);
+    drop(second);
+    gateway.drain().await.expect("drain");
+    std::fs::remove_dir_all(root).expect("clean fixture root");
+}

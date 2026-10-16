@@ -674,7 +674,11 @@ chooses which ready unit acquires a lease. Strong models propose task boundaries
 - **The CPU budget stays the only allocator.** On selection the scheduler submits the unit's CPU ask to the budget
   above, in selection order, and the grant reports the tokens the budget gave it. The scheduler holds no token counter:
   its capacity view folds the budget's own ledger, a capacity observation never mints a grant, and what cannot be
-  observed stays unknown rather than becoming headroom.
+  observed stays unknown rather than becoming headroom. `TaskClass` is the work-unit ordering and placement axis, not
+  the root-admission `JobserverClass` axis. Selected work-unit asks use `JobserverClass::Background`, including units in
+  the `TaskClass::Gate` band; a task band must not create an exclusive gate root per group. The trusted execution
+  boundary owns the one host-wide `JobserverClass::Gate` grant; its coordinator groups share that grant's existing child
+  pool concurrently.
 - **Wire.** `task-admit` is held exactly like `cpu-tokens` —
   `{"op":"task-admit","unit":…,"owner":…,"incarnation": …,"deps":[…],"leases":[…],"want":<n>,"priority":<u32>,"urgent":true,"class":"background","cost":<u64>,"deadline": <epoch-ms>,"command":…}`
   — answered `queued` at once and a granted `taskGrant` (`unit`, `band`, `caps`, `cpuTokens`) when the scheduler selects
@@ -691,7 +695,8 @@ Tests: the scheduler's own regressions pin the policy without an agent in the lo
 set, the same order from the same facts however they arrive, a low-priority unit selected at its age bound under a
 stream of fresher urgent arrivals, the serial classes with the urgent land behind a turn in progress, one live attempt
 per unit, and the caps applied and clamped to the grant — plus `tests/task_server.rs` over a real control socket: units
-admitted and advanced by their terminal facts alone, with the caps and the queue view read off the wire.
+admitted and advanced by their terminal facts alone, with the caps and the queue view read off the wire. Gate-band units
+with spare CPU capacity retain concurrent grants; a work-unit class never creates exclusive root-gate admission.
 
 ## Credentials
 

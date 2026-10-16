@@ -883,6 +883,7 @@ async fn run(
                         Arc::clone(&facts.owner),
                         want,
                         Claim::new(&facts.command, facts.pid),
+                        cowshed_gateway_types::JobserverClass::Background,
                     );
                     cpu_stakes.insert(ticket, stake);
                     let ceiling = facts.caps;
