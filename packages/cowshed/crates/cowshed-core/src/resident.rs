@@ -471,17 +471,6 @@ mod tests {
             let checkout = root.join("checkout");
             std::fs::create_dir_all(&store).expect("store");
             std::fs::create_dir_all(checkout.join(".git")).expect("checkout");
-            let host = store.join("host.json");
-            std::fs::write(
-                &host,
-                format!(
-                    r#"{{"version":1,"mountRoot":"{}"}}"#,
-                    root.join("mnt").display()
-                ),
-            )
-            .expect("host config");
-            std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o600))
-                .expect("host config mode");
             let layout = StorageLayout::new(&store, &repo()).expect("layout");
             let project = layout.project().clone();
             std::fs::create_dir_all(&project.sessions).expect("sessions");

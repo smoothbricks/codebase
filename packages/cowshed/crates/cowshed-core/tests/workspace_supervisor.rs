@@ -974,6 +974,7 @@ async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
     let before_id = BuildVolumeId::parse(&"a".repeat(32)).unwrap();
     let adopted_id = BuildVolumeId::parse(&"b".repeat(32)).unwrap();
     std::fs::create_dir_all(layout.images()).unwrap();
+    std::fs::create_dir_all(layout.mounts()).unwrap();
     for id in [&before_id, &adopted_id] {
         std::fs::File::create(layout.image(id)).unwrap();
     }
