@@ -21,7 +21,12 @@ import {
 } from './__tests__/counted-cargo.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
-import { boundedCargoLockWait, type CargoResolve, readCargoResolve } from './cargo-source-hash.js';
+import {
+  acquireCargoResolveLock,
+  type CargoResolve,
+  CargoResolveLockError,
+  readCargoResolve,
+} from './cargo-source-hash.js';
 import { createNodesV2 } from './index.js';
 
 useFixtureCargoHome();
@@ -992,21 +997,47 @@ it('a Cargo child that never answers is killed and named at the resolve bound', 
   });
 }, 20_000);
 
-it('a resolve lock held by another worker fails its waiter at the bound, naming the lock', async () => {
+it('a held resolve lock times out with its name and elapsed wait and leaves no lock child', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-resolve-lock-')));
   try {
     const lockFile = join(root, 'resolve.lock');
     const holder = new FileLock(lockFile);
     holder.lock();
     try {
-      const refused = await rejectionOf(boundedCargoLockWait(new FileLock(lockFile), lockFile, 50));
-      expect(String(refused)).toContain('waited 50ms for the Cargo resolve lock');
-      expect(String(refused)).toContain(lockFile);
+      const started = performance.now();
+      const refused = await rejectionOf(acquireCargoResolveLock(lockFile, 100));
+      if (!(refused instanceof CargoResolveLockError)) throw new Error(`unexpected lock refusal: ${refused}`);
+      expect(refused.name).toBe('CargoResolveLockError');
+      expect(refused.message).toContain(lockFile);
+      expect(refused.message).toContain(`waited ${refused.waitedMs}ms`);
+      expect(refused.message).toContain('bound 100ms');
+      expect(refused.waitedMs).toBeGreaterThanOrEqual(100);
+      expect(performance.now() - started).toBeLessThan(1_100);
+      if (refused.waiterPid === undefined) throw new Error('the lock refusal named no spawned waiter');
+      expect(refused.message).toContain(`reaped lock waiter pid ${refused.waiterPid}`);
+      expect(alive(refused.waiterPid)).toBe(false);
+      expect(new FileLock(lockFile).check()).toBe(true);
     } finally {
       holder.unlock();
     }
-    // Once the holder lets go, the same wait takes the lock at once.
-    await boundedCargoLockWait(new FileLock(lockFile), lockFile, 50);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+it('a successful resolve lock lease holds the kernel lock until its child is released and reaped', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-resolve-lease-')));
+  try {
+    const lockFile = join(root, 'resolve.lock');
+    const lease = await acquireCargoResolveLock(lockFile, 5_000);
+    try {
+      expect(alive(lease.pid)).toBe(true);
+      expect(new FileLock(lockFile).check()).toBe(true);
+    } finally {
+      await lease.release();
+    }
+    expect(alive(lease.pid)).toBe(false);
+    expect(new FileLock(lockFile).check()).toBe(false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

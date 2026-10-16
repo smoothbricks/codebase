@@ -15,6 +15,7 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -23,7 +24,7 @@ import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory
 import { CARGO_TOOLCHAIN_PIN_INPUTS } from './cargo-toolchain-policy.js';
 import { rustTokens } from './rust-tokens.js';
 
-const { FileLock, IS_WASM, WorkspaceContext } = native;
+const { IS_WASM, WorkspaceContext } = native;
 
 const cargoResolveEvents = channel('@smoothbricks/nx-plugin:cargo-resolve');
 
@@ -502,10 +503,9 @@ async function loadResolveCache(file: string): Promise<ResolveCache | null> {
 
 /**
  * One content-keyed resolution per Cargo workspace, across concurrent graph
- * calls and workers. Nx's kernel FileLock releases even if its worker dies;
- * in-process callers join before taking that lock, so a synchronous lock()
- * cannot block the continuation that owns it. A changed key queues behind
- * the old child instead of receiving its stale answer.
+ * calls and workers. A bounded child owns Nx's kernel FileLock while the
+ * resolution runs; in-process callers join before asking for that lease.
+ * A changed key queues behind the old child instead of receiving its stale answer.
  */
 export async function readCargoResolve(
   manifestPath: string,
@@ -592,11 +592,7 @@ async function resolveAndCache(
     if (state.cached?.key === key) return state.cached.cargo;
   }
   const lockFile = join(directory, 'resolve.lock');
-  const lock = new FileLock(lockFile);
-  await boundedCargoLockWait(lock, lockFile, boundMs);
-  // Nx's lock() is synchronous: losing this inter-process check/acquire race
-  // can block for one foreign flight. Only the in-process leader reaches it.
-  lock.lock();
+  const lock = await acquireCargoResolveLock(lockFile, boundMs);
   try {
     // Another worker may have populated it while this worker waited.
     state.cached = await loadResolveCache(file);
@@ -639,42 +635,117 @@ async function resolveAndCache(
     }
     throw new Error('Cargo resolution inputs kept changing during three consecutive locked offline queries');
   } finally {
-    lock.unlock();
+    await lock.release();
+  }
+}
+
+/** A failed acquisition names the lock, elapsed wait, and the reaped waiter. */
+export class CargoResolveLockError extends Error {
+  constructor(
+    readonly lockFile: string,
+    readonly boundMs: number,
+    readonly waitedMs: number,
+    readonly waiterPid: number | undefined,
+  ) {
+    super(
+      `waited ${waitedMs}ms for the Cargo resolve lock ${lockFile} (bound ${boundMs}ms; holder pid unknown); ` +
+        `killed and reaped lock waiter pid ${waiterPid ?? 'unavailable'} because an unbounded wait hangs project-graph construction`,
+    );
+    this.name = 'CargoResolveLockError';
   }
 }
 
 /**
- * Take `lock` once it is free, or fail at `boundMs` naming the lock and the wait: the
- * native wait has no bound of its own, and a stopped or stuck holder must not hang
- * every project-graph construction behind it with no output.
+ * The pinned Nx binding has only blocking acquisition. Isolate that syscall in
+ * one child per cold flight so the caller's deadline can kill and reap it.
+ * Closing stdin releases a successful lease; warm cache reads spawn no child.
  */
-
-export async function boundedCargoLockWait(
-  lock: InstanceType<typeof FileLock>,
+export function acquireCargoResolveLock(
   lockFile: string,
   boundMs: number,
-): Promise<void> {
-  if (!lock.check()) return;
+): Promise<{ readonly pid: number; release(): Promise<void> }> {
+  const nativeModule = createRequire(import.meta.url).resolve('nx/src/native/index.js');
+  const program = [
+    `const { FileLock } = require(${JSON.stringify(nativeModule)});`,
+    `const lock = new FileLock(${JSON.stringify(lockFile)});`,
+    'lock.lock();',
+    "process.stdout.write('locked\\n');",
+    'process.stdin.resume();',
+    "process.stdin.on('end', () => { lock.unlock(); process.exit(0); });",
+  ].join('\n');
   // The public ES2022 library API requires the constructor form, not Promise.withResolvers.
-  let timer: NodeJS.Timeout | undefined;
-  const bound = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(
-      () =>
-        reject(
-          new Error(
-            `waited ${boundMs}ms for the Cargo resolve lock ${lockFile}, held by another Nx worker; ` +
-              'refusing to wait longer, because an unbounded wait hangs every project-graph construction with no output. ' +
-              'Look for a stopped or stuck Nx or Cargo process holding it.',
-          ),
-        ),
+  return new Promise((settle, reject) => {
+    const started = performance.now();
+    const child = spawn(process.execPath, ['--eval', program], {
+      detached: process.platform !== 'win32',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let acquired = false;
+    let releasing = false;
+    let failure: Error | undefined;
+    let stdout = '';
+    let stderr = '';
+    const fail = (error: Error): void => {
+      failure ??= error;
+      killCargoChild(child);
+    };
+    const timer = setTimeout(
+      () => fail(new CargoResolveLockError(lockFile, boundMs, Math.ceil(performance.now() - started), child.pid)),
       boundMs,
     );
+    const closed = new Promise<void>((finish) => {
+      child.on('close', (code, signal) => {
+        clearTimeout(timer);
+        cargoChildren.delete(child);
+        if (cargoChildren.size === 0) {
+          process.removeListener('exit', killCargoChildren);
+          removeCargoSignalHandlers();
+        }
+        if (failure === undefined && (!releasing || code !== 0)) {
+          failure = new Error(
+            `Cargo resolve lock ${lockFile} waiter pid ${child.pid} exited (${signal ?? code}): ${stderr.trim()}`,
+          );
+        }
+        if (!acquired) reject(failure);
+        finish();
+      });
+    });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+      if (failure !== undefined || acquired || stdout !== 'locked\n') return;
+      const waitedMs = Math.ceil(performance.now() - started);
+      if (waitedMs >= boundMs) {
+        fail(new CargoResolveLockError(lockFile, boundMs, waitedMs, child.pid));
+        return;
+      }
+      if (child.pid === undefined) {
+        fail(new Error(`Cargo resolve lock ${lockFile} acquired without a child pid`));
+        return;
+      }
+      acquired = true;
+      clearTimeout(timer);
+      settle({
+        pid: child.pid,
+        release: async () => {
+          releasing = true;
+          child.stdin.end();
+          await closed;
+          if (failure !== undefined) throw failure;
+        },
+      });
+    });
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+    child.on('error', fail);
+    child.stdin.on('error', fail);
+    child.stdout.on('error', fail);
+    child.stderr.on('error', fail);
+    if (cargoChildren.size === 0) ownCargoChildren();
+    cargoChildren.add(child);
   });
-  try {
-    await Promise.race([lock.wait(), bound]);
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 async function resolveCargoMetadata(

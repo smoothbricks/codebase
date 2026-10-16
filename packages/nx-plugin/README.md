@@ -352,6 +352,14 @@ both the Nx and Cargo workspaces are left to the plugin's inferred file inputs. 
 require maintaining a second list of source roots. The command refuses missing dependencies or an unavailable locked
 dependency cache instead of emitting a partial digest.
 
+Each Cargo child and each acquisition of the cross-process resolve lock has a five-minute `CARGO_RESOLVE_BOUND_MS`
+deadline. A warm content-keyed cache read takes no lock and spawns no child. A cold flight acquires the pinned Nx
+binding's blocking kernel lock in one owned child; its parent kills and reaps that child if acquisition exceeds the
+deadline. The named `CargoResolveLockError` reports the lock path, elapsed wait, bound and waiter pid (the holder pid is
+unknown). A successful flight holds the lease until closing the child's stdin releases the lock and the child is reaped.
+A timed-out Cargo command is killed, and resolution refuses instead of hanging graph construction or returning a stale
+closure.
+
 ### Cargo closure input
 
 Custom Cargo targets that replace inferred inputs need the source closure of the crates they build. The plugin infers it
