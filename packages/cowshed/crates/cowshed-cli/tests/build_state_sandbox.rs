@@ -103,6 +103,7 @@ fn host_controller_build_state_answers_with_only_the_installed_executable_grant(
         workspace_mount: checkout,
         exec_temp_dir: temporary,
         profile_directory: cowshed_core::exec::profile_directory(&scratch.join("store")),
+        cpu_pool_directory: None,
         port_block: PortBlock::new(40_960, 16).unwrap(),
         retained_port_blocks: Vec::new(),
         mode: RunSandboxMode::ReadWrite,

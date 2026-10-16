@@ -47,9 +47,9 @@ use crate::repository::OwnedRepoIds;
 use crate::repository::{RepoId, RepositoryBinding};
 use crate::runtime::job_progress::JobProgressStream;
 use crate::runtime::process_stream::JobProcessStream;
-use crate::runtime::supervisor_socket::AdmissionSource;
 #[cfg(target_os = "macos")]
 use crate::runtime::supervisor::NxDaemonRetirement;
+use crate::runtime::supervisor_socket::AdmissionSource;
 #[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::RunAsync as _;
 #[cfg(target_os = "macos")]

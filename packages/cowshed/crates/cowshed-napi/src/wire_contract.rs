@@ -827,7 +827,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
-    let land_unverifiable = LandReport {
+    let land_unverifiable = cowshed_core::api::dto::LandedReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
             seed: cowshed_core::api::dto::LandSeed::Unchanged,
             adoption: cowshed_core::api::dto::Adoption::Skipped {

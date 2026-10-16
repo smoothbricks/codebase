@@ -7957,7 +7957,7 @@ mod tests {
                 JobScheduling::default(),
                 OutputTargets::default(),
             ),
-            Err(ArtifactError::AdmissionKeyUnprovable { set_aside: path }) if path == set_aside
+            Err(ArtifactError::HistoryUnprovable { set_aside: path }) if path == set_aside
         ));
         assert_eq!(fs::read(records_path(&root)).ok(), before);
         drop(store);
@@ -8120,14 +8120,17 @@ mod tests {
         );
         drop(store);
 
-        let reopened = store_at(&root, ArtifactConfig::default());
+        let mut reopened = store_at(&root, ArtifactConfig::default());
         match reopened.admitted(&admission.key) {
             AdmissionLookup::Admitted { scheduling, .. } => {
                 assert_eq!(scheduling, gate(8, 120_000));
             }
             other => panic!("the key reads back as {other:?}"),
         }
-        let record = reopened.sealed(job_id).expect("the terminal record");
+        let record = reopened
+            .sealed(job_id)
+            .unwrap()
+            .expect("the terminal record");
         assert_eq!(
             (record.scheduling, record.cpu_tokens, record.nice),
             (gate(8, 120_000), NonZeroUsize::new(6), Some(0))
@@ -8266,7 +8269,14 @@ mod tests {
         let mut untouched = store_at(&root, ArtifactConfig::default());
         let readable_id = store.next_job_id().unwrap();
         let token = store
-            .begin_job(readable_id, 1, &argv_true(), None, OutputTargets::default())
+            .begin_job(
+                readable_id,
+                1,
+                &argv_true(),
+                None,
+                JobScheduling::default(),
+                OutputTargets::default(),
+            )
             .unwrap();
         let mut running_reader = store_at(&root, ArtifactConfig::default());
         assert!(running_reader.sealed(readable_id).unwrap().is_none());
@@ -8401,7 +8411,14 @@ mod tests {
         // and the seal, so only the digest can refuse it.
         let spill_id = store.next_job_id().unwrap();
         let token = store
-            .begin_job(spill_id, 1, &argv_true(), None, OutputTargets::default())
+            .begin_job(
+                spill_id,
+                1,
+                &argv_true(),
+                None,
+                JobScheduling::default(),
+                OutputTargets::default(),
+            )
             .unwrap();
         let correct: &[u8] = b"sealed spill bytes";
         store.append(&token, StreamKind::Stdout, correct).unwrap();
@@ -8449,7 +8466,14 @@ mod tests {
         // spill's immutable record: a changed refresh validates only the newly learned terminal.
         let next_id = store.next_job_id().unwrap();
         let token = store
-            .begin_job(next_id, 1, &argv_true(), None, OutputTargets::default())
+            .begin_job(
+                next_id,
+                1,
+                &argv_true(),
+                None,
+                JobScheduling::default(),
+                OutputTargets::default(),
+            )
             .unwrap();
         store.finish(token, JobState::Exited).unwrap();
         assert!(
@@ -9326,7 +9350,14 @@ mod tests {
         );
         let other_id = store.next_job_id().unwrap();
         let other = store
-            .begin_job(other_id, 1, &argv_true(), None, OutputTargets::default())
+            .begin_job(
+                other_id,
+                1,
+                &argv_true(),
+                None,
+                JobScheduling::default(),
+                OutputTargets::default(),
+            )
             .unwrap();
         store.finish(other, JobState::Failed).unwrap();
         assert!(
