@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { managedAssetsRoot } from '@smoothbricks/nx-plugin/managed-assets';
@@ -145,6 +145,13 @@ function runInstallDevenv(lock: string, options: { devenvVersion?: string; hostR
     const bin = join(dir, 'bin');
     mkdirSync(direnv, { recursive: true });
     mkdirSync(bin);
+    // NixOS does not put coreutils in /usr/bin or /bin. Admit only the real
+    // tools this script needs, never a profile directory containing devenv.
+    for (const tool of ['bash', 'dirname', 'mkdir']) {
+      const resolved = Bun.which(tool);
+      if (resolved === null) throw new Error(`${tool} must be on PATH`);
+      symlinkSync(resolved, join(bin, tool));
+    }
     writeFileSync(join(direnv, 'github-actions-bootstrap.sh'), readFileSync(script, 'utf8'));
     writeFileSync(join(direnv, 'devenv.lock'), lock);
     const nixCalls = join(dir, 'nix-calls');
@@ -158,12 +165,12 @@ function runInstallDevenv(lock: string, options: { devenvVersion?: string; hostR
       writeFileSync(devenv, `#!/usr/bin/env bash\necho "${options.devenvVersion}"\n`);
       chmodSync(devenv, 0o755);
     }
-    const r = spawnSync('bash', [join(direnv, 'github-actions-bootstrap.sh'), 'install-devenv'], {
+    const r = spawnSync(join(bin, 'bash'), [join(direnv, 'github-actions-bootstrap.sh'), 'install-devenv'], {
       encoding: 'utf8',
       // A bare PATH on purpose: an ambient devenv would decide these cases
       // instead of the stub.
       env: {
-        PATH: `${bin}:/usr/bin:/bin`,
+        PATH: bin,
         HOME: join(dir, 'home'),
         NIX_CALLS: nixCalls,
         REAL_NIX,

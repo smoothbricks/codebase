@@ -49,3 +49,8 @@ The managed `repo-path` helper keeps an active `VIRTUAL_ENV/bin` ahead of the de
 hook or tooling calls. With no active environment, its repository entries are unchanged. Its `--print` and
 `--github-path` modes use the same entries, with the existing reverse order for GitHub PATH writes. Installed Cargo and
 cowshed launchers still prepend their owned directory after composition, so activating Python does not replace them.
+
+Shell fixtures for `github-actions-bootstrap` and `repo-path` resolve their required Bash and coreutils executables from
+the active toolchain into private tool directories before scrubbing `PATH`. They run without `/usr/bin:/bin`, which does
+not provide coreutils on NixOS. The install fixture still delegates lock evaluation to the real Nix executable, but
+never adds its profile directory to the child search path, so an ambient devenv cannot choose the install branch.
