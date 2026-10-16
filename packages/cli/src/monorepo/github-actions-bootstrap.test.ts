@@ -257,18 +257,22 @@ describe('github-actions-bootstrap install-devenv', () => {
     expect(run.nixCalls).toBe('');
   });
 
-  it('installs from the floating branch on a host runner with no devenv', () => {
-    // The one place drift is accepted deliberately. A host installs into a
-    // long-lived profile that roots the fleet's shared store, and holding it
-    // back to an older CLI than the fleet was running segfaulted the Rust
-    // linker in run 34374650577. Refusing to install at all was also wrong —
-    // that failed linux-release-candidate in run 34373420924.
+  it('installs a pinned devenv release on a host runner with no devenv', () => {
+    // Not the locked rev: a host installs into a long-lived profile that roots
+    // the fleet's shared store, and holding it back to an older CLI than the
+    // fleet was running segfaulted the Rust linker in run 34374650577.
+    // Refusing to install at all was also wrong — that failed
+    // linux-release-candidate in run 34373420924. Not devenv's floating main
+    // either: on 2026-10-16 main needed a nix 2.35.2 the binary cache did not
+    // serve, and every host failed compiling it. A release is pinned in
+    // devenv.cachix.org for good.
     const run = runInstallDevenv(LOCK_WITH_REV, { hostRunner: true });
     if (run.status !== 0) {
       printCommandOutput(run.stdout, run.stderr);
     }
     expect(run.status).toBe(0);
-    expect(run.nixCalls).toContain('nix profile add --accept-flake-config github:cachix/devenv\n');
+    expect(run.nixCalls).toMatch(/nix profile add --accept-flake-config github:cachix\/devenv\/v\d+(\.\d+)+\n/);
+    expect(run.nixCalls).not.toContain('github:cachix/devenv\n');
     expect(run.nixCalls).not.toContain(REV);
     // Never on a host: the profile roots a store the whole fleet shares.
     expect(run.nixCalls).not.toContain('profile remove');
