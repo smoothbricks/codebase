@@ -136,6 +136,11 @@ No mounts, no root, no network — pure functions with table-driven cases:
   transitions once to `output-limit`; tests pin TERM→grace→KILL→drain→seal→terminal-audit-record ordering and
   distinguish timeout/signal/exit.
 
+Native process-metric fixtures that require a positive RSS wait for the measured child itself to report readiness after
+exec and touching memory. A parent's report of the just-forked PID is not that evidence: the child can still report
+measured zero before exec. One lifecycle keeps the live, exited-unreaped and reaped assertions; no sleep or retry
+supplies readiness.
+
 ## Host-controller authority
 
 Run `nx run cowshed:host-controller-test` from the owned checkout in an unsandboxed host-controller shell. This single
