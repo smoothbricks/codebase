@@ -162,8 +162,9 @@ ASIF-to-RAW transition and the RAW guest-space reclaim operation, not an image c
    legacy ASIF source's hold is distinct from the published RAW hold: the old claim remains alive while seed capture
    independently claims the new RAW resource. A published replacement or kept build already detached is seeded before
    its first mount, not mounted merely to detach and restore it for capture. The claim remains held through that mount
-   and the new seed's post-mount freshness mark. A replay keeps an existing seed's mark: it never declares old captured
-   bytes current by sampling the live image again.
+   and the new seed's captured-clone freshness mark. This immutable captured-clone clock replaces live-source
+   re-stamping after mount. A replay keeps an existing seed's mark: it never declares old captured bytes current by
+   sampling the live image again.
 4. Verify the copied content before publication, including tracked and untracked-not-ignored file checksums, the entire
    `.git` state above, `git fsck`, and the build contents and identity. Re-adoption does not normalize Git
    configuration, delete lock files, prune worktree registrations or replace user hooks. Only cowshed's own marker and
