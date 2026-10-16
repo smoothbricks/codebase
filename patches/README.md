@@ -86,6 +86,22 @@ require `python3 tooling/nx_patch.py --check` to reproduce the current patch byt
 regenerate both patch copies with `python3 tooling/nx_patch.py`. Retire the prepared copy and install normally as
 specified there. Do not splice Bun-generated sections or hand-edit the generated patch.
 
+## Root-only raw-input inspection
+
+`getTaskRawInputs` returns only the requested canonical task's inputs. Upstream nevertheless asks the native inspector
+to resolve every plan in its dependency graph, including output-inventory walks whose results the caller discards. Each
+parallel output walk creates its own filesystem workers, so this wasted work can consume a test's unchanged bound.
+
+The raw-input call now supplies only the canonical task ID at the plan-selection boundary. The complete task graph still
+reaches the planner: dependency edges and generated-output inputs are not excluded. `inspectTaskInputs` keeps its
+full-closure default; its optional selected-ID list limits resolution, not graph construction. No persistent inventory
+cache, thread-environment override, input narrowing or timeout change is involved.
+
+`nx-raw-inputs.test.ts` runs the actual installed Nx planner and inspector against a diamond producer graph. It compares
+every root input bucket with full-closure inspection, retains the shared transitive producer's declarations,
+distinguishes configurations and unrelated files, and preserves refusal errors. A delegating control drops the
+selected-ID argument; the same oracle must then reject the old all-plan behavior without depending on a timeout.
+
 ## Cross-client task output ownership
 
 Clients of one checkout share a target's output tree and cache entry. Each target with declared outputs holds one
