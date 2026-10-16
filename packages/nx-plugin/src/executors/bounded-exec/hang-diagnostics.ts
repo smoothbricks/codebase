@@ -160,7 +160,8 @@ export function captureHangDiagnostics(
       let observed = before.length > 0;
       if (source.platform === 'darwin') {
         const args = ['-nP', '-p', before.map((entry) => entry.pid).join(',')];
-        let resources = await probe('lsof privileged', '/usr/bin/sudo', ['-n', '/usr/sbin/lsof', ...args], 1_500);
+        // Bare `sudo`/`lsof` through PATH, like `ps` above: NixOS provides neither /usr/bin/sudo nor /usr/sbin/lsof.
+        let resources = await probe('lsof privileged', 'sudo', ['-n', 'lsof', ...args], 1_500);
         if (finished) return;
         const answered = (result: HangProbeResult): boolean =>
           result.status === 'exited' && (result.code === 0 || (result.code === 1 && result.stderr.trim() === ''));
@@ -171,7 +172,7 @@ export function captureHangDiagnostics(
           lines.push(
             'Privileged resource census unavailable; fallback is ordinary-user visibility only, not proof of no holders.',
           );
-          resources = await probe('lsof user-scoped fallback', '/usr/sbin/lsof', args, 1_000);
+          resources = await probe('lsof user-scoped fallback', 'lsof', args, 1_000);
           if (finished) return;
         }
         if (resources.stdout.trim() !== '')
