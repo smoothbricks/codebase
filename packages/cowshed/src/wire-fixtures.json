@@ -2105,6 +2105,7 @@
           "kind": "unchanged"
         }
       },
+      "kind": "landed",
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
       "targetBranch": "main",
