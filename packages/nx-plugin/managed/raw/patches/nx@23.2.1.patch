@@ -1319,6 +1319,63 @@ index 66371610921778e1ee3c44055ca6438cc01dc7a9..92b1f00e948ac522fad5a6e6e3e87f41
  // Prepare a serialized project graph result for sending over IPC from the server to the client
  function serializeResult(error, serializedProjectGraph, serializedSourceMaps) {
      // We do not want to repeat work `JSON.stringify`ing an object containing the potentially large project graph so merge as strings
+diff --git a/dist/src/hasher/check-task-files.js b/dist/src/hasher/check-task-files.js
+index d21213e8de9eba5e1edcde9e7db474ec7266272b..584785648eefa62878cc914a2d91bace5478fccf 100644
+--- a/dist/src/hasher/check-task-files.js
++++ b/dist/src/hasher/check-task-files.js
+@@ -96,11 +96,13 @@ async function getRawInputs(taskId, { projectGraph, getInspector }) {
+     const inspector = await getInspector();
+     // `null` means "this task is absent from the hash plan" — any other failure
+     // is a real error and propagates to the caller.
++    // The raw API returns only this task. Keep its producer graph for planning,
++    // but do not resolve dependency plans whose results would be discarded.
+     const planResult = inspector.inspectTaskInputs({
+         project,
+         target,
+         configuration,
+-    });
++    }, {}, {}, false, [canonicalTaskId]);
+     const result = planResult[canonicalTaskId] ?? null;
+     hashInputsCache.set(taskId, result);
+     return result;
+diff --git a/dist/src/hasher/hash-plan-inspector.d.ts b/dist/src/hasher/hash-plan-inspector.d.ts
+index edb5a7bf425cfd04ad243b0d30a21f1cf6061140..316ca4b91dbf788c9f41d5a2acfbb077590d5db2 100644
+--- a/dist/src/hasher/hash-plan-inspector.d.ts
++++ b/dist/src/hasher/hash-plan-inspector.d.ts
+@@ -26,8 +26,9 @@ export declare class HashPlanInspector {
+     /**
+      * Like inspectTask() but returns structured HashInputs objects instead of flat strings.
+      * Each input is categorized into files, runtime, environment, depOutputs, or external.
++     * A selected task list limits resolution, not the dependency graph used to plan its inputs.
+      */
+     inspectTaskInputs({ project, target, configuration }: Target, parsedArgs?: {
+         [k: string]: any;
+-    }, extraTargetDependencies?: Record<string, (TargetDependencyConfig | string)[]>, excludeTaskDependencies?: boolean): Record<string, HashInputs>;
++    }, extraTargetDependencies?: Record<string, (TargetDependencyConfig | string)[]>, excludeTaskDependencies?: boolean, taskIdsToInspect?: string[]): Record<string, HashInputs>;
+ }
+diff --git a/dist/src/hasher/hash-plan-inspector.js b/dist/src/hasher/hash-plan-inspector.js
+index 332accab74919348073538f4198693328bf68193..a56864600a5e7a9f9e40adea9a7bfc9e5803029d 100644
+--- a/dist/src/hasher/hash-plan-inspector.js
++++ b/dist/src/hasher/hash-plan-inspector.js
+@@ -54,15 +54,16 @@ class HashPlanInspector {
+     /**
+      * Like inspectTask() but returns structured HashInputs objects instead of flat strings.
+      * Each input is categorized into files, runtime, environment, depOutputs, or external.
++     * A selected task list limits resolution, not the dependency graph used to plan its inputs.
+      */
+-    inspectTaskInputs({ project, target, configuration }, parsedArgs = {}, extraTargetDependencies = {}, excludeTaskDependencies = false) {
++    inspectTaskInputs({ project, target, configuration }, parsedArgs = {}, extraTargetDependencies = {}, excludeTaskDependencies = false, taskIdsToInspect) {
+         const { nxArgs, overrides } = (0, command_line_utils_1.splitArgsIntoNxArgsAndOverrides)({
+             ...parsedArgs,
+             configuration: configuration,
+             targets: [target],
+         }, 'run-one', { printWarnings: false }, this.nxJson);
+         const taskGraph = (0, create_task_graph_1.createTaskGraph)(this.projectGraph, extraTargetDependencies, [project], nxArgs.targets, nxArgs.configuration, overrides, excludeTaskDependencies);
+-        const taskIds = Object.keys(taskGraph.tasks);
++        const taskIds = taskIdsToInspect ?? Object.keys(taskGraph.tasks);
+         const plansReference = this.planner.getPlansReference(taskIds, taskGraph);
+         return this.inspector.inspectInputs(plansReference);
+     }
 diff --git a/dist/src/plugins/js/lock-file/bun-parser.js b/dist/src/plugins/js/lock-file/bun-parser.js
 index 169563d598af64c8b74d00ab9815dd651650ec9d..0bd5e1f536b1e0e02843396e01b29dcece8293b0 100644
 --- a/dist/src/plugins/js/lock-file/bun-parser.js

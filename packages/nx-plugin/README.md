@@ -396,9 +396,8 @@ arguments it refuses, prints one fixed line (`cargo-input-unavailable`, `cargo-i
 nonzero, and `runtime-input.sh` turns that into an Nx error. Its stderr names the cause, Cargo's own message included,
 with the checkout's absolute path written as a relative one and Cargo's timing-dependent lock-wait lines dropped;
 refused arguments write nothing. The Cargo target, run by hand, still refuses the missing dependency or manifest with
-Cargo's own cause.
-Only stdout supplies the cache-key result. Stderr retains the operational cause and may also contain native-loader
-warnings; those diagnostics are not required to be byte-identical across checkouts.
+Cargo's own cause. Only stdout supplies the cache-key result. Stderr retains the operational cause and may also contain
+native-loader warnings; those diagnostics are not required to be byte-identical across checkouts.
 
 Cargo resolution failures (no `cargo` on PATH, a stale `Cargo.lock`, or an unavailable locked dependency) fail graph
 inference with `CargoMetadataError`, including the manifest path and Cargo's cause. A member inside the workspace
@@ -904,6 +903,11 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   daemon can have frozen a different database namespace before a later client supplies workspace-data overrides. The
   patch removes the obsolete history RPCs and retains native errors, including post-run failures. See
   [upstream Nx #37268](https://github.com/nrwl/nx/pull/37268).
+- **A raw-input query resolves only its requested task's plan.** Nx still builds the full dependency graph to plan
+  dependent outputs, but does not walk every producer's own inputs and then discard those results. The plural inspector
+  keeps its full-closure default. The installed-product regression compares all root input buckets and configurations
+  against closure inspection and rejects the old all-plan selection. See
+  [root-only raw-input inspection](../../patches/README.md#root-only-raw-input-inspection).
 - **The default cache limit uses the cache's own filesystem.** It takes ten percent of `statfs(cacheDir)` capacity, or
   its nearest existing ancestor when the directory has not been created. This avoids synchronously inventorying every
   mounted disk. Explicit `NX_MAX_CACHE_SIZE` and `nx.json.maxCacheSize` retain their precedence; filesystem errors other
