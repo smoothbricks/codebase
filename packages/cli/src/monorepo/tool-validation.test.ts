@@ -103,6 +103,71 @@ describe('tool configuration validation', () => {
     }
   });
 
+  describe('complete coreutils providers', () => {
+    const packageList = (provider: string) => `{
+  pkgs,
+  ...
+}: {
+  imports = [./devenv.smoo.nix];
+  packages = with pkgs; [
+    bun
+    git
+    git-format-staged
+    jq
+    alejandra
+    ${provider}
+    gnutar
+  ];
+}
+`;
+    async function writeProvider(root: string, provider: string) {
+      const path = join(root, 'tooling/direnv/devenv.nix');
+      await mkdir(dirname(path), { recursive: true });
+      const content = packageList(provider);
+      await writeFile(path, content);
+      return { path, content };
+    }
+
+    it.each(['coreutils', 'coreutils-tee'])('accepts the complete %s provider', async (provider) => {
+      const root = await mkdtemp(join(tmpdir(), 'smoo-coreutils-provider-'));
+      try {
+        const { path, content } = await writeProvider(root, provider);
+        expect(validateDevenvPackages(root)).toBe(0);
+        expect(await readFile(path, 'utf8')).toBe(content);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it('does not append unpatched coreutils beside the selected patched provider', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'smoo-coreutils-provider-'));
+      try {
+        const { path, content } = await writeProvider(root, 'coreutils-tee');
+        applyDevenvPackageDefaults(root);
+        expect(await readFile(path, 'utf8')).toBe(content);
+        expect(validateDevenvPackages(root)).toBe(0);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it.each(['', 'coreutils-tee-extras'])('still requires a provider when the entry is %p', async (provider) => {
+      const root = await mkdtemp(join(tmpdir(), 'smoo-coreutils-provider-'));
+      try {
+        const { path } = await writeProvider(root, provider);
+        expect(validateDevenvPackages(root)).toBe(1);
+        applyDevenvPackageDefaults(root);
+        const updated = await readFile(path, 'utf8');
+        expect(updated).toContain('    coreutils # Provides fmt for commit message wrapping\n');
+        expect(validateDevenvPackages(root)).toBe(0);
+        applyDevenvPackageDefaults(root);
+        expect(await readFile(path, 'utf8')).toBe(updated);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  });
+
   it('leaves Go and Node to the managed module, and rejects a repo-owned bare go', async () => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-tool-validation-'));
     try {

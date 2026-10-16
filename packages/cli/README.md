@@ -437,6 +437,10 @@ compiler/SDK inputs stay unchanged; remove the patch when the pinned nixpkgs inc
 through
 [canonical workspace activation](../../specs/cowshed/04_sandbox.md#evaluating-an-edited-devenvnix-inside-its-workspace).
 
+Tool declaration policy recognizes both complete providers, `coreutils` and `coreutils-tee`. Updates preserve an
+already-selected provider rather than adding stock coreutils beside the patched one; repositories without either
+provider still receive the stock `coreutils` default.
+
 Every direnv load runs the managed devenv prologue (`tooling/direnv/devenv.smoo.nix`), and it is built to cost almost
 nothing when nothing changed:
 
