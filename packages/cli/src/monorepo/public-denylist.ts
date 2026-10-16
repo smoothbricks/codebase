@@ -2,8 +2,11 @@
  * Pre-push judges published trees and messages using the clone's configured PCRE patterns.
  * Commit hooks use the same patterns and regex engine, plus locally discovered sibling projects
  * and HOME. Only added index lines are judged, so old private text can be removed incrementally.
+ * A merge receiving a side proven public against the clone's declared tracking ref is judged on
+ * the lines it introduces, not on the already-public lines it carries in.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -11,6 +14,12 @@ import typia from 'typia';
 
 /** Local git config key: one pattern per value. */
 export const PUBLIC_DENYLIST_CONFIG_KEY = 'smoothbricks.publicDenylist';
+
+/**
+ * Local git config key naming the one public tracking ref (a full `refs/remotes/...` ref) whose
+ * history is already public. Clone-local on purpose: a tree cannot declare its own exemption.
+ */
+export const PUBLIC_TRACKING_REF_CONFIG_KEY = 'smoothbricks.publicTrackingRef';
 
 /** Environment source for the same list: one pattern per line. */
 export const PUBLIC_DENYLIST_ENV = 'SMOOTHBRICKS_PUBLIC_DENYLIST';
@@ -348,10 +357,77 @@ function readAllowlist(root: string, env: Environment): Allowlist | { failure: s
   return { scopes, repositories, lines };
 }
 
+/**
+ * The tree the staged index is diffed against, or null for git's ordinary HEAD diff. During a
+ * merge, lines the incoming side carries were judged when they were published, not when they
+ * are received: only when MERGE_HEAD names a single commit proven reachable from the declared
+ * public tracking ref is the index diffed against that incoming tree, so new-resolution and
+ * ours-only lines are still judged and already-public lines are not judged again. MERGE_HEAD
+ * itself is never the anchor — a merge cannot exempt itself — so an incoming side that is not
+ * proven public falls back to the HEAD diff, which judges its lines as added. A merge with no
+ * declared ref, a declared ref that does not resolve, or any Git failure refuses: fail closed.
+ */
+function stagedDiffBase(root: string, env: Environment): { base: string | null } | { failure: string } {
+  const mergeHeadPathResult = git(root, ['rev-parse', '--git-path', 'MERGE_HEAD'], env);
+  if (mergeHeadPathResult.exitCode !== 0) {
+    return { failure: `git rev-parse --git-path MERGE_HEAD: ${mergeHeadPathResult.stderr}` };
+  }
+  const mergeHeadPath = resolve(root, mergeHeadPathResult.stdout.trim());
+  if (!existsSync(mergeHeadPath)) return { base: null };
+  let contents: string;
+  try {
+    contents = readFileSync(mergeHeadPath, 'utf8');
+  } catch (error) {
+    return { failure: `${mergeHeadPath}: ${errorReason(error)}` };
+  }
+  const heads = contents
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+  if (heads.length !== 1 || heads[0] === undefined) return { base: null };
+  const incoming = heads[0];
+  const declared = git(root, ['config', '--get-all', PUBLIC_TRACKING_REF_CONFIG_KEY], env);
+  if (declared.exitCode === 1) {
+    return {
+      failure:
+        `a merge is in progress but no public tracking ref is declared; set git config ${PUBLIC_TRACKING_REF_CONFIG_KEY} ` +
+        'to the clone-local public tracking ref (for example refs/remotes/origin-https/main), or finish the merge without this hook',
+    };
+  }
+  if (declared.exitCode !== 0) {
+    return { failure: `git config --get-all ${PUBLIC_TRACKING_REF_CONFIG_KEY}: ${declared.stderr}` };
+  }
+  const refs = declared.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+  if (refs.length !== 1 || refs[0] === undefined || !refs[0].startsWith('refs/remotes/')) {
+    return {
+      failure: `git config ${PUBLIC_TRACKING_REF_CONFIG_KEY} must name exactly one refs/remotes/ public tracking ref`,
+    };
+  }
+  const ref = refs[0];
+  const resolved = git(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], env);
+  if (resolved.exitCode !== 0) {
+    return { failure: `declared public tracking ref ${ref} does not resolve to a commit` };
+  }
+  const ancestry = git(root, ['merge-base', '--is-ancestor', incoming, ref], env);
+  if (ancestry.exitCode === 0) return { base: incoming };
+  if (ancestry.exitCode === 1) return { base: null };
+  return { failure: `git merge-base --is-ancestor ${incoming} ${ref}: ${ancestry.stderr}` };
+}
+
 function addedIndexLines(root: string, env: Environment): { lines: AddedLine[] } | { failure: string } {
+  const diffBase = stagedDiffBase(root, env);
+  if ('failure' in diffBase) return diffBase;
   // Omitting HEAD makes git handle an unborn branch as the empty tree. All commands inherit
   // GIT_INDEX_FILE, including a partial commit's temporary index.
-  const paths = git(root, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--'], env);
+  const base = diffBase.base === null ? [] : [diffBase.base];
+  const paths = git(
+    root,
+    ['diff', '--cached', ...base, '--name-only', '-z', '--no-renames', '--no-ext-diff', '--'],
+    env,
+  );
   if (paths.exitCode !== 0) return { failure: `git diff --cached --name-only: ${paths.stderr}` };
   const lines: AddedLine[] = [];
   for (const path of paths.stdout.split('\0')) {
@@ -362,6 +438,7 @@ function addedIndexLines(root: string, env: Environment): { lines: AddedLine[] }
         '--literal-pathspecs',
         'diff',
         '--cached',
+        ...base,
         '--no-color',
         '--no-ext-diff',
         '--no-textconv',

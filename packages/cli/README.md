@@ -763,6 +763,16 @@ refuse the commit with diagnostics rather than silently disabling the guard. The
 names only. Explicit `smoothbricks.publicDenylist` or `SMOOTHBRICKS_PUBLIC_DENYLIST` patterns still judge the original
 text and remain authoritative, just as in the push gate.
 
+Receiving a merge is the one exception to diffing the index against `HEAD`. Lines an incoming side carries were judged
+when they were published, so a clone may declare its public tracking ref once, locally:
+`git config smoothbricks.publicTrackingRef refs/remotes/origin-https/main`. During a merge whose single `MERGE_HEAD` is
+proven reachable from that declared ref, the index is diffed against the incoming public tree instead, so only
+new-resolution and ours-only lines are judged. `MERGE_HEAD` itself is never the anchor — a merge cannot exempt itself —
+and an incoming side not proven public falls back to the ordinary `HEAD` diff, which judges its lines as added. A merge
+with no declared ref, a declared ref that does not resolve, or any Git failure refuses the commit. The declaration is
+clone-local git config, never tree content, and the guard reads only local refs: it fetches nothing. Refresh the
+tracking ref through the normal verified publication route before receiving.
+
 The generated post-commit hook restores the index for the paths the commit just wrote. `git commit --only -- <paths>` is
 a partial commit: git stages those paths from the working tree into the real index, locks it, and builds the commit from
 a separate throwaway index it hands the pre-commit hook. The formatter's rewrite therefore reaches the commit and the

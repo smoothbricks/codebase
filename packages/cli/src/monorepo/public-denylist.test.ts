@@ -416,6 +416,80 @@ describe('commit-time public denylist', () => {
     expect(git('show', ':notes.txt')).toBe('neutral');
   });
 
+  async function branchWith(path: string, content: string, branch: string): Promise<string> {
+    git('checkout', '--quiet', '-b', branch);
+    const sha = await commit(path, content);
+    git('checkout', '--quiet', 'main');
+    return sha;
+  }
+
+  function declarePublicRef(sha?: string): void {
+    git('config', 'smoothbricks.publicTrackingRef', 'refs/remotes/origin-https/main');
+    if (sha !== undefined) git('update-ref', 'refs/remotes/origin-https/main', sha);
+  }
+
+  it('cannot launder private lines through a merge whose incoming side is not proven public', async () => {
+    await sibling();
+    const publicSha = await branchWith('public.txt', 'neutral public line\n', 'public-side');
+    declarePublicRef(publicSha);
+    await branchWith('notes.txt', 'secret-consumer\n', 'private-side');
+    git('merge', '--quiet', '--no-commit', '--no-ff', 'private-side');
+    expect(await staged()).toEqual({
+      outcome: 'denied',
+      matches: 'staged:notes.txt:1:secret-consumer\n',
+    });
+  });
+
+  it('accepts already-public lines a proven-public merge carries in, without judging them again', async () => {
+    const home = join(container, 'home');
+    const publicSha = await branchWith('notes.txt', `${home}/project\n`, 'public-side');
+    declarePublicRef(publicSha);
+    git('merge', '--quiet', '--no-commit', '--no-ff', 'public-side');
+    expect((await staged({ ...environment(), HOME: home })).outcome).toBe('clean');
+  });
+
+  it('still refuses new HOME, sibling and custom-pattern lines the merge resolution introduces', async () => {
+    const home = join(container, 'home');
+    deny('secret-codename');
+    const publicSha = await branchWith('notes.txt', `${home}/project\n`, 'public-side');
+    declarePublicRef(publicSha);
+    git('merge', '--quiet', '--no-commit', '--no-ff', 'public-side');
+    await sibling();
+    await stage(`${home}/project\n${home}/other\nsecret-consumer\nSecret-Codename\n`);
+    expect(await staged({ ...environment(), HOME: home })).toEqual({
+      outcome: 'denied',
+      matches:
+        `staged:notes.txt:2:${home}/other\n` +
+        'staged:notes.txt:3:secret-consumer\n' +
+        'staged:notes.txt:4:Secret-Codename\n',
+    });
+  });
+
+  it('fails closed during a merge when the declared public ref is missing, undeclared or malformed', async () => {
+    const publicSha = await branchWith('notes.txt', 'neutral\n', 'public-side');
+    git('merge', '--quiet', '--no-commit', '--no-ff', 'public-side');
+    expect((await staged()).outcome).toBe('failed');
+    git('config', 'smoothbricks.publicTrackingRef', 'refs/remotes/origin-https/main');
+    expect((await staged()).outcome).toBe('failed');
+    git('config', 'smoothbricks.publicTrackingRef', 'main');
+    expect((await staged()).outcome).toBe('failed');
+    git('update-ref', 'refs/remotes/origin-https/main', publicSha);
+    git('config', 'smoothbricks.publicTrackingRef', 'refs/remotes/origin-https/main');
+    expect((await staged()).outcome).toBe('clean');
+  });
+
+  it('keeps GIT_INDEX_FILE authoritative for a receiving merge and leaves the real index alone', async () => {
+    const home = join(container, 'home');
+    const publicSha = await branchWith('notes.txt', `${home}/project\n`, 'public-side');
+    declarePublicRef(publicSha);
+    git('merge', '--quiet', '--no-commit', '--no-ff', 'public-side');
+    const alternate = join(container, 'merge-index');
+    await writeFile(alternate, await readFile(join(root, '.git', 'index')));
+    const env = { ...environment(), HOME: home, GIT_INDEX_FILE: alternate };
+    expect((await staged(env)).outcome).toBe('clean');
+    expect(git('show', ':notes.txt')).toBe(`${home}/project`);
+  });
+
   it('isolates sibling probes and scratch grep from the committing repository pointers', async () => {
     await sibling();
     await stage('secret-consumer\n');
