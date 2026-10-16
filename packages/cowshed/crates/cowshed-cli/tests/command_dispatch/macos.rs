@@ -2508,8 +2508,8 @@ async fn nx_statuses(
 /// main changes `a` and runs it on the adopted volume, so its seed, frozen from the landing
 /// volume at the same tree, is behind; doctor says so, and the next `fork` reseeds main
 /// from its volume before it clones the seed and hits main's run. No command does it by hand.
-/// A fork of a workspace reseeds through the same fork path:
-/// [`directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle`].
+/// A keeper-held workspace takes the separate busy-skip path:
+/// [`directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_substrate_lifecycle`].
 #[tokio::test]
 async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
  {
@@ -2642,13 +2642,13 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
     fixture.stop_gateway().await;
 }
 
-/// `cowshed fork` reseeds its source first (16_build_volumes.md, "Fork"): `w1` runs on
-/// its own volume after its seed was frozen at its creation, and a fork of `w1` hits that run
-/// instead of cloning the older seed and running everything again.
+/// A foreground keeper holds `w1`'s volume, so `cowshed fork` cannot refresh its seed.
+/// It keeps the existing seed without waiting or bypassing the hold; `w2` therefore runs
+/// both tasks again. The no-keeper main case above retains the warm-fork `LocalHit` oracle.
 /// Before either fork, doctor diagnoses main's displaced workspace-data link and an exec restores
 /// it, so the forks never inherit a real directory in place of the build-volume link.
 #[tokio::test]
-async fn directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_substrate_lifecycle() {
+async fn directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
@@ -2656,6 +2656,7 @@ async fn directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_subs
     });
     let nx_reads = nx_read_paths(&fixture_nx(&fixture.checkout));
     let mut service = serve_project(&mut fixture, &nx_reads).await;
+    let layout = build_volumes(&fixture);
     assert_eq!(build_link_findings(&mut service).await, [""; 0]);
 
     let data = fixture.checkout.join(".nx/workspace-data");
@@ -2692,8 +2693,20 @@ async fn directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_subs
         "w1 runs a:build and a:test itself: {ran:?}"
     );
 
-    // A skipped reseed is said on the process's stderr, which nextest shows beside a failure;
-    // the command's own captured stderr never carries it, so only the hits below can tell.
+    let source_daemon = recorded_daemon(&w1).expect("w1's keeper left its daemon recorded");
+    assert!(
+        cowshed_os::process::running(source_daemon).expect("observe w1's daemon"),
+        "the source keeper's daemon runs before the fork"
+    );
+    let source_volume = linked_volume(&layout, &w1);
+    assert!(
+        layout
+            .held(&source_volume)
+            .expect("observe the source hold"),
+        "the source keeper holds its build volume before the fork"
+    );
+    // The keeper's ordinary lifetime hold makes capture skip, retaining the older seed.
+    // There is no synchronous release wait and no permission to bypass this hold.
     succeed(&mut service, ["fork", "w1", "w2"]).await;
     let w2 = service
         .path("w2", false)
@@ -2730,8 +2743,8 @@ async fn directory_a_fork_of_a_workspace_reseeds_it_and_hits_its_latest_run_subs
     assert_eq!(hits.len(), 2, "{hits:?}");
     assert!(
         hits.iter()
-            .all(|(_, status)| *status == nx::CacheStatus::LocalHit),
-        "a fork reseeds w1 first and hits w1's run: {hits:?}"
+            .all(|(_, status)| *status == nx::CacheStatus::Miss),
+        "a keeper-held fork keeps the older seed and runs both tasks again: {hits:?}"
     );
 }
 
