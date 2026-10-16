@@ -7808,19 +7808,59 @@ mod process_death_tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let mut job = std::process::Command::new("/bin/sh")
-            .args(["-c", "(trap '' TERM; echo READY; exec sleep 300) & wait"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .process_group(0)
-            .spawn_locked()
-            .unwrap();
-        let pgid = i32::try_from(job.id()).unwrap();
+        // The OwnedGroup test idiom keeps cleanup around the assertions, not after them.
+        struct OwnedGroup(std::process::Child);
+        impl Drop for OwnedGroup {
+            fn drop(&mut self) {
+                let pgid = i32::try_from(self.0.id()).expect("owned child pid");
+                // SAFETY: this test created the group and keeps its descendant until cleanup.
+                if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        eprintln!("end owned signal-test group {pgid}: {error}");
+                    }
+                }
+                if let Err(error) = self.0.wait()
+                    && error.raw_os_error() != Some(libc::ECHILD)
+                {
+                    eprintln!("reap owned signal-test leader {pgid}: {error}");
+                }
+                if let Some(mut output) = self.0.stdout.take()
+                    && let Err(error) = io::copy(&mut output, &mut io::sink())
+                {
+                    eprintln!("observe owned signal-test group {pgid} output closure: {error}");
+                }
+            }
+        }
+        struct OwnedSignaller {
+            done: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<Vec<bool>>>,
+        }
+        impl Drop for OwnedSignaller {
+            fn drop(&mut self) {
+                self.done.store(true, Ordering::SeqCst);
+                if let Some(thread) = self.thread.take()
+                    && let Err(panic) = thread.join()
+                {
+                    eprintln!("join owned signal-test signaller during cleanup: {panic:?}");
+                }
+            }
+        }
+        let mut job = OwnedGroup(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "(trap '' TERM; echo READY; exec sleep 300) & wait"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn_locked()
+                .unwrap(),
+        );
+        let pgid = i32::try_from(job.0.id()).unwrap();
         let mut ready = String::new();
-        std::io::BufReader::new(job.stdout.take().unwrap())
+        std::io::BufReader::new(job.0.stdout.as_mut().unwrap())
             .read_line(&mut ready)
             .unwrap();
-        let fence = Arc::new(ChildFence::new(job.id()).unwrap());
+        let fence = Arc::new(ChildFence::new(job.0.id()).unwrap());
         assert!(fence.birth().leader().is_some());
         fence
             .signal(0)
@@ -7839,20 +7879,23 @@ mod process_death_tests {
 
         let done = Arc::new(AtomicBool::new(false));
         let (observed, observation) = oneshot::channel();
-        let signaller = {
-            let (fence, done) = (Arc::clone(&fence), Arc::clone(&done));
-            std::thread::spawn(move || {
-                let initial = fence.signal(0).is_ok();
-                let mut outcomes = vec![initial];
-                observed
-                    .send(initial)
-                    .expect("the reaper waits for the signaller");
-                while !done.load(Ordering::SeqCst) {
+        let mut signaller = OwnedSignaller {
+            done: Arc::clone(&done),
+            thread: Some({
+                let (fence, done) = (Arc::clone(&fence), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    let initial = fence.signal(0).is_ok();
+                    let mut outcomes = vec![initial];
+                    observed
+                        .send(initial)
+                        .expect("the reaper waits for the signaller");
+                    while !done.load(Ordering::SeqCst) {
+                        outcomes.push(fence.signal(0).is_ok());
+                    }
                     outcomes.push(fence.signal(0).is_ok());
-                }
-                outcomes.push(fence.signal(0).is_ok());
-                outcomes
-            })
+                    outcomes
+                })
+            }),
         };
         assert!(
             observation
@@ -7862,9 +7905,9 @@ mod process_death_tests {
         );
         let status = fence.wait().await.unwrap();
         // The fence, not std's handle, owns waitpid. A second reaper must find no child left.
-        assert_eq!(job.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
+        assert_eq!(job.0.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
         done.store(true, Ordering::SeqCst);
-        let outcomes = signaller.join().unwrap();
+        let outcomes = signaller.thread.take().unwrap().join().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert_eq!(outcomes.last(), Some(&false), "no signal after the reap");
         assert!(
@@ -7874,8 +7917,7 @@ mod process_death_tests {
         let refused = fence.signal(libc::SIGTERM).unwrap_err();
         assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
         assert!(super::super::job_groups::group_has_live_members(pgid).unwrap());
-        // SAFETY: the test's own descendant still holds the group it made.
-        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        drop(job);
     }
 
     /// A job's leader is observed exiting, with its exact status, while it stays unreaped: a kill
