@@ -374,45 +374,46 @@ mod startup_wire_tests {
     }
 
     #[test]
-    fn exact_store_locked_frame_is_accepted() {
-        let frame = r#"{"kind":"failed","ok":false,"stage":"store-locked","directory":"/d","path":"/d/.owner.lock","reason":"locked"}"#;
-        assert!(matches!(parse(frame), Ok(Startup::Failed(_))));
+    fn exact_failure_frames_are_accepted() {
+        for (label, frame) in [
+            (
+                "exact_store_locked_frame_is_accepted",
+                r#"{"kind":"failed","ok":false,"stage":"store-locked","directory":"/d","path":"/d/.owner.lock","reason":"locked"}"#,
+            ),
+            (
+                "exact_config_frame_is_accepted_without_ok",
+                r#"{"kind":"failed","stage":"config","problems":["executable is relative"]}"#,
+            ),
+        ] {
+            assert!(matches!(parse(frame), Ok(Startup::Failed(_))), "{label}");
+        }
     }
 
     #[test]
-    fn exact_config_frame_is_accepted_without_ok() {
-        let frame = r#"{"kind":"failed","stage":"config","problems":["executable is relative"]}"#;
-        assert!(matches!(parse(frame), Ok(Startup::Failed(_))));
-    }
-
-    #[test]
-    fn store_locked_without_path_is_refused() {
-        let frame = r#"{"kind":"failed","ok":false,"stage":"store-locked","directory":"/d","reason":"locked"}"#;
-        assert!(parse(frame).is_err());
-    }
-
-    #[test]
-    fn operation_failure_with_path_is_refused() {
-        let frame = r#"{"kind":"failed","ok":false,"stage":"store","directory":"/d","path":"/d/x","reason":"io"}"#;
-        assert!(parse(frame).is_err());
-    }
-
-    #[test]
-    fn unknown_stage_is_refused() {
-        let frame =
-            r#"{"kind":"failed","ok":false,"stage":"bogus","directory":"/d","reason":"io"}"#;
-        assert!(parse(frame).is_err());
-    }
-
-    #[test]
-    fn unknown_kind_is_refused() {
-        let frame = r#"{"kind":"stopped","origin":"http://127.0.0.1:4000","port":4000,"reclaimedStagingFiles":0}"#;
-        assert!(parse(frame).is_err());
-    }
-
-    #[test]
-    fn extra_field_is_refused() {
-        let frame = r#"{"kind":"ready","origin":"http://127.0.0.1:4000","port":4000,"reclaimedStagingFiles":0,"extra":1}"#;
-        assert!(parse(frame).is_err());
+    fn malformed_startup_frames_are_refused() {
+        for (label, frame) in [
+            (
+                "store_locked_without_path_is_refused",
+                r#"{"kind":"failed","ok":false,"stage":"store-locked","directory":"/d","reason":"locked"}"#,
+            ),
+            (
+                "operation_failure_with_path_is_refused",
+                r#"{"kind":"failed","ok":false,"stage":"store","directory":"/d","path":"/d/x","reason":"io"}"#,
+            ),
+            (
+                "unknown_stage_is_refused",
+                r#"{"kind":"failed","ok":false,"stage":"bogus","directory":"/d","reason":"io"}"#,
+            ),
+            (
+                "unknown_kind_is_refused",
+                r#"{"kind":"stopped","origin":"http://127.0.0.1:4000","port":4000,"reclaimedStagingFiles":0}"#,
+            ),
+            (
+                "extra_field_is_refused",
+                r#"{"kind":"ready","origin":"http://127.0.0.1:4000","port":4000,"reclaimedStagingFiles":0,"extra":1}"#,
+            ),
+        ] {
+            assert!(parse(frame).is_err(), "{label}");
+        }
     }
 }
