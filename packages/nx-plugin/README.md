@@ -1139,6 +1139,10 @@ A refused rollback also records the kernel mount and read-only filesystem/device
 Each observation has a one-second wait bound and retains its status and stderr; an incomplete probe is not an empty
 holder set. These observations do not prove which holder caused `EBUSY`, and change no case or target bound.
 
+The native lifecycle walk also observes its real working-directory census through the existing process-host seam,
+retaining start/end times and the original error's exit code, signal and killed flag before rethrowing it unchanged.
+This locates whether a census was outstanding at a case timeout without substituting a fake process inventory.
+
 Whatever still works in a lease when its task ends is a leak, and is stopped before the lease goes. The usual one is a
 fixture's Nx daemon: Nx detaches it into a session of its own, so the process-group kill that ends a timed-out command
 never reaches it, and a test process that is killed runs no teardown. Deleting its root asks the daemon to leave only by
