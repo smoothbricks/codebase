@@ -17,10 +17,12 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { OpContextBinding } from '@smoothbricks/lmao';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
+import { pidsWorkingIn, processTable, terminate } from '../../testing.js';
 import {
   type CommandOutput,
   createHostCommands,
   type HostCommands,
+  leaseProcessesOn,
   mountsBelow,
   operationDisk,
   type RamDisk,
@@ -112,6 +114,63 @@ function expectUntouched(outside: string): void {
 
 async function nativeRamVolume(): Promise<void> {
   const { parent, paths, capacity } = scratchVolume(1);
+  const trace = useTestSpan<OpContextBinding>();
+  const caseStartedAt = Date.now();
+  process.stderr.write(`RAM lifecycle case started pid=${process.pid} wallAtMs=${caseStartedAt}\n`);
+  const processes = leaseProcessesOn({
+    async workingIn(directory) {
+      const startedAt = Date.now();
+      const starting = JSON.stringify({
+        phase: 'cwd-census-start',
+        directory,
+        pid: process.pid,
+        wallAtMs: startedAt,
+        caseElapsedMs: startedAt - caseStartedAt,
+      });
+      trace.log.info(starting);
+      process.stderr.write(`${starting}\n`);
+      try {
+        const pids = await pidsWorkingIn(directory);
+        const endedAt = Date.now();
+        const finished = JSON.stringify({
+          phase: 'cwd-census-end',
+          directory,
+          pid: process.pid,
+          wallAtMs: endedAt,
+          elapsedMs: endedAt - startedAt,
+          caseElapsedMs: endedAt - caseStartedAt,
+          pids,
+        });
+        trace.log.info(finished);
+        process.stderr.write(`${finished}\n`);
+        return pids;
+      } catch (error) {
+        const endedAt = Date.now();
+        const details = typeof error === 'object' && error !== null ? error : {};
+        const failed = JSON.stringify(
+          {
+            phase: 'cwd-census-error',
+            directory,
+            pid: process.pid,
+            wallAtMs: endedAt,
+            elapsedMs: endedAt - startedAt,
+            caseElapsedMs: endedAt - caseStartedAt,
+            message: error instanceof Error ? error.message : String(error),
+            code: 'code' in details ? details.code : null,
+            signal: 'signal' in details ? details.signal : null,
+            killed: 'killed' in details ? details.killed : null,
+          },
+          null,
+          2,
+        );
+        trace.log.info(failed);
+        process.stderr.write(`${failed}\n`);
+        throw error;
+      }
+    },
+    table: processTable,
+    signal: terminate,
+  });
   // A readonly directory outside every lease. Each lease links to it: removal must unlink the
   // link and never follow it, leaving this directory's mode and contents as they were.
   const outside = join(parent, 'outside');
@@ -147,8 +206,8 @@ async function nativeRamVolume(): Promise<void> {
     },
   };
   const alive = new Set([101, 202]);
-  const first = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
-  const second = new RamTempVolume(paths, capacity, commands, 202, (pid) => alive.has(pid));
+  const first = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
+  const second = new RamTempVolume(paths, capacity, commands, 202, (pid) => alive.has(pid), processes);
   const run = async (file: string, args: string[]): Promise<string> => {
     const output = await host.run(file, args);
     if (output.status !== 0) {
@@ -156,7 +215,7 @@ async function nativeRamVolume(): Promise<void> {
     }
     return output.stdout;
   };
-  const volume = new RamTempVolume(paths, capacity, host);
+  const volume = new RamTempVolume(paths, capacity, host, undefined, undefined, processes);
   try {
     // The debris: a volume mounted at the mountpoint by a creator that died before its marker
     // (the order this module used to create in), and a RAM disk whose deadlined attach finished
@@ -235,7 +294,7 @@ async function nativeRamVolume(): Promise<void> {
     alive.delete(202);
     const image = join(leaseB.directory, 'store', 'main.asif');
     attachedBelow.image = image;
-    const third = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
+    const third = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
     // A failed acquire must not leave its new live-pid lease or reclaim claim behind. Reuse
     // this mounted volume: no extra attach is needed to cover the failed-publication path.
     attachedBelow.failInventory = true;
@@ -273,7 +332,7 @@ async function nativeRamVolume(): Promise<void> {
     // Once its owner has detached the image, the next task reclaims the lease, and its release,
     // the last, detaches the volume.
     attachedBelow.image = null;
-    const fourth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
+    const fourth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
     const d = await fourth.acquire();
     if (!d.ok || d.value.kind !== 'leased') {
       throw new Error(`fourth lease failed: ${JSON.stringify(d)}`);
