@@ -193,6 +193,7 @@ async function nativeRamVolume(): Promise<void> {
       });
       process.stderr.write(`${starting}\n`);
       trace.log.info(starting);
+      const delegateStartedAt = Date.now();
       const output = await delegate.run(file, args, deadlineMs);
       const endedAt = Date.now();
       const finished = JSON.stringify({
@@ -203,6 +204,9 @@ async function nativeRamVolume(): Promise<void> {
         stderr: output.stderr,
         wallAtMs: endedAt,
         elapsedMs: endedAt - startedAt,
+        delegateStartedWallAtMs: delegateStartedAt,
+        observationBeforeDelegateMs: delegateStartedAt - startedAt,
+        delegateElapsedMs: endedAt - delegateStartedAt,
         caseElapsedMs: endedAt - caseStartedAt,
       });
       process.stderr.write(`${finished}\n`);
