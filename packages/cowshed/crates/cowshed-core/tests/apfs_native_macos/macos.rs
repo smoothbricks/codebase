@@ -5610,7 +5610,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     const INCARNATION: &str = "00000000000000000000000000000003";
     let fixture = RealFixture::new("root-held-event-debris");
     let backing_image = fixture.root().join("bare-host.dmg");
-    let backing = fixture.root().join("bare-host");
+    let backing = fixture.root().join("mnt");
     fixture.blank_image(&backing_image);
     let mut mounts = fsevents::Watch::start(fixture.root());
     let attachment = fixture.mount_left_behind(&backing_image, &backing, "owners");
@@ -5625,10 +5625,8 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
     fixture.remount(attachment.volume_device(), &backing, "nobrowse,noowners");
     mounts.wait_for(&backing, Mounted);
 
-    let store = backing.join("store");
-    std::fs::create_dir_all(&store).expect("fixture store on the backing filesystem");
-    let config = ApfsSubstrateConfig::new(&store, fixture.main_mount());
-    let layout = StorageLayout::new(&store, &repo()).expect("fixture-local mount root");
+    let config = fixture.config();
+    let layout = fixture.layout();
     let name = WorkspaceName::session("retired").expect("workspace");
     let bare = layout.workspace_mount(&name).expect("bare mountpoint");
     std::fs::create_dir_all(&bare).expect("user-owned bare mountpoint");
@@ -5662,8 +5660,7 @@ fn real_apfs_gc_retains_root_held_event_debris_without_blocking_retirement() {
         .project()
         .sessions
         .join(format!(".trash/retired-{INCARNATION}.dmg"));
-    let host =
-        MacOsApfsExecutionHost::new(SystemCommandRunner, config.clone()).expect("native APFS host");
+    let host = fixture.host();
     host.retire_image(canonical.image(), &trash)
         .expect("retire image");
     for other in [".late-data", "work.rs"] {
