@@ -52,8 +52,8 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain('/fixture/held-file');
     expect(capture.text).toContain('not proof of a contested lock');
     expect(capture.text).toContain('pid=101 pgid=101');
-    expect(calls.map((call) => call.file)).toEqual(['ps', '/usr/bin/sudo', 'ps']);
-    expect(calls[1]?.args).toEqual(['-n', '/usr/sbin/lsof', '-nP', '-p', '101,202,303,404']);
+    expect(calls.map((call) => call.file)).toEqual(['ps', 'sudo', 'ps']);
+    expect(calls[1]?.args).toEqual(['-n', 'lsof', '-nP', '-p', '101,202,303,404']);
     expect(capture.offsetFromExpiryMs).toBeGreaterThan(0);
     expect(capture.capturedAtMs).toBeGreaterThanOrEqual(capture.startedAtMs);
   });
@@ -78,7 +78,7 @@ describe('pre-expiry hang diagnostics', () => {
     expect(capture.text).toContain('sudo: permission denied');
     expect(capture.text).toContain('ordinary-user visibility only');
     expect(capture.text).toContain('/fixture/held-file');
-    expect(calls[2]?.file).toBe('/usr/sbin/lsof');
+    expect(calls[2]?.file).toBe('lsof');
   });
 
   it('retains partial failed output instead of replacing it with an empty fallback', async () => {
