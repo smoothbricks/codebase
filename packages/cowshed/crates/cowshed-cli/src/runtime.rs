@@ -4337,41 +4337,25 @@ fn departed_volume_references_finding(
     })
 }
 
-struct HostDiagnosis {
-    storage_ready: bool,
-    findings: Vec<Finding>,
-}
-
-async fn diagnose_host() -> Result<HostDiagnosis> {
+async fn diagnose_host() -> Result<Vec<Finding>> {
     let home = gateway_service::canonical_home()?;
     let plan = plan_host_setup(&home, CachesVolume::Keep).await;
-    let mut diagnosis = match plan {
-        Ok(plan) => HostDiagnosis {
-            storage_ready: plan.actions.is_empty(),
-            findings: host_storage_findings(&plan),
-        },
-        Err(error) => HostDiagnosis {
-            storage_ready: false,
-            findings: vec![Finding {
-                code: "host-storage".into(),
-                severity: FindingSeverity::Error,
-                message: error.message,
-                hint: "cowshed setup".into(),
-                path: None,
-            }],
-        },
+    let mut findings = match plan {
+        Ok(plan) => host_storage_findings(&plan),
+        Err(error) => vec![Finding {
+            code: "host-storage".into(),
+            severity: FindingSeverity::Error,
+            message: error.message,
+            hint: "cowshed setup".into(),
+            path: None,
+        }],
     };
-    if diagnosis.storage_ready {
-        diagnosis.findings.extend(retired_mount_layout_findings(
-            CanonicalRoots::global().store(),
-        ));
-    }
     if let Some(finding) = caches_volume_finding() {
-        diagnosis.findings.push(finding);
+        findings.push(finding);
     }
     match gateway_service::service_status().await {
-        Ok(status) => diagnosis.findings.extend(gateway_findings(&status)),
-        Err(error) => diagnosis.findings.push(Finding {
+        Ok(status) => findings.extend(gateway_findings(&status)),
+        Err(error) => findings.push(Finding {
             code: "gateway-status".into(),
             severity: FindingSeverity::Error,
             message: error.message,
@@ -4379,27 +4363,21 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
             path: None,
         }),
     }
-    diagnosis
-        .findings
-        .extend(vnode_table_finding(cowshed_core::vnodes::VnodeTable::read()));
-    diagnosis
-        .findings
-        .extend(orphaned_disk_image_helpers_finding(
-            cowshed_apfs::disk_image_helpers::OrphanedHelpers::read(),
-        ));
+    findings.extend(vnode_table_finding(cowshed_core::vnodes::VnodeTable::read()));
+    findings.extend(orphaned_disk_image_helpers_finding(
+        cowshed_apfs::disk_image_helpers::OrphanedHelpers::read(),
+    ));
     // One snapshot answers both findings: departed volumes need no census of their own.
     let budget = cowshed_apfs::attach_budget::observe();
     let departed = budget
         .as_ref()
         .ok()
         .and_then(|budget| departed_volume_references_finding(&budget.reading));
-    diagnosis
-        .findings
-        .extend(disk_image_attach_budget_finding(budget));
-    diagnosis.findings.extend(departed);
+    findings.extend(disk_image_attach_budget_finding(budget));
+    findings.extend(departed);
     match crate::capabilities::sccache::service::service_status().await {
-        Ok(status) => diagnosis.findings.push(sccache_finding(&status)),
-        Err(error) => diagnosis.findings.push(Finding {
+        Ok(status) => findings.push(sccache_finding(&status)),
+        Err(error) => findings.push(Finding {
             code: "sccache-status".into(),
             severity: FindingSeverity::Warning,
             message: error.message,
@@ -4411,15 +4389,11 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
     // agent whose store path was collected looks identical to a healthy one until launchd next
     // tries to exec it, which may be a reboot away.
     match crate::capabilities::sccache::service::control_target(&home) {
-        Ok(target) => {
-            diagnosis
-                .findings
-                .extend(crate::capabilities::sccache::nix::pinning_findings(
-                    &home,
-                    target.plist_path(),
-                ))
-        }
-        Err(error) => diagnosis.findings.push(Finding {
+        Ok(target) => findings.extend(crate::capabilities::sccache::nix::pinning_findings(
+            &home,
+            target.plist_path(),
+        )),
+        Err(error) => findings.push(Finding {
             code: "sccache-agent".into(),
             severity: FindingSeverity::Error,
             message: error.message,
@@ -4427,58 +4401,51 @@ async fn diagnose_host() -> Result<HostDiagnosis> {
             path: None,
         }),
     }
-    if diagnosis.storage_ready {
-        // One registry traversal supplies every finding below. Besides avoiding redundant I/O,
-        // this guarantees one diagnostic per skipped registry entry rather than one per
-        // derived view.
-        match doctor_projects().await {
-            Ok((projects, mains, checkoutless, unreadable)) => {
-                diagnosis.findings.push(Finding {
-                    code: "workspace-inventory".into(),
-                    severity: FindingSeverity::Info,
-                    message: format!(
-                        "{} readable adopted project(s) recorded; {} unreadable project(s)",
-                        projects.len(),
-                        unreadable.len()
-                    ),
-                    hint: if projects.is_empty() && unreadable.is_empty() {
-                        "cowshed adopt <git-root>".into()
-                    } else {
-                        String::new()
-                    },
-                    path: None,
-                });
-                diagnosis
-                    .findings
-                    .extend(mains.iter().map(main_mount_finding));
-                let roots = CanonicalRoots::global();
-                let store = roots.store();
-                diagnosis.findings.extend(
-                    checkoutless
-                        .iter()
-                        .map(|repo| no_adopted_checkout_finding(repo, store)),
-                );
-                diagnosis
-                    .findings
-                    .extend(unreadable.into_iter().map(|(repo, error)| Finding {
-                        code: "workspace-inventory".into(),
-                        severity: FindingSeverity::Error,
-                        message: format!("project {repo}: {error}"),
-                        hint:
-                            "repair this project's store records, then retry cowshed doctor".into(),
-                        path: Some(store.join(repo.as_str())),
-                    }));
-            }
-            Err(error) => diagnosis.findings.push(Finding {
+    // Inventory validates the existing store itself. A pending host setup action is a finding,
+    // not permission to hide project state. One registry traversal supplies every view below.
+    match doctor_projects().await {
+        Ok((projects, mains, checkoutless, unreadable)) => {
+            let roots = CanonicalRoots::global();
+            let store = roots.store();
+            findings.extend(retired_mount_layout_findings(store));
+            findings.push(Finding {
+                code: "workspace-inventory".into(),
+                severity: FindingSeverity::Info,
+                message: format!(
+                    "{} readable adopted project(s) recorded; {} unreadable project(s)",
+                    projects.len(),
+                    unreadable.len()
+                ),
+                hint: if projects.is_empty() && unreadable.is_empty() {
+                    "cowshed adopt <git-root>".into()
+                } else {
+                    String::new()
+                },
+                path: None,
+            });
+            findings.extend(mains.iter().map(main_mount_finding));
+            findings.extend(
+                checkoutless
+                    .iter()
+                    .map(|repo| no_adopted_checkout_finding(repo, store)),
+            );
+            findings.extend(unreadable.into_iter().map(|(repo, error)| Finding {
                 code: "workspace-inventory".into(),
                 severity: FindingSeverity::Error,
-                message: error.message,
-                hint: error.hint,
-                path: None,
-            }),
+                message: format!("project {repo}: {error}"),
+                hint: "repair this project's store records, then retry cowshed doctor".into(),
+                path: Some(store.join(repo.as_str())),
+            }));
         }
+        Err(error) => findings.push(Finding {
+            code: "workspace-inventory".into(),
+            severity: FindingSeverity::Error,
+            message: error.message,
+            hint: error.hint,
+            path: None,
+        }),
     }
-    Ok(diagnosis)
+    Ok(findings)
 }
 
 fn doctor_report(findings: Vec<Finding>) -> DoctorReport {
@@ -4581,14 +4548,11 @@ where
 {
     let repair = matches!(&cli.command, Command::Doctor(args) if args.repair);
     let project_root = resolve_project_root(&cli).await;
-    let mut diagnosis = diagnose_host().await?;
-    if repair
-        && diagnosis.storage_ready
-        && let Ok(root) = project_root.as_ref()
-    {
+    let mut findings = diagnose_host().await?;
+    if repair && let Ok(root) = project_root.as_ref() {
         match repair_project_artifacts(root).await {
-            Ok(findings) => diagnosis.findings.extend(findings),
-            Err(error) => diagnosis.findings.push(Finding {
+            Ok(repaired) => findings.extend(repaired),
+            Err(error) => findings.push(Finding {
                 code: "artifact-repair".into(),
                 severity: FindingSeverity::Error,
                 message: error.message,
@@ -4597,64 +4561,60 @@ where
             }),
         }
     }
-    if diagnosis.storage_ready {
-        match project_root {
-            Ok(root) => {
-                match ActorBridge::open_existing(&root, runtime_recovery_scope(&cli.command)?).await
-                {
-                    Ok(mut bridge) => {
-                        let identity = git_identity_findings(&bridge);
-                        let project = bridge.doctor().await;
-                        let teardown = bridge.shutdown().await.err();
-                        match identity {
-                            Ok(findings) => diagnosis.findings.extend(findings),
-                            Err(error) => diagnosis.findings.push(Finding {
-                                code: "git-identity".into(),
-                                severity: FindingSeverity::Warning,
-                                message: error.message,
-                                hint: error.hint,
-                                path: Some(root.clone()),
-                            }),
-                        }
-                        match project {
-                            Ok(report) => diagnosis.findings.extend(report.findings),
-                            Err(error) => diagnosis.findings.push(Finding {
-                                code: "project-doctor".into(),
-                                severity: FindingSeverity::Error,
-                                message: error.message,
-                                hint: error.hint,
-                                path: Some(root),
-                            }),
-                        }
-                        if let Some(error) = teardown {
-                            diagnosis.findings.push(Finding {
-                                code: "project-shutdown".into(),
-                                severity: FindingSeverity::Error,
-                                message: error.message,
-                                hint: error.hint,
-                                path: None,
-                            });
-                        }
+    // Project opening validates storage independently of setup's repair plan. An unavailable
+    // project is reported explicitly rather than silently skipped because a host needs repair.
+    match project_root {
+        Ok(root) => {
+            match ActorBridge::open_existing(&root, runtime_recovery_scope(&cli.command)?).await {
+                Ok(mut bridge) => {
+                    let identity = git_identity_findings(&bridge);
+                    let project = bridge.doctor().await;
+                    let teardown = bridge.shutdown().await.err();
+                    match identity {
+                        Ok(identity) => findings.extend(identity),
+                        Err(error) => findings.push(Finding {
+                            code: "git-identity".into(),
+                            severity: FindingSeverity::Warning,
+                            message: error.message,
+                            hint: error.hint,
+                            path: Some(root.clone()),
+                        }),
                     }
-                    // A project-open failure means none of its invariants ran. Host findings remain
-                    // useful, but an unobserved project is never a healthy project.
-                    Err(error) => record_project_checks_skipped(
-                        output,
-                        &mut diagnosis.findings,
-                        Some(&error),
-                        Some(root),
-                    )?,
+                    match project {
+                        Ok(report) => findings.extend(report.findings),
+                        Err(error) => findings.push(Finding {
+                            code: "project-doctor".into(),
+                            severity: FindingSeverity::Error,
+                            message: error.message,
+                            hint: error.hint,
+                            path: Some(root),
+                        }),
+                    }
+                    if let Some(error) = teardown {
+                        findings.push(Finding {
+                            code: "project-shutdown".into(),
+                            severity: FindingSeverity::Error,
+                            message: error.message,
+                            hint: error.hint,
+                            path: None,
+                        });
+                    }
+                }
+                // A project-open failure means none of its invariants ran. Host findings remain
+                // useful, but an unobserved project is never a healthy project.
+                Err(error) => {
+                    record_project_checks_skipped(output, &mut findings, Some(&error), Some(root))?
                 }
             }
-            Err(error) => record_project_checks_skipped(
-                output,
-                &mut diagnosis.findings,
-                Some(&error),
-                cli.global.project.clone(),
-            )?,
         }
+        Err(error) => record_project_checks_skipped(
+            output,
+            &mut findings,
+            Some(&error),
+            cli.global.project.clone(),
+        )?,
     }
-    emit_doctor_report(output, cli.global.json, doctor_report(diagnosis.findings))
+    emit_doctor_report(output, cli.global.json, doctor_report(findings))
 }
 
 pub async fn dispatch_and_shutdown<S, R, W, E>(
@@ -4823,16 +4783,16 @@ where
             Ok(success())
         }
         Command::Doctor(_) => {
-            let mut diagnosis = diagnose_host().await?;
+            let mut findings = diagnose_host().await?;
             if project_checks_skipped {
                 record_project_checks_skipped(
                     output,
-                    &mut diagnosis.findings,
+                    &mut findings,
                     None,
                     cli.global.project.clone(),
                 )?;
             }
-            emit_doctor_report(output, cli.global.json, doctor_report(diagnosis.findings))
+            emit_doctor_report(output, cli.global.json, doctor_report(findings))
         }
         _ => Err(CowshedError::internal(
             "command without project context was not dispatched by its host service",
