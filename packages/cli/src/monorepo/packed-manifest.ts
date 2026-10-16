@@ -1,7 +1,7 @@
 import { type PackageExports, type PackageJson, parsePackageJsonText } from '../lib/json.js';
 import { printCommandOutput, runResult } from '../lib/run.js';
 import type { PackageInfo } from '../lib/workspace.js';
-import { getWorkspacePackages, workspaceDependencyFields } from '../lib/workspace.js';
+import { getWorkspacePackages, runtimeDependencyFields, workspaceDependencyFields } from '../lib/workspace.js';
 import { releaseCandidateShell } from '../release/candidate-shell.js';
 import { packagePinFreshness } from '../release/candidates.js';
 import { npmVersionExists } from '../release/index.js';
@@ -105,7 +105,7 @@ function walkExportConditions(
 }
 
 /**
- * A packed manifest pins each workspace dependency at a version; that version
+ * A packed manifest pins each runtime workspace dependency at a version; that version
  * must be what the package was built against. A dependency outside the release
  * set is pinned at a published version, and that publish must be the source at
  * HEAD: when the dependency carries releasable changes since the pin's tag, or
@@ -124,7 +124,7 @@ export async function validatePackedDependencyFreshness(
   const workspacePackages = getWorkspacePackages(root);
   const shell = await releaseCandidateShell(root);
   const failures: string[] = [];
-  for (const field of workspaceDependencyFields) {
+  for (const field of runtimeDependencyFields) {
     for (const [name, pinned] of Object.entries(packedPackage[field] ?? {})) {
       const dep = workspacePackages.find((pkg) => pkg.name === name);
       if (!dep || pinned.includes('-') || releasing.includes(dep.projectName)) continue;
