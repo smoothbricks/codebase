@@ -118,6 +118,11 @@ A land changes exactly one name, `.cowshed/build`, with one `rename(2)` of a new
 path a tool opens afterwards resolves into the new volume. The fixed links mean no tool, no environment variable and no
 configuration file ever names a build volume directly.
 
+Membership is physical, not lexical: the controller resolves the link target's parent and the project's build-mount
+directory before comparing them. A preferred-path symlink to the fixed mount root names the same directory and is
+accepted without rewriting the checkout's build link. A target resolving to another directory, including another
+project's build namespace, is refused; the volume id and sidecar ownership rules still apply.
+
 To Git each of these links is a file. A repository's own directory pattern (`target/`) matches the directory a link
 replaced and never the link itself. Before cowshed creates any link, it therefore adds an anchored, exact pattern for
 the build link and for every build-state link to one managed block in the repository's `info/exclude` (the common

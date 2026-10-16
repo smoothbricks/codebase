@@ -651,9 +651,9 @@ impl BuildVolumeLayout {
     }
 
     /// The volume a build link's target names, or `None` when the target is not one of this
-    /// project's build mountpoints.
+    /// project's build mountpoints. Root aliases compare by their resolved parent directories.
     pub fn volume_at(&self, target: &Path) -> Option<BuildVolumeId> {
-        if target.parent()? != self.mounts {
+        if target.parent()?.canonicalize().ok()? != self.mounts.canonicalize().ok()? {
             return None;
         }
         BuildVolumeId::parse(target.file_name()?.to_str()?)
@@ -668,9 +668,10 @@ impl BuildVolumeLayout {
         self.volume_at(&target).map(Some).ok_or_else(|| {
             crate::CowshedError::integrity(
                 format!(
-                    "{} names {}, which is not one of this project's build volumes",
+                    "{} names {}, which is not one of this project's build volumes; expected a volume under {} (root aliases are resolved)",
                     checkout.join(link::BUILD_LINK).display(),
                     target.display(),
+                    self.mounts.display(),
                 ),
                 "cowshed doctor --json",
             )
@@ -996,18 +997,51 @@ mod tests {
                 "/Users/tester/Dev/.cowshed/.build/acme/widget/0123456789abcdef0123456789abcdef"
             )
         );
-        assert_eq!(layout.volume_at(&layout.mount(&id)), Some(id.clone()));
-        assert_eq!(
-            layout.volume_at(Path::new(
-                "/Users/tester/Dev/.cowshed/.build/acme/other/0123456789abcdef0123456789abcdef"
-            )),
-            None
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_links_accept_root_aliases_but_refuse_other_physical_namespaces() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("cowshed-build-alias-{}", uuid::Uuid::new_v4()));
+        let physical = root.join("physical");
+        let alias = root.join("preferred");
+        let repo = RepoId::parse("acme/widget").unwrap();
+        let project = ProjectPaths::with_mount_root(root.join("store"), &physical, &repo).unwrap();
+        let layout = BuildVolumeLayout::new(&project).unwrap();
+        fs::create_dir_all(layout.mounts()).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let id = BuildVolumeId::mint();
+        let target = layout.mount(&id);
+        fs::create_dir(&target).unwrap();
+        let alias_target = alias.join(".build/acme/widget").join(id.as_str());
+        let checkout = root.join("checkout");
+        fs::create_dir_all(checkout.join(".cowshed")).unwrap();
+        symlink(&alias_target, checkout.join(link::BUILD_LINK)).unwrap();
+
+        assert_eq!(layout.volume_at(&target), Some(id.clone()));
+        assert_eq!(layout.linked(&checkout).unwrap(), Some(id.clone()));
+        let aliased = BuildVolumeLayout::new(
+            &ProjectPaths::with_mount_root(root.join("store"), &alias, &repo).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(aliased.volume_at(&target), Some(id.clone()));
+        assert_eq!(layout.volume_at(&target.join("target")), None);
+
+        let other = physical.join(".build/acme/other");
+        fs::create_dir_all(&other).unwrap();
+        fs::remove_file(checkout.join(link::BUILD_LINK)).unwrap();
+        symlink(other.join(id.as_str()), checkout.join(link::BUILD_LINK)).unwrap();
+        let error = layout.linked(&checkout).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("not one of this project's build volumes")
         );
-        assert_eq!(
-            layout.volume_at(&layout.mount(&id).join("target")),
-            None,
-            "a path inside a volume is not a volume"
-        );
+        assert_eq!(layout.volume_at(&other.join(id.as_str())), None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
