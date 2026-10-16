@@ -19,6 +19,11 @@ entries=(
   "$root/node_modules/.bin"
 )
 
+# Keep an activated Python environment ahead of the profile, including later hook calls.
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+  entries=("$VIRTUAL_ENV/bin" "${entries[@]}")
+fi
+
 case "${1:-}" in
   --github-path)
     # GITHUB_PATH prepends entries; last line written = first in PATH.

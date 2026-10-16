@@ -44,3 +44,8 @@ CI puts the same devenv profile bin on PATH, so CI uses the same pin.
 The managed package list also provides `shellcheck-minimal` and an executable-only `pyflakes` package, pinned by the
 existing devenv lockfile. The pyflakes package exposes only its checker executable, leaving the repository's configured
 Python interpreter and build environment unchanged. Both default integrations remain enabled locally and in CI.
+
+The managed `repo-path` helper keeps an active `VIRTUAL_ENV/bin` ahead of the devenv profile for shell entries and later
+hook or tooling calls. With no active environment, its repository entries are unchanged. Its `--print` and
+`--github-path` modes use the same entries, with the existing reverse order for GitHub PATH writes. Installed Cargo and
+cowshed launchers still prepend their owned directory after composition, so activating Python does not replace them.
