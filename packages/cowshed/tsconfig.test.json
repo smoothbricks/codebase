@@ -26,6 +26,9 @@
     },
     {
       "path": "../lmao/tsconfig.lib.json"
+    },
+    {
+      "path": "../nx-cache-server/tsconfig.lib.json"
     }
   ]
 }
