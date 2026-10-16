@@ -2126,10 +2126,30 @@
         }
       },
       "landedHead": "1111111111111111111111111111111111111111",
-      "remoteCache": {
-        "kind": "missingQualification",
-        "reason": "fixture has no protected Nx check receipt"
+      "retired": false,
+      "targetBranch": "main",
+      "targetWasCheckedOut": false
+    },
+    "landingOpening": {
+      "buildVolume": {
+        "adoption": {
+          "kind": "skipped",
+          "reason": {
+            "database": "/build/nx/workspace-data/tasks.db",
+            "holders": [
+              {
+                "command": "node nx build widget",
+                "pid": 4443
+              }
+            ],
+            "kind": "landingOpening"
+          }
+        },
+        "seed": {
+          "kind": "unchanged"
+        }
       },
+      "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
       "targetBranch": "main",
       "targetWasCheckedOut": false
