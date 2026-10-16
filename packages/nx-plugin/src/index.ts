@@ -4,7 +4,6 @@ import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { readTsConfig } from '@nx/js';
 import {
   type CreateNodesContextV2,
   type CreateNodesResultV2,
@@ -14,7 +13,7 @@ import {
 } from 'nx/src/devkit-exports.js';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { parse as parseToml } from 'smol-toml';
-import type { ParsedCommandLine } from 'typescript';
+import { parseJsonConfigFileContent, type ParsedCommandLine, readConfigFile, sys as typescriptSys } from 'typescript';
 
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import {
@@ -366,6 +365,18 @@ async function indexedEslintSources(workspaceRoot: string): Promise<ReadonlySet<
   return new Set(await globIndexedFiles(workspaceRoot, [ESLINT_SOURCES_GLOB]));
 }
 
+/**
+ * Read a tsconfig with this plugin's own TypeScript. `@nx/js`'s readTsConfig does an
+ * undeclared `require('typescript')` resolved from its own location: where that lands on the
+ * TypeScript 7 native package (whose entry exports only its version), `sys` is undefined and
+ * graph construction dies reading `sys.readFile`. The plugin declares TypeScript 6, whose
+ * `sys` this uses, so the resolution is the one this package's manifest promises.
+ */
+function readTestTsConfig(testConfig: string): ParsedCommandLine {
+  const readResult = readConfigFile(testConfig, typescriptSys.readFile);
+  return parseJsonConfigFileContent(readResult.config, typescriptSys, dirname(testConfig));
+}
+
 function projectLintCommands(
   projectRoot: string,
   workspaceRoot: string,
@@ -395,7 +406,7 @@ function projectLintCommands(
       // A test program can live anywhere the declaration selects, not just src.
       // Use the compiler's file set and the existing declaration-chain hasher,
       // so inherited includes and files outside this project keep their keys.
-      const program: ParsedCommandLine = readTsConfig(testConfig);
+      const program: ParsedCommandLine = readTestTsConfig(testConfig);
       const errors = program.errors.filter(({ code }) => code !== 18003);
       if (errors.length > 0) {
         throw new Error(
