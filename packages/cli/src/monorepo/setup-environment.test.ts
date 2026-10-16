@@ -1,7 +1,7 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell fixture scripts are literal shell text. */
 import { describe, expect, it } from 'bun:test';
 import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from 'node:fs';
-import { chmod, copyFile, cp, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, cp, mkdir, mkdtemp, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -677,6 +677,182 @@ describe('Bun installation receipt link admission', () => {
         expect(await enter()).toEqual(HEALTHY);
         expect(readFileSync(receipt)).toEqual(recorded);
         expect(readFileSync(join(root, 'integrity-installs'), 'utf8')).toBe('x\n');
+      },
+    );
+  });
+
+  it('admits a superseded store variant whose link dangles beside its intact replacement', async () => {
+    await withManagedRepository(options, async ({ root, enterShell: enter }) => {
+      expect(await enter()).toEqual(HEALTHY);
+      const receipt = join(root, 'node_modules', '.smoo-install');
+      await rm(receipt);
+      // A store entry a restored cache carried from another machine's install: same package and
+      // version as the intact entry, its link aimed at an install cache this machine never had.
+      await symlink(
+        join(dirname(root), 'private-bun-cache', 'missing-stale-variant'),
+        join(root, 'node_modules', '.bun', '@fixture+parent@1.0.0+stale'),
+      );
+      const entered = await enter({ ciSecrets: CI_SECRETS });
+      expect(entered.exitCode).toBe(0);
+      expect(entered.stderr).not.toContain('Bun install integrity:');
+      expect(existsSync(receipt)).toBe(true);
+    });
+  });
+
+  it('refuses a dangling variant the installed tree still references, however intact its replacement', async () => {
+    await withManagedRepository(
+      {
+        ...options,
+        prepare: 'bun integrity-fixture.mjs && bun plant-negative.mjs',
+        files: {
+          ...files,
+          'plant-negative.mjs': [
+            "import { mkdirSync, symlinkSync } from 'node:fs';",
+            "import { dirname, join } from 'node:path';",
+            'const root = process.cwd();',
+            "const stale = join(root, 'node_modules', '.bun', '@fixture+parent@1.0.0+stale');",
+            "symlinkSync(join(dirname(root), 'private-bun-cache', 'missing-stale'), stale);",
+            "mkdirSync(join(root, 'node_modules', '@fixture'), { recursive: true });",
+            "symlinkSync(join('..', '.bun', '@fixture+parent@1.0.0+stale', 'node_modules', '@fixture', 'parent'), join(root, 'node_modules', '@fixture', 'parent'));",
+            '',
+          ].join('\n'),
+        },
+      },
+      async ({ enterShell: enter }) => {
+        const refused = await enter({ ciSecrets: CI_SECRETS });
+        expect(refused.exitCode).toBe(1);
+        expect(refused.stderr).toContain('Bun install integrity:');
+      },
+    );
+  });
+
+  it('refuses a live alias aimed at a version-named missing target, however intact its namesake', async () => {
+    await withManagedRepository(
+      {
+        ...options,
+        prepare: 'bun integrity-fixture.mjs && bun plant-alias.mjs',
+        files: {
+          ...files,
+          'plant-alias.mjs': [
+            "import { rmSync, symlinkSync } from 'node:fs';",
+            "import { dirname, join } from 'node:path';",
+            'const root = process.cwd();',
+            "const alias = join(root, 'node_modules', '.bun', '@fixture+parent@1.0.0', 'node_modules', '@fixture', 'child');",
+            'rmSync(alias, { force: true });',
+            "symlinkSync(join(dirname(root), 'private-bun-cache', 'missing', '@fixture+parent@1.0.0'), alias);",
+            '',
+          ].join('\n'),
+        },
+      },
+      async ({ enterShell: enter }) => {
+        const refused = await enter({ ciSecrets: CI_SECRETS });
+        expect(refused.exitCode).toBe(1);
+        expect(refused.stderr).toContain('Bun install integrity:');
+      },
+    );
+  });
+
+  it('refuses a root alias aimed into a store entry that does not exist, however intact its namesake', async () => {
+    await withManagedRepository(
+      {
+        ...options,
+        prepare: 'bun integrity-fixture.mjs && bun plant-ghost.mjs',
+        files: {
+          ...files,
+          'plant-ghost.mjs': [
+            "import { mkdirSync, symlinkSync } from 'node:fs';",
+            "import { join } from 'node:path';",
+            'const root = process.cwd();',
+            "mkdirSync(join(root, 'node_modules', '@fixture'), { recursive: true });",
+            "symlinkSync(join('..', '.bun', '@fixture+parent@1.0.0+nonexistent', 'node_modules', '@fixture', 'parent'), join(root, 'node_modules', '@fixture', 'parent'));",
+            '',
+          ].join('\n'),
+        },
+      },
+      async ({ enterShell: enter }) => {
+        const refused = await enter({ ciSecrets: CI_SECRETS });
+        expect(refused.exitCode).toBe(1);
+        expect(refused.stderr).toContain('Bun install integrity:');
+      },
+    );
+  });
+
+  it('refuses a root alias aimed at an absolute install-cache target that does not exist', async () => {
+    await withManagedRepository(
+      {
+        ...options,
+        prepare: 'bun integrity-fixture.mjs && bun plant-external.mjs',
+        files: {
+          ...files,
+          'plant-external.mjs': [
+            "import { mkdirSync, symlinkSync } from 'node:fs';",
+            "import { dirname, join } from 'node:path';",
+            'const root = process.cwd();',
+            "const globalEntry = join(dirname(root), 'private-bun-cache', 'links', '@fixture+parent@1.0.0+old');",
+            "symlinkSync(globalEntry, join(root, 'node_modules', '.bun', '@fixture+parent@1.0.0+old'));",
+            "mkdirSync(join(root, 'node_modules', '@fixture'), { recursive: true });",
+            "symlinkSync(join(globalEntry, 'node_modules', '@fixture', 'parent'), join(root, 'node_modules', '@fixture', 'parent'));",
+            '',
+          ].join('\n'),
+        },
+      },
+      async ({ enterShell: enter }) => {
+        const refused = await enter({ ciSecrets: CI_SECRETS });
+        expect(refused.exitCode).toBe(1);
+        expect(refused.stderr).toContain('Bun install integrity:');
+      },
+    );
+  });
+
+  it('refuses a root package alias that resolves to a regular file, not a package directory', async () => {
+    await withManagedRepository(
+      {
+        ...options,
+        prepare: 'bun integrity-fixture.mjs && bun plant-file-alias.mjs',
+        files: {
+          ...files,
+          'plant-file-alias.mjs': [
+            "import { mkdirSync, symlinkSync } from 'node:fs';",
+            "import { join } from 'node:path';",
+            'const root = process.cwd();',
+            "mkdirSync(join(root, 'node_modules', '@fixture'), { recursive: true });",
+            "symlinkSync(join(root, 'integrity-mode'), join(root, 'node_modules', '@fixture', 'filepkg'));",
+            '',
+          ].join('\n'),
+        },
+      },
+      async ({ enterShell: enter }) => {
+        const refused = await enter({ ciSecrets: CI_SECRETS });
+        expect(refused.exitCode).toBe(1);
+        expect(refused.stderr).toContain('Bun install integrity:');
+      },
+    );
+  });
+
+  it('admits a root scope that is itself a symlink to a directory of packages', async () => {
+    await withManagedRepository(
+      {
+        ...options,
+        prepare: 'bun integrity-fixture.mjs && bun plant-scope.mjs',
+        files: {
+          ...files,
+          'plant-scope.mjs': [
+            "import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';",
+            "import { dirname, join } from 'node:path';",
+            'const root = process.cwd();',
+            "const scope = join(dirname(root), 'private-bun-cache', 'linked-scope');",
+            "mkdirSync(join(scope, 'pkg'), { recursive: true });",
+            "writeFileSync(join(scope, 'pkg', 'package.json'), JSON.stringify({ name: '@linked/pkg', version: '1.0.0' }));",
+            "symlinkSync(scope, join(root, 'node_modules', '@linked'));",
+            '',
+          ].join('\n'),
+        },
+      },
+      async ({ root, enterShell: enter }) => {
+        const entered = await enter({ ciSecrets: CI_SECRETS });
+        expect(entered.exitCode).toBe(0);
+        expect(entered.stderr).not.toContain('Bun install integrity:');
+        expect(existsSync(join(root, 'node_modules', '.smoo-install'))).toBe(true);
       },
     );
   });
