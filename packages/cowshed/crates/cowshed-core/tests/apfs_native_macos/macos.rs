@@ -3337,6 +3337,8 @@ fn real_apfs_unmount_verified_twice_preserves_the_attached_image() {
 /// Independent exact-whole image-driver detach attempts release after cowshed has checked its
 /// identity and before fsck opens diskN. A pathname check alone loses that race;
 /// the raw volume descriptor must keep the kernel from recycling diskN even for a forced eject.
+/// Unexpected refusals retain command timing and current ownership observations without changing
+/// the Busy oracle or adding a pin that could itself prevent release.
 struct EjectAtFsck {
     owned: PathBuf,
     foreign: PathBuf,
@@ -3359,16 +3361,34 @@ impl EjectAtFsck {
         );
         let whole = owned.whole_device();
         self.release_attempts.fetch_add(1, Ordering::SeqCst);
+        let mounted_before = SystemKernelMountSource
+            .mounts()
+            .expect("kernel mount inventory before the pinned operation")
+            .into_iter()
+            .filter(|mount| mount.source_device == volume_device)
+            .collect::<Vec<_>>();
         assert!(
-            SystemKernelMountSource
-                .mounts()
-                .expect("kernel mount inventory before the pinned operation")
-                .iter()
-                .all(|mount| mount.source_device != volume_device),
+            mounted_before.is_empty(),
             "the raw-pin release hook must run before the owned volume is mounted"
         );
         let eject_request = CommandRequest::new("/usr/bin/hdiutil", ["detach", "-force", whole]);
-        let eject = system.run(&eject_request)?;
+        eprintln!(
+            "raw-pin attack start wall={:?} pid={} image={} whole={whole} \
+             volume={volume_device} kernel_mounts={mounted_before:?} command={eject_request:?}",
+            SystemTime::now(),
+            std::process::id(),
+            self.owned.display(),
+        );
+        let started = Instant::now();
+        let eject = system.run(&eject_request);
+        eprintln!(
+            "raw-pin attack end wall={:?} elapsed={:?} image={} whole={whole} \
+             volume={volume_device} result={eject:?}",
+            SystemTime::now(),
+            started.elapsed(),
+            self.owned.display(),
+        );
+        let eject = eject?;
         if eject.succeeded() {
             self.ejected.store(1, Ordering::SeqCst);
             let attached = system.run(&CommandRequest::new(
@@ -3398,6 +3418,35 @@ impl EjectAtFsck {
                 request: eject_request,
                 output: eject,
             };
+            if !cowshed_apfs::detach_was_dissented(&refusal) {
+                // Observe before unwinding drops the production pin and cleanup releases the image.
+                // Failed observations stay visible beside the original command failure.
+                let registry_after = system.attached_disk_images().map(|images| {
+                    images
+                        .into_iter()
+                        .filter(|image| {
+                            matches!(&image.source, DiskImageSource::File(path)
+                                if path == &self.owned || path == &self.foreign)
+                                || image.media.iter().any(|media| {
+                                    media.device == whole || media.device == volume_device
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let mounts_after = SystemKernelMountSource.mounts().map(|mounts| {
+                    mounts
+                        .into_iter()
+                        .filter(|mount| mount.source_device == volume_device)
+                        .collect::<Vec<_>>()
+                });
+                eprintln!(
+                    "raw-pin unexpected refusal wall={:?} image={} whole={whole} \
+                     volume={volume_device} registry_after={registry_after:?} \
+                     kernel_mounts_after={mounts_after:?}; {refusal}",
+                    SystemTime::now(),
+                    self.owned.display(),
+                );
+            }
             assert!(
                 cowshed_apfs::detach_was_dissented(&refusal),
                 "the raw pin must produce an image-driver Busy refusal: {refusal}"
@@ -3435,6 +3484,7 @@ impl CommandRunner for EjectAtFsck {
             None
         };
         if let Some(volume) = volume {
+            eprintln!("raw-pin attack hook request={request:?}");
             self.try_recycle(volume)?;
         }
         SystemCommandRunner.run(request)
@@ -3445,7 +3495,16 @@ impl CommandRunner for EjectAtFsck {
     }
 
     fn pin_raw_device(&self, device: &Path) -> std::io::Result<Option<Fenced<std::fs::File>>> {
-        SystemCommandRunner.pin_raw_device(device)
+        let pin = SystemCommandRunner.pin_raw_device(device)?;
+        eprintln!(
+            "raw-pin opened wall={:?} image={} raw={} descriptor={pin:?} rdev={:?}",
+            SystemTime::now(),
+            self.owned.display(),
+            device.display(),
+            pin.as_ref()
+                .map(|pin| pin.metadata().map(|metadata| metadata.rdev())),
+        );
+        Ok(pin)
     }
 
     fn attached_disk_images(&self) -> std::io::Result<Vec<AttachedDiskImage>> {
