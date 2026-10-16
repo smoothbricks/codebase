@@ -4539,8 +4539,9 @@ impl SupervisorActor {
         let id = layout.volume_at(grant).ok_or_else(|| {
             CowshedError::integrity(
                 format!(
-                    "build volume grant {} is not one of this project's build volumes",
-                    grant.display()
+                    "build volume grant {} is not one of this project's build volumes; expected a volume under {} (root aliases are resolved)",
+                    grant.display(),
+                    layout.mounts().display(),
                 ),
                 "cowshed doctor --json",
             )
