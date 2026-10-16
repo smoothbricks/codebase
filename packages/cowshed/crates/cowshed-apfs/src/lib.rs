@@ -6597,7 +6597,7 @@ mod tests {
                 }
                 let mut token = [0];
                 match (&*ready).read(&mut token) {
-                    Ok(1) if token == [b'r'] => break Ok(()),
+                    Ok(1) if token == *b"r" => break Ok(()),
                     Ok(0) => {}
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Ok(_) => {
