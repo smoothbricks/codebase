@@ -179,7 +179,37 @@ async function nativeRamVolume(): Promise<void> {
   chmodSync(outside, 0o555);
   // The host's own commands, with one injectable image in the I/O Registry listing. The steps that
   // mount, unmount or place the volume are recorded in the order provisioning runs them.
-  const host = createHostCommands();
+  const delegate = createHostCommands();
+  const host: HostCommands = {
+    async run(file, args, deadlineMs) {
+      const startedAt = Date.now();
+      const starting = JSON.stringify({
+        phase: 'native-host-command-start',
+        file,
+        args,
+        deadlineMs: deadlineMs ?? null,
+        wallAtMs: startedAt,
+        caseElapsedMs: startedAt - caseStartedAt,
+      });
+      process.stderr.write(`${starting}\n`);
+      trace.log.info(starting);
+      const output = await delegate.run(file, args, deadlineMs);
+      const endedAt = Date.now();
+      const finished = JSON.stringify({
+        phase: 'native-host-command-end',
+        file,
+        args,
+        status: output.status,
+        stderr: output.stderr,
+        wallAtMs: endedAt,
+        elapsedMs: endedAt - startedAt,
+        caseElapsedMs: endedAt - caseStartedAt,
+      });
+      process.stderr.write(`${finished}\n`);
+      trace.log.info(finished);
+      return output;
+    },
+  };
   const attachedBelow: { image: string | null; failInventory: boolean } = { image: null, failInventory: false };
   const provisioning: string[] = [];
   const commands: HostCommands = {
