@@ -662,6 +662,7 @@ mod tests {
             profile_directory: root.join("store/run/profiles"),
             port_block: crate::metadata::PortBlock::new(49_136, 16).expect("ports"),
             retained_port_blocks: Vec::new(),
+            cpu_pool_directory: None,
             mode: crate::sandbox::RunSandboxMode::ReadWrite,
             grants: crate::sandbox::SandboxGrants {
                 read: vec![checkout.to_owned()],

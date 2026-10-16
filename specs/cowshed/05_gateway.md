@@ -474,13 +474,65 @@ core count.
   three at the same priority.
 - **All at once.** A request is granted once, in full, and never holds part of a grant while waiting for more, so no two
   requests can deadlock on each other's tokens.
+
+- **Gate admission by whole-grant drain** (2026-10-14). A jobserver root request carries a typed
+  `class: "background" | "gate"`; omission is background. A queued gate stops **new background root admissions** (both
+  jobserver and `cpu-tokens`). An in-flight background grant stays exactly as it is until its child exits or its
+  connection closes. The oldest queued gate takes `min(want, free)` whole tokens ahead of all queued background work,
+  including background requests earlier in the same checkout. One gate is active host-wide; while it holds its grant,
+  later gates and background roots stay queued. When it ends, the next gate wins, otherwise ordinary checkout fairness
+  resumes. This is priority on genuinely returned tokens, not a reserved budget, budget increase, or stolen allocation.
+  Conservation remains `free + Σ held = N`.
+- **What drain priority does not guarantee.** A background test's CPU grant cannot be shrunk mid-run: Cargo's implicit
+  make token and libtest/nextest threads sized from the original grant do not return FIFO bytes. The gateway does not
+  resize a running FIFO, kill peer work, or use `SIGSTOP`/`SIGCONT`: wall and idle bounds would keep advancing during a
+  freeze. A gate may have to wait for a **whole grant** to return. It has guaranteed admission once the background set
+  drains while its request is live, and queued background churn cannot overtake it, but no fixed latency is promised
+  while every token is genuinely held. Drain priority promises admission, not a fixed test duration. The supervisor's
+  separate nice placement below lowers background scheduling weight without raising a gate above default.
+- **A gate wait is bounded and diagnosed.** A gate jobserver request must name an explicit positive uint32 `waitMs`. The
+  trusted operator request `cowshed exec <workspace> --class gate --host --want N [--wait-ms N] -- COMMAND [ARGS...]`
+  defaults its gate wait to **120000 ms**; the explicit per-invocation `--wait-ms` overrides that admission bound only.
+  It sends `{"op":"jobserver","class":"gate","waitMs":120000,"want":<n>,"checkout":"<root>","command":"…"}`. The wait
+  ends at the returned-token grant, never deliberately at the bound. Expiry answers
+  `{"ok":false,"code":"gate-admission-timeout","error":"…","waitMs":<actual wait>,"cpuBudget":{…}}`: the error names the
+  actual wait and current checkout holders, with each held count and running-grant count; `cpuBudget` is the live ledger
+  snapshot. The timed-out request leaves the queue. Unknown classes, a missing/zero gate bound, or a background bound
+  are invalid requests. Ordinary builds keep **no admission deadline**. Running task wall/idle bounds still start at
+  their grant.
+- **The task server owns the live grant and nice.** Work enters the existing `cowshed exec` / workspace supervisor, not
+  a gate-host or taskpolicy wrapper. Its typed request carries class, want, waitMs and scope. Only a trusted
+  coordinator/operator may request Gate or HostGate; a worker request is refused with typed class-not-permitted before
+  job or spawn effects. Ordinary commands default Background, want1 and Workspace scope; producers that need parallel
+  work supply their actual demand. The supervisor records Queued, asks the gateway off its actor path and spawns only
+  after a real grant. CPU admission uses the control socket of the controller's validated host storage, the same
+  store/gateway.sock authority its gateway reconciliation uses, never an unrelated ambient store. A queued kill
+  withdraws the request without spawning. Missing/refused admission never causes an unbudgeted server spawn. The
+  supervisor retains the allocation until the owned job concludes. The gateway's existing CpuBudget ledger serves that
+  exact allocation on a private workspace-scoped CPU-pool endpoint; Nx bounded-exec and Cargo descendants borrow only
+  from it, with sibling sums bounded by its actual count. The root FIFO is not offered alongside the pool: that would
+  spend the same tokens twice. Its canonical endpoint is `<store>/run/cpu/<base64url-incarnation>/<opaque-endpoint>`:
+  the unpadded 22-byte incarnation component losslessly encodes all 128 bits of the validated 32-lowercase-hex workspace
+  incarnation, never a digest or truncated prefix. The opaque endpoint is an independent 22-byte unpadded base64url
+  UUID. The gateway, sandbox builder and grant validator derive this one layout through the same helper; there is no
+  runtime alias or fallback. This adds 54 bytes to the store prefix, giving a 98-byte socket path for the existing
+  44-byte fixture store, within Darwin's 103-byte usable limit. Arbitrarily long store paths do not acquire a new
+  short-link lifecycle. A bare count/class is no gate role. The owned command is placed at **nice0 for Gate, nice+10 for
+  Background**, never the shared warm host or supervisor. Raising a gate above default requires root and is not
+  attempted; priority lowers background nice instead. Nice is applied and read back before command execution, using the
+  held-child fence on macOS and a private report pipe on Linux. Refusal is typed PriorityFailure, not an unobserved run.
+  Class, scope, actual tokens and observed nice are recorded; nice remains absent when never observed. A HostGate is a
+  coordinator-only argv one-shot on the host, outside ExecutedChild, preserving the real-APFS gate's host authority; no
+  ordinary workspace sandbox is loosened. Controller discovery uses only `cargo locate-project` and
+  `cargo metadata --no-deps --offline`, which retain their noncompiling exemption: no grant, class nice or job record is
+  claimed for that discovery.
 - **Work-conserving.** No grant is capped below `want` for fairness' sake: with nobody else waiting, a grant is
   `min(want, free)`, so a lone runner may hold all N tokens, because idle tokens help nobody and a gate's wall time is
   what the budget buys. A lone waiter also takes the remaining free tokens when fewer than its fair share are free: on
   an 18-token host, a runner holding 12 does not make the sole newcomer wait instead of taking the idle 6. What a
-  newcomer needs is not a reserved half — it never waits out a whole run — but the foreground band (Dynamic QoS, below):
-  a foreground arrival demotes running normal work to utility instead of queueing behind its tokens. Fairness among
-  checkouts (the share rule above) still bounds a grant while another checkout waits.
+  newcomer does not get a reserved half. Ordinary checkout fairness (the share rule above) still bounds a grant while
+  another ordinary checkout waits. Gate admission is the explicit drain-priority exception: an active gate blocks new
+  background roots even when its requested count leaves tokens idle.
 - **Dynamic QoS.** A job's class states what it is; its band states how the host schedules it now, and the two move
   independently. Four bands, in scheduler order: **foreground**, **normal**, **utility**, **background**. The land turn
   — its holder and the gate lineage that follows it — and any job a model is waiting on run **foreground**. Ordinary
@@ -491,8 +543,9 @@ core count.
   foreground job's threads win the cores its grant names. When no foreground job is starved, utility jobs are promoted
   back to normal. A band change is a live transition on the job's retained process identities (the Darwin and Linux
   placements of "Bands"); one that cannot cover a forked tree whole reports `IncompleteCoverage` and claims no
-  transition. Bands never admit, queue or size a job — the token ledger alone does that — so a demoted job holding many
-  tokens cannot starve a foreground job of cores, and an idle host leaves every band's work at full speed.
+  transition. Bands never admit, queue or size a job — the token ledger alone does that. Demotion does not reclaim
+  tokens from a live background test grant: bounded gate admission above, not an OS band, diagnoses that wait. An idle
+  host leaves every band's work at full speed.
 - **Crash safety by connection.** The grant is tied to the connection: on exit, `SIGKILL` included, the kernel closes
   the socket and the gateway returns the tokens at once. A request that closes while queued leaves the queue. A gateway
   restart forgets every grant, so runners started under the old one overshoot until they finish.
@@ -511,10 +564,14 @@ core count.
   `{"ok":true}`, or `not-found` for an admission that is not live. It re-keys the selected admission only while queued;
   a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions. This
   control changes neither the token budget nor the dynamic-band rules and creates no separate resource ledger.
-- **The budget spaces runners out; it never decides whether one runs.** With no gateway listening (any host without
-  cowshed, CI included) the command runs exactly as configured and nothing is said. A gateway that predates the budget
-  refuses the unknown operation at once (an older one, silent until EOF, is half-closed after 2 s), and the command runs
-  unbudgeted with that reason on its stderr. A grant has no deadline: queued, the client knows the gateway is alive.
+- **Managed Cargo admission is fail-closed.** For a root request, the CLI launcher scans cwd ancestors with lstat for
+  the in-image `.cowshed/workspace.json` marker. Its presence only tightens admission and grants no authority; an
+  inspection error refuses. A managed checkout starts no payload without a live grant: absent gateway, refusal, unknown
+  operation, malformed protocol and premature close all fail with their actual reason. Only a positively nonmanaged
+  host/CI checkout may run unbudgeted only when NotFound proves gateway absence. ConnectionRefused can come from a live
+  saturated listener, so it and every other connect error refuse. A connected refusal or protocol error is never
+  absence, in any checkout. Noncompiling discovery and inherited grants keep their existing precedence. An ordinary
+  grant has no deadline; a gate's positive waitMs remains bounded.
 - **Spans.** The executor prints
   `cowshed: cpu-tokens wait done elapsed=<ms>ms status=ok tokens=<g>/<want> runner=<kind>` before the command's own
   output (`status=err … runs unbudgeted: <reason>` without a grant), so a slow or failing task says how long it waited
@@ -526,6 +583,17 @@ core count.
   environment and its subcommand, the first argument after cargo's global options and a `+toolchain`, in this order:
   - **An inherited jobserver** (`CARGO_MAKEFLAGS` names a live one; for a `fifo:` one, its path exists), as for a
     `cargo` a build script starts: it runs `cargo` as asked, since that jobserver already counts it.
+
+  - **A live parent CPU pool** (`BOUNDED_EXEC_CPU_POOL` plus its positive count): a compiling Cargo asks that pool for
+    at most `min(count, ceil(cores / 2))` local tokens, never a second host grant. It requests
+    `{"op":"cpu-pool","want":<n>,"children":true}`; the existing pool accounts for this holder and serves its actual
+    grant as a private child pool, named by `pool` in the granted reply. Cargo's jobs/test variables and inherited count
+    are set to the actual local grant, and descendants receive that child pool, not the occupied ancestor. Cargo's own
+    inherited make jobserver still comes first. Noncompiling subcommands still run directly. A connected parent's
+    refusal, connection failure, malformed grant or loss fails the command. A valid named pool never falls through to a
+    second root or an unbudgeted run. An absent or malformed descriptor alone follows normal host admission. The
+    launcher owns its unreaped Cargo process group, ends it on pool loss with the normal TERM/grace/KILL path (10
+    seconds grace), and releases its local grant after its command ends; it never freezes a test.
   - **A `bounded-exec` grant** (`BOUNDED_EXEC_CPU_TOKENS` set): it takes no second grant and runs `cargo` with
     `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to `BOUNDED_EXEC_CPU_TOKENS` where they are
     unset. `bounded-exec` sets the cargo variables only for a cargo runner, so a `cargo` that a `process` runner's
@@ -555,10 +623,12 @@ core count.
   and returns all `g` tokens to the ledger, so tokens a killed process read and never wrote back are credited too. A
   `cargo` that outlives a killed launcher keeps its open fifo and runs over budget until it finishes, as a runner does
   across a gateway restart.
-- **Where the launcher cannot budget.** With no gateway listening it runs `cargo` unbudgeted, as `bounded-exec` does. A
-  sandboxed process cannot reach the control socket (above), so its `cargo` runs unbudgeted too. A daemon that inherited
-  `BOUNDED_EXEC_CPU_TOKENS` from a grant and outlives it starts later `cargo` runs capped to that count but outside any
-  grant; an inherited `CARGO_MAKEFLAGS` whose fifo is gone counts as no jobserver.
+- **Where the launcher cannot budget.** It refuses a failed root admission in a managed checkout and never starts Cargo.
+  Gateway absence permits unbudgeted execution only in a positively nonmanaged host/CI checkout, not merely because a
+  sandbox cannot reach the socket. Marker inspection failures also refuse. The failure diagnostic names the cause and
+  says it is refusing to run without a grant. Existing inherited jobserver/pool and noncompiling paths above are
+  unchanged; fixed test/nextest grants are never opted into cooperative FIFO reclaim. An inherited `CARGO_MAKEFLAGS`
+  whose fifo is gone counts as no jobserver.
 
 Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave) and `tests/cpu_budget.rs`
 over a real socket (`SIGKILL` of a holding client returns its tokens to the waiter at once; checkouts share the host;

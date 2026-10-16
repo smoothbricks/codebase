@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
@@ -11,16 +12,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::api::dto::{
-    AdmissionKey, BinaryData, CommandArg, ExecCommand, ExecRequest, ExitStatus, JobFailure, JobId,
-    JobInfo, JobJournalCursor, JobListeningPorts, JobState, JobTail, JobTailLimits,
-    OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary, ProtectedOutput, SealedJob,
-    Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo, TraceContext, TraceId,
-    UtcTimestamp, WorkspacePath,
+    AdmissionKey, BinaryData, CommandArg, ExecCommand, ExecRequest, ExecScope, ExitStatus,
+    JobFailure, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobState, JobTail,
+    JobTailLimits, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
+    ProtectedOutput, SealedJob, Sha256Digest, StdinInfo, StdinKind, StdinSource, StreamInfo,
+    TraceContext, TraceId, UtcTimestamp, WorkspacePath,
 };
 use crate::api::journal_tail::tail_journals;
 use crate::api::process::JobLeafAttribution;
@@ -30,6 +32,8 @@ use crate::api::resources::UsageReconciliation;
 use crate::api::resources::{
     HostLoadSample, JobAccounting, JobResourceSample, ResidentBytes, SampleInterval,
 };
+#[cfg(target_os = "macos")]
+use crate::error::PriorityFailure;
 use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result, StdinRefusal};
 use crate::exec::{
     ExecError, ProfileFile, ProfileLaunch, SandboxExecRequest, SpawnPlan, classify_spawn_error,
@@ -44,10 +48,11 @@ use crate::sandbox::{
 use crate::storage::apfs::Labelled;
 use crate::storage::audit::AuditSinkError;
 use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV};
-use cowshed_gateway_types::WorkspaceToken;
+use cowshed_gateway_types::{JobserverClass, WorkspaceToken};
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::fsio::AnchoredDirectory;
 
+use crate::runtime::job_cpu::{JobCpuAdmission, JobCpuAsk, JobCpuGrant};
 use crate::runtime::job_groups::Birth;
 use crate::runtime::job_progress::{JobProgressStream, ProgressRead};
 use crate::runtime::job_resources::{
@@ -58,14 +63,17 @@ use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
 #[cfg(target_os = "macos")]
 use crate::runtime::process_monitor::ProcessMonitor;
 use crate::runtime::process_stream::JobProcessStream;
+use crate::runtime::supervisor_socket::AdmissionSource;
 use crate::runtime::volume_usage::{HostVolume, HostVolumeStat, VolumeBaseline, VolumeMountpoint};
 use crate::storage::job_artifact::{
     AdmissionLookup, AdmittedSession, AdmittedStdin, ArtifactConfig, ArtifactError, ArtifactStore,
-    CompletedJobArtifacts, JobAdmission, JobEnding, OutputTargets, SealedCheckpointManifest,
-    StreamKind,
+    CompletedJobArtifacts, JobAdmission, JobEnding, JobScheduling, OutputTargets,
+    SealedCheckpointManifest, StreamKind,
 };
 
+#[cfg(test)]
 const DEFAULT_ACTOR_CAPACITY: usize = 64;
+#[cfg(test)]
 const DEFAULT_EVENT_CAPACITY: usize = 64;
 const PROCESS_IO_CHUNK: usize = 64 * 1024;
 const MAX_LOG_READ: usize = 64 * 1024;
@@ -132,6 +140,9 @@ pub struct WorkspaceSupervisorConfig {
     pub workspace_volume: Option<VolumeMountpoint>,
     /// How each job's resources are sampled.
     pub job_sampling: JobSamplingPolicy,
+    /// The host CPU budget every job's command is admitted through before it spawns (05_gateway.md
+    /// "Host CPU budget"): the gateway's grant, held until the job concludes.
+    pub cpu: Arc<dyn JobCpuAdmission>,
 }
 
 /// How the supervisor samples its jobs' resources (07_api.md, "Job monitoring"): policy values,
@@ -257,6 +268,8 @@ impl WorkspaceSupervisorConfig {
     }
 }
 
+/// A fixture's configuration: placeholder paths and a CPU budget that grants at once.
+#[cfg(test)]
 impl Default for WorkspaceSupervisorConfig {
     fn default() -> Self {
         let workspace_root = PathBuf::from("/tmp/cowshed-workspace");
@@ -287,6 +300,7 @@ impl Default for WorkspaceSupervisorConfig {
                 mode: crate::sandbox::RunSandboxMode::ReadWrite,
                 grants: crate::sandbox::SandboxGrants::default(),
                 allowed_unix_sockets: Vec::new(),
+                cpu_pool_directory: None,
                 additional_denies: Vec::new(),
                 shed_links: Vec::new(),
                 git_worktree_repository: None,
@@ -308,7 +322,30 @@ impl Default for WorkspaceSupervisorConfig {
             volume_labels: None,
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
+            cpu: Arc::new(ImmediateCpu),
         }
+    }
+}
+
+/// A CPU budget that grants each request its whole want at once: in-crate tests' stand-in for the
+/// gateway. Its pool names no live socket; nothing in these tests asks it for tokens.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ImmediateCpu;
+
+#[cfg(test)]
+impl JobCpuAdmission for ImmediateCpu {
+    fn admit(
+        &self,
+        ask: JobCpuAsk,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobCpuGrant>> + Send>> {
+        Box::pin(async move {
+            Ok(JobCpuGrant::new(
+                ask.want,
+                PathBuf::from("/nonexistent/cowshed-cpu-pool.sock"),
+                Box::new(()),
+            ))
+        })
     }
 }
 
@@ -516,6 +553,93 @@ pub struct ProcessSpawnRequest {
     pub policy: SandboxPolicy,
     /// Requested narrowing of the policy's ceiling.
     pub mode: crate::api::dto::RunSandboxMode,
+    /// Where the command runs: in the workspace's sandbox, or a trusted coordinator's gate at the
+    /// host boundary.
+    pub scope: ExecScope,
+    /// The CPU grant and class nice the command alone runs under.
+    pub cpu: CpuPlacement,
+}
+
+/// What a spawn places a job's owned command under: its CPU grant, served to the command as the
+/// live pool and count every nested runner borrows from (05_gateway.md "Nested runners use a
+/// parent-held sub-ledger"), and the nice its class runs at.
+#[derive(Clone, Debug)]
+pub struct CpuPlacement {
+    pub tokens: NonZeroUsize,
+    pub pool: PathBuf,
+    pub nice: i32,
+}
+
+impl CpuPlacement {
+    /// The variables only the grant's authority sets, laid over the caller's: a caller cannot
+    /// name a pool or a count it was not granted. The root FIFO is never offered beside the pool,
+    /// which would count the same tokens twice.
+    pub(super) fn environment(&self) -> [(OsString, OsString); 2] {
+        [
+            (
+                OsString::from("BOUNDED_EXEC_CPU_POOL"),
+                self.pool.clone().into_os_string(),
+            ),
+            (
+                OsString::from("BOUNDED_EXEC_CPU_TOKENS"),
+                OsString::from(self.tokens.get().to_string()),
+            ),
+        ]
+    }
+}
+
+/// The nice a class's command runs at: a gate at the supervisor's own, background ten below it.
+/// Never negative: raising a priority takes a privilege no supervisor holds.
+pub(super) const fn class_nice(class: JobserverClass) -> i32 {
+    match class {
+        JobserverClass::Gate => 0,
+        JobserverClass::Background => 10,
+    }
+}
+
+/// Set the held command `pid` -- forked, leading its own group, not yet running anything of the
+/// job's -- to `nice`, and read back what its kernel entry holds: the nice the command is
+/// observed at. Only a child held at its observation fence is placed here, never a host or this
+/// supervisor.
+#[cfg(target_os = "macos")]
+pub(super) fn place_nice(pid: u32, nice: i32) -> std::result::Result<i32, PriorityFailure> {
+    let failure = |observed, errno| PriorityFailure {
+        pid,
+        requested: nice,
+        observed,
+        errno,
+    };
+    // SAFETY: plain system calls naming a child this supervisor's spawn holds unreleased.
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, nice) } == -1 {
+        return Err(failure(None, io::Error::last_os_error().raw_os_error()));
+    }
+    super::shell_host::clear_errno();
+    // SAFETY: as above.
+    let observed = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
+    if observed == -1
+        && let Some(errno) = io::Error::last_os_error().raw_os_error()
+        && errno != 0
+    {
+        return Err(failure(None, Some(errno)));
+    }
+    if observed == nice {
+        Ok(observed)
+    } else {
+        Err(failure(Some(observed), None))
+    }
+}
+
+/// The command as the gateway's admission diagnostics name it: an argv's words, or that it is a
+/// script.
+fn command_label(command: &ExecCommand) -> String {
+    match command {
+        ExecCommand::Argv(argv) => argv
+            .iter()
+            .map(|argument| argument.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
+        ExecCommand::Script(_) => "script".to_owned(),
+    }
 }
 
 #[derive(Debug)]
@@ -589,6 +713,8 @@ pub enum ProcessEvent {
     Started {
         job_id: JobId,
         process: OwnedProcess,
+        /// The nice the command was observed at once placed, before it ran anything.
+        nice: i32,
     },
     /// A warm-shell job ended before any command started; nothing is left running.
     LaunchFailed {
@@ -625,6 +751,9 @@ pub trait RunningProcess: Send {
     /// The command's process as its parent observed it before anything could reap it. `None`
     /// until the process exists; a warm-shell job reports it with [`ProcessEvent::Started`].
     fn process(&self) -> Option<&OwnedProcess>;
+    /// The nice the command this handle spawned itself was observed at; `None` for one whose
+    /// start, and nice, arrive with [`ProcessEvent::Started`].
+    fn nice(&self) -> Option<i32>;
     /// The retained native source this spawn owns, or absence for a non-native spawn provider.
     #[cfg(target_os = "macos")]
     fn observations(&self) -> Option<&ProcessMonitor>;
@@ -670,13 +799,15 @@ pub struct ArtifactSeal {
 
 pub trait ArtifactSink: Send {
     fn next_job_id(&self) -> Result<JobId>;
-    /// Durably admit `job_id`, under `admission`'s key when it has one, before it spawns.
+    /// Durably admit `job_id`, under `admission`'s key when it has one, with the scheduling it
+    /// asked for, before it spawns.
     fn admit(
         &mut self,
         job_id: JobId,
         grant_revision: u64,
         command: &ExecCommand,
         admission: Option<JobAdmission>,
+        scheduling: JobScheduling,
     ) -> Result<()>;
     /// What this workspace incarnation's admissions say of `key`.
     fn admitted(&self, key: &AdmissionKey) -> AdmissionLookup<'_>;
@@ -750,6 +881,10 @@ impl ArtifactSink for ArtifactStoreSink {
             output_limit: record.output_limit.clone(),
             stdout: record.stdout.clone(),
             stderr: record.stderr.clone(),
+            class: record.scheduling.class(),
+            scope: record.scheduling.scope(),
+            nice: record.nice,
+            cpu_tokens: record.cpu_tokens,
         })
     }
 
@@ -759,6 +894,7 @@ impl ArtifactSink for ArtifactStoreSink {
         grant_revision: u64,
         command: &ExecCommand,
         admission: Option<JobAdmission>,
+        scheduling: JobScheduling,
     ) -> Result<()> {
         let token = self
             .store
@@ -767,6 +903,7 @@ impl ArtifactSink for ArtifactStoreSink {
                 grant_revision,
                 command,
                 admission,
+                scheduling,
                 OutputTargets::default(),
             )
             .map_err(map_artifact_error)?;
@@ -1257,10 +1394,21 @@ async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The caller's variables a child may take: no bypass of managed Git configuration and no
-/// agent-harness `CI` in a development checkout. GitHub/Forgejo Actions identifies real CI
-/// with `GITHUB_ACTIONS=true`; a bare `CI` changes Cargo unit identities but names no runner.
+/// The caller's variables a child may take: no bypass of managed Git configuration, no
+/// agent-harness `CI` in a development checkout, and no CPU authority but the job's own grant.
+/// GitHub/Forgejo Actions identifies real CI with `GITHUB_ACTIONS=true`; a bare `CI` changes
+/// Cargo unit identities but names no runner. A caller's make jobserver (`CARGO_MAKEFLAGS`,
+/// `MAKEFLAGS`, `MFLAGS`) would outrank the job's pool in the Cargo launcher and run its builds
+/// on someone else's tokens, and its pool markers are the grant's to set ([`CpuPlacement`]).
 /// What the sandbox owns or withholds is laid over this by [`SandboxEnvironment`].
+/// Variables that name a CPU authority; only a job's own grant sets them.
+const CALLER_CPU_AUTHORITY: [&str; 5] = [
+    "CARGO_MAKEFLAGS",
+    "MAKEFLAGS",
+    "MFLAGS",
+    "BOUNDED_EXEC_CPU_POOL",
+    "BOUNDED_EXEC_CPU_TOKENS",
+];
 pub(super) fn caller_environment(
     caller: &BTreeMap<String, String>,
 ) -> impl Iterator<Item = (&str, &str)> {
@@ -1268,6 +1416,7 @@ pub(super) fn caller_environment(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .filter(|(name, _)| crate::workspace_git_fetch::caller_git_environment_allowed(name))
+        .filter(|(name, _)| !CALLER_CPU_AUTHORITY.contains(name))
         .filter(|(name, _)| {
             *name != "CI"
                 || caller
@@ -1659,6 +1808,20 @@ impl SpawnSink for SystemSpawnSink {
         let cwd =
             crate::exec::contained_cwd(&request.policy.ceiling().workspace_mount, &request.cwd)
                 .map_err(map_exec_error)?;
+        if request.scope == ExecScope::HostGate {
+            let command = host_gate_command(&request, &cwd)?;
+            #[cfg(target_os = "macos")]
+            let monitor = ProcessMonitor::prepare(request.job_id)?;
+            return spawn_fenced(
+                command,
+                request.job_id,
+                request.cpu.nice,
+                #[cfg(target_os = "macos")]
+                monitor,
+                events,
+            )
+            .await;
+        }
         let policy = request.policy.for_cwd(&cwd)?;
         let (sandbox, profile) = policy.child(request.mode);
         let envrc_directory = shell_directory(sandbox);
@@ -1681,6 +1844,7 @@ impl SpawnSink for SystemSpawnSink {
             environment,
             caller: &request.env,
             grant_revision: request.authority.grant_revision,
+            cpu: &request.cpu,
             #[cfg(target_os = "macos")]
             monitor: monitor.clone(),
         };
@@ -1709,159 +1873,286 @@ impl SpawnSink for SystemSpawnSink {
             );
         }
         let plan = one_shot_plan(sandbox, profile, cwd, argv)?;
-        let mut command = sandboxed_command(&plan, &environment.child(&request.env));
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        prepare_child_descriptors(command.as_std_mut())
-            .map_err(ExecError::from)
-            .map_err(map_exec_error)?;
-        // SAFETY: `pre_exec` runs in the forked child, between `fork` and `exec`, in a process
-        // that was multithreaded at the fork. Only async-signal-safe calls are legal there, and
-        // POSIX lists `setpgid` as one; it allocates nothing, takes no lock, and touches no
-        // memory this closure captures. Its success is load-bearing rather than decorative:
-        // `ChildFence::signal` signals `-pid`, which is the child's own group only because the
-        // child made itself a group leader here, so a failure is returned and fails the spawn
-        // instead of leaving a job whose kill would target the wrong processes.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
-        // Through `std`: this process alone reaps the child, inside its fence ([`ChildFence`]).
-        #[cfg(target_os = "macos")]
-        let mut child = {
-            let (gate, held) = super::process_fence::leader_gate().map_err(|error| {
-                CowshedError::environment_missing(
-                    format!("cannot prepare the process observation fence: {error}"),
-                    "inspect descriptor availability before retrying the command",
-                )
-            })?;
-            let (ready, go) = (
-                std::os::fd::AsRawFd::as_raw_fd(&held.ready),
-                std::os::fd::AsRawFd::as_raw_fd(&held.go),
-            );
-            // SAFETY: the fence calls only getpid/write/read, all async-signal-safe.
-            unsafe {
-                command.pre_exec(move || super::process_fence::hold_before_exec(ready, go));
-            }
-            let command = command.into_std();
-            let source = monitor.clone();
-            tokio::task::spawn_blocking(move || spawn_observed(command, held, gate, &source))
-                .await
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()))
-                .map_err(classify_spawn_error)
-                .map_err(ExecError::from)
-                .map_err(map_exec_error)?
-        };
-        #[cfg(not(target_os = "macos"))]
-        let mut child = command
-            .into_std()
-            .spawn_locked()
-            .map_err(classify_spawn_error)
-            .map_err(ExecError::from)
-            .map_err(map_exec_error)?;
-        let fence = std::sync::Arc::new(ChildFence::new(child.id())?);
-        let pipe = |error: io::Error| {
-            CowshedError::internal(format!("cannot watch the spawned process's pipes: {error}"))
-        };
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| CowshedError::internal("spawned process has no stdin pipe"))
-            .and_then(|stdin| tokio::process::ChildStdin::from_std(stdin).map_err(pipe))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| CowshedError::internal("spawned process has no stdout pipe"))
-            .and_then(|stdout| tokio::process::ChildStdout::from_std(stdout).map_err(pipe))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| CowshedError::internal("spawned process has no stderr pipe"))
-            .and_then(|stderr| tokio::process::ChildStderr::from_std(stderr).map_err(pipe))?;
-        let job_id = request.job_id;
-        let (stdin_sender, stdin_receiver) = mpsc::channel(1);
-        tokio::spawn(run_system_stdin(
-            job_id,
-            stdin,
-            stdin_receiver,
-            events.clone(),
-        ));
-        tokio::spawn(run_system_output(
-            job_id,
-            StreamKind::Stdout,
-            stdout,
-            events.clone(),
-        ));
-        tokio::spawn(run_system_output(
-            job_id,
-            StreamKind::Stderr,
-            stderr,
-            events.clone(),
-        ));
-        let watcher = std::sync::Arc::clone(&fence);
-        tokio::spawn(async move {
-            let event = match watcher.exited().await {
-                Ok(exit) => ProcessEvent::Exited { job_id, exit },
-                Err(error) => {
-                    // The child's end was not observed, so it may still be running. Kill the
-                    // group before reporting: a job that cannot be observed must not be left
-                    // alive behind a terminal record.
-                    let _ = watcher.signal(libc::SIGKILL);
-                    ProcessEvent::WaitFailed { job_id, error }
-                }
-            };
-            let _ = events.send(event).await;
-        });
-        Ok(Box::new(SystemRunningProcess {
-            fence,
-            stdin: StdinLane::new(stdin_sender),
+        let mut environment = environment.child(&request.env);
+        // The grant's pool and count are the authority's, laid over whatever the caller named.
+        environment.extend(request.cpu.environment());
+        spawn_fenced(
+            sandboxed_command(&plan, &environment),
+            request.job_id,
+            request.cpu.nice,
             #[cfg(target_os = "macos")]
             monitor,
-        }))
+            events,
+        )
+        .await
     }
 }
 
+/// The host-boundary command of a trusted coordinator's gate: its argv exec'd directly in the
+/// workspace, outside every sandbox profile and without shell activation, so the gate keeps the
+/// host authority real APFS images need. Its environment is exactly the caller's (credential
+/// names already withheld), with the CPU grant's pool and count laid over it. Admission refused
+/// a host-gate script, which needs the sandboxed exec host's interpreter.
+fn host_gate_command(request: &ProcessSpawnRequest, cwd: &Path) -> Result<tokio::process::Command> {
+    let SpawnCommand::Argv(argv) = &request.command else {
+        return Err(CowshedError::internal(format!(
+            "job {} was admitted as a host-gate script",
+            request.job_id.get()
+        )));
+    };
+    let Some((program, arguments)) = argv.split_first() else {
+        return Err(CowshedError::internal(format!(
+            "job {} was admitted with an empty argv",
+            request.job_id.get()
+        )));
+    };
+    let mut command = tokio::process::Command::new(program);
+    command
+        .env_clear()
+        .args(arguments)
+        .current_dir(cwd)
+        .envs(caller_environment(&request.env))
+        .envs(request.cpu.environment())
+        .env("PWD", cwd);
+    Ok(command)
+}
+
+/// Spawn `command` as a job's one-shot leader: in a process group of its own, at `nice`, reaped
+/// only inside its [`ChildFence`]. On macOS the child is held before exec until its native
+/// observer watches it and this process placed its nice; elsewhere the child sets and verifies its
+/// own nice before exec, and a refusal fails the spawn with the kernel's errno.
+async fn spawn_fenced(
+    mut command: tokio::process::Command,
+    job_id: JobId,
+    nice: i32,
+    #[cfg(target_os = "macos")] monitor: ProcessMonitor,
+    events: mpsc::Sender<ProcessEvent>,
+) -> Result<Box<dyn RunningProcess>> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    prepare_child_descriptors(command.as_std_mut())
+        .map_err(ExecError::from)
+        .map_err(map_exec_error)?;
+    // SAFETY: `pre_exec` runs in the forked child, between `fork` and `exec`, in a process
+    // that was multithreaded at the fork. Only async-signal-safe calls are legal there, and
+    // POSIX lists `setpgid` as one; it allocates nothing, takes no lock, and touches no
+    // memory this closure captures. Its success is load-bearing rather than decorative:
+    // `ChildFence::signal` signals `-pid`, which is the child's own group only because the
+    // child made itself a group leader here, so a failure is returned and fails the spawn
+    // instead of leaving a job whose kill would target the wrong processes.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    // Through `std`: this process alone reaps the child, inside its fence ([`ChildFence`]).
+    #[cfg(target_os = "macos")]
+    let (mut child, nice) = {
+        let (gate, held) = super::process_fence::leader_gate().map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot prepare the process observation fence: {error}"),
+                "inspect descriptor availability before retrying the command",
+            )
+        })?;
+        let (ready, go) = (
+            std::os::fd::AsRawFd::as_raw_fd(&held.ready),
+            std::os::fd::AsRawFd::as_raw_fd(&held.go),
+        );
+        // SAFETY: the fence calls only getpid/write/read, all async-signal-safe.
+        unsafe {
+            command.pre_exec(move || super::process_fence::hold_before_exec(ready, go));
+        }
+        let command = command.into_std();
+        let source = monitor.clone();
+        tokio::task::spawn_blocking(move || spawn_observed(command, held, gate, &source, nice))
+            .await
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()))
+            .map_err(|error| match error {
+                HeldSpawnError::Spawn(error) => {
+                    map_exec_error(ExecError::from(classify_spawn_error(error)))
+                }
+                HeldSpawnError::Priority(failure) => CowshedError::priority(failure),
+            })?
+    };
+    // No fence holds the child here: it places its own nice before exec and reports exactly what
+    // it observed on a private pipe, so a refusal is typed and a placement is the read-back.
+    #[cfg(not(target_os = "macos"))]
+    let (mut child, nice) = {
+        let (reported, report) = super::shell_host::nice_pipe().map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot prepare the command's nice report: {error}"),
+                "inspect descriptor availability before retrying the command",
+            )
+        })?;
+        let report_end = std::os::fd::AsRawFd::as_raw_fd(&report);
+        // SAFETY: getpid/setpriority/getpriority/write and an errno store run between fork and
+        // exec, on a stack buffer and a descriptor this closure only names.
+        unsafe {
+            command.pre_exec(move || super::shell_host::report_own_nice(report_end, nice));
+        }
+        let spawned = command.into_std().spawn_locked();
+        // The child wrote before exec or never got that far; this end only kept the pipe open.
+        drop(report);
+        match (spawned, super::shell_host::read_nice_report(reported)) {
+            (Ok(child), Ok(Some(Ok(observed)))) => (child, observed),
+            (Err(_), Ok(Some(Err(failure)))) => return Err(CowshedError::priority(failure)),
+            (Err(error), _) => {
+                return Err(map_exec_error(ExecError::from(classify_spawn_error(error))));
+            }
+            (Ok(mut child), report) => {
+                // Exec happened, so the child placed and reported its nice; a report that does not
+                // say so leaves the command's nice unknown, and it must not run on unobserved.
+                let pid = i32::try_from(child.id()).unwrap_or(i32::MAX);
+                // SAFETY: this unreaped child leads its own group, made before its nice.
+                let killed = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                let kill = (killed == -1).then(io::Error::last_os_error);
+                let waited = child.wait();
+                return Err(CowshedError::internal(format!(
+                    "the command started without a readable nice report ({report:?}); group \
+                     kill {kill:?}; reap {waited:?}"
+                )));
+            }
+        }
+    };
+    let fence = std::sync::Arc::new(ChildFence::new(child.id())?);
+    let pipe = |error: io::Error| {
+        CowshedError::internal(format!("cannot watch the spawned process's pipes: {error}"))
+    };
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| CowshedError::internal("spawned process has no stdin pipe"))
+        .and_then(|stdin| tokio::process::ChildStdin::from_std(stdin).map_err(pipe))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CowshedError::internal("spawned process has no stdout pipe"))
+        .and_then(|stdout| tokio::process::ChildStdout::from_std(stdout).map_err(pipe))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CowshedError::internal("spawned process has no stderr pipe"))
+        .and_then(|stderr| tokio::process::ChildStderr::from_std(stderr).map_err(pipe))?;
+    let (stdin_sender, stdin_receiver) = mpsc::channel(1);
+    tokio::spawn(run_system_stdin(
+        job_id,
+        stdin,
+        stdin_receiver,
+        events.clone(),
+    ));
+    tokio::spawn(run_system_output(
+        job_id,
+        StreamKind::Stdout,
+        stdout,
+        events.clone(),
+    ));
+    tokio::spawn(run_system_output(
+        job_id,
+        StreamKind::Stderr,
+        stderr,
+        events.clone(),
+    ));
+    let watcher = std::sync::Arc::clone(&fence);
+    tokio::spawn(async move {
+        let event = match watcher.exited().await {
+            Ok(exit) => ProcessEvent::Exited { job_id, exit },
+            Err(error) => {
+                // The child's end was not observed, so it may still be running. Kill the
+                // group before reporting: a job that cannot be observed must not be left
+                // alive behind a terminal record.
+                let _ = watcher.signal(libc::SIGKILL);
+                ProcessEvent::WaitFailed { job_id, error }
+            }
+        };
+        let _ = events.send(event).await;
+    });
+    Ok(Box::new(SystemRunningProcess {
+        fence,
+        stdin: StdinLane::new(stdin_sender),
+        nice,
+        #[cfg(target_os = "macos")]
+        monitor,
+    }))
+}
+
+/// Why a held one-shot spawn did not release a command.
+#[cfg(target_os = "macos")]
+enum HeldSpawnError {
+    /// The spawn, or the observation fence around it, failed.
+    Spawn(io::Error),
+    /// The held child could not be placed at its nice; it never ran.
+    Priority(PriorityFailure),
+}
+
 /// std::Command waits for exec, so spawn and observation run concurrently while the child
-/// is held. A failed attachment fails the exec; no workload is released unobserved.
+/// is held. While it is held the observer attaches and its nice is placed; a failed attachment
+/// or placement fails the exec, so no workload is released unobserved or at the wrong nice.
 #[cfg(target_os = "macos")]
 fn spawn_observed(
     mut command: std::process::Command,
     held: super::process_fence::HeldEnds,
     gate: super::process_fence::LeaderGate,
     monitor: &ProcessMonitor,
-) -> io::Result<std::process::Child> {
+    nice: i32,
+) -> std::result::Result<(std::process::Child, i32), HeldSpawnError> {
     std::thread::scope(|scope| {
         let spawning = scope.spawn(move || {
             let child = command.spawn_locked();
             drop(held);
             child
         });
-        let observed = gate.observe(|pid| monitor.watch(pid).map_err(io::Error::other));
+        let mut placed = None;
+        let observed = gate.observe(|pid| {
+            monitor.watch(pid).map_err(io::Error::other)?;
+            let placement = place_nice(pid, nice);
+            let refused = placement
+                .as_ref()
+                .err()
+                .map(|failure| io::Error::other(format!("{failure:?}")));
+            placed = Some(placement);
+            refused.map_or(Ok(()), Err)
+        });
         let spawned = spawning
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        match (observed, spawned) {
-            (Ok(_), spawned) => spawned,
-            (Err(observation), Err(spawn)) => Err(io::Error::other(format!(
-                "cannot attach the process observer: {observation}; held spawn failed: {spawn}"
-            ))),
-            (Err(observation), Ok(mut child)) => {
-                let pid = i32::try_from(child.id()).map_err(io::Error::other)?;
+        match (observed, placed, spawned) {
+            (Ok(_), Some(Ok(nice)), Ok(child)) => Ok((child, nice)),
+            (_, Some(Err(failure)), Err(_)) => Err(HeldSpawnError::Priority(failure)),
+            (Ok(_), _, Err(spawn)) => Err(HeldSpawnError::Spawn(spawn)),
+            (Err(observation), _, Err(spawn)) => {
+                Err(HeldSpawnError::Spawn(io::Error::other(format!(
+                    "cannot attach the process observer: {observation}; held spawn failed: {spawn}"
+                ))))
+            }
+            (observed, placed, Ok(mut child)) => {
+                let pid = i32::try_from(child.id())
+                    .map_err(io::Error::other)
+                    .map_err(HeldSpawnError::Spawn)?;
                 // SAFETY: this unreaped child leads its own group, established before the hold.
                 let killed = unsafe { libc::kill(-pid, libc::SIGKILL) };
                 let kill = (killed == -1).then(io::Error::last_os_error);
                 let waited = child.wait();
-                Err(io::Error::other(format!(
-                    "cannot attach the process observer: {observation}; unreleased group kill: \
-                     {kill:?}; reap: {waited:?}"
-                )))
+                match placed {
+                    Some(Err(failure)) => {
+                        if kill.is_some() || waited.is_err() {
+                            eprintln!(
+                                "cowshed: the command refused nice {} was not ended cleanly: group kill {kill:?}; reap {waited:?}",
+                                failure.requested
+                            );
+                        }
+                        Err(HeldSpawnError::Priority(failure))
+                    }
+                    Some(Ok(_)) | None => Err(HeldSpawnError::Spawn(io::Error::other(format!(
+                        "cannot attach the process observer: {observed:?}; unreleased group kill: \
+                         {kill:?}; reap: {waited:?}"
+                    )))),
+                }
             }
         }
     })
@@ -2164,6 +2455,8 @@ impl StdinLane {
 struct SystemRunningProcess {
     fence: std::sync::Arc<ChildFence>,
     stdin: StdinLane,
+    /// The nice the command was observed at once placed.
+    nice: i32,
     #[cfg(target_os = "macos")]
     monitor: ProcessMonitor,
 }
@@ -2171,6 +2464,10 @@ struct SystemRunningProcess {
 impl RunningProcess for SystemRunningProcess {
     fn process(&self) -> Option<&OwnedProcess> {
         Some(self.fence.process())
+    }
+
+    fn nice(&self) -> Option<i32> {
+        Some(self.nice)
     }
 
     #[cfg(target_os = "macos")]
@@ -2390,23 +2687,30 @@ impl WorkspaceSupervisorHandle {
     /// controller resolved for this job (`None` when the checkout links none): the job's
     /// sandbox grants exactly that volume (16_build_volumes.md, "Process lifetime across a
     /// swap").
+    ///
+    /// `source` is who asks: only a coordinator may run a gate or reach the host boundary. The
+    /// answer comes once the job's command spawned under its CPU grant, or could not.
     pub async fn exec(
         &self,
         session: Option<&SessionToken>,
         build_volume: Option<PathBuf>,
         request: ExecRequest,
+        source: AdmissionSource,
     ) -> Result<JobId> {
-        self.exec_admitted(session, build_volume, request, false)
+        self.exec_admitted(session, build_volume, request, false, source)
             .await
     }
 
+    /// As [`Self::exec`], answered as soon as the job is admitted: it spawns when its CPU grant
+    /// arrives, and a refusal is its own failure.
     pub async fn exec_background(
         &self,
         session: Option<&SessionToken>,
         build_volume: Option<PathBuf>,
         request: ExecRequest,
+        source: AdmissionSource,
     ) -> Result<JobId> {
-        self.exec_admitted(session, build_volume, request, true)
+        self.exec_admitted(session, build_volume, request, true, source)
             .await
     }
 
@@ -2416,6 +2720,7 @@ impl WorkspaceSupervisorHandle {
         build_volume: Option<PathBuf>,
         request: ExecRequest,
         background: bool,
+        source: AdmissionSource,
     ) -> Result<JobId> {
         self.call(|reply| Command::Exec {
             authority: self.authority.clone(),
@@ -2423,6 +2728,7 @@ impl WorkspaceSupervisorHandle {
             build_volume,
             request: Box::new(request),
             background,
+            source,
             reply,
         })
         .await
@@ -2827,6 +3133,8 @@ impl WorkspaceSupervisor {
             labelling: tokio::task::JoinSet::new(),
             job_sampling: config.job_sampling,
             sample_clock: None,
+            cpu: config.cpu,
+            admissions: tokio::task::JoinSet::new(),
         };
         // Whatever the checkout's volumes were cloned from, they are named for it from here.
         let build = actor.policy.ceiling().build_volume_mount.clone();
@@ -2864,6 +3172,7 @@ pub(super) enum Command {
         build_volume: Option<PathBuf>,
         request: Box<ExecRequest>,
         background: bool,
+        source: AdmissionSource,
         reply: oneshot::Sender<Result<JobId>>,
     },
     StdinWrite {
@@ -3005,6 +3314,8 @@ enum KillReason {
     WaitFailure,
     /// A script did not parse, so nothing ran.
     ScriptSyntax,
+    /// The host CPU budget refused the job, so nothing ran.
+    CpuAdmission,
 }
 
 /// A job's stdin as the actor delivers it, in input order: the bytes the pump wrote to the
@@ -3214,6 +3525,69 @@ struct JobStateRecord {
     /// ends: while it lives, no release unmounts that volume, whatever moved the checkout's link
     /// meanwhile (16_build_volumes.md, "Process lifetime across a swap").
     build_hold: Option<crate::build_volume::BuildVolumeHold>,
+    /// Where the job stands with the host CPU budget.
+    cpu: CpuStanding,
+    /// Why the job failed before any status of its own could say, when it did.
+    failure: Option<JobFailure>,
+    /// A foreground exec's answer, given once its command spawned or could not.
+    spawn_reply: Option<oneshot::Sender<Result<JobId>>>,
+}
+
+/// The complete authored environment's identity, before session or activation overlays. Values
+/// withheld from the command are excluded; every other name/value binds a keyed request even
+/// when it is private and therefore absent from the worker-readable admission projection.
+fn admission_env_sha256(
+    env: &std::collections::HashMap<String, String>,
+    withheld: &BTreeSet<String>,
+) -> Sha256Digest {
+    let mut entries: Vec<(&String, &String)> = env
+        .iter()
+        .filter(|(name, _)| !withheld.contains(*name))
+        .collect();
+    entries.sort_unstable_by_key(|(name, _)| *name);
+    let mut digest = Sha256::new();
+    for (name, value) in entries {
+        for part in [name.as_bytes(), value.as_bytes()] {
+            let length = u64::try_from(part.len()).expect("an environment component fits in u64");
+            digest.update(length.to_le_bytes());
+            digest.update(part);
+        }
+    }
+    Sha256Digest::from_bytes(digest.finalize().into())
+}
+/// Where a job stands with the host CPU budget (05_gateway.md "Host CPU budget").
+enum CpuStanding {
+    /// Asking the gateway; the command spawns when the grant arrives.
+    Queued(Box<PendingSpawn>),
+    /// Cancelled while queued: it left the gateway's queue, and nothing ever spawned.
+    Withdrawn,
+    /// The grant the command runs under, held until the job concludes, whatever ends it.
+    Granted { _grant: JobCpuGrant },
+    /// Holding nothing: the request was refused, or the job concluded and returned its grant.
+    Settled,
+}
+
+/// What a queued job's spawn needs once its grant arrives, as admission settled it: the authority
+/// and sandbox it was admitted under, never ones adopted while it waited.
+struct PendingSpawn {
+    /// Aborting it drops the gateway request, which leaves the queue.
+    asking: tokio::task::AbortHandle,
+    authority: WorkspaceAuthoritySnapshot,
+    policy: SandboxPolicy,
+    command: SpawnCommand,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+    mode: crate::api::dto::RunSandboxMode,
+    scope: ExecScope,
+    stdin: StdinSource,
+}
+
+/// What an exec admission did.
+enum ExecAdmission {
+    /// A keyed repeat of a job already admitted; nothing new happened.
+    Repeat(JobId),
+    /// A new job, durable and queued for its CPU grant.
+    Queued(JobId),
 }
 
 impl JobStateRecord {
@@ -3353,6 +3727,11 @@ struct SupervisorActor {
     job_sampling: JobSamplingPolicy,
     /// The job sampling clock: running while a job owns a process.
     sample_clock: Option<tokio::time::Interval>,
+    /// See [`WorkspaceSupervisorConfig::cpu`].
+    cpu: Arc<dyn JobCpuAdmission>,
+    /// Each queued job's CPU request, answered off the actor's path, so status, kill and every
+    /// other command are served while jobs wait for their grants.
+    admissions: tokio::task::JoinSet<(JobId, Result<JobCpuGrant>)>,
 }
 
 /// The actor's run loop ends only once every job is terminal, so an actor dropped with a job still
@@ -3418,6 +3797,15 @@ impl SupervisorActor {
                     match event {
                         Some(event) => self.handle_event(event),
                         None => break,
+                    }
+                }
+                granted = self.admissions.join_next(), if !self.admissions.is_empty() => {
+                    match granted {
+                        Some(Ok((job_id, granted))) => self.spawn_granted(job_id, granted).await,
+                        // A withdrawn request: its job ended while it was queued.
+                        Some(Err(error)) if error.is_cancelled() => {}
+                        Some(Err(error)) => std::panic::resume_unwind(error.into_panic()),
+                        None => {}
                     }
                 }
                 labelled = self.labelling.join_next(), if !self.labelling.is_empty() => {
@@ -3539,12 +3927,33 @@ impl SupervisorActor {
                 build_volume,
                 request,
                 background,
+                source,
                 reply,
             } => {
-                let result = self
-                    .admit_exec(authority, session, build_volume, *request, background)
-                    .await;
-                let _ = reply.send(result);
+                match self
+                    .admit_exec(
+                        authority,
+                        session,
+                        build_volume,
+                        *request,
+                        background,
+                        source,
+                    )
+                    .await
+                {
+                    // A foreground caller is answered once its command spawned or could not.
+                    Ok(ExecAdmission::Queued(job_id)) if !background => {
+                        if let Some(job) = self.jobs.get_mut(&job_id) {
+                            job.spawn_reply = Some(reply);
+                        }
+                    }
+                    Ok(ExecAdmission::Queued(job_id) | ExecAdmission::Repeat(job_id)) => {
+                        let _ = reply.send(Ok(job_id));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
             Command::StdinWrite {
                 authority,
@@ -4063,9 +4472,9 @@ impl SupervisorActor {
         });
     }
 
-    /// What `key` binds: `request` as the caller sent it, in `session`, before the session lends
-    /// it a cwd or an environment. Withheld credential names are no part of it, as they are no
-    /// part of any job's environment, and so never reach the job record.
+    /// Bind the authored request before a session lends cwd/environment: only public environment
+    /// names are projected in plaintext, while the complete non-withheld environment binds the
+    /// key through its digest. Activation and execution retain their existing environment rules.
     fn job_admission(
         &self,
         key: AdmissionKey,
@@ -4089,9 +4498,13 @@ impl SupervisorActor {
             env: request
                 .env
                 .iter()
-                .filter(|(name, _)| !self.credential_env_names.contains(*name))
+                .filter(|(name, _)| {
+                    !self.credential_env_names.contains(*name)
+                        && crate::api::dto::host_gate_env_name_allowed(name)
+                })
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
+            env_sha256: admission_env_sha256(&request.env, &self.credential_env_names),
             stdin,
             session: match session {
                 None => AdmittedSession::None,
@@ -4116,22 +4529,12 @@ impl SupervisorActor {
         &self,
         admitted: &JobAdmission,
         command: &ExecCommand,
+        scheduling: JobScheduling,
         request: &ExecRequest,
         session: Option<&SessionToken>,
     ) -> Vec<AdmissionField> {
-        let mut env_entries = 0;
-        let mut env_matches = true;
-        for (name, value) in &request.env {
-            if self.credential_env_names.contains(name) {
-                continue;
-            }
-            env_entries += 1;
-            if admitted.env.get(name) != Some(value) {
-                env_matches = false;
-                break;
-            }
-        }
-        env_matches &= env_entries == admitted.env.len();
+        let env_matches =
+            admitted.env_sha256 == admission_env_sha256(&request.env, &self.credential_env_names);
         let stdin_matches = match &request.stdin {
             StdinSource::Empty => matches!(admitted.stdin, AdmittedStdin::Empty),
             StdinSource::Inline(input) => matches!(
@@ -4174,13 +4577,23 @@ impl SupervisorActor {
                 AdmissionField::StderrCopy,
                 admitted.stderr_copy != request.stderr_copy,
             ),
+            (AdmissionField::Scope, scheduling.scope() != request.scope),
+            (AdmissionField::Class, scheduling.class() != request.class),
+            (AdmissionField::Want, scheduling.want() != request.want),
+            (
+                AdmissionField::WaitMs,
+                scheduling.wait_ms() != request.wait_ms,
+            ),
         ]
         .into_iter()
         .filter_map(|(field, differs)| differs.then_some(field))
         .collect()
     }
 
-    /// Admit and spawn one job, granted `build_volume`.
+    /// Admit one job, granted `build_volume`, and ask the host CPU budget for it: once this
+    /// returns the job is durable and queued, and its command spawns when the grant arrives
+    /// ([`Self::spawn_granted`]). The request is fenced first: only a coordinator's exec runs a
+    /// gate or reaches the host boundary. A keyed repeat answers the job it already admitted.
     async fn admit_exec(
         &mut self,
         authority: WorkspaceAuthoritySnapshot,
@@ -4188,7 +4601,8 @@ impl SupervisorActor {
         build_volume: Option<PathBuf>,
         request: ExecRequest,
         background: bool,
-    ) -> Result<JobId> {
+        source: AdmissionSource,
+    ) -> Result<ExecAdmission> {
         self.validate_authority(&authority)
             .and_then(|()| {
                 if self.lifecycle == ActorLifecycle::Running {
@@ -4204,6 +4618,36 @@ impl SupervisorActor {
                     Ok(())
                 }
             })?;
+        source.admit(request.class, request.scope)?;
+        // The host boundary takes no session overlay a worker controls. Environment names do
+        // not restrict execution; the public-name projection is applied only when recording.
+        crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
+        let scheduling =
+            JobScheduling::new(request.scope, request.class, request.want, request.wait_ms)
+                .ok_or_else(|| {
+                    CowshedError::usage(
+                        "a gate names its admission bound (waitMs), background names none, and \
+                         only a gate runs at the host boundary",
+                        "pass --wait-ms only with --class gate, and the host-gate scope only for a \
+                         gate",
+                    )
+                })?;
+        // The host boundary has no sandbox to narrow and no exec host to interpret a script.
+        if scheduling.scope() == ExecScope::HostGate {
+            if matches!(request.command, ExecCommand::Script(_)) {
+                return Err(CowshedError::usage(
+                    "a host gate runs an argv; a script runs only in the workspace's sandboxed \
+                     exec host",
+                    "pass the gate's command as an argv",
+                ));
+            }
+            if request.mode == crate::api::dto::RunSandboxMode::ReadOnly {
+                return Err(CowshedError::usage(
+                    "a host gate runs outside every sandbox, so it cannot be narrowed read-only",
+                    "run the gate read-write, or in the workspace scope",
+                ));
+            }
+        }
         // A key's repeat answers before anything else is touched: its session keeps the cwd and
         // environment it had, no build volume is held and no job id is taken.
         let admission = match &request.admission_key {
@@ -4216,9 +4660,15 @@ impl SupervisorActor {
                     job_id,
                     command,
                     admission: admitted,
+                    scheduling: bound,
                 } => {
-                    let fields =
-                        self.admission_differences(admitted, command, &request, session.as_ref());
+                    let fields = self.admission_differences(
+                        admitted,
+                        command,
+                        bound,
+                        &request,
+                        session.as_ref(),
+                    );
                     return if !fields.is_empty() {
                         Err(CowshedError::admission_refusal(
                             AdmissionRefusal::KeyConflict { job_id, fields },
@@ -4228,7 +4678,7 @@ impl SupervisorActor {
                             AdmissionRefusal::StdinBound { job_id },
                         ))
                     } else {
-                        Ok(job_id)
+                        Ok(ExecAdmission::Repeat(job_id))
                     };
                 }
                 AdmissionLookup::Unprovable { set_aside } => {
@@ -4265,6 +4715,10 @@ impl SupervisorActor {
             stdout_copy,
             stderr_copy,
             admission_key: _,
+            class: _,
+            want: _,
+            wait_ms: _,
+            scope: _,
         } = request;
         command.validate().map_err(|error| {
             CowshedError::usage(error.to_string(), "provide a valid bounded command")
@@ -4325,8 +4779,13 @@ impl SupervisorActor {
             })?;
         {
             let _span = cowshed_os::timing::span("admit", "record");
-            self.artifacts
-                .admit(job_id, self.authority.grant_revision, &command, admission)?;
+            self.artifacts.admit(
+                job_id,
+                self.authority.grant_revision,
+                &command,
+                admission,
+                scheduling,
+            )?;
         }
         self.next_job_id = expected_next;
         let admission = cowshed_os::timing::spanned(
@@ -4371,7 +4830,7 @@ impl SupervisorActor {
             repo_id: self.authority.repo_id.clone(),
             workspace_incarnation: self.authority.workspace_incarnation.clone(),
             job_id,
-            state: JobState::Running,
+            state: JobState::Queued,
             pid: None,
             grant_revision: self.authority.grant_revision,
             command,
@@ -4386,10 +4845,13 @@ impl SupervisorActor {
             output_limit: None,
             stdin: stdin_info,
             failure: None,
+            class: scheduling.class(),
+            scope: scheduling.scope(),
+            nice: None,
+            cpu_tokens: None,
         };
-
-        // Read before the job's first process is dispatched, so nothing it writes precedes its
-        // baseline: a warm host may start the command before its start is reported here.
+        // The admission's own view of the volumes, for a job that ends before it spawns; the
+        // spawn reads them again immediately before the first process is dispatched.
         let volumes = {
             let _span = cowshed_os::timing::span("admit", "volume-baseline");
             VolumeBaseline::admitted(
@@ -4405,30 +4867,25 @@ impl SupervisorActor {
                 },
             );
         }
-        let spawn_span = cowshed_os::timing::span("admit", "spawn");
-        let spawn = self
-            .spawner
-            .spawn(
-                ProcessSpawnRequest {
-                    authority: self.authority.clone(),
+        // Off the actor's path: the actor keeps serving every command while the gateway queues
+        // the request. Dropping the request -- an abort, or this supervisor ending -- closes its
+        // connection, which leaves the queue.
+        let asking = {
+            let ask = self.cpu.admit(JobCpuAsk {
+                class: scheduling.class(),
+                want: scheduling.want(),
+                wait_ms: scheduling.wait_ms(),
+                checkout: self.workspace_root.clone(),
+                command: command_label(&info.command),
+                job: (
+                    self.authority.repo_id.clone(),
+                    self.authority.workspace_incarnation.clone(),
                     job_id,
-                    command: spawn_command,
-                    cwd: cwd
-                        .as_ref()
-                        .map(WorkspacePath::as_path)
-                        .map(Path::to_path_buf)
-                        .unwrap_or_default(),
-                    env: merged_env,
-                    // Rendered when this authority was taken. The request may narrow the
-                    // ceiling, never widen it, and narrowing one job alters no other job.
-                    policy: self.policy.clone(),
-                    mode,
-                },
-                self.events.clone(),
-            )
-            .await;
-        drop(spawn_span);
-        let mut job = JobStateRecord {
+                ),
+            });
+            self.admissions.spawn(async move { (job_id, ask.await) })
+        };
+        let job = JobStateRecord {
             info,
             started_at: Instant::now(),
             process: None,
@@ -4458,58 +4915,190 @@ impl SupervisorActor {
             log_waiters: Vec::new(),
             session_identity,
             build_hold,
+            cpu: CpuStanding::Queued(Box::new(PendingSpawn {
+                asking,
+                authority: self.authority.clone(),
+                // Rendered when this authority was taken. The request may narrow the ceiling,
+                // never widen it, and narrowing one job alters no other job.
+                policy: self.policy.clone(),
+                command: spawn_command,
+                cwd: cwd
+                    .as_ref()
+                    .map(WorkspacePath::as_path)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default(),
+                env: merged_env,
+                mode,
+                scope: scheduling.scope(),
+                stdin,
+            })),
+            failure: None,
+            spawn_reply: None,
         };
-        match spawn {
-            Ok(process) => {
-                #[cfg(target_os = "macos")]
-                {
-                    job.monitor = process.observations().cloned();
-                    if let (Some(monitor), Some(publisher)) = (&job.monitor, &self.job_spans)
-                        && let Err(error) = monitor.trace(publisher.clone(), &job.info)
-                    {
-                        eprintln!(
-                            "cowshed: attaching job {}'s process spans: {error}",
-                            job_id.get()
-                        );
-                    }
-                }
-                if let Some(owned) = process.process() {
-                    // A one-shot command is the job's first process.
-                    own_process(&mut job, owned.clone(), self.job_sampling.leaf_coverage);
-                    adopt_birth(&mut job, self.group_ledger.is_some(), owned.birth.clone());
-                    self.arm_sample_clock();
-                }
-                job.process = Some(process);
-                let started = job.birth.is_some();
-                if background
-                    && let Some(identity) = session_identity
-                    && let Some(session) = self.sessions.get_mut(&identity)
-                {
-                    session.background_jobs.insert(job_id);
-                }
-                self.jobs.insert(job_id, job);
-                if started {
-                    self.record_groups();
-                }
-                launch_stdin_pump(
-                    job_id,
-                    stdin,
-                    self.workspace_root.clone(),
-                    self.events.clone(),
-                );
-                Ok(job_id)
-            }
+        if background
+            && let Some(identity) = session_identity
+            && let Some(session) = self.sessions.get_mut(&identity)
+        {
+            session.background_jobs.insert(job_id);
+        }
+        self.jobs.insert(job_id, job);
+        Ok(ExecAdmission::Queued(job_id))
+    }
+
+    /// The host CPU budget answered for a queued job: spawn its command under the grant, or fail
+    /// the job with the refusal. A job that already ended returns the grant at once, by dropping
+    /// it.
+    async fn spawn_granted(&mut self, job_id: JobId, granted: Result<JobCpuGrant>) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if job.terminal() || !matches!(job.cpu, CpuStanding::Queued(_)) {
+            return;
+        }
+        let CpuStanding::Queued(pending) = std::mem::replace(&mut job.cpu, CpuStanding::Settled)
+        else {
+            return;
+        };
+        let PendingSpawn {
+            asking: _,
+            authority,
+            policy,
+            command,
+            cwd,
+            env,
+            mode,
+            scope,
+            stdin,
+        } = *pending;
+        let grant = match granted {
+            Ok(grant) => grant,
             Err(error) => {
-                job.stdout_eof = true;
-                job.stderr_eof = true;
-                job.exit = Some(ExitStatus::Exited {
-                    code: error.exec_wrapper_exit_code().into(),
-                });
-                job.kill_reason = Some(KillReason::SpawnFailure);
-                self.jobs.insert(job_id, job);
-                self.finalize_job(job_id, Some(JobState::Failed)).await;
-                Err(error)
+                job.failure = Some(JobFailure::CpuAdmission);
+                self.fail_before_command(job_id, KillReason::CpuAdmission, error)
+                    .await;
+                return;
             }
+        };
+        let cpu = CpuPlacement {
+            tokens: grant.tokens(),
+            pool: grant.pool().to_path_buf(),
+            nice: class_nice(job.info.class),
+        };
+        job.info.cpu_tokens = Some(grant.tokens());
+        job.info.state = JobState::Running;
+        job.cpu = CpuStanding::Granted { _grant: grant };
+        // Read before the job's first process is dispatched, so nothing it writes precedes its
+        // baseline: a warm host may start the command before its start is reported here. Its
+        // run counts from here too: the wait for the host is not the command's time.
+        job.volumes = VolumeBaseline::admitted(
+            self.workspace_volume.as_ref(),
+            policy.ceiling().build_volume_mount.as_deref(),
+        );
+        job.started_at = Instant::now();
+        let spawn_span = cowshed_os::timing::span("admit", "spawn");
+        let spawn = self
+            .spawner
+            .spawn(
+                ProcessSpawnRequest {
+                    authority,
+                    job_id,
+                    command,
+                    cwd,
+                    env,
+                    policy,
+                    mode,
+                    scope,
+                    cpu,
+                },
+                self.events.clone(),
+            )
+            .await;
+        drop(spawn_span);
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let process = match spawn {
+            Ok(process) => process,
+            Err(error) => {
+                if error.priority_source().is_some() {
+                    job.failure = Some(JobFailure::Priority);
+                }
+                self.fail_before_command(job_id, KillReason::SpawnFailure, error)
+                    .await;
+                return;
+            }
+        };
+        #[cfg(target_os = "macos")]
+        {
+            job.monitor = process.observations().cloned();
+            if let (Some(monitor), Some(publisher)) = (&job.monitor, &self.job_spans)
+                && let Err(error) = monitor.trace(publisher.clone(), &job.info)
+            {
+                eprintln!(
+                    "cowshed: attaching job {}'s process spans: {error}",
+                    job_id.get()
+                );
+            }
+        }
+        if let Some(owned) = process.process() {
+            // A one-shot command is the job's first process.
+            own_process(job, owned.clone(), self.job_sampling.leaf_coverage);
+            adopt_birth(job, self.group_ledger.is_some(), owned.birth.clone());
+            self.arm_sample_clock();
+        }
+        let job = self.jobs.get_mut(&job_id).expect("the job just spawned");
+        job.info.nice = process.nice();
+        job.process = Some(process);
+        let started = job.birth.is_some();
+        if let Some(reply) = job.spawn_reply.take() {
+            let _ = reply.send(Ok(job_id));
+        }
+        if started {
+            self.record_groups();
+        }
+        launch_stdin_pump(
+            job_id,
+            stdin,
+            self.workspace_root.clone(),
+            self.events.clone(),
+        );
+        // Input a client wrote while the job waited for its grant goes to the command now.
+        self.flush_stdin(job_id);
+    }
+
+    /// End a job whose command never ran, failed by `error`: its exit is the failure's wrapper
+    /// code, a foreground caller is answered with the error itself, and a caller that was already
+    /// answered at admission reads why on the job's stderr.
+    async fn fail_before_command(
+        &mut self,
+        job_id: JobId,
+        reason: KillReason,
+        error: CowshedError,
+    ) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let reply = job.spawn_reply.take();
+        if reply.is_none() {
+            self.process_output(
+                job_id,
+                StreamKind::Stderr,
+                Bytes::from(format!("cowshed: {}\n", error.message)),
+            );
+        }
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        job.stdout_eof = true;
+        job.stderr_eof = true;
+        job.exit = Some(ExitStatus::Exited {
+            code: error.exec_wrapper_exit_code().into(),
+        });
+        job.kill_reason = Some(reason);
+        end_job_stdin(job);
+        self.finalize_job(job_id, Some(JobState::Failed)).await;
+        if let Some(reply) = reply {
+            let _ = reply.send(Err(error));
         }
     }
 
@@ -4627,11 +5216,22 @@ impl SupervisorActor {
             super::nx_daemon::start_request(&self.workspace_root, &project_root)
                 .map(|request| (grant, request))
         }) {
-            Ok((grant, request)) => self.admit_exec(authority, None, grant, request, true).await,
+            // The keeper is the supervisor's own coordinator-side work.
+            Ok((grant, request)) => {
+                self.admit_exec(
+                    authority,
+                    None,
+                    grant,
+                    request,
+                    true,
+                    AdmissionSource::Coordinator,
+                )
+                .await
+            }
             Err(error) => Err(error),
         };
         match started {
-            Ok(job_id) => {
+            Ok(ExecAdmission::Queued(job_id) | ExecAdmission::Repeat(job_id)) => {
                 if let Some(keeper) = &mut self.nx_daemon {
                     keeper.starting = Some(job_id);
                 }
@@ -4736,18 +5336,19 @@ impl SupervisorActor {
             )));
             return;
         }
-        let Some(process) = job.process.as_mut() else {
-            let _ = reply.send(Err(CowshedError::conflict(
-                "job process is unavailable",
-                "inspect the terminal job status",
-            )));
-            return;
-        };
-        // Behind a queued write the lane is not this write's to take: it would overtake.
-        let handed = if delivery.queued.is_empty() {
-            process.try_write_stdin(bytes.clone())
-        } else {
-            Ok(false)
+        let handed = match job.process.as_mut() {
+            // Behind a queued write the lane is not this write's to take: it would overtake.
+            Some(process) if delivery.queued.is_empty() => process.try_write_stdin(bytes.clone()),
+            Some(_) => Ok(false),
+            // Waiting for its CPU grant: the write waits in order until the command spawns.
+            None if matches!(job.cpu, CpuStanding::Queued(_)) => Ok(false),
+            None => {
+                let _ = reply.send(Err(CowshedError::conflict(
+                    "job process is unavailable",
+                    "inspect the terminal job status",
+                )));
+                return;
+            }
         };
         match handed {
             Ok(true) => delivery.in_lane.push_back(bytes),
@@ -4796,6 +5397,12 @@ impl SupervisorActor {
             return;
         }
         let Some(process) = job.process.as_mut() else {
+            // Waiting for its CPU grant: the close follows the input once the command spawns.
+            if matches!(job.cpu, CpuStanding::Queued(_)) {
+                job.close_stdin_when_drained = true;
+                job.close_waiters.push(reply);
+                return;
+            }
             let _ = reply.send(Err(CowshedError::conflict(
                 "job process is unavailable",
                 "inspect job status",
@@ -5088,10 +5695,15 @@ impl SupervisorActor {
                     sampler.rusage().end(usage);
                 }
             }
-            ProcessEvent::Started { job_id, process } => {
+            ProcessEvent::Started {
+                job_id,
+                process,
+                nice,
+            } => {
                 let ledger = self.group_ledger.is_some();
                 let coverage = self.job_sampling.leaf_coverage;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
+                    job.info.nice = Some(nice);
                     let birth = process.birth.clone();
                     own_process(job, process, coverage);
                     adopt_birth(job, ledger, birth);
@@ -5108,6 +5720,9 @@ impl SupervisorActor {
                 }
                 // The same terminal shape as a spawn that failed synchronously; the job's
                 // stderr already carries the reason.
+                if error.priority_source().is_some() {
+                    job.failure = Some(JobFailure::Priority);
+                }
                 job.exit = Some(ExitStatus::Exited {
                     code: error.exec_wrapper_exit_code().into(),
                 });
@@ -5251,6 +5866,19 @@ impl SupervisorActor {
         if !initiate {
             return Ok(());
         }
+        // A job still waiting for its CPU grant has nothing to signal: withdrawing its request
+        // leaves the gateway's queue, and the job ends without a command.
+        if matches!(job.cpu, CpuStanding::Queued(_)) {
+            if let CpuStanding::Queued(pending) =
+                std::mem::replace(&mut job.cpu, CpuStanding::Withdrawn)
+            {
+                pending.asking.abort();
+            }
+            job.stdout_eof = true;
+            job.stderr_eof = true;
+            end_job_stdin(job);
+            return Ok(());
+        }
         if let Some(process) = job.process.as_mut() {
             process.signal_process_tree(ProcessSignal::Term)?;
         }
@@ -5271,6 +5899,7 @@ impl SupervisorActor {
                 // the terminal guard in `process_output`.
                 (!job.terminal()
                     && (job.wait_failure.is_some()
+                        || matches!(job.cpu, CpuStanding::Withdrawn)
                         || (job.exit.is_some() && job.stdout_eof && job.stderr_eof)))
                     .then_some(*id)
             })
@@ -5295,7 +5924,8 @@ impl SupervisorActor {
                 | KillReason::StdinFailure
                 | KillReason::ArtifactFailure
                 | KillReason::WaitFailure
-                | KillReason::ScriptSyntax,
+                | KillReason::ScriptSyntax
+                | KillReason::CpuAdmission,
             ) => JobState::Failed,
             None => match job.exit.as_ref().expect("ready terminal job has exit") {
                 ExitStatus::Exited { .. } => JobState::Exited,
@@ -5339,11 +5969,20 @@ impl SupervisorActor {
         if let Some(job_spans) = &self.job_spans {
             job_spans.record(&job.info, JobSpanEdge::end(state, job.exit.as_ref()));
         }
+        // Only a failed job names why; a job killed meanwhile ended by the kill.
+        let failure = match job.kill_reason {
+            Some(KillReason::ScriptSyntax) => Some(JobFailure::ScriptSyntax),
+            _ => job.failure,
+        }
+        .filter(|_| state == JobState::Failed);
         let ending = JobEnding {
             state,
             exit: job.exit.clone(),
             duration_ms: Some(duration_ms),
             resources: job.info.resources.clone(),
+            failure,
+            cpu_tokens: job.info.cpu_tokens,
+            nice: job.info.nice,
         };
         let seal_span = cowshed_os::timing::span("seal", "record");
         let sealed = self.artifacts.seal(
@@ -5397,13 +6036,19 @@ impl SupervisorActor {
             "the job concluded before the write was reported whole",
         ));
         job.process = None;
-        // Nor does it run on its build volume any more: a release may take it.
+        // Nor does it run on its build volume any more: a release may take it. Nor does it hold
+        // its CPU grant: dropping it returns every token to the gateway's ledger.
         job.build_hold = None;
+        job.cpu = CpuStanding::Settled;
         job.info.state = state;
         job.info.duration_ms = Some(duration_ms);
         job.info.exit = job.exit.clone();
-        job.info.failure =
-            (job.kill_reason == Some(KillReason::ScriptSyntax)).then_some(JobFailure::ScriptSyntax);
+        job.info.failure = failure;
+        // A foreground exec still waiting was cancelled before its command spawned: the job it
+        // admitted is its answer, and the job's status says how it ended.
+        if let Some(reply) = job.spawn_reply.take() {
+            let _ = reply.send(Ok(job_id));
+        }
         job.info.stdin.complete = true;
         if let Some(identity) = job.session_identity
             && let Some(session) = self.sessions.get_mut(&identity)
@@ -6342,6 +6987,7 @@ mod workspace_toolchain_tests {
             mode: RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),
+            cpu_pool_directory: None,
             additional_denies: Vec::new(),
             shed_links: Vec::new(),
             git_worktree_repository: None,
@@ -7308,6 +7954,7 @@ mod lifecycle_commitment_tests {
                 7,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -7331,6 +7978,7 @@ mod lifecycle_commitment_tests {
                 8,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -7409,6 +8057,7 @@ mod lifecycle_commitment_tests {
             volume_labels: None,
             workspace_volume: None,
             job_sampling: JobSamplingPolicy::default(),
+            cpu: defaults.cpu,
         };
         // `list()`/`info()` answer from the actor's resident job set, which is this supervisor's
         // own lifetime and deliberately not the durable history: the artifact store holds every
@@ -7457,6 +8106,7 @@ mod lifecycle_commitment_tests {
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -8158,5 +8808,43 @@ mod label_report_tests {
             report(Err(io::Error::other("refused"))).is_some_and(|line| line.contains("refused"))
         );
         assert_eq!(report(Ok(Labelled::Already)), None);
+    }
+}
+
+#[cfg(test)]
+mod admission_environment_commitment_tests {
+    use super::admission_env_sha256;
+    use std::collections::{BTreeSet, HashMap};
+    #[test]
+    fn admission_environment_commitment_is_sorted_framed_and_credential_filtered() {
+        let withheld = BTreeSet::from(["TOKEN".to_owned()]);
+        let env = HashMap::from([
+            ("PROJECT_CUSTOM".to_owned(), "first".to_owned()),
+            ("LANG".to_owned(), "C".to_owned()),
+        ]);
+        let reordered = HashMap::from([
+            ("LANG".to_owned(), "C".to_owned()),
+            ("PROJECT_CUSTOM".to_owned(), "first".to_owned()),
+            ("TOKEN".to_owned(), "private".to_owned()),
+        ]);
+        assert_eq!(
+            admission_env_sha256(&env, &withheld),
+            admission_env_sha256(&reordered, &withheld)
+        );
+        let changed = HashMap::from([
+            ("PROJECT_CUSTOM".to_owned(), "second".to_owned()),
+            ("LANG".to_owned(), "C".to_owned()),
+        ]);
+        assert_ne!(
+            admission_env_sha256(&env, &withheld),
+            admission_env_sha256(&changed, &withheld)
+        );
+        let left = HashMap::from([("A".to_owned(), "BC".to_owned())]);
+        let right = HashMap::from([("AB".to_owned(), "C".to_owned())]);
+        assert_ne!(
+            admission_env_sha256(&left, &withheld),
+            admission_env_sha256(&right, &withheld),
+            "component boundaries are committed"
+        );
     }
 }

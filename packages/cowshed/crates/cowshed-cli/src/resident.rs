@@ -187,12 +187,19 @@ async fn run(
 ) -> Result<ExecResult> {
     let build_volume = resident.build_volume.clone();
     let link = JobLink::new(resident);
+    // The operator's gate is the coordinator's route, as it is through the controller.
+    let source = if request.class == cowshed_core::api::JobserverClass::Gate {
+        cowshed_core::runtime::supervisor_socket::AdmissionSource::Coordinator
+    } else {
+        cowshed_core::runtime::supervisor_socket::AdmissionSource::Worker
+    };
+
     // Admission is where a refusal can still mean nothing ran; after it, every failure is this
     // job's and is reported, never retried through the controller.
     let job = spanned(
         "resident",
         "submit",
-        link.handle.exec(None, build_volume, request),
+        link.handle.exec(None, build_volume, request, source),
     )
     .await?;
     if background {

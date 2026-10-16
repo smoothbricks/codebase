@@ -10,17 +10,22 @@
 #![cfg(target_os = "macos")]
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use cowshed_core::api::{
-    CommandArg, ExecCommand, ExecRequest, ExitStatus, JobAccounting, JobFailure, JobInfo, JobState,
-    RunSandboxMode, ScriptCommand, ScriptValue, StdinSource, WorkspacePath,
+    CommandArg, ExecCommand, ExecRequest, ExecScope, ExitStatus, JobAccounting, JobFailure,
+    JobInfo, JobState, RunSandboxMode, ScriptCommand, ScriptValue, StdinSource, WorkspacePath,
 };
-use cowshed_core::error::Result;
+use cowshed_core::error::{ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
+use cowshed_core::runtime::job_cpu::{JobCpuAdmission, JobCpuAsk, JobCpuGrant};
 use cowshed_core::runtime::shell_host::ShellHostProgram;
 use cowshed_core::runtime::shell_pool::ShellPoolConfig;
 use cowshed_core::runtime::supervisor::{
@@ -28,10 +33,11 @@ use cowshed_core::runtime::supervisor::{
     WorkspaceAuthoritySnapshot, WorkspaceSupervisor, WorkspaceSupervisorConfig,
     WorkspaceSupervisorHandle,
 };
+use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
-use cowshed_gateway_types::WorkspaceToken;
+use cowshed_gateway_types::{JobserverClass, WorkspaceToken};
 use cowshed_os::host_load::HostLoad;
 
 const COUNT: &str = "printf 'activation\\n' >> \"$TMPDIR/activations\"\n";
@@ -46,6 +52,25 @@ fn shell_host() -> PathBuf {
             "cargo and nextest set CARGO_BIN_EXE_cowshed-shell-host for an integration test",
         ),
     )
+}
+
+/// The pool every test grant names; the commands here only read its name.
+const TEST_POOL: &str = "/nonexistent/cowshed-test-cpu-pool.sock";
+
+/// The gateway's CPU budget for these tests: each request is granted its whole want at once.
+#[derive(Debug)]
+struct GrantingCpu;
+
+impl JobCpuAdmission for GrantingCpu {
+    fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
+        Box::pin(async move {
+            Ok(JobCpuGrant::new(
+                ask.want,
+                PathBuf::from(TEST_POOL),
+                Box::new(()),
+            ))
+        })
+    }
 }
 
 struct DiscardedCommitments;
@@ -87,6 +112,7 @@ impl Workspace {
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),
+            cpu_pool_directory: None,
             additional_denies: Vec::new(),
             shed_links: Vec::new(),
             git_worktree_repository: None,
@@ -173,6 +199,7 @@ impl Workspace {
             volume_labels: None,
             workspace_volume: None,
             job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
+            cpu: Arc::new(GrantingCpu),
         };
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
@@ -225,7 +252,71 @@ fn request(argv: &[&str]) -> ExecRequest {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
+        class: JobserverClass::Background,
+        want: NonZeroUsize::MIN,
+        wait_ms: None,
+        scope: ExecScope::Workspace,
     }
+}
+
+fn gate(request: ExecRequest) -> ExecRequest {
+    ExecRequest {
+        class: JobserverClass::Gate,
+        wait_ms: NonZeroU32::new(120_000),
+        ..request
+    }
+}
+
+/// The nice the kernel holds for `pid`, read from outside every sandbox. A class nice is 0 or
+/// 10, never -1, so -1 is getpriority's error.
+fn kernel_nice(pid: u32) -> i32 {
+    // SAFETY: a read of another process's scheduling priority.
+    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
+    assert_ne!(
+        nice,
+        -1,
+        "getpriority({pid}): {}",
+        std::io::Error::last_os_error()
+    );
+    nice
+}
+
+/// Run `request` holding its stdin open, read the nice its leader runs at from outside the
+/// sandbox while it waits on that stdin, then let it end.
+async fn held_nice(
+    handle: &WorkspaceSupervisorHandle,
+    request: ExecRequest,
+    source: AdmissionSource,
+) -> (i32, JobInfo) {
+    let job = handle
+        .exec_background(
+            None,
+            None,
+            ExecRequest {
+                stdin: StdinSource::Open,
+                ..request
+            },
+            source,
+        )
+        .await
+        .expect("admit the held job");
+    let pid = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if let Some(pid) = handle.info(job).await.expect("job info").pid {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the command starts");
+    let observed = kernel_nice(pid);
+    handle.stdin_close(job).await.expect("end the job's stdin");
+    let info = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
+        .await
+        .expect("job terminates")
+        .expect("job outcome");
+    (observed, info)
 }
 
 fn sh(script: &str) -> ExecRequest {
@@ -280,7 +371,7 @@ async fn run_in(
     request: ExecRequest,
 ) -> Ran {
     let job = handle
-        .exec(session, None, request)
+        .exec(session, None, request, AdmissionSource::Worker)
         .await
         .expect("admit job");
     let info = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
@@ -432,6 +523,7 @@ async fn host_controller_killing_a_job_ends_its_whole_group_and_keeps_the_warm_s
             None,
             None,
             sh("sleep 300 & printf '%s %s\\n' $$ $! > pids; wait"),
+            AdmissionSource::Worker,
         )
         .await
         .expect("admit");
@@ -486,6 +578,7 @@ async fn host_controller_a_kill_reaches_the_descendants_of_an_exited_leader() {
             None,
             None,
             sh("sleep 300 & printf '%s\\n' $! > pid; exit 3"),
+            AdmissionSource::Worker,
         )
         .await
         .expect("admit");
@@ -693,7 +786,10 @@ async fn host_controller_a_concurrent_command_takes_the_prewarmed_spare() {
         "a spare is activated once a generation exists"
     );
     // One command holds the returned shell; the next takes the spare without activating.
-    let holding = handle.exec(None, None, sh("sleep 2")).await.expect("admit");
+    let holding = handle
+        .exec(None, None, sh("sleep 2"), AdmissionSource::Worker)
+        .await
+        .expect("admit");
     let second = run(&handle, sh("true")).await.ok();
     assert!(
         !second.stderr.contains("direnv: loading"),
@@ -715,7 +811,10 @@ async fn host_controller_orphan_helper_exits_while_an_activation_runs() {
     };
     let workspace = Workspace::from_root(PathBuf::from(root));
     let handle = workspace.supervisor(false);
-    let _job = handle.exec(None, None, sh("true")).await.expect("admit");
+    let _job = handle
+        .exec(None, None, sh("true"), AdmissionSource::Worker)
+        .await
+        .expect("admit");
     let pid_file = workspace.sandbox.exec_temp_dir.join("activation-pid");
     while !pid_file.exists() {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -834,6 +933,7 @@ async fn host_controller_killing_a_script_job_ends_every_process_it_started() {
                 &["sleep 300 & (sleep 301; true) & printf '%s %s\\n' $$ $! > pids; wait"],
                 Vec::new(),
             ),
+            AdmissionSource::Worker,
         )
         .await
         .expect("admit");
@@ -906,6 +1006,7 @@ async fn host_controller_a_revoke_binds_every_later_command_and_no_running_one()
                 "while [ ! -e {} ]; do sleep 0.05; done; printf n > {granted_path}/during",
                 gate.display()
             )),
+            AdmissionSource::Worker,
         )
         .await
         .expect("admit the running job");
@@ -1051,6 +1152,7 @@ async fn host_controller_a_cold_activation_is_sampled_before_its_command_starts(
             None,
             None,
             sh("printf '%s\\n' $$ > \"$TMPDIR/command-pid\"; read _ < \"$TMPDIR/command-hold\""),
+            AdmissionSource::Worker,
         )
         .await
         .expect("admit");
@@ -1177,6 +1279,7 @@ async fn host_controller_a_job_s_sample_names_its_whole_group_and_none_after_a_k
                 "(read _ < \"$TMPDIR/hold-b\") & b=$!; ",
                 "printf '%s %s %s\\n' $$ $a $b > \"$TMPDIR/pids\"; wait",
             )),
+            AdmissionSource::Worker,
         )
         .await
         .expect("admit");
@@ -1343,5 +1446,193 @@ async fn host_controller_a_failed_activation_keeps_its_cost() {
             .resources,
         failed.info.resources,
         "the sealed sample keeps the activation's cost"
+    );
+}
+
+/// On both spawn paths -- one-shot where no `.envrc` sits above the command, a warm exec host
+/// where one does -- the command a job owns runs under its actual grant: the pool and count the
+/// grant names replace whatever the caller sent, the leader runs at its class's nice as the
+/// kernel reports it from outside the sandbox, and the job's record says the same nice.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_owned_commands_run_under_their_grant_at_their_class_nice() {
+    for (warm, port_base) in [(false, 41_424), (true, 41_440)] {
+        let workspace = Workspace::new(
+            if warm {
+                "cpu-nice-warm"
+            } else {
+                "cpu-nice-one-shot"
+            },
+            port_base,
+        );
+        if warm {
+            workspace.envrc("");
+        }
+        let handle = workspace.supervisor(false);
+        let mut forged =
+            sh("printf '%s|%s' \"$BOUNDED_EXEC_CPU_TOKENS\" \"$BOUNDED_EXEC_CPU_POOL\"");
+        forged.want = NonZeroUsize::new(3).unwrap();
+        forged
+            .env
+            .insert("BOUNDED_EXEC_CPU_TOKENS".to_owned(), "99".to_owned());
+        forged.env.insert(
+            "BOUNDED_EXEC_CPU_POOL".to_owned(),
+            "/tmp/forged.sock".to_owned(),
+        );
+        let ran = run(&handle, forged).await.ok();
+        assert_eq!(
+            ran.stdout,
+            format!("3|{TEST_POOL}"),
+            "warm {warm}: the grant's count and pool, never the caller's"
+        );
+        assert_eq!(
+            (ran.info.cpu_tokens, ran.info.nice, ran.info.class),
+            (NonZeroUsize::new(3), Some(10), JobserverClass::Background),
+            "warm {warm}"
+        );
+
+        // The nice this test, and so its supervisor, already runs at: a class nice below it
+        // would need a privilege no supervisor holds, and is refused rather than faked.
+        let base = kernel_nice(std::process::id());
+        for (request, source, nice) in [
+            (sh("read _"), AdmissionSource::Worker, 10),
+            (gate(sh("read _")), AdmissionSource::Coordinator, 0),
+        ] {
+            if base <= nice {
+                let (observed, info) = held_nice(&handle, request, source).await;
+                assert_eq!(
+                    (observed, info.nice),
+                    (nice, Some(nice)),
+                    "warm {warm}: the kernel and the record agree on the class nice"
+                );
+            } else {
+                let refused = handle
+                    .exec(None, None, request, source)
+                    .await
+                    .expect_err("a nice below the supervisor's own is refused");
+                let failure = refused.priority_source().expect("a typed priority failure");
+                assert_eq!(failure.requested, nice, "warm {warm}");
+            }
+        }
+        assert_eq!(
+            kernel_nice(std::process::id()),
+            base,
+            "the supervisor itself is never reniced"
+        );
+    }
+}
+
+/// A coordinator's host gate runs its argv at the host boundary, outside the workspace sandbox:
+/// it writes where no executed child may, under its grant at gate nice. A worker cannot ask for
+/// it, and a host-gate script is refused before anything runs.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_coordinator_host_gate_runs_outside_the_sandbox() {
+    let workspace = Workspace::new("cpu-host-gate", 41_456);
+    let handle = workspace.supervisor(false);
+    let outside = workspace.root.join("host-gate-wrote");
+    // Only public names reach a host gate: the path rides in the script, not the environment.
+    let host = || {
+        let mut host = gate(sh(&format!(
+            "printf host > '{}'; printf '%s' \"$BOUNDED_EXEC_CPU_TOKENS\"",
+            outside.display()
+        )));
+        host.scope = ExecScope::HostGate;
+        host.want = NonZeroUsize::new(2).unwrap();
+        host
+    };
+
+    let sandboxed = run(
+        &handle,
+        sh(&format!("printf sandboxed > '{}'", outside.display())),
+    )
+    .await;
+    assert_ne!(
+        sandboxed.info.exit,
+        Some(ExitStatus::Exited { code: 0 }),
+        "an executed child may not write outside its workspace"
+    );
+
+    let refused = handle
+        .exec(None, None, host(), AdmissionSource::Worker)
+        .await
+        .expect_err("a worker cannot reach the host boundary");
+    assert_eq!(refused.code, ErrorCode::SandboxDenied);
+    assert!(!outside.exists(), "the refused gate ran nothing");
+
+    let job = handle
+        .exec(None, None, host(), AdmissionSource::Coordinator)
+        .await
+        .expect("a coordinator's host gate is admitted");
+    let info = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
+        .await
+        .expect("job terminates")
+        .expect("job outcome");
+    let stdout = read_stream(&handle, &info, StreamKind::Stdout).await;
+    assert_eq!(info.exit, Some(ExitStatus::Exited { code: 0 }));
+    assert_eq!(String::from_utf8_lossy(&stdout), "2");
+    assert_eq!(
+        std::fs::read_to_string(&outside).expect("the host gate wrote outside the sandbox"),
+        "host"
+    );
+    assert_eq!(
+        (info.class, info.scope, info.nice, info.cpu_tokens),
+        (
+            JobserverClass::Gate,
+            ExecScope::HostGate,
+            Some(0),
+            NonZeroUsize::new(2)
+        )
+    );
+}
+
+/// Real direnv activation and a warm worker retain project-defined/custom request variables.
+/// Their plaintext never enters JobAdmission.env; the full authored request is bound by digest.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_worker_custom_environment_runs_but_is_absent_from_admission_records() {
+    let workspace = Workspace::new("record-only-worker-env", 41_472);
+    workspace.envrc("export PROJECT_ENVRC_CUSTOM=activated-custom-value\n");
+    let handle = workspace.supervisor(false);
+    let mut ask = sh(
+        "printf '%s\\0' \"$PROJECT_ENVRC_CUSTOM\" \"$PROJECT_REQUEST_CUSTOM\" | /usr/bin/shasum -a 256",
+    );
+    ask.env.insert("LANG".to_owned(), "C".to_owned());
+    ask.env.insert(
+        "PROJECT_REQUEST_CUSTOM".to_owned(),
+        "authored-custom-value".to_owned(),
+    );
+    ask.admission_key = Some(cowshed_core::api::AdmissionKey::new("custom-worker-env").unwrap());
+    let ran = run(&handle, ask).await.ok();
+    let expected = cowshed_core::api::Sha256Digest::compute(
+        b"activated-custom-value\0authored-custom-value\0",
+    );
+    assert_eq!(
+        ran.stdout,
+        format!("{}  -\n", expected.to_hex()),
+        "both actual worker values reached the child"
+    );
+    assert_eq!(workspace.activations(), 1, "the real .envrc was evaluated");
+    let records = workspace.mount().join(".cowshed/job/records.arrow");
+    let history = cowshed_core::storage::job_artifact::recover_records(&records).unwrap();
+    assert!(!history.frames.is_empty());
+    for frame in history.frames {
+        if let cowshed_core::storage::job_artifact::ProtectedRecord::Job(record) = frame.record {
+            let admitted = record.admission.expect("a keyed worker record");
+            assert_eq!(
+                admitted.env,
+                std::collections::BTreeMap::from([("LANG".to_owned(), "C".to_owned())])
+            );
+            assert_ne!(
+                admitted.env_sha256,
+                cowshed_core::api::Sha256Digest::compute(&[])
+            );
+        }
+    }
+    let bytes = std::fs::read(&records).unwrap();
+    assert!(
+        !bytes
+            .windows(b"authored-custom-value".len())
+            .any(|part| part == b"authored-custom-value")
     );
 }

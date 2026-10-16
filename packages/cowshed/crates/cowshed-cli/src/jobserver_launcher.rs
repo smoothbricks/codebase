@@ -14,15 +14,16 @@
 //!   frequent `cargo metadata` never queues behind gates;
 //! - any other subcommand asks the gateway for a jobserver grant and runs
 //!   under its fifo, with the test-thread sizing set to the grant where
-//!   unset. With no gateway listening, `cargo` runs unbudgeted.
+//!   unset. A managed checkout refuses every failed admission. Only gateway absence in a
+//!   positively nonmanaged host/CI checkout permits an unbudgeted run.
 
-use cowshed_os::fork_lock::Run as _;
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -58,6 +59,43 @@ const NONCOMPILING: &[&str] = &[
     "report",
 ];
 
+/// Absence is the only admission failure an explicitly nonmanaged host may bypass.
+#[derive(Debug)]
+enum GrantFailure {
+    NoGateway(String),
+    Admission(String),
+}
+impl From<String> for GrantFailure {
+    fn from(reason: String) -> Self {
+        Self::Admission(reason)
+    }
+}
+impl std::fmt::Display for GrantFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoGateway(reason) | Self::Admission(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+/// Presence only tightens admission, never grants authority. Cargo can run below the checkout
+/// root, so inspect the same protected workspace marker as bounded-exec along its ancestors.
+fn managed_checkout(cwd: &Path) -> Result<bool, String> {
+    for root in cwd.ancestors() {
+        let marker = root.join(".cowshed/workspace.json");
+        match std::fs::symlink_metadata(&marker) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect CPU admission marker {}: {error}",
+                    marker.display()
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
 /// What the launcher decided to do with this invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Plan {
@@ -67,6 +105,8 @@ enum Plan {
     Sized(usize),
     /// Ask the gateway for a jobserver grant of this many tokens.
     Ask { want: usize },
+    /// A live immediate parent owns the upstream grant; borrow only its local allocation.
+    Parent { socket: PathBuf, want: usize },
 }
 
 /// Whether this process was invoked as the managed environment's `cargo`.
@@ -90,13 +130,50 @@ pub fn run_at(arguments: &[OsString], socket: &Path) -> i32 {
     match plan(&get, arguments) {
         Plan::Direct => exec(arguments, &[]),
         Plan::Sized(tokens) => exec(arguments, &sizing(tokens, &get)),
-        Plan::Ask { want } => match ask(arguments, want, socket) {
+
+        Plan::Parent {
+            socket: parent,
+            want,
+        } => match ask_parent(arguments, want, &parent) {
             Ok(code) => code,
             Err(reason) => {
-                eprintln!("cowshed: cargo runs unbudgeted: {reason}");
-                exec(arguments, &[])
+                eprintln!("cowshed: cargo parent CPU grant refused: {reason}");
+                1
             }
         },
+        Plan::Ask { want } => {
+            let checkout = match env::current_dir() {
+                Ok(checkout) => checkout,
+                Err(error) => {
+                    eprintln!(
+                        "cowshed: cannot name Cargo checkout: {error}; refusing to run without a grant"
+                    );
+                    return 1;
+                }
+            };
+            let managed = match managed_checkout(&checkout) {
+                Ok(managed) => managed,
+                Err(reason) => {
+                    eprintln!(
+                        "cowshed: cargo CPU admission failed: {reason}; refusing to run without a grant"
+                    );
+                    return 1;
+                }
+            };
+            match ask(arguments, want, socket, &checkout) {
+                Ok(code) => code,
+                Err(GrantFailure::NoGateway(reason)) if !managed => {
+                    eprintln!("cowshed: cargo runs unbudgeted: {reason}");
+                    exec(arguments, &[])
+                }
+                Err(reason) => {
+                    eprintln!(
+                        "cowshed: cargo CPU admission failed: {reason}; refusing to run without a grant"
+                    );
+                    1
+                }
+            }
+        }
     }
 }
 
@@ -104,6 +181,22 @@ pub fn run_at(arguments: &[OsString], socket: &Path) -> i32 {
 fn plan(get: &impl Fn(&str) -> Option<String>, arguments: &[OsString]) -> Plan {
     if inherited_jobserver_live(get) {
         return Plan::Direct;
+    }
+
+    if let Some(socket) =
+        get("BOUNDED_EXEC_CPU_POOL").filter(|value| !value.is_empty() && !value.contains('\0'))
+        && let Some(tokens) = get("BOUNDED_EXEC_CPU_TOKENS")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+    {
+        if subcommand(arguments).is_none_or(|name| NONCOMPILING.contains(&name.as_str())) {
+            return Plan::Direct;
+        }
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        return Plan::Parent {
+            socket: PathBuf::from(socket),
+            want: tokens.min(cores.div_ceil(2)),
+        };
     }
     if let Some(tokens) = get("BOUNDED_EXEC_CPU_TOKENS")
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -176,17 +269,26 @@ fn sizing(tokens: usize, get: &impl Fn(&str) -> Option<String>) -> Vec<(String, 
     .collect()
 }
 
-/// Ask the gateway for a jobserver grant and run under it. `Err` names why
-/// there is no grant; the caller then runs `cargo` unbudgeted.
-fn ask(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32, String> {
+/// Ask the gateway and run only after a real grant. Connected refusal/protocol failures never
+/// become absence; the caller may bypass only NoGateway in a positively nonmanaged checkout.
+fn ask(
+    arguments: &[OsString],
+    want: usize,
+    socket: &Path,
+    checkout: &Path,
+) -> Result<i32, GrantFailure> {
     let mut stream = UnixStream::connect(socket).map_err(|error| {
-        format!(
+        let absent = error.kind() == io::ErrorKind::NotFound;
+        let reason = format!(
             "the gateway's control socket {} does not answer ({error})",
             socket.display()
-        )
+        );
+        if absent {
+            GrantFailure::NoGateway(reason)
+        } else {
+            GrantFailure::Admission(reason)
+        }
     })?;
-    let checkout = env::current_dir()
-        .map_err(|error| format!("cannot name the working directory: {error}"))?;
     let command = std::iter::once("cargo".to_owned())
         .chain(
             arguments
@@ -219,7 +321,11 @@ fn ask(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32, String
             .read_line(&mut line)
             .map_err(|error| format!("the gateway stopped answering: {error}"))?;
         if read == 0 {
-            return Err("the gateway closed the jobserver request without granting it".to_owned());
+            return Err(
+                "the gateway closed the jobserver request without granting it"
+                    .to_owned()
+                    .into(),
+            );
         }
         let answer: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
             format!("the gateway answered a jobserver request with non-JSON: {error}")
@@ -229,7 +335,7 @@ fn ask(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32, String
         }
         if answer["ok"] != true || answer["lease"] != "granted" {
             let reason = answer["error"].as_str().unwrap_or("refused");
-            return Err(format!("the gateway refused the jobserver grant: {reason}"));
+            return Err(format!("the gateway refused the jobserver grant: {reason}").into());
         }
         break answer;
     };
@@ -429,5 +535,161 @@ mod tests {
             want,
             std::thread::available_parallelism().map_or(1, usize::from)
         );
+    }
+}
+
+fn ask_parent(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32, String> {
+    let mut stream = UnixStream::connect(socket).map_err(|error| {
+        format!(
+            "the inherited CPU pool {} is unavailable: {error}; no second root grant is taken",
+            socket.display()
+        )
+    })?;
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::json!({ "op": "cpu-pool", "want": want, "children": true })
+            )
+            .as_bytes(),
+        )
+        .map_err(|error| format!("cannot ask the parent CPU pool: {error}"))?;
+    let mut lines = BufReader::new(&mut stream);
+    let granted = loop {
+        let mut line = String::new();
+        if lines
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?
+            == 0
+        {
+            return Err("parent closed without granting tokens".to_owned());
+        }
+        let answer: serde_json::Value =
+            serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if answer["ok"] != true {
+            return Err(format!("parent refused: {answer}"));
+        }
+        if answer["lease"] == "queued" {
+            cowshed_os::timing::event("jobserver", || {
+                format!(
+                    "cargo parent-pool queued want={want} pool={}",
+                    socket.display()
+                )
+            });
+            continue;
+        }
+        if answer["lease"] != "granted" {
+            return Err(format!("parent answered out of turn: {answer}"));
+        }
+        break answer;
+    };
+    let tokens = granted["tokens"]
+        .as_u64()
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .filter(|tokens| *tokens > 0 && *tokens <= want)
+        .ok_or_else(|| format!("invalid parent allocation: {granted}"))?;
+    let subpool = granted["pool"]
+        .as_str()
+        .filter(|pool| !pool.is_empty() && !pool.contains('\0'))
+        .ok_or_else(|| format!("parent supplied no live child pool: {granted}"))?;
+    let mut environment = sizing(tokens, &|_| None);
+    environment.push(("BOUNDED_EXEC_CPU_POOL".to_owned(), subpool.to_owned()));
+    cowshed_os::timing::event("jobserver", || {
+        format!(
+            "cargo parent-pool granted tokens={tokens}/{want} pool={}",
+            socket.display()
+        )
+    });
+    drop(lines);
+    stream
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        use tokio::io::AsyncReadExt as _;
+        use std::os::unix::process::CommandExt as _;
+        let mut pool = tokio::net::UnixStream::from_std(stream).map_err(|error| error.to_string())?;
+        let cargo = real_cargo().ok_or_else(|| "no cargo on PATH beyond the launcher".to_owned())?;
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|error| error.to_string())?;
+        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).map_err(|error| error.to_string())?;
+        // A std Child is never reaped behind our back. The existing controller primitive waits
+        // with WNOWAIT, keeping its process-group identity owned until all signals are finished.
+        let mut child = Command::new(cargo).args(arguments).envs(environment).process_group(0).spawn_locked().map_err(|error| error.to_string())?;
+        let pid = child.id();
+        let group = i32::try_from(pid).expect("a process id fits pid_t");
+        let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+            .map_err(|error| error.to_string())?;
+        let mut exited = std::pin::pin!(async {
+            loop {
+                if cowshed_core::runtime::job_groups::exit_unreaped(group).map_err(|error| error.to_string())?.is_some() {
+                    return Ok::<(), String>(());
+                }
+                if exits.recv().await.is_none() { return Err("child-exit notifications ended".to_owned()); }
+            }
+        });
+        let mut byte = [0_u8; 1];
+        let ending = async {
+            tokio::select! {
+                end = pool.read(&mut byte) => (true, libc::SIGTERM, format!("parent CPU grant lost: {end:?}")),
+                interrupt = tokio::signal::ctrl_c() => (false, libc::SIGINT, format!("SIGINT: {interrupt:?}")),
+                _ = terminate.recv() => (false, libc::SIGTERM, "SIGTERM".to_owned()),
+                _ = hangup.recv() => (false, libc::SIGHUP, "SIGHUP".to_owned()),
+            }
+        };
+        let (observed, lost) = tokio::select! {
+            observed = &mut exited => (observed, false),
+            (lost, signal, reason) = ending => {
+                eprintln!("cowshed: cargo {reason}; stopping owned Cargo process group {pid}");
+                if let Err(error) = signal_borrowed_group(group, signal) {
+                    eprintln!("cowshed: {error}; retaining the allocation until the owned child exits");
+                }
+                let observed = match tokio::time::timeout(std::time::Duration::from_secs(10), &mut exited).await {
+                    Ok(observed) => observed,
+                    Err(_) => {
+                        if let Err(error) = signal_borrowed_group(group, libc::SIGKILL) {
+                            eprintln!("cowshed: {error}; retaining the allocation until the owned child exits");
+                        }
+                        exited.await
+                    }
+                };
+                (observed, lost)
+            }
+        };
+        observed?;
+        // The leader remains unreaped here. Never signal a numeric group after its id can be reused.
+        signal_borrowed_group(group, libc::SIGKILL)?;
+        let status = child.wait().map_err(|error| error.to_string())?;
+        Ok(if lost { 1 } else { exit_code(status) })
+    })
+}
+
+fn signal_borrowed_group(group: i32, signal: i32) -> Result<(), String> {
+    cowshed_core::runtime::job_groups::signal_unreaped_group(group, signal).map_err(|error| {
+        format!("cannot signal owned unreaped Cargo process group {group}: {error}")
+    })
+}
+
+#[cfg(test)]
+mod parent_pool_tests {
+    use super::*;
+    #[test]
+    fn a_gate_string_is_no_grant_and_compiling_cargo_takes_a_live_local_pool() {
+        let arguments = vec![OsString::from("build")];
+        assert!(matches!(
+            plan(&environment(&[("COWSHED_QOS_CLASS", "gate")]), &arguments),
+            Plan::Ask { .. }
+        ));
+        let get = environment(&[
+            ("BOUNDED_EXEC_CPU_POOL", "/private/live-parent.sock"),
+            ("BOUNDED_EXEC_CPU_TOKENS", "3"),
+        ]);
+        assert!(matches!(
+            plan(&get, &arguments),
+            Plan::Parent { want: 1..=3, .. }
+        ));
+        assert_eq!(plan(&get, &[OsString::from("metadata")]), Plan::Direct);
     }
 }

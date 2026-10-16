@@ -252,7 +252,10 @@ impl Emitter<'_> {
                 let mut has_fields = false;
                 for field in fields.iter().filter(|field| !field.serde.skip) {
                     if field.serde.flatten {
-                        flattened.push(self.ty(&field.ty)?);
+                        flattened.push(match option_inner(&field.ty) {
+                            Some(inner) => self.optional_flattened(inner)?,
+                            None => self.ty(&field.ty)?,
+                        });
                         continue;
                     }
                     let rust_name = field.name.as_deref().ok_or("named field lacks a name")?;
@@ -303,6 +306,70 @@ impl Emitter<'_> {
                     Ok(flattened.join(" & "))
                 }
             }
+        }
+    }
+
+    /// An absent flattened object omits its members; it is not a null intersection.
+    /// Derive optional members from the canonical fields instead of mirroring error causes.
+    fn optional_flattened(&mut self, ty: &RustType) -> Result<String, String> {
+        match ty {
+            RustType::Reference { element, .. } => self.optional_flattened(element),
+            RustType::Named { name, arguments } => {
+                let name = last_segment(name);
+                let arguments = type_arguments(name, arguments)?;
+                if matches!(name, "Box" | "Arc" | "Cow") {
+                    return match arguments.as_slice() {
+                        [inner] => self.optional_flattened(inner),
+                        _ => Err(format!("{name} requires one type argument")),
+                    };
+                }
+                no_arguments(name, &arguments)?;
+                let api = self.api;
+                let record = api.records.get(name).ok_or_else(|| {
+                    format!("{name}: flattened record has no canonical declaration")
+                })?;
+                match &record.shape {
+                    Shape::Alias(inner) => self.optional_flattened(inner),
+                    Shape::Struct(fields @ Fields::Named(_)) => self.fields(
+                        fields,
+                        record.serde.rename_all.as_deref(),
+                        true,
+                        &record.projection.exclusive,
+                    ),
+                    Shape::Enum(variants) if record.serde.untagged => {
+                        let mut members = Vec::with_capacity(variants.len());
+                        for variant in variants.iter().filter(|variant| !variant.serde.skip) {
+                            if !matches!(variant.fields, Fields::Named(_)) {
+                                return Err(format!(
+                                    "{name}: optional flattened variants must have named fields"
+                                ));
+                            }
+                            members.push(
+                                self.fields(
+                                    &variant.fields,
+                                    variant
+                                        .serde
+                                        .rename_all
+                                        .as_deref()
+                                        .or(record.serde.rename_all_fields.as_deref()),
+                                    true,
+                                    &[],
+                                )?,
+                            );
+                        }
+                        if members.is_empty() {
+                            return Err(format!(
+                                "{name}: optional flattened enum has no projected variants"
+                            ));
+                        }
+                        Ok(members.join(" & "))
+                    }
+                    _ => Err(format!(
+                        "{name}: optional flatten requires a named record or untagged named variants"
+                    )),
+                }
+            }
+            _ => Err("optional flatten requires a canonical named object".to_owned()),
         }
     }
 
@@ -616,6 +683,38 @@ mod tests {
         assert!(output.types.contains("readonly 'kind': 'started'"));
         assert!(output.types.contains("readonly 'value': Id"));
         assert!(output.types.contains("export type Wrapped = Event;"));
+    }
+
+    #[test]
+    fn optional_flattened_causes_keep_the_same_optional_public_members() {
+        let output = render(
+            r#"
+            #[derive(Serialize)] pub struct CpuCause { pub detail: String }
+            #[derive(Serialize)] pub struct PriorityCause { pub pid: u32 }
+            #[derive(Serialize)] #[serde(untagged)] enum PrivateCause {
+                Admission { #[serde(rename = "cpuAdmission")] cpu_admission: CpuCause },
+                Priority { priority: PriorityCause },
+            }
+            #[derive(Serialize)] pub struct CowshedError {
+                pub message: String,
+                #[serde(flatten)] execution: Option<Box<PrivateCause>>,
+            }
+        "#,
+        );
+        assert!(
+            output.types.contains("readonly 'cpuAdmission'?: CpuCause;"),
+            "{}",
+            output.types
+        );
+        assert!(
+            output
+                .types
+                .contains("readonly 'priority'?: PriorityCause;"),
+            "{}",
+            output.types
+        );
+        assert!(!output.types.contains("'execution'"), "{}", output.types);
+        assert!(!output.types.contains(" | null"), "{}", output.types);
     }
 
     #[test]

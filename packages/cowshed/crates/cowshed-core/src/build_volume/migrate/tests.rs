@@ -93,6 +93,7 @@ fn sandbox(checkout: &Path) -> SandboxConfig {
         profile_directory: checkout.join("store/run/profiles"),
         port_block: crate::metadata::PortBlock::new(49_184, 16).unwrap(),
         retained_port_blocks: Vec::new(),
+        cpu_pool_directory: None,
         mode: RunSandboxMode::ReadWrite,
         grants: SandboxGrants::default(),
         allowed_unix_sockets: Vec::new(),

@@ -4,13 +4,18 @@ import type { JobLogsArguments } from './native.generated.js';
 export type * from './api.generated.js';
 export type { JobLogsArguments } from './native.generated.js';
 
-export type CowshedErrorOptions = ErrorOptions & Pick<Api.CowshedError, 'admission' | 'stdin'>;
+export type CowshedErrorOptions = ErrorOptions &
+  Pick<Api.CowshedError, 'admission' | 'cpuAdmission' | 'priority' | 'stdin'>;
 
 export class CowshedError extends Error {
   readonly code: Api.ErrorCode;
   readonly hint: string;
   /** Present only on a keyed exec that spawned nothing, naming why and the job its key admitted. */
   readonly admission?: Api.AdmissionRefusal;
+  /** Present only on a refused CPU admission: a class a worker may not ask for, a gate whose bound expired, a gateway that refused. */
+  readonly cpuAdmission?: Api.CpuAdmissionRefusal;
+  /** Present only when an owned job's child could not be placed at its nice, so its command never ran. */
+  readonly priority?: Api.PriorityFailure;
   readonly stdin: Api.StdinRefusal | undefined;
 
   constructor(code: Api.ErrorCode, message: string, hint: string, options?: CowshedErrorOptions) {
@@ -20,6 +25,12 @@ export class CowshedError extends Error {
     this.hint = hint;
     if (options?.admission !== undefined) {
       this.admission = options.admission;
+    }
+    if (options?.cpuAdmission !== undefined) {
+      this.cpuAdmission = options.cpuAdmission;
+    }
+    if (options?.priority !== undefined) {
+      this.priority = options.priority;
     }
     this.stdin = options?.stdin;
   }
@@ -99,6 +110,12 @@ export interface Coordinator {
   gc(options?: Api.GcOptions): Promise<Api.GcReport>;
   doctor(): Promise<Api.DoctorReport>;
   worker(workspace: string): Promise<WorkspaceHandle>;
+  /**
+   * Admits one job under coordinator authority: the only route that may ask for the gate class (with its bounded
+   * waitMs) or the host-gate scope. The worker capability supplies only the workspace incarnation the job is fenced
+   * to; a worker's own exec never admits a gate and is refused with the typed class-not-permitted error.
+   */
+  exec(worker: WorkspaceHandle, request: ExecRequest): Promise<JobHandle>;
 }
 
 export interface WorkspaceHandle {

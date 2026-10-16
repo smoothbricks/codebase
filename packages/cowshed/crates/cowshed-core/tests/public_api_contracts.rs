@@ -4,6 +4,7 @@ use cowshed_os::fork_lock::Run as _;
 use serde_json::json;
 use std::ffi::OsString;
 use std::fs;
+use std::num::{NonZeroU32, NonZeroUsize};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
@@ -133,6 +134,10 @@ fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
             complete: true,
         },
         failure: None,
+        class: JobserverClass::Background,
+        scope: ExecScope::Workspace,
+        nice: Some(10),
+        cpu_tokens: NonZeroUsize::new(1),
     }
 }
 
@@ -526,6 +531,10 @@ fn nested_job_info_shape_is_byte_safe_and_frozen() {
             "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/out"}},"bytes":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"ok\n","truncated":false}},
             "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
             "trace": {"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7"},
+            "class": "background",
+            "scope": "workspace",
+            "nice": 10,
+            "cpuTokens": 1,
             "stdin": {"kind":"workspaceFile","bytes":12,"workspacePath":"fixtures/input.bin","complete":true}
         })
     );
@@ -588,6 +597,10 @@ fn root_job_info_requires_explicit_null_cwd() {
         "stdout": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/out"}},"bytes":3,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"ok\n","truncated":false}},
         "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/7/err"}},"bytes":0,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
         "trace": {"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7"},
+        "class": "background",
+        "scope": "workspace",
+        "nice": 10,
+        "cpuTokens": 1,
         "stdin": {"kind":"workspaceFile","bytes":12,"workspacePath":"fixtures/input.bin","complete":true}
     });
 
@@ -627,6 +640,8 @@ fn output_limit_is_an_explicit_terminal_projection() {
         "stderr": {"storage":{"kind":"captured","artifact":{"kind":"file","path":".cowshed/job/8/err"}},"bytes":1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","summary":{"version":1,"text":"","truncated":false}},
         "trace": {"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7"},
         "outputLimit": {"limitBytes":1024,"crossingBytes":1025},
+        "class": "background",
+        "scope": "workspace",
         "stdin": {"kind":"empty","bytes":0,"complete":true}
     });
     let info: JobInfo = serde_json::from_value(value.clone()).expect("output limit job");
@@ -1016,7 +1031,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
             "destinationRef":"refs/cowshed/raven/heads/topic"
         })
     );
-    let land = LandReport {
+    let land = LandReport::Landed(cowshed_core::api::dto::LandedReport {
         landed_head: oid('b'),
         target_branch: "main".into(),
         previous_target_head: Some(oid('a')),
@@ -1034,13 +1049,40 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
                 },
             },
         },
-    };
+    });
     let land = serde_json::to_value(land).unwrap();
+    assert_eq!(land["kind"], "landed");
     assert_eq!(land["targetWasCheckedOut"], true);
     assert_eq!(
         land["buildVolume"],
         json!({"seed":{"kind":"frozen"},"adoption":{"kind":"skipped","reason":{"kind":"targetHeld",
             "database":"/m/.nx/workspace-data/A-v3.db","holders":[{"pid":42,"command":"node nx run-many"}]}}})
+    );
+
+    let delivered = LandReport::Delivered(PushReport {
+        source_head: oid('b'),
+        destination_ref: "refs/cowshed/raven/heads/topic".into(),
+        previous_destination_head: None,
+    });
+    let wire = json!({
+        "kind": "delivered",
+        "sourceHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "destinationRef": "refs/cowshed/raven/heads/topic"
+    });
+    assert_eq!(serde_json::to_value(&delivered).unwrap(), wire);
+    assert_eq!(
+        serde_json::from_value::<LandReport>(wire).unwrap(),
+        delivered
+    );
+    assert!(
+        serde_json::from_value::<LandReport>(json!({
+            "kind": "delivered",
+            "sourceHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "destinationRef": "refs/cowshed/raven/heads/topic",
+            "retired": true
+        }))
+        .is_err(),
+        "a delivery cannot pretend it retired a workspace"
     );
 
     let status = GatewayStatus {
@@ -1418,4 +1460,237 @@ fn lesser_capabilities_fail_to_compile_with_coordinator_authority() {
             );
         }
     }
+}
+
+/// The scheduling facts of a job are explicit on its JSON projection: the class and scope it was
+/// admitted under always, and the nice its command was observed at and the CPU tokens its grant
+/// held only once there is something to say: never null, never a fabricated zero.
+#[test]
+fn job_info_reports_admitted_scheduling_and_observations_exactly() {
+    let info = finished_job(None);
+    let value = serde_json::to_value(&info).expect("job JSON");
+    assert_eq!(value["class"], json!("background"));
+    assert_eq!(value["scope"], json!("workspace"));
+    assert_eq!(value["nice"], json!(10));
+    assert_eq!(value["cpuTokens"], json!(1));
+
+    let mut unobserved = info.clone();
+    unobserved.nice = None;
+    unobserved.cpu_tokens = None;
+    let value = serde_json::to_value(&unobserved).expect("unobserved job JSON");
+    assert!(value.get("nice").is_none());
+    assert!(value.get("cpuTokens").is_none());
+    assert_eq!(
+        serde_json::from_value::<JobInfo>(value).expect("decode"),
+        unobserved
+    );
+
+    // A gate's observed nice is what the supervisor set: zero is a real observation.
+    let mut gate = info;
+    gate.class = JobserverClass::Gate;
+    gate.nice = Some(0);
+    gate.cpu_tokens = NonZeroUsize::new(12);
+    let value = serde_json::to_value(&gate).expect("gate job JSON");
+    assert_eq!(value["class"], json!("gate"));
+    assert_eq!(value["nice"], json!(0));
+    assert_eq!(value["cpuTokens"], json!(12));
+    assert_eq!(
+        serde_json::from_value::<JobInfo>(value).expect("decode"),
+        gate
+    );
+}
+
+/// A job's class and scope are required on the wire, each refuses an unknown spelling, a zero
+/// grant is not a grant, the host gate is a gate, and a queued job has observed no nice.
+#[test]
+fn job_info_requires_its_class_and_scope_and_refuses_impossible_scheduling() {
+    let info = finished_job(None);
+    let value = serde_json::to_value(&info).expect("job JSON");
+    for required in ["class", "scope"] {
+        let mut omitted = value.clone();
+        omitted.as_object_mut().unwrap().remove(required);
+        assert!(
+            serde_json::from_value::<JobInfo>(omitted).is_err(),
+            "{required} is required"
+        );
+    }
+    for (field, invalid) in [
+        ("class", json!("foreground")),
+        ("scope", json!("host")),
+        ("nice", json!("10")),
+        ("cpuTokens", json!(0)),
+    ] {
+        let mut changed = value.clone();
+        changed[field] = invalid;
+        assert!(
+            serde_json::from_value::<JobInfo>(changed).is_err(),
+            "{field} refuses its invalid spelling"
+        );
+    }
+
+    let mut host = info.clone();
+    host.scope = ExecScope::HostGate;
+    assert!(
+        host.validate().is_err(),
+        "a background job does not run as the host gate"
+    );
+    host.class = JobserverClass::Gate;
+    host.validate().expect("a gate runs as the host gate");
+
+    let mut queued = info;
+    queued.state = JobState::Queued;
+    queued.duration_ms = None;
+    queued.exit = None;
+    queued.resources = None;
+    queued.pid = None;
+    assert!(
+        queued.validate().is_err(),
+        "a queued job owns no command to observe a nice for"
+    );
+    queued.nice = None;
+    queued
+        .validate()
+        .expect("a queued job may already hold its grant");
+}
+
+/// A sealed record keeps the scheduling facts after the supervisor that ran the job is gone, and
+/// the two CPU failures a job can end with have their exact wire names.
+#[test]
+fn sealed_job_and_cpu_failures_keep_their_exact_wire_spellings() {
+    let sealed = SealedJob {
+        job_id: JobId::new(7).unwrap(),
+        state: JobState::Failed,
+        exit: None,
+        failure: Some(JobFailure::Priority),
+        duration_ms: Some(3),
+        resources: None,
+        output_limit: None,
+        stdout: stream(".cowshed/job/7/out", 0, ""),
+        stderr: stream(".cowshed/job/7/err", 0, ""),
+        class: JobserverClass::Gate,
+        scope: ExecScope::HostGate,
+        nice: None,
+        cpu_tokens: NonZeroUsize::new(12),
+    };
+    let value = serde_json::to_value(&sealed).expect("sealed JSON");
+    assert_eq!(value["failure"], json!("priority"));
+    assert_eq!(value["class"], json!("gate"));
+    assert_eq!(value["scope"], json!("hostGate"));
+    assert_eq!(value["cpuTokens"], json!(12));
+    assert!(value.get("nice").is_none());
+    assert_eq!(
+        serde_json::from_value::<SealedJob>(value).expect("decode"),
+        sealed
+    );
+
+    assert_eq!(
+        serde_json::to_value(JobFailure::CpuAdmission).unwrap(),
+        json!("cpuAdmission")
+    );
+    assert_eq!(
+        serde_json::to_value(JobFailure::Priority).unwrap(),
+        json!("priority")
+    );
+    assert_eq!(
+        serde_json::to_value(ExecScope::default()).unwrap(),
+        json!("workspace")
+    );
+}
+
+/// The pairings an exec's scheduling may carry: a gate names a positive bound, background names
+/// none, and the host gate is a gate.
+#[test]
+fn exec_scheduling_pairs_class_bound_and_scope() {
+    let bound = NonZeroU32::new(120_000);
+    for (class, wait_ms, scope, valid) in [
+        (JobserverClass::Background, None, ExecScope::Workspace, true),
+        (JobserverClass::Gate, bound, ExecScope::Workspace, true),
+        (JobserverClass::Gate, bound, ExecScope::HostGate, true),
+        (JobserverClass::Gate, None, ExecScope::Workspace, false),
+        (JobserverClass::Gate, None, ExecScope::HostGate, false),
+        (
+            JobserverClass::Background,
+            bound,
+            ExecScope::Workspace,
+            false,
+        ),
+        (JobserverClass::Background, None, ExecScope::HostGate, false),
+        (
+            JobserverClass::Background,
+            bound,
+            ExecScope::HostGate,
+            false,
+        ),
+    ] {
+        assert_eq!(
+            validate_scheduling(class, wait_ms, scope).is_ok(),
+            valid,
+            "{class:?} {wait_ms:?} {scope:?}"
+        );
+    }
+}
+
+/// Admission records in every scope contain only public tool and identity names
+/// (07_api.md "Keyed admission and restart attachment"). This projection is not an
+/// execution allowlist; the locale family is closed to its category names.
+#[test]
+fn admission_records_contain_only_the_public_environment_names() {
+    for name in HOST_GATE_ENV_NAMES.iter().copied().chain([
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "LC_NUMERIC_2",
+    ]) {
+        assert!(host_gate_env_name_allowed(name), "{name}");
+    }
+    for name in [
+        "CI",
+        "GITHUB_ACTIONS",
+        "NX_DAEMON",
+        "NODE_OPTIONS",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NIX_SSL_CERT_FILE",
+        "SDKROOT",
+        "GITHUB_TOKEN",
+        "NPM_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "MAKEFLAGS",
+        "CARGO_MAKEFLAGS",
+        "MFLAGS",
+        "BOUNDED_EXEC_CPU_POOL",
+        "BOUNDED_EXEC_CPU_TOKENS",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "BASH_ENV",
+        "ENV",
+        "GIT_DIR",
+        "path",
+        "Home",
+        "PATH ",
+        "PATH=/usr/bin",
+        "RUSTUP",
+        "LC",
+        "LC_",
+        "LC_a",
+        "LC_ALL=C",
+        "LCALL",
+        "",
+    ] {
+        assert!(!host_gate_env_name_allowed(name), "{name:?}");
+    }
+}
+
+/// A host gate runs in no session; this request validator has no environment-name policy.
+/// Other scopes remain free to borrow a session.
+#[test]
+fn a_host_gate_request_runs_outside_every_session() {
+    validate_host_gate_request(ExecScope::HostGate, false).expect("a host gate without a session");
+    validate_host_gate_request(ExecScope::Workspace, false).expect("an ordinary one-shot");
+    validate_host_gate_request(ExecScope::Workspace, true).expect("an ordinary session exec");
+
+    let error = validate_host_gate_request(ExecScope::HostGate, true)
+        .expect_err("a host gate runs in no session");
+    assert_eq!(error.code, ErrorCode::Usage);
+    assert!(error.message.contains("session"), "{}", error.message);
 }

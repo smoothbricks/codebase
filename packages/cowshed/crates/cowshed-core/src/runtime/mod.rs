@@ -7,6 +7,7 @@ pub mod job_accounting;
 mod job_attribution;
 #[cfg(target_os = "linux")]
 pub mod job_cgroup;
+pub mod job_cpu;
 pub mod job_groups;
 pub mod job_progress;
 mod job_resources;

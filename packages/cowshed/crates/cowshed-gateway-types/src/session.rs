@@ -256,6 +256,8 @@ pub fn validate_identifier(field: &'static str, value: &str) -> Result<(), Confi
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("CPU pool workspace incarnation must be 32 lowercase hexadecimal characters")]
+    InvalidCpuPoolIncarnation,
     #[error("{field} must be 1-128 ASCII identifier characters")]
     InvalidIdentifier { field: &'static str },
     #[error("repo_id must be exactly two 1-128 ASCII identifier components joined by '/'")]

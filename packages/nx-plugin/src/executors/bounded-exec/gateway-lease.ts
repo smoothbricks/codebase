@@ -38,7 +38,7 @@ export type UnleasedCause = 'absent' | 'predates' | 'predates-field' | 'other';
  */
 export type HeldLease =
   | { granted: true; answer: Readonly<Record<string, unknown>>; release: () => void; closed: Promise<void> }
-  | { granted: false; cause: UnleasedCause; reason: string };
+  | { granted: false; cause: UnleasedCause; reason: string; code?: string };
 
 /**
  * Ask the gateway at `socket` for the lease `request` names, `what` in its messages ("disk
@@ -52,6 +52,7 @@ export function holdLease(
   request: Readonly<Record<string, unknown>>,
   what: string,
   bounds: LeaseBounds,
+  onQueued?: () => void,
 ): Promise<HeldLease> {
   // `Promise.withResolvers` would read better but needs lib es2024; this package inherits lib
   // es2022 from tsconfig.base.json.
@@ -79,7 +80,8 @@ export function holdLease(
     }
     resolve(outcome);
   };
-  const unleased = (reason: string, cause: UnleasedCause = 'other') => settle({ granted: false, cause, reason });
+  const unleased = (reason: string, cause: UnleasedCause = 'other', code?: string) =>
+    settle({ granted: false, cause, reason, ...(code === undefined ? {} : { code }) });
   const wait = (ms: number, onExpiry: () => void) => {
     clearTimeout(timer);
     timer = setTimeout(onExpiry, ms);
@@ -109,12 +111,17 @@ export function holdLease(
           'predates-field',
         );
       } else {
-        unleased(`the gateway refused the lease (${why})`);
+        unleased(
+          `the gateway refused the lease (${why})`,
+          'other',
+          typeof fields.code === 'string' ? fields.code : undefined,
+        );
       }
     } else if (state === 'half-closed') {
       unleased('the gateway did not queue the request in time; it is alive but overloaded');
     } else if (state === 'asked' && lease === 'queued') {
       state = 'queued';
+      onQueued?.();
       const grantMs = bounds.grantMs;
       if (grantMs === null) {
         clearTimeout(timer);

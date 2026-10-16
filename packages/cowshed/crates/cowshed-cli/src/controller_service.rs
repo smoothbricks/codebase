@@ -201,7 +201,9 @@ async fn answer(
 /// without checks runs nothing in the workspace, as `cowshed land` without `--check` does not.
 fn needs_gateway(operation: &OperationRequest) -> bool {
     match operation {
-        OperationRequest::WorkerExec(_) | OperationRequest::WorkerShell(_) => true,
+        OperationRequest::WorkerExec(_)
+        | OperationRequest::CoordinatorExec(_)
+        | OperationRequest::WorkerShell(_) => true,
         OperationRequest::CoordinatorLand(request) => request
             .options
             .check

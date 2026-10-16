@@ -1,11 +1,12 @@
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
 use cowshed_apfs::DiskTool;
+use cowshed_core::api::{ExecScope, JobserverClass};
 use cowshed_core::metadata::{EgressMode, MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -344,6 +345,9 @@ pub enum StdinSource {
     InlineBase64(OsString),
 }
 
+/// How long a gate waits for its CPU grant when `--wait-ms` does not say: two minutes.
+pub const DEFAULT_GATE_WAIT_MS: NonZeroU32 = NonZeroU32::new(120_000).unwrap();
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecArgs {
     pub workspace: String,
@@ -357,6 +361,14 @@ pub struct ExecArgs {
     pub stdout_copy: Option<PathBuf>,
     pub stderr_copy: Option<PathBuf>,
     pub replace_output: bool,
+    /// The host CPU admission class (`--class`): background unless the operator asks for the gate.
+    pub class: JobserverClass,
+    /// The most CPU tokens the command can use at once (`--want`); its grant is between one and this.
+    pub want: NonZeroUsize,
+    /// A gate's bound on waiting for its grant: `--wait-ms`, or [`DEFAULT_GATE_WAIT_MS`]; none for background.
+    pub wait_ms: Option<NonZeroU32>,
+    /// Where the command runs: the workspace sandbox, or `--host`, the operator's host gate.
+    pub scope: ExecScope,
 }
 
 /// Whose grants `grant` reads or changes.
@@ -767,6 +779,10 @@ fn cli_command() -> ClapCommand {
                     value_once("stdout-copy"),
                     value_once("stderr-copy"),
                     flag("replace-output"),
+                    value("class"),
+                    value("want"),
+                    value("wait-ms"),
+                    flag("host"),
                 ])
                 .arg(
                     Arg::new("argv")
@@ -2137,6 +2153,7 @@ const EXEC: CommandSpec = CommandSpec {
     about: &[
         "Runs one argv — never a shell string — inside the workspace's sandbox, with the cwd at the workspace root. Child stdout and stderr pass through as opaque bytes and the child's exit code passes through untouched; only a denial cowshed has authoritative evidence for is reported as one.",
         "Waits for the command however long it runs and exits with its status. With `--timeout`, a command still running then keeps running under the workspace supervisor and exec exits 103 naming its job; `--background` prints the job id and returns at once. No CLI verb reattaches to a job: the cowshed API does. `--session` keeps a named session's cwd and variables across calls.",
+        "Every job takes host CPU tokens from the gateway before its command starts. An ordinary command is `background` and wants one token; `--want <n>` names the tokens a heavy runner can use at once, and its grant is between one and `n`. `--class gate` admits the command as the operator's gate: it waits for whole returned tokens ahead of queued background work and runs at nice 0 where background runs at +10, for at most `--wait-ms` (default 120000), then fails with `gate-admission-timeout` naming the holders it waited on. Only this trusted route may ask for a gate; a workspace's own capability is refused. `--host` runs the gate once at the host boundary, outside the workspace sandbox.",
     ],
     options: &[
         Opt {
@@ -2183,6 +2200,22 @@ const EXEC: CommandSpec = CommandSpec {
             spelling: "--replace-output",
             meaning: "overwrite an existing publication target; without it a copy refuses to clobber",
         },
+        Opt {
+            spelling: "--want <n>",
+            meaning: "the CPU tokens the command can use at once (default 1); its grant is between one and n",
+        },
+        Opt {
+            spelling: "--class <background|gate>",
+            meaning: "admit the command as background work (default) or as the operator's gate",
+        },
+        Opt {
+            spelling: "--wait-ms <n>",
+            meaning: "with --class gate, fail if the gate's CPU grant takes longer than n milliseconds (default 120000)",
+        },
+        Opt {
+            spelling: "--host",
+            meaning: "with --class gate, run the gate once at the host boundary, outside the workspace sandbox, with only the operator's public tool and identity environment",
+        },
     ],
 };
 
@@ -2228,6 +2261,57 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
     let session = os(matches, "session")
         .map(|value| workspace_name(&value, false, USAGE))
         .transpose()?;
+    let class = match os(matches, "class") {
+        None => JobserverClass::Background,
+        Some(value) => match value.to_str() {
+            Some("background") => JobserverClass::Background,
+            Some("gate") => JobserverClass::Gate,
+            _ => {
+                return Err(UsageError::new(
+                    format!(
+                        "--class must be background or gate, got `{}`",
+                        value.to_string_lossy()
+                    ),
+                    USAGE,
+                ));
+            }
+        },
+    };
+    let want = match positive_count(matches, "want", USAGE)? {
+        None => NonZeroUsize::MIN,
+        Some(count) => usize::try_from(count)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| UsageError::new("--want is too large for this platform", USAGE))?,
+    };
+    let explicit_wait = positive_count(matches, "wait-ms", USAGE)?
+        .map(|count| {
+            u32::try_from(count)
+                .ok()
+                .and_then(NonZeroU32::new)
+                .ok_or_else(|| UsageError::new("--wait-ms must fit in 32 bits", USAGE))
+        })
+        .transpose()?;
+    let host = flagged(matches, "host");
+    if class == JobserverClass::Background && (explicit_wait.is_some() || host) {
+        return Err(UsageError::new(
+            "--wait-ms and --host require --class gate: only a gate has an admission bound and a host form",
+            USAGE,
+        ));
+    }
+    if class == JobserverClass::Gate && session.is_some() {
+        return Err(UsageError::new(
+            "--class gate runs outside any named session",
+            USAGE,
+        ));
+    }
+    let wait_ms =
+        (class == JobserverClass::Gate).then(|| explicit_wait.unwrap_or(DEFAULT_GATE_WAIT_MS));
+    let scope = if host {
+        ExecScope::HostGate
+    } else {
+        ExecScope::Workspace
+    };
     Ok(Command::Exec(ExecArgs {
         workspace: require_workspace(matches, "workspace", false, USAGE, USAGE.missing)?,
         argv,
@@ -2240,7 +2324,36 @@ fn parse_exec(matches: &ArgMatches) -> Result<Command, UsageError> {
         stdout_copy,
         stderr_copy,
         replace_output,
+        class,
+        want,
+        wait_ms,
+        scope,
     }))
+}
+
+/// `--<flag> n`: a positive whole number, refused as usage when it is zero or not a number.
+fn positive_count(
+    matches: &ArgMatches,
+    flag: &str,
+    usage: &'static CommandSpec,
+) -> Result<Option<u64>, UsageError> {
+    let Some(value) = os(matches, flag) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|count| *count > 0)
+        .map(Some)
+        .ok_or_else(|| {
+            UsageError::new(
+                format!(
+                    "--{flag} must be a positive whole number, got `{}`",
+                    value.to_string_lossy()
+                ),
+                usage,
+            )
+        })
 }
 
 const GRANT: CommandSpec = CommandSpec {
@@ -3634,6 +3747,106 @@ mod tests {
         ])
         .unwrap_err();
         assert!(duplicate.message.contains("only be specified once"));
+    }
+
+    #[test]
+    fn exec_names_its_scheduling_and_defaults_to_ordinary_background_work() {
+        let exec = |argv: &[&str]| {
+            let Command::Exec(exec) = parse_args(argv.iter().copied()).unwrap().command else {
+                panic!("expected exec")
+            };
+            exec
+        };
+        let ordinary = exec(&["exec", "raven", "--", "build"]);
+        assert_eq!(ordinary.class, JobserverClass::Background);
+        assert_eq!(ordinary.want, NonZeroUsize::MIN);
+        assert_eq!(ordinary.wait_ms, None);
+        assert_eq!(ordinary.scope, ExecScope::Workspace);
+
+        let heavy = exec(&["exec", "raven", "--want", "12", "--", "nextest"]);
+        assert_eq!(
+            (heavy.class, heavy.want.get()),
+            (JobserverClass::Background, 12)
+        );
+
+        let gate = exec(&["exec", "raven", "--class", "gate", "--", "gate"]);
+        assert_eq!(gate.class, JobserverClass::Gate);
+        assert_eq!(DEFAULT_GATE_WAIT_MS.get(), 120_000);
+        assert_eq!(gate.wait_ms, Some(DEFAULT_GATE_WAIT_MS));
+        assert_eq!(gate.scope, ExecScope::Workspace);
+
+        let host = exec(&[
+            "exec",
+            "raven",
+            "--class",
+            "gate",
+            "--host",
+            "--want",
+            "18",
+            "--wait-ms",
+            "30000",
+            "--",
+            "gate",
+        ]);
+        assert_eq!(host.scope, ExecScope::HostGate);
+        assert_eq!(host.want.get(), 18);
+        assert_eq!(host.wait_ms, NonZeroU32::new(30_000));
+    }
+
+    #[test]
+    fn exec_refuses_scheduling_that_cannot_be_admitted() {
+        for (argv, mention) in [
+            (
+                vec!["exec", "raven", "--wait-ms", "5000", "--", "x"],
+                "--wait-ms and --host require --class gate",
+            ),
+            (
+                vec!["exec", "raven", "--host", "--", "x"],
+                "--wait-ms and --host require --class gate",
+            ),
+            (
+                vec!["exec", "raven", "--class", "foreground", "--", "x"],
+                "--class must be background or gate",
+            ),
+            (
+                vec!["exec", "raven", "--want", "0", "--", "x"],
+                "--want must be a positive whole number",
+            ),
+            (
+                vec![
+                    "exec",
+                    "raven",
+                    "--class",
+                    "gate",
+                    "--wait-ms",
+                    "0",
+                    "--",
+                    "x",
+                ],
+                "--wait-ms must be a positive whole number",
+            ),
+            (
+                vec![
+                    "exec",
+                    "raven",
+                    "--class",
+                    "gate",
+                    "--session",
+                    "build",
+                    "--",
+                    "x",
+                ],
+                "--class gate runs outside any named session",
+            ),
+        ] {
+            let error = parse_args(argv.clone()).unwrap_err();
+            assert!(
+                error.message.contains(mention),
+                "{argv:?}: {}",
+                error.message
+            );
+            assert_eq!(error.exit_code(), 2, "{argv:?}");
+        }
     }
 
     #[test]

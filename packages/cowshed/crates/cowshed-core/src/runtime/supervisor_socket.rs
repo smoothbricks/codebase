@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -29,9 +30,9 @@ use super::supervisor::{
     WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use crate::api::dto::{
-    AdmissionKey, CommandArg, ExecCommand, ExecRequest, JobId, JobJournalCursor, JobTailLimits,
-    OutputPublication, RunSandboxMode, ScriptCommand, Sha256Digest, StdinSource, TraceContext,
-    WorkspacePath,
+    AdmissionKey, CommandArg, ExecCommand, ExecRequest, ExecScope, JobId, JobJournalCursor,
+    JobTailLimits, JobserverClass, OutputPublication, RunSandboxMode, ScriptCommand, Sha256Digest,
+    StdinSource, TraceContext, WorkspacePath,
 };
 use crate::api::process::JobProcessEvent;
 use crate::api::resources::SampleInterval;
@@ -257,6 +258,9 @@ enum Call {
         /// The build volume the caller resolved for this job (`WorkspaceSupervisorHandle::exec`).
         build_volume: Option<PathBuf>,
         background: bool,
+        /// The controller route that admitted the exec. It is chosen by the route that decoded the
+        /// call, never by a request field or an environment value.
+        source: AdmissionSource,
         request: Box<ExecWire>,
     },
     #[serde(rename_all = "camelCase")]
@@ -407,6 +411,37 @@ struct ExecWire {
     stdout_copy: Option<OutputPublication>,
     stderr_copy: Option<OutputPublication>,
     admission_key: Option<AdmissionKey>,
+    class: JobserverClass,
+    want: NonZeroUsize,
+    wait_ms: Option<NonZeroU32>,
+    scope: ExecScope,
+}
+
+/// The controller route that admitted an exec. The route is the authority for the gate class and
+/// the host-gate scope (05_gateway.md "Host CPU budget", 07_api.md "Capability split"): no request
+/// field, environment value or caller claim selects it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AdmissionSource {
+    /// worker.exec: a workspace's own capability, which admits background work in its workspace
+    /// sandbox only.
+    Worker,
+    /// coordinator.exec and the controller's own execs: the trusted coordinator, which may also
+    /// admit the gate class and the host-gate scope.
+    Coordinator,
+}
+
+impl AdmissionSource {
+    /// Whether this route may admit an exec of class in scope. A worker admits background work
+    /// in the workspace sandbox and nothing else; anything more is refused as the typed
+    /// class-not-permitted error, before any record, process or gateway request exists.
+    pub fn admit(self, class: JobserverClass, scope: ExecScope) -> Result<()> {
+        match (self, class, scope) {
+            (Self::Coordinator, _, _)
+            | (Self::Worker, JobserverClass::Background, ExecScope::Workspace) => Ok(()),
+            (Self::Worker, _, _) => Err(CowshedError::class_not_permitted(class, scope)),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1169,6 +1204,7 @@ async fn answer(
             session: wire,
             build_volume,
             background,
+            source,
             request,
         } => {
             let request = *request;
@@ -1200,15 +1236,19 @@ async fn answer(
                 stdout_copy: request.stdout_copy,
                 stderr_copy: request.stderr_copy,
                 admission_key: request.admission_key,
+                class: request.class,
+                want: request.want,
+                wait_ms: request.wait_ms,
+                scope: request.scope,
             };
             let session = wire.map(session);
             let job_id = if background {
                 supervisor
-                    .exec_background(session.as_ref(), build_volume, exec)
+                    .exec_background(session.as_ref(), build_volume, exec, source)
                     .await?
             } else {
                 supervisor
-                    .exec(session.as_ref(), build_volume, exec)
+                    .exec(session.as_ref(), build_volume, exec, source)
                     .await?
             };
             if let Some(writer) = writer {
@@ -1758,6 +1798,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             build_volume,
             request,
             background,
+            source,
             reply,
         } => {
             forward_exec(
@@ -1767,6 +1808,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 build_volume,
                 *request,
                 background,
+                source,
                 reply,
             )
             .await;
@@ -1993,6 +2035,10 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one forwarded exec: the supervisor's socket, its authority, session and build volume, the request, how it runs and the route that admitted it, and where the answer goes"
+)]
 async fn forward_exec(
     path: &Path,
     authority: WorkspaceAuthoritySnapshot,
@@ -2000,6 +2046,7 @@ async fn forward_exec(
     build_volume: Option<PathBuf>,
     request: ExecRequest,
     background: bool,
+    source: AdmissionSource,
     reply: oneshot::Sender<Result<JobId>>,
 ) {
     let (stdin, payload, stream) = match request.stdin {
@@ -2021,6 +2068,7 @@ async fn forward_exec(
         session: session.as_ref().map(SessionWire::from),
         build_volume,
         background,
+        source,
         request: Box::new(ExecWire {
             argv,
             script,
@@ -2032,6 +2080,10 @@ async fn forward_exec(
             stdout_copy: request.stdout_copy,
             stderr_copy: request.stderr_copy,
             admission_key: request.admission_key,
+            class: request.class,
+            want: request.want,
+            wait_ms: request.wait_ms,
+            scope: request.scope,
         }),
     };
     let admitted = call::<JobId>(path, &authority, call_request, payload).await;
@@ -2500,5 +2552,98 @@ mod socket_ownership_tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
         assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod admission_source_tests {
+    use super::*;
+    use crate::error::{CpuAdmissionRefusal, ErrorCode};
+
+    /// The route is the authority: a worker admits background work in the workspace sandbox and
+    /// nothing else, the refusal is the typed class-not-permitted error naming both, and the
+    /// coordinator admits every pairing.
+    #[test]
+    fn a_worker_admits_only_background_workspace_work() {
+        for class in [JobserverClass::Background, JobserverClass::Gate] {
+            for scope in [ExecScope::Workspace, ExecScope::HostGate] {
+                let worker = AdmissionSource::Worker.admit(class, scope);
+                if (class, scope) == (JobserverClass::Background, ExecScope::Workspace) {
+                    worker.expect("a worker admits ordinary background work");
+                } else {
+                    let error = worker.expect_err("a worker admits nothing else");
+                    assert_eq!(error.code, ErrorCode::SandboxDenied);
+                    assert_eq!(
+                        error.cpu_admission_source(),
+                        Some(&CpuAdmissionRefusal::ClassNotPermitted { class, scope })
+                    );
+                }
+                AdmissionSource::Coordinator
+                    .admit(class, scope)
+                    .expect("the coordinator admits every pairing");
+            }
+        }
+    }
+
+    /// The route crosses the socket in camel case and an unknown route is refused: the wire has
+    /// no spelling for another authority.
+    #[test]
+    fn the_wire_spells_the_route_and_refuses_another() {
+        assert_eq!(
+            serde_json::to_value(AdmissionSource::Worker).expect("encode"),
+            serde_json::json!("worker")
+        );
+        assert_eq!(
+            serde_json::to_value(AdmissionSource::Coordinator).expect("encode"),
+            serde_json::json!("coordinator")
+        );
+        assert!(serde_json::from_value::<AdmissionSource>(serde_json::json!("operator")).is_err());
+    }
+
+    /// An exec call carries its route and scheduling on the wire: a gate with its bound and the
+    /// host-gate scope decode exactly, and an exec that names no route is refused.
+    #[test]
+    fn an_exec_call_carries_its_route_and_scheduling() {
+        let call = serde_json::json!({
+            "call": "exec",
+            "session": null,
+            "buildVolume": null,
+            "background": false,
+            "source": "coordinator",
+            "request": {
+                "argv": [{ "encoding": "utf8", "data": "true" }],
+                "script": null,
+                "cwd": null,
+                "mode": "readWrite",
+                "env": {},
+                "trace": null,
+                "stdin": { "kind": "empty" },
+                "stdoutCopy": null,
+                "stderrCopy": null,
+                "admissionKey": null,
+                "class": "gate",
+                "want": 8,
+                "waitMs": 120000,
+                "scope": "hostGate"
+            }
+        });
+        let Call::Exec {
+            source, request, ..
+        } = serde_json::from_value::<Call>(call.clone()).expect("decode the exec call")
+        else {
+            panic!("decoded another call");
+        };
+        assert_eq!(source, AdmissionSource::Coordinator);
+        assert_eq!(request.class, JobserverClass::Gate);
+        assert_eq!(request.want.get(), 8);
+        assert_eq!(request.wait_ms.map(NonZeroU32::get), Some(120_000));
+        assert_eq!(request.scope, ExecScope::HostGate);
+
+        let mut unrouted = call;
+        unrouted
+            .as_object_mut()
+            .expect("an object")
+            .remove("source");
+        assert!(serde_json::from_value::<Call>(unrouted).is_err());
     }
 }

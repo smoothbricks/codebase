@@ -3196,6 +3196,7 @@ fn sandboxed_git_command_with_paths(
         )),
         port_block: crate::metadata::PortBlock::new(40_960, 16).expect("static macOS port block"),
         retained_port_blocks: Vec::new(),
+        cpu_pool_directory: None,
         mode: RunSandboxMode::ReadWrite,
         grants: SandboxGrants {
             read,

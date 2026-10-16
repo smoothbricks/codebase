@@ -19,6 +19,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The byte a GNU make jobserver hands out as one token.
 const TOKEN_BYTE: u8 = b'+';
 
+/// Whole-grant admission, never a request to resize a live FIFO.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum JobserverAdmission {
+    Background,
+    Gate { wait_ms: std::num::NonZeroU32 },
+}
+
+impl JobserverAdmission {
+    pub(crate) fn class(self) -> cowshed_gateway_types::JobserverClass {
+        match self {
+            Self::Background => cowshed_gateway_types::JobserverClass::Background,
+            Self::Gate { .. } => cowshed_gateway_types::JobserverClass::Gate,
+        }
+    }
+
+    pub(crate) async fn deadline(self) {
+        match self {
+            Self::Background => std::future::pending::<()>().await,
+            Self::Gate { wait_ms } => {
+                tokio::time::sleep(std::time::Duration::from_millis(u64::from(wait_ms.get()))).await
+            }
+        }
+    }
+}
+
 /// The fifos of one gateway, in its private runtime directory.
 #[derive(Clone, Debug)]
 pub(crate) struct JobserverFifos {
@@ -27,6 +52,19 @@ pub(crate) struct JobserverFifos {
 }
 
 impl JobserverFifos {
+    /// The trusted job identity chooses the workspace IPC scope; clients cannot name a path.
+    pub(crate) fn create_pool(&self, tokens: usize, incarnation: &str) -> io::Result<CpuPool> {
+        let store = self.directory.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "jobserver directory has no runtime parent",
+            )
+        })?;
+        let directory = cowshed_gateway_types::cpu_pool_directory(store, incarnation)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        CpuPool::start(std::sync::Arc::new(directory), tokens)
+    }
+
     /// Name the fifo directory, sweeping a previous gateway's leftover fifos.
     pub(crate) fn start(directory: PathBuf) -> Self {
         // Sweep the fifos a previous gateway left in the directory when it
@@ -117,6 +155,224 @@ impl JobserverFifo {
 
 use std::os::unix::io::AsRawFd as _;
 
+/// One actual parent allocation. Its actor uses the same ledger as host admission, with a single
+/// checkout so local sibling grants retain the existing parent pool's FIFO/min(want,free) policy.
+pub(crate) struct CpuPool {
+    path: PathBuf,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl CpuPool {
+    fn start(directory: std::sync::Arc<PathBuf>, tokens: usize) -> io::Result<Self> {
+        use base64::Engine as _;
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory.as_path())?;
+        // Flat, opaque endpoints stay within Darwin's sun_path bound and cannot be guessed
+        // from the job's public id. Sandbox policy admits connect/metadata, never directory data.
+        let name = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(uuid::Uuid::new_v4().as_bytes());
+        let path = directory.join(name);
+        let listener =
+            cowshed_os::fork_lock::Fenced::create(|| tokio::net::UnixListener::bind(&path))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let budget = crate::cpu_budget::CpuBudget::start(crate::cpu_budget::CpuBudgetLimits {
+            tokens: std::num::NonZeroUsize::new(tokens).expect("a parent grant is nonzero"),
+        });
+        let checkout: std::sync::Arc<str> = std::sync::Arc::from("parent-pool");
+        let task = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = async {
+                        use std::future::Future as _;
+                        let mut accepting = std::pin::pin!(listener.accept());
+                        std::future::poll_fn(|cx| cowshed_os::fork_lock::create(|| Ok(accepting.as_mut().poll(cx)))
+                            .expect("polling socket accept runs an infallible closure")).await
+                    } => match accepted {
+                        Ok((stream, _)) => {
+                            children.spawn(serve_pool(cowshed_os::fork_lock::Fenced::new(stream), budget.clone(), std::sync::Arc::clone(&checkout), std::sync::Arc::clone(&directory)));
+                        }
+                        Err(error) => { eprintln!("cowshed: CPU pool listener failed: {error}"); break; }
+                    },
+                    ended = children.join_next(), if !children.is_empty() => {
+                        if let Some(Err(error)) = ended { eprintln!("cowshed: CPU pool child failed: {error}"); }
+                    }
+                }
+            }
+            children.shutdown().await;
+        });
+        Ok(Self {
+            path,
+            task: Some(task),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) async fn close(mut self) -> io::Result<()> {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                return Err(io::Error::other(format!("CPU pool task failed: {error}")));
+            }
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for CpuPool {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "cowshed: cannot remove CPU pool {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "op", deny_unknown_fields)]
+enum PoolRequest {
+    #[serde(rename = "cpu-pool")]
+    Take {
+        want: std::num::NonZeroUsize,
+        #[serde(default)]
+        children: bool,
+    },
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "lease", rename_all = "kebab-case")]
+enum PoolGrant<'a> {
+    Queued {
+        ok: bool,
+    },
+    Granted {
+        ok: bool,
+        tokens: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pool: Option<&'a Path>,
+    },
+}
+
+async fn pool_reply(
+    writer: &mut cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
+    answer: &impl serde::Serialize,
+) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut frame = serde_json::to_vec(answer).map_err(io::Error::other)?;
+    frame.push(b'\n');
+    writer.write_all(&frame).await
+}
+
+async fn serve_pool(
+    stream: cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
+    budget: crate::cpu_budget::CpuBudget,
+    checkout: std::sync::Arc<str>,
+    directory: std::sync::Arc<PathBuf>,
+) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
+    let mut reader = BufReader::new(stream);
+    let mut frame = Vec::new();
+    let parsed = match (&mut reader).take(4097).read_until(b'\n', &mut frame).await {
+        Ok(_) if frame.len() <= 4096 && frame.ends_with(b"\n") => {
+            serde_json::from_slice::<PoolRequest>(&frame)
+        }
+        Ok(_) => {
+            let _ = pool_reply(reader.get_mut(), &serde_json::json!({"ok":false,"code":"invalid-request","error":"a CPU pool request is one line of at most 4096 bytes"})).await;
+            return;
+        }
+        Err(error) => {
+            eprintln!("cowshed: cannot read CPU pool request: {error}");
+            return;
+        }
+    };
+    let PoolRequest::Take { want, children } = match parsed {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = pool_reply(
+                reader.get_mut(),
+                &serde_json::json!({"ok":false,"code":"invalid-request","error":error.to_string()}),
+            )
+            .await;
+            return;
+        }
+    };
+    let (stake, granted) = budget.ask(
+        checkout,
+        want,
+        crate::disk_lease::Claim::new("child CPU pool", None),
+        cowshed_gateway_types::JobserverClass::Background,
+    );
+    if pool_reply(reader.get_mut(), &PoolGrant::Queued { ok: true })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut byte = [0_u8; 1];
+    let tokens = tokio::select! {
+        granted = granted => match granted {
+            Ok(tokens) => tokens,
+            Err(_) => {
+                let _ = pool_reply(reader.get_mut(), &serde_json::json!({"ok":false,"code":"rejected","error":"the parent CPU pool stopped"})).await;
+                return;
+            }
+        },
+        _ = reader.read(&mut byte) => return,
+    };
+    let pool = if children {
+        match CpuPool::start(directory, tokens) {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                let _ = pool_reply(reader.get_mut(), &serde_json::json!({"ok":false,"code":"rejected","error":format!("cannot serve child CPU pool: {error}")})).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if pool_reply(
+        reader.get_mut(),
+        &PoolGrant::Granted {
+            ok: true,
+            tokens,
+            pool: pool.as_ref().map(CpuPool::path),
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    // End of stream or post-request bytes end the local allocation; a child never releases the
+    // parent's upstream grant and never takes a second host allocation while it is borrowed.
+    let _ = reader.read(&mut byte).await;
+    if let Some(pool) = pool
+        && let Err(error) = pool.close().await
+    {
+        eprintln!("cowshed: child CPU pool did not close: {error}");
+    }
+    drop(stake);
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
@@ -152,6 +408,67 @@ mod tests {
         drop(client);
         fifo.drain_and_unlink();
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_pool_binds_and_serves_with_a_real_fixture_length_store() {
+        use std::os::unix::fs::DirBuilderExt as _;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let root = std::fs::canonicalize("/tmp").unwrap().join(format!(
+            "cowshed-dtest-{}-{}-cli",
+            std::process::id(),
+            &uuid::Uuid::new_v4().simple().to_string()[..4]
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let store = root.join("store");
+        let incarnation = "0123456789abcdef0123456789abcdef";
+        let previous_layout = store
+            .join("run/cpu-pool")
+            .join(incarnation)
+            .join("abcdefghijklmnopqrstuv");
+        assert!(previous_layout.as_os_str().as_encoded_bytes().len() >= 104);
+        let fifos = JobserverFifos::start(store.join("jobserver"));
+        let pool = fifos
+            .create_pool(2, incarnation)
+            .expect("the actual private pool binds");
+        let endpoint = pool.path().to_owned();
+        assert_eq!(
+            endpoint.parent(),
+            Some(
+                cowshed_gateway_types::cpu_pool_directory(&store, incarnation)
+                    .unwrap()
+                    .as_path()
+            )
+        );
+        assert!(endpoint.as_os_str().as_encoded_bytes().len() < 104);
+        assert_eq!(
+            std::fs::metadata(&endpoint).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let stream = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        reader
+            .get_mut()
+            .write_all(b"{\"op\":\"cpu-pool\",\"want\":2}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let queued: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(queued["lease"], "queued");
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let granted: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(granted["lease"], "granted");
+        assert_eq!(granted["tokens"], 2);
+        drop(reader);
+        pool.close().await.expect("the actual pool retires");
+        assert!(!endpoint.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

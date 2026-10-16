@@ -25,6 +25,128 @@ use serde::{Deserialize, Serialize};
 pub const CPU_TOKENS_OP: &str = "cpu-tokens";
 pub const JOBSERVER_OP: &str = "jobserver";
 
+/// Root jobserver admission class. Only a live grant, not an environment marker, admits a gate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JobserverClass {
+    #[default]
+    Background,
+    Gate,
+}
+
+/// The trusted supervisor's existing immutable job identity; never an environment claim.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobserverJob<'a> {
+    pub repo_id: &'a str,
+    pub workspace_incarnation: &'a str,
+    pub job_id: std::num::NonZeroU64,
+}
+
+/// A supervisor holds one root grant; its children draw only from the private live pool.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobserverRequest<'a> {
+    op: &'static str,
+    want: NonZeroUsize,
+    checkout: &'a str,
+    command: &'a str,
+    class: JobserverClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_ms: Option<std::num::NonZeroU32>,
+    pool: bool,
+    job: JobserverJob<'a>,
+}
+
+impl<'a> JobserverRequest<'a> {
+    pub const fn background(
+        want: NonZeroUsize,
+        checkout: &'a str,
+        command: &'a str,
+        job: JobserverJob<'a>,
+    ) -> Self {
+        Self {
+            op: JOBSERVER_OP,
+            want,
+            checkout,
+            command,
+            class: JobserverClass::Background,
+            wait_ms: None,
+            pool: true,
+            job,
+        }
+    }
+    pub const fn gate(
+        want: NonZeroUsize,
+        checkout: &'a str,
+        command: &'a str,
+        wait_ms: std::num::NonZeroU32,
+        job: JobserverJob<'a>,
+    ) -> Self {
+        Self {
+            op: JOBSERVER_OP,
+            want,
+            checkout,
+            command,
+            class: JobserverClass::Gate,
+            wait_ms: Some(wait_ms),
+            pool: true,
+            job,
+        }
+    }
+}
+
+/// The grant/timeout as a supervisor reads it; unrelated control fields are ignored.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobserverAnswer {
+    pub ok: bool,
+    pub lease: Option<crate::LeaseState>,
+    pub tokens: Option<NonZeroUsize>,
+    pub fifo: Option<std::path::PathBuf>,
+    pub cpu_pool: Option<std::path::PathBuf>,
+    pub cpu_budget: Option<CpuBudgetStatus>,
+    pub wait_ms: Option<u64>,
+    pub code: Option<String>,
+    pub error: Option<String>,
+}
+
+/// The gateway and the single sandbox builder derive exactly the same workspace IPC scope.
+/// The global control socket and every other workspace remain outside that scope.
+pub fn cpu_pool_directory(
+    store: &std::path::Path,
+    workspace_incarnation: &str,
+) -> Result<std::path::PathBuf, crate::ConfigError> {
+    if workspace_incarnation.len() != 32
+        || !workspace_incarnation
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(crate::ConfigError::InvalidCpuPoolIncarnation);
+    }
+    use base64::Engine as _;
+    let digit = |byte: u8| {
+        if byte <= b'9' {
+            byte - b'0'
+        } else {
+            byte - b'a' + 10
+        }
+    };
+    let mut identity = [0_u8; 16];
+    for (slot, pair) in identity
+        .iter_mut()
+        .zip(workspace_incarnation.as_bytes().as_chunks::<2>().0)
+    {
+        *slot = digit(pair[0]) * 16 + digit(pair[1]);
+    }
+    let mut encoded = [0_u8; 22];
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode_slice(identity, &mut encoded)
+        .expect("22 bytes hold a complete base64url 128-bit incarnation");
+    let name = std::str::from_utf8(&encoded).expect("base64url is ASCII");
+    Ok(store.join("run/cpu").join(name))
+}
+
 /// The one line a client writes:
 /// `{"op":"cpu-tokens","want":8,"checkout":"/path/to/checkout","command":"…"}`.
 ///
@@ -73,4 +195,60 @@ pub struct CpuCheckoutStatus {
     pub running: usize,
     /// Runners waiting for a grant.
     pub waiting: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine as _;
+    use std::path::Path;
+
+    #[test]
+    fn pool_scope_encoding_preserves_every_incarnation_bit() {
+        let mut scopes = std::collections::BTreeSet::new();
+        for bit in 0..=128 {
+            let mut identity = [0_u8; 16];
+            if bit < 128 {
+                identity[bit / 8] = 1 << (bit % 8);
+            }
+            let incarnation: String = identity.iter().map(|byte| format!("{byte:02x}")).collect();
+            let directory = super::cpu_pool_directory(Path::new("/store"), &incarnation).unwrap();
+            assert_eq!(directory.parent(), Some(Path::new("/store/run/cpu")));
+            let encoded = directory.file_name().unwrap().to_str().unwrap();
+            assert_eq!(encoded.len(), 22);
+            assert_eq!(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded)
+                    .unwrap(),
+                identity
+            );
+            assert!(
+                scopes.insert(directory),
+                "distinct full identities must have distinct scopes"
+            );
+        }
+        assert_eq!(scopes.len(), 129);
+    }
+
+    #[test]
+    fn pool_scope_is_store_local_and_fits_the_existing_fixture_socket_budget() {
+        let incarnation = "0123456789abcdef0123456789abcdef";
+        let store = Path::new("/private/tmp/cowshed-dtest-79675-0-cli/store");
+        let scope = super::cpu_pool_directory(store, incarnation).unwrap();
+        let endpoint = scope.join("abcdefghijklmnopqrstuv");
+        assert!(scope.starts_with(store));
+        assert_eq!(endpoint.as_os_str().as_encoded_bytes().len(), 98);
+        assert!(endpoint.as_os_str().as_encoded_bytes().len() < 104);
+        assert_ne!(
+            scope,
+            super::cpu_pool_directory(Path::new("/another-store"), incarnation).unwrap()
+        );
+        for invalid in [
+            "",
+            "../0123456789abcdef0123456789abcd",
+            "0123456789ABCDEF0123456789abcdef",
+            "0123456789abcdef0123456789abcdeg",
+        ] {
+            assert!(super::cpu_pool_directory(store, invalid).is_err());
+        }
+    }
 }

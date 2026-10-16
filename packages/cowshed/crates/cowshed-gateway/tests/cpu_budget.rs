@@ -111,6 +111,22 @@ struct Asker {
 }
 
 impl Asker {
+    async fn jobserver(socket: &Path, want: usize, checkout: &str, wait_ms: u32) -> Self {
+        let stream = UnixStream::connect(socket).await.expect("connect");
+        let (reader, mut writer) = stream.into_split();
+        let request = serde_json::json!({ "op": "jobserver", "want": want, "checkout": checkout,
+            "command": "land gate", "class": "gate", "waitMs": wait_ms });
+        writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("ask gate");
+        let mut asker = Self {
+            lines: BufReader::new(reader),
+            _writer: writer,
+        };
+        assert_eq!(asker.answer().await["lease"], "queued");
+        asker
+    }
     async fn ask(socket: &Path, want: usize, checkout: &str) -> Self {
         let stream = UnixStream::connect(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
@@ -296,6 +312,129 @@ async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gate_wins_whole_returned_tokens_before_older_background_work() {
+    let (gateway, root, socket) = gateway(4).await;
+    let mut holder = Asker::ask(&socket, 4, "/w/background").await;
+    assert_eq!(holder.granted(Duration::from_secs(10)).await, Some(4));
+    let mut old_background = Asker::ask(&socket, 4, "/w/same").await;
+    let asked = std::time::Instant::now();
+    let mut gate = Asker::jobserver(&socket, 4, "/w/same", 120_000).await;
+    assert_eq!(gate.granted(Duration::from_millis(50)).await, None);
+    assert_eq!(
+        ledger(&socket)
+            .await
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.checkout == "/w/background")
+            .unwrap()
+            .held,
+        4,
+        "the in-flight background grant must not be fictionally shrunk"
+    );
+    let returned = std::time::Instant::now();
+    drop(holder);
+    assert_eq!(gate.granted(Duration::from_secs(10)).await, Some(4));
+    let admitted = std::time::Instant::now();
+    let status = ledger(&socket).await;
+    assert_eq!((status.total, status.held), (4, 4));
+    assert!(
+        status
+            .checkouts
+            .iter()
+            .all(|checkout| checkout.checkout != "/w/background")
+    );
+    assert_eq!(
+        old_background.granted(Duration::from_millis(50)).await,
+        None
+    );
+    eprintln!(
+        "gate-drain proof: background=4->0 gate=0->4 request-to-grant={:?} return-to-grant={:?}",
+        admitted.duration_since(asked),
+        admitted.duration_since(returned)
+    );
+    drop(gate);
+    assert_eq!(
+        old_background.granted(Duration::from_secs(10)).await,
+        Some(4)
+    );
+    drop(old_background);
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_active_gate_blocks_new_background_roots_and_later_gates_even_with_free_tokens() {
+    let (gateway, root, socket) = gateway(8).await;
+    let mut gate = Asker::jobserver(&socket, 4, "/w/gate", 120_000).await;
+    assert_eq!(gate.granted(Duration::from_secs(10)).await, Some(4));
+    let mut background = Asker::ask(&socket, 1, "/w/background").await;
+    let mut next_gate = Asker::jobserver(&socket, 2, "/w/next-gate", 120_000).await;
+    assert_eq!(background.granted(Duration::from_millis(50)).await, None);
+    assert_eq!(next_gate.granted(Duration::from_millis(50)).await, None);
+    assert_eq!(ledger(&socket).await.held, 4);
+    drop(gate);
+    assert_eq!(next_gate.granted(Duration::from_secs(10)).await, Some(2));
+    assert_eq!(background.granted(Duration::from_millis(50)).await, None);
+    drop(next_gate);
+    assert_eq!(background.granted(Duration::from_secs(10)).await, Some(1));
+    drop(background);
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bounded_gate_timeout_names_unchanged_live_holders_and_leaves_no_queue_barrier() {
+    let (gateway, root, socket) = gateway(4).await;
+    let mut holder = Asker::ask(&socket, 4, "/w/live-test").await;
+    assert_eq!(holder.granted(Duration::from_secs(10)).await, Some(4));
+    let mut background = Asker::ask(&socket, 4, "/w/after-timeout").await;
+    let asked = std::time::Instant::now();
+    let mut gate = Asker::jobserver(&socket, 4, "/w/gate", 60).await;
+    let refusal = tokio::time::timeout(Duration::from_secs(10), gate.answer())
+        .await
+        .expect("bounded refusal");
+    assert_eq!(refusal["ok"], false, "{refusal}");
+    assert_eq!(refusal["code"], "gate-admission-timeout", "{refusal}");
+    assert!(
+        refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("/w/live-test: 4 tokens"),
+        "{refusal}"
+    );
+    assert!(asked.elapsed() >= Duration::from_millis(60));
+    assert_eq!(refusal["cpuBudget"]["held"], 4);
+    assert_eq!(ledger(&socket).await.held, 4);
+    drop((gate, holder));
+    assert_eq!(background.granted(Duration::from_secs(10)).await, Some(4));
+    drop(background);
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jobserver_class_and_gate_bounds_are_validated_without_changing_ordinary_requests() {
+    let (gateway, root, socket) = gateway(4).await;
+    for fields in [
+        serde_json::json!({"class":"gate"}),
+        serde_json::json!({"class":"gate","waitMs":0}),
+        serde_json::json!({"class":"pretend-gate","waitMs":100}),
+        serde_json::json!({"class":"background","waitMs":100}),
+    ] {
+        let mut request = serde_json::json!({"op":"jobserver","want":4,"checkout":"/w/refused","command":"cargo test"});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let refused = one_shot(&socket, &format!("{request}\n")).await;
+        assert_eq!(refused["code"], "invalid-request", "{refused}");
+    }
+    assert_eq!(ledger(&socket).await.held, 0);
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }

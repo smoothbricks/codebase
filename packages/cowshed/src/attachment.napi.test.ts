@@ -183,6 +183,8 @@ describe('Cowshed attachment Node-API boundary', () => {
         jobId,
         state: jobId === 1 && released ? 'exited' : 'running',
         grantRevision: 1,
+      class: 'background',
+      scope: 'workspace',
         argv: [{ encoding: 'utf8', data: jobId === 1 ? 'attachment-oracle' : 'delivery-unknown-oracle' }],
         cwd: null,
         started: '2026-07-13T00:00:00Z',

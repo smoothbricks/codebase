@@ -46,12 +46,14 @@ type CloseOutcome = { ok: true } | { ok: false; error: string };
 interface CpuPoolRequest {
   op: 'cpu-pool';
   want: number & typia.tags.Type<'uint32'> & typia.tags.Minimum<1>;
+  /** Ask the owning pool to serve this allocation as its own child pool (Cargo's host launcher). */
+  children?: boolean;
 }
 
 /** The pool's answers, in `holdLease`'s framing. */
 type CpuPoolReply =
   | { ok: true; lease: 'queued' }
-  | { ok: true; lease: 'granted'; tokens: number }
+  | { ok: true; lease: 'granted'; tokens: number; pool?: string }
   | { ok: false; code: 'invalid-request'; error: string };
 
 const parseRequest = typia.json.createIsParse<CpuPoolRequest>();
@@ -84,6 +86,7 @@ interface Child {
 interface Waiter {
   readonly child: Child;
   readonly want: number;
+  readonly children: boolean;
 }
 
 /** One framed reply line. The newline is the framing; every reply goes through here. */
@@ -171,6 +174,9 @@ export async function createCpuPool(
   // Every failure the pool records, including one its listener reports while it runs. The outcome reads them.
   const failures: string[] = [];
   const queue: Waiter[] = [];
+  // Allocated only for children that need the owner to serve their local sub-ledger.
+  let subpools: Set<CpuPool> | undefined;
+  let creating: Promise<void>[] | undefined;
   const children = new Set<Socket>();
   let resolveStarted!: (failure: Error | null) => void;
   const started = new Promise<Error | null>((done) => {
@@ -192,7 +198,34 @@ export async function createCpuPool(
       const granted = Math.min(waiter.want, free);
       free -= granted;
       waiter.child.phase = { kind: 'holding', tokens: granted };
-      waiter.child.socket.write(frame({ ok: true, lease: 'granted', tokens: granted }));
+      if (!waiter.children) {
+        waiter.child.socket.write(frame({ ok: true, lease: 'granted', tokens: granted }));
+        continue;
+      }
+      const ended = new Promise<void>((done) => {
+        if (waiter.child.socket.destroyed) done();
+        else waiter.child.socket.once('close', done);
+      });
+      const creation = createCpuPool(granted, ended).then(async (made) => {
+        if (!made.ok) {
+          failures.push(made.error);
+          // Keep holding until close credits exactly this allocation once.
+          waiter.child.socket.end(frame({ ok: false, code: 'invalid-request', error: made.error }));
+          return;
+        }
+        subpools ??= new Set();
+        subpools.add(made.pool);
+        if (waiter.child.phase.kind !== 'holding' || closing) {
+          const outcome = await made.pool.close();
+          if (!outcome.ok) failures.push(outcome.error);
+          return;
+        }
+        waiter.child.socket.write(
+          frame({ ok: true, lease: 'granted', tokens: granted, pool: made.pool.environment[CPU_POOL_ENV] }),
+        );
+      });
+      creating ??= [];
+      creating.push(creation);
     }
   };
 
@@ -263,7 +296,7 @@ export async function createCpuPool(
       }
       const line = buffered.subarray(0, newline).toString('utf8');
       buffered = EMPTY;
-      let request: ReturnType<typeof parseRequest>;
+      let request: CpuPoolRequest | null;
       try {
         request = parseRequest(line);
       } catch (error) {
@@ -276,7 +309,7 @@ export async function createCpuPool(
         return;
       }
       child.phase = { kind: 'queued' };
-      queue.push({ child, want: request.want });
+      queue.push({ child, want: request.want, children: request.children === true });
       socket.write(frame({ ok: true, lease: 'queued' }));
       drain();
     });
@@ -302,6 +335,13 @@ export async function createCpuPool(
             done();
           });
         });
+      }
+      if (creating !== undefined) await Promise.all(creating);
+      if (subpools !== undefined) {
+        for (const pool of subpools) {
+          const outcome = await pool.close();
+          if (!outcome.ok) failures.push(outcome.error);
+        }
       }
       try {
         await rm(directory, { recursive: true, force: true });

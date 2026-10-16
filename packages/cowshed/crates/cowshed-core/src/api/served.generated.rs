@@ -699,6 +699,83 @@ impl Serves<CoordinatorWorker> for Coordinator {
     }
 }
 
+impl Serves<CoordinatorExec> for Coordinator {
+    const BOUND: &'static [&'static str] = &["repoId"];
+
+    fn request(
+        authority: &<Self as Binder>::Fields<'_>,
+        arguments: Arguments,
+    ) -> Result<ExecParams> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Caller {
+            workspace: WorkspaceName,
+            workspace_incarnation: WorkspaceIncarnation,
+            session: Option<String>,
+            #[serde(default)]
+            argv: Option<Vec<CommandArg>>,
+            #[serde(default)]
+            script: Option<ScriptCommand>,
+            cwd: Option<WorkspacePath>,
+            mode: RunSandboxMode,
+            env: HashMap<String, String>,
+            trace: Option<TraceContext>,
+            stdin: ExecStdin,
+            stdout_copy: Option<OutputPublication>,
+            stderr_copy: Option<OutputPublication>,
+            #[serde(default)]
+            admission_key: Option<AdmissionKey>,
+            #[serde(default)]
+            class: JobserverClass,
+            #[serde(default = "minimum_want")]
+            want: NonZeroUsize,
+            #[serde(default)]
+            wait_ms: Option<NonZeroU32>,
+            #[serde(default)]
+            scope: ExecScope,
+        }
+        let Caller {
+            workspace,
+            workspace_incarnation,
+            session,
+            argv,
+            script,
+            cwd,
+            mode,
+            env,
+            trace,
+            stdin,
+            stdout_copy,
+            stderr_copy,
+            admission_key,
+            class,
+            want,
+            wait_ms,
+            scope,
+        } = decode::<CoordinatorExec, Caller>(arguments)?;
+        Ok(ExecParams {
+            repo_id: owned(authority.repo_id),
+            workspace,
+            workspace_incarnation,
+            session,
+            argv,
+            script,
+            cwd,
+            mode,
+            env,
+            trace,
+            stdin,
+            stdout_copy,
+            stderr_copy,
+            admission_key,
+            class,
+            want,
+            wait_ms,
+            scope,
+        })
+    }
+}
+
 impl Serves<WorkspaceGrants> for WorkspaceHandle {
     const BOUND: &'static [&'static str] = &["repoId", "workspace", "workspaceIncarnation"];
 
@@ -742,6 +819,14 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             stderr_copy: Option<OutputPublication>,
             #[serde(default)]
             admission_key: Option<AdmissionKey>,
+            #[serde(default)]
+            class: JobserverClass,
+            #[serde(default = "minimum_want")]
+            want: NonZeroUsize,
+            #[serde(default)]
+            wait_ms: Option<NonZeroU32>,
+            #[serde(default)]
+            scope: ExecScope,
         }
         let Caller {
             session,
@@ -755,6 +840,10 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             stdout_copy,
             stderr_copy,
             admission_key,
+            class,
+            want,
+            wait_ms,
+            scope,
         } = decode::<WorkerExec, Caller>(arguments)?;
         Ok(ExecParams {
             repo_id: owned(authority.repo_id),
@@ -771,6 +860,10 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             stdout_copy,
             stderr_copy,
             admission_key,
+            class,
+            want,
+            wait_ms,
+            scope,
         })
     }
 }
@@ -1343,6 +1436,7 @@ pub(crate) fn each_served(
     check.served::<CoordinatorSetCheckpointQuota, _>(coordinator, &[]);
     check.served::<CoordinatorDoctor, _>(coordinator, &[]);
     check.served::<CoordinatorWorker, _>(coordinator, &[]);
+    check.served::<CoordinatorExec, _>(coordinator, &[]);
     check.served::<WorkspaceGrants, _>(workspace_handle, &[]);
     check.served::<WorkerExec, _>(workspace_handle, &[]);
     check.served::<WorkerStdinChunk, _>(workspace_handle, &[]);

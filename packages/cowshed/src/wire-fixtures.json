@@ -163,6 +163,76 @@
     }
   },
   "JobInfo": {
+    "cpuAdmissionFailed": {
+      "argv": [
+        {
+          "data": "sh",
+          "encoding": "utf8"
+        },
+        {
+          "data": "-c",
+          "encoding": "utf8"
+        }
+      ],
+      "class": "gate",
+      "cwd": null,
+      "durationMs": 1234,
+      "failure": "cpuAdmission",
+      "grantRevision": 7,
+      "jobId": 9,
+      "repoId": "smoothbricks/codebase",
+      "scope": "hostGate",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "failed",
+      "stderr": {
+        "bytes": 41,
+        "sha256": "f3683ad2deadf965ac71955924d6d381e83c095b86fb646ce4c9e9513584c4af",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "gate-admission-timeout: waited 120000 ms\n",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "gate-admission-timeout: waited 120000 ms\n",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 5,
+        "complete": true,
+        "kind": "inline"
+      },
+      "stdout": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
     "exited": {
       "argv": [
         {
@@ -174,6 +244,8 @@
           "encoding": "utf8"
         }
       ],
+      "class": "gate",
+      "cpuTokens": 8,
       "cwd": null,
       "durationMs": 1234,
       "exit": {
@@ -182,6 +254,7 @@
       },
       "grantRevision": 7,
       "jobId": 3,
+      "nice": 0,
       "pid": 4243,
       "repoId": "smoothbricks/codebase",
       "resources": {
@@ -241,6 +314,7 @@
         "wallMs": 1234,
         "wallUs": 1234000
       },
+      "scope": "workspace",
       "started": "2026-01-02T03:04:05Z",
       "state": "exited",
       "stderr": {
@@ -303,11 +377,13 @@
           "encoding": "utf8"
         }
       ],
+      "class": "background",
       "cwd": null,
       "durationMs": 1234,
       "grantRevision": 7,
       "jobId": 7,
       "repoId": "smoothbricks/codebase",
+      "scope": "workspace",
       "started": "2026-01-02T03:04:05Z",
       "state": "failed",
       "stderr": {
@@ -374,6 +450,8 @@
           "encoding": "base64"
         }
       ],
+      "class": "background",
+      "cpuTokens": 2,
       "cwd": null,
       "durationMs": 9,
       "exit": {
@@ -382,8 +460,10 @@
       },
       "grantRevision": 9,
       "jobId": 6,
+      "nice": 10,
       "pid": 4244,
       "repoId": "smoothbricks/codebase",
+      "scope": "workspace",
       "started": "2026-01-02T03:04:05Z",
       "state": "killed",
       "stderr": {
@@ -450,6 +530,8 @@
           "encoding": "base64"
         }
       ],
+      "class": "background",
+      "cpuTokens": 2,
       "cwd": null,
       "durationMs": 9,
       "exit": {
@@ -459,8 +541,10 @@
       },
       "grantRevision": 9,
       "jobId": 6,
+      "nice": 10,
       "pid": 4244,
       "repoId": "smoothbricks/codebase",
+      "scope": "workspace",
       "started": "2026-01-02T03:04:05Z",
       "state": "killed",
       "stderr": {
@@ -520,10 +604,12 @@
             "encoding": "utf8"
           }
         ],
+        "class": "background",
         "cwd": null,
         "grantRevision": 0,
         "jobId": 1,
         "repoId": "smoothbricks/codebase",
+        "scope": "workspace",
         "started": "2026-01-02T03:04:05Z",
         "state": "queued",
         "stderr": {
@@ -590,9 +676,12 @@
             "encoding": "utf8"
           }
         ],
+        "class": "background",
+        "cpuTokens": 4,
         "cwd": "packages/cowshed",
         "grantRevision": 7,
         "jobId": 2,
+        "nice": 10,
         "pid": 4242,
         "repoId": "smoothbricks/codebase",
         "resources": {
@@ -669,6 +758,7 @@
           "wallMs": 1250,
           "wallUs": 1250400
         },
+        "scope": "workspace",
         "started": "2026-01-02T03:04:05Z",
         "state": "running",
         "stderr": {
@@ -724,16 +814,20 @@
           "encoding": "utf8"
         }
       ],
+      "class": "background",
+      "cpuTokens": 1,
       "cwd": null,
       "durationMs": 50,
       "grantRevision": 9,
       "jobId": 5,
+      "nice": 10,
       "outputLimit": {
         "crossingBytes": 1048577,
         "limitBytes": 1048576
       },
       "pid": 4245,
       "repoId": "smoothbricks/codebase",
+      "scope": "workspace",
       "started": "2026-01-02T03:04:05Z",
       "state": "outputLimit",
       "stderr": {
@@ -782,6 +876,78 @@
       },
       "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
     },
+    "priorityFailed": {
+      "argv": [
+        {
+          "data": "sh",
+          "encoding": "utf8"
+        },
+        {
+          "data": "-c",
+          "encoding": "utf8"
+        }
+      ],
+      "class": "background",
+      "cpuTokens": 1,
+      "cwd": null,
+      "durationMs": 1234,
+      "failure": "priority",
+      "grantRevision": 7,
+      "jobId": 10,
+      "pid": 4246,
+      "repoId": "smoothbricks/codebase",
+      "scope": "workspace",
+      "started": "2026-01-02T03:04:05Z",
+      "state": "failed",
+      "stderr": {
+        "bytes": 33,
+        "sha256": "a5e061d08732391a93eb279b1b3a463fff5e267894a9d14c5239ff508dafdcd7",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "cannot place pid 4246 at nice 10\n",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "cannot place pid 4246 at nice 10\n",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "stdin": {
+        "bytes": 5,
+        "complete": true,
+        "kind": "inline"
+      },
+      "stdout": {
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "storage": {
+          "artifact": {
+            "data": {
+              "data": "",
+              "encoding": "utf8"
+            },
+            "kind": "inline"
+          },
+          "kind": "captured"
+        },
+        "summary": {
+          "text": "",
+          "truncated": false,
+          "version": 1
+        }
+      },
+      "trace": {
+        "spanId": "0011223344556677",
+        "traceId": "00112233445566778899aabbccddeeff"
+      },
+      "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
+    },
     "queued": {
       "argv": [
         {
@@ -789,10 +955,12 @@
           "encoding": "utf8"
         }
       ],
+      "class": "background",
       "cwd": null,
       "grantRevision": 0,
       "jobId": 1,
       "repoId": "smoothbricks/codebase",
+      "scope": "workspace",
       "started": "2026-01-02T03:04:05Z",
       "state": "queued",
       "stderr": {
@@ -859,9 +1027,12 @@
           "encoding": "utf8"
         }
       ],
+      "class": "background",
+      "cpuTokens": 4,
       "cwd": "packages/cowshed",
       "grantRevision": 7,
       "jobId": 2,
+      "nice": 10,
       "pid": 4242,
       "repoId": "smoothbricks/codebase",
       "resources": {
@@ -938,6 +1109,7 @@
         "wallMs": 1250,
         "wallUs": 1250400
       },
+      "scope": "workspace",
       "started": "2026-01-02T03:04:05Z",
       "state": "running",
       "stderr": {
@@ -986,6 +1158,7 @@
       "workspaceIncarnation": "0123456789abcdef0123456789abcdef"
     },
     "scriptSyntax": {
+      "class": "background",
       "cwd": null,
       "durationMs": 1234,
       "exit": {
@@ -996,6 +1169,7 @@
       "grantRevision": 7,
       "jobId": 8,
       "repoId": "smoothbricks/codebase",
+      "scope": "workspace",
       "script": {
         "parts": ["grep -r ", " src | (", ""],
         "values": [
@@ -1073,6 +1247,8 @@
           "encoding": "base64"
         }
       ],
+      "class": "background",
+      "cpuTokens": 2,
       "cwd": null,
       "durationMs": 9,
       "exit": {
@@ -1082,6 +1258,7 @@
       },
       "grantRevision": 9,
       "jobId": 4,
+      "nice": 10,
       "pid": 4244,
       "repoId": "smoothbricks/codebase",
       "resources": {
@@ -1145,6 +1322,7 @@
         "wallMs": 9,
         "wallUs": 9000
       },
+      "scope": "workspace",
       "started": "2026-01-02T03:04:05Z",
       "state": "signaled",
       "stderr": {
@@ -1829,6 +2007,7 @@
           "kind": "frozen"
         }
       },
+      "kind": "landed",
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
       "targetBranch": "main",
@@ -1853,10 +2032,16 @@
           "kind": "frozen"
         }
       },
+      "kind": "landed",
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
       "targetBranch": "main",
       "targetWasCheckedOut": false
+    },
+    "delivered": {
+      "destinationRef": "refs/cowshed/raven/heads/topic",
+      "kind": "delivered",
+      "sourceHead": "1111111111111111111111111111111111111111"
     },
     "firstLanding": {
       "buildVolume": {
@@ -1870,6 +2055,7 @@
           "kind": "unchanged"
         }
       },
+      "kind": "landed",
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
       "targetBranch": "main",
@@ -1894,6 +2080,7 @@
           "kind": "unchanged"
         }
       },
+      "kind": "landed",
       "landedHead": "1111111111111111111111111111111111111111",
       "retired": false,
       "targetBranch": "main",
@@ -1971,6 +2158,7 @@
           "reason": "build volume /cache/build/0123.dmg is in use by pid 5940 (workspace job); nothing was forced: close what holds it and run the command again"
         }
       },
+      "kind": "landed",
       "landedHead": "1111111111111111111111111111111111111111",
       "previousTargetHead": "2222222222222222222222222222222222222222",
       "retired": true,

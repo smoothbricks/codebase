@@ -112,12 +112,17 @@ pub struct ExecRequest {
     pub command: ExecCommand,
     pub cwd: Option<PathBuf>,            // relative to mount; default mount root
     pub mode: RunSandboxMode,            // default ReadWrite
-    pub env: HashMap<String, String>,    // filtered through the build-config allowlist
+    pub env: HashMap<String, String>,    // execution env; existing reserved/credential rules apply, record projection below
     pub trace: Option<TraceContext>,     // W3C context; propagated into the job env as TRACEPARENT (13_telemetry.md)
     pub stdin: StdinSource,
     pub stdout_copy: Option<OutputPublication>,
     pub stderr_copy: Option<OutputPublication>,
     pub admission_key: Option<AdmissionKey>, // idempotent admission within the exact workspace incarnation
+
+    pub class: JobserverClass,            // Background by default; Gate requires trusted coordinator
+    pub want: NonZeroUsize,               // default1; actual command demand, bounded to granted tokens
+    pub wait_ms: Option<NonZeroU32>,       // Some iff Gate; background has no admission deadline
+    pub scope: ExecScope,                 // Workspace default; HostGate requires trusted Gate
 }
 
 pub enum ExecCommand {
@@ -234,7 +239,8 @@ pub struct JobAdmission {
     pub key: AdmissionKey,
     pub cwd: Option<WorkspacePath>,
     pub mode: RunSandboxMode,
-    pub env: BTreeMap<String, String>,      // sorted; withheld credential names never enter this record
+    pub env: BTreeMap<String, String>,      // sorted public-name plaintext projection only, for every scope
+    pub env_sha256: Sha256Digest,          // full authored non-withheld env identity; wire envSha256
     pub stdin: AdmittedStdin,
     pub session: AdmittedSession,
     pub stdout_copy: Option<OutputPublication>,
@@ -473,12 +479,19 @@ pub struct LandOptions {
     pub expected_target_head: Option<ExpectedRefHead>,
 }
 
-pub struct LandReport {
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LandReport {
+    Delivered(PushReport),
+    Landed(LandedReport),
+}
+
+pub struct LandedReport {
     pub landed_head: GitOid,
     pub target_branch: String,
     pub previous_target_head: Option<GitOid>,
     pub target_was_checked_out: bool,
     pub retired: bool,
+    pub build_volume: LandBuildVolume,
 }
 ```
 
@@ -638,6 +651,12 @@ The canonical API declarations own operation signatures, authority scopes, reque
 names, and validation bounds. They generate the controller protocol, N-API adapter signatures, TypeScript public types,
 and validators as one surface. There is no separate handwritten N-API request or TypeScript DTO field list. Shared
 corpus tests check every generated projection and reject a deliberately changed or omitted field.
+
+Error detail projection follows the canonical Serde object, including omitted and flattened sources. The native adapter
+copies its actual serialized own properties, not a second generated property list. Optional flattened named causes
+retain their optional public members in TypeScript; absence is not a null intersection. Mutually exclusive cold
+execution refusals may share one private boxed cause without changing the flat cpuAdmission/priority fields,
+unknown-source decoding, or borrowed source accessors.
 
 The public declaration IR is serializable from its own Rust types. Its serde and projection metadata and normalized Rust
 type graph generate their TypeScript model through the same owner emitter; a consumer never restates those fields or
@@ -1201,11 +1220,13 @@ records remain typed; no JSON string column carries a process tree or metric pay
 `ExecRequest.admissionKey` is a raw string of 1 to 4096 UTF-8 bytes, compared byte for byte. It is optional for ordinary
 direct callers and mandatory for an executor admitting an idempotent operation. Before spawn, cowshed commits the key,
 the authored request identity and the allocated job id in the job's first record, under the lock ordering the workspace
-incarnation's records. The identity is the request before a session lends it a cwd or environment: command, cwd,
-environment less withheld credential names, sandbox mode, session, publications and stdin source. Inline input is
-identified by its SHA-256 and length, a workspace file by its path, and a stream only by its kind, never its bytes.
-Named sessions compare by name; unnamed sessions carry a distinct UUID, including across supervisor restart. The command
-remains the record's own, not a second copy inside admission metadata.
+incarnation's records. The identity is the request before a session lends it a cwd or environment: command, cwd, the
+full authored environment less withheld credential names, sandbox mode, session, publications and stdin source. The
+environment binds the key through the typed envSha256 commitment, not the public plaintext projection recorded in
+JobAdmission.env. Custom/private changes therefore remain Env keyConflict after a restart without storing their values.
+Inline input is identified by its SHA-256 and length, a workspace file by its path, and a stream only by its kind, never
+its bytes. Named sessions compare by name; unnamed sessions carry a distinct UUID, including across supervisor restart.
+The command remains the record's own, not a second copy inside admission metadata.
 
 Open remains distinct from Stream on the wire and has no live reader, while its durable stdin identity uses the existing
 stream kind. A repeated keyed Open answers the same job before or after termination, starts no reader and sends no EOF.
@@ -1324,8 +1345,10 @@ supervisor that ran the job retires.
   so size zero, a size that is not a power of two, a base not aligned to its size, overflow, unknown fields, and
   struct-literal forgery fail.
 - `PushReport = { sourceHead, destinationRef, previousDestinationHead? }`;
-  `LandReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired }`;
-  `MirrorInfo = { url, mirror }`; `CheckpointQuota = { maxCount, maxBytes }`.
+  `LandReport = { kind: "delivered", ...PushReport } | { kind: "landed", ...LandedReport }`;
+  `LandedReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, buildVolume }`;
+  preservation-only delivery has no landed, build-volume or retirement fields; `MirrorInfo = { url, mirror }`;
+  `CheckpointQuota = { maxCount, maxBytes }`.
 - `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon? }`;
   `healing = { mounting: { projects } } | "restoringSessions"` says how far the daemon's startup pass has got — the
   projects it still mounts, never 0, then the sessions it restores from them — and is absent once that pass is over
@@ -1662,11 +1685,11 @@ One boundary answer, no ambiguity:
   conflict. The controller never stops reading a connection, so a demand on an open stream is always read. A job's
   output therefore reaches a client while the client waits for the job's end, and a status read is answered while a wait
   is open on the same connection. A frame that breaks the protocol ends the connection and fails every call still open
-  on it with that error.
-  The SDK client admits at most that same published limit of non-stream calls onto its connection at once. Excess
-  calls wait in FIFO order until an answer frees a slot, and receive their wire id only when sent. Stream-lane requests,
-  demands and closes continue while the non-stream queue is full; the client neither opens extra connections nor retries
-  or suppresses a controller conflict. A fatal connection error fails queued calls as well as calls already sent.
+  on it with that error. The SDK client admits at most that same published limit of non-stream calls onto its connection
+  at once. Excess calls wait in FIFO order until an answer frees a slot, and receive their wire id only when sent.
+  Stream-lane requests, demands and closes continue while the non-stream queue is full; the client neither opens extra
+  connections nor retries or suppresses a controller conflict. A fatal connection error fails queued calls as well as
+  calls already sent.
 - **A call may ask to hear its lifecycle steps.** A request that sets top-level `steps: true` gets, ahead of its answer,
   one `{id, step}` frame per step start and end its router call reports — the same steps a lifecycle verb prints on
   stderr (13_telemetry.md): `{event: "started", step, parent?, scope, name}` and `{event: "ended", step, error?}`. Step
@@ -1729,3 +1752,45 @@ framed stdin channel with bounded buffers and child-pipe backpressure. Source EO
 client cancellation closes the source and child stdin, records incomplete delivery, and does not implicitly kill the job
 unless the caller separately requests cancellation of the job. Job/trace events carry stdin kind, delivered bytes,
 completion, and normalized workspace-relative source where applicable, never inline contents.
+
+## Task server scheduling and trusted host gates
+
+`Coordinator::exec(worker, request)` is the trusted `coordinator.exec` upload route; the worker handle supplies only the
+immutable workspace/incarnation fence. Ordinary `worker.exec` admits only Background / Workspace. Requesting Gate or
+HostGate there is typed class-not-permitted before snapshot, record, CPU request or spawn. Scope, class, want and waitMs
+bind keyed admission just like command/env: changing one under the same key is keyConflict, never a new spawn.
+
+`ExecScope` is Workspace (default) or HostGate. HostGate requires Gate, argv, read-write mode and no session; it runs
+one host one-shot without ExecutedChild or shell activation, never a new wrapper. No worker gains host authority. The
+operator gate command explicitly selects its checkout environment. The host child starts from an empty environment and
+gets the ordinary request environment under the existing reserved/credential rules, its live grant's pool/count and PWD,
+not the supervisor's environment or authority. CLI HostGate preserves custom operator/project names; ordinary worker
+activation and overlays remain unchanged.
+
+The public environment-name policy is **record-only**, for **all scopes**: `JobAdmission.env` stores only
+`PATH HOME USER LOGNAME SHELL TMPDIR LANG TERM TZ CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN BUN_INSTALL DEVELOPER_DIR` and
+the `LC_*` locale-category family. Filtering occurs before admission records are persisted, never by refusing a request
+or stripping its execution environment. Project variables exported by devenv or `.envrc`, custom caller variables and
+their values continue to reach actual jobs under the existing runtime rules. `NX_*`, `NODE_*`, `CI`, credentials,
+CPU-authority names and every other non-public name are omitted only from this plaintext record projection.
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, `NIX_SSL_CERT_FILE` and `SDKROOT` are not public-record names; this does not prevent
+their runtime use by a project. There is no private ambient channel or plaintext shadow.
+
+The full authored request environment, minus the existing withheld credentials and before session/activation overlays,
+is committed as typed `envSha256` (`Sha256Digest`). Name/value pairs are sorted by name; each UTF-8 component is framed
+by its u64 little-endian byte length followed by its bytes, using the existing structured SHA-256 commitment pattern.
+Env identity comparisons use this commitment, not the filtered plaintext map. Changing a custom/private value cannot
+alias a previous job, including after supervisor restart; changing a withheld credential still does not change request
+identity because it cannot reach the command. The existing Arrow record proof covers both projection and commitment. No
+unrecorded private map is retained to make a repeat work.
+
+JobInfo and SealedJob expose admitted class/scope, actual cpuTokens and observed nice (absent before placement).
+CowshedError carries typed cpuAdmission (including gateAdmissionTimeout with actual waitMs/cpuBudget holder evidence)
+and priority (actual pid, requested/observed nice and errno). A failed or absent observation is never fabricated.
+
+Records now use layout11: layout10's columns remain an exact prefix, followed by nullable Binary admission_env_sha256,
+exactly 32 bytes and present exactly for keyed job records. Earlier histories are retained untouched and set aside, not
+migrated or re-keyed. On an existing incarnation that may have served keyed work, new keyed exec is refused as
+unprovable until the incarnation is renewed. **Operators must renew existing incarnations before keyed exec after
+upgrading.** Unkeyed operator CLI exec remains available. This is the existing strict history-attestation contract, not
+silent compatibility.

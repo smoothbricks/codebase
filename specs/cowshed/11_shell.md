@@ -691,7 +691,10 @@ admitted but never sealed. Two things put that right:
   error. KILL is followed by bounded membership verification; live survivors or inspection errors retain the ledger
   rather than claiming release. A sealed failed-wait record is not process-release proof, so its still-unaccounted-for
   group remains recorded. Failed inspection of an inherited group likewise retains that entry while recording new
-  groups.
+  groups. A macOS audit-token signal permission denial retains the native cause and reports the expected pid/version,
+  caller EUID, and a separately labeled post-failure kernel UID/flags/current version or inspection error. This cold
+  observation never renews signal authority or proves exit. The error explicitly says no exit watch was held at that
+  signal boundary; it never registers a late watch and presents it as prior exit evidence.
 
   Every replacement supervisor inherits unresolved entries with their original job, group, and lost supervisor. Each
   subsequent ledger rewrite carries them while the group remains unaccounted for, and drops only entries proven
@@ -855,3 +858,37 @@ success. The captured bytes remain readable through `logRead`; `sealed` reports 
 answered without hanging, and retirement may proceed after the child has ended. The next supervisor uses the existing
 lost-job recovery for records that genuinely remained unterminated, preserving the distinction between a child's exit, a
 protected terminal record, and its controller commitment.
+
+## Server-owned CPU admission and nice placement
+
+The supervisor's exec admission records Queued durably, acquires the gateway jobserver off the actor path, and spawns
+only under the actual grant (05_gateway.md, Host CPU budget). Status/cancel remain responsive while queued. Foreground
+exec answers at spawn/refusal; background exec answers at admission, with a later refusal on the job's stderr and
+failure cpuAdmission. Killing a queued job withdraws its request and seals Killed without a command. The grant stays
+held until the owned job concludes. Caller MAKEFLAGS/CARGO_MAKEFLAGS/MFLAGS and BOUNDED_EXEC_CPU_* never substitute for
+that allocation; actual pool/count override caller env after filtering.
+
+Gate is trusted coordinator/operator only; workers default Background / Workspace and cannot request Gate or HostGate.
+The owned command's nice is Gate0 / Background+10, not the reusable host's or supervisor's. On macOS placement/read-back
+occurs while the existing observation fence holds the child. On Linux the child reports placement before exec or group
+reporting on a private CLOEXEC pipe: a 20-byte stack record of outcome, actual pid, requested, observed and errno. No
+allocation occurs in the forked report path. REPLY_NICE_REFUSED (tag11) carries the typed failure in the warm-host
+exchange; absence is explicit, not a guessed nice. A script that exits before reporting its group answers EXITED, never
+STARTED. Failed placement is priority, and observed nice stays absent until placement succeeds.
+
+HostGate is an explicitly authorized argv host one-shot on this same server, without ExecutedChild or activation; it
+preserves the real-APFS host boundary and refuses scripts, read-only mode and sessions, never custom environment names.
+Its record-only public environment projection and full authored-env commitment are defined in 07_api.md, Task server
+scheduling and trusted host gates; execution and canonical activation retain all ordinary project variables. No ordinary
+workspace sandbox is widened. The single sandbox builder allows only connection and file metadata in the gateway-derived
+workspace CPU-pool scope, not directory data, file writes, socket binding, the global control socket or another
+workspace's pool.
+
+Job records use layout11: layout10's cpu_class, cpu_want, cpu_wait_ms, cpu_tokens, cpu_nice and cpu_scope columns remain
+an exact prefix, followed by admission_env_sha256 for the complete non-withheld authored environment. JobAdmission.env
+is the public plaintext projection only for every scope; keyed Env comparison uses the digest, including after restart.
+Records retain typed cpuAdmission/priority failures. Earlier histories are retained untouched and set aside. Per
+07_api.md Keyed admission, existing incarnations must be renewed before new keyed exec: unverifiable historical keys are
+refused as unprovable, never migrated into an attestation they did not record. Unkeyed operator CLI exec remains
+available. Controller-only discovery runs locate-project/metadata --no-deps --offline under its ordinary child sandbox
+outside job admission, retaining the explicit noncompiling exemption rather than claiming a grant or recorded nice.

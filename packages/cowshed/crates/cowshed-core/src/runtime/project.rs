@@ -18,8 +18,6 @@ use crate::api::dto::AbandonedWork;
 use crate::api::dto::GitOid;
 #[cfg(target_os = "macos")]
 use crate::api::dto::LandingCommits;
-#[cfg(target_os = "macos")]
-use crate::api::dto::RunSandboxMode;
 use crate::api::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions,
@@ -29,6 +27,8 @@ use crate::api::dto::{
     RemoveProjectReport, RemoveReport, RemovedWorkspace, SealedJob, StdinSource,
     WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
+#[cfg(target_os = "macos")]
+use crate::api::dto::{LandedReport, RunSandboxMode};
 use crate::api::operations::{
     self, AdoptRequest, BuildVolume, ExecParams, ExecStdin, GrantRequest, JobRequest, JobStream,
     LogsChunk, LogsRequest, Operation, OperationRequest, ProgressRequest, ProjectOpenRequest,
@@ -40,13 +40,14 @@ use crate::api::resources::{JobResourceSample, SampleInterval};
 use crate::api::server::{
     ConnectionAuthority, EventSource, RouterCommand, RouterHandle, RouterRequest, RouterResponse,
 };
-use crate::error::{CowshedError, ErrorCode, Result};
+use crate::error::{CowshedError, CpuAdmissionRefusal, ErrorCode, Result};
 use crate::metadata::WorkspaceName;
 #[cfg(target_os = "macos")]
 use crate::repository::OwnedRepoIds;
 use crate::repository::{RepoId, RepositoryBinding};
 use crate::runtime::job_progress::JobProgressStream;
 use crate::runtime::process_stream::JobProcessStream;
+use crate::runtime::supervisor_socket::AdmissionSource;
 #[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::RunAsync as _;
 #[cfg(target_os = "macos")]
@@ -321,6 +322,7 @@ pub trait ProjectRuntimeHost: Send + 'static {
         incarnation: WorkspaceIncarnation,
         session: Option<String>,
         request: ExecRequest,
+        source: AdmissionSource,
     ) -> Result<JobId>;
     /// Taken once `bytes`, the job's input from byte `offset` on, reached the job's stdin, which
     /// lasts as long as the job leaves its input unread.
@@ -1327,8 +1329,15 @@ impl ProjectActor {
                     snapshot,
                 )))
             }
+            Op::CoordinatorExec(params) => respond::<operations::CoordinatorExec>(
+                &self
+                    .admit_exec(&authority, AdmissionSource::Coordinator, params, upload)
+                    .await?,
+            ),
             Op::WorkerExec(params) => respond::<operations::WorkerExec>(
-                &self.worker_exec(&authority, params, upload).await?,
+                &self
+                    .admit_exec(&authority, AdmissionSource::Worker, params, upload)
+                    .await?,
             ),
             Op::WorkerStdinChunk(params) => {
                 return self
@@ -1647,17 +1656,28 @@ impl ProjectActor {
             .await
     }
 
-    async fn worker_exec(
+    /// Admits one exec through the route that decoded it. The route is the authority: a worker
+    /// admits background work in its workspace sandbox only, and a request for more is refused as
+    /// the typed class-not-permitted error before the workspace is even read.
+    async fn admit_exec(
         &mut self,
         authority: &ConnectionAuthority,
+        source: AdmissionSource,
         params: ExecParams,
         upload: Option<Bytes>,
     ) -> Result<JobId> {
+        source.admit(params.class, params.scope)?;
         let (scope, session, exec) = exec_request(params, upload)?;
         self.require_scoped_workspace(authority, &scope.repo_id, &scope.workspace)
             .await?;
         self.host
-            .exec(scope.workspace, scope.workspace_incarnation, session, exec)
+            .exec(
+                scope.workspace,
+                scope.workspace_incarnation,
+                session,
+                exec,
+                source,
+            )
             .await
     }
 
@@ -2149,6 +2169,14 @@ fn exec_request(
     upload: Option<Bytes>,
 ) -> Result<(WorkerScope, Option<String>, ExecRequest)> {
     let command = exec_command(params.argv, params.script)?;
+    crate::api::dto::validate_scheduling(params.class, params.wait_ms, params.scope).map_err(
+        |error| {
+            CowshedError::cpu_admission(CpuAdmissionRefusal::InvalidRequest {
+                detail: error.to_string(),
+            })
+        },
+    )?;
+    crate::api::dto::validate_host_gate_request(params.scope, params.session.is_some())?;
     let stdin = match params.stdin {
         ExecStdin::Empty => {
             if upload.is_some() {
@@ -2214,6 +2242,10 @@ fn exec_request(
             stdout_copy: params.stdout_copy,
             stderr_copy: params.stderr_copy,
             admission_key: params.admission_key,
+            class: params.class,
+            want: params.want,
+            wait_ms: params.wait_ms,
+            scope: params.scope,
         },
     ))
 }
@@ -4685,8 +4717,19 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 stdout_copy: None,
                 stderr_copy: None,
                 admission_key: None,
+                class: cowshed_gateway_types::JobserverClass::Background,
+                want: std::num::NonZeroUsize::MIN,
+                wait_ms: None,
+                scope: crate::api::dto::ExecScope::Workspace,
             };
-            let job = handle.exec(None, build_volume.clone(), request).await?;
+            let job = handle
+                .exec(
+                    None,
+                    build_volume.clone(),
+                    request,
+                    AdmissionSource::Coordinator,
+                )
+                .await?;
             let info = handle.wait(job).await?;
             let restored = match (&info.exit, read_job_stdout(&handle, job).await) {
                 (Some(crate::api::dto::ExitStatus::Exited { code: 0 }), Ok(stdout)) => {
@@ -7110,6 +7153,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             },
             workspace_volume,
             job_sampling: super::supervisor::JobSamplingPolicy::default(),
+            // Every job's command spawns under a grant from this host's gateway CPU budget.
+            cpu: std::sync::Arc::new(super::job_cpu::GatewayJobCpu::new(
+                self.descriptor.storage.store().join("gateway.sock"),
+            )),
         };
         // A workspace has one supervisor, its one job allocator: when another controller
         // process already serves it under this authority, or under grants published since this
@@ -11331,7 +11378,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             let job_id = timed_async(
                 "land",
                 "check-exec",
-                handle.exec(None, build_volume.clone(), land_check_request(check)),
+                handle.exec(
+                    None,
+                    build_volume.clone(),
+                    land_check_request(check),
+                    AdmissionSource::Coordinator,
+                ),
             )
             .await?;
             let info = timed_async("land", "check-wait", handle.wait(job_id)).await?;
@@ -11385,6 +11437,24 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         "check out a branch in the workspace and retry land",
                     )
                 })?;
+        if options.push_only {
+            let branch = crate::api::dto::BranchName::new(source_branch)
+                .map_err(|error| CowshedError::internal(error.to_string()))?;
+            let delivered = timed_async(
+                "land",
+                "preservation",
+                preserve_workspace_branch(
+                    &self.descriptor.git_root,
+                    &source_mount,
+                    &workspace,
+                    &branch,
+                    Some(&source_head),
+                    None,
+                ),
+            )
+            .await?;
+            return Ok(LandReport::Delivered(delivered));
+        }
         timed_async(
             "land",
             "delivery",
@@ -11494,14 +11564,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 )
             })?;
         }
-        Ok(LandReport {
+        Ok(LandReport::Landed(LandedReport {
             landed_head: source_head,
             target_branch,
             previous_target_head: previous,
             target_was_checked_out: true,
             retired: retire,
             build_volume,
-        })
+        }))
     }
 
     async fn push(
@@ -12276,12 +12346,15 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         incarnation: WorkspaceIncarnation,
         session: Option<String>,
         request: ExecRequest,
+        source: AdmissionSource,
     ) -> Result<JobId> {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         let token = self.session(&workspace, &session).cloned();
         let (handle, build_volume) = self.admit_build_state(&workspace).await?;
-        handle.exec(token.as_ref(), build_volume, request).await
+        handle
+            .exec(token.as_ref(), build_volume, request, source)
+            .await
     }
 
     async fn stdin_write(
@@ -13932,6 +14005,7 @@ mod removal_supervisor_tests {
             _grant_revision: u64,
             _command: &ExecCommand,
             admission: Option<crate::storage::job_artifact::JobAdmission>,
+            _scheduling: crate::storage::job_artifact::JobScheduling,
         ) -> Result<()> {
             match admission {
                 None => Ok(()),
@@ -14024,6 +14098,7 @@ mod removal_supervisor_tests {
                 .send(ProcessEvent::Started {
                     job_id: request.job_id,
                     process: process.clone(),
+                    nice: request.cpu.nice,
                 })
                 .await
                 .map_err(|_| CowshedError::internal("test process event channel closed"))?;
@@ -14054,6 +14129,10 @@ mod removal_supervisor_tests {
     impl RunningProcess for TestProcess {
         fn process(&self) -> Option<&super::super::supervisor::OwnedProcess> {
             Some(&self.process)
+        }
+
+        fn nice(&self) -> Option<i32> {
+            None
         }
 
         #[cfg(target_os = "macos")]
@@ -14137,7 +14216,12 @@ mod removal_supervisor_tests {
                     stdout_copy: None,
                     stderr_copy: None,
                     admission_key: None,
+                    class: cowshed_gateway_types::JobserverClass::Background,
+                    want: std::num::NonZeroUsize::MIN,
+                    wait_ms: None,
+                    scope: crate::api::dto::ExecScope::Workspace,
                 },
+                super::super::supervisor_socket::AdmissionSource::Worker,
             )
             .await
             .expect("start job");
@@ -14870,6 +14954,10 @@ fn land_check_request(check: &str) -> ExecRequest {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
+        class: crate::api::dto::JobserverClass::Background,
+        want: NonZeroUsize::MIN,
+        wait_ms: None,
+        scope: crate::api::dto::ExecScope::Workspace,
     }
 }
 
@@ -14949,7 +15037,9 @@ async fn task_inputs(
         "exec node_modules/.bin/nx show target inputs '{}' --json",
         task.replace('\'', "'\\''")
     ));
-    let job = handle.exec(None, build_volume, request).await?;
+    let job = handle
+        .exec(None, build_volume, request, AdmissionSource::Coordinator)
+        .await?;
     let info = handle.wait(job).await?;
     let described = match (&info.exit, read_job_stdout(handle, job).await) {
         (_, Err(error)) => Err(format!(
@@ -15061,6 +15151,10 @@ async fn rebased_task_hashes(
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            class: crate::api::dto::JobserverClass::Background,
+            want: NonZeroUsize::MIN,
+            wait_ms: None,
+            scope: crate::api::dto::ExecScope::Workspace,
         };
         let selection = probe_task_hashes(handle, build_volume.clone(), request).await;
         match selection {
@@ -15088,7 +15182,7 @@ async fn probe_task_hashes(
     request: ExecRequest,
 ) -> std::result::Result<crate::build_volume::nx::TaskSelection, String> {
     let job = handle
-        .exec(None, build_volume, request)
+        .exec(None, build_volume, request, AdmissionSource::Coordinator)
         .await
         .map_err(|error| format!("cannot start the probe: {error}"))?;
     let info = handle
@@ -15429,6 +15523,7 @@ mod grant_unit_tests {
             profile_directory: mount_root.join("store/run/profiles"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
             retained_port_blocks: Vec::new(),
+            cpu_pool_directory: None,
             mode: RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),
@@ -15781,6 +15876,7 @@ fn supervisor_sandbox(
             .exec_temp_dir(&current.metadata.workspace)
             .map_err(native_integrity_error)?,
         store_root: &layout.project().store_root,
+        workspace_incarnation: &current.metadata.workspace_incarnation,
     })
 }
 

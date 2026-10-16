@@ -12,7 +12,7 @@ use cowshed_cli::runtime::{ActorBridge, CliService, dispatch};
 use cowshed_core::api::JsonEnvelope;
 use cowshed_core::api::dto::{
     Adoption, AdoptionSkip, CarrySide, DatabaseHolder, GcReport, LandReport, LandSeed,
-    RebaseBuildVolume, RebaseCarrySkip, RebaseReport,
+    LandedReport, RebaseBuildVolume, RebaseCarrySkip, RebaseReport,
 };
 use cowshed_core::build_volume::{
     BuildVolumeId, BuildVolumeLayout, BuildVolumeRecord, BuildVolumeRole, link, nx,
@@ -2032,7 +2032,7 @@ async fn land(
     workspace: &str,
     retire: bool,
     checks: &[&str],
-) -> LandReport {
+) -> LandedReport {
     let mut args = vec!["--json", "land", workspace];
     if !retire {
         args.push("--no-retire");
@@ -2048,10 +2048,12 @@ async fn land(
                 String::from_utf8_lossy(&stdout)
             )
         });
-    envelope
-        .result()
-        .cloned()
-        .expect("a successful land report")
+    match envelope.result().expect("a successful land report") {
+        LandReport::Landed(report) => report.clone(),
+        LandReport::Delivered(delivery) => {
+            panic!("ordinary land only preserved its head: {delivery:?}")
+        }
+    }
 }
 
 fn git_stdout(directory: &Path, args: &[&str]) -> String {
@@ -2108,6 +2110,127 @@ fn seeds_of_main(layout: &BuildVolumeLayout) -> Vec<(BuildVolumeId, BuildVolumeR
                 .then_some((id, record))
         })
         .collect()
+}
+
+/// Review-gated delivery validates and preserves the head, but is not a land, even with
+/// retirement left at its default. The control then takes the ordinary landing path.
+#[tokio::test]
+async fn directory_push_only_preserves_the_validated_head_without_landing_or_retiring_substrate_lifecycle()
+ {
+    let (nx, node) = repository_nx();
+    let mut fixture = Fixture::with_directory(Project::Build {
+        nx: Some((&nx, &node)),
+        rust: None,
+    });
+    let reads = nx_read_paths(&fixture_nx(&fixture.checkout));
+    let mut service = serve_project(&mut fixture, &reads).await;
+    let layout = build_volumes(&fixture);
+    let main = fixture.checkout.clone();
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("a/src.txt"), b"reviewed source\\n").unwrap();
+    git(&topic, &["commit", "-q", "-am", "prepare reviewed source"]);
+    let source_head = git_stdout(&topic, &["rev-parse", "HEAD"]);
+    let source_branch = git_stdout(&topic, &["symbolic-ref", "--short", "HEAD"]);
+    let preservation_ref = format!("refs/cowshed/topic/heads/{source_branch}");
+    let main_head = git_stdout(&main, &["rev-parse", "HEAD"]);
+    assert_ne!(source_head, main_head);
+    let main_index = fs::read(main.join(".git/index")).unwrap();
+    let main_source = fs::read(main.join("a/src.txt")).unwrap();
+    let main_build = fs::read_link(main.join(".cowshed/build")).unwrap();
+    let topic_build = fs::read_link(topic.join(".cowshed/build")).unwrap();
+    let seeds = serde_json::to_value(seeds_of_main(&layout)).unwrap();
+    let volumes = layout.list().unwrap();
+    let land_commitments = || {
+        controller_commitments(fixture.storage.telemetry())
+            .into_iter()
+            .filter(|value| {
+                matches!(
+                    value,
+                    cowshed_core::api::dto::ControllerCommitment::LandOutcome(_)
+                        | cowshed_core::api::dto::ControllerCommitment::LandAdoption(_)
+                )
+            })
+            .map(|value| serde_json::to_value(value).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let commitments = land_commitments();
+    let (stdout, _) = succeed(
+        &mut service,
+        [
+            "--json",
+            "land",
+            "topic",
+            "--push-only",
+            "--check",
+            "/usr/bin/touch .git/push-only-validated",
+        ],
+    )
+    .await;
+    let envelope: JsonEnvelope<LandReport> = serde_json::from_slice(&stdout).unwrap();
+    let LandReport::Delivered(delivery) = envelope.result().expect("successful delivery") else {
+        panic!("preservation-only returned a fabricated land: {envelope:?}");
+    };
+    assert!(
+        topic.join(".git/push-only-validated").exists(),
+        "step 2 validated the workspace"
+    );
+    assert_eq!(delivery.source_head.as_str(), source_head);
+    assert_eq!(delivery.destination_ref, preservation_ref);
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", &preservation_ref]),
+        source_head
+    );
+    assert_eq!(git_stdout(&main, &["rev-parse", "HEAD"]), main_head);
+    assert_eq!(fs::read(main.join(".git/index")).unwrap(), main_index);
+    assert_eq!(fs::read(main.join("a/src.txt")).unwrap(), main_source);
+    assert_eq!(
+        fs::read_link(main.join(".cowshed/build")).unwrap(),
+        main_build
+    );
+    assert_eq!(
+        fs::read_link(topic.join(".cowshed/build")).unwrap(),
+        topic_build
+    );
+    assert_eq!(serde_json::to_value(seeds_of_main(&layout)).unwrap(), seeds);
+    assert_eq!(
+        layout.list().unwrap(),
+        volumes,
+        "no build collection or adoption"
+    );
+    assert_eq!(
+        land_commitments(),
+        commitments,
+        "no fabricated land commitments"
+    );
+    assert!(
+        topic.exists(),
+        "the default retire=true must not retire a delivery"
+    );
+    let (text, diagnostics) = succeed(&mut service, ["land", "topic", "--push-only"]).await;
+    assert_eq!(
+        text,
+        format!("{preservation_ref}\t{source_head}\n").into_bytes()
+    );
+    assert!(
+        !diagnostics.contains("build volume"),
+        "delivery has no adoption report: {diagnostics}"
+    );
+    let landed = land(&mut service, "topic", true, &[]).await;
+    assert_eq!(landed.landed_head.as_str(), source_head);
+    assert_eq!(git_stdout(&main, &["rev-parse", "HEAD"]), source_head);
+    assert!(landed.retired, "ordinary land still retires by default");
+    // Logical retirement returns at step4; step5 reclaims the mountpoint in the background.
+    eventually(
+        "ordinary land reclaims the retired workspace mountpoint",
+        || !topic.exists(),
+    )
+    .await;
+    assert!(!topic.exists());
+    assert_land_outcome(fixture.storage.telemetry(), &landed.build_volume);
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
 }
 
 async fn eventually(what: &str, mut ready: impl FnMut() -> bool) {

@@ -15,9 +15,9 @@
 //!
 
 //! Fairness only acts when a grant is made: a running nextest or cargo cannot hand tokens back.
-//! No grant is capped below its `want` for fairness' sake either: a lone runner may hold every
-//! free token, because idle tokens help nobody. What a newcomer needs arrives as the foreground
-//! band (05_gateway.md, "Dynamic QoS"), not as a reserved half of the host.
+//! A gate blocks new background root admissions and takes returned tokens first. Existing grants
+//! drain whole; their FIFOs, implicit make token and test-thread sizing are never resized. The
+//! gate's bounded admission diagnoses holders rather than freezing their running tests.
 //!
 //! [`Ledger`] is the whole policy as a pure state machine; [`CpuBudget`] is the thin actor that
 //! feeds it requests and departures and answers status.
@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cowshed_gateway_types::{CpuBudgetStatus, CpuCheckoutStatus};
+use cowshed_gateway_types::{CpuBudgetStatus, CpuCheckoutStatus, JobserverClass};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::disk_lease::{Claim, Ticket};
@@ -67,6 +67,7 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 struct Waiter {
     ticket: Ticket,
+    class: JobserverClass,
     /// The count asked for, as asked.
     want: usize,
     asked: Instant,
@@ -76,6 +77,7 @@ struct Waiter {
 #[derive(Debug)]
 struct Holder {
     ticket: Ticket,
+    class: JobserverClass,
     tokens: usize,
 }
 
@@ -109,26 +111,14 @@ impl Ledger {
         }
     }
 
-    /// `ticket` of `checkout` asks for up to `want` tokens.
-    pub(crate) fn ask(
-        &mut self,
-        now: Instant,
-        ticket: Ticket,
-        checkout: Arc<str>,
-        want: NonZeroUsize,
-        claim: Claim,
-        effects: &mut Vec<Effect>,
-    ) {
+    /// Queue the exact admission record, retaining its original request instant.
+    fn ask(&mut self, checkout: Arc<str>, waiter: Waiter, effects: &mut Vec<Effect>) {
+        let (now, ticket) = (waiter.asked, waiter.ticket);
         self.checkouts
             .entry(Arc::clone(&checkout))
             .or_default()
             .waiting
-            .push_back(Waiter {
-                ticket,
-                want: want.get(),
-                asked: now,
-                claim,
-            });
+            .push_back(waiter);
         self.tickets.insert(ticket, checkout);
         self.admit(now, effects);
     }
@@ -175,6 +165,57 @@ impl Ledger {
     /// does everyone behind it: skipping to a smaller request would starve a large one for good.
     fn admit(&mut self, now: Instant, effects: &mut Vec<Effect>) {
         while self.free > 0 {
+            // One live fleet gate. Its children draw from its parent-held sub-ledger, not here.
+            if self.checkouts.values().any(|checkout| {
+                checkout
+                    .running
+                    .iter()
+                    .any(|holder| holder.class == JobserverClass::Gate)
+            }) {
+                return;
+            }
+            // A gate can be behind background work in the same checkout's queue. Select it by
+            // its ticket across every queue, without letting background churn consume returns.
+            let gate = self
+                .checkouts
+                .iter()
+                .flat_map(|(name, checkout)| {
+                    checkout
+                        .waiting
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, waiter)| waiter.class == JobserverClass::Gate)
+                        .map(move |(position, waiter)| (Arc::clone(name), position, waiter.ticket))
+                })
+                .min_by_key(|(_, _, ticket)| *ticket);
+            if let Some((name, position, _)) = gate {
+                let checkout = self
+                    .checkouts
+                    .get_mut(&name)
+                    .expect("chosen checkout exists");
+                let waiter = checkout
+                    .waiting
+                    .remove(position)
+                    .expect("chosen gate exists");
+                let tokens = waiter.want.min(self.free);
+                checkout.held += tokens;
+                checkout.running.push(Holder {
+                    ticket: waiter.ticket,
+                    class: waiter.class,
+                    tokens,
+                });
+                self.free -= tokens;
+                effects.push(Effect::Grant {
+                    ticket: waiter.ticket,
+                    tokens,
+                    want: waiter.want,
+                    waited: now.saturating_duration_since(waiter.asked),
+                    checkout: name,
+                    claim: waiter.claim,
+                });
+                return;
+            }
+
             // Some checkout waits whenever the loop gets past this, so the map is not empty.
             let Some((name, checkout)) = self
                 .checkouts
@@ -215,6 +256,7 @@ impl Ledger {
             checkout.held += tokens;
             checkout.running.push(Holder {
                 ticket: waiter.ticket,
+                class: waiter.class,
                 tokens,
             });
             self.free -= tokens;
@@ -255,6 +297,7 @@ enum Message {
         checkout: Arc<str>,
         want: NonZeroUsize,
         claim: Claim,
+        class: JobserverClass,
         granted: oneshot::Sender<usize>,
     },
     Leave {
@@ -307,6 +350,7 @@ impl CpuBudget {
         checkout: Arc<str>,
         want: NonZeroUsize,
         claim: Claim,
+        class: JobserverClass,
     ) -> (Stake, oneshot::Receiver<usize>) {
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
         let (granted, receiver) = oneshot::channel();
@@ -315,6 +359,7 @@ impl CpuBudget {
             checkout,
             want,
             claim,
+            class,
             granted,
         });
         (
@@ -344,10 +389,21 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 checkout,
                 want,
                 claim,
+                class,
                 granted,
             } => {
                 grants.insert(ticket, granted);
-                ledger.ask(Instant::now(), ticket, checkout, want, claim, &mut effects);
+                ledger.ask(
+                    checkout,
+                    Waiter {
+                        ticket,
+                        want: want.get(),
+                        asked: Instant::now(),
+                        claim,
+                        class,
+                    },
+                    &mut effects,
+                );
             }
             Message::Leave { ticket } => {
                 grants.remove(&ticket);
@@ -415,11 +471,14 @@ mod tests {
         ) -> Vec<(Ticket, usize)> {
             let now = self.origin + Duration::from_millis(ms);
             self.ledger.ask(
-                now,
-                ticket,
                 Arc::from(checkout),
-                NonZeroUsize::new(want).unwrap(),
-                Claim::new(&format!("t{ticket}"), Some(7)),
+                Waiter {
+                    ticket,
+                    want: NonZeroUsize::new(want).unwrap().get(),
+                    asked: now,
+                    claim: Claim::new(&format!("t{ticket}"), Some(7)),
+                    class: JobserverClass::Background,
+                },
                 &mut self.effects,
             );
             self.grants()

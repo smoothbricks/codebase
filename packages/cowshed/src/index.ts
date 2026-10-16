@@ -1,6 +1,6 @@
 import typia from 'typia';
 import type * as Api from './api.generated.js';
-import { exec } from './exec.js';
+import { coordinatorExec, exec } from './exec.js';
 import { packageRootFromModule, runLauncher } from './launcher.js';
 import * as N from './native.generated.js';
 import {
@@ -55,6 +55,8 @@ function normalizeNativeError(error: unknown): unknown {
   return new CowshedError(error.code, error.message, error.hint, {
     cause: error,
     admission: error.admission,
+    cpuAdmission: error.cpuAdmission,
+    priority: error.priority,
     stdin: error.stdin,
   });
 }
@@ -259,6 +261,10 @@ class CoordinatorImpl implements Coordinator {
     return callNativeAsync(() => N.coordinatorDoctor(this.#native, {}));
   }
 
+  async exec(worker: WorkspaceHandle, request: ExecRequest): Promise<JobHandle> {
+    return WorkspaceHandleImpl.execAsCoordinator(this.#native, worker, request);
+  }
+
   async worker(workspace: string): Promise<WorkspaceHandle> {
     return new WorkspaceHandleImpl(await callNativeAsync(() => N.coordinatorWorker(this.#native, { workspace })));
   }
@@ -269,6 +275,27 @@ class WorkspaceHandleImpl implements WorkspaceHandle {
 
   constructor(nativeWorkspace: NativeWorkspaceHandle) {
     this.#native = nativeWorkspace;
+  }
+
+  /**
+   * Admits one job through coordinator.exec in the incarnation a worker capability was minted for. A handle this module
+   * did not mint has no resolved incarnation behind it, so it is refused rather than trusted by name.
+   */
+  static async execAsCoordinator(
+    coordinator: NativeCoordinatorHandle,
+    worker: WorkspaceHandle,
+    request: ExecRequest,
+  ): Promise<JobHandle> {
+    if (!(#native in worker)) {
+      throw new CowshedError(
+        'usage',
+        `workspace ${worker.name} is not a capability this project minted`,
+        'mint it with coordinator.worker(name) and pass that handle',
+      );
+    }
+    const fence = { workspace: worker.#native.name, workspaceIncarnation: worker.#native.workspaceIncarnation };
+    const id = await callNativeAsync(() => coordinatorExec(coordinator, fence, request));
+    return worker.job(id);
   }
 
   get name(): string {

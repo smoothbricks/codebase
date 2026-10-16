@@ -77,7 +77,9 @@ No mounts, no root, no network — pure functions with table-driven cases:
 - **Job CPU sampling**: the real-process witness compares CPU share with the job's own observed CPU delta and wall-time
   interval, not a presumed share of a loaded host. A paused Tokio sampling clock keeps the interval's boundaries known
   while kernel rusage and monotonic wall time remain real. Repeated reads must keep the window; advancing one clock
-  boundary opens the idle window. The child's independent CPU report pins the accounted total.
+  boundary opens the idle window. The child's independent CPU report pins the accounted total. Concurrent witnesses
+  sharing a pipe emit each complete bounded report in one write; the reader keeps its strict record grammar rather than
+  accepting interleaved fields.
 - **API capability goldens**: `Project` exposes discovery only; `WorkspaceRef` exposes inspection plus safe `attach`;
   `WorkspaceHandle` exposes exactly one workspace's exec/shell/jobs/quota-bound checkpoint/push/grant reads; only
   `Coordinator` exposes grant/revoke/restore/destroy/rebase/land/gc/repo-mirror and quota policy. Compile-fail fixtures
@@ -85,7 +87,9 @@ No mounts, no root, no network — pure functions with table-driven cases:
   `job.processes` and `job.processEvents`, has one request in `operations.corpus.json`; the codec, controller authority
   routing, and served-handle decoding tests consume that same corpus. Process-tree and process-event reply goldens cover
   omitted observations, observed exits, sparse changes, and coverage gaps through core serialization and the generated
-  public validators. `cowshed:wire-fixtures` regenerates those goldens; generated JSON is never edited by hand.
+  public validators. `cowshed:wire-fixtures` regenerates those goldens before the workspace's `cargo-test-archive`
+  compiles them with `include_str!`; the archive hashes the produced JSON. Its later `cargo-test-compile` join cannot
+  establish that predecessor. Generated JSON is never edited by hand.
 - **Public declaration IR:** `cowshed:declaration-model-test` admits the actual owner model through its generated Typia
   Equals guards in one setup, pins `get`/`as-str`/`display` projection metadata, and refuses missing, unknown and extra
   metadata through both assertion and JSON parsing. It consumes the prebuilt owner generator, without an N-API wire

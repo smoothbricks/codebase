@@ -588,6 +588,12 @@ impl WorkspaceHandle {
     pub fn mount_path(&self, env: Env) -> napi::Result<String> {
         utf8_path(env, self.inner.mount_path(), "workspace mount path")
     }
+
+    /// The workspace incarnation this capability was minted for: the fence a coordinator names when it admits a job in it.
+    #[napi(getter, js_name = "workspaceIncarnation")]
+    pub fn workspace_incarnation(&self) -> String {
+        self.inner.info().workspace_incarnation.as_str().to_owned()
+    }
 }
 
 /// One job of one workspace incarnation.
@@ -691,7 +697,8 @@ mod parity_tests {
             Command::Restore(_) => Some(&["coordinator.restore"]),
             Command::List(_) => Some(&["project.list"]),
             Command::Path(_) => Some(&["project.workspace", "workspace.info"]),
-            Command::Exec(_) => Some(&["worker.exec"]),
+            // The verb runs as the worker's exec, or as the coordinator's when it asks for the gate class.
+            Command::Exec(_) => Some(&["worker.exec", "coordinator.exec"]),
             Command::Grant(_) => Some(&["coordinator.grant", "workspace.grants"]),
             Command::Remove(_) => Some(&["coordinator.destroy"]),
             Command::Attach(_) => Some(&["workspace.attach"]),
@@ -743,7 +750,27 @@ mod parity_tests {
             &["path", "parity"],
             Some(&["project.workspace", "workspace.info"]),
         ),
-        (&["exec", "parity", "--", "true"], Some(&["worker.exec"])),
+        (
+            &["exec", "parity", "--", "true"],
+            Some(&["worker.exec", "coordinator.exec"]),
+        ),
+        (
+            &[
+                "exec",
+                "parity",
+                "--class",
+                "gate",
+                "--wait-ms",
+                "60000",
+                "--",
+                "true",
+            ],
+            Some(&["worker.exec", "coordinator.exec"]),
+        ),
+        (
+            &["exec", "parity", "--class", "gate", "--host", "--", "true"],
+            Some(&["worker.exec", "coordinator.exec"]),
+        ),
         (
             &["grant", "parity"],
             Some(&["coordinator.grant", "workspace.grants"]),

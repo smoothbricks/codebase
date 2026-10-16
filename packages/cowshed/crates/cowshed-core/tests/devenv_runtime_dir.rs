@@ -102,6 +102,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         profile_directory: root.join("store/run/profiles"),
         port_block: PortBlock::new(port_base, 16).expect("port block"),
         retained_port_blocks: Vec::new(),
+        cpu_pool_directory: None,
         mode: RunSandboxMode::ReadWrite,
         grants: SandboxGrants::default(),
         allowed_unix_sockets: Vec::new(),
@@ -1128,6 +1129,12 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
         env: BTreeMap::new(),
         policy: SandboxPolicy::render(sandbox.clone()).expect("sandbox policy"),
         mode: cowshed_core::api::RunSandboxMode::ReadWrite,
+        scope: cowshed_core::api::ExecScope::Workspace,
+        cpu: cowshed_core::runtime::supervisor::CpuPlacement {
+            tokens: std::num::NonZeroUsize::MIN,
+            pool: std::path::PathBuf::from("/nonexistent/cowshed-test-cpu-pool.sock"),
+            nice: 10,
+        },
     }
 }
 
@@ -1714,6 +1721,10 @@ fn production_workspace(
         workspace_mount: mount,
         exec_temp_dir,
         store_root: &root.join("store"),
+        workspace_incarnation: &cowshed_core::metadata::WorkspaceIncarnation::new(
+            "0123456789abcdef0123456789abcdef",
+        )
+        .expect("a valid workspace incarnation"),
     })
     .expect("production workspace sandbox")
 }

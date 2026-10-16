@@ -306,6 +306,23 @@ impl Coordinator {
     pub fn worker(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
         super::worker_call::<operations::CoordinatorWorker>(env, Arc::clone(&self.inner), arguments)
     }
+
+    /// Admits one job under coordinator authority, the only route that may ask for the gate class or
+    /// the host-gate scope. Inline stdin travels as the upload frame.
+    #[napi(js_name = "exec")]
+    pub fn exec(
+        &self,
+        env: Env,
+        arguments: String,
+        bytes: Option<Buffer>,
+    ) -> napi::Result<JsObject> {
+        super::upload_call::<operations::CoordinatorExec, _>(
+            env,
+            Arc::clone(&self.inner),
+            arguments,
+            bytes,
+        )
+    }
 }
 
 #[napi]
@@ -566,53 +583,17 @@ pub(super) fn cowshed_error(
     let mut error = napi::JsError::from(napi::Error::new(source.code.as_str(), source.message))
         .into_unknown(env)
         .coerce_to_object()?;
-    if details.has_named_property("hint")? {
-        error.set_named_property(
-            "hint",
-            details.get_named_property::<napi::JsUnknown>("hint")?,
-        )?;
-    }
-    if details.has_named_property("otherBuild")? {
-        error.set_named_property(
-            "otherBuild",
-            details.get_named_property::<napi::JsUnknown>("otherBuild")?,
-        )?;
-    }
-    if details.has_named_property("recovering")? {
-        error.set_named_property(
-            "recovering",
-            details.get_named_property::<napi::JsUnknown>("recovering")?,
-        )?;
-    }
-    if details.has_named_property("healing")? {
-        error.set_named_property(
-            "healing",
-            details.get_named_property::<napi::JsUnknown>("healing")?,
-        )?;
-    }
-    if details.has_named_property("fence")? {
-        error.set_named_property(
-            "fence",
-            details.get_named_property::<napi::JsUnknown>("fence")?,
-        )?;
-    }
-    if details.has_named_property("retry")? {
-        error.set_named_property(
-            "retry",
-            details.get_named_property::<napi::JsUnknown>("retry")?,
-        )?;
-    }
-    if details.has_named_property("admission")? {
-        error.set_named_property(
-            "admission",
-            details.get_named_property::<napi::JsUnknown>("admission")?,
-        )?;
-    }
-    if details.has_named_property("stdin")? {
-        error.set_named_property(
-            "stdin",
-            details.get_named_property::<napi::JsUnknown>("stdin")?,
-        )?;
+    let names = details.get_all_property_names(
+        napi::KeyCollectionMode::OwnOnly,
+        napi::KeyFilter::AllProperties,
+        napi::KeyConversion::NumbersToStrings,
+    )?;
+    for index in 0..names.get_array_length()? {
+        let name = names.get_element::<napi::JsString>(index)?.into_utf8()?;
+        let name = name.as_str()?;
+        if name != "code" && name != "message" {
+            error.set_named_property(name, details.get_named_property::<napi::JsUnknown>(name)?)?;
+        }
     }
     Ok(napi::Error::from(error.into_unknown()))
 }

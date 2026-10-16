@@ -158,8 +158,18 @@
         ]
       },
       "cargo-test-archive": {
+        "dependsOn": [
+          "...",
+          {
+            "target": "wire-fixtures",
+            "projects": [
+              "cowshed"
+            ]
+          }
+        ],
         "inputs": [
           "...",
+          "{workspaceRoot}/packages/cowshed/src/wire-fixtures.json",
           {
             "env": "LMAO_GIT_REVISION"
           }
@@ -188,15 +198,6 @@
         ]
       },
       "cargo-test-compile": {
-        "dependsOn": [
-          "...",
-          {
-            "target": "wire-fixtures",
-            "projects": [
-              "cowshed"
-            ]
-          }
-        ],
         "inputs": [
           "rustWorkspace",
           {

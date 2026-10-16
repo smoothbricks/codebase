@@ -1067,7 +1067,12 @@ mod tests {
                     stdout_copy: None,
                     stderr_copy: None,
                     admission_key: None,
+                    class: cowshed_gateway_types::JobserverClass::Background,
+                    want: std::num::NonZeroUsize::MIN,
+                    wait_ms: None,
+                    scope: crate::api::dto::ExecScope::Workspace,
                 },
+                crate::runtime::supervisor_socket::AdmissionSource::Worker,
             )
             .await
             .expect("the replacement supervisor admits the shell after the mark");
@@ -1709,6 +1714,10 @@ mod tests {
                 None
             }
 
+            fn nice(&self) -> Option<i32> {
+                None
+            }
+
             fn observations(&self) -> Option<&crate::runtime::process_monitor::ProcessMonitor> {
                 None
             }
@@ -1824,7 +1833,12 @@ mod tests {
                     stdout_copy: None,
                     stderr_copy: None,
                     admission_key: None,
+                    class: cowshed_gateway_types::JobserverClass::Background,
+                    want: std::num::NonZeroUsize::MIN,
+                    wait_ms: None,
+                    scope: crate::api::dto::ExecScope::Workspace,
                 },
+                crate::runtime::supervisor_socket::AdmissionSource::Worker,
             )
             .await
             .expect("admit the job");
@@ -1875,6 +1889,7 @@ mod tests {
             ProcessEvent::Started {
                 job_id,
                 process: owned(&command),
+                nice: 10,
             },
             1,
         )

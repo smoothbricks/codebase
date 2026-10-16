@@ -1021,7 +1021,10 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
 
 `--no-retire` keeps the workspace after a successful land (for a coordinator that wants to reuse it via
 `rebase --fresh`). `--push-only` performs steps 1–2 and installs the validated head in the workspace's durable
-`refs/cowshed/<ws>/heads/<branch>` preservation ref without advancing the target branch, for review-gated flows.
+`refs/cowshed/<ws>/heads/<branch>` preservation ref without advancing the target branch, for review-gated flows. It
+returns `LandReport::Delivered(PushReport)` before build-volume adoption, land commitments, retirement or collection,
+even with the default `retire: true`. An ordinary land returns `LandReport::Landed(LandedReport)`; its existing landed
+fields describe only an actual target advance. The canonical JSON report uses the flat `kind: delivered | landed` tag.
 
 A target fast-forwarded through plain Git instead is an **external land**: it forfeits carry, output restoration and
 adoption. The next fork (including `--ref` naming the target's current tree) automatically captures a live workspace at

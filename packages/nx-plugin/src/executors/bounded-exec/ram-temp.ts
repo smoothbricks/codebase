@@ -212,6 +212,7 @@ const STARTS_NOTHING = /^[TtZ]/;
  * was read is in no table that was. So each one found is held with SIGSTOP and the table is read
  * again, until a read names nothing that the read before did not already show stopped: a stopped
  * process starts nothing, and whatever it started before it stopped is in every table read after.
+ * Discovery waits for stopped-census readiness; the exit grace starts only after SIGTERM.
  * Only then does each get SIGTERM, and SIGCONT to act on it. A child whose parent exited before it
  * could be held has lost its ancestry, so once the stopped-table barrier holds, the lease is asked
  * again what works in it, including when that table names nothing, to recover reparented children.
@@ -223,17 +224,13 @@ export function leaseProcessesOn(host: ProcessHost): LeaseProcesses {
       if (working.length === 0) {
         return [];
       }
-      const start = Date.now();
-      const deadline = start + LEFTOVER_GRACE_MS;
       const known = new Map<number, ProcessEntry>();
       let held = new Set<number>();
       let failures: unknown[] | undefined;
-      let tableReads = 0;
       try {
         for (;;) {
           const roots = [...working, ...known.keys()];
           const current = withDescendants(await host.table(), roots).filter((entry) => entry.pid !== process.pid);
-          tableReads += 1;
           for (const entry of current) {
             known.set(entry.pid, entry);
           }
@@ -242,13 +239,6 @@ export function leaseProcessesOn(host: ProcessHost): LeaseProcesses {
             if (working.every((pid) => held.has(pid))) {
               break;
             }
-          }
-          const now = Date.now();
-          if (now > deadline) {
-            const list = current.map((entry) => `${entry.pid} (${entry.command}, state ${entry.stat})`).join(', ');
-            throw new Error(
-              `processes working in ${directory}: ${list || 'no current processes'} did not stop spawning within ${LEFTOVER_GRACE_MS}ms after ${tableReads} table reads and ${now - start}ms; cwd roots: ${working.join(', ') || 'none'}`,
-            );
           }
           for (const entry of current) {
             host.signal(entry.pid, 'SIGSTOP');

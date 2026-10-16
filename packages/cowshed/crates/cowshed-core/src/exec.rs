@@ -518,6 +518,7 @@ mod tests {
                 profile_directory: self.root.join("store/run/profiles"),
                 port_block: PortBlock::new(40_960, 16).unwrap(),
                 retained_port_blocks: Vec::new(),
+                cpu_pool_directory: None,
                 mode: RunSandboxMode::ReadWrite,
                 grants: SandboxGrants::default(),
                 allowed_unix_sockets: vec![],

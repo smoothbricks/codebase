@@ -898,7 +898,11 @@ impl CliService for ActorBridge {
         )
         .await?;
         let submit = cowshed_os::timing::span("exec", "submit");
-        let job = if let Some(session_name) = command.session.as_deref() {
+        // The gate class is the operator's: it travels the coordinator route, which a worker
+        // capability cannot take. The parser refused a gate with a session.
+        let job = if command.request.class == cowshed_core::api::JobserverClass::Gate {
+            self.coordinator()?.exec(&worker, command.request).await?
+        } else if let Some(session_name) = command.session.as_deref() {
             worker
                 .shell(Some(session_name))
                 .await?
@@ -2133,7 +2137,7 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
             } else {
                 RunSandboxMode::ReadWrite
             },
-            env: HashMap::new(),
+            env: host_gate_environment(args.scope, std::env::vars_os())?,
             trace: None,
             stdin,
             stdout_copy: args
@@ -2145,11 +2149,46 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
                 .map(|path| publication(path, "stderr copy"))
                 .transpose()?,
             admission_key: None,
+            class: args.class,
+            want: args.want,
+            wait_ms: args.wait_ms,
+            scope: args.scope,
         },
         session: args.session,
         background: args.background,
         timeout,
     })
+}
+
+/// A HostGate request carries the operator's ambient environment, including custom project
+/// variables, because its child starts from an empty environment. Other scopes forward nothing
+/// here, preserving ordinary Workspace behavior. The supervisor's existing caller_environment
+/// owns reserved/credential filtering; the public-name list limits records, not execution.
+/// The request carries UTF-8 names and values; an unrepresentable variable is refused, not dropped.
+fn host_gate_environment(
+    scope: cowshed_core::api::ExecScope,
+    ambient: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Result<HashMap<String, String>> {
+    if scope != cowshed_core::api::ExecScope::HostGate {
+        return Ok(HashMap::new());
+    }
+    let mut forwarded = HashMap::new();
+    for (name, value) in ambient {
+        let name = name.into_string().map_err(|_| {
+            usage(
+                "the host gate forwards only UTF-8 environment names",
+                "export the variable with a UTF-8 name or unset it",
+            )
+        })?;
+        let value = value.into_string().map_err(|_| {
+            usage(
+                format!("the host gate forwards only UTF-8 values, and {name} is not"),
+                "export the variable as UTF-8 or unset it",
+            )
+        })?;
+        forwarded.insert(name, value);
+    }
+    Ok(forwarded)
 }
 
 fn workspace_path(path: PathBuf, label: &str) -> Result<WorkspacePath> {
@@ -3108,6 +3147,10 @@ fn emit_push<W: Write, E: Write>(output: &mut Output<W, E>, report: &PushReport)
 }
 
 fn emit_land<W: Write, E: Write>(output: &mut Output<W, E>, report: &LandReport) -> Result<()> {
+    let report = match report {
+        LandReport::Delivered(delivery) => return emit_push(output, delivery),
+        LandReport::Landed(landed) => landed,
+    };
     output
         .bare(report.target_branch.as_bytes())
         .and_then(|()| output.bare(b"\t"))
@@ -5121,6 +5164,8 @@ mod tests {
                     "workspaceIncarnation": INCARNATION,
                     "jobId": 1,
                     "state": if ended { "exited" } else { "running" },
+                    "class": "background",
+                    "scope": "workspace",
                     "grantRevision": 1,
                     "argv": [{"encoding": "utf8", "data": "build"}],
                     "cwd": null,
@@ -5261,6 +5306,10 @@ mod tests {
                     stdout_copy: None,
                     stderr_copy: None,
                     admission_key: None,
+                    class: cowshed_core::api::JobserverClass::Background,
+                    want: std::num::NonZeroUsize::MIN,
+                    wait_ms: None,
+                    scope: cowshed_core::api::ExecScope::Workspace,
                 })
                 .await
                 .expect("exec")
@@ -6848,5 +6897,119 @@ mod tests {
              next: cowshed setup\n\
              next: cowshed gateway stop && cowshed gateway start\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod host_gate_environment_tests {
+
+    /// Exercise the real checkout's entry hooks with the operator environment the CLI carries,
+    /// without treating the record projection as an execution allowlist.
+    #[test]
+    #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+    fn host_controller_operator_environment_activates_the_checkout() {
+        let forwarded = host_gate_environment(ExecScope::HostGate, std::env::vars_os())
+            .expect("the operator's environment");
+        let package = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("runtime package root"),
+        );
+        let root = package.ancestors().nth(4).expect("workspace root");
+        let activated = std::process::Command::new("direnv")
+            .env_clear().envs(&forwarded).current_dir(root)
+            .args(["exec", ".", "/bin/sh", "-c", "command -v cargo && command -v bun && command -v rustc && bun --version && rustc --version"])
+            .output().expect("run the real host activation");
+        let mut names: Vec<&str> = forwarded.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        eprintln!("HostGate activation forwarded names: {}", names.join(", "));
+        eprintln!("{}", String::from_utf8_lossy(&activated.stdout));
+        assert!(
+            activated.status.success(),
+            "activation failed: {}",
+            String::from_utf8_lossy(&activated.stderr)
+        );
+    }
+    use super::host_gate_environment;
+    use cowshed_core::api::ExecScope;
+    use std::ffi::OsString;
+
+    fn ambient(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect()
+    }
+
+    /// Custom operator/project variables travel in the normal HostGate request; the CLI does
+    /// not duplicate the supervisor's runtime filters. Workspace forwarding remains unchanged.
+    #[test]
+    fn a_host_gate_preserves_custom_ambient_names_and_workspace_forwards_nothing() {
+        let operator = ambient(&[
+            ("PATH", "/nix/profile/bin:/usr/bin"),
+            ("HOME", "/Users/operator"),
+            ("LC_ALL", "C"),
+            ("PROJECT_SETTING", "custom-value"),
+            ("CI", "true"),
+            ("NX_DAEMON", "false"),
+            ("NODE_OPTIONS", "--max-old-space-size=4096"),
+            ("SSL_CERT_FILE", "/etc/ssl/cert.pem"),
+            ("SDKROOT", "/operator/sdk"),
+        ]);
+        let forwarded = host_gate_environment(ExecScope::HostGate, operator.iter().cloned())
+            .expect("a host gate environment");
+        let expected: std::collections::HashMap<String, String> = operator
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.to_str().unwrap().to_owned(),
+                    value.to_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(forwarded, expected);
+        assert!(
+            host_gate_environment(ExecScope::Workspace, operator.into_iter())
+                .expect("an ordinary environment")
+                .is_empty()
+        );
+    }
+
+    /// A custom variable whose value the request cannot carry is refused by name, not dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_custom_value_that_is_not_utf8_is_refused_by_name() {
+        use std::os::unix::ffi::OsStringExt;
+        let operator = vec![(
+            OsString::from("PROJECT_SETTING"),
+            OsString::from_vec(vec![0xff, b'/']),
+        )];
+        let error = host_gate_environment(ExecScope::HostGate, operator.into_iter())
+            .expect_err("a non-UTF-8 custom value cannot travel");
+        assert!(
+            error.message.contains("PROJECT_SETTING"),
+            "{}",
+            error.message
+        );
+    }
+
+    /// The public-name record helper does not determine which names the CLI may execute with.
+    #[test]
+    fn the_record_projection_is_not_a_host_gate_execution_allowlist() {
+        let operator = ambient(&[
+            ("PATH", "/usr/bin"),
+            ("LC_CTYPE", "C"),
+            ("PROJECT_SETTING", "custom-value"),
+            ("SSL_CERT_FILE", "/etc/ssl/cert.pem"),
+        ]);
+        let forwarded = host_gate_environment(ExecScope::HostGate, operator.into_iter())
+            .expect("a host gate environment");
+        assert!(cowshed_core::api::host_gate_env_name_allowed("PATH"));
+        assert!(cowshed_core::api::host_gate_env_name_allowed("LC_CTYPE"));
+        for name in ["PROJECT_SETTING", "SSL_CERT_FILE"] {
+            assert!(!cowshed_core::api::host_gate_env_name_allowed(name));
+            assert!(
+                forwarded.contains_key(name),
+                "{name} travels in the request"
+            );
+        }
     }
 }

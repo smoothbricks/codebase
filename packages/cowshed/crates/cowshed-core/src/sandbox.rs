@@ -149,6 +149,9 @@ pub struct SandboxConfig {
     /// the store the launcher serves ([`crate::exec::profile_directory`]), so a fixture's
     /// launches stay in its own store (04_sandbox.md, "Exec pipeline" step 4).
     pub profile_directory: PathBuf,
+
+    /// Gateway-derived workspace IPC scope. None when an injected provider needs no extra socket scope.
+    pub cpu_pool_directory: Option<PathBuf>,
     /// The block the workspace's environment names (`COWSHED_PORT_BASE`/`_SIZE`) and its
     /// gateway listens on.
     pub port_block: PortBlock,
@@ -216,6 +219,7 @@ impl SandboxConfig {
             shed_links: self.shed_links.clone(),
             exec_temp_dir: self.exec_temp_dir.clone(),
             profile_directory: self.profile_directory.clone(),
+            cpu_pool_directory: self.cpu_pool_directory.clone(),
             port_block: self.port_block,
             retained_port_blocks: self.retained_port_blocks.clone(),
             mode: self.mode,
@@ -325,6 +329,7 @@ pub struct WorkspaceSandbox<'a> {
     pub exec_temp_dir: PathBuf,
     /// The store the workspace's supervisor serves, whose `run/profiles` its launches read.
     pub store_root: &'a Path,
+    pub workspace_incarnation: &'a crate::metadata::WorkspaceIncarnation,
 }
 
 /// The sandbox a workspace's supervisor runs in and hands `plan_exec` for every child it
@@ -346,6 +351,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         workspace_mount: mount,
         exec_temp_dir,
         store_root,
+        workspace_incarnation,
     } = workspace;
     // Main's checkout lives at the operator's own path, outside the mount root, so the
     // sibling-mount deny never reaches it: it is denied by name, exactly like a sibling. Main
@@ -362,6 +368,13 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         mount_root: mount_root.to_path_buf(),
         exec_temp_dir,
         profile_directory: crate::exec::profile_directory(store_root),
+
+        cpu_pool_directory: Some(
+            cowshed_gateway_types::cpu_pool_directory(store_root, workspace_incarnation.as_str())
+                .map_err(|error| {
+                CowshedError::integrity(error.to_string(), "inspect the workspace incarnation")
+            })?,
+        ),
         shed_links: shed_links(&mount).map_err(|error| {
             CowshedError::integrity(
                 format!("cannot read the shed beside {}: {error}", mount.display()),
@@ -782,6 +795,19 @@ pub fn seatbelt_profile(
     // which no job may write (every host process's temp files live there): `mktemp` under a
     // devenv shell then picked one and failed with EPERM instead of using the job's temp dir.
 
+    if let Some(directory) = &config.cpu_pool_directory {
+        let directory = sbpl_path(directory)?;
+        push_line(
+            &mut profile,
+            &format!(
+                "(allow network-outbound (remote unix-socket (path-prefix \"{directory}/\")))"
+            ),
+        );
+        push_line(
+            &mut profile,
+            &format!("(allow file-read-metadata (subpath \"{directory}\"))"),
+        );
+    }
     for socket in &sockets {
         push_line(
             &mut profile,
@@ -1445,6 +1471,7 @@ mod tests {
                 }],
             },
             allowed_unix_sockets: vec![PathBuf::from("/var/run/nix/daemon-socket/socket")],
+            cpu_pool_directory: None,
             additional_denies: vec![],
             git_worktree_repository: None,
             build_volume_mount: None,
@@ -2036,6 +2063,10 @@ mod tests {
                 workspace_mount: mount.to_path_buf(),
                 exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
                 store_root: Path::new("/private/tmp/cowshed-raven-store"),
+                workspace_incarnation: &crate::metadata::WorkspaceIncarnation::new(
+                    "0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
             })
             .unwrap()
         };
@@ -2139,6 +2170,10 @@ mod tests {
             workspace_mount: PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/raven"),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
             store_root: Path::new("/private/tmp/cowshed-raven-store"),
+            workspace_incarnation: &crate::metadata::WorkspaceIncarnation::new(
+                "0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
         })
         .unwrap();
         assert_eq!(

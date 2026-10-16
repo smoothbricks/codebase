@@ -139,16 +139,16 @@ done. They are independent of each other.
 
 ## cowshed-helper
 
-- Spec: `specs/cowshed/09_substrates.md:278-287`, `00_overview.md:137`, `08_testing.md:177`, `10_ci.md:22,152`: Linux
-  ZFS mutations go through `cowshed-helper`, a minimal root binary with a fixed verb set that refuses any dataset
-  outside `<pool>/cowshed/`. Its `promote` verb serves only the CI refresh promotion (`10_ci.md:71-79`,
-  `09_substrates.md:271`).
+- Spec: `specs/cowshed/09_substrates.md`, "Privileged helper (Linux)", `00_overview.md:137`, `08_testing.md:177`,
+  `10_ci.md`, "Runner host": Linux ZFS mutations go through `cowshed-helper`, a minimal root binary with a fixed verb
+  set that refuses any dataset outside `<pool>/cowshed/`. CI uses the ordinary target lifecycle, not a separate
+  promotion verb.
 - Code: no crate; an argument parser was started and removed (`29f212088`).
-- Work: the crate, its fixed verbs, and dataset validation; part of the Linux substrate. `promote` accepts only a
-  refresh clone whose origin is a snapshot of the project's main.
-- Acceptance: the helper refuses a dataset outside `<pool>/cowshed/`, any verb outside its set, and a `promote` of any
-  dataset but a refresh clone of main. A refresh promotion followed by `rm` of every job clone leaves the previous main
-  reclaimable by `gc`, and the snapshot graph is again main at the center.
+- Work: the crate, its fixed verbs, and dataset validation; part of the Linux substrate. Keep the constrained restore
+  clone-swap and ordinary origin/dependent cleanup from `09_substrates.md`; no CI-refresh-only verb is required.
+- Acceptance: the helper refuses a dataset outside `<pool>/cowshed/` and any verb outside its set. Removing a workspace
+  destroys its clone before its origin snapshot, and live dependents still refuse reclamation. Restore retains its
+  constrained clone-swap.
 
 ## Workspace-only operator quiesce and retirement
 

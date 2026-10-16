@@ -1163,10 +1163,11 @@ gap. Discovery failures attempt to resume every held process; one denied SIGCONT
 the original discovery failure and name any denied continuation with its PID and command. The settled census gets
 SIGTERM then SIGCONT, SIGKILL if anything has not exited five seconds later, and names each PID once on stderr
 (`stopped <pid> (<command>), which the command left working in its lease`). A lease with nothing in it costs no scan.
-The lease's working directories are read again only after the same census is stopped in consecutive process tables,
-including an empty one, which recovers children reparented out of the tree. This avoids host-wide cwd scans while
-stopped-table quiescence is still being established. The line is the leak check: a suite that prints it has a fixture to
-fix.
+Discovery follows stopped-census readiness under the enclosing operation's existing bound; the five-second exit grace
+does not include discovery or fixture readiness. The lease's working directories are read again only after the same
+census is stopped in consecutive process tables, including an empty one, which recovers children reparented out of the
+tree. This avoids host-wide cwd scans while stopped-table quiescence is still being established. The line is the leak
+check: a suite that prints it has a fixture to fix.
 
 The volume mounts at `/Volumes/smoo-ram2-<uid>`, where DiskArbitration puts it: asking for any other mountpoint
 escalates to an administrator dialog that blocks every `diskutil` on the host. That mount is `noowners`, and launchd
@@ -1225,7 +1226,18 @@ unchanged.
 
 The absent-parent fixture uses the executor's injectable budget with a real, controlled outer pool as its backing. It
 proves a positive allocation and re-acquires it after the command ends, rather than depending on free tokens in the
-host-wide gateway while the test runner itself holds an allocation. A bare count or unbudgeted success is not proof.
+host-wide gateway while the test runner itself holds an allocation. A bare count or unbudgeted success is not proof. A
+land gate enters the existing task server with
+`cowshed exec <workspace> --class gate --host --want N [--wait-ms N] -- COMMAND [ARGS...]` before daemon-stop and Nx
+gate work. It requires a real gateway jobserver `class: "gate"` grant and serves that exact count as an existing live
+parent CPU pool; no environment-only class or unbudgeted fallback is accepted. The default **120000 ms** admission wait
+is explicitly overridable per invocation. A queued gate stops new background root admissions and takes whole tokens as
+in-flight grants end. Running background tests/FIFOs are never shrunk, frozen or killed to manufacture tokens. An
+expired wait returns `gate-admission-timeout` naming the wait and current checkout holders; it changes no task wall/idle
+bound. Requested/granted count and actual queue wait are logged, and a child's nonzero exit is preserved exactly.
+Compiling Cargo under the live pool borrows a sibling-accounted local allocation and receives its own private child
+pool, so grandchildren never compete with their occupied ancestor. See `specs/cowshed/05_gateway.md`, "Gate admission by
+whole-grant drain", for the guarantee and its deliberate limits.
 
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:

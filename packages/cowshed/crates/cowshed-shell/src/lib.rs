@@ -38,9 +38,9 @@ use cowshed_core::runtime::job_groups::{self, Birth};
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_ACTIVATED,
     REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED,
-    REPLY_HOST_FAILED, REPLY_RELEASED, REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE,
-    REQUEST_APPROVE, REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus,
-    SHELL_HOST_ARGUMENT, ShellHostProgram, read_frame,
+    REPLY_HOST_FAILED, REPLY_NICE_REFUSED, REPLY_RELEASED, REPLY_SIGNAL_FAILED, REPLY_STARTED,
+    REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT,
+    REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_ARGUMENT, ShellHostProgram, read_frame,
 };
 use cowshed_core::script::Binding;
 
@@ -154,6 +154,13 @@ fn one_descriptor(descriptors: &mut Vec<OwnedFd>, what: &str) -> io::Result<Owne
 
 /// The command's observation fence, passed with its streams and closed once the held child
 /// has been released. A script child closes these explicitly because it does not exec.
+/// Placement and the unreleased-child fence travel together to either launch path.
+pub(crate) struct CommandPlacement {
+    nice: Option<i32>,
+    #[cfg(target_os = "macos")]
+    hold: ObservationHold,
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) struct ObservationHold {
     ready: OwnedFd,
@@ -230,6 +237,7 @@ impl Host {
                 }
                 let cwd = PathBuf::from(OsStr::from_bytes(fields.bytes()?));
                 let overlay = fields.list()?;
+                let nice = fields.child_nice()?;
                 fields.finish()?;
                 let stdin = one_descriptor(&mut descriptors, "stdin")?;
                 let stdout = one_descriptor(&mut descriptors, "stdout")?;
@@ -243,15 +251,19 @@ impl Host {
                     &bindings,
                     &cwd,
                     &environment,
+                    CommandPlacement {
+                        nice,
+                        #[cfg(target_os = "macos")]
+                        hold,
+                    },
                     [stdin, stdout, stderr],
-                    #[cfg(target_os = "macos")]
-                    hold,
                 )
             }
             REQUEST_RUN => {
                 let argv = fields.list()?;
                 let cwd = PathBuf::from(OsStr::from_bytes(fields.bytes()?));
                 let overlay = fields.list()?;
+                let nice = fields.child_nice()?;
                 fields.finish()?;
                 let stdin = one_descriptor(&mut descriptors, "stdin")?;
                 let stdout = one_descriptor(&mut descriptors, "stdout")?;
@@ -263,9 +275,12 @@ impl Host {
                     &argv,
                     &cwd,
                     &overlay,
+                    CommandPlacement {
+                        nice,
+                        #[cfg(target_os = "macos")]
+                        hold,
+                    },
                     [stdin, stdout, stderr],
-                    #[cfg(target_os = "macos")]
-                    hold,
                 )
             }
             // Only a held command is signalled or released, inside its own exchange.
@@ -438,9 +453,14 @@ impl Host {
         argv: &[&[u8]],
         cwd: &Path,
         overlay: &[&[u8]],
+        placement: CommandPlacement,
         [stdin, stdout, stderr]: [OwnedFd; 3],
-        #[cfg(target_os = "macos")] hold: ObservationHold,
     ) -> io::Result<()> {
+        let CommandPlacement {
+            nice,
+            #[cfg(target_os = "macos")]
+            hold,
+        } = placement;
         let Some((program, arguments)) = argv.split_first() else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "empty argv"));
         };
@@ -456,6 +476,24 @@ impl Host {
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        // A child its supervisor cannot hold sets its own nice before exec and reports exactly
+        // what it observed: a refusal fails the spawn and reaches the supervisor typed, so no
+        // command runs at a nice nobody verified.
+        let report = match nice {
+            Some(nice) => {
+                let (reported, report) = cowshed_core::runtime::shell_host::nice_pipe()?;
+                let report_end = report.as_raw_fd();
+                // SAFETY: getpid/setpriority/getpriority/write and an errno store run between
+                // fork and exec, on a stack buffer and a descriptor the closure only names.
+                unsafe {
+                    command.pre_exec(move || {
+                        cowshed_core::runtime::shell_host::report_own_nice(report_end, nice)
+                    });
+                }
+                Some((reported, report))
+            }
+            None => None,
+        };
         #[cfg(target_os = "macos")]
         {
             let [ready, go] = hold.raw();
@@ -474,6 +512,11 @@ impl Host {
         drop(command);
         #[cfg(target_os = "macos")]
         drop(hold);
+        // The child wrote before exec or never got that far; this end only kept the pipe open.
+        let reported = report.map(|(reported, report)| {
+            drop(report);
+            cowshed_core::runtime::shell_host::read_nice_report(reported)
+        });
         let exit = match spawned {
             Ok(child) => {
                 drop(diagnostics);
@@ -483,6 +526,13 @@ impl Host {
                 return serve_command(socket, held);
             }
             Err(error) => {
+                // Refused its nice: the supervisor says why on the job's stderr.
+                if let Some(Ok(Some(Err(failure)))) = &reported {
+                    return reply(
+                        socket,
+                        FrameWriter::new(REPLY_NICE_REFUSED).priority_failure(failure),
+                    );
+                }
                 let mut diagnostics = std::fs::File::from(diagnostics);
                 let _ = writeln!(
                     diagnostics,

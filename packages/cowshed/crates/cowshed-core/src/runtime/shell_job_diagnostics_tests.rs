@@ -127,6 +127,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 command: HostCommand::Argv(vec![OsString::from("true")]),
                 cwd: PathBuf::from("/"),
                 overlay: Vec::new(),
+                nice: 10,
                 #[cfg(target_os = "macos")]
                 monitor,
             },
