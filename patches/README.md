@@ -39,6 +39,10 @@ archive/package identity. The generator supports Python 3.9 and newer. Extractio
 Python 3.12+; older interpreters omit only that unsupported keyword. Every version verifies the archive's lock-selected
 SHA-512 before extracting it.
 
+If an inherited patch differs only in diff-header spelling or hunk ordering, first apply it to the verified pristine
+archive and compare every resulting package file with the prepared package. Only an identical file set and content allow
+one generator normalization of both carried copies; then require a byte-identical `--check` before editing.
+
 Do not use `bun patch --commit` for this carried patch with Bun 1.4.2: it emits absolute registry-cache paths and
 discards the bodies of deleted-file hunks, and includes a `.bun-tag-*` installer marker. Nor hand-edit the generated
 patch. Retire the Bun-prepared `node_modules/nx` copy after regeneration: even `bun install --force` leaves that
@@ -81,6 +85,34 @@ with the verified registry-index generator in [Activating a patch change](#activ
 require `python3 tooling/nx_patch.py --check` to reproduce the current patch byte-identically before editing, then
 regenerate both patch copies with `python3 tooling/nx_patch.py`. Retire the prepared copy and install normally as
 specified there. Do not splice Bun-generated sections or hand-edit the generated patch.
+
+## Cross-client task output ownership
+
+Clients of one checkout share a target's output tree and cache entry. Each target with declared outputs holds one
+kernel-backed lease from cache lookup and restore through execution, publication, output-hash recording and cache
+capture. The lease is keyed by project and target in the checkout's workspace-data directory, not by task hash or
+configuration: different inputs and configurations can publish the same directory. Independent targets and checkouts
+remain concurrent. A waiting client rechecks the cache after acquiring ownership.
+
+The native cache recursively copies live directories. Replacing a complete output tree and retiring the previous
+directory during that walk can return success with only a tail of its files; two same-hash writers can also remove each
+other's cache destination. A lock inside the producer command ends too soon to protect either capture or restore.
+Discrete, batch and continuous task lifetimes therefore own the lease at the orchestrator boundary. Batch keys are
+acquired in sorted order; a continuous task retains ownership until its exit is handled, while clients sharing the
+already-running task do not acquire another writer lease.
+
+Nx's native `FileLock.lock()` blocks synchronously, so a bounded, reusable helper-process pool holds leases without
+blocking the client's event loop. A helper can be cancelled even while blocked inside the native call; a worker thread
+cannot. Lock files are never unlinked or replaced; their contents name the holder and client PIDs and target names, and
+helper death releases kernel ownership. Runner cleanup cancels pending acquisitions before stopping owned producers,
+then releases held leases. The `nx:task-output-lease` diagnostics channel reports waiting, acquired and released
+transitions with target names and lock paths.
+
+`packages/nx-plugin/src/nx-task-output-lease.test.ts` exercises two actual Nx clients against one output tree, pauses
+the real cache capture while another producer attempts to publish, checks both complete byte-exact artifacts, then
+restores one through a dependent runtime-input hash. Binary file content is hashed as bytes by its producer; the
+runtime-input wrapper's deliberate non-UTF-8 failure sentinel is unchanged. Drop these hunks only when the installed
+upstream orchestrator protects the same complete lifetime, retaining the regression.
 
 ## Dependency-graph resolution cache identity
 

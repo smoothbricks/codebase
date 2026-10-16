@@ -916,6 +916,12 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   pre-run of one never hit the cache of the other. The patch answers with the tasks that lie on a cycle (Tarjan's
   strongly connected components), so a task's dependencies are a property of the graph behind it. Not yet proposed
   upstream: Nx `master` carries the same `findCycles`.
+- **A target's output has one owner across clients of the checkout.** A per-project/target lease spans cache lookup and
+  restore, execution, output publication, output-hash recording and cache capture. A producer replacing and retiring a
+  directory cannot invalidate a concurrent cache walk, and same-hash clients cannot remove one another's artifact while
+  publishing it. Waiting clients recheck the cache under ownership; independent targets retain concurrency. See
+  [`patches/README.md` §Cross-client task output ownership](../../patches/README.md#cross-client-task-output-ownership)
+  for the kernel lock, worker lifecycle and real-client regression.
 - **A restored output is newer than the output it replaces.** Nx restores a cached output with `std::fs::copy`, which on
   macOS clones the file and keeps its timestamps, so a restored output carried the mtime it had when its cache entry was
   written. Build from input A, rebuild from B, return to A, and the restored A was older than the B output it replaced:
