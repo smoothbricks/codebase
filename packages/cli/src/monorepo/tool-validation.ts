@@ -420,7 +420,9 @@ function addNixPackage(content: string, name: string, comment: string): string {
 }
 
 function hasNixPackage(content: string, name: string): boolean {
-  return new RegExp(`(^|\\s)${escapeRegex(name)}(\\s|#|$)`, 'm').test(content);
+  // coreutils-tee is the complete coreutils derivation with only tee patched (README §Shell Entry).
+  const provider = name === 'coreutils' ? 'coreutils(?:-tee)?' : escapeRegex(name);
+  return new RegExp(`(^|\\s)${provider}(\\s|#|$)`, 'm').test(content);
 }
 
 function workspaceCompilesRust(root: string): boolean {
