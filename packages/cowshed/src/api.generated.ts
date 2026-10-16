@@ -29,7 +29,19 @@ export type AdmissionCommitment = {
  * A part of an exec request a repeat under its admission key must carry unchanged, by its
  * request name.
  */
-export type AdmissionField = 'command' | 'cwd' | 'mode' | 'env' | 'stdin' | 'session' | 'stdoutCopy' | 'stderrCopy';
+export type AdmissionField =
+  | 'command'
+  | 'cwd'
+  | 'mode'
+  | 'env'
+  | 'stdin'
+  | 'session'
+  | 'stdoutCopy'
+  | 'stderrCopy'
+  | 'class'
+  | 'want'
+  | 'waitMs'
+  | 'scope';
 
 /**
  * The caller's name for one idempotent exec within a workspace incarnation (07_api "Keyed
@@ -366,6 +378,66 @@ export type CowshedError = {
    * where that input stands. Absent from the wire otherwise, like `fence`.
    */
   readonly stdin?: StdinRefusal;
+} & {
+  readonly cpuAdmission?: CpuAdmissionRefusal;
+} & {
+  readonly priority?: PriorityFailure;
+};
+
+/**
+ * CPU admission is authority, not a class string in a child's environment.
+ */
+export type CpuAdmissionRefusal =
+  | ({ readonly reason: 'classNotPermitted' } & {
+      readonly class: JobserverClass;
+      readonly scope: ExecScope;
+    })
+  | ({ readonly reason: 'invalidRequest' } & {
+      readonly detail: string;
+    })
+  | ({ readonly reason: 'gatewayUnavailable' } & {
+      readonly socket: string;
+      readonly error: string;
+    })
+  | ({ readonly reason: 'gatewayRefused' } & {
+      readonly code: string;
+      readonly error: string;
+    })
+  | ({ readonly reason: 'gateAdmissionTimeout' } & {
+      readonly waitMs: number & tags.Type<'uint64'>;
+      readonly cpuBudget: CpuBudgetStatus;
+    })
+  | ({ readonly reason: 'protocol' } & {
+      readonly detail: string;
+    });
+
+/**
+ * The budget as the gateway reports it in its status: the host total, how many tokens are held,
+ * and by whom. `held` plus the free tokens is always `total`.
+ */
+export type CpuBudgetStatus = {
+  readonly total: number & tags.Type<'uint64'>;
+  readonly held: number & tags.Type<'uint64'>;
+  /**
+   * One entry per checkout holding or waiting for tokens.
+   */
+  readonly checkouts: ReadonlyArray<CpuCheckoutStatus>;
+};
+
+export type CpuCheckoutStatus = {
+  readonly checkout: string;
+  /**
+   * Tokens its granted runners hold.
+   */
+  readonly held: number & tags.Type<'uint64'>;
+  /**
+   * Runners holding tokens.
+   */
+  readonly running: number & tags.Type<'uint64'>;
+  /**
+   * Runners waiting for a grant.
+   */
+  readonly waiting: number & tags.Type<'uint64'>;
 };
 
 /**
@@ -490,6 +562,23 @@ export type ExecParams = {
   readonly stdoutCopy: OutputPublication | null;
   readonly stderrCopy: OutputPublication | null;
   readonly admissionKey?: AdmissionKey;
+  /**
+   * The host CPU admission class, omitted for background, which is what ordinary exec asks for.
+   * Only the coordinator.exec route admits the gate class.
+   */
+  readonly class?: JobserverClass;
+  /**
+   * The most CPU tokens the command can use at once; omitted for one.
+   */
+  readonly want?: number & tags.Type<'uint64'> & tags.Minimum<1>;
+  /**
+   * A gate's bound, in milliseconds, on waiting for its CPU grant; omitted for background.
+   */
+  readonly waitMs?: number & tags.Type<'uint32'> & tags.Minimum<1>;
+  /**
+   * Where the command runs; omitted for the workspace sandbox.
+   */
+  readonly scope?: ExecScope;
 };
 
 export type ExecRecord = ExecRecordRef;
@@ -512,6 +601,11 @@ export type ExecRecordRef = {
   readonly stdin: StdinInfo;
   readonly outputLimit?: OutputLimitInfo;
 };
+
+/**
+ * Where an exec's command runs (07_api.md "Exec and grants").
+ */
+export type ExecScope = 'workspace' | 'hostGate';
 
 /**
  * Where an admitted job's stdin comes from. Inline bytes travel as the call's upload frame; a
@@ -838,7 +932,7 @@ export type JobAccounting =
 /**
  * Why a job failed when no command's own status explains it.
  */
-export type JobFailure = 'scriptSyntax' | 'supervisorLost';
+export type JobFailure = 'scriptSyntax' | 'supervisorLost' | 'cpuAdmission' | 'priority';
 
 export type JobId = number & tags.Type<'uint64'> & tags.Minimum<1> & tags.Maximum<9007199254740991>;
 
@@ -862,6 +956,10 @@ export type JobInfoRef = {
   readonly outputLimit?: OutputLimitInfo;
   readonly stdin: StdinInfo;
   readonly failure?: JobFailure;
+  readonly class: JobserverClass;
+  readonly scope: ExecScope;
+  readonly nice?: number & tags.Type<'int32'>;
+  readonly cpuTokens?: number & tags.Type<'uint64'> & tags.Minimum<1>;
 } & (
   | { readonly argv: ReadonlyArray<CommandArg>; readonly script?: never }
   | { readonly script: ScriptCommand; readonly argv?: never }
@@ -1154,6 +1252,11 @@ export type JobVolumeUsage = {
 };
 
 /**
+ * Root jobserver admission class. Only a live grant, not an environment marker, admits a gate.
+ */
+export type JobserverClass = 'background' | 'gate';
+
+/**
  * One Nx task that missed the cache when a land re-ran its check in the target on the adopted
  * build volume (16_build_volumes.md, Land step 7): a defect in the project's build
  * configuration, recorded once per miss so a coordinator can turn each into fix work.
@@ -1222,17 +1325,10 @@ export type LandOutcomeCommitment = {
   readonly skip: AdoptionSkip | null;
 };
 
-export type LandReport = {
-  readonly landedHead: GitOid;
-  readonly targetBranch: string;
-  readonly previousTargetHead?: GitOid;
-  readonly targetWasCheckedOut: boolean;
-  readonly retired: boolean;
-  /**
-   * What the land did with build volumes (16_build_volumes.md, Land steps 4–7).
-   */
-  readonly buildVolume: LandBuildVolume;
-};
+/**
+ * Preservation-only delivery is distinct from a target that actually landed.
+ */
+export type LandReport = ({ readonly kind: 'delivered' } & PushReport) | ({ readonly kind: 'landed' } & LandedReport);
 
 /**
  * A unit's land: the unit, what it lands into (main when absent), and its options.
@@ -1253,6 +1349,18 @@ export type LandSeed =
   | ({ readonly kind: 'sealBusy' } & {
       readonly reason: string;
     });
+
+export type LandedReport = {
+  readonly landedHead: GitOid;
+  readonly targetBranch: string;
+  readonly previousTargetHead?: GitOid;
+  readonly targetWasCheckedOut: boolean;
+  readonly retired: boolean;
+  /**
+   * What the land did with build volumes (16_build_volumes.md, Land steps 4–7).
+   */
+  readonly buildVolume: LandBuildVolume;
+};
 
 /**
  * Where a workspace's commits stand relative to the branch that outlives it.
@@ -1413,6 +1521,16 @@ export type OutputSummary = {
 export type PortBlock = {
   readonly base: number & tags.Type<'uint32'> & tags.Maximum<65535>;
   readonly size: number & tags.Type<'uint32'> & tags.Maximum<65535>;
+};
+
+/**
+ * What placing nice on the owned child observed; absent values were not observed, never guessed.
+ */
+export type PriorityFailure = {
+  readonly pid: number & tags.Type<'uint32'>;
+  readonly requested: number & tags.Type<'int32'>;
+  readonly observed: (number & tags.Type<'int32'>) | null;
+  readonly errno: (number & tags.Type<'int32'>) | null;
 };
 
 /**
@@ -1961,6 +2079,22 @@ export type SealedJob = {
   readonly outputLimit: OutputLimitInfo | null;
   readonly stdout: StreamInfo;
   readonly stderr: StreamInfo;
+  /**
+   * The class the job was admitted under, as JobInfo.class.
+   */
+  readonly class: JobserverClass;
+  /**
+   * Where the job's command ran, as JobInfo.scope.
+   */
+  readonly scope: ExecScope;
+  /**
+   * The nice the job's command was observed at, as JobInfo.nice.
+   */
+  readonly nice?: number & tags.Type<'int32'>;
+  /**
+   * The CPU tokens the job's grant held, as JobInfo.cpu_tokens.
+   */
+  readonly cpuTokens?: number & tags.Type<'uint64'> & tags.Minimum<1>;
 };
 
 export type SessionRequest = {

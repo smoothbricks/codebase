@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,14 +16,16 @@ use cowshed_apfs::{
 use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, DefragmentResult, DoctorReport, ExecCommand, ExecRequest,
-    Finding, FindingSeverity, ForkOptions, GcOptions, GcReport, GitOid, GrantDelta, GrantSet,
-    JobId, JobInfo, JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits, LandOptions,
-    LandReport, MirrorInfo, PortBlock, PushOptions, PushReport, RebaseOptions, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ResizeResult, ResizeVolume,
-    RunSandboxMode, StdinSource, StepReport, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
+    ExecScope, Finding, FindingSeverity, ForkOptions, GcOptions, GcReport, GitOid, GrantDelta,
+    GrantSet, JobId, JobInfo, JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits,
+    JobserverClass, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport,
+    RebaseOptions, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
+    ResizeResult, ResizeVolume, RunSandboxMode, StdinSource, StepReport, WorkspaceInfo,
+    WorkspaceState, WorkspaceTarget,
 };
 use cowshed_core::api::operations::{JobLogs, LogsRequest, Operation, OperationRequest};
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
+use cowshed_core::error::CpuAdmissionRefusal;
 use cowshed_core::metadata::{
     NEW_PORT_BLOCK_SIZE, WorkspaceIncarnation, WorkspaceName, WorkspaceRole,
 };
@@ -33,6 +36,7 @@ use cowshed_core::runtime::supervisor::{
     ProcessSpawnRequest, RunningProcess, SpawnSink, WorkspaceAuthoritySnapshot,
     WorkspaceSupervisor, WorkspaceSupervisorConfig, WorkspaceSupervisorHandle,
 };
+use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::runtime::{
     ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost,
     RuntimeLogChunk, WorkspaceSnapshot,
@@ -201,6 +205,8 @@ impl HeldJob {
             "jobId": 1,
             "state": if ended { "exited" } else { "running" },
             "grantRevision": 1,
+            "class": "background",
+            "scope": "workspace",
             "argv": [{"encoding": "utf8", "data": "build"}],
             "cwd": null,
             "started": "2026-07-13T00:00:00Z",
@@ -267,6 +273,8 @@ struct FakeHost {
     reclaims: Vec<tokio::task::JoinHandle<()>>,
     /// Abandon bundles removals left in the trash, for `delete_abandon_bundles`.
     bundles: Vec<PathBuf>,
+    /// What the router admitted, in order: the route that decoded each exec and its scheduling.
+    admitted: Arc<std::sync::Mutex<Vec<Admitted>>>,
 }
 
 impl FakeHost {
@@ -312,6 +320,7 @@ impl FakeHost {
             create_gate: None,
             reclaims: Vec::new(),
             bundles: Vec::new(),
+            admitted: Arc::default(),
         }
     }
 
@@ -1201,7 +1210,7 @@ impl ProjectRuntimeHost for FakeHost {
         _options: LandOptions,
     ) -> Result<LandReport> {
         self.workspace(&workspace)?;
-        Ok(LandReport {
+        Ok(LandReport::Landed(cowshed_core::api::dto::LandedReport {
             landed_head: GitOid::new("1111111111111111111111111111111111111111")
                 .expect("fixed oid"),
             target_branch: "main".into(),
@@ -1214,7 +1223,7 @@ impl ProjectRuntimeHost for FakeHost {
                     reason: cowshed_core::api::dto::AdoptionSkip::NoLandingVolume,
                 },
             },
-        })
+        }))
     }
 
     async fn push(
@@ -1273,10 +1282,18 @@ impl ProjectRuntimeHost for FakeHost {
         incarnation: WorkspaceIncarnation,
         _session: Option<String>,
         request: cowshed_core::api::dto::ExecRequest,
+        source: AdmissionSource,
     ) -> Result<JobId> {
         self.require_incarnation(&workspace, &incarnation)?;
+        self.admitted.lock().expect("admission log").push(Admitted {
+            source,
+            class: request.class,
+            want: request.want,
+            wait_ms: request.wait_ms,
+            scope: request.scope,
+        });
         if let Some(supervisor) = self.supervisors.get(&workspace) {
-            return supervisor.exec(None, None, request).await;
+            return supervisor.exec(None, None, request, source).await;
         }
         let mount = self.snapshot(self.workspace(&workspace)?).info.mount;
         self.events
@@ -1752,6 +1769,285 @@ async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
     }
 }
 
+/// What the router admitted for one exec: the route that decoded it and the scheduling it carried.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Admitted {
+    source: AdmissionSource,
+    class: JobserverClass,
+    want: NonZeroUsize,
+    wait_ms: Option<NonZeroU32>,
+    scope: ExecScope,
+}
+
+/// The exec params of a main-workspace job, with the scheduling a test names added.
+fn main_exec(repo: &RepoId, incarnation: &Value, scheduling: Value) -> Value {
+    let mut params = json!({
+        "repoId": repo,
+        "workspace": "main",
+        "workspaceIncarnation": incarnation,
+        "session": null,
+        "argv": serde_json::to_value(vec![CommandArg::from("build")]).unwrap(),
+        "cwd": null,
+        "mode": "readWrite",
+        "env": {},
+        "trace": null,
+        "stdin": {"kind": "empty"},
+        "stdoutCopy": null,
+        "stderrCopy": null
+    });
+    params
+        .as_object_mut()
+        .unwrap()
+        .extend(scheduling.as_object().expect("scheduling fields").clone());
+    params
+}
+
+/// A router over a fake host whose admissions the test can read.
+async fn start_recording_admissions(
+    root: &Path,
+) -> (
+    ProjectRuntime,
+    RouterHandle,
+    RepoId,
+    mpsc::UnboundedReceiver<Event>,
+    Arc<std::sync::Mutex<Vec<Admitted>>>,
+    Value,
+) {
+    let (events, mut receiver) = mpsc::unbounded_channel();
+    let host = FakeHost::new(root, events, false, false, Vec::new());
+    let admitted = Arc::clone(&host.admitted);
+    let repo = host.descriptor.repo_id.clone();
+    let runtime = ProjectRuntime::start(host).await.expect("start runtime");
+    let router = runtime.router();
+    let adopted = adopt(&router, &repo).await;
+    while receiver.try_recv().is_ok() {}
+    let incarnation = adopted["info"]["workspaceIncarnation"].clone();
+    (runtime, router, repo, receiver, admitted, incarnation)
+}
+
+/// The route that decoded an exec is its authority. The worker route — a worker connection, or a
+/// coordinator connection naming worker.exec — admits background work in the workspace sandbox
+/// and nothing more: a gate, or the host gate, is refused as the typed class-not-permitted error
+/// before the workspace is read or anything is admitted. The coordinator route admits both, and
+/// the host sees the route that decoded each exec.
+#[tokio::test]
+async fn router_admits_a_gate_only_through_the_coordinator_route() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events, admitted, incarnation) =
+        start_recording_admissions(&root).await;
+    let worker = ConnectionAuthority::Worker {
+        repo_id: repo.clone(),
+        workspace: WorkspaceName::new("main").expect("main"),
+        workspace_incarnation: serde_json::from_value(incarnation.clone()).expect("incarnation"),
+    };
+    let gate = json!({"class": "gate", "waitMs": 120_000, "want": 8});
+    let host_gate = json!({"class": "gate", "waitMs": 120_000, "want": 8, "scope": "hostGate"});
+    let host_only = json!({"scope": "hostGate"});
+
+    for authority in [worker.clone(), coordinator(repo.clone())] {
+        for (ask, class, scope) in [
+            (&gate, JobserverClass::Gate, ExecScope::Workspace),
+            (&host_gate, JobserverClass::Gate, ExecScope::HostGate),
+            (&host_only, JobserverClass::Background, ExecScope::HostGate),
+        ] {
+            let error = route(
+                &router,
+                authority.clone(),
+                "worker.exec",
+                main_exec(&repo, &incarnation, ask.clone()),
+            )
+            .await
+            .expect_err("the worker route admits no gate");
+            assert_eq!(error.code, ErrorCode::SandboxDenied);
+            assert_eq!(
+                error.cpu_admission_source(),
+                Some(&CpuAdmissionRefusal::ClassNotPermitted { class, scope })
+            );
+            assert!(events.try_recv().is_err(), "a refused ask reached the host");
+        }
+    }
+    assert!(admitted.lock().unwrap().is_empty(), "nothing was admitted");
+
+    for ask in [gate, host_gate] {
+        assert_eq!(
+            route(
+                &router,
+                coordinator(repo.clone()),
+                "coordinator.exec",
+                main_exec(&repo, &incarnation, ask),
+            )
+            .await
+            .expect("the coordinator route admits a gate"),
+            json!(1)
+        );
+    }
+    assert_eq!(
+        route(
+            &router,
+            worker,
+            "worker.exec",
+            main_exec(&repo, &incarnation, json!({"want": 4})),
+        )
+        .await
+        .expect("a worker admits a heavy ordinary runner"),
+        json!(1)
+    );
+    let bound = NonZeroU32::new(120_000);
+    let eight = NonZeroUsize::new(8).unwrap();
+    assert_eq!(
+        *admitted.lock().unwrap(),
+        vec![
+            Admitted {
+                source: AdmissionSource::Coordinator,
+                class: JobserverClass::Gate,
+                want: eight,
+                wait_ms: bound,
+                scope: ExecScope::Workspace,
+            },
+            Admitted {
+                source: AdmissionSource::Coordinator,
+                class: JobserverClass::Gate,
+                want: eight,
+                wait_ms: bound,
+                scope: ExecScope::HostGate,
+            },
+            Admitted {
+                source: AdmissionSource::Worker,
+                class: JobserverClass::Background,
+                want: NonZeroUsize::new(4).unwrap(),
+                wait_ms: None,
+                scope: ExecScope::Workspace,
+            },
+        ]
+    );
+}
+
+/// HostGate preserves project environment variables while retaining the no-session boundary.
+#[tokio::test]
+async fn router_confines_a_host_gate_session_without_restricting_environment_names() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events, admitted, incarnation) =
+        start_recording_admissions(&root).await;
+    let gate = |extra: Value| {
+        let mut ask = json!({"class": "gate", "waitMs": 120_000, "scope": "hostGate"});
+        ask.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        ask
+    };
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "coordinator.exec",
+        main_exec(&repo, &incarnation, gate(json!({"session": "build"}))),
+    )
+    .await
+    .expect_err("a host gate runs in no session");
+    assert_eq!(error.code, ErrorCode::Usage);
+    assert!(error.message.contains("session"));
+    assert!(events.try_recv().is_err());
+    assert!(admitted.lock().unwrap().is_empty());
+    let project = gate(json!({"env": {
+        "PATH": "/usr/bin", "PROJECT_DEVENV_CUSTOM": "project-value", "NODE_OPTIONS": "project-node-value"
+    }}));
+    assert_eq!(
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.exec",
+            main_exec(&repo, &incarnation, project)
+        )
+        .await
+        .expect("custom names are admitted"),
+        json!(1)
+    );
+    let worker = json!({"env": {"PROJECT_DEVENV_CUSTOM": "worker-value"}});
+    assert_eq!(
+        route(
+            &router,
+            coordinator(repo.clone()),
+            "worker.exec",
+            main_exec(&repo, &incarnation, worker)
+        )
+        .await
+        .expect("worker custom names are admitted"),
+        json!(1)
+    );
+    assert_eq!(admitted.lock().unwrap().len(), 2);
+}
+
+/// coordinator.exec is coordinator-scoped: a worker connection cannot call it, and the refusal
+/// is the router's own authority error, before the workspace is read.
+#[tokio::test]
+async fn a_worker_connection_cannot_call_the_coordinator_exec_route() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events, admitted, incarnation) =
+        start_recording_admissions(&root).await;
+    let worker = ConnectionAuthority::Worker {
+        repo_id: repo.clone(),
+        workspace: WorkspaceName::new("main").expect("main"),
+        workspace_incarnation: serde_json::from_value(incarnation.clone()).expect("incarnation"),
+    };
+    let error = route(
+        &router,
+        worker,
+        "coordinator.exec",
+        main_exec(&repo, &incarnation, json!({})),
+    )
+    .await
+    .expect_err("a worker connection is no coordinator");
+    assert_eq!(error.code, ErrorCode::SandboxDenied);
+    assert!(
+        events.try_recv().is_err(),
+        "a refused call reached the host"
+    );
+    assert!(admitted.lock().unwrap().is_empty());
+}
+
+/// A scheduling the gateway cannot accept is an invalid request even under coordinator
+/// authority — a gate with no bound, background with one, the host gate as background — and a
+/// worker asking for the gate meets the authority refusal first, whatever else it got wrong.
+#[tokio::test]
+async fn router_refuses_an_unpaired_scheduling_before_admission() {
+    let root = test_root();
+    let (_runtime, router, repo, mut events, admitted, incarnation) =
+        start_recording_admissions(&root).await;
+    for ask in [
+        json!({"class": "gate"}),
+        json!({"waitMs": 1}),
+        json!({"scope": "hostGate"}),
+        json!({"waitMs": 1, "scope": "hostGate"}),
+    ] {
+        let error = route(
+            &router,
+            coordinator(repo.clone()),
+            "coordinator.exec",
+            main_exec(&repo, &incarnation, ask.clone()),
+        )
+        .await
+        .expect_err("an unpaired scheduling");
+        assert_eq!(error.code, ErrorCode::Usage, "{ask}");
+        assert!(
+            matches!(
+                error.cpu_admission_source(),
+                Some(CpuAdmissionRefusal::InvalidRequest { .. })
+            ),
+            "{ask}"
+        );
+        assert!(events.try_recv().is_err(), "{ask} reached the host");
+    }
+    let error = route(
+        &router,
+        coordinator(repo.clone()),
+        "worker.exec",
+        main_exec(&repo, &incarnation, json!({"class": "gate"})),
+    )
+    .await
+    .expect_err("a worker route admits no gate");
+    assert_eq!(error.code, ErrorCode::SandboxDenied);
+    assert!(admitted.lock().unwrap().is_empty());
+}
+
 /// The controller carries an exec's admission key into the real job store and routes lookup
 /// under the caller's incarnation fence. Only proven key absence is null; malformed keys,
 /// missing workspaces and stale incarnations remain errors.
@@ -1971,6 +2267,10 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
     let job = worker
         .exec(ExecRequest {
             command: ExecCommand::Argv(vec![CommandArg::from("build")]),
+            class: JobserverClass::Background,
+            want: NonZeroUsize::MIN,
+            wait_ms: None,
+            scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
             env: std::collections::HashMap::new(),
@@ -2052,6 +2352,10 @@ impl RunningProcess for ScriptedProcess {
         self.process.as_ref()
     }
 
+    fn nice(&self) -> Option<i32> {
+        None
+    }
+
     #[cfg(target_os = "macos")]
     fn observations(&self) -> Option<&cowshed_core::runtime::process_monitor::ProcessMonitor> {
         None
@@ -2069,6 +2373,31 @@ impl RunningProcess for ScriptedProcess {
 
     fn signal_process_tree(&mut self, _signal: ProcessSignal) -> Result<()> {
         Ok(())
+    }
+}
+
+/// A host CPU budget that grants every job what it asks for at once, as an idle host does. The
+/// pool socket it names serves no connection: no job here runs a nested runner.
+#[derive(Debug)]
+struct GrantingCpu;
+
+impl cowshed_core::runtime::job_cpu::JobCpuAdmission for GrantingCpu {
+    fn admit(
+        &self,
+        ask: cowshed_core::runtime::job_cpu::JobCpuAsk,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<cowshed_core::runtime::job_cpu::JobCpuGrant>>
+                + Send,
+        >,
+    > {
+        Box::pin(async move {
+            Ok(cowshed_core::runtime::job_cpu::JobCpuGrant::new(
+                ask.want,
+                PathBuf::from("/nonexistent/cowshed-test-cpu-pool.sock"),
+                Box::new(()),
+            ))
+        })
     }
 }
 
@@ -2118,6 +2447,7 @@ fn supervisor_config_of(
             profile_directory: root.join("store/run/profiles"),
             port_block: cowshed_core::metadata::PortBlock::new(49_136, 16).expect("port block"),
             retained_port_blocks: Vec::new(),
+            cpu_pool_directory: None,
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),
@@ -2142,6 +2472,7 @@ fn supervisor_config_of(
         volume_labels: None,
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
+        cpu: std::sync::Arc::new(GrantingCpu),
     }
 }
 
@@ -2264,6 +2595,10 @@ async fn exec_in(
     worker
         .exec(ExecRequest {
             command,
+            class: JobserverClass::Background,
+            want: NonZeroUsize::MIN,
+            wait_ms: None,
+            scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
             env: std::collections::HashMap::new(),
@@ -2343,6 +2678,10 @@ async fn a_keyed_lookup_reaches_one_job_or_proven_absence_over_the_controller() 
 
     let request = || ExecRequest {
         command: ExecCommand::Argv(vec![CommandArg::from("build")]),
+        class: JobserverClass::Background,
+        want: NonZeroUsize::MIN,
+        wait_ms: None,
+        scope: ExecScope::Workspace,
         cwd: None,
         mode: RunSandboxMode::ReadWrite,
         env: std::collections::HashMap::new(),
@@ -3645,6 +3984,10 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
                 .map(CommandArg::from)
                 .collect(),
         ),
+        class: JobserverClass::Background,
+        want: NonZeroUsize::MIN,
+        wait_ms: None,
+        scope: ExecScope::Workspace,
         cwd: None,
         mode: RunSandboxMode::ReadWrite,
         env: std::collections::HashMap::new(),
@@ -3655,7 +3998,12 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
         admission_key: Some(cowshed_core::api::AdmissionKey::new("session-op").unwrap()),
     };
     let job = supervisor
-        .exec(Some(&first_session), None, request())
+        .exec(
+            Some(&first_session),
+            None,
+            request(),
+            AdmissionSource::Worker,
+        )
         .await
         .expect("first admission");
     let ended = supervisor.wait(job).await.expect("first job ends");
@@ -3664,7 +4012,12 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
         Some(cowshed_core::api::ExitStatus::Exited { code: 0 })
     );
     let repeated = supervisor
-        .exec(Some(&second_session), None, request())
+        .exec(
+            Some(&second_session),
+            None,
+            request(),
+            AdmissionSource::Worker,
+        )
         .await;
     let counter = std::fs::read(root.join("workspace").join("counter")).expect("counter");
     supervisor.retire().await.expect("retire supervisor");
@@ -3683,7 +4036,9 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
     // counter must not alias the admission's earlier unnamed session.
     let restarted = system_supervisor_of(config);
     let new_session = restarted.open_session(None).await.expect("new session");
-    let repeated = restarted.exec(Some(&new_session), None, request()).await;
+    let repeated = restarted
+        .exec(Some(&new_session), None, request(), AdmissionSource::Worker)
+        .await;
     let counter = std::fs::read(root.join("workspace").join("counter")).expect("counter");
     restarted
         .retire()
@@ -3793,6 +4148,7 @@ async fn resource_reads_refuse_unowned_then_observe_and_keep_the_sealed_sample()
         .send(ProcessEvent::Started {
             job_id: job.id(),
             process: owned,
+            nice: 10,
         })
         .await
         .expect("publish ownership");
@@ -4027,6 +4383,10 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
                 .map(CommandArg::from)
                 .collect(),
             ),
+            class: JobserverClass::Background,
+            want: NonZeroUsize::MIN,
+            wait_ms: None,
+            scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
             env: std::collections::HashMap::new(),
@@ -4184,6 +4544,10 @@ async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
                 .map(CommandArg::from)
                 .collect(),
             ),
+            class: JobserverClass::Background,
+            want: NonZeroUsize::MIN,
+            wait_ms: None,
+            scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
             env: std::collections::HashMap::new(),
@@ -4436,6 +4800,10 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
     let job = worker
         .exec(ExecRequest {
             command: ExecCommand::Argv(vec![CommandArg::from("cat")]),
+            class: JobserverClass::Background,
+            want: NonZeroUsize::MIN,
+            wait_ms: None,
+            scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
             env: std::collections::HashMap::new(),

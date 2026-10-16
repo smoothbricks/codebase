@@ -113,10 +113,27 @@ pub struct CowshedError {
         deserialize_with = "known_to_this_build"
     )]
     stdin: Option<Box<StdinRefusal>>,
+
+    /// One cold execution refusal, never two pointer slots in every Result.
+    #[serde(flatten, default, deserialize_with = "known_to_this_build")]
+    execution: Option<Box<ExecutionRefusal>>,
     /// Boxed like `otherBuild` and `fence`: the structured CAS refusal is rare, and every
     /// `Result` in cowshed carries this type.
     #[serde(skip)]
     lifecycle_conflict: Option<Box<crate::storage::lifecycle::Conflict>>,
+}
+
+/// Canonical wire fields remain flat; only the private storage groups these exclusive causes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+enum ExecutionRefusal {
+    Admission {
+        #[serde(rename = "cpuAdmission")]
+        cpu_admission: CpuAdmissionRefusal,
+    },
+    Priority {
+        priority: PriorityFailure,
+    },
 }
 
 /// The daemon serves only its own build, and refused a request from another (11_shell.md
@@ -145,6 +162,48 @@ where
         .and_then(|source| serde_json::from_value(source).ok()))
 }
 
+/// CPU admission is authority, not a class string in a child's environment.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "reason",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum CpuAdmissionRefusal {
+    ClassNotPermitted {
+        class: cowshed_gateway_types::JobserverClass,
+        scope: crate::api::dto::ExecScope,
+    },
+    InvalidRequest {
+        detail: String,
+    },
+    GatewayUnavailable {
+        socket: std::path::PathBuf,
+        error: String,
+    },
+    GatewayRefused {
+        code: String,
+        error: String,
+    },
+    GateAdmissionTimeout {
+        wait_ms: u64,
+        cpu_budget: cowshed_gateway_types::CpuBudgetStatus,
+    },
+    Protocol {
+        detail: String,
+    },
+}
+
+/// What placing nice on the owned child observed; absent values were not observed, never guessed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriorityFailure {
+    pub pid: u32,
+    pub requested: i32,
+    pub observed: Option<i32>,
+    pub errno: Option<i32>,
+}
+
 /// Why a `Conflict` is safe to retry unchanged: the call planned against state a concurrent
 /// operation changed before it acted, and changed nothing itself. Retrying is the remedy; no
 /// other repair is needed.
@@ -169,6 +228,10 @@ pub enum AdmissionField {
     Session,
     StdoutCopy,
     StderrCopy,
+    Class,
+    Want,
+    WaitMs,
+    Scope,
 }
 
 impl AdmissionField {
@@ -183,6 +246,10 @@ impl AdmissionField {
             Self::Session => "session",
             Self::StdoutCopy => "stdoutCopy",
             Self::StderrCopy => "stderrCopy",
+            Self::Class => "class",
+            Self::Want => "want",
+            Self::WaitMs => "waitMs",
+            Self::Scope => "scope",
         }
     }
 }
@@ -327,6 +394,93 @@ impl FenceRefusal {
 }
 
 impl CowshedError {
+    pub fn class_not_permitted(
+        class: cowshed_gateway_types::JobserverClass,
+        scope: crate::api::dto::ExecScope,
+    ) -> Self {
+        Self::cpu_admission(CpuAdmissionRefusal::ClassNotPermitted { class, scope })
+    }
+
+    pub fn cpu_admission(refusal: CpuAdmissionRefusal) -> Self {
+        let error = match &refusal {
+            CpuAdmissionRefusal::ClassNotPermitted { class, scope } => Self::sandbox_denied(
+                format!("class-not-permitted: worker exec cannot request {class:?} / {scope:?}"),
+                "use the trusted coordinator/operator gate path; workers admit only background workspace work",
+            ),
+            CpuAdmissionRefusal::InvalidRequest { detail } => Self::usage(
+                detail,
+                "gate requires positive waitMs; background has no admission deadline; HostGate requires Gate",
+            ),
+            CpuAdmissionRefusal::GatewayUnavailable { socket, error } => Self::environment_missing(
+                format!(
+                    "jobserver admission at {} is unavailable: {error}",
+                    socket.display()
+                ),
+                "start the owning cowshed gateway; no unbudgeted spawn is permitted",
+            ),
+            CpuAdmissionRefusal::GatewayRefused { code, error } => Self::environment_missing(
+                format!("jobserver admission refused ({code}): {error}"),
+                "inspect cowshed gateway status and use the matching installed build",
+            ),
+            CpuAdmissionRefusal::GateAdmissionTimeout {
+                wait_ms,
+                cpu_budget,
+            } => Self::conflict(
+                format!(
+                    "gate-admission-timeout after {wait_ms} ms; live checkout holders: {}",
+                    cpu_budget
+                        .checkouts
+                        .iter()
+                        .filter(|checkout| checkout.held > 0)
+                        .map(|checkout| format!(
+                            "{}: {} tokens in {} running grant(s)",
+                            checkout.checkout, checkout.held, checkout.running
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                "let the named in-flight grants finish or cancel your own work; the gate never freezes background tests",
+            ),
+            CpuAdmissionRefusal::Protocol { detail } => Self::environment_missing(
+                format!("jobserver admission protocol failed: {detail}"),
+                "inspect the owning gateway; no unbudgeted spawn is permitted",
+            ),
+        };
+        Self {
+            execution: Some(Box::new(ExecutionRefusal::Admission {
+                cpu_admission: refusal,
+            })),
+            ..error
+        }
+    }
+
+    pub fn priority(failure: PriorityFailure) -> Self {
+        let error = Self::sandbox_denied(
+            format!(
+                "cannot place owned job pid {} at nice {}: observed {:?}, errno {:?}",
+                failure.pid, failure.requested, failure.observed, failure.errno
+            ),
+            "gate runs at default nice 0; lower only background jobs, never request elevated gate priority",
+        );
+        Self {
+            execution: Some(Box::new(ExecutionRefusal::Priority { priority: failure })),
+            ..error
+        }
+    }
+
+    pub fn cpu_admission_source(&self) -> Option<&CpuAdmissionRefusal> {
+        match self.execution.as_deref() {
+            Some(ExecutionRefusal::Admission { cpu_admission }) => Some(cpu_admission),
+            Some(ExecutionRefusal::Priority { .. }) | None => None,
+        }
+    }
+    pub fn priority_source(&self) -> Option<&PriorityFailure> {
+        match self.execution.as_deref() {
+            Some(ExecutionRefusal::Priority { priority }) => Some(priority),
+            Some(ExecutionRefusal::Admission { .. }) | None => None,
+        }
+    }
+
     pub fn new(code: ErrorCode, message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             code,
@@ -339,6 +493,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
+            execution: None,
             lifecycle_conflict: None,
         }
     }
@@ -368,6 +523,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
+            execution: None,
             lifecycle_conflict: Some(Box::new(conflict)),
         }
     }
@@ -394,6 +550,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
+            execution: None,
             lifecycle_conflict: None,
         }
     }
@@ -422,6 +579,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
+            execution: None,
             lifecycle_conflict: None,
         }
     }
@@ -445,6 +603,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
+            execution: None,
             lifecycle_conflict: None,
         }
     }
@@ -709,6 +868,61 @@ pub type Result<T> = std::result::Result<T, CowshedError>;
 #[cfg(test)]
 mod tests {
     use super::{CowshedError, ErrorCode};
+
+    #[test]
+    fn execution_causes_keep_their_flat_wire_and_unknown_sources_keep_the_envelope() {
+        use super::{CpuAdmissionRefusal, PriorityFailure};
+        let admission = CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+            detail: "fixture protocol".to_owned(),
+        });
+        let value = serde_json::to_value(&admission).expect("serialize admission");
+        assert_eq!(
+            value["cpuAdmission"],
+            serde_json::json!({"reason":"protocol", "detail":"fixture protocol"})
+        );
+        assert!(value.get("execution").is_none());
+        assert!(value.get("priority").is_none());
+        let decoded: CowshedError = serde_json::from_value(value).expect("decode admission");
+        assert_eq!(
+            decoded.cpu_admission_source(),
+            admission.cpu_admission_source()
+        );
+        assert!(decoded.priority_source().is_none());
+        let priority = CowshedError::priority(PriorityFailure {
+            pid: 7,
+            requested: 10,
+            observed: Some(0),
+            errno: Some(libc::EPERM),
+        });
+        let value = serde_json::to_value(&priority).expect("serialize priority");
+        assert_eq!(
+            value["priority"],
+            serde_json::json!({"pid":7, "requested":10, "observed":0, "errno":libc::EPERM})
+        );
+        assert!(value.get("cpuAdmission").is_none());
+        let decoded: CowshedError = serde_json::from_value(value).expect("decode priority");
+        assert_eq!(decoded.priority_source(), priority.priority_source());
+        assert!(decoded.cpu_admission_source().is_none());
+        for cause in [
+            serde_json::json!({"cpuAdmission":{"reason":"futureRefusal"}}),
+            serde_json::json!({"priority":{"future":true}}),
+            serde_json::json!({}),
+        ] {
+            let mut value =
+                serde_json::to_value(CowshedError::conflict("retained message", "retained hint"))
+                    .unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(cause.as_object().unwrap().clone());
+            let decoded: CowshedError =
+                serde_json::from_value(value).expect("unknown source keeps base envelope");
+            assert_eq!(decoded.message, "retained message");
+            assert_eq!(decoded.hint, "retained hint");
+            assert!(decoded.cpu_admission_source().is_none());
+            assert!(decoded.priority_source().is_none());
+        }
+    }
 
     const CODES: [ErrorCode; 7] = [
         ErrorCode::Internal,

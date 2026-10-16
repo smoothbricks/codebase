@@ -210,6 +210,10 @@ pub(crate) fn start_request(workspace_root: &Path, project_root: &Path) -> Resul
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
+        class: crate::api::dto::JobserverClass::Background,
+        want: std::num::NonZeroUsize::MIN,
+        wait_ms: None,
+        scope: crate::api::dto::ExecScope::Workspace,
     })
 }
 

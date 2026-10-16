@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::num::{NonZeroU32, NonZeroUsize};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Fields, Schema};
+use cowshed_gateway_types::JobserverClass;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -23,12 +25,13 @@ use uuid::Uuid;
 
 use crate::api::dto::{
     AdmissionCommitment, AdmissionKey, BinaryData, CheckpointCommitment, CommandArg,
-    ControllerCommitment, DtoError, ExecCommand, ExitStatus, ForkCommitment, GitOid, JobId,
-    JobState, LandAdoptionCommitment, LandOutcomeCommitment, MAX_ARGV_BYTES, MAX_COMMAND_ARG_BYTES,
-    MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication, OutputStorage, OutputSummary,
-    ProtectedOutput, PublicationPolicy, RestoreCommitment, RunSandboxMode, Sha256Digest,
-    StreamInfo, TerminalCommitment, UtcTimestamp, WorkspaceIntroducedCommitment, WorkspacePath,
-    WorkspaceRetiredCommitment, validate_command_argv,
+    ControllerCommitment, DtoError, ExecCommand, ExecScope, ExitStatus, ForkCommitment, GitOid,
+    JobId, JobState, LandAdoptionCommitment, LandOutcomeCommitment, MAX_ARGV_BYTES,
+    MAX_COMMAND_ARG_BYTES, MAX_INLINE_OUTPUT_BYTES, OutputLimitInfo, OutputPublication,
+    OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy, RestoreCommitment,
+    RunSandboxMode, Sha256Digest, StreamInfo, TerminalCommitment, UtcTimestamp,
+    WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
+    validate_command_argv,
 };
 use crate::api::resources::{
     ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, CpuTotals, HostLoadSample, JobAccounting,
@@ -86,10 +89,10 @@ const JOB_FLOOR: CounterFile = CounterFile {
     magic: b"CSJOB001",
     what: "job id floor",
 };
-/// Layout 9 keeps every column of layout 8 -- layout 7's resource, accounting and volume
-/// columns, then the keyed admission -- and appends [`SAMPLE_COLUMNS`]. A store holding a record
-/// in an earlier layout is set aside whole ([`SetAsideStore`]), never read.
-const RECORD_SCHEMA_VERSION: u64 = 9;
+/// Layout 11 keeps every column of layout 10, including its [`CPU_COLUMNS`], and appends
+/// `admission_env_sha256`. A store holding a record in an earlier layout is set aside whole
+/// ([`SetAsideStore`]), never read or migrated.
+const RECORD_SCHEMA_VERSION: u64 = 11;
 /// The first layout whose job records carry admission keys. A store in it or a later layout set
 /// aside while serving an incarnation took that incarnation's keyed admissions along, so the
 /// keys it named can no longer be proven absent ([`AdmissionLookup::Unprovable`]).
@@ -160,6 +163,25 @@ const SAMPLE_COLUMNS: [&str; 5] = [
 ];
 /// The first of [`SAMPLE_COLUMNS`].
 const SAMPLE_COLUMN: usize = ADMISSION_COLUMN + ADMISSION_COLUMNS;
+/// The job's host CPU admission and its owned child's placement, which layout 10 appended after
+/// [`SAMPLE_COLUMNS`] (05_gateway.md "Host CPU budget"): the class, the tokens it wants and a
+/// gate's admission bound, present in every job record; then the tokens its grant held and the
+/// nice its command was observed at, present only in the terminal record of a job that was granted
+/// and whose command was observed; then the scope it ran in, present in every job record. Nothing
+/// here is inferred for a job that never got that far.
+const CPU_COLUMNS: [&str; 6] = [
+    "cpu_class",
+    "cpu_want",
+    "cpu_wait_ms",
+    "cpu_tokens",
+    "cpu_nice",
+    "cpu_scope",
+];
+/// The first of [`CPU_COLUMNS`].
+const CPU_COLUMN: usize = SAMPLE_COLUMN + SAMPLE_COLUMNS.len();
+/// The authored non-withheld environment commitment layout 11 appends after [`CPU_COLUMNS`]:
+/// present exactly for keyed job records, never derived from their public environment projection.
+const ADMISSION_ENV_SHA256_COLUMN: usize = CPU_COLUMN + CPU_COLUMNS.len();
 /// [`JobAccounting::LinuxCgroupV2`] in its source column: its wire kind.
 const CGROUP_SOURCE: &str = "linuxCgroupV2";
 #[cfg(unix)]
@@ -395,6 +417,13 @@ pub struct JobArtifactRecord {
     /// The key a keyed exec admitted this job under, with the rest of the request it was
     /// admitted for; every record of the job carries it.
     pub admission: Option<JobAdmission>,
+    /// The host CPU admission the job asked for; every record of the job carries it.
+    pub scheduling: JobScheduling,
+    /// The tokens the gateway granted the job; only the terminal record of a granted job.
+    pub cpu_tokens: Option<NonZeroUsize>,
+    /// The nice value the job's owned command was observed at right after its spawn set it; only
+    /// the terminal record of a job whose command was observed. Never inferred.
+    pub nice: Option<i32>,
 }
 
 /// A keyed exec's admission: its key and every part of its request a repeat under the key must
@@ -405,12 +434,81 @@ pub struct JobAdmission {
     pub key: AdmissionKey,
     pub cwd: Option<WorkspacePath>,
     pub mode: RunSandboxMode,
-    /// Sorted by name, so equal environments compare equal.
+    /// The public-name projection of the authored environment, sorted by name.
     pub env: BTreeMap<String, String>,
+    /// Commitment to the full authored environment, less withheld credentials.
+    pub env_sha256: Sha256Digest,
     pub stdin: AdmittedStdin,
     pub session: AdmittedSession,
     pub stdout_copy: Option<OutputPublication>,
     pub stderr_copy: Option<OutputPublication>,
+}
+
+/// The host CPU admission a job asked for (05_gateway.md "Host CPU budget"): the scope it runs
+/// in, its class, the tokens it wants, and a gate's bound on its wait. A gate always names a bound
+/// and background never does, and only a gate runs at the host boundary, so [`Self::new`] is the
+/// only way to one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobScheduling {
+    scope: ExecScope,
+    class: JobserverClass,
+    want: NonZeroUsize,
+    wait_ms: Option<NonZeroU32>,
+}
+
+impl JobScheduling {
+    /// `None` when the parts disagree: a gate without a bound, background with one, or a host
+    /// gate scope for background work.
+    pub fn new(
+        scope: ExecScope,
+        class: JobserverClass,
+        want: NonZeroUsize,
+        wait_ms: Option<NonZeroU32>,
+    ) -> Option<Self> {
+        let bounded = match (class, wait_ms) {
+            (JobserverClass::Gate, Some(_)) | (JobserverClass::Background, None) => true,
+            (JobserverClass::Gate, None) | (JobserverClass::Background, Some(_)) => false,
+        };
+        let scoped = match (scope, class) {
+            (ExecScope::Workspace, _) | (ExecScope::HostGate, JobserverClass::Gate) => true,
+            (ExecScope::HostGate, JobserverClass::Background) => false,
+        };
+        (bounded && scoped).then_some(Self {
+            scope,
+            class,
+            want,
+            wait_ms,
+        })
+    }
+
+    pub fn scope(self) -> ExecScope {
+        self.scope
+    }
+
+    pub fn class(self) -> JobserverClass {
+        self.class
+    }
+
+    pub fn want(self) -> NonZeroUsize {
+        self.want
+    }
+
+    pub fn wait_ms(self) -> Option<NonZeroU32> {
+        self.wait_ms
+    }
+}
+
+/// What a request that names no scheduling asks for: background in its workspace, one token, no
+/// bound.
+impl Default for JobScheduling {
+    fn default() -> Self {
+        Self {
+            scope: ExecScope::Workspace,
+            class: JobserverClass::Background,
+            want: NonZeroUsize::MIN,
+            wait_ms: None,
+        }
+    }
 }
 
 /// Where a keyed exec's stdin came from. Inline bytes are part of the request, so they are
@@ -437,6 +535,7 @@ struct Admitted {
     job_id: JobId,
     command: ExecCommand,
     admission: JobAdmission,
+    scheduling: JobScheduling,
 }
 
 /// Every admission key the store's incarnation admitted a job under.
@@ -455,6 +554,7 @@ pub enum AdmissionLookup<'a> {
         job_id: JobId,
         command: &'a ExecCommand,
         admission: &'a JobAdmission,
+        scheduling: JobScheduling,
     },
     /// The key admitted nothing in this incarnation.
     Absent,
@@ -486,7 +586,8 @@ impl AdmissionIndex {
                 Some(known)
                     if known.job_id == record.job_id
                         && known.command == record.command
-                        && &known.admission == admission => {}
+                        && &known.admission == admission
+                        && known.scheduling == record.scheduling => {}
                 Some(known) => {
                     return Err(integrity(
                         0,
@@ -505,6 +606,7 @@ impl AdmissionIndex {
                             job_id: record.job_id,
                             command: record.command.clone(),
                             admission: admission.clone(),
+                            scheduling: record.scheduling,
                         },
                     );
                 }
@@ -522,6 +624,7 @@ impl AdmissionIndex {
                 job_id: known.job_id,
                 command: &known.command,
                 admission: &known.admission,
+                scheduling: known.scheduling,
             },
             (None, None) => AdmissionLookup::Absent,
             (None, Some(set_aside)) => AdmissionLookup::Unprovable { set_aside },
@@ -547,14 +650,16 @@ impl AdmissionIndex {
         }
     }
 
-    /// Bind `admission`'s key to `job_id`, a record [`Self::check`] allowed now being durable.
-    fn admit(&mut self, job_id: JobId, command: &ExecCommand, admission: &JobAdmission) {
+    /// Bind `admission`'s key to `record`'s job, a record [`Self::check`] allowed now being
+    /// durable.
+    fn admit(&mut self, record: &JobArtifactRecord, admission: &JobAdmission) {
         self.keys
             .entry(admission.key.clone())
             .or_insert_with(|| Admitted {
-                job_id,
-                command: command.clone(),
+                job_id: record.job_id,
+                command: record.command.clone(),
                 admission: admission.clone(),
+                scheduling: record.scheduling,
             });
     }
 }
@@ -656,6 +761,20 @@ impl JobArtifactRecord {
                  resource sample",
             ));
         }
+        if matches!(self.state, JobState::Queued | JobState::Running)
+            && (self.cpu_tokens.is_some() || self.nice.is_some())
+        {
+            return Err(integrity(
+                0,
+                "only a terminal job record names its granted CPU tokens or its observed nice",
+            ));
+        }
+        if self.nice.is_some() && self.cpu_tokens.is_none() {
+            return Err(integrity(
+                0,
+                "a job record names an observed nice only for a command its CPU grant admitted",
+            ));
+        }
         if let Some(resources) = &self.resources
             && (resources.job_id != self.job_id || !resources.consistent())
         {
@@ -704,6 +823,12 @@ pub struct JobEnding {
     pub duration_ms: Option<u64>,
     /// The job's terminal resource sample; `None` when no process of the job ever existed.
     pub resources: Option<JobResourceSample>,
+    /// Why a failed job failed when no status of its own says so.
+    pub failure: Option<crate::api::dto::JobFailure>,
+    /// The tokens the job's CPU grant held; `None` when it was never granted.
+    pub cpu_tokens: Option<NonZeroUsize>,
+    /// The nice its command was observed at; `None` when no command was observed.
+    pub nice: Option<i32>,
 }
 
 /// An ending of which nothing is known beyond its state: a job refused before its command ran.
@@ -714,6 +839,9 @@ impl From<JobState> for JobEnding {
             exit: None,
             duration_ms: None,
             resources: None,
+            failure: None,
+            cpu_tokens: None,
+            nice: None,
         }
     }
 }
@@ -1172,6 +1300,7 @@ impl ArtifactStore {
         grant_revision: u64,
         command: &ExecCommand,
         admission: Option<JobAdmission>,
+        scheduling: JobScheduling,
         mut targets: OutputTargets,
     ) -> Result<JobArtifactToken, ArtifactError> {
         command.validate()?;
@@ -1198,7 +1327,8 @@ impl ArtifactStore {
             workspace_incarnation: self.workspace_incarnation.clone(),
             job_id,
             sequence: 0,
-            state: JobState::Running,
+            // Admitted, and waiting for its CPU grant: nothing has spawned yet.
+            state: JobState::Queued,
             grant_revision,
             command: command.clone(),
             output_limit: None,
@@ -1209,6 +1339,9 @@ impl ArtifactStore {
             duration_ms: None,
             resources: None,
             admission: admission.clone(),
+            scheduling,
+            cpu_tokens: None,
+            nice: None,
         };
         self.append_record(record)?;
         let replaced = self.live_jobs.insert(
@@ -1217,6 +1350,7 @@ impl ArtifactStore {
                 grant_revision,
                 command: command.clone(),
                 admission,
+                scheduling,
                 stdout: StreamWriterState::new(StreamKind::Stdout, targets.stdout),
                 stderr: StreamWriterState::new(StreamKind::Stderr, targets.stderr),
                 quota: QuotaLedger {
@@ -1360,8 +1494,7 @@ impl ArtifactStore {
         append_framed_batch_under_lock(&lock, &payload, digest, JOB_RECORD_DURABILITY, None)?;
         self.records_seen = RecordsIdentity::of(&path)?;
         if let Some(admission) = &record.admission {
-            self.admissions
-                .admit(record.job_id, &record.command, admission);
+            self.admissions.admit(&record, admission);
         }
         if !matches!(record.state, JobState::Queued | JobState::Running) {
             self.committed_jobs.insert(record.job_id, record.clone());
@@ -1613,6 +1746,7 @@ struct LiveJobState {
     grant_revision: u64,
     command: ExecCommand,
     admission: Option<JobAdmission>,
+    scheduling: JobScheduling,
     stdout: StreamWriterState,
     stderr: StreamWriterState,
     quota: QuotaLedger,
@@ -1796,6 +1930,9 @@ impl ArtifactStore {
             exit,
             duration_ms,
             resources,
+            failure,
+            cpu_tokens,
+            nice,
         } = ending.into();
         self.validate_token(&token)?;
         let mut live =
@@ -1840,11 +1977,14 @@ impl ArtifactStore {
                 output_limit: output_limit.clone(),
                 stdout,
                 stderr,
-                failure: None,
+                failure,
                 exit,
                 duration_ms,
                 resources,
                 admission: live.admission.clone(),
+                scheduling: live.scheduling,
+                cpu_tokens,
+                nice,
             };
             let (record, terminal_batch_sha256) = self.append_record(record)?;
             Ok(SealedJobArtifacts {
@@ -3896,6 +4036,13 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field(SAMPLE_COLUMNS[2], DataType::Utf8, true),
         field(SAMPLE_COLUMNS[3], DataType::UInt64, true),
         field(SAMPLE_COLUMNS[4], DataType::UInt64, true),
+        field(CPU_COLUMNS[0], DataType::Utf8, true),
+        field(CPU_COLUMNS[1], DataType::UInt64, true),
+        field(CPU_COLUMNS[2], DataType::UInt32, true),
+        field(CPU_COLUMNS[3], DataType::UInt64, true),
+        field(CPU_COLUMNS[4], DataType::Int32, true),
+        field(CPU_COLUMNS[5], DataType::Utf8, true),
+        field("admission_env_sha256", DataType::Binary, true),
     ]))
 }
 
@@ -3973,6 +4120,8 @@ fn failure_name(failure: crate::api::dto::JobFailure) -> &'static str {
     match failure {
         crate::api::dto::JobFailure::ScriptSyntax => "scriptSyntax",
         crate::api::dto::JobFailure::SupervisorLost => "supervisorLost",
+        crate::api::dto::JobFailure::CpuAdmission => "cpuAdmission",
+        crate::api::dto::JobFailure::Priority => "priority",
     }
 }
 
@@ -3980,6 +4129,8 @@ fn parse_failure(name: &str) -> Result<crate::api::dto::JobFailure, ArtifactErro
     match name {
         "scriptSyntax" => Ok(crate::api::dto::JobFailure::ScriptSyntax),
         "supervisorLost" => Ok(crate::api::dto::JobFailure::SupervisorLost),
+        "cpuAdmission" => Ok(crate::api::dto::JobFailure::CpuAdmission),
+        "priority" => Ok(crate::api::dto::JobFailure::Priority),
         other => Err(ArtifactError::Arrow(format!(
             "unknown job failure {other:?}"
         ))),
@@ -4268,6 +4419,31 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
             charged.map(|charged| charged.peak_bytes.get()),
         ])),
     ]);
+    let scheduling = record.scheduling;
+    columns.extend([
+        Arc::new(StringArray::from(vec![Some(class_name(
+            scheduling.class(),
+        ))])) as ArrayRef,
+        Arc::new(UInt64Array::from(vec![Some(token_column(
+            scheduling.want(),
+        )?)])),
+        Arc::new(UInt32Array::from(vec![
+            scheduling.wait_ms().map(NonZeroU32::get),
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            record.cpu_tokens.map(token_column).transpose()?,
+        ])),
+        Arc::new(Int32Array::from(vec![record.nice])),
+        Arc::new(StringArray::from(vec![Some(scope_name(
+            scheduling.scope(),
+        ))])),
+    ]);
+    columns.push(Arc::new(BinaryArray::from(vec![
+        record
+            .admission
+            .as_ref()
+            .map(|admission| admission.env_sha256.as_bytes().as_slice()),
+    ])));
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
@@ -4362,6 +4538,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
     let exit = decode_exit(batch, EXIT_COLUMN)?;
     let resources = decode_resources(batch, job_id)?;
     let admission = decode_admission(batch, ADMISSION_COLUMN)?;
+    let (scheduling, cpu_tokens, nice) = decode_cpu(batch, CPU_COLUMN)?;
     Ok(JobArtifactRecord {
         repo_id,
         workspace_incarnation,
@@ -4378,7 +4555,100 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         duration_ms,
         resources,
         admission,
+        scheduling,
+        cpu_tokens,
+        nice,
     })
+}
+
+/// A token count as its column's `UInt64`.
+fn token_column(tokens: NonZeroUsize) -> Result<u64, ArtifactError> {
+    u64::try_from(tokens.get())
+        .map_err(|_| ArtifactError::Arrow("a CPU token count exceeds u64".into()))
+}
+
+/// A token count out of its column: positive, and within this platform's `usize`.
+fn decode_tokens(value: u64, what: &str) -> Result<NonZeroUsize, ArtifactError> {
+    usize::try_from(value)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| {
+            ArtifactError::Arrow(format!("{what} {value} is not a positive token count"))
+        })
+}
+
+fn class_name(class: JobserverClass) -> &'static str {
+    match class {
+        JobserverClass::Background => "background",
+        JobserverClass::Gate => "gate",
+    }
+}
+
+fn scope_name(scope: ExecScope) -> &'static str {
+    match scope {
+        ExecScope::Workspace => "workspace",
+        ExecScope::HostGate => "hostGate",
+    }
+}
+
+fn parse_scope(name: &str) -> Result<ExecScope, ArtifactError> {
+    match name {
+        "workspace" => Ok(ExecScope::Workspace),
+        "hostGate" => Ok(ExecScope::HostGate),
+        other => Err(ArtifactError::Arrow(format!(
+            "unknown exec scope {other:?}"
+        ))),
+    }
+}
+
+fn parse_class(name: &str) -> Result<JobserverClass, ArtifactError> {
+    match name {
+        "background" => Ok(JobserverClass::Background),
+        "gate" => Ok(JobserverClass::Gate),
+        other => Err(ArtifactError::Arrow(format!("unknown CPU class {other:?}"))),
+    }
+}
+
+/// The [`CPU_COLUMNS`] of a current-layout job batch, the first at `first`: the scheduling every
+/// job record names, then the granted tokens and observed nice only a terminal record may name.
+fn decode_cpu(
+    batch: &RecordBatch,
+    first: usize,
+) -> Result<(JobScheduling, Option<NonZeroUsize>, Option<i32>), ArtifactError> {
+    if batch.column(first).is_null(0)
+        || batch.column(first + 1).is_null(0)
+        || batch.column(first + 5).is_null(0)
+    {
+        return Err(ArtifactError::Arrow(
+            "a job record names its scope, its CPU class and the tokens it wants".into(),
+        ));
+    }
+    let scope = parse_scope(string(batch, first + 5)?.value(0))?;
+    let class = parse_class(string(batch, first)?.value(0))?;
+    let want = decode_tokens(uint64(batch, first + 1)?.value(0), "cpu_want")?;
+    let wait_ms = (!batch.column(first + 2).is_null(0))
+        .then(|| {
+            uint32(batch, first + 2).and_then(|column| {
+                NonZeroU32::new(column.value(0))
+                    .ok_or_else(|| ArtifactError::Arrow("cpu_wait_ms is zero".into()))
+            })
+        })
+        .transpose()?;
+    let scheduling = JobScheduling::new(scope, class, want, wait_ms).ok_or_else(|| {
+        ArtifactError::Arrow(
+            "a gate names its admission bound, background names none, and only a gate runs at              the host boundary"
+                .into(),
+        )
+    })?;
+    let cpu_tokens = (!batch.column(first + 3).is_null(0))
+        .then(|| {
+            uint64(batch, first + 3).and_then(|column| decode_tokens(column.value(0), "cpu_tokens"))
+        })
+        .transpose()?;
+    let nice = (!batch.column(first + 4).is_null(0))
+        .then(|| int32(batch, first + 4).map(|column| column.value(0)))
+        .transpose()?;
+    Ok((scheduling, cpu_tokens, nice))
 }
 
 /// The terminal resource sample of a current-layout job batch: absent when every one of
@@ -4650,7 +4920,7 @@ fn workspace_path_str(path: &WorkspacePath) -> &str {
         .expect("WorkspacePath is always UTF-8")
 }
 
-/// The fourteen admission columns of one job record: all null for an unkeyed job.
+/// The fourteen layout 8 admission columns: all null for an unkeyed job.
 fn admission_columns(admission: Option<&JobAdmission>) -> Result<Vec<ArrayRef>, ArtifactError> {
     let Some(admission) = admission else {
         let schema = protected_record_schema();
@@ -4726,8 +4996,8 @@ fn admission_columns(admission: Option<&JobAdmission>) -> Result<Vec<ArrayRef>, 
     ])
 }
 
-/// The admission a job record's columns from `first` on carry: none when its key is null, and
-/// then every other admission column must be null too.
+/// The admission in the layout 8 columns from `first` and the layout 11 environment digest:
+/// none when its key is null, and then every other admission column must be null too.
 fn decode_admission(
     batch: &RecordBatch,
     first: usize,
@@ -4746,7 +5016,9 @@ fn decode_admission(
         WorkspacePath::new(value).map_err(|error| ArtifactError::Arrow(error.to_string()))
     };
     let Some(key) = text(0)? else {
-        return if (1..14).any(present) {
+        return if (1..ADMISSION_COLUMNS).any(present)
+            || !batch.column(ADMISSION_ENV_SHA256_COLUMN).is_null(0)
+        {
             Err(ArtifactError::Arrow(
                 "an unkeyed job record carries admission columns".into(),
             ))
@@ -4755,6 +5027,7 @@ fn decode_admission(
         };
     };
     let key = AdmissionKey::new(key)?;
+    let env_sha256 = required_digest(batch, ADMISSION_ENV_SHA256_COLUMN, 0)?;
     let cwd = text(1)?.map(path).transpose()?;
     let mode = parse_mode(required(2, "sandbox mode")?)?;
     if !present(3) {
@@ -4826,6 +5099,7 @@ fn decode_admission(
         cwd,
         mode,
         env,
+        env_sha256,
         stdin,
         session,
         stdout_copy: publication(10)?,
@@ -6872,6 +7146,9 @@ mod tests {
             duration_ms: None,
             resources: None,
             admission: None,
+            scheduling: JobScheduling::default(),
+            cpu_tokens: None,
+            nice: None,
         }
     }
 
@@ -7134,12 +7411,29 @@ mod tests {
         }
     }
 
+    /// A fixture's full authored environment, sorted by name with each UTF-8 component u64LE framed.
+    fn authored_env_sha256(env: &BTreeMap<String, String>) -> Sha256Digest {
+        let mut hasher = Sha256::new();
+        for (name, value) in env {
+            for bytes in [name.as_bytes(), value.as_bytes()] {
+                let length = u64::try_from(bytes.len())
+                    .expect("a fixture environment component fits in u64");
+                hasher.update(length.to_le_bytes());
+                hasher.update(bytes);
+            }
+        }
+        Sha256Digest::from_bytes(hasher.finalize().into())
+    }
+
     fn keyed(key: &str, stdin: AdmittedStdin) -> JobAdmission {
+        let env = BTreeMap::from([("LANG".to_owned(), "C".to_owned())]);
+        let env_sha256 = authored_env_sha256(&env);
         JobAdmission {
             key: AdmissionKey::new(key).unwrap(),
             cwd: Some(WorkspacePath::new("packages/app").unwrap()),
             mode: RunSandboxMode::ReadOnly,
-            env: BTreeMap::from([("LANG".to_owned(), "C".to_owned())]),
+            env,
+            env_sha256,
             stdin,
             session: AdmittedSession::Named("build".into()),
             stdout_copy: Some(OutputPublication {
@@ -7175,7 +7469,6 @@ mod tests {
             .iter()
             .map(|field| field.name().as_str())
             .collect();
-        assert_eq!(RECORD_SCHEMA_VERSION, 9);
         assert_eq!(FIRST_KEYED_LAYOUT, 8);
         assert_eq!(ADMISSION_COLUMN, 59);
         assert_eq!(names[ADMISSION_COLUMN - 1], "resources_volume_build");
@@ -7232,11 +7525,10 @@ mod tests {
             .iter()
             .map(|field| field.name().as_str())
             .collect();
-        assert_eq!(RECORD_SCHEMA_VERSION, 9);
         assert_eq!(SAMPLE_COLUMN, 73);
         assert_eq!(names[SAMPLE_COLUMN - 1], "admission_stderr_copy_policy");
         assert_eq!(
-            &names[SAMPLE_COLUMN..],
+            &names[SAMPLE_COLUMN..CPU_COLUMN],
             &[
                 "resources_cpu_pct",
                 "resources_leaf",
@@ -7262,6 +7554,437 @@ mod tests {
         );
     }
 
+    fn gate(want: usize, wait_ms: u32) -> JobScheduling {
+        JobScheduling::new(
+            ExecScope::Workspace,
+            JobserverClass::Gate,
+            NonZeroUsize::new(want).unwrap(),
+            NonZeroU32::new(wait_ms),
+        )
+        .unwrap()
+    }
+
+    /// Layout 10 appends the job's CPU class, demand, gate bound, granted tokens and observed
+    /// nice after layout 9's sample columns, and layout 9 stays the exact prefix.
+    #[test]
+    fn layout_ten_appends_the_cpu_columns_after_the_complete_layout_nine_prefix() {
+        let record = JobArtifactRecord {
+            scheduling: gate(6, 120_000),
+            cpu_tokens: NonZeroUsize::new(4),
+            nice: Some(0),
+            ..valid_job_record(9)
+        };
+        let batch = job_record_to_batch(&record).unwrap();
+        let schema = batch.schema();
+        let names: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(CPU_COLUMN, 78);
+        assert_eq!(
+            names[CPU_COLUMN - 1],
+            "resources_accounting_charged_peak_bytes"
+        );
+        assert_eq!(
+            &names[CPU_COLUMN..ADMISSION_ENV_SHA256_COLUMN],
+            &CPU_COLUMNS
+        );
+        assert_eq!(
+            round_trip(&record),
+            record,
+            "the class, demand, bound, grant and observed nice survive"
+        );
+        let background = JobArtifactRecord {
+            scheduling: JobScheduling::default(),
+            cpu_tokens: NonZeroUsize::new(1),
+            nice: Some(10),
+            ..valid_job_record(9)
+        };
+        assert_eq!(round_trip(&background), background);
+
+        let prefix_schema = Arc::new(Schema::new(schema.fields()[..CPU_COLUMN].to_vec()));
+        let mut prefix_columns = batch.columns()[..CPU_COLUMN].to_vec();
+        prefix_columns[1] = Arc::new(UInt64Array::from(vec![9]));
+        let prior = RecordBatch::try_new(prefix_schema, prefix_columns).unwrap();
+        assert_eq!(
+            earlier_layout(&prior),
+            Some(9),
+            "layout 9 remains the exact prefix"
+        );
+    }
+
+    /// Layout 11 appends only the authored environment commitment; every layout 10 field stays
+    /// in the same position with its original type and nullability.
+    #[test]
+    fn layout_eleven_appends_the_environment_digest_after_the_complete_layout_ten_prefix() {
+        let record = JobArtifactRecord {
+            resources: Some(sample(9, 1_234_567, 4242)),
+            admission: Some(keyed("op-layout-eleven", AdmittedStdin::Empty)),
+            scheduling: gate(6, 120_000),
+            cpu_tokens: NonZeroUsize::new(4),
+            nice: Some(0),
+            ..valid_job_record(9)
+        };
+        let batch = job_record_to_batch(&record).unwrap();
+        let schema = batch.schema();
+        assert_eq!(RECORD_SCHEMA_VERSION, 11);
+        assert_eq!(ADMISSION_ENV_SHA256_COLUMN, 84);
+        assert_eq!(schema.fields().len(), ADMISSION_ENV_SHA256_COLUMN + 1);
+        assert_eq!(
+            schema.field(ADMISSION_ENV_SHA256_COLUMN - 1).name(),
+            "cpu_scope"
+        );
+        assert_eq!(
+            schema.field(ADMISSION_ENV_SHA256_COLUMN),
+            &field("admission_env_sha256", DataType::Binary, true)
+        );
+        assert_eq!(round_trip(&record), record);
+
+        let prefix_schema = Arc::new(Schema::new(
+            schema.fields()[..ADMISSION_ENV_SHA256_COLUMN].to_vec(),
+        ));
+        let mut prefix_columns = batch.columns()[..ADMISSION_ENV_SHA256_COLUMN].to_vec();
+        prefix_columns[1] = Arc::new(UInt64Array::from(vec![10]));
+        let prior = RecordBatch::try_new(prefix_schema, prefix_columns).unwrap();
+        assert_eq!(
+            earlier_layout(&prior),
+            Some(10),
+            "layout 10 remains the exact prefix"
+        );
+        assert_damage(
+            &prior,
+            "layout 10 cannot attest to an environment commitment",
+        );
+    }
+
+    /// A commitment carries the full authored identity without persisting private names or values
+    /// or pretending the public projection is sufficient to recompute it.
+    #[test]
+    fn an_authored_environment_digest_round_trips_without_its_private_values() {
+        let private_name = "CUSTOM_PRIVATE_ENVIRONMENT_COMMITMENT_ONLY";
+        let private_value = "private-authored-value-must-never-enter-records";
+        let authored_env = BTreeMap::from([
+            ("LANG".to_owned(), "C".to_owned()),
+            (private_name.to_owned(), private_value.to_owned()),
+        ]);
+        let mut admission = keyed("op-private-environment", AdmittedStdin::Empty);
+        admission.env_sha256 = authored_env_sha256(&authored_env);
+        assert_ne!(admission.env_sha256, authored_env_sha256(&admission.env));
+        let record = JobArtifactRecord {
+            admission: Some(admission.clone()),
+            ..valid_job_record(9)
+        };
+        let batch = job_record_to_batch(&record).unwrap();
+        assert_eq!(
+            binary(&batch, ADMISSION_ENV_SHA256_COLUMN)
+                .unwrap()
+                .value(0),
+            admission.env_sha256.as_bytes().as_slice()
+        );
+        let payload = encode_batch(&batch).unwrap();
+        for private_text in [private_name, private_value] {
+            assert!(
+                !payload
+                    .windows(private_text.len())
+                    .any(|bytes| bytes == private_text.as_bytes()),
+                "the private authored environment is not recorded"
+            );
+        }
+        let read = batch_to_protected_record(&decode_single_batch(&payload).unwrap()).unwrap();
+        assert_eq!(read, ProtectedRecord::Job(record));
+    }
+
+    /// A keyed row requires one exactly-32-byte digest, including for an empty public environment.
+    #[test]
+    fn a_keyed_environment_digest_must_be_present_and_exactly_32_bytes() {
+        let mut admission = keyed("op-empty-environment", AdmittedStdin::Empty);
+        admission.env.clear();
+        admission.env_sha256 = authored_env_sha256(&admission.env);
+        assert_eq!(admission.env_sha256, Sha256Digest::compute(&[]));
+        let record = JobArtifactRecord {
+            admission: Some(admission),
+            ..valid_job_record(9)
+        };
+        let batch = admitted(&record);
+        assert_eq!(round_trip(&record), record);
+        assert_damage(
+            &null_column(&batch, ADMISSION_ENV_SHA256_COLUMN),
+            "a keyed record without its environment commitment",
+        );
+        for length in [0, 1, 31, 33, 64] {
+            let bytes = vec![0x5a; length];
+            let malformed = replace_column(
+                &batch,
+                ADMISSION_ENV_SHA256_COLUMN,
+                Arc::new(BinaryArray::from(vec![Some(bytes.as_slice())])),
+            );
+            assert_damage(
+                &malformed,
+                &format!("an environment digest of {length} bytes"),
+            );
+        }
+    }
+
+    /// Unkeyed job and lifecycle records carry no authored environment commitment.
+    #[test]
+    fn unkeyed_and_lifecycle_records_have_no_environment_digest() {
+        let record = valid_job_record(9);
+        let unkeyed = admitted(&record);
+        assert!(unkeyed.column(ADMISSION_ENV_SHA256_COLUMN).is_null(0));
+        assert_eq!(round_trip(&record), record);
+        let commitment = keyed("op-digest", AdmittedStdin::Empty).env_sha256;
+        let digest: ArrayRef = Arc::new(BinaryArray::from(vec![Some(
+            commitment.as_bytes().as_slice(),
+        )]));
+        assert_damage(
+            &replace_column(&unkeyed, ADMISSION_ENV_SHA256_COLUMN, Arc::clone(&digest)),
+            "an unkeyed record carrying an environment commitment",
+        );
+
+        let manifest = CheckpointManifestRecord {
+            version: RECORD_SCHEMA_VERSION as u16,
+            repo_id: repo(),
+            origin_incarnation: incarnation(),
+            barrier_id: 1,
+            visible_jobs: Vec::new(),
+            records_sha256: Sha256Digest::compute(RECORD_MAGIC),
+        };
+        let lifecycle = checkpoint_manifest_to_batch(&manifest).unwrap();
+        assert!(lifecycle.column(ADMISSION_ENV_SHA256_COLUMN).is_null(0));
+        assert_eq!(
+            batch_to_protected_record(&lifecycle).unwrap(),
+            ProtectedRecord::CheckpointManifest(manifest)
+        );
+        assert_damage(
+            &replace_column(&lifecycle, ADMISSION_ENV_SHA256_COLUMN, digest),
+            "a lifecycle record carrying a keyed environment commitment",
+        );
+    }
+
+    /// A layout 10 history has no environment commitment: it remains byte-for-byte archived,
+    /// and no key from the incarnation it served is silently migrated or proved absent.
+    #[test]
+    fn a_layout_ten_keyed_history_is_retained_untouched_and_unprovable() {
+        let root = temp_root("layout-ten-environment-unprovable");
+        drop(store_at(&root, ArtifactConfig::default()));
+        let admission = keyed("op-layout-ten", AdmittedStdin::Empty);
+        let historical = JobArtifactRecord {
+            admission: Some(admission.clone()),
+            ..valid_job_record(5)
+        };
+        append_batch(&root, &earlier_batch(&historical, 1, 10));
+        let old_records = fs::read(records_path(&root)).unwrap();
+        let set_aside = root
+            .join(PROTECTED_DIRECTORY)
+            .join(JOB_DIRECTORY)
+            .join(SET_ASIDE_DIRECTORY)
+            .join("layout-10");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        assert_eq!(
+            store.recovery().set_aside,
+            Some(SetAsideStore {
+                layout: 10,
+                path: set_aside.clone(),
+            })
+        );
+        assert!(store.recovery().frames.is_empty());
+        assert_eq!(fs::read(set_aside.join(RECORDS_FILE)).unwrap(), old_records);
+        assert_eq!(
+            store.admitted(&admission.key),
+            AdmissionLookup::Unprovable {
+                set_aside: &set_aside,
+            }
+        );
+        let job_id = store.next_job_id().unwrap();
+        assert_eq!(job_id.get(), 6);
+        let before = fs::read(records_path(&root)).ok();
+        assert!(matches!(
+            store.begin_job(
+                job_id,
+                1,
+                &argv_true(),
+                Some(keyed("op-new-key", AdmittedStdin::Empty)),
+                JobScheduling::default(),
+                OutputTargets::default(),
+            ),
+            Err(ArtifactError::AdmissionKeyUnprovable { set_aside: path }) if path == set_aside
+        ));
+        assert_eq!(fs::read(records_path(&root)).ok(), before);
+        drop(store);
+        let reopened = store_at(&root, ArtifactConfig::default());
+        assert_eq!(
+            reopened.admitted(&admission.key),
+            AdmissionLookup::Unprovable {
+                set_aside: &set_aside,
+            }
+        );
+        assert_eq!(fs::read(set_aside.join(RECORDS_FILE)).unwrap(), old_records);
+        drop(reopened);
+        fs::remove_dir_all(&root).unwrap();
+    }
+    /// A job that never reached a grant or an observed command names neither: nothing is
+    /// inferred, and a record that claims a placement it cannot have is damage.
+    #[test]
+    fn cpu_placement_is_named_only_where_it_was_observed() {
+        let never_spawned = JobArtifactRecord {
+            state: JobState::Failed,
+            ..valid_job_record(9)
+        };
+        let read = round_trip(&never_spawned);
+        assert_eq!((read.cpu_tokens, read.nice), (None, None));
+
+        let running = JobArtifactRecord {
+            state: JobState::Running,
+            cpu_tokens: NonZeroUsize::new(2),
+            nice: Some(10),
+            ..valid_job_record(9)
+        };
+        assert!(matches!(
+            running.validate(),
+            Err(ArtifactError::Integrity { .. })
+        ));
+        let unexplained = JobArtifactRecord {
+            nice: Some(10),
+            ..valid_job_record(9)
+        };
+        assert!(matches!(
+            unexplained.validate(),
+            Err(ArtifactError::Integrity { .. })
+        ));
+
+        let base = admitted(&JobArtifactRecord {
+            scheduling: gate(2, 5_000),
+            ..valid_job_record(9)
+        });
+        for (column, why) in [
+            (CPU_COLUMN, "no class"),
+            (CPU_COLUMN + 1, "no demand"),
+            (CPU_COLUMN + 2, "a gate without its bound"),
+            (CPU_COLUMN + 5, "no scope"),
+        ] {
+            assert!(
+                batch_to_protected_record(&null_column(&base, column)).is_err(),
+                "{why} is damage"
+            );
+        }
+        let bounded_background = replace_column(
+            &admitted(&valid_job_record(9)),
+            CPU_COLUMN + 2,
+            Arc::new(UInt32Array::from(vec![Some(5_000)])),
+        );
+        assert!(batch_to_protected_record(&bounded_background).is_err());
+        let zero_tokens = replace_column(
+            &admitted(&valid_job_record(9)),
+            CPU_COLUMN + 3,
+            Arc::new(UInt64Array::from(vec![Some(0)])),
+        );
+        assert!(batch_to_protected_record(&zero_tokens).is_err());
+    }
+
+    #[test]
+    fn scheduling_admits_only_a_bounded_gate_or_unbounded_background() {
+        let want = NonZeroUsize::new(3).unwrap();
+        let bound = NonZeroU32::new(120_000);
+        let workspace = ExecScope::Workspace;
+        assert!(JobScheduling::new(workspace, JobserverClass::Gate, want, None).is_none());
+        assert!(JobScheduling::new(workspace, JobserverClass::Background, want, bound).is_none());
+        assert!(
+            JobScheduling::new(ExecScope::HostGate, JobserverClass::Background, want, None)
+                .is_none(),
+            "only a gate runs at the host boundary"
+        );
+        let gate = JobScheduling::new(workspace, JobserverClass::Gate, want, bound).unwrap();
+        assert_eq!(
+            (gate.scope(), gate.class(), gate.want(), gate.wait_ms()),
+            (workspace, JobserverClass::Gate, want, bound)
+        );
+        let host =
+            JobScheduling::new(ExecScope::HostGate, JobserverClass::Gate, want, bound).unwrap();
+        assert_eq!(host.scope(), ExecScope::HostGate);
+        let ordinary = JobScheduling::default();
+        assert_eq!(
+            (
+                ordinary.scope(),
+                ordinary.class(),
+                ordinary.want(),
+                ordinary.wait_ms()
+            ),
+            (
+                workspace,
+                JobserverClass::Background,
+                NonZeroUsize::MIN,
+                None
+            )
+        );
+        let host_record = JobArtifactRecord {
+            scheduling: host,
+            ..valid_job_record(9)
+        };
+        assert_eq!(round_trip(&host_record), host_record);
+        let host_background = replace_column(
+            &admitted(&valid_job_record(9)),
+            CPU_COLUMN + 5,
+            Arc::new(StringArray::from(vec![Some("hostGate")])),
+        );
+        assert!(
+            batch_to_protected_record(&host_background).is_err(),
+            "a recorded host-gate background job is damage"
+        );
+    }
+
+    /// A key binds the scheduling it was admitted under with the rest of its request, and the
+    /// terminal record keeps the grant and the observed nice the supervisor reported.
+    #[test]
+    fn a_keyed_admission_binds_its_scheduling_and_its_ending_keeps_the_placement() {
+        let root = temp_root("admission-scheduling");
+        let admission = keyed("land-1", AdmittedStdin::Empty);
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let job_id = store.next_job_id().unwrap();
+        let token = store
+            .begin_job(
+                job_id,
+                1,
+                &argv_true(),
+                Some(admission.clone()),
+                gate(8, 120_000),
+                OutputTargets::default(),
+            )
+            .unwrap();
+        let sealed = store
+            .finish(
+                token,
+                JobEnding {
+                    state: JobState::Exited,
+                    exit: Some(ExitStatus::Exited { code: 0 }),
+                    duration_ms: Some(5),
+                    resources: None,
+                    failure: None,
+                    cpu_tokens: NonZeroUsize::new(6),
+                    nice: Some(0),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (sealed.record.cpu_tokens, sealed.record.nice),
+            (NonZeroUsize::new(6), Some(0))
+        );
+        drop(store);
+
+        let reopened = store_at(&root, ArtifactConfig::default());
+        match reopened.admitted(&admission.key) {
+            AdmissionLookup::Admitted { scheduling, .. } => {
+                assert_eq!(scheduling, gate(8, 120_000));
+            }
+            other => panic!("the key reads back as {other:?}"),
+        }
+        let record = reopened.sealed(job_id).expect("the terminal record");
+        assert_eq!(
+            (record.scheduling, record.cpu_tokens, record.nice),
+            (gate(8, 120_000), NonZeroUsize::new(6), Some(0))
+        );
+    }
+
     fn argv_true() -> ExecCommand {
         ExecCommand::Argv(vec!["true".into()])
     }
@@ -7272,13 +7995,22 @@ mod tests {
     #[test]
     fn an_admission_survives_its_records_and_binds_its_key_to_one_job() {
         let root = temp_root("admission-round-trip");
-        let inline = keyed(
+        let mut inline = keyed(
             "op-1",
             AdmittedStdin::Inline {
                 sha256: Sha256Digest::compute(b"payload"),
                 bytes: 7,
             },
         );
+        let authored_env = BTreeMap::from([
+            ("LANG".to_owned(), "C".to_owned()),
+            (
+                "CUSTOM_PRIVATE".to_owned(),
+                "restart-commitment-only".to_owned(),
+            ),
+        ]);
+        inline.env_sha256 = authored_env_sha256(&authored_env);
+        assert_ne!(inline.env_sha256, authored_env_sha256(&inline.env));
         let mut store = store_at(&root, ArtifactConfig::default());
         let job_id = store.next_job_id().unwrap();
         let token = store
@@ -7287,27 +8019,44 @@ mod tests {
                 1,
                 &argv_true(),
                 Some(inline.clone()),
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
         let sealed = store.finish(token, JobState::Exited).unwrap();
         assert_eq!(sealed.record.admission.as_ref(), Some(&inline));
+        assert_eq!(
+            sealed.record.admission.as_ref().unwrap().env_sha256,
+            inline.env_sha256,
+            "the terminal record retains the authored environment commitment"
+        );
         let next = store.next_job_id().unwrap();
         assert!(matches!(
-            store.begin_job(next, 1, &argv_true(), Some(inline.clone()), OutputTargets::default()),
+            store.begin_job(next, 1, &argv_true(), Some(inline.clone()), JobScheduling::default(), OutputTargets::default()),
             Err(ArtifactError::AdmissionKeyTaken { admitted, .. }) if admitted == job_id
         ));
         drop(store);
 
         let reopened = store_at(&root, ArtifactConfig::default());
+        for frame in &reopened.recovery().frames {
+            let ProtectedRecord::Job(record) = &frame.record else {
+                panic!("this store contains only the admitted job's records");
+            };
+            assert_eq!(
+                record.admission.as_ref().unwrap().env_sha256,
+                inline.env_sha256,
+                "both initial and terminal records retain the commitment after reopen"
+            );
+        }
         match reopened.admitted(&inline.key) {
             AdmissionLookup::Admitted {
                 job_id: admitted,
                 command,
                 admission,
+                scheduling,
             } => assert_eq!(
-                (admitted, command, admission),
-                (job_id, &argv_true(), &inline)
+                (admitted, command, admission, scheduling),
+                (job_id, &argv_true(), &inline, JobScheduling::default())
             ),
             other => panic!("the key reads back as {other:?}"),
         }
@@ -7328,7 +8077,14 @@ mod tests {
         let admission = keyed("op-1", AdmittedStdin::Stream);
         let unkeyed = first.next_job_id().unwrap();
         let token = first
-            .begin_job(unkeyed, 1, &argv_true(), None, OutputTargets::default())
+            .begin_job(
+                unkeyed,
+                1,
+                &argv_true(),
+                None,
+                JobScheduling::default(),
+                OutputTargets::default(),
+            )
             .unwrap();
         first.finish(token, JobState::Exited).unwrap();
         let bound = first.next_job_id().unwrap();
@@ -7338,6 +8094,7 @@ mod tests {
                 1,
                 &argv_true(),
                 Some(admission.clone()),
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -7348,7 +8105,7 @@ mod tests {
         );
         let records = fs::read(records_path(&root)).unwrap();
         assert!(matches!(
-            second.begin_job(stale, 1, &argv_true(), Some(admission), OutputTargets::default()),
+            second.begin_job(stale, 1, &argv_true(), Some(admission), JobScheduling::default(), OutputTargets::default()),
             Err(ArtifactError::AdmissionKeyTaken { job_id: refused, admitted })
                 if refused == stale && admitted == bound
         ));
@@ -7397,6 +8154,7 @@ mod tests {
                 1,
                 &argv_true(),
                 Some(keyed(key.as_str(), AdmittedStdin::Empty)),
+                JobScheduling::default(),
                 OutputTargets::default(),
             );
             if unprovable {
@@ -7469,6 +8227,7 @@ mod tests {
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -7499,6 +8258,7 @@ mod tests {
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -7644,6 +8404,7 @@ mod tests {
                     1,
                     &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                     None,
+                    JobScheduling::default(),
                     OutputTargets::default(),
                 )
                 .unwrap();
@@ -7908,6 +8669,7 @@ mod tests {
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -7973,6 +8735,7 @@ mod tests {
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -8016,6 +8779,7 @@ mod tests {
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -8052,6 +8816,7 @@ mod tests {
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -8087,6 +8852,7 @@ mod tests {
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -8186,6 +8952,7 @@ mod tests {
                 1,
                 &crate::api::dto::ExecCommand::Argv(vec!["true".into()]),
                 None,
+                JobScheduling::default(),
                 OutputTargets {
                     stdout: StreamTarget::Redirect { source, descriptor },
                     stderr: StreamTarget::Captured,

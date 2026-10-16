@@ -17,17 +17,20 @@
 //! case: a variant absent from the corpus is a variant the TypeScript side is unverified against.
 //! `nx run cowshed:wire-fixtures` regenerates it and runs ahead of every cargo test target.
 
-use std::{collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
+use std::{
+    collections::BTreeMap, ffi::OsString, num::NonZeroUsize, os::unix::ffi::OsStringExt,
+    path::PathBuf,
+};
 
 use cowshed_core::{
     api::{
         AbandonedWork, BinaryData, CarrySide, CheckpointInfo, CommandArg, CpuMicros,
-        CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule, ExitStatus, Finding,
-        FindingSeverity, GcCandidate, GcDeferred, GcReason, GcReport, GitOid, GrantSet,
+        CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule, ExecScope, ExitStatus,
+        Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason, GcReport, GitOid, GrantSet,
         HostLoadSample, JobAccounting, JobId, JobInfo, JobLeafAttribution, JobProcessLeaf,
-        JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage, LandReport,
-        LandingCommits, OneCoreCpuPercent, OutputLimitInfo, OutputStorage, OutputSummary,
-        PortBlock, ProcessCoverage, ProcessCoverageGap, ProtectedOutput, PushReport,
+        JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage, JobserverClass,
+        LandReport, LandingCommits, OneCoreCpuPercent, OutputLimitInfo, OutputStorage,
+        OutputSummary, PortBlock, ProcessCoverage, ProcessCoverageGap, ProtectedOutput, PushReport,
         RebaseBuildVolume, RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule, ResidentBytes,
         ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
         StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId, UsageReconciliation,
@@ -235,6 +238,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         output_limit: None,
         stdin: empty_stdin(),
         failure: None,
+        class: JobserverClass::Background,
+        scope: ExecScope::Workspace,
+        nice: None,
+        cpu_tokens: None,
     };
 
     let running_cpu = CpuTotals {
@@ -327,6 +334,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             complete: true,
         },
         failure: None,
+        class: JobserverClass::Background,
+        scope: ExecScope::Workspace,
+        nice: Some(10),
+        cpu_tokens: NonZeroUsize::new(4),
     };
 
     // An exited job with inline stdin.
@@ -357,6 +368,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             complete: true,
         },
         failure: None,
+        class: JobserverClass::Gate,
+        scope: ExecScope::Workspace,
+        nice: Some(0),
+        cpu_tokens: NonZeroUsize::new(8),
     };
     // A supervisor configured with no volume sampled it: its volumes say so.
     let exited = JobInfo {
@@ -400,6 +415,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         output_limit: None,
         stdin: empty_stdin(),
         failure: None,
+        class: JobserverClass::Background,
+        scope: ExecScope::Workspace,
+        nice: Some(10),
+        cpu_tokens: NonZeroUsize::new(2),
     };
     // A platform with no used-bytes stat for the workspace volume, and a build volume that shrank.
     let signaled = JobInfo {
@@ -446,6 +465,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             complete: false,
         },
         failure: None,
+        class: JobserverClass::Background,
+        scope: ExecScope::Workspace,
+        nice: Some(10),
+        cpu_tokens: NonZeroUsize::new(1),
     };
 
     // A cancelled job may die from a signal or exit normally after handling it.
@@ -474,6 +497,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         resources: None,
         stdout: inline_stream(""),
         stderr: inline_stream("spawn refused\n"),
+        class: JobserverClass::Background,
+        scope: ExecScope::Workspace,
+        nice: None,
+        cpu_tokens: None,
         ..exited.clone()
     };
 
@@ -498,6 +525,46 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         stdout: inline_stream(""),
         stderr: inline_stream("syntax error: unterminated subshell\n"),
         failure: Some(cowshed_core::api::JobFailure::ScriptSyntax),
+        class: JobserverClass::Background,
+        scope: ExecScope::Workspace,
+        nice: None,
+        cpu_tokens: None,
+        ..exited.clone()
+    };
+
+    // A job whose host CPU admission failed before its command ran: a gate's bound expired. It
+    // holds no grant and was never observed, and it is the one job that ran as the host gate.
+    let cpu_admission_failed = JobInfo {
+        job_id: JobId::new(9).expect("fixture job id"),
+        state: JobState::Failed,
+        exit: None,
+        pid: None,
+        resources: None,
+        stdout: inline_stream(""),
+        stderr: inline_stream("gate-admission-timeout: waited 120000 ms\n"),
+        failure: Some(cowshed_core::api::JobFailure::CpuAdmission),
+        class: JobserverClass::Gate,
+        scope: ExecScope::HostGate,
+        nice: None,
+        cpu_tokens: None,
+        ..exited.clone()
+    };
+
+    // A job whose grant was held but whose owned child could not be placed at its nice: the child
+    // was killed before its command ran, so no nice was observed.
+    let priority_failed = JobInfo {
+        job_id: JobId::new(10).expect("fixture job id"),
+        state: JobState::Failed,
+        exit: None,
+        pid: Some(4246),
+        resources: None,
+        stdout: inline_stream(""),
+        stderr: inline_stream("cannot place pid 4246 at nice 10\n"),
+        failure: Some(cowshed_core::api::JobFailure::Priority),
+        class: JobserverClass::Background,
+        scope: ExecScope::Workspace,
+        nice: None,
+        cpu_tokens: NonZeroUsize::new(1),
         ..exited.clone()
     };
 
@@ -516,6 +583,11 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ),
         ("failed", document("job status", &failed)),
         ("scriptSyntax", document("job status", &script_syntax)),
+        (
+            "cpuAdmissionFailed",
+            document("job status", &cpu_admission_failed),
+        ),
+        ("priorityFailed", document("job status", &priority_failed)),
         ("list", document("job list", &list)),
     ])
 }
@@ -637,7 +709,7 @@ fn grant_sets() -> BTreeMap<&'static str, Value> {
 }
 
 fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
-    let land_first = LandReport {
+    let land_first = cowshed_core::api::dto::LandedReport {
         landed_head: oid("1111111111111111111111111111111111111111"),
         target_branch: "main".to_owned(),
         previous_target_head: None,
@@ -650,7 +722,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             },
         },
     };
-    let land_retired = LandReport {
+    let land_retired = cowshed_core::api::dto::LandedReport {
         previous_target_head: Some(oid("2222222222222222222222222222222222222222")),
         target_was_checked_out: true,
         retired: true,
@@ -695,7 +767,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
-    let land_held = LandReport {
+    let land_held = cowshed_core::api::dto::LandedReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
             seed: cowshed_core::api::dto::LandSeed::Frozen,
             adoption: cowshed_core::api::dto::Adoption::Skipped {
@@ -710,7 +782,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
-    let land_opening = LandReport {
+    let land_opening = cowshed_core::api::dto::LandedReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
             seed: cowshed_core::api::dto::LandSeed::Frozen,
             adoption: cowshed_core::api::dto::Adoption::Skipped {
@@ -725,7 +797,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
-    let landing_opening = LandReport {
+    let landing_opening = cowshed_core::api::dto::LandedReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
             seed: cowshed_core::api::dto::LandSeed::Unchanged,
             adoption: cowshed_core::api::dto::Adoption::Skipped {
@@ -740,7 +812,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         },
         ..land_first.clone()
     };
-    let land_building = LandReport {
+    let land_building = cowshed_core::api::dto::LandedReport {
         build_volume: cowshed_core::api::dto::LandBuildVolume {
             seed: cowshed_core::api::dto::LandSeed::Unchanged,
             adoption: cowshed_core::api::dto::Adoption::Skipped {
@@ -895,14 +967,22 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         (
             "LandReport",
             BTreeMap::from([
-                ("firstLanding", document("land report", &land_first)),
-                ("retired", document("land report", &land_retired)),
-                ("adoptionSkipped", document("land report", &land_held)),
-                ("landingBuilding", document("land report", &land_building)),
-                ("landingOpening", document("land report", &landing_opening)),
+                (
+                    "delivered",
+                    document("land report", &LandReport::Delivered(PushReport {
+                        source_head: oid("1111111111111111111111111111111111111111"),
+                        destination_ref: "refs/cowshed/raven/heads/topic".to_owned(),
+                        previous_destination_head: None,
+                    })),
+                ),
+                ("firstLanding", document("land report", &LandReport::Landed(land_first))),
+                ("retired", document("land report", &LandReport::Landed(land_retired))),
+                ("adoptionSkipped", document("land report", &LandReport::Landed(land_held))),
+                ("landingBuilding", document("land report", &LandReport::Landed(land_building))),
+                ("landingOpening", document("land report", &LandReport::Landed(landing_opening))),
                 (
                     "adoptionSkippedOpening",
-                    document("land report", &land_opening),
+                    document("land report", &LandReport::Landed(land_opening)),
                 ),
             ]),
         ),
@@ -1437,4 +1517,53 @@ fn each_ended_jobs_sample_in_the_corpus_is_its_own() {
             );
         }
     }
+}
+
+/// Every scheduling variant and optional observation a job can carry is in the corpus: a value
+/// absent from it is one the TypeScript side is unverified against, and a zero nice is a real
+/// observation, not an omission.
+#[test]
+fn every_scheduling_fact_appears_in_the_corpus() {
+    let documents: Vec<Value> = job_infos()
+        .values()
+        .flat_map(|value| match value {
+            Value::Array(items) => items.clone(),
+            single => vec![single.clone()],
+        })
+        .collect();
+    for (field, spellings) in [
+        ("class", ["background", "gate"].as_slice()),
+        ("scope", ["workspace", "hostGate"].as_slice()),
+        (
+            "failure",
+            ["scriptSyntax", "cpuAdmission", "priority"].as_slice(),
+        ),
+    ] {
+        for spelling in spellings {
+            assert!(
+                documents
+                    .iter()
+                    .any(|document| document.get(field).and_then(Value::as_str) == Some(spelling)),
+                "no job carries {field} {spelling:?}, so types.ts is unverified for it"
+            );
+        }
+    }
+    for field in ["nice", "cpuTokens"] {
+        assert!(
+            documents
+                .iter()
+                .any(|document| document.get(field).is_some()),
+            "no job carries {field}"
+        );
+        assert!(
+            documents
+                .iter()
+                .any(|document| document.get(field).is_none()),
+            "no job omits {field}"
+        );
+    }
+    assert!(
+        documents.iter().any(|document| document["nice"] == 0),
+        "a gate's observed nice zero is a real observation"
+    );
 }

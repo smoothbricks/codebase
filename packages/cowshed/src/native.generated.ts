@@ -64,7 +64,8 @@ export interface NativeCoordinatorOperations
     NativeCoordinatorRepoMirror,
     NativeCoordinatorSetCheckpointQuota,
     NativeCoordinatorDoctor,
-    NativeCoordinatorWorker {}
+    NativeCoordinatorWorker,
+    NativeCoordinatorExec {}
 
 /** The operations a `WorkspaceHandle` serves: exactly those its authority admits. */
 export interface NativeWorkspaceHandleOperations
@@ -221,6 +222,50 @@ export async function coordinatorDoctor(
   args: CoordinatorDoctorArguments,
 ): Promise<Api.DoctorReport> {
   return V.parseDoctorReport(await handle.doctor(JSON.stringify(args)));
+}
+
+/** A handle that serves `coordinator.exec`. */
+export interface NativeCoordinatorExec {
+  exec(argumentsJson: string, bytes?: Buffer): Promise<string>;
+}
+
+/** The request fields a `coordinator.exec` caller names; its handle binds the rest. */
+export type CoordinatorExecArguments = Pick<
+  Api.ExecParams,
+  | 'workspace'
+  | 'workspaceIncarnation'
+  | 'session'
+  | 'argv'
+  | 'script'
+  | 'cwd'
+  | 'mode'
+  | 'env'
+  | 'trace'
+  | 'stdin'
+  | 'stdoutCopy'
+  | 'stderrCopy'
+  | 'admissionKey'
+  | 'class'
+  | 'want'
+  | 'waitMs'
+  | 'scope'
+>;
+
+/**
+ * Admits one job under coordinator authority, the only route that may ask for the gate class or
+ * the host-gate scope. Inline stdin travels as the upload frame.
+ */
+export async function coordinatorExec(
+  handle: NativeCoordinatorExec,
+  args: CoordinatorExecArguments,
+  bytes?: Uint8Array,
+): Promise<Api.JobId> {
+  return V.parseJobId(
+    await handle.exec(
+      JSON.stringify(args),
+      bytes === undefined ? undefined : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+    ),
+  );
 }
 
 /** A handle that serves `coordinator.fork`. */
@@ -894,6 +939,10 @@ export type WorkerExecArguments = Pick<
   | 'stdoutCopy'
   | 'stderrCopy'
   | 'admissionKey'
+  | 'class'
+  | 'want'
+  | 'waitMs'
+  | 'scope'
 >;
 
 /**

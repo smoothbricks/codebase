@@ -41,6 +41,7 @@ fn sandbox(workspace: &Path, temp: &Path) -> SandboxConfig {
         profile_directory: temp.join("store/run/profiles"),
         port_block: PortBlock::new(40_960, 16).expect("port block"),
         retained_port_blocks: Vec::new(),
+        cpu_pool_directory: None,
         mode: RunSandboxMode::ReadWrite,
         grants: SandboxGrants::default(),
         allowed_unix_sockets: Vec::new(),

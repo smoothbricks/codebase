@@ -18,7 +18,7 @@ import { CPU_TOKENS_ENV, type TokenGrant } from './cpu-tokens.js';
 /** The pool's replies as the wire carries them, one line each. */
 type PoolReply =
   | { ok: true; lease: 'queued' }
-  | { ok: true; lease: 'granted'; tokens: number }
+  | { ok: true; lease: 'granted'; tokens: number; pool?: string }
   | { ok: false; code: 'invalid-request'; error: string };
 
 const parseReply = typia.json.createAssertParse<PoolReply>();
@@ -177,6 +177,32 @@ async function untilLine(stream: ReadableStream<Uint8Array>, marker: string): Pr
 }
 
 describe('the parent-held CPU pool', () => {
+  it('serves a Cargo allocation as its own live child pool without competing with the occupied ancestor', async () => {
+    const { parent, pool } = await openPool(4);
+    const cargo = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 4, children: true }));
+    expect(await cargo.next()).toEqual(QUEUED);
+    const granted = await cargo.next();
+    if (!granted.ok || granted.lease !== 'granted' || granted.pool === undefined)
+      throw new Error('no live child pool granted');
+    expect(granted.tokens).toBe(4);
+    expect(granted.pool).not.toBe(parent.socket);
+    const sibling = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 1 }));
+    expect(await sibling.next()).toEqual(QUEUED);
+    const a = childOf(granted.pool, JSON.stringify({ op: 'cpu-pool', want: 3 }));
+    const b = childOf(granted.pool, JSON.stringify({ op: 'cpu-pool', want: 3 }));
+    expect(await a.next()).toEqual(QUEUED);
+    expect(await a.next()).toEqual({ ok: true, lease: 'granted', tokens: 3 });
+    expect(await b.next()).toEqual(QUEUED);
+    expect(await b.next()).toEqual({ ok: true, lease: 'granted', tokens: 1 });
+    cargo.socket.destroy();
+    await cargo.closed;
+    await Promise.all([a.closed, b.closed]);
+    expect(await sibling.next()).toEqual({ ok: true, lease: 'granted', tokens: 1 });
+    sibling.socket.destroy();
+    await sibling.closed;
+    expect(await pool.close()).toEqual({ ok: true });
+    expect(existsSync(granted.pool)).toBe(false);
+  });
   it('admits queued children first-in, first-out, each at most its want', async () => {
     const { parent } = await openPool(4);
     const a = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 3 }));

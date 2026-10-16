@@ -2,7 +2,7 @@
 /// <reference types="node" />
 
 import { describe, expect, it } from 'bun:test';
-import { exec } from './exec.js';
+import { coordinatorExec, exec } from './exec.js';
 import type { ExecOptions } from './types.js';
 
 /**
@@ -45,6 +45,61 @@ describe('exec', () => {
     const request = JSON.parse('{"argv":["build"],"undeclaredField":"k"}');
     await expect(exec(worker, null, request)).rejects.toThrow();
     expect(sent).toEqual([]);
+  });
+
+  it('forwards the typed scheduling as the generated request spells it and refuses what it cannot spell', async () => {
+    const { worker, sent } = recordingWorker();
+    const scheduling = { class: 'gate', want: 8, waitMs: 120_000, scope: 'hostGate' } satisfies ExecOptions;
+    await expect(exec(worker, null, { argv: ['gate'], ...scheduling })).rejects.toThrow('recorded');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.args).toMatchObject(scheduling);
+    // An untyped caller naming a class, a demand or a scope the wire has no spelling for is refused unsent.
+    for (const invalid of ['"class":"foreground"', '"want":0', '"waitMs":0', '"scope":"host"']) {
+      await expect(exec(worker, null, JSON.parse(`{"argv":["x"],${invalid}}`))).rejects.toThrow();
+    }
+    expect(sent).toHaveLength(1);
+  });
+
+  it('sends the coordinator route as its own operation in the fence it is given', async () => {
+    const sent: { readonly args: unknown; readonly bytes: Buffer | undefined }[] = [];
+    const coordinator = {
+      async exec(argumentsJson: string, bytes?: Buffer): Promise<string> {
+        sent.push({ args: JSON.parse(argumentsJson), bytes });
+        return '7';
+      },
+    };
+    const fence = { workspace: 'raven', workspaceIncarnation: '0198f2c0b7e34dc795f17b238b331c80' };
+    const request = {
+      argv: ['gate'],
+      class: 'gate',
+      want: 8,
+      waitMs: 120_000,
+      scope: 'hostGate',
+    } satisfies ExecOptions & {
+      readonly argv: readonly string[];
+    };
+    await expect(coordinatorExec(coordinator, fence, request)).resolves.toBe(7);
+    expect(sent).toEqual([
+      {
+        args: {
+          ...fence,
+          session: null,
+          argv: [{ encoding: 'utf8', data: 'gate' }],
+          cwd: null,
+          mode: 'readWrite',
+          env: {},
+          trace: null,
+          stdoutCopy: null,
+          stderrCopy: null,
+          stdin: { kind: 'empty' },
+          class: 'gate',
+          want: 8,
+          waitMs: 120_000,
+          scope: 'hostGate',
+        },
+        bytes: undefined,
+      },
+    ]);
   });
 
   it('forwards every option as given and adapts only the command, stdin and defaults', async () => {

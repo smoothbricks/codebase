@@ -1061,8 +1061,11 @@ the workspace intact. A retire refused after the fast-forward keeps the workspac
 message starts with what landed, so the retry is `cowshed rm`, not another land. The retire measures the workspace
 against the branch it just landed on, so a lane unit retires once its lane base holds its commits. The target branch
 (`--target`, default the branch the target's checkout has checked out) must be the checked-out one. `--into` refuses the
-workspace itself (exit 2). `--no-retire` keeps the workspace; `--push-only` stops after validation for review-gated
-flows.
+workspace itself (exit 2). `--no-retire` keeps the workspace. For review-gated flows, `--push-only` validates and
+installs the exact head in `refs/cowshed/<name>/heads/<branch>`, without moving the target, adopting build state,
+recording a land outcome, collecting volumes or retiring the workspace, even when retirement is left at its default. Its
+text output is the preservation ref and source SHA; `--json` returns `kind: delivered` with the existing push-report
+fields. An ordinary land returns `kind: landed` with its target, build-volume and retirement report.
 
 Post-land output restoration never reruns `--check` commands. Checks pass once in the landing workspace; only their
 attributed Nx task graphs may be hashed and restored from the adopted local cache. Missing or uncacheable results are
@@ -1475,6 +1478,31 @@ Copies are published only after the canonical artifact is drained, fsynced, clos
 independent clone/reflink when supported, otherwise an ordinary copy, and is atomically renamed under the selected
 policy. Publication does not alter `StreamInfo.storage` and is never used for reads or authority. Failure is a typed
 operational error and does not change the already-established process result.
+
+### Host CPU admission
+
+Every job takes host CPU tokens from the gateway before its command starts (05_gateway.md, "Host CPU budget"), at a
+class and demand its request names. An ordinary command is `background` and wants one token; `--want <n>` names the
+tokens a heavy runner can use at once, and its grant is between one and `n`. `--class gate` admits the command as the
+operator's gate: it waits for whole returned tokens ahead of queued background work and runs at nice 0, where background
+runs at +10, for at most `--wait-ms <n>` (default 120000), then fails with `gate-admission-timeout` and the holders it
+waited on. `--wait-ms` and `--host` are valid only with `--class gate`, and a gate cannot name a `--session`. Only this
+trusted route may ask for a gate: a workspace's own capability (`worker.exec`) is refused with a typed
+class-not-permitted error before anything runs, and no environment variable confers the class. `--host` runs the gate
+once at the host boundary, outside the workspace sandbox, for the real-APFS host gate. `JobInfo` reports the admitted
+`class` and `scope`, the observed `nice`, and the granted `cpuTokens`.
+
+A host gate's child starts from an empty environment. `--host` carries the operator's environment, including custom
+operator and project variables, in the normal request. There is no execution environment-name allowlist: the existing
+supervisor runtime rules withhold enrolled credentials and replace reserved CPU-authority variables with the actual
+grant. A host gate still cannot name a session; an ordinary exec's environment is unchanged.
+
+For every scope, keyed admission records contain only public environment names: `PATH`, `HOME`, `USER`, `LOGNAME`,
+`SHELL`, `TMPDIR`, `LANG`, `TERM`, `TZ`, `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`, `BUN_INSTALL`, `DEVELOPER_DIR`
+and the `LC_` locale family. This is a record projection, not a restriction on request, activation or job execution. The
+admission's typed SHA-256 commitment binds the full authored environment minus existing withheld credentials, so
+custom/private changes conflict under the same key without exposing their plaintext in worker-readable records
+(07_api.md, "Keyed admission and restart attachment" and "Task server scheduling and trusted host gates").
 
 ### Job artifact storage and output limit
 

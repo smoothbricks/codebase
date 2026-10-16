@@ -263,6 +263,10 @@ fn running_job() -> JobInfo {
             complete: true,
         },
         failure: None,
+        class: cowshed_gateway_types::JobserverClass::Background,
+        scope: cowshed_core::api::ExecScope::Workspace,
+        cpu_tokens: None,
+        nice: None,
     }
 }
 

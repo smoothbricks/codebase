@@ -28,9 +28,10 @@ use super::server::{
     HANDSHAKE_VERSION, MAX_HANDSHAKE_BYTES, MAX_IN_FLIGHT_REQUESTS,
     MAX_JSON_FRAME_BYTES as MAX_RPC_BYTES, codec,
 };
-use crate::error::{CowshedError, ErrorCode, OtherBuild, Result};
+use crate::error::{CowshedError, CpuAdmissionRefusal, ErrorCode, OtherBuild, Result};
 use crate::metadata::WorkspaceName;
 use crate::repository::{ProjectPaths, RepoId, RepositoryBinding};
+use crate::runtime::supervisor_socket::AdmissionSource;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::Value;
@@ -150,6 +151,7 @@ pub(crate) trait ControllerRuntime: Send + Sync {
         authority: &WorkspaceAuthority,
         session: Option<&str>,
         request: ExecRequest,
+        source: AdmissionSource,
     ) -> Result<JobId>;
     async fn logs(
         &self,
@@ -328,10 +330,19 @@ impl ControllerRuntime for ActorRuntime {
         authority: &WorkspaceAuthority,
         session: Option<&str>,
         request: ExecRequest,
+        source: AdmissionSource,
     ) -> Result<JobId> {
+        source.admit(request.class, request.scope)?;
         request.command.validate().map_err(|error| {
             CowshedError::usage(error.to_string(), "provide a valid bounded command")
         })?;
+        crate::api::dto::validate_scheduling(request.class, request.wait_ms, request.scope)
+            .map_err(|error| {
+                CowshedError::cpu_admission(CpuAdmissionRefusal::InvalidRequest {
+                    detail: error.to_string(),
+                })
+            })?;
+        crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
         let ExecRequest {
             command,
             cwd,
@@ -342,6 +353,10 @@ impl ControllerRuntime for ActorRuntime {
             stdout_copy,
             stderr_copy,
             admission_key,
+            class,
+            want,
+            wait_ms,
+            scope,
         } = request;
         let (stdin, inline, mut stream) = match stdin {
             StdinSource::Empty => (ExecStdin::Empty, None, None),
@@ -371,10 +386,24 @@ impl ControllerRuntime for ActorRuntime {
             stdout_copy,
             stderr_copy,
             admission_key,
+            class,
+            want,
+            wait_ms,
+            scope,
         };
-        let job_id = match inline {
-            Some(bytes) => invoke_upload::<operations::WorkerExec>(self, &params, bytes).await?,
-            None => invoke::<operations::WorkerExec>(self, &params).await?,
+        let job_id = match (source, inline) {
+            (AdmissionSource::Worker, Some(bytes)) => {
+                invoke_upload::<operations::WorkerExec>(self, &params, bytes).await?
+            }
+            (AdmissionSource::Worker, None) => {
+                invoke::<operations::WorkerExec>(self, &params).await?
+            }
+            (AdmissionSource::Coordinator, Some(bytes)) => {
+                invoke_upload::<operations::CoordinatorExec>(self, &params, bytes).await?
+            }
+            (AdmissionSource::Coordinator, None) => {
+                invoke::<operations::CoordinatorExec>(self, &params).await?
+            }
         };
         if let Some(reader) = stream.as_mut() {
             let mut buffer = [0_u8; MAX_BINARY_FRAME_BYTES];
@@ -2160,6 +2189,23 @@ impl Coordinator {
         Ok(self.worker_handle(view))
     }
 
+    /// Admits one job under coordinator authority: the only route that may ask for the gate class or
+    /// the host-gate scope (05_gateway.md "Host CPU budget"). The worker capability supplies only
+    /// the workspace incarnation the job is fenced to; the returned handle carries that fence like
+    /// any job of that worker, and the request is admitted as the coordinator's, never the worker's.
+    /// A host gate runs in no session. Custom environment names do not restrict execution;
+    /// the public-name projection applies only to admission records, for every exec scope.
+    pub async fn exec(&self, worker: &WorkspaceHandle, request: ExecRequest) -> Result<JobHandle> {
+        exec_job(
+            &self.runtime,
+            Arc::clone(&worker.authority),
+            None,
+            request,
+            AdmissionSource::Coordinator,
+        )
+        .await
+    }
+
     /// The worker capability the controller minted as `view`.
     pub(super) fn worker_handle(&self, view: WorkspaceView) -> WorkspaceHandle {
         WorkspaceHandle::new(self.workspace_ref(view), Arc::clone(&self.runtime))
@@ -2270,7 +2316,14 @@ impl WorkspaceHandle {
     }
 
     pub async fn exec(&self, request: ExecRequest) -> Result<JobHandle> {
-        exec_job(&self.runtime, Arc::clone(&self.authority), None, request).await
+        exec_job(
+            &self.runtime,
+            Arc::clone(&self.authority),
+            None,
+            request,
+            AdmissionSource::Worker,
+        )
+        .await
     }
 
     pub async fn shell(&self, session: Option<&str>) -> Result<Session> {
@@ -2386,8 +2439,9 @@ async fn exec_job(
     authority: Arc<WorkspaceAuthority>,
     session: Option<&str>,
     request: ExecRequest,
+    source: AdmissionSource,
 ) -> Result<JobHandle> {
-    let id = runtime.exec(&authority, session, request).await?;
+    let id = runtime.exec(&authority, session, request, source).await?;
     Ok(JobHandle {
         authority,
         id,
@@ -2557,6 +2611,7 @@ impl Session {
             Arc::clone(&self.authority),
             self.name.as_deref(),
             request,
+            AdmissionSource::Worker,
         )
         .await
     }
@@ -2587,9 +2642,11 @@ mod tests {
     use super::*;
     use crate::api::call::{Arguments, Serves, call};
     use crate::api::dto::RunSandboxMode;
+    use crate::api::dto::{ExecScope, JobserverClass};
     use crate::api::operations::{self, OPERATIONS, Scope};
     use serde_json::json;
     use std::future::{self, Future};
+    use std::num::{NonZeroU32, NonZeroUsize};
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
     fn empty_params() -> Params {
@@ -2712,6 +2769,7 @@ mod tests {
             _authority: &WorkspaceAuthority,
             _session: Option<&str>,
             _request: ExecRequest,
+            _source: AdmissionSource,
         ) -> Result<JobId> {
             Err(CowshedError::internal("unexpected test exec"))
         }
@@ -2754,6 +2812,8 @@ mod tests {
             "jobId": 7,
             "state": "exited",
             "grantRevision": 1,
+            "class": "background",
+            "scope": "workspace",
             "argv": [{"encoding": "utf8", "data": "true"}],
             "cwd": "packages/app",
             "started": "2016-12-31T23:59:60Z",
@@ -3001,6 +3061,10 @@ mod tests {
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
+            class: JobserverClass::Background,
+            want: NonZeroUsize::MIN,
+            wait_ms: None,
+            scope: ExecScope::Workspace,
         }
     }
     fn workspace_ref(runtime: Arc<dyn ControllerRuntime>) -> WorkspaceRef {
@@ -3527,6 +3591,7 @@ mod tests {
                 &authority,
                 None,
                 exec_request(StdinSource::Stream(Box::pin(std::io::Cursor::new(payload)))),
+                AdmissionSource::Worker,
             )
             .await
             .unwrap();
@@ -3976,6 +4041,190 @@ mod tests {
             .filter(|method| *method != "project.open")
             .collect();
         assert_eq!(agrees.checked, reachable);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ordinary_exec_names_only_a_demand_above_one() {
+        let (runtime, mut server) = actor_pair();
+        let server_task = tokio::spawn(async move {
+            for wants in [None, Some(8)] {
+                let (_, exec) = read_rpc_request(&mut server).await;
+                assert_eq!(exec["method"], "worker.exec");
+                let params = exec["params"].as_object().expect("params");
+                assert_eq!(params.get("want"), wants.map(|want| json!(want)).as_ref());
+                for omitted in ["class", "waitMs", "scope"] {
+                    assert!(params.get(omitted).is_none(), "{omitted} is omitted");
+                }
+                write_rpc_success(&mut server, exec["id"].as_u64().unwrap(), json!(7), None).await;
+            }
+        });
+        let handle = workspace_handle(runtime);
+        handle.exec(exec_request(StdinSource::Empty)).await.unwrap();
+        let mut heavy = exec_request(StdinSource::Empty);
+        heavy.want = NonZeroUsize::new(8).unwrap();
+        handle.exec(heavy).await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    /// The route is the authority: a worker capability that asks for the gate class, or for the
+    /// host-gate scope, is refused with the typed class-not-permitted error before the controller
+    /// hears anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_that_asks_for_a_gate_is_refused_before_any_call() {
+        let (runtime, mut server) = actor_pair();
+        let handle = workspace_handle(runtime);
+        for scope in [ExecScope::Workspace, ExecScope::HostGate] {
+            let mut request = exec_request(StdinSource::Empty);
+            request.class = JobserverClass::Gate;
+            request.wait_ms = NonZeroU32::new(120_000);
+            request.scope = scope;
+            let error = handle
+                .exec(request)
+                .await
+                .expect_err("a worker admits no gate");
+            assert_eq!(error.code, ErrorCode::SandboxDenied);
+            assert_eq!(
+                error.cpu_admission_source(),
+                Some(&CpuAdmissionRefusal::ClassNotPermitted {
+                    class: JobserverClass::Gate,
+                    scope,
+                })
+            );
+        }
+        drop(handle);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_rpc_frame(&mut server),
+        )
+        .await
+        .expect("the connection closed with no call on it");
+        assert!(outcome.is_err(), "no call reached the controller");
+    }
+
+    /// The trusted route travels as coordinator.exec, with the fence of the worker it borrows and
+    /// every scheduling field spelled as the wire spells it; its job is that worker's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_coordinator_exec_travels_as_its_own_route_with_its_scheduling() {
+        let (runtime, mut server) = actor_pair();
+        let server_task = tokio::spawn(async move {
+            let (_, exec) = read_rpc_request(&mut server).await;
+            assert_eq!(exec["method"], "coordinator.exec");
+            assert_eq!(
+                exec["params"],
+                json!({
+                    "repoId": "acme/widget",
+                    "workspace": "raven",
+                    "workspaceIncarnation": "0198f2c0b7e34dc795f17b238b331c80",
+                    "session": null,
+                    "argv": [{"encoding": "utf8", "data": "cat"}],
+                    "cwd": null,
+                    "mode": "readWrite",
+                    "env": {"PROJECT_SETTING": "custom-value", "CI": "true"},
+                    "trace": null,
+                    "stdin": {"kind": "empty"},
+                    "stdoutCopy": null,
+                    "stderrCopy": null,
+                    "class": "gate",
+                    "want": 8,
+                    "waitMs": 120000,
+                    "scope": "hostGate",
+                })
+            );
+            write_rpc_success(&mut server, exec["id"].as_u64().unwrap(), json!(7), None).await;
+        });
+        let worker = workspace_handle(Arc::clone(&runtime));
+        let coordinator = coordinator(runtime);
+        let mut request = exec_request(StdinSource::Empty);
+        request.class = JobserverClass::Gate;
+        request.want = NonZeroUsize::new(8).unwrap();
+        request.wait_ms = NonZeroU32::new(120_000);
+        request.scope = ExecScope::HostGate;
+        request.env = [
+            ("PROJECT_SETTING".to_owned(), "custom-value".to_owned()),
+            ("CI".to_owned(), "true".to_owned()),
+        ]
+        .into();
+        let job = coordinator.exec(&worker, request).await.unwrap();
+        assert_eq!(job.id(), JobId::new(7).unwrap());
+        server_task.await.unwrap();
+    }
+
+    /// A host gate cannot borrow a session's cwd or environment, even under coordinator
+    /// authority. Custom environment names are not refused at this request boundary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_host_gate_in_a_session_is_refused_before_any_call() {
+        let (runtime, mut server) = actor_pair();
+        let worker = workspace_handle(Arc::clone(&runtime));
+        let mut request = exec_request(StdinSource::Empty);
+        request.class = JobserverClass::Gate;
+        request.wait_ms = NonZeroU32::new(120_000);
+        request.scope = ExecScope::HostGate;
+        request.env = [("PROJECT_SETTING".to_owned(), "custom-value".to_owned())].into();
+        let error = runtime
+            .exec(
+                &worker.authority,
+                Some("work"),
+                request,
+                AdmissionSource::Coordinator,
+            )
+            .await
+            .expect_err("a host gate runs in no session");
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert!(error.message.contains("session"), "{}", error.message);
+        drop((worker, runtime));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_rpc_frame(&mut server),
+        )
+        .await
+        .expect("the connection closed with no call on it");
+        assert!(outcome.is_err(), "no call reached the controller");
+    }
+
+    /// A scheduling the gateway cannot accept — a gate with no bound, background with one, the
+    /// host gate as background — is refused as an invalid request before the controller hears
+    /// anything, even under coordinator authority.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_scheduling_the_gateway_cannot_accept_is_refused_before_any_call() {
+        let (runtime, mut server) = actor_pair();
+        let worker = workspace_handle(Arc::clone(&runtime));
+        let coordinator = coordinator(runtime);
+        for (class, wait_ms, scope) in [
+            (JobserverClass::Gate, None, ExecScope::Workspace),
+            (
+                JobserverClass::Background,
+                NonZeroU32::new(1),
+                ExecScope::Workspace,
+            ),
+            (JobserverClass::Background, None, ExecScope::HostGate),
+        ] {
+            let mut request = exec_request(StdinSource::Empty);
+            request.class = class;
+            request.wait_ms = wait_ms;
+            request.scope = scope;
+            let error = coordinator
+                .exec(&worker, request)
+                .await
+                .expect_err("an invalid scheduling");
+            assert_eq!(error.code, ErrorCode::Usage);
+            assert!(matches!(
+                error.cpu_admission_source(),
+                Some(CpuAdmissionRefusal::InvalidRequest { .. })
+            ));
+        }
+        drop((worker, coordinator));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_rpc_frame(&mut server),
+        )
+        .await
+        .expect("the connection closed with no call on it");
+        assert!(outcome.is_err(), "no call reached the controller");
     }
 
     #[cfg(unix)]

@@ -1,30 +1,37 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::future::Future;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
     AdmissionKey, CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand,
-    ExecRequest, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState, JobTailBytes,
-    JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication, OutputStorage,
-    OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest, StdinKind,
-    StdinSource, StreamInfo, WorkspacePath,
+    ExecRequest, ExecScope, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState,
+    JobTailBytes, JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
+    OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest,
+    StdinKind, StdinSource, StreamInfo, WorkspacePath,
 };
 #[cfg(target_os = "macos")]
 use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap};
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
+use cowshed_core::runtime::job_cpu::{JobCpuAdmission, JobCpuAsk, JobCpuGrant};
 use cowshed_core::runtime::job_groups::Birth;
+use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::apfs::Labelled;
 use cowshed_core::storage::job_artifact::{
     AdmissionLookup, ArtifactConfig, ArtifactStore, FIRST_KEYED_LAYOUT, JobAdmission, JobEnding,
-    StreamKind,
+    JobScheduling, StreamKind,
 };
+use cowshed_gateway_types::JobserverClass;
 #[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::Run as _;
 use cowshed_os::fork_lock::Spawn as _;
@@ -102,6 +109,7 @@ impl SpawnSink for FakeSpawner {
             events,
             backpressure: self.backpressure,
             writes: 0,
+            nice: request.cpu.nice,
         }))
     }
 }
@@ -109,6 +117,8 @@ impl SpawnSink for FakeSpawner {
 struct FakeProcess {
     job_id: JobId,
     process: OwnedProcess,
+    /// The nice the spawn was asked for, standing in for the one a real spawn observes.
+    nice: i32,
     observations: mpsc::UnboundedSender<ProcessObservation>,
     /// Where an unbackpressured fake reports each write it took as written to the child.
     events: mpsc::Sender<ProcessEvent>,
@@ -122,6 +132,10 @@ struct FakeProcess {
 impl RunningProcess for FakeProcess {
     fn process(&self) -> Option<&OwnedProcess> {
         Some(&self.process)
+    }
+
+    fn nice(&self) -> Option<i32> {
+        Some(self.nice)
     }
 
     #[cfg(target_os = "macos")]
@@ -204,6 +218,7 @@ impl ArtifactSink for FakeArtifactSink {
         _grant_revision: u64,
         command: &cowshed_core::api::ExecCommand,
         admission: Option<JobAdmission>,
+        _scheduling: JobScheduling,
     ) -> Result<()> {
         assert!(command.validate().is_ok());
         assert_eq!(admission, None, "this sink keeps no admission keys");
@@ -420,6 +435,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),
+            cpu_pool_directory: None,
             additional_denies: Vec::new(),
             shed_links: Vec::new(),
             git_worktree_repository: None,
@@ -444,6 +460,110 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         volume_labels: None,
         workspace_volume: None,
         job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
+        cpu: Arc::new(ImmediateCpu),
+    }
+}
+
+/// The pool every test grant names; nothing in these tests connects to it.
+const TEST_POOL: &str = "/nonexistent/cowshed-test-cpu-pool.sock";
+
+/// The gateway's CPU budget for these tests: each request is granted its whole want at once, so
+/// a job spawns as soon as it is admitted.
+#[derive(Debug)]
+struct ImmediateCpu;
+
+impl JobCpuAdmission for ImmediateCpu {
+    fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
+        Box::pin(async move {
+            Ok(JobCpuGrant::new(
+                ask.want,
+                PathBuf::from(TEST_POOL),
+                Box::new(()),
+            ))
+        })
+    }
+}
+
+/// A CPU budget a test answers by hand. Each request arrives as a [`CpuRequest`]; dropping a
+/// request before its answer (a job withdrawn while queued) and returning a grant are reported.
+#[derive(Debug)]
+struct ScriptedCpu {
+    requests: mpsc::UnboundedSender<CpuRequest>,
+}
+
+struct CpuRequest {
+    ask: JobCpuAsk,
+    answer: tokio::sync::oneshot::Sender<Result<NonZeroUsize>>,
+    withdrawn: tokio::sync::oneshot::Receiver<()>,
+    released: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Sends once when dropped, unless disarmed first.
+struct Signal(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Signal {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Signal {
+    fn drop(&mut self) {
+        if let Some(signal) = self.0.take() {
+            let _ = signal.send(());
+        }
+    }
+}
+
+impl JobCpuAdmission for ScriptedCpu {
+    fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
+        let requests = self.requests.clone();
+        Box::pin(async move {
+            let (answer, answered) = tokio::sync::oneshot::channel();
+            let (withdraw, withdrawn) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let queued = Signal(Some(withdraw));
+            requests
+                .send(CpuRequest {
+                    ask,
+                    answer,
+                    withdrawn,
+                    released,
+                })
+                .expect("the test reads its CPU requests");
+            let tokens = answered.await.expect("the test answers each request")?;
+            queued.disarm();
+            Ok(JobCpuGrant::new(
+                tokens,
+                PathBuf::from(TEST_POOL),
+                Box::new(Signal(Some(release))),
+            ))
+        })
+    }
+}
+
+/// A fake-spawner harness whose CPU requests the test answers by hand.
+fn scripted_harness(label: &str) -> (Harness, mpsc::UnboundedReceiver<CpuRequest>, TempRoot) {
+    let root = workspace_root(label);
+    let (requests, asked) = mpsc::unbounded_channel();
+    let h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            cpu: Arc::new(ScriptedCpu { requests }),
+            ..config(&root)
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    (h, asked, root)
+}
+
+fn gate(request: ExecRequest) -> ExecRequest {
+    ExecRequest {
+        class: JobserverClass::Gate,
+        wait_ms: NonZeroU32::new(120_000),
+        ..request
     }
 }
 
@@ -589,6 +709,10 @@ fn request(stdin: StdinSource) -> ExecRequest {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
+        class: JobserverClass::Background,
+        want: NonZeroUsize::MIN,
+        wait_ms: None,
+        scope: ExecScope::Workspace,
     }
 }
 
@@ -715,7 +839,11 @@ async fn host_controller_exec_mode_enforces_each_request_without_widening_the_ce
                 .map(CommandArg::from)
                 .collect(),
             );
-            let job = h.handle.exec(None, None, exec).await.unwrap();
+            let job = h
+                .handle
+                .exec(None, None, exec, AdmissionSource::Worker)
+                .await
+                .unwrap();
             let spawned = h.spawned.recv().await.unwrap();
             // Run the admitted request through the production spawn checks and the
             // kernel. A profile-only probe misses the supervisor/child role boundary.
@@ -824,23 +952,18 @@ async fn host_controller_an_admitted_nix_bun_loads_icu_without_a_nix_project() {
     )
     .unwrap();
     let handle = WorkspaceSupervisor::start(supervisor_config, commitments).unwrap();
-    let job = handle
-        .exec(
-            None,
-            None,
-            ExecRequest {
-                command: ExecCommand::Argv(vec![
-                    CommandArg::from(bun.into_os_string()),
-                    "--config=/dev/null".into(),
-                    "--no-env-file".into(),
-                    "--no-install".into(),
-                    "--eval".into(),
-                    "console.log(new Intl.DateTimeFormat('en-GB', {year:'numeric', month:'2-digit', day:'2-digit', timeZone:'UTC'}).format(new Date('2026-10-12T00:00:00Z')))".into(),
-                ]),
-                cwd: None,
-                ..request(StdinSource::Empty)
-            },
-        )
+    let job = handle.exec(None, None, ExecRequest {
+        command: ExecCommand::Argv(vec![
+            CommandArg::from(bun.into_os_string()),
+            "--config=/dev/null".into(),
+            "--no-env-file".into(),
+            "--no-install".into(),
+            "--eval".into(),
+            "console.log(new Intl.DateTimeFormat('en-GB', {year:'numeric', month:'2-digit', day:'2-digit', timeZone:'UTC'}).format(new Date('2026-10-12T00:00:00Z')))".into(),
+        ]),
+        cwd: None,
+        ..request(StdinSource::Empty)
+    }, AdmissionSource::Worker)
         .await
         .unwrap();
     let info = handle.wait(job).await.unwrap();
@@ -870,7 +993,12 @@ async fn graceful_requested_cancellation_keeps_its_actual_exit_serializable() {
     for code in [0, 143] {
         let job = h
             .handle
-            .exec(None, None, request(StdinSource::Empty))
+            .exec(
+                None,
+                None,
+                request(StdinSource::Empty),
+                AdmissionSource::Worker,
+            )
             .await
             .unwrap();
         let spawned = h.spawned.recv().await.unwrap();
@@ -906,7 +1034,11 @@ async fn non_utf8_argv_reaches_spawn_and_job_info_without_loss() {
         CommandArg::from(OsString::from_vec(raw.clone())),
         CommandArg::from("--flag"),
     ]);
-    let job = h.handle.exec(None, None, exec).await.unwrap();
+    let job = h
+        .handle
+        .exec(None, None, exec, AdmissionSource::Worker)
+        .await
+        .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     let SpawnCommand::Argv(spawned_argv) = &spawned.request.command else {
         panic!("an argv job spawns an argv");
@@ -932,7 +1064,11 @@ async fn unsafe_argv_rejects_before_artifact_commitment_or_spawn_effects() {
     ] {
         let mut exec = request(StdinSource::Empty);
         exec.command = ExecCommand::Argv(vec![CommandArg::from(argument)]);
-        let error = h.handle.exec(None, None, exec).await.unwrap_err();
+        let error = h
+            .handle
+            .exec(None, None, exec, AdmissionSource::Worker)
+            .await
+            .unwrap_err();
         assert_eq!(error.code, ErrorCode::Usage);
         assert!(matches!(
             h.spawned.try_recv(),
@@ -984,13 +1120,23 @@ async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
     let first = h
         .handle
-        .exec(None, Some(before.clone()), request(StdinSource::Empty))
+        .exec(
+            None,
+            Some(before.clone()),
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let first_spawn = h.spawned.recv().await.unwrap();
     let second = h
         .handle
-        .exec(None, Some(adopted.clone()), request(StdinSource::Empty))
+        .exec(
+            None,
+            Some(adopted.clone()),
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let second_spawn = h.spawned.recv().await.unwrap();
@@ -1032,7 +1178,12 @@ async fn each_job_runs_with_the_build_volume_it_was_admitted_with() {
     // A checkout that links no volume grants none.
     let third = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let third_spawn = h.spawned.recv().await.unwrap();
@@ -1061,12 +1212,22 @@ async fn monotonic_ids_and_simultaneous_completions_are_serialized() {
     let (mut h, _root) = harness(41, 1024, false, false);
     let first = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let second = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     assert_eq!((first.get(), second.get()), (41, 42));
@@ -1116,7 +1277,12 @@ async fn exact_authority_and_session_identity_are_fenced() {
     let stale = old.list().await.unwrap_err();
     assert_eq!(stale.code, ErrorCode::Conflict);
     let stale_session = advanced
-        .exec(Some(&session), None, request(StdinSource::Empty))
+        .exec(
+            Some(&session),
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap_err();
     assert_eq!(stale_session.code, ErrorCode::Conflict);
@@ -1138,7 +1304,12 @@ async fn disconnect_does_not_cancel_background_process() {
     let session = open_named(&h.handle, "daemon").await;
     let job = h
         .handle
-        .exec_background(Some(&session), None, request(StdinSource::Empty))
+        .exec_background(
+            Some(&session),
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1155,7 +1326,12 @@ async fn opaque_non_utf8_output_round_trips_through_logs_and_artifacts() {
     let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1189,7 +1365,12 @@ async fn stdin_write_observes_bounded_backpressure_and_counts_only_delivered_byt
     let (mut h, _root) = harness(1, 1024, false, true);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Open))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Open),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1252,7 +1433,12 @@ async fn output_limit_terms_kills_and_drains_before_terminal_commitment() {
     let (mut h, _root) = harness(1, 4, false, false);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1310,7 +1496,12 @@ async fn spawn_failure_is_typed_terminal_with_one_terminal_commitment() {
     let (mut h, _root) = harness(7, 1024, true, false);
     let error = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::EnvironmentMissing);
@@ -1334,7 +1525,7 @@ async fn named_session_preserves_cwd_env_and_background_membership() {
     first.env.insert("MODE".into(), "watch".into());
     let job = h
         .handle
-        .exec_background(Some(&session), None, first)
+        .exec_background(Some(&session), None, first, AdmissionSource::Worker)
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1386,7 +1577,7 @@ async fn a_registered_credential_env_name_never_reaches_a_child() {
     first.env.insert("MODE".into(), "watch".into());
     let job = h
         .handle
-        .exec_background(Some(&session), None, first)
+        .exec_background(Some(&session), None, first, AdmissionSource::Worker)
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1482,7 +1673,12 @@ async fn a_fresh_supervisor_answers_for_a_job_its_predecessor_sealed() {
     let mut first = real_store_harness(supervisor_config.clone());
     let job = first
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = first.spawned.recv().await.unwrap();
@@ -1559,6 +1755,7 @@ async fn a_refused_output_copy_fails_its_callers_after_the_job_ends_truthfully()
                 }),
                 ..request(StdinSource::Empty)
             },
+            AdmissionSource::Worker,
         )
         .await
         .unwrap();
@@ -1613,7 +1810,12 @@ async fn a_refused_terminal_record_answers_every_caller_and_stays_unterminated()
     let mut h = real_store_harness(supervisor_config);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -1719,7 +1921,12 @@ async fn a_refused_terminal_commitment_keeps_the_sealed_truth_and_fails_its_call
     )
     .unwrap();
     let job = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = spawned.recv().await.unwrap();
@@ -1797,6 +2004,7 @@ impl SpawnSink for ReapedGroupSpawner {
             events,
             backpressure: false,
             writes: 0,
+            nice: request.cpu.nice,
         }))
     }
 }
@@ -1872,13 +2080,23 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
     };
 
     handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let first = birth(births.recv().await.unwrap());
     assert_eq!(ledger_leaders(&ledger), vec![(1, first)]);
     handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let second = birth(births.recv().await.unwrap());
@@ -1910,7 +2128,12 @@ async fn an_unidentified_leader_never_enters_the_ledger() {
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     assert_eq!(h.handle.info(job).await.unwrap().pid, Some(10_001));
@@ -1973,7 +2196,12 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
 
     let first = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     assert_eq!(carried(&ledger), vec![9]);
@@ -1999,7 +2227,12 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
     }
     let second = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     assert_eq!(carried(&ledger), Vec::<u64>::new());
@@ -2014,7 +2247,12 @@ async fn retire_waits_for_process_tree_stop_and_terminal_persistence() {
     let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2061,7 +2299,12 @@ async fn retire_waits_for_process_tree_stop_and_terminal_persistence() {
     assert_eq!(terminal_count, 1);
     assert_eq!(
         h.handle
-            .exec(None, None, request(StdinSource::Empty))
+            .exec(
+                None,
+                None,
+                request(StdinSource::Empty),
+                AdmissionSource::Worker
+            )
             .await
             .unwrap_err()
             .code,
@@ -2074,7 +2317,12 @@ async fn kill_acknowledges_only_after_terminal_artifact_and_commitment() {
     let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2138,7 +2386,12 @@ async fn a_kill_after_the_leader_exits_reaches_the_group_still_holding_its_outpu
     let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2186,7 +2439,12 @@ async fn log_follow_and_attach_wait_for_exact_next_bytes() {
     let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2353,7 +2611,12 @@ async fn quiesce_rejects_admission_and_waits_for_existing_terminal_commitment() 
     let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2363,7 +2626,12 @@ async fn quiesce_rejects_admission_and_waits_for_existing_terminal_commitment() 
     assert!(!quiesce.is_finished());
     assert_eq!(
         h.handle
-            .exec(None, None, request(StdinSource::Empty))
+            .exec(
+                None,
+                None,
+                request(StdinSource::Empty),
+                AdmissionSource::Worker
+            )
             .await
             .unwrap_err()
             .code,
@@ -2379,7 +2647,12 @@ async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
     let (mut h, _root) = harness(2, 1024, false, false);
     let first = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let first_spawned = h.spawned.recv().await.unwrap();
@@ -2387,7 +2660,12 @@ async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
     assert_eq!(refused.code, ErrorCode::Conflict);
     let second = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .expect("busy refusal must leave admission open");
     let second_spawned = h.spawned.recv().await.unwrap();
@@ -2398,7 +2676,12 @@ async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
     h.handle.quiesce_if_idle().await.unwrap();
     assert_eq!(
         h.handle
-            .exec(None, None, request(StdinSource::Empty))
+            .exec(
+                None,
+                None,
+                request(StdinSource::Empty),
+                AdmissionSource::Worker
+            )
             .await
             .unwrap_err()
             .code,
@@ -2415,7 +2698,11 @@ async fn none_cwd_is_preserved_as_workspace_root_without_a_sentinel() {
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
     let mut exec = request(StdinSource::Empty);
     exec.cwd = None;
-    let job = h.handle.exec(None, None, exec).await.unwrap();
+    let job = h
+        .handle
+        .exec(None, None, exec, AdmissionSource::Worker)
+        .await
+        .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     assert!(spawned.request.cwd.as_os_str().is_empty());
     assert_eq!(h.handle.info(job).await.unwrap().cwd, None);
@@ -2431,7 +2718,12 @@ async fn a_wait_failure_fails_the_job_without_inventing_an_exit_status() {
     let (mut h, _root) = harness(1, 1024, false, false);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2512,7 +2804,12 @@ async fn a_terminal_log_read_answers_from_the_sealed_artifact_not_a_retained_cop
     let (mut h, _root) = harness_with_sealed_stdout(b"sealed".to_vec());
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2572,7 +2869,12 @@ fn a_dropped_supervisor_ends_the_jobs_it_still_runs() {
         let (mut h, root) = harness(1, 1024, false, false);
         let job = h
             .handle
-            .exec_background(None, None, request(StdinSource::Empty))
+            .exec_background(
+                None,
+                None,
+                request(StdinSource::Empty),
+                AdmissionSource::Worker,
+            )
             .await
             .unwrap();
         let spawned = h.spawned.recv().await.unwrap();
@@ -2638,6 +2940,7 @@ async fn a_served_supervisor_runs_a_job_exactly_as_the_in_process_one_does() {
             Some(&session),
             None,
             request(StdinSource::Inline(stdin.clone())),
+            AdmissionSource::Worker,
         )
         .await
         .unwrap();
@@ -2684,7 +2987,12 @@ async fn a_served_supervisor_answers_a_tail_as_the_in_process_one_does() {
     let (mut h, _root) = harness(1, 1024, false, false);
     let (remote, _path) = served(&h.handle).await;
     let job = remote
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2728,7 +3036,12 @@ async fn a_streamed_stdin_reaches_a_served_job_whole_and_in_order() {
     let (remote, _path) = served(&h.handle).await;
     let (mut writer, reader) = tokio::io::duplex(1024);
     let job = remote
-        .exec(None, None, request(StdinSource::Stream(Box::pin(reader))))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Stream(Box::pin(reader))),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2806,13 +3119,23 @@ async fn a_keyed_open_repeat_reaches_the_same_job_and_never_binds_a_reader() {
     let mut h = real_store_harness(supervisor_config);
     let (remote, _path) = served(&h.handle).await;
     let job = remote
-        .exec(None, None, keyed("op-open", StdinSource::Open))
+        .exec(
+            None,
+            None,
+            keyed("op-open", StdinSource::Open),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     assert_eq!(
         remote
-            .exec(None, None, keyed("op-open", StdinSource::Open))
+            .exec(
+                None,
+                None,
+                keyed("op-open", StdinSource::Open),
+                AdmissionSource::Worker
+            )
             .await
             .unwrap(),
         job
@@ -2849,6 +3172,7 @@ async fn a_keyed_open_repeat_reaches_the_same_job_and_never_binds_a_reader() {
                     dropped: Some(dropped),
                 })),
             ),
+            AdmissionSource::Worker,
         )
         .await
         .unwrap_err();
@@ -2883,7 +3207,12 @@ async fn a_keyed_open_repeat_reaches_the_same_job_and_never_binds_a_reader() {
     remote.wait(job).await.unwrap();
     assert_eq!(
         remote
-            .exec(None, None, keyed("op-open", StdinSource::Open))
+            .exec(
+                None,
+                None,
+                keyed("op-open", StdinSource::Open),
+                AdmissionSource::Worker
+            )
             .await
             .unwrap(),
         job,
@@ -2908,6 +3237,7 @@ async fn a_keyed_stream_repeat_names_its_job_and_binds_no_second_stream() {
             None,
             None,
             keyed("op-1", StdinSource::Stream(Box::pin(reader))),
+            AdmissionSource::Worker,
         )
         .await
         .unwrap();
@@ -2921,6 +3251,7 @@ async fn a_keyed_stream_repeat_names_its_job_and_binds_no_second_stream() {
                 "op-1",
                 StdinSource::Stream(Box::pin(std::io::Cursor::new(b"second".to_vec()))),
             ),
+            AdmissionSource::Worker,
         )
         .await
         .unwrap_err();
@@ -2969,7 +3300,12 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
     let mut h = real_store_harness(supervisor_config);
     let (remote, _path) = served(&h.handle).await;
     let job = remote
-        .exec(None, None, keyed("op-fields", StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            keyed("op-fields", StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2978,7 +3314,13 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
     let mut same = keyed("op-fields", StdinSource::Empty);
     same.env
         .insert("TEST_SECRET".to_owned(), "not an admitted field".to_owned());
-    assert_eq!(remote.exec(None, None, same).await.unwrap(), job);
+    assert_eq!(
+        remote
+            .exec(None, None, same, AdmissionSource::Worker)
+            .await
+            .unwrap(),
+        job
+    );
 
     let named = remote
         .open_session(Some("different".to_owned()))
@@ -2993,6 +3335,7 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
         AdmissionField::Session,
         AdmissionField::StdoutCopy,
         AdmissionField::StderrCopy,
+        AdmissionField::Want,
     ] {
         let mut changed = keyed("op-fields", StdinSource::Empty);
         let mut session = None;
@@ -3023,8 +3366,15 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
                     policy: PublicationPolicy::CreateNew,
                 });
             }
+            AdmissionField::Want => changed.want = NonZeroUsize::new(4).unwrap(),
+            AdmissionField::Class | AdmissionField::WaitMs | AdmissionField::Scope => {
+                unreachable!("a class, its bound and its scope change together, below")
+            }
         }
-        let refused = remote.exec(session, None, changed).await.unwrap_err();
+        let refused = remote
+            .exec(session, None, changed, AdmissionSource::Worker)
+            .await
+            .unwrap_err();
         assert_eq!(refused.code, ErrorCode::Conflict);
         assert_eq!(
             refused.admission_source(),
@@ -3033,6 +3383,37 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
                 fields: vec![field],
             }),
             "the changed field is {field:?}"
+        );
+    }
+    // A gate names its bound, and the host boundary is a gate's: their fields change together,
+    // and only a coordinator may ask for either.
+    for (changed, fields) in [
+        (
+            gate(keyed("op-fields", StdinSource::Empty)),
+            vec![AdmissionField::Class, AdmissionField::WaitMs],
+        ),
+        (
+            ExecRequest {
+                scope: ExecScope::HostGate,
+                ..gate(keyed("op-fields", StdinSource::Empty))
+            },
+            vec![
+                AdmissionField::Scope,
+                AdmissionField::Class,
+                AdmissionField::WaitMs,
+            ],
+        ),
+    ] {
+        let refused = remote
+            .exec(None, None, changed, AdmissionSource::Coordinator)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.admission_source(),
+            Some(&AdmissionRefusal::KeyConflict {
+                job_id: job,
+                fields
+            })
         );
     }
     assert!(
@@ -3115,12 +3496,17 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
                 "session": null,
                 "buildVolume": null,
                 "background": false,
+                                "source": AdmissionSource::Worker,
                 "request": {
                     "argv": argv,
                     "script": null,
                     "cwd": sent.cwd,
                     "mode": sent.mode,
                     "env": sent.env,
+                                        "class": sent.class,
+                    "want": sent.want,
+                    "waitMs": sent.wait_ms,
+                    "scope": sent.scope,
                     "trace": null,
                     "stdin": { "kind": "inline" },
                     "stdoutCopy": null,
@@ -3156,7 +3542,12 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
     assert_eq!(remote.job_by_key(key.clone()).await.unwrap(), Some(job));
     assert_eq!(
         remote
-            .exec(None, None, keyed("op-1", payload()))
+            .exec(
+                None,
+                None,
+                keyed("op-1", payload()),
+                AdmissionSource::Worker
+            )
             .await
             .unwrap(),
         job
@@ -3166,7 +3557,10 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
         command: ExecCommand::Argv(vec!["printf".into(), "other".into()]),
         ..keyed("op-1", payload())
     };
-    let conflict = remote.exec(None, None, changed_argv).await.unwrap_err();
+    let conflict = remote
+        .exec(None, None, changed_argv, AdmissionSource::Worker)
+        .await
+        .unwrap_err();
     assert_eq!(conflict.code, ErrorCode::Conflict);
     assert_eq!(
         conflict.admission_source(),
@@ -3180,6 +3574,7 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
             None,
             None,
             keyed("op-1", StdinSource::Inline(Bytes::from_static(b"payloaD"))),
+            AdmissionSource::Worker,
         )
         .await
         .unwrap_err();
@@ -3224,7 +3619,12 @@ async fn a_key_a_set_aside_store_may_hold_is_refused_and_never_spawned() {
     };
     let refused = h
         .handle
-        .exec(None, None, keyed("op-1", StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            keyed("op-1", StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap_err();
     assert_eq!(refused.code, ErrorCode::Conflict);
@@ -3307,7 +3707,12 @@ async fn an_open_stdin_answers_before_one_eof_and_never_ends_the_job() {
     let (mut h, _root) = harness(1, 1024, false, false);
     let (remote, _path) = served(&h.handle).await;
     let job = remote
-        .exec(None, None, request(StdinSource::Open))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Open),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -3380,7 +3785,12 @@ async fn a_close_behind_a_busy_lane_waits_for_it_and_refuses_later_writes() {
     let (mut h, _root) = harness(1, 1024, false, true);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Open))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Open),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -3439,7 +3849,12 @@ async fn a_repeated_write_is_answered_once_and_only_with_the_bytes_delivered() {
     let (mut h, _root) = harness(1, 1024, false, false);
     let (remote, _path) = served(&h.handle).await;
     let job = remote
-        .exec(None, None, request(StdinSource::Open))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Open),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -3521,7 +3936,12 @@ async fn a_partly_delivered_write_refuses_every_later_write_with_the_last_known_
     let (mut h, _root) = harness(1, 1024, false, true);
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Open))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Open),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -3605,7 +4025,12 @@ async fn a_served_supervisor_refuses_a_caller_that_holds_another_authority() {
         },
     );
     let refused = stale
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap_err();
     assert_eq!(refused.code, ErrorCode::Conflict);
@@ -3620,7 +4045,12 @@ async fn a_pending_wait_holds_up_no_other_call_to_a_served_supervisor() {
     let (mut h, _root) = harness(1, 1024, false, false);
     let (remote, _path) = served(&h.handle).await;
     let job = remote
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -3891,7 +4321,12 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     );
     let remote = supervisor_socket::connect(ensured.socket, ensured.authority);
     let admitted = remote
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -3955,7 +4390,12 @@ async fn an_ensure_from_a_stale_grant_read_is_answered_by_the_newer_supervisor()
     );
     let remote = supervisor_socket::connect(ensured.socket, ensured.authority);
     let admitted = remote
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = h.spawned.recv().await.unwrap();
@@ -4024,7 +4464,12 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
     ));
     let remote = supervisor_socket::connect(path.clone(), authority());
     let job = remote
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -4036,7 +4481,15 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
     );
     let refused = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match remote.exec(None, None, request(StdinSource::Empty)).await {
+            match remote
+                .exec(
+                    None,
+                    None,
+                    request(StdinSource::Empty),
+                    AdmissionSource::Worker,
+                )
+                .await
+            {
                 Err(error) => return error,
                 // Admitted before the drain reached the actor: let it end and try again.
                 Ok(admitted) => {
@@ -4119,7 +4572,12 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
     ));
 
     let first = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     complete(
@@ -4153,7 +4611,12 @@ async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it
         .await
         .unwrap();
     let second = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     complete(
@@ -4183,7 +4646,12 @@ async fn a_job_s_durable_record_keeps_its_exit_and_duration() {
     let mut h = real_store_harness(supervisor_config);
     let job_id = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -4218,6 +4686,10 @@ struct WarmProcess;
 
 impl RunningProcess for WarmProcess {
     fn process(&self) -> Option<&OwnedProcess> {
+        None
+    }
+
+    fn nice(&self) -> Option<i32> {
         None
     }
 
@@ -4392,7 +4864,12 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -4456,6 +4933,7 @@ async fn a_job_is_sampled_from_its_first_owned_process_until_its_sealed_terminal
         ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
+            nice: 10,
         },
         1,
     )
@@ -4516,7 +4994,12 @@ async fn a_served_supervisor_s_progress_starts_at_ownership_and_ends_at_the_seal
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let (remote, _path) = served(&handle).await;
     let job_id = remote
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -4530,6 +5013,7 @@ async fn a_served_supervisor_s_progress_starts_at_ownership_and_ends_at_the_seal
         ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
+            nice: 10,
         },
         0,
     )
@@ -4620,7 +5104,12 @@ async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_re
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -4631,6 +5120,7 @@ async fn a_job_s_rss_is_its_group_s_simultaneous_sum_and_its_peak_the_largest_re
         ProcessEvent::Started {
             job_id,
             process: owned(&leader, Instant::now()),
+            nice: 10,
         },
         0,
     )
@@ -4706,7 +5196,12 @@ async fn a_job_that_ends_before_any_process_of_its_own_has_no_sample() {
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -4746,7 +5241,12 @@ async fn a_stream_counts_the_bytes_and_lines_of_every_admitted_chunk() {
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -4755,6 +5255,7 @@ async fn a_stream_counts_the_bytes_and_lines_of_every_admitted_chunk() {
         .send(ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
+            nice: 10,
         })
         .await
         .unwrap();
@@ -4830,7 +5331,12 @@ async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
     let mut harness = warm_harness(supervisor_config.clone());
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -4839,6 +5345,7 @@ async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
         .send(ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
+            nice: 10,
         })
         .await
         .unwrap();
@@ -4929,11 +5436,11 @@ const SLACK_US: u64 = 300_000;
 #[cfg(target_os = "macos")]
 fn burner() -> String {
     format!(
-        "python3 -c 'import resource\n\
+        "python3 -c 'import os, resource\n\
          def used():\n    u = resource.getrusage(resource.RUSAGE_SELF)\n    return u.ru_utime + u.ru_stime\n\
          x = 0\n\
          while used() < {BURN_SECONDS}:\n    for _ in range(10000):\n        x += 1\n\
-         print(\"burned\", int(used() * 1e6), flush=True)\n'"
+         os.write(1, (\"burned %d\\n\" % int(used() * 1e6)).encode(\"ascii\"))\n'"
     )
 }
 
@@ -5079,7 +5586,12 @@ async fn a_job_s_cpu_keeps_the_descendants_that_ended_between_samples() {
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -5094,6 +5606,7 @@ async fn a_job_s_cpu_keeps_the_descendants_that_ended_between_samples() {
         ProcessEvent::Started {
             job_id,
             process: owned(&leader.child, Instant::now()),
+            nice: 10,
         },
         0,
     )
@@ -5152,7 +5665,12 @@ async fn an_activation_and_its_command_each_count_once() {
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -5191,6 +5709,7 @@ async fn an_activation_and_its_command_each_count_once() {
         ProcessEvent::Started {
             job_id,
             process: owned(&command.child, Instant::now()),
+            nice: 10,
         },
         1,
     )
@@ -5292,7 +5811,12 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -5305,6 +5829,7 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
         ProcessEvent::Started {
             job_id,
             process: owned(&leader.child, Instant::now()),
+            nice: 10,
         },
         0,
     )
@@ -5433,7 +5958,12 @@ async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -5451,6 +5981,7 @@ async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
         ProcessEvent::Started {
             job_id,
             process: owned(&leader.child, Instant::now()),
+            nice: 10,
         },
         0,
     )
@@ -5516,7 +6047,12 @@ async fn a_linux_job_s_sample_names_its_missing_accounting_source() {
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -5527,6 +6063,7 @@ async fn a_linux_job_s_sample_names_its_missing_accounting_source() {
         ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
+            nice: 10,
         },
         0,
     )
@@ -5764,7 +6301,12 @@ async fn a_shed_stops_its_idle_nx_daemon_and_starts_another_only_for_a_job() {
 
     let job = h
         .handle
-        .exec_background(None, None, request(StdinSource::Empty))
+        .exec_background(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let ran = h.spawned.recv().await.unwrap();
@@ -5793,7 +6335,12 @@ async fn a_shed_keeps_its_nx_daemon_while_a_job_runs() {
 
     let job = h
         .handle
-        .exec_background(None, None, request(StdinSource::Empty))
+        .exec_background(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let ran = h.spawned.recv().await.unwrap();
@@ -6276,7 +6823,11 @@ async fn an_exec_and_its_terminal_seal_one_job_span_under_the_job_s_trace_contex
 
     let mut adopted = request(StdinSource::Empty);
     adopted.trace = Some(adopted_trace());
-    let job = h.handle.exec(None, None, adopted).await.unwrap();
+    let job = h
+        .handle
+        .exec(None, None, adopted, AdmissionSource::Worker)
+        .await
+        .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     let clean = h.handle.wait(job).await.unwrap();
@@ -6287,7 +6838,12 @@ async fn an_exec_and_its_terminal_seal_one_job_span_under_the_job_s_trace_contex
 
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -6326,7 +6882,12 @@ async fn a_refused_job_span_is_counted_and_never_fails_its_job() {
     );
     let job = h
         .handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -6374,7 +6935,11 @@ async fn jobs_sharing_an_adopted_trace_and_a_job_id_across_workspaces_are_distin
         );
         let mut adopted = request(StdinSource::Empty);
         adopted.trace = Some(adopted_trace());
-        let job = h.handle.exec(None, None, adopted).await.unwrap();
+        let job = h
+            .handle
+            .exec(None, None, adopted, AdmissionSource::Worker)
+            .await
+            .unwrap();
         let spawned = h.spawned.recv().await.unwrap();
         complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
         ended.push(h.handle.wait(job).await.unwrap());
@@ -6442,7 +7007,12 @@ async fn a_served_supervisor_answers_its_trace_health() {
     );
     let (remote, _path) = served(&h.handle).await;
     let job = remote
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -6511,7 +7081,12 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
         ..request(StdinSource::Empty)
     };
     let job = handle
-        .exec(None, None, run("/usr/bin/true", Some(adopted_trace())))
+        .exec(
+            None,
+            None,
+            run("/usr/bin/true", Some(adopted_trace())),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let clean = handle.wait(job).await.unwrap();
@@ -6527,7 +7102,12 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
     assert_job_spans(&telemetry, &[expected_span(&clean, "span-ok", "exited")]);
 
     let job = handle
-        .exec(None, None, run("/usr/bin/false", None))
+        .exec(
+            None,
+            None,
+            run("/usr/bin/false", None),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let failed = handle.wait(job).await.unwrap();
@@ -6549,6 +7129,451 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
     handle.retire().await.unwrap();
 }
 
+/// A job is durable and queued before the gateway grants it anything; the actor answers status
+/// meanwhile and spawns nothing. The command spawns under the actual grant -- its count, its live
+/// pool, its class's nice -- and the grant is held until the job concludes, then returned.
+#[tokio::test]
+async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() {
+    let (mut h, mut asked, root) = scripted_harness("cpu-grant");
+    let handle = h.handle.clone();
+    let exec = tokio::spawn(async move {
+        handle
+            .exec(
+                None,
+                None,
+                ExecRequest {
+                    want: NonZeroUsize::new(6).unwrap(),
+                    ..request(StdinSource::Empty)
+                },
+                AdmissionSource::Worker,
+            )
+            .await
+    });
+    let cpu = asked.recv().await.expect("the job asks the CPU budget");
+    let job = JobId::new(1).unwrap();
+    assert_eq!(
+        (cpu.ask.class, cpu.ask.want, cpu.ask.wait_ms),
+        (
+            JobserverClass::Background,
+            NonZeroUsize::new(6).unwrap(),
+            None
+        )
+    );
+    assert_eq!(cpu.ask.checkout, root.join("workspace"));
+    assert_eq!(cpu.ask.job.2, job);
+    let queued = h.handle.info(job).await.unwrap();
+    assert_eq!(
+        (
+            queued.state,
+            queued.class,
+            queued.scope,
+            queued.nice,
+            queued.cpu_tokens
+        ),
+        (
+            JobState::Queued,
+            JobserverClass::Background,
+            ExecScope::Workspace,
+            None,
+            None
+        ),
+        "a queued job owns no command and names no placement"
+    );
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "nothing spawns before the grant"
+    );
+
+    cpu.answer.send(Ok(NonZeroUsize::new(4).unwrap())).unwrap();
+    assert_eq!(exec.await.unwrap().unwrap(), job);
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        (
+            spawned.request.cpu.tokens,
+            spawned.request.cpu.pool.as_path(),
+            spawned.request.cpu.nice,
+            spawned.request.scope,
+        ),
+        (
+            NonZeroUsize::new(4).unwrap(),
+            Path::new(TEST_POOL),
+            10,
+            ExecScope::Workspace
+        ),
+        "the command runs under the granted count, not its want, at background nice"
+    );
+    let running = h.handle.info(job).await.unwrap();
+    assert_eq!(
+        (running.state, running.cpu_tokens, running.nice),
+        (JobState::Running, NonZeroUsize::new(4), Some(10))
+    );
+    let mut released = cpu.released;
+    assert!(
+        released.try_recv().is_err(),
+        "the grant is held while the job runs"
+    );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    let ended = h.handle.wait(job).await.unwrap();
+    assert_eq!(
+        (ended.cpu_tokens, ended.nice, ended.class),
+        (NonZeroUsize::new(4), Some(10), JobserverClass::Background)
+    );
+    released
+        .await
+        .expect("the concluded job returned its grant to the gateway");
+}
+
+/// Cancelling a job still waiting for its grant withdraws its request from the gateway's queue:
+/// nothing spawns, nothing is signalled, and the job ends killed without a placement.
+#[tokio::test]
+async fn a_job_killed_while_queued_leaves_the_queue_without_a_command() {
+    let (mut h, mut asked, _root) = scripted_harness("cpu-withdraw");
+    let job = h
+        .handle
+        .exec_background(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .expect("a background exec is answered at admission");
+    let cpu = asked.recv().await.unwrap();
+    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Queued);
+    h.handle.kill(job).await.unwrap();
+    cpu.withdrawn
+        .await
+        .expect("the cancelled job's request left the queue");
+    let ended = h.handle.wait(job).await.unwrap();
+    assert_eq!(
+        (ended.state, ended.nice, ended.cpu_tokens, ended.failure),
+        (JobState::Killed, None, None, None)
+    );
+    assert!(h.spawned.try_recv().is_err(), "nothing spawned");
+    assert!(h.process.try_recv().is_err(), "nothing was signalled");
+}
+
+/// A refused admission -- a gate whose bound elapsed, a gateway that is not there -- fails the
+/// job before any command: a foreground caller gets the refusal itself, a background caller reads
+/// it on the job's stderr, and the record types the failure.
+#[tokio::test]
+async fn a_refused_cpu_admission_fails_the_job_before_any_command() {
+    let (mut h, mut asked, _root) = scripted_harness("cpu-refused");
+    let handle = h.handle.clone();
+    let exec = tokio::spawn(async move {
+        handle
+            .exec(
+                None,
+                None,
+                request(StdinSource::Empty),
+                AdmissionSource::Worker,
+            )
+            .await
+    });
+    let refusal = || {
+        CowshedError::conflict(
+            "gate-admission-timeout: waited 5000ms; holders: /w: 8 tokens in 1 running grant(s)",
+            "retry once the holders finish",
+        )
+    };
+    asked
+        .recv()
+        .await
+        .unwrap()
+        .answer
+        .send(Err(refusal()))
+        .unwrap();
+    let refused = exec.await.unwrap().unwrap_err();
+    assert_eq!(refused.message, refusal().message);
+    let ended = h.handle.wait(JobId::new(1).unwrap()).await.unwrap();
+    assert_eq!(
+        (ended.state, ended.failure, ended.nice, ended.cpu_tokens),
+        (JobState::Failed, Some(JobFailure::CpuAdmission), None, None)
+    );
+
+    let job = h
+        .handle
+        .exec_background(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    asked
+        .recv()
+        .await
+        .unwrap()
+        .answer
+        .send(Err(refusal()))
+        .unwrap();
+    let ended = h.handle.wait(job).await.unwrap();
+    assert_eq!(ended.failure, Some(JobFailure::CpuAdmission));
+    let stderr = h
+        .handle
+        .log_read(job, StreamKind::Stderr, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&stderr.bytes),
+        format!("cowshed: {}\n", refusal().message)
+    );
+    assert!(h.spawned.try_recv().is_err(), "no command ran");
+}
+
+/// A worker asking for a gate, or for the host boundary, is refused with the typed
+/// class-not-permitted error before anything exists: no record, no gateway request, no spawn.
+#[tokio::test]
+async fn a_worker_gate_is_refused_before_any_record_request_or_spawn() {
+    let (mut h, mut asked, _root) = scripted_harness("cpu-worker-gate");
+    for scope in [ExecScope::Workspace, ExecScope::HostGate] {
+        let refused = h
+            .handle
+            .exec(
+                None,
+                None,
+                ExecRequest {
+                    scope,
+                    ..gate(request(StdinSource::Empty))
+                },
+                AdmissionSource::Worker,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::SandboxDenied, "{scope:?}");
+        assert!(refused.cpu_admission_source().is_some(), "{scope:?}");
+    }
+    assert!(asked.try_recv().is_err(), "no gateway request");
+    assert!(h.artifacts.try_recv().is_err(), "no job record");
+    assert!(h.spawned.try_recv().is_err(), "no spawn");
+}
+
+/// A coordinator's gate asks with its bound, runs at the supervisor's own nice, and may name the
+/// host boundary for an argv; a host-gate script, which needs the sandboxed exec host, is refused
+/// before any effect.
+#[tokio::test]
+async fn a_coordinator_gate_runs_at_gate_nice_and_may_reach_the_host_boundary() {
+    let (mut h, mut asked, _root) = scripted_harness("cpu-gate");
+    for scope in [ExecScope::Workspace, ExecScope::HostGate] {
+        let handle = h.handle.clone();
+        let exec = tokio::spawn(async move {
+            handle
+                .exec(
+                    None,
+                    None,
+                    ExecRequest {
+                        want: NonZeroUsize::new(8).unwrap(),
+                        scope,
+                        ..gate(request(StdinSource::Empty))
+                    },
+                    AdmissionSource::Coordinator,
+                )
+                .await
+        });
+        let cpu = asked.recv().await.unwrap();
+        assert_eq!(
+            (cpu.ask.class, cpu.ask.want, cpu.ask.wait_ms),
+            (
+                JobserverClass::Gate,
+                NonZeroUsize::new(8).unwrap(),
+                NonZeroU32::new(120_000)
+            )
+        );
+        cpu.answer.send(Ok(NonZeroUsize::new(8).unwrap())).unwrap();
+        let job = exec.await.unwrap().unwrap();
+        let spawned = h.spawned.recv().await.unwrap();
+        assert_eq!(
+            (spawned.request.scope, spawned.request.cpu.nice),
+            (scope, 0)
+        );
+        let info = h.handle.info(job).await.unwrap();
+        assert_eq!(
+            (info.class, info.scope, info.nice),
+            (JobserverClass::Gate, scope, Some(0))
+        );
+        complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+        h.handle.wait(job).await.unwrap();
+    }
+    let script = ExecRequest {
+        command: ExecCommand::Script(
+            cowshed_core::api::ScriptCommand::new(vec!["true".to_owned()], Vec::new()).unwrap(),
+        ),
+        scope: ExecScope::HostGate,
+        ..gate(request(StdinSource::Empty))
+    };
+    let refused = h
+        .handle
+        .exec(None, None, script, AdmissionSource::Coordinator)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Usage);
+    // A host gate still takes no session overlay; environment names restrict only its records.
+    let session = open_named(&h.handle, "gate").await;
+    let refused = h
+        .handle
+        .exec(
+            Some(&session),
+            None,
+            ExecRequest {
+                scope: ExecScope::HostGate,
+                ..gate(request(StdinSource::Empty))
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Usage);
+    assert!(
+        asked.try_recv().is_err(),
+        "the refused host gates asked nothing"
+    );
+    assert!(h.spawned.try_recv().is_err(), "nothing spawned");
+}
+
+/// The production store keeps the job's class, scope, granted tokens and observed nice in its
+/// terminal record, so the sealed job says what it ran under after its supervisor is gone.
+#[tokio::test]
+async fn the_sealed_record_keeps_the_class_scope_grant_and_observed_nice() {
+    let (supervisor_config, _root) = isolated_config("cpu-sealed");
+    let mut h = real_store_harness(supervisor_config);
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                want: NonZeroUsize::new(2).unwrap(),
+                ..gate(request(StdinSource::Empty))
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+    let sealed = h.handle.sealed(job).await.unwrap();
+    assert_eq!(
+        (sealed.class, sealed.scope, sealed.cpu_tokens, sealed.nice),
+        (
+            JobserverClass::Gate,
+            ExecScope::Workspace,
+            NonZeroUsize::new(2),
+            Some(0)
+        )
+    );
+}
+
+/// Public plaintext is a record projection, not an execution policy. Both scopes preserve the
+/// authored custom environment but bind it through a digest after their supervisor restarts.
+#[tokio::test]
+async fn a_host_gate_records_only_public_environment_without_restricting_execution() {
+    const PRIVATE: &str = "operator-private-value-must-never-enter-admission";
+    for scope in [ExecScope::Workspace, ExecScope::HostGate] {
+        let (mut config, _root) = isolated_config("record-only-environment");
+        config.credential_env_names.insert("TEST_SECRET".to_owned());
+        let records = config.workspace_root.join(".cowshed/job/records.arrow");
+        let authored = || {
+            let mut ask = keyed("record-projection", StdinSource::Empty);
+            ask.scope = scope;
+            if scope == ExecScope::HostGate {
+                ask = gate(ask);
+            }
+            for name in ["PROJECT_CUSTOM", "NPM_TOKEN", "NODE_OPTIONS", "NX_DAEMON"] {
+                ask.env.insert(name.to_owned(), PRIVATE.to_owned());
+            }
+            ask.env
+                .insert("TEST_SECRET".to_owned(), "withheld-value".to_owned());
+            ask
+        };
+        let source = if scope == ExecScope::HostGate {
+            AdmissionSource::Coordinator
+        } else {
+            AdmissionSource::Worker
+        };
+        let mut first = real_store_harness(config.clone());
+        let job = first
+            .handle
+            .exec(None, None, authored(), source)
+            .await
+            .expect("custom environment names never refuse a request");
+        let spawned = first.spawned.recv().await.unwrap();
+        assert_eq!(spawned.request.env["PROJECT_CUSTOM"], PRIVATE);
+        assert!(
+            !spawned.request.env.contains_key("TEST_SECRET"),
+            "existing credentials remain withheld"
+        );
+        complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+        first.handle.wait(job).await.unwrap();
+        let history = cowshed_core::storage::job_artifact::recover_records(&records).unwrap();
+        assert!(!history.frames.is_empty());
+        for frame in history.frames {
+            if let cowshed_core::storage::job_artifact::ProtectedRecord::Job(record) = frame.record
+            {
+                let admitted = record.admission.expect("keyed admission is durable");
+                assert_eq!(
+                    admitted.env,
+                    BTreeMap::from([("LANG".to_owned(), "C".to_owned())])
+                );
+                assert_ne!(admitted.env_sha256, Sha256Digest::compute(&[]));
+            }
+        }
+        let bytes = std::fs::read(&records).unwrap();
+        assert!(
+            !bytes
+                .windows(PRIVATE.len())
+                .any(|window| window == PRIVATE.as_bytes())
+        );
+        first.handle.quiesce().await.unwrap();
+        first.handle.retire().await.unwrap();
+        drop(first);
+        let mut second = real_store_harness(config);
+        assert_eq!(
+            second
+                .handle
+                .exec(None, None, authored(), source)
+                .await
+                .unwrap(),
+            job
+        );
+        let mut withheld = authored();
+        withheld.env.insert(
+            "TEST_SECRET".to_owned(),
+            "another-withheld-value".to_owned(),
+        );
+        assert_eq!(
+            second
+                .handle
+                .exec(None, None, withheld, source)
+                .await
+                .unwrap(),
+            job
+        );
+        let mut changed = authored();
+        changed.env.insert(
+            "PROJECT_CUSTOM".to_owned(),
+            "different-private-value".to_owned(),
+        );
+        let refused = second
+            .handle
+            .exec(None, None, changed, source)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.admission_source(),
+            Some(&AdmissionRefusal::KeyConflict {
+                job_id: job,
+                fields: vec![AdmissionField::Env],
+            })
+        );
+        assert!(
+            second.spawned.try_recv().is_err(),
+            "neither repeats nor conflicts run another job"
+        );
+    }
+}
+
 /// A job's span states the host at its two boundaries as the supervisor found it: the start row as
 /// admission read it, the end row as the job's terminal resource sample holds it. A supervisor
 /// configured with no volume to stat states no volume change: those cells are null, never zero.
@@ -6559,22 +7584,24 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
     use arrow_array::types::{Int64Type, UInt16Type, UInt32Type};
     use cowshed_core::api::{VolumeUnavailable, VolumeUsage};
     use cowshed_core::runtime::job_span_facts::HostColumns;
-
     let (mut supervisor_config, root) = isolated_config("job-span-facts");
     let telemetry = root.join("telemetry");
     std::fs::create_dir(&telemetry).unwrap();
     supervisor_config.telemetry_root = Some(telemetry.clone());
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
-
     let before = cowshed_core::host_load::read_host_load().expect("a host before admission");
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let after = cowshed_core::host_load::read_host_load().expect("a host after admission");
     let job = spawned.recv().await.unwrap();
-
     let command = lone_group();
     deliver(
         &handle,
@@ -6582,6 +7609,12 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
         ProcessEvent::Started {
             job_id,
             process: owned(&command, Instant::now()),
+            nice: {
+                // SAFETY: the fixture still owns this live leader.
+                let observed = unsafe { libc::getpriority(libc::PRIO_PROCESS, command.id()) };
+                assert_ne!(observed, -1, "fixture leader priority is observable");
+                observed
+            },
         },
         0,
     )
@@ -6603,7 +7636,6 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
     );
     let health = handle.trace_health().await.unwrap();
     assert_eq!((health.recorded, health.failed), (3, 0), "{health:?}");
-
     let facts = |batch: &arrow_array::RecordBatch| {
         let cell = |name: &str| batch.column_by_name(name).expect(name).clone();
         let milli = cell("load1_milli");
@@ -6625,10 +7657,8 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
     assert_eq!(
         batches.len(),
         3,
-        "a start row, the unattributed usage its terminal sample states -- a polled census never \\
-         covers the whole tree -- and an end row"
+        "a start row, the unattributed usage its terminal sample states -- a polled census never covers the whole tree -- and an end row"
     );
-
     // The start row's host lies between independent reads taken around admission.
     let milli = |host| HostColumns::of(host).expect("a host in range");
     let (low, high) = (
@@ -6642,10 +7672,8 @@ async fn a_job_span_states_the_admission_host_and_the_terminal_sample_s_host() {
     );
     assert_eq!(start_cores, Some(before.cores.get()));
     assert_eq!((start_workspace, start_build), (None, None));
-
     // The unattributed-usage row states no host or volume fact of its own.
     assert_eq!(facts(&batches[1].1), (None, None, None, None));
-
     // The end row is the terminal sample's host, and no volume change it did not state.
     let host = milli(terminal.host);
     assert_eq!(
@@ -6668,7 +7696,12 @@ async fn cpu_the_observed_processes_never_counted_is_the_job_span_s_unattributed
     let mut harness = warm_harness(supervisor_config);
     let (handle, spawned) = (harness.handle.clone(), &mut harness.spawned);
     let job_id = handle
-        .exec(None, None, request(StdinSource::Empty))
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
         .await
         .unwrap();
     let job = spawned.recv().await.unwrap();
@@ -6682,13 +7715,18 @@ async fn cpu_the_observed_processes_never_counted_is_the_job_span_s_unattributed
         ProcessEvent::Started {
             job_id,
             process: owned(&leader.child, Instant::now()),
+            nice: {
+                // SAFETY: the fixture still owns this live leader.
+                let observed = unsafe { libc::getpriority(libc::PRIO_PROCESS, leader.child.id()) };
+                assert_ne!(observed, -1, "fixture leader priority is observable");
+                observed
+            },
         },
         0,
     )
     .await;
     let burned = leader.burned() + leader.burned();
     leader.expect("reaped");
-
     let leader = leader.exit();
     complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
     let ended = handle.wait(job_id).await.unwrap();
@@ -6696,14 +7734,12 @@ async fn cpu_the_observed_processes_never_counted_is_the_job_span_s_unattributed
     let reconciliation = *terminal.accounting.reconciliation();
     assert!(
         reconciliation.cpu_us.get() > i64::try_from(burned / 2).unwrap(),
-        "the reaped children's {burned} us are in the job's totals and in no observed process: \
-         {reconciliation:?}"
+        "the reaped children's {burned} us are in the job's totals and in no observed process: {reconciliation:?}"
     );
     assert!(
         matches!(reconciliation.coverage, ProcessCoverage::Gap { .. }),
         "a polled census never claims the whole tree: {reconciliation:?}"
     );
-
     let health = handle.trace_health().await.unwrap();
     assert_eq!((health.recorded, health.failed), (3, 0), "{health:?}");
     assert_job_spans(&telemetry, &[expected_span(&ended, "span-ok", "exited")]);

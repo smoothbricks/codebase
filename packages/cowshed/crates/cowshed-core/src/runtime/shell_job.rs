@@ -29,9 +29,10 @@ use super::job_groups::Birth;
 use super::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, FrameReader, FrameWriter, MAX_FRAME_BYTES, REPLY_ACTIVATED,
     REPLY_ACTIVATION_EXITED, REPLY_ACTIVATION_UNUSABLE, REPLY_APPROVED, REPLY_EXITED,
-    REPLY_HOST_FAILED, REPLY_RELEASED, REPLY_SCRIPT_SYNTAX, REPLY_SIGNAL_FAILED, REPLY_STARTED,
-    REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RELEASE, REQUEST_RUN, REQUEST_SCRIPT,
-    REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_DIRECTORY, ShellHostProgram, send_with_descriptors,
+    REPLY_HOST_FAILED, REPLY_NICE_REFUSED, REPLY_RELEASED, REPLY_SCRIPT_SYNTAX,
+    REPLY_SIGNAL_FAILED, REPLY_STARTED, REQUEST_ACTIVATE, REQUEST_APPROVE, REQUEST_RELEASE,
+    REQUEST_RUN, REQUEST_SCRIPT, REQUEST_SIGNAL, RawWaitStatus, SHELL_HOST_DIRECTORY,
+    ShellHostProgram, send_with_descriptors,
 };
 use super::shell_pool::{Acquired, Activation, Activator, ShellPool, ShellPoolConfig};
 use super::shell_watch::{
@@ -115,6 +116,8 @@ pub(super) struct PooledSpawn<'a> {
     pub environment: SandboxEnvironment,
     pub caller: &'a BTreeMap<String, String>,
     pub grant_revision: u64,
+    /// The job's CPU grant and class nice, which the command alone runs under, never its host.
+    pub cpu: &'a super::supervisor::CpuPlacement,
     #[cfg(target_os = "macos")]
     pub monitor: super::process_monitor::ProcessMonitor,
 }
@@ -160,7 +163,9 @@ impl WorkspaceShells {
                 pool
             }
         };
-        let overlay = spawn.environment.overlay(spawn.caller);
+        // The grant's pool and count are the authority's, laid over whatever the caller named.
+        let mut overlay = spawn.environment.overlay(spawn.caller);
+        overlay.extend(spawn.cpu.environment());
         let (stdin_read, stdin_write) = pipe().map_err(pipe_error)?;
         let (stdout_read, stdout_write) = pipe().map_err(pipe_error)?;
         let (stderr_read, stderr_write) = pipe().map_err(pipe_error)?;
@@ -203,6 +208,7 @@ impl WorkspaceShells {
                 command: spawn.command,
                 cwd: spawn.cwd,
                 overlay,
+                nice: spawn.cpu.nice,
                 #[cfg(target_os = "macos")]
                 monitor: spawn.monitor.clone(),
             },
@@ -375,6 +381,11 @@ impl RunningProcess for PooledProcess {
         None
     }
 
+    fn nice(&self) -> Option<i32> {
+        // The command's observed nice arrives with `ProcessEvent::Started`.
+        None
+    }
+
     #[cfg(target_os = "macos")]
     fn observations(&self) -> Option<&super::process_monitor::ProcessMonitor> {
         Some(&self.monitor)
@@ -413,6 +424,8 @@ struct RunCommand {
     command: HostCommand,
     cwd: PathBuf,
     overlay: Vec<(OsString, OsString)>,
+    /// The nice the command runs at, its class's.
+    nice: i32,
     #[cfg(target_os = "macos")]
     monitor: super::process_monitor::ProcessMonitor,
 }
@@ -614,15 +627,19 @@ async fn run_pooled(
     // The host forked the command just before it replied: this is the first moment this
     // process knows of it.
     let spawned = Instant::now();
-    let (birth, host_at_spawn) = match started {
-        Ok(Started::Running(birth)) => {
+    let (birth, nice, host_at_spawn) = match started {
+        Ok(Started::Running { birth, nice }) => {
             let host_at_spawn = crate::host_load::read_host_load();
             // The command runs and holds the job's streams; nothing here may.
             *diagnostics = None;
-            (birth, host_at_spawn)
+            (birth, nice, host_at_spawn)
         }
         Ok(Started::Unexecutable(exit)) => return Outcome::Exited(exit),
         Ok(Started::ScriptSyntax) => return Outcome::ScriptSyntax,
+        // The host is intact and holds nothing; the job fails typed, saying why on its stderr.
+        Ok(Started::NiceRefused(failure)) => {
+            return Outcome::NotLaunched(CowshedError::priority(failure));
+        }
         Err(error) => {
             checkout.poison();
             return Outcome::NotLaunched(error);
@@ -640,6 +657,7 @@ async fn run_pooled(
                 spawned,
                 host: host_at_spawn,
             },
+            nice,
         })
         .await;
     let exit = match host.exited(&mut forwarded, job_id, events).await {
@@ -694,12 +712,14 @@ impl Drop for ExecHost {
 }
 
 enum Started {
-    /// The command runs; the host observed its group leader before it could reap it.
-    Running(Birth),
+    /// The command runs at `nice`; the host observed its group leader before it could reap it.
+    Running { birth: Birth, nice: i32 },
     /// The argv could not be executed; the host already wrote why to the job's stderr.
     Unexecutable(ExitStatus),
     /// The script did not parse; the host already wrote why to the job's stderr.
     ScriptSyntax,
+    /// The forked command could not run at its nice and never ran; the host holds nothing.
+    NiceRefused(crate::error::PriorityFailure),
 }
 
 /// The first fields of a script request: its text and its bindings.
@@ -787,6 +807,15 @@ impl ExecHost {
                         .into_iter(),
                 )
             })
+            // macOS holds the forked command at its observation fence, where this process sets
+            // its nice; without a hold the child sets its own before it runs anything.
+            .map(|frame| {
+                frame.child_nice(if cfg!(target_os = "macos") {
+                    None
+                } else {
+                    Some(command.nice)
+                })
+            })
             .and_then(FrameWriter::finish)
             .map_err(|error| protocol_error("request", error))?;
         #[cfg(target_os = "macos")]
@@ -803,24 +832,50 @@ impl ExecHost {
         let raw = descriptors.each_ref().map(AsRawFd::as_raw_fd);
         self.send(frame, &raw).await?;
         drop(descriptors);
+        // The nice the command was observed at while the fence held it, before it ran anything.
+        // A refusal fails the launch; this host is then dropped, which ends the held command.
         #[cfg(target_os = "macos")]
-        {
+        let placed = {
             drop(held);
             let monitor = command.monitor.clone();
-            tokio::task::spawn_blocking(move || {
-                gate.observe(|pid| monitor.watch(pid).map_err(io::Error::other))
+            let nice = command.nice;
+            let (observed, placed) = tokio::task::spawn_blocking(move || {
+                let mut placed = None;
+                let observed = gate.observe(|pid| {
+                    monitor.watch(pid).map_err(io::Error::other)?;
+                    let placement = super::supervisor::place_nice(pid, nice);
+                    let refused = placement
+                        .as_ref()
+                        .err()
+                        .map(|failure| io::Error::other(format!("{failure:?}")));
+                    placed = Some(placement);
+                    refused.map_or(Ok(()), Err)
+                });
+                (observed, placed)
             })
             .await
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()))
-            .map_err(pipe_error)?;
-        }
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
+            let placed = match placed {
+                Some(Err(failure)) => return Err(CowshedError::priority(failure)),
+                Some(Ok(nice)) => Some(nice),
+                None => None,
+            };
+            observed.map_err(pipe_error)?;
+            placed
+        };
+        // The child verified its own nice before exec; one it could not set never starts.
+        #[cfg(not(target_os = "macos"))]
+        let placed = Some(command.nice);
         let payload = self.receive().await?;
         let (tag, mut fields) =
             FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;
         let started = match tag {
-            REPLY_STARTED => {
-                Started::Running(fields.birth().map_err(|e| protocol_error("reply", e))?)
-            }
+            REPLY_STARTED => Started::Running {
+                birth: fields.birth().map_err(|e| protocol_error("reply", e))?,
+                nice: placed.ok_or_else(|| {
+                    protocol_error("reply", "a command started that its fence never held")
+                })?,
+            },
             REPLY_EXITED => {
                 Started::Unexecutable(fields.exit().map_err(|e| protocol_error("reply", e))?)
             }
@@ -828,6 +883,11 @@ impl ExecHost {
                 fields.bytes().map_err(|e| protocol_error("reply", e))?;
                 Started::ScriptSyntax
             }
+            REPLY_NICE_REFUSED => Started::NiceRefused(
+                fields
+                    .priority_failure()
+                    .map_err(|e| protocol_error("reply", e))?,
+            ),
             other => return Err(protocol_error("reply", format!("unexpected tag {other}"))),
         };
         fields

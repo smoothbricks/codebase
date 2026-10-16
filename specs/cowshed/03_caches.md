@@ -206,13 +206,19 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   `.cowshed/env` publishes that literal PATH prefix, and managed activation reapplies the same writer after project PATH
   hooks; the child bootstrap uses the same host identity. It runs the next `cargo` on `PATH` sized to the host CPU
   budget (05_gateway.md "Host CPU budget", Outside `bounded-exec`). Under an inherited jobserver (`CARGO_MAKEFLAGS`
-  names a live one, as for a `cargo` a build script starts) it runs that `cargo` as asked. Under a `bounded-exec` grant
-  (`BOUNDED_EXEC_CPU_TOKENS` set) it takes no second grant and sets `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and
-  `NEXTEST_TEST_THREADS` to that count where they are unset. A subcommand classified as non-compiling by
-  [05 Gateway, Host CPU budget](05_gateway.md#host-cpu-budget) runs directly. Any other takes a jobserver grant of `g`
-  tokens and runs with the grant's fifo, and with `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` and
-  `BOUNDED_EXEC_CPU_TOKENS` set to `g` where they are unset. With no gateway listening it runs `cargo` unbudgeted, as
-  `bounded-exec` does.
+  names a live one, as for a `cargo` a build script starts) it runs that `cargo` as asked. A live parent CPU pool comes
+  next: compiling Cargo borrows its actual local allocation, sizes to it and inherits its own child sub-pool; it never
+  competes for the parent's held host grant. Pool refusal/loss fails the command (05 Gateway, gate admission by drain).
+  Under a `bounded-exec` grant (`BOUNDED_EXEC_CPU_TOKENS` set) it takes no second grant and sets `CARGO_BUILD_JOBS`,
+  `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` to that count where they are unset. A subcommand classified as
+  non-compiling by [05 Gateway, Host CPU budget](05_gateway.md#host-cpu-budget) runs directly. Any other takes a
+  jobserver grant of `g` tokens and runs with the grant's fifo, and with `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` and
+  `BOUNDED_EXEC_CPU_TOKENS` set to `g` where they are unset. For a root admission, the launcher scans cwd ancestors with
+  lstat for `.cowshed/workspace.json`: presence only tightens admission and grants no authority; inspection errors
+  refuse. A managed checkout never starts Cargo on an absent/refused/protocol-failed grant. Only positively nonmanaged
+  host/CI checkouts may run unbudgeted only when NotFound proves gateway absence. ConnectionRefused, permission failures
+  and other connect errors refuse; a live saturated listener can return ConnectionRefused. Connected failures are never
+  relabeled as absence. Noncompiling exemptions and inherited grants keep their existing precedence.
 - **Tool homes stay where the tool keeps them.** Every layer-3 cache lives at its tool's own default location in the
   host user's HOME, the one place the host's own tools already use without configuration, and cowshed shares that exact
   path into the sandbox of every project whose detector names the tool (15_capabilities.md). There is no cache volume,

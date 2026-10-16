@@ -230,6 +230,48 @@ impl<T> Drop for Fenced<T> {
     }
 }
 
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Fenced<T> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().0).poll_read(cx, buffer)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Fenced<T> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.get_mut().0).poll_write(cx, bytes)
+    }
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.get_mut().0).poll_write_vectored(cx, bytes)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
 /// A spawn this crate's tests hold in flight, for any lease's release to be tried against.
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod in_flight {

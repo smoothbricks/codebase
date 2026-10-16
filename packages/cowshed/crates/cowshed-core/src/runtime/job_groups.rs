@@ -688,6 +688,21 @@ pub struct Process {
     version: u32,
 }
 
+/// An observation after a denied signal, never an identity renewed for a retry.
+#[cfg(target_os = "macos")]
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "signaling process {pid} with signal {signal} failed: {source}; expected_version={expected_version}, caller_euid={caller_euid}, post_failure_unfenced(uid,flags,version)={post_failure:?}, exit_watch=unavailable (none held at the signal boundary)"
+)]
+struct SignalPermissionDenied {
+    pid: i32,
+    signal: libc::c_int,
+    expected_version: u32,
+    caller_euid: u32,
+    post_failure: io::Result<Option<(u32, u32, u32)>>,
+    source: io::Error,
+}
+
 /// `struct proc_uniqidentifierinfo` (`<sys/proc_info.h>`), which the `libc` crate does not
 /// declare: `p_uuid[16]`, `p_uniqueid`, `p_puniqueid`, then `p_idversion`, then 20 reserved
 /// bytes. The unique ids are never given to another process while the system runs.
@@ -865,6 +880,7 @@ impl Process {
         match unsafe { proc_signal_with_audittoken(&mut token, signal) } {
             0 => Ok(true),
             libc::ESRCH => Ok(false),
+            libc::EPERM => Err(self.signal_permission_denied(signal)),
             error => Err(io::Error::new(
                 io::Error::from_raw_os_error(error).kind(),
                 format!(
@@ -874,6 +890,34 @@ impl Process {
                 ),
             )),
         }
+    }
+
+    /// Read diagnostic facts only after EPERM; failure remains a permission denial.
+    #[cold]
+    fn signal_permission_denied(&self, signal: libc::c_int) -> io::Error {
+        let post_failure = running_info(self.pid).map(|info| {
+            info.map(|info| {
+                (
+                    info.bsd.pbi_uid,
+                    info.bsd.pbi_flags,
+                    info.unique.id_version.cast_unsigned(),
+                )
+            })
+        });
+        // SAFETY: geteuid takes no pointers and only reads the caller's credential.
+        let caller_euid = unsafe { libc::geteuid() };
+        let source = io::Error::from_raw_os_error(libc::EPERM);
+        io::Error::new(
+            source.kind(),
+            SignalPermissionDenied {
+                pid: self.pid,
+                signal,
+                expected_version: self.version,
+                caller_euid,
+                post_failure,
+                source,
+            },
+        )
     }
 
     /// Watch for this process's exit, from now. A watch registered by pid once the process has

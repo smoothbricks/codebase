@@ -4,7 +4,11 @@ A cowshed workspace is what a CI job wants: a warm, isolated checkout with `.git
 Nix/devenv state, and every package cache already populated. The cowshed runner that would give every job one — a
 self-hosted Linux host with a ZFS substrate, a `services.cowshed-runner` NixOS module, and job hooks that create and
 destroy each job's workspace and dispatch every command through `cowshed exec` — does not exist yet. Its design is
-`specs/cowshed/10_ci.md` (and `09_substrates.md` for ZFS). What ships today is the composite action below.
+`specs/cowshed/10_ci.md` (and `09_substrates.md` for ZFS). That design uses the ordinary land/adoption and fork
+lifecycle from `16_build_volumes.md`: keep the exact successful trusted tree/environment's workspace through handover,
+materialize its outputs and adopt its built state, then retire it. There is no separate refresh workspace or repeated
+install/build/test to warm main. A different tree or environment still needs its own checks. This is the runner design,
+not a lifecycle implemented by the composite action. What ships today is the composite action below.
 
 ## The one factual constraint
 

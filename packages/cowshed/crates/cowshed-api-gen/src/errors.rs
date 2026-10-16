@@ -2,46 +2,37 @@
 //! another list of causes in the addon. Serde builds the JS values directly; no JSON text or
 //! handwritten tagged-union encoder stands between a core refusal and its native cause.
 
-use crate::ir::{Api, Fields, Shape};
-use std::fmt::Write;
+use crate::ir::Api;
 
 pub fn emit(api: &Api) -> Result<String, String> {
-    let record = api
-        .records
-        .get("CowshedError")
-        .ok_or("CowshedError has no canonical declaration")?;
-    let Shape::Struct(Fields::Named(fields)) = &record.shape else {
-        return Err("CowshedError is not a record of named fields".to_owned());
-    };
-    let mut output = String::from(
-        "\n/// The canonical core error, with every serialized detail retained on the JS Error.\n\
-         pub(super) fn cowshed_error(env: Env, source: cowshed_core::CowshedError) -> napi::Result<napi::Error> {\n\
-         \x20   let details = env.to_js_value(&source)?.coerce_to_object()?;\n\
-         \x20   let mut error = napi::JsError::from(napi::Error::new(source.code.as_str(), source.message))\n\
-         \x20       .into_unknown(env).coerce_to_object()?;\n",
-    );
-    for field in fields.iter().filter(|field| !field.serde.skip) {
-        if field.serde.flatten {
-            return Err("CowshedError cannot flatten native error properties".to_owned());
-        }
-        let name = field
-            .name
-            .as_deref()
-            .ok_or("CowshedError has an unnamed field")?;
-        let wire = crate::typescript::renamed(
-            name,
-            field.serde.rename.as_deref(),
-            record.serde.rename_all.as_deref(),
-        )?;
-        if wire == "code" || wire == "message" {
-            continue;
-        }
-        writeln!(output,
-            "    if details.has_named_property({wire:?})? {{\n        error.set_named_property({wire:?}, details.get_named_property::<napi::JsUnknown>({wire:?})?)?;\n    }}"
-        ).unwrap();
+    if !api.records.contains_key("CowshedError") {
+        return Err("CowshedError has no canonical declaration".to_owned());
     }
-    output.push_str("    Ok(napi::Error::from(error.into_unknown()))\n}\n");
-    Ok(output)
+    // Serde owns field names, omission and flattening. Enumerate its actual own properties;
+    // deriving a second field list here rejected flattened causes and drifted from the wire.
+    Ok(String::from(
+        r#"
+/// The canonical core error, with every serialized detail retained on the JS Error.
+pub(super) fn cowshed_error(env: Env, source: cowshed_core::CowshedError) -> napi::Result<napi::Error> {
+    let details = env.to_js_value(&source)?.coerce_to_object()?;
+    let mut error = napi::JsError::from(napi::Error::new(source.code.as_str(), source.message))
+        .into_unknown(env).coerce_to_object()?;
+    let names = details.get_all_property_names(
+        napi::KeyCollectionMode::OwnOnly,
+        napi::KeyFilter::AllProperties,
+        napi::KeyConversion::NumbersToStrings,
+    )?;
+    for index in 0..names.get_array_length()? {
+        let name = names.get_element::<napi::JsString>(index)?.into_utf8()?;
+        let name = name.as_str()?;
+        if name != "code" && name != "message" {
+            error.set_named_property(name, details.get_named_property::<napi::JsUnknown>(name)?)?;
+        }
+    }
+    Ok(napi::Error::from(error.into_unknown()))
+}
+"#,
+    ))
 }
 
 #[cfg(test)]
@@ -57,39 +48,36 @@ mod tests {
     #[test]
     fn native_error_details_follow_canonical_field_spellings() {
         let source = r#"
-            #[derive(Serialize, Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            pub struct CowshedError {
-                pub code: ErrorCode,
-                pub message: String,
-                pub hint: String,
-                #[serde(default, skip_serializing_if = "Option::is_none")]
-                stdin: Option<Box<StdinRefusal>>,
-                #[serde(rename = "otherBuild", default, skip_serializing_if = "Option::is_none")]
-                other_build: Option<Box<OtherBuild>>,
-                #[serde(skip)]
-                private_state: Option<PrivateState>,
-            }
-        "#;
-        let output = emit(&declaration(source)).expect("native projection");
-        assert!(output.contains("env.to_js_value(&source)?"), "{output}");
-        for property in ["hint", "stdin", "otherBuild"] {
-            assert!(
-                output.contains(&format!("error.set_named_property({property:?},")),
-                "{output}"
-            );
+    #[derive(Serialize, Deserialize)]
+    pub struct CowshedError {
+        pub code: ErrorCode,
+        pub message: String,
+        pub hint: String,
+        #[serde(flatten)]
+        execution: Option<Box<ExecutionRefusal>>,
+        #[serde(skip)]
+        private_state: Option<PrivateState>,
+    }
+"#;
+        let output = emit(&declaration(source)).expect("native flattened projection");
+        for required in [
+            "env.to_js_value(&source)?",
+            "get_all_property_names(",
+            "napi::KeyCollectionMode::OwnOnly",
+            "error.set_named_property(name,",
+        ] {
+            assert!(output.contains(required), "{output}");
         }
         assert!(!output.contains("private_state"), "{output}");
         assert!(!output.contains("serde_json"), "{output}");
         assert!(!output.contains(".clone()"), "{output}");
         let changed = emit(&declaration(
-            &source.replace("stdin: Option", "admission: Option"),
+            &source.replace("execution:", "another_cause:"),
         ))
-        .expect("changed projection");
-        assert!(
-            changed.contains("error.set_named_property(\"admission\","),
-            "{changed}"
+        .expect("renamed private storage");
+        assert_eq!(
+            output, changed,
+            "native properties follow Serde, not private storage names"
         );
-        assert!(!changed.contains("\"stdin\""), "{changed}");
     }
 }

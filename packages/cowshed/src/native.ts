@@ -35,6 +35,7 @@ export interface NativeWorkspaceRefHandle extends NativeWorkspaceRefOperations {
 export type NativeCoordinatorHandle = NativeCoordinatorOperations;
 
 export interface NativeWorkspaceHandle extends NativeWorkspaceHandleOperations {
+  readonly workspaceIncarnation: string;
   readonly name: string;
   readonly mountPath: string;
 }

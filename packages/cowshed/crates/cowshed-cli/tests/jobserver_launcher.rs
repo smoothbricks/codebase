@@ -138,6 +138,8 @@ exit "${FAKE_CARGO_EXIT:-0}"
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole() {
     let root = scratch("cases");
+    let original_cwd = std::env::current_dir().expect("original cwd");
+    std::env::set_current_dir(&root).expect("explicit nonmanaged checkout");
     let bin = root.join("bin");
     std::fs::create_dir(&bin).expect("bin");
     let fake = bin.join("cargo");
@@ -233,13 +235,105 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
     );
     unset("CARGO_MAKEFLAGS");
 
-    // With no gateway listening a build runs unbudgeted.
+    // With a missing gateway socket a nonmanaged build runs unbudgeted.
     let absent = root.join("absent.sock");
     let code = run(&["build"], &absent).expect("launcher thread");
     assert_eq!(code, 7);
     let shown = env_out();
     assert!(shown.contains("CARGO_MAKEFLAGS=\n"), "{shown}");
 
+    // Missing and failed admissions never start a managed payload, even below its marker root.
+    let metadata = root.join(".cowshed");
+    std::fs::create_dir(&metadata).expect("managed metadata directory");
+    let marker = metadata.join("workspace.json");
+    std::fs::write(&marker, b"{\"role\":\"workspace\"}").expect("managed marker");
+    let nested = root.join("crate");
+    std::fs::create_dir(&nested).expect("nested crate cwd");
+    std::env::set_current_dir(&nested).expect("run below the managed marker");
+    std::fs::remove_file(&out).expect("discard prior payload output");
+    assert_eq!(run(&["build"], &absent).expect("managed absent outcome"), 1);
+    assert!(!out.exists(), "managed gateway absence never starts cargo");
+    for (name, answer) in [
+        ("refused", "{\"ok\":false,\"error\":\"fixture-refusal\"}\n"),
+        ("protocol", "not-json\n"),
+        ("closed", "{\"ok\":true,\"lease\":\"queued\"}\n"),
+    ] {
+        let endpoint = root.join(format!("{name}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&endpoint).expect("fixture endpoint");
+        let server = std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            let (mut stream, _) = listener.accept().expect("launcher connected");
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .expect("jobserver request");
+            stream.write_all(answer.as_bytes()).expect("fixture reply");
+        });
+        assert_eq!(
+            run(&["build"], &endpoint).expect("managed refusal outcome"),
+            1,
+            "{name}"
+        );
+        server.join().expect("fixture server ends");
+        assert!(!out.exists(), "managed {name} never starts cargo");
+        std::fs::remove_file(&endpoint).expect("retire fixture endpoint");
+    }
+    // Noncompiling discovery remains exempt, including in a managed checkout.
+    assert_eq!(run(&["metadata"], &absent).expect("metadata exemption"), 7);
+    std::fs::remove_file(&out).expect("discard exempt payload output");
+    std::fs::remove_file(&marker).expect("remove marker");
+    std::fs::remove_dir(&metadata).expect("remove metadata directory");
+    std::fs::write(&metadata, b"not a directory").expect("uninspectable marker parent");
+    assert_eq!(
+        run(&["build"], &socket).expect("marker inspection outcome"),
+        1
+    );
+    assert!(!out.exists(), "inspection uncertainty never starts cargo");
+    std::fs::remove_file(&metadata).expect("remove malformed marker parent");
+    std::env::set_current_dir(&root).expect("return to explicit nonmanaged checkout");
+
+    // A refused socket is not absent, even when this checkout is not managed.
+    let refused = root.join("nonmanaged-refused.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&refused)
+        .expect("nonmanaged refused fixture endpoint");
+    drop(listener);
+    assert_eq!(
+        run(&["build"], &refused).expect("nonmanaged connection-refused outcome"),
+        1
+    );
+    assert!(!out.exists(), "a refused host gateway never starts cargo");
+    std::fs::remove_file(&refused).expect("retire nonmanaged refused fixture endpoint");
+    // Connected protocol/refusal failures are not absence, even outside cowshed.
+    for (name, answer) in [
+        (
+            "host-refused",
+            "{\"ok\":false,\"error\":\"fixture-host-refusal\"}\n",
+        ),
+        ("host-protocol", "not-json\n"),
+    ] {
+        let endpoint = root.join(format!("{name}.sock"));
+        let listener =
+            std::os::unix::net::UnixListener::bind(&endpoint).expect("host fixture endpoint");
+        let server = std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            let (mut stream, _) = listener.accept().expect("host launcher connected");
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .expect("host jobserver request");
+            stream
+                .write_all(answer.as_bytes())
+                .expect("host fixture reply");
+        });
+        assert_eq!(
+            run(&["build"], &endpoint).expect("host connected refusal outcome"),
+            1,
+            "{name}"
+        );
+        server.join().expect("host fixture server ends");
+        assert!(!out.exists(), "host {name} cannot be relabeled as absent");
+        std::fs::remove_file(&endpoint).expect("retire host fixture endpoint");
+    }
     // Exercise the real CLI entrypoint through cargo -> cowshed -> this test build.
     // A metadata command must reach the next Cargo, not the cowshed CLI parser.
     let installed = root.join("installed");
@@ -309,5 +403,6 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
     unset("FAKE_CARGO_SLEEP");
 
     gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
+    std::env::set_current_dir(original_cwd).expect("restore original cwd");
+    std::fs::remove_dir_all(root).expect("retire launcher fixture");
 }

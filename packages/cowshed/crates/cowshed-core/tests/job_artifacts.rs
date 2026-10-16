@@ -17,8 +17,8 @@ use cowshed_core::api::{
 };
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
 use cowshed_core::storage::job_artifact::{
-    ArtifactConfig, ArtifactError, ArtifactStore, JobArtifactToken, OutputTargets, ProtectedRecord,
-    PublicationStage, StreamKind, StreamTarget, controller_commitment_schema,
+    ArtifactConfig, ArtifactError, ArtifactStore, JobArtifactToken, JobScheduling, OutputTargets,
+    ProtectedRecord, PublicationStage, StreamKind, StreamTarget, controller_commitment_schema,
     controller_commitments_to_batch, decode_controller_commitment, decode_controller_commitments,
     encode_controller_commitment, open_stream_reader, protected_record_schema, read_stream,
     recover_records, recover_records_with_budget,
@@ -93,6 +93,7 @@ fn begin_with_argv(
             grant_revision,
             &cowshed_core::api::ExecCommand::Argv(argv.to_vec()),
             None,
+            JobScheduling::default(),
             targets,
         )
         .unwrap()
@@ -282,6 +283,7 @@ fn stale_and_foreign_tokens_are_typed_conflicts() {
             1,
             &ExecCommand::Argv(vec!["true".into()]),
             None,
+            JobScheduling::default(),
             OutputTargets::default(),
         )
         .unwrap();
@@ -292,6 +294,7 @@ fn stale_and_foreign_tokens_are_typed_conflicts() {
             1,
             &ExecCommand::Argv(vec!["true".into()]),
             None,
+            JobScheduling::default(),
             OutputTargets::default()
         ),
         Err(ArtifactError::TokenConflict { .. })
@@ -403,6 +406,7 @@ fn unsafe_argv_rejects_before_artifact_creation_or_id_advance() {
             1,
             &ExecCommand::Argv(nul.to_vec()),
             None,
+            JobScheduling::default(),
             OutputTargets::default()
         ),
         Err(ArtifactError::Dto(DtoError::CommandArgumentContainsNul))
@@ -421,6 +425,7 @@ fn unsafe_argv_rejects_before_artifact_creation_or_id_advance() {
             1,
             &ExecCommand::Argv(oversize.to_vec()),
             None,
+            JobScheduling::default(),
             OutputTargets::default(),
         ),
         Err(ArtifactError::Dto(DtoError::CommandArgumentTooLarge))

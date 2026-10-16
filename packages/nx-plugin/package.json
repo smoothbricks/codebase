@@ -13,6 +13,7 @@
       "import": "./loader.js",
       "default": "./loader.js"
     },
+
     "./version-actions": {
       "types": "./dist/version-actions.d.cts",
       "require": "./dist/version-actions.cjs",

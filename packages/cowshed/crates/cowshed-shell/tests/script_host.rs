@@ -228,6 +228,7 @@ fn submit(
         .unwrap()
         .list(std::iter::empty())
         .unwrap()
+        .child_nice(None)
         .finish()
         .unwrap();
     #[cfg(target_os = "macos")]

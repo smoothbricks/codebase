@@ -363,6 +363,7 @@ enum Incoming {
         want: NonZeroUsize,
         checkout: String,
         command: String,
+        options: JobserverOptions,
     },
     TaskAdmit {
         unit: String,
@@ -430,6 +431,32 @@ struct TaskAdmitIn {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobserverIn {
+    #[serde(flatten)]
+    tokens: CpuTokensIn,
+    #[serde(default)]
+    class: cowshed_gateway_types::JobserverClass,
+    wait_ms: Option<std::num::NonZeroU32>,
+    #[serde(default)]
+    pool: bool,
+    job: Option<JobserverJobIn>,
+}
+
+struct JobserverOptions {
+    admission: crate::jobserver::JobserverAdmission,
+    pool_job: Option<JobserverJobIn>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JobserverJobIn {
+    repo_id: cowshed_core::repository::RepoId,
+    workspace_incarnation: String,
+    job_id: std::num::NonZeroU64,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AuthenticatedControlRequestIn {
     controller_credential: String,
@@ -462,6 +489,12 @@ struct ControlResponse {
     /// The jobserver fifo a `jobserver` grant names for `CARGO_MAKEFLAGS`.
     #[serde(skip_serializing_if = "Option::is_none")]
     fifo: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_pool: Option<String>,
+    /// Actual admission wait on a gate timeout, not the requested bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_budget: Option<CpuBudgetStatus>,
     /// What a selected task-server unit runs under.
@@ -488,6 +521,8 @@ pub enum ControlFailureCode {
     /// The daemon's startup pass has not restored its sessions yet: a session change now would
     /// race that restore. Retry once status reports no `healing`.
     Healing,
+    /// A gate's explicit admission bound elapsed; its live holder snapshot is in cpuBudget.
+    GateAdmissionTimeout,
     Rejected,
 }
 
@@ -861,10 +896,12 @@ async fn serve<R, W>(
             checkout,
             command,
         }) => {
-            let (stake, granted) =
-                services
-                    .cpu_budget
-                    .ask(Arc::from(checkout), want, Claim::new(&command, pid));
+            let (stake, granted) = services.cpu_budget.ask(
+                Arc::from(checkout),
+                want,
+                Claim::new(&command, pid),
+                cowshed_gateway_types::JobserverClass::Background,
+            );
             hold(
                 reader,
                 writer,
@@ -882,12 +919,24 @@ async fn serve<R, W>(
             want,
             checkout,
             command,
+            options,
         }) => {
-            let (stake, granted) =
-                services
-                    .cpu_budget
-                    .ask(Arc::from(checkout), want, Claim::new(&command, pid));
-            hold_jobserver(reader, writer, stake, granted, services.jobserver.clone()).await;
+            let (stake, granted) = services.cpu_budget.ask(
+                Arc::from(checkout),
+                want,
+                Claim::new(&command, pid),
+                options.admission.class(),
+            );
+            hold_jobserver(
+                reader,
+                writer,
+                stake,
+                granted,
+                services.jobserver.clone(),
+                options,
+                services.cpu_budget.clone(),
+            )
+            .await;
         }
         Ok(Incoming::TaskAdmit {
             unit,
@@ -1005,10 +1054,13 @@ async fn hold_jobserver<R, W, S>(
     stake: S,
     granted: tokio::sync::oneshot::Receiver<usize>,
     fifos: crate::jobserver::JobserverFifos,
+    options: JobserverOptions,
+    budget: CpuBudget,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let asked = std::time::Instant::now();
     if write_response(&mut writer, &lease(LeaseState::Queued))
         .await
         .is_err()
@@ -1017,6 +1069,7 @@ async fn hold_jobserver<R, W, S>(
     }
     let mut discard = [0_u8; 64];
     let tokens = tokio::select! {
+        biased;
         answer = granted => match answer {
             Ok(tokens) => tokens,
             Err(_) => {
@@ -1030,6 +1083,21 @@ async fn hold_jobserver<R, W, S>(
                 .await;
                 return;
             }
+        },
+
+        () = options.admission.deadline() => {
+            let status = budget.status().await;
+            let holders = status.as_ref().map(|status| status.checkouts.iter()
+                .filter(|checkout| checkout.held > 0)
+                .map(|checkout| format!("{}: {} tokens in {} running grant(s)", checkout.checkout, checkout.held, checkout.running))
+                .collect::<Vec<_>>().join("; "));
+            let wait_ms = u64::try_from(asked.elapsed().as_millis()).expect("an admission wait fits u64 milliseconds");
+            let error = format!("gate admission waited {wait_ms} ms; live checkout holders: {}",
+                holders.as_deref().unwrap_or("CPU budget unavailable"));
+            let response = ControlResponse { cpu_budget: status, wait_ms: Some(wait_ms),
+                ..failure(ControlFailureCode::GateAdmissionTimeout, error) };
+            let _ = write_response(&mut writer, &response).await;
+            return;
         },
         _ = reader.read(&mut discard) => return,
     };
@@ -1047,7 +1115,40 @@ async fn hold_jobserver<R, W, S>(
             return;
         }
     };
+    let pool = if let Some(job) = options.pool_job {
+        match fifos.create_pool(tokens, &job.workspace_incarnation) {
+            Ok(pool) => {
+                cowshed_os::timing::event("jobserver", || {
+                    format!(
+                        "pool {tokens} for {}/{} job {} at {}",
+                        job.repo_id,
+                        job.workspace_incarnation,
+                        job.job_id,
+                        pool.path().display()
+                    )
+                });
+                Some(pool)
+            }
+            Err(error) => {
+                let _ = write_response(
+                    &mut writer,
+                    &failure(
+                        ControlFailureCode::Rejected,
+                        format!("cannot serve the job's CPU pool: {error}"),
+                    ),
+                )
+                .await;
+                fifo.drain_and_unlink();
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let answer = ControlResponse {
+        cpu_pool: pool
+            .as_ref()
+            .map(|pool| pool.path().to_string_lossy().into_owned()),
         tokens: Some(tokens),
         fifo: Some(fifo.path().to_string_lossy().into_owned()),
         ..lease(LeaseState::Granted)
@@ -1059,6 +1160,11 @@ async fn hold_jobserver<R, W, S>(
     while let Ok(read) = reader.read(&mut discard).await
         && read > 0
     {}
+    if let Some(pool) = pool
+        && let Err(error) = pool.close().await
+    {
+        eprintln!("cowshed: jobserver CPU pool did not close: {error}");
+    }
     fifo.drain_and_unlink();
     drop(stake);
 }
@@ -1108,7 +1214,9 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         ],
         DISK_LEASE_OP => &["op", "class", "share", "command"],
         CPU_TOKENS_OP => &["op", "want", "checkout", "command"],
-        JOBSERVER_OP => &["op", "want", "checkout", "command"],
+        JOBSERVER_OP => &[
+            "op", "want", "checkout", "command", "class", "waitMs", "pool", "job",
+        ],
         _ => {
             return Err(ControlError::Encoding(
                 "unknown gateway control operation".to_owned(),
@@ -1135,11 +1243,60 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
     }
     let jobserver = op == JOBSERVER_OP;
     if op == CPU_TOKENS_OP || jobserver {
+        let (tokens, options) = if jobserver {
+            let JobserverIn {
+                tokens,
+                class,
+                wait_ms,
+                pool,
+                job,
+            } = serde_json::from_value(value).map_err(encoding)?;
+            let admission = match (class, wait_ms) {
+                (cowshed_gateway_types::JobserverClass::Background, None) => crate::jobserver::JobserverAdmission::Background,
+                (cowshed_gateway_types::JobserverClass::Gate, Some(wait_ms)) => crate::jobserver::JobserverAdmission::Gate { wait_ms },
+                _ => return Err(ControlError::Encoding("a gate jobserver request requires nonzero waitMs; background requests have no deadline".to_owned())),
+            };
+            let pool_job = if pool {
+                let job = job.ok_or_else(|| {
+                    ControlError::Encoding(
+                        "a private CPU pool requires the trusted job identity".to_owned(),
+                    )
+                })?;
+                if job.job_id.get() > 9_007_199_254_740_991 {
+                    return Err(ControlError::Encoding(
+                        "jobId must be a positive JavaScript-safe integer".to_owned(),
+                    ));
+                }
+                cowshed_gateway_types::cpu_pool_directory(
+                    Path::new("."),
+                    &job.workspace_incarnation,
+                )
+                .map_err(|error| ControlError::Encoding(error.to_string()))?;
+                Some(job)
+            } else {
+                None
+            };
+            (
+                tokens,
+                JobserverOptions {
+                    admission,
+                    pool_job,
+                },
+            )
+        } else {
+            (
+                serde_json::from_value(value).map_err(encoding)?,
+                JobserverOptions {
+                    admission: crate::jobserver::JobserverAdmission::Background,
+                    pool_job: None,
+                },
+            )
+        };
         let CpuTokensIn {
             want,
             checkout,
             command,
-        } = serde_json::from_value(value).map_err(encoding)?;
+        } = tokens;
         if checkout.is_empty() || checkout.len() > MAX_CHECKOUT {
             return Err(ControlError::Encoding(format!(
                 "a cpu-tokens checkout must name a path of 1 to {MAX_CHECKOUT} bytes"
@@ -1150,6 +1307,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 want,
                 checkout,
                 command,
+                options,
             }
         } else {
             Incoming::CpuTokens {
@@ -1523,6 +1681,8 @@ fn success() -> ControlResponse {
         lease: None,
         tokens: None,
         fifo: None,
+        cpu_pool: None,
+        wait_ms: None,
         cpu_budget: None,
         task_grant: None,
         task_queue: None,

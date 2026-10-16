@@ -387,6 +387,7 @@ mod tests {
             profile_directory: fixture.root.join("store/run/profiles"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
             retained_port_blocks: Vec::new(),
+            cpu_pool_directory: None,
             mode: crate::sandbox::RunSandboxMode::ReadWrite,
             grants: crate::sandbox::SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),

@@ -11,13 +11,13 @@
 
 use super::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, DefragmentResult, DoctorReport, EmptyResult, ForkOptions,
-    GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts,
-    JobTail, JobTailLimits, LandOptions, LandReport, MirrorInfo, OutputPublication,
-    ProjectGrantDelta, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
-    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
-    ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext, WorkspaceIncarnation,
-    WorkspaceInfo, WorkspacePath, WorkspaceTarget,
+    CheckpointResult, CommandArg, DefragmentResult, DoctorReport, EmptyResult, ExecScope,
+    ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor,
+    JobListeningPorts, JobTail, JobTailLimits, JobserverClass, LandOptions, LandReport, MirrorInfo,
+    OutputPublication, ProjectGrantDelta, PushOptions, PushReport, RebaseOptions, RebaseReport,
+    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult,
+    ResizeResult, ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext,
+    WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
 use super::process::{JobProcessEvent, JobProcessTree};
 use super::resources::{JobResourceSample, SampleInterval};
@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::collections::HashMap;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -312,6 +313,9 @@ operations! {
     coordinator json "coordinator.doctor" CoordinatorDoctor(RepoRequest) -> DoctorReport;
     /// Mints a worker capability for one workspace.
     coordinator json "coordinator.worker" CoordinatorWorker(WorkspaceRequest) -> WorkerView;
+    /// Admits one job under coordinator authority, the only route that may ask for the gate class or
+    /// the host-gate scope. Inline stdin travels as the upload frame.
+    coordinator upload "coordinator.exec" CoordinatorExec(ExecParams) -> JobId;
     /// Starts serving a workspace's supervisor.
     internal json "coordinator.serveSupervisor" CoordinatorServeSupervisor(WorkspaceRequest) -> EmptyResult;
     /// Refreshes a mounted workspace's build state.
@@ -623,6 +627,22 @@ pub enum ExecStdin {
     },
 }
 
+fn is_background(class: &JobserverClass) -> bool {
+    *class == JobserverClass::Background
+}
+
+fn minimum_want() -> NonZeroUsize {
+    NonZeroUsize::MIN
+}
+
+fn is_minimum_want(want: &NonZeroUsize) -> bool {
+    *want == NonZeroUsize::MIN
+}
+
+fn is_workspace(scope: &ExecScope) -> bool {
+    *scope == ExecScope::Workspace
+}
+
 /// One job admission: the worker fence, the session it runs in, exactly one of `argv` and
 /// `script`, and the job's environment.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -645,6 +665,19 @@ pub struct ExecParams {
     pub stderr_copy: Option<OutputPublication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_key: Option<AdmissionKey>,
+    /// The host CPU admission class, omitted for background, which is what ordinary exec asks for.
+    /// Only the coordinator.exec route admits the gate class.
+    #[serde(default, skip_serializing_if = "is_background")]
+    pub class: JobserverClass,
+    /// The most CPU tokens the command can use at once; omitted for one.
+    #[serde(default = "minimum_want", skip_serializing_if = "is_minimum_want")]
+    pub want: NonZeroUsize,
+    /// A gate's bound, in milliseconds, on waiting for its CPU grant; omitted for background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<NonZeroU32>,
+    /// Where the command runs; omitted for the workspace sandbox.
+    #[serde(default, skip_serializing_if = "is_workspace")]
+    pub scope: ExecScope,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -878,6 +911,78 @@ mod tests {
         };
         assert_eq!(tail.cursor, None);
         assert_eq!(request.params().expect("encode"), params);
+    }
+
+    /// A request that names no scheduling is ordinary work: background, one token, no admission
+    /// bound, in the workspace sandbox. Its defaults are omitted again when it is encoded.
+    #[test]
+    fn an_exec_that_names_no_scheduling_is_ordinary_background_work() {
+        let params = corpus()
+            .remove("worker.exec")
+            .expect("worker.exec corpus request");
+        for field in ["class", "want", "waitMs", "scope"] {
+            assert!(
+                params.get(field).is_none(),
+                "{field} is omitted by the corpus"
+            );
+        }
+        let request = OperationRequest::decode("worker.exec", &params).expect("decode");
+        let OperationRequest::WorkerExec(exec) = &request else {
+            panic!("decoded {request:?}");
+        };
+        assert_eq!(exec.class, JobserverClass::Background);
+        assert_eq!(exec.want, NonZeroUsize::MIN);
+        assert_eq!(exec.wait_ms, None);
+        assert_eq!(exec.scope, ExecScope::Workspace);
+        assert_eq!(request.params().expect("encode"), params);
+    }
+
+    /// The coordinator route's corpus request names every scheduling field, in the camel case the
+    /// wire spells them, and decodes into exactly those values.
+    #[test]
+    fn a_coordinator_exec_carries_its_gate_scheduling() {
+        let params = corpus()
+            .remove("coordinator.exec")
+            .expect("coordinator.exec corpus request");
+        let request = OperationRequest::decode("coordinator.exec", &params).expect("decode");
+        let OperationRequest::CoordinatorExec(exec) = &request else {
+            panic!("decoded {request:?}");
+        };
+        assert_eq!(exec.class, JobserverClass::Gate);
+        assert_eq!(exec.want.get(), 8);
+        assert_eq!(exec.wait_ms.map(NonZeroU32::get), Some(120_000));
+        assert_eq!(exec.scope, ExecScope::HostGate);
+        assert_eq!(request.params().expect("encode"), params);
+    }
+
+    /// Zero tokens, a zero bound and an unknown class or scope are refused as usage before any
+    /// admission: the wire has no spelling for them.
+    #[test]
+    fn exec_scheduling_refuses_what_the_wire_cannot_spell() {
+        for (field, value) in [
+            ("want", serde_json::json!(0)),
+            ("waitMs", serde_json::json!(0)),
+            ("class", serde_json::json!("foreground")),
+            ("scope", serde_json::json!("host")),
+        ] {
+            let mut params = corpus()
+                .remove("coordinator.exec")
+                .expect("coordinator.exec corpus request");
+            params[field] = value;
+            let error = OperationRequest::decode("coordinator.exec", &params)
+                .expect_err("the declaration refuses it");
+            assert_eq!(error.code, crate::error::ErrorCode::Usage, "{field}");
+        }
+    }
+
+    /// The gate class has exactly one route in: coordinator.exec is coordinator-scoped and carries
+    /// inline stdin as an upload, as worker.exec does.
+    #[test]
+    fn the_gate_route_is_coordinator_scoped_and_carries_an_upload() {
+        let gate = operation("coordinator.exec").expect("declared");
+        assert_eq!((gate.scope, gate.lane), (Scope::Coordinator, Lane::Upload));
+        let worker = operation("worker.exec").expect("declared");
+        assert_eq!((worker.scope, worker.lane), (Scope::Worker, Lane::Upload));
     }
 
     #[test]

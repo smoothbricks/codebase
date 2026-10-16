@@ -9,6 +9,7 @@ use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
 use crate::storage::lifecycle::{DerivedWorkspace, MountState, Pin as LifecyclePin};
 use base64::Engine;
 use bytes::Bytes;
+pub use cowshed_gateway_types::JobserverClass;
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -16,6 +17,7 @@ use sha2::Digest;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::num::{NonZeroU32, NonZeroUsize};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -84,6 +86,8 @@ pub enum DtoError {
     CommandShape,
     #[error("an admission key is 1 to {MAX_ADMISSION_KEY_BYTES} UTF-8 bytes, got {0}")]
     InvalidAdmissionKey(usize),
+    #[error("invalid exec scheduling: {0}")]
+    InvalidScheduling(&'static str),
 }
 
 #[cfg_attr(
@@ -1908,6 +1912,17 @@ pub struct JobInfo {
     /// Set only for a job that failed before its command ran, for a reason its exit status
     /// cannot name.
     pub failure: Option<JobFailure>,
+    /// The class the job was admitted under (05_gateway.md "Host CPU budget"): background unless a
+    /// trusted coordinator route admitted it as a gate.
+    pub class: JobserverClass,
+    /// Where the job's command ran: the workspace sandbox, or a coordinator's host gate.
+    pub scope: ExecScope,
+    /// The nice the job's command was observed at right after its spawn set it: a gate runs at 0,
+    /// background at +10. Absent before the command exists and for a job whose command was never
+    /// observed; never inferred from the class.
+    pub nice: Option<i32>,
+    /// The CPU tokens the job's gateway grant held. Absent until a grant is held.
+    pub cpu_tokens: Option<NonZeroUsize>,
 }
 
 impl JobInfo {
@@ -1916,6 +1931,16 @@ impl JobInfo {
         if self.failure.is_some() && self.state != JobState::Failed {
             return Err(DtoError::InvalidJobProjection(
                 "failure is present only for the failed state",
+            ));
+        }
+        if self.scope == ExecScope::HostGate && self.class != JobserverClass::Gate {
+            return Err(DtoError::InvalidJobProjection(
+                "a host gate job is admitted as a gate",
+            ));
+        }
+        if self.nice.is_some() && self.state == JobState::Queued {
+            return Err(DtoError::InvalidJobProjection(
+                "a queued job owns no command to observe a nice for",
             ));
         }
         let terminal = !matches!(self.state, JobState::Queued | JobState::Running);
@@ -1998,6 +2023,12 @@ struct JobInfoRef<'a> {
     stdin: &'a StdinInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<JobFailure>,
+    class: JobserverClass,
+    scope: ExecScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nice: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_tokens: Option<NonZeroUsize>,
 }
 
 #[derive(Deserialize)]
@@ -2033,6 +2064,12 @@ struct JobInfoWire {
     stdin: StdinInfo,
     #[serde(default)]
     failure: Option<JobFailure>,
+    class: JobserverClass,
+    scope: ExecScope,
+    #[serde(default)]
+    nice: Option<i32>,
+    #[serde(default)]
+    cpu_tokens: Option<NonZeroUsize>,
 }
 
 /// The wire's two mutually exclusive command spellings, `argv` and `script`, as one command.
@@ -2062,6 +2099,10 @@ impl Serialize for JobInfo {
             output_limit: self.output_limit.as_ref(),
             stdin: &self.stdin,
             failure: self.failure,
+            class: self.class,
+            scope: self.scope,
+            nice: self.nice,
+            cpu_tokens: self.cpu_tokens,
         }
         .serialize(serializer)
     }
@@ -2097,6 +2138,10 @@ impl<'de> Deserialize<'de> for JobInfo {
             output_limit: wire.output_limit,
             stdin: wire.stdin,
             failure: wire.failure,
+            class: wire.class,
+            scope: wire.scope,
+            nice: wire.nice,
+            cpu_tokens: wire.cpu_tokens,
         };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
@@ -2122,6 +2167,16 @@ pub struct SealedJob {
     pub output_limit: Option<OutputLimitInfo>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
+    /// The class the job was admitted under, as JobInfo.class.
+    pub class: JobserverClass,
+    /// Where the job's command ran, as JobInfo.scope.
+    pub scope: ExecScope,
+    /// The nice the job's command was observed at, as JobInfo.nice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nice: Option<i32>,
+    /// The CPU tokens the job's grant held, as JobInfo.cpu_tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_tokens: Option<NonZeroUsize>,
 }
 
 #[cfg_attr(any(), cowshed_api(wire = "ExecRecordRef"))]
@@ -2472,6 +2527,11 @@ pub enum JobFailure {
     /// The supervisor running the job ended without seeing it end. Recovery sealed its terminal
     /// record; any process group it could not safely identify remains diagnosed in the ledger.
     SupervisorLost,
+    /// The job's host CPU admission failed before its command ran: the gateway refused it or was
+    /// unreachable, a gate's bound expired, or its grant was lost. The cause is on stderr.
+    CpuAdmission,
+    /// The nice of the job's owned command could not be set, so the command never ran.
+    Priority,
 }
 
 #[derive(Debug)]
@@ -2487,6 +2547,109 @@ pub struct ExecRequest {
     /// Names this exec for idempotent admission: a repeat with the same key and request answers
     /// the job the first admitted, and never spawns again.
     pub admission_key: Option<AdmissionKey>,
+    /// The host CPU admission class (05_gateway.md "Host CPU budget"): background, or a gate when a
+    /// trusted coordinator route asks for one.
+    pub class: JobserverClass,
+    /// The most CPU tokens the command can use at once; its grant is between one and this count.
+    pub want: NonZeroUsize,
+    /// A gate's bound, in milliseconds, on waiting for its grant: present exactly for a gate.
+    pub wait_ms: Option<NonZeroU32>,
+    /// Where the command runs: the workspace sandbox, or a coordinator's host gate, which is a gate.
+    pub scope: ExecScope,
+}
+
+/// Where an exec's command runs (07_api.md "Exec and grants").
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecScope {
+    /// Inside the workspace's sandbox, as every exec runs.
+    #[default]
+    Workspace,
+    /// A trusted coordinator's one-shot gate at the host boundary, outside the workspace sandbox:
+    /// the real-APFS host gate. Only the coordinator route admits it, and only as a gate.
+    HostGate,
+}
+
+/// The pairings an exec's scheduling may carry (05_gateway.md "A gate wait is bounded and
+/// diagnosed"): a gate names a positive admission bound, background names none, and the host
+/// gate is a gate.
+pub fn validate_scheduling(
+    class: JobserverClass,
+    wait_ms: Option<NonZeroU32>,
+    scope: ExecScope,
+) -> Result<(), DtoError> {
+    match (class, wait_ms) {
+        (JobserverClass::Gate, Some(_)) | (JobserverClass::Background, None) => {}
+        (JobserverClass::Gate, None) => {
+            return Err(DtoError::InvalidScheduling(
+                "a gate names a positive waitMs",
+            ));
+        }
+        (JobserverClass::Background, Some(_)) => {
+            return Err(DtoError::InvalidScheduling(
+                "a background exec names no waitMs",
+            ));
+        }
+    }
+    if scope == ExecScope::HostGate && class != JobserverClass::Gate {
+        return Err(DtoError::InvalidScheduling(
+            "the host gate scope requires the gate class",
+        ));
+    }
+    Ok(())
+}
+/// Public environment names permitted in JobAdmission.env records for every exec scope
+/// (07_api.md "Keyed admission and restart attachment"). This is a record projection, not an
+/// execution allowlist: custom operator and project variables may travel in requests and reach
+/// jobs under the existing runtime reserved/credential rules. The full authored non-withheld
+/// environment is bound by the admission's SHA-256 commitment, not by this public projection.
+pub const HOST_GATE_ENV_NAMES: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "TERM",
+    "TZ",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "BUN_INSTALL",
+    "DEVELOPER_DIR",
+];
+
+/// The locale category prefix (`LC_ALL`, `LC_CTYPE`, …) also permitted in public env records.
+pub const HOST_GATE_LOCALE_PREFIX: &str = "LC_";
+
+/// Whether JobAdmission.env may record this name in any exec scope, never whether a job may
+/// execute with it. Only the name decides, never the value: a listed name or a locale category
+/// (`LC_` and one or more of A-Z, 0-9 and `_`).
+pub fn host_gate_env_name_allowed(name: &str) -> bool {
+    HOST_GATE_ENV_NAMES.contains(&name)
+        || name
+            .strip_prefix(HOST_GATE_LOCALE_PREFIX)
+            .is_some_and(|category| {
+                !category.is_empty()
+                    && category.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            })
+}
+
+/// A host gate runs outside every session, whose cwd and environment a worker controls
+/// (07_api.md "Task server scheduling and trusted host gates"). Environment names do not
+/// restrict execution; the public-name policy applies only to records. Other scopes may use
+/// sessions. Scheduling is validated separately by [`validate_scheduling`].
+pub fn validate_host_gate_request(scope: ExecScope, in_session: bool) -> Result<(), CowshedError> {
+    if scope == ExecScope::HostGate && in_session {
+        return Err(CowshedError::usage(
+            "a host gate runs outside every session: it takes no session's cwd or environment",
+            "run the host gate without a session",
+        ));
+    }
+    Ok(())
 }
 
 fn valid_ref_name(value: &str) -> bool {
@@ -2980,9 +3143,17 @@ pub struct PushReport {
     pub previous_destination_head: Option<GitOid>,
 }
 
+/// Preservation-only delivery is distinct from a target that actually landed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum LandReport {
+    Delivered(PushReport),
+    Landed(LandedReport),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LandReport {
+pub struct LandedReport {
     pub landed_head: GitOid,
     pub target_branch: String,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -206,10 +206,12 @@ describe('declaration model admission', () => {
     const core = join(scratch, 'crates/cowshed-core/src');
     cpSync(join(project, 'crates/cowshed-core/src'), core, { recursive: true });
     mkdirSync(join(scratch, 'crates/cowshed-gateway-types/src'), { recursive: true });
-    cpSync(
-      join(project, 'crates/cowshed-gateway-types/src/status.rs'),
-      join(scratch, 'crates/cowshed-gateway-types/src/status.rs'),
-    );
+    for (const file of ['status.rs', 'cpu_budget.rs']) {
+      cpSync(
+        join(project, 'crates/cowshed-gateway-types/src', file),
+        join(scratch, 'crates/cowshed-gateway-types/src', file),
+      );
+    }
     // The probe is written before the owner CLI reads the scratch project, so the model carries it.
     writeFileSync(join(core, 'api/admission_probe.rs'), PROBE);
     const rootModule = join(core, 'api/mod.rs');

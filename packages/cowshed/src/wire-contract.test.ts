@@ -432,7 +432,9 @@ describe('canonical DTO generation', () => {
       const gateway = join(scratch, 'crates/cowshed-gateway-types/src');
       cpSync(join(project, 'crates/cowshed-core/src'), core, { recursive: true });
       mkdirSync(gateway, { recursive: true });
-      cpSync(join(project, 'crates/cowshed-gateway-types/src/status.rs'), join(gateway, 'status.rs'));
+      for (const name of ['cpu_budget.rs', 'status.rs']) {
+        cpSync(join(project, 'crates/cowshed-gateway-types/src', name), join(gateway, name));
+      }
       mkdirSync(join(scratch, 'src'));
       mkdirSync(join(scratch, 'crates/cowshed-napi/src'), { recursive: true });
       // A separate project snapshots the mutant after it exists; the running test's program

@@ -263,10 +263,9 @@ Unlike APFS clonefile, a ZFS clone depends on its origin snapshot: `main@cowshed
 `ws/raven` exists. cowshed contains this with one rule — **one origin snapshot per workspace, destroyed together with
 it**:
 
-- `cowshed fork raven` creates `main@cowshed:fork-raven`; `cowshed rm raven` destroys `ws/raven` then its origin
-  snapshot, the one its `origin` property names (`main@cowshed:fork-raven` unless a CI refresh promotion moved it,
-  below), in that order — an idempotent logical transaction (physically two commands; `cowshed gc` completes interrupted
-  halves).
+- `cowshed fork raven` creates `main@cowshed:fork-raven`; `cowshed rm raven` destroys `ws/raven` then the origin
+  snapshot named by its `origin` property, in that order — an idempotent logical transaction (physically two commands;
+  `cowshed gc` completes interrupted halves).
 - `cowshed gc` prunes `cowshed:*` snapshots with no surviving clone (crash between the two destroys).
 - Main is never blocked: writes to main proceed freely; a workspace's origin snapshot pins only the main blocks that
   main has since overwritten. `cowshed doctor` reports that pinned space per workspace (`zfs list -H -o written,origin`)
@@ -276,21 +275,17 @@ it**:
   rather than breaks: a workspace's origin snapshot dies with it, and **a workspace with live dependents cannot be
   reclaimed** — `cowshed rm src` exits 4 naming the dependent forks; `cowshed doctor` reports fork dependencies and
   their pinned bytes so a coordinator lands or removes forks first.
-- `zfs promote` is used in exactly one case: the CI host's refresh promotion (10_ci.md, "Keeping the host main warm"),
-  where a green refresh clone becomes main. There it removes the old main from the center of the graph instead of
-  chaining every later main onto it; the old main becomes one spoke off the new main and is destroyed by `gc` once no
-  live clone hangs off it. Everywhere else promotion re-parents the dependency graph and makes teardown order
-  data-dependent, so cowshed keeps the graph shallow — main at the center, one snapshot spoke per workspace, fork spokes
-  off sessions — and refuses reclaim while dependents exist rather than re-parenting.
+- cowshed does not use `zfs promote` to re-parent dependencies. It keeps the graph shallow — main at the center, one
+  snapshot spoke per workspace, fork spokes off sessions — and refuses reclaim while dependents exist. CI uses the
+  ordinary target/build-volume lifecycle (10_ci.md, "Keeping the host main warm"), not a dataset promotion exception.
 
 ### Privileged helper (Linux)
 
 `zfs allow` delegation covers create/snapshot/clone/destroy but **not `mount(2)`**, which Linux gates on `CAP_SYS_ADMIN`
 regardless of delegation. Substrate mutations therefore go through `cowshed-helper`: a minimal root binary (installed by
 the package, auditable in one sitting) that accepts a fixed verb set
-(`create|clone|snapshot|destroy|rename|swap|promote|mount|unmount|set-mountpoint`) — `rename` serves retire's trash
-namespace, `swap` is the narrowly-constrained clone-swap that `cowshed restore` and the CI refresh promotion need, and
-`promote` serves only the CI refresh promotion (a refresh clone of main) — and refuses, on every verb, any dataset
+(`create|clone|snapshot|destroy|rename|swap|mount|unmount|set-mountpoint`) — `rename` serves retire's trash namespace
+and `swap` is the narrowly-constrained clone-swap that `cowshed restore` needs — and refuses, on every verb, any dataset
 argument outside `<pool>/cowshed/`. Constrained sudoers entries are the supported alternative for hosts that forbid
 setuid helpers. Everything else — Landlock sandboxing (04_sandbox.md), gateway, secrets scanner, CLI — runs
 unprivileged.
