@@ -1407,8 +1407,10 @@ commands those findings carry — findings first, hints after, never interleaved
 Store-wide listing and diagnosis continue past an unreadable project's records: listing warns with the project name, and
 doctor records a finding for it while checking other projects.
 
-If a selected project's checks cannot run, doctor records an error finding named `project-checks-skipped`; it never
-turns missing evidence into `healthy: true`.
+Pending host setup work, including a missing mount-service LaunchDaemon, does not suppress workspace inventory or the
+selected project's checks. Each reader validates its own storage; if the selected project's checks cannot run, doctor
+records an error finding named `project-checks-skipped`. It never silently skips them or turns missing evidence into
+`healthy: true`.
 
 Opening the project for its checks finishes nothing, unlike every other command's open: no unfinished lifecycle
 operation is replayed (`main`'s included), no interrupted publication or restore is completed, no retired image is
