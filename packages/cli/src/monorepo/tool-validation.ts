@@ -420,7 +420,7 @@ function addNixPackage(content: string, name: string, comment: string): string {
 }
 
 function hasNixPackage(content: string, name: string): boolean {
-  // coreutils-tee is the complete coreutils derivation with only tee patched (README §Shell Entry).
+  // Either complete package satisfies coreutils; do not add a second package (README §Shell Entry).
   const provider = name === 'coreutils' ? 'coreutils(?:-tee)?' : escapeRegex(name);
   return new RegExp(`(^|\\s)${provider}(\\s|#|$)`, 'm').test(content);
 }
