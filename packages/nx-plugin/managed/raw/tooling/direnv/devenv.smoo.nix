@@ -506,6 +506,7 @@ in {
         "linked-snapshots.ts"
         "secret-references.ts"
         "../../node_modules/.smoo-install"
+        "../../node_modules/@typescript/native/bin/tsc"
       ];
       before = ["devenv:enterShell"];
       showOutput = true;

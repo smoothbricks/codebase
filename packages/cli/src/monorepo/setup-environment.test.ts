@@ -423,6 +423,30 @@ describe('what shell entry installs', () => {
     );
   });
 
+  it('repairs a restored tree that kept its stamp but lost the declared native compiler binary', async () => {
+    await withManagedRepository(
+      {
+        dependencies: { '@typescript/native': 'file:./vendor/native' },
+        files: {
+          'vendor/native/package.json': JSON.stringify({ name: '@typescript/native', version: '7.0.2' }),
+          'vendor/native/bin/tsc': '#!/usr/bin/env node\n',
+        },
+      },
+      async ({ root, enterShell: enter, count }) => {
+        const bin = join(root, 'node_modules', '@typescript', 'native', 'bin', 'tsc');
+        expect(await enter()).toEqual(HEALTHY);
+        expect(existsSync(bin)).toBe(true);
+        expect(count('install')).toBe(1);
+
+        // A pruned cache restore: the stamp and the TypeScript API package survive, the binary does not.
+        await rm(bin);
+        expect(await enter()).toEqual(HEALTHY);
+        expect(count('install')).toBe(2);
+        expect(existsSync(bin)).toBe(true);
+      },
+    );
+  });
+
   it('reinstalls receipts missing lock digests and repairs digest drift through the same installer', async () => {
     await withManagedRepository(
       {
