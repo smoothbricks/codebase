@@ -664,15 +664,17 @@ Covered flows:
   the owned attachment or names its cleanup refusal. Foreign/stale descendants are neither targets nor vetoes. No
   combined `--mountPoint` attach, fallback or retry is permitted. Detached verification/resize and unformatted RAW
   retain intentional unmounted fixtures;
-- **Live source capture stays mounted; build seeds are sealed**: a live capture (`fork`, `checkpoint`) flushes the
+- **Live captures stay mounted; build seeds retain writer exclusion**: a live capture (`fork`, `checkpoint`) flushes the
   source volume and backing file, descriptor-clones the live RAW image, and asserts that the source's attachment and
   mount flags are unchanged (01a_apfs.md, "Images"). `fork` and `restore` pass a formatted clone to the one exact-image
   no-mount attach, pinned `fsck_apfs -q` and `mount_apfs` path and verify the resulting held mount identity. A failed
   operation refuses publication and cleans up only the destination, never the live source (02_workspaces.md, fork step
-  4). A build seed is the exception (16_build_volumes.md): the sealed capture detaches its source without force, clones
-  through its held inode, and restores identical access/visibility and an updated registry after both success and
-  failure; busy-source refusal names visible holders and leaves source bytes and mounts intact. RAW has no outer
-  allocation map for a live capture to split (02_workspaces.md, fork step 2).
+  4). A build seed (16_build_volumes.md, "Targets and seeds") uses the same block-atomic mounted descriptor clone with
+  supervised admission closed and the Nx and existing Cargo-profile guards held through capture and publication. Tests
+  require an exempt index/cache reader to survive with source identity and mounts unchanged; an Nx state holder or a
+  held known Cargo profile refuses seed replacement. The new-host-profile gap remains explicit in that contract; no
+  fencing of that case is claimed. RAW has no outer allocation map for a live capture to split (02_workspaces.md, fork
+  step 2).
 - checkpoint/restore round-trip (restore undo image `pre-restore-…` present);
 - defrag: main fragmented by rewriting pages while a clone shares them refuses the rewrite while a file is open on its
   volume (image untouched), then, idle, comes back in at most a tenth of its extents with its data, marker, and mount
