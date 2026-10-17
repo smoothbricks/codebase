@@ -1,9 +1,10 @@
 //! Measures ptrace fork/exec/exit tracing, the Linux process event source a supervisor can run
 //! as the job's parent (07_api.md, "Complete job accounting and observation reconciliation"),
 //! against an unobserved baseline and a census that reads the tree before and after a burst, as
-//! a one-second poll would. The proc connector is not run here: no crate this workspace locks
-//! carries its UAPI records, and a probe built against the kernel's own `cn_proc.h` found its
-//! listen request refused (`ECONNREFUSED`) on the measured runner, so no workload ran under it.
+//! two consecutive reads of a poll would. The proc connector is not run here: no crate this
+//! workspace locks carries its UAPI records, and a probe built against the kernel's own
+//! `cn_proc.h` found its listen request refused (`ECONNREFUSED`) on the measured runner, so no
+//! workload ran under it.
 //!
 //! One workload runs unchanged under every mode. The harness forks the job's root held on a
 //! fence pipe; in the traced mode it attaches with `PTRACE_SEIZE` before opening the fence, so
@@ -17,11 +18,14 @@
 //! wait status and the argv it was given -- and every such thread records its own tid and the
 //! argv it is about to exec, as JSON lines in an oracle file, independently of any observer.
 //!
-//! The coverage burst must end inside the census window, so a census that misses its lives
-//! misses events, not time. Controls run once after the measured runs: an attach the kernel
-//! refuses because another tracer owns the process, a tracer killed while tracing, and process
-//! metadata read through files opened before the process was reaped. Each ends in a typed
-//! failure that keeps what the kernel said.
+//! The census reads the tree once before the root's gate opens and once after the root has reaped
+//! every child, so each life of the burst begins after its first read and ends before its second,
+//! however long the host takes to run it: a census that misses those lives misses them for events,
+//! not time, as a poll misses every life that falls between two of its reads. Each run reports
+//! the interval it measured (`wallNs`); no assertion holds the host to one. Controls run once
+//! after the measured runs: an attach the kernel refuses because another tracer owns the process,
+//! a tracer killed while tracing, and process metadata read through files opened before the
+//! process was reaped. Each ends in a typed failure that keeps what the kernel said.
 //!
 //! A mode the kernel or sandbox refuses is reported with the refused call and its errno, never
 //! as an observation with zero events. The report is printed and, when
@@ -58,14 +62,10 @@ const ORACLE_FD: RawFd = 4;
 const DONE_FD: RawFd = 5;
 const HOLD_FD: RawFd = 6;
 
-/// A burst a one-second census cannot see, and a fork-heavy run for overhead.
+/// A burst for the census claim, and a fork-heavy run for overhead.
 const COVERAGE_BURST: u32 = 32;
 const OVERHEAD_BURST: u32 = 256;
 const REPETITIONS: u32 = 5;
-
-/// The interval of the census this fixture stands for. A coverage burst must end inside it, or
-/// a census missing its lives could be missing time rather than events.
-const CENSUS_WINDOW_NS: u64 = 1_000_000_000;
 
 /// A cloned grandchild's stack: it only calls execve and _exit.
 const CLONE_STACK: usize = 64 * 1024;
@@ -607,7 +607,6 @@ enum Mode {
 struct Report {
     kernel: String,
     namespaces: NamespaceFacts,
-    census_window_ns: u64,
     runs: Vec<Run>,
     controls: Controls,
 }
@@ -828,7 +827,6 @@ fn linux_process_event_sources_are_measured() {
             .map(|release| release.trim().to_owned())
             .unwrap_or_else(|error| format!("unreadable: {error}")),
         namespaces: namespace_facts(),
-        census_window_ns: CENSUS_WINDOW_NS,
         runs,
         controls: Controls {
             attach_rejected,
@@ -866,20 +864,17 @@ fn linux_process_event_sources_are_measured() {
             Mode::Baseline => {}
             Mode::Census => {
                 if run.burst == COVERAGE_BURST {
-                    // The window is this claim's premise, and only this claim's: a burst that outran it
-                    // could have been missed for time rather than for events. The baseline and ptrace
-                    // runs make no claim about a window, so their wall time is the host's, not theirs.
-                    assert!(
-                        measured.wall_ns < CENSUS_WINDOW_NS,
-                        "census coverage burst, run {}: {} ns is not inside the {CENSUS_WINDOW_NS} ns census window",
-                        run.repetition,
-                        measured.wall_ns
-                    );
+                    // The reads bracket the burst by construction (`run_with_census`): the first
+                    // before the gate opens, the second once the root reports every child reaped.
+                    // However long the host took between them, the census saw none of the burst's
+                    // lives, which is the claim; the overhead burst is measured for cost alone.
                     assert_eq!(
                         coverage.births_missing.len(),
                         expected.births,
-                        "a census before and after a burst inside its window misses every \
-                         short-lived birth: {coverage:?}"
+                        "census run {}: a census before and after a burst misses every life inside \
+                         it, {} ns apart: {coverage:?}",
+                        run.repetition,
+                        measured.wall_ns
                     );
                 }
             }
@@ -1126,7 +1121,7 @@ impl Root {
     }
 
     /// Read the tree before the gate opens and once the burst is done, while the root is held:
-    /// what a poll once a second sees of work shorter than a second.
+    /// what two consecutive reads of a poll see of work that falls between them.
     fn run_with_census(&self) -> Sight {
         let before = rusage(libc::RUSAGE_THREAD);
         let mut observed = Observed::default();
