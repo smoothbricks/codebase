@@ -302,10 +302,13 @@ as `failed` with classification `nx-backend-unavailable` and logs the cause loud
 forwards no artifact, but an upstream-5xx response may arrive after request bytes have already been sent. An outage is
 never a successful read: its 404 is not evidence that a hash is absent and never counts as a hit.
 
-Startup waiting shares the gateway's queued-request bounds. A full startup queue is an audited `nx-queue-limited`
-404/403, not a stock-client-fatal 429. Other gateway-level refusals, including drain, audit fail-closed, ordinary queue
-capacity and ordinary queue deadlines, retain their own statuses; they are not backend outages. Unsupported Nx methods
-are denied before starting or waiting for a backend.
+**Busy gateway.** Nx requests wait under the gateway's queued-request bounds whether their backend is starting or
+`Ready`. A full queue is an audited `limited` `nx-queue-limited` 404/403 and an expired queue wait an audited
+`timed-out` `queue-timeout` 404/403, never a 429 or 504. Stock Nx 23.2.1 retries no `GET`, ignores `Retry-After`, and
+reads every status but `GET` 200/404 and `PUT` 200/403/409 as a fatal misconfiguration (`native/cache/errors.rs`
+`convert_response_to_error`), so a busy gateway answers what a cache may always answer: not served now. Like an outage,
+that 404 is not evidence of absence and never counts as a hit. Drain and audit fail-closed retain their own statuses;
+they are not backend outages. Unsupported Nx methods are denied before starting or waiting for a backend.
 
 **Backend lifecycle isolation.** Each repository's backend is supervised by a per-repository lifecycle state
 (`Starting`, `Ready`, or `Failed { retry_after }`) held by the actor; backend startup and readiness waiting run outside
@@ -362,8 +365,8 @@ The engine is `hyper` + `rustls` + `rcgen` + `tokio`:
   512 queued admissions globally, and 8 active upstream connections per workspace+origin. Intercepted CONNECT transports
   use a separate bounded pool (32 per workspace, 256 globally), not their contained requests' slots or upstream-origin
   slots; lifetime audit leases, rotation, cancellation, and drain cover both pools. Active status is their combined
-  count. Queue overflow returns 429 without reading a body. Each direction gets a 1 MiB bounded streaming buffer;
-  producers pause when it fills, and cancellation closes both legs.
+  count. Queue overflow returns 429 without reading a body, except an Nx cache request's (§Busy gateway above). Each
+  direction gets a 1 MiB bounded streaming buffer; producers pause when it fills, and cancellation closes both legs.
 - Timeouts are 10 s for request headers, 5 s for TCP connect, 10 s for each TLS handshake, 60 s to upstream response
   headers, 120 s idle between body bytes, 15 min total for ordinary requests, and 60 min total for opaque tunnels or
   explicitly detected streaming responses. Timeouts close both legs and emit a classified audit event.

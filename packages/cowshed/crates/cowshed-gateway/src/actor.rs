@@ -848,6 +848,29 @@ impl NxRefusal {
             message: "project Nx cache backend is unavailable",
         }
     }
+
+    /// A full queue, whether the project's backend is starting or Ready. Stock Nx 23.2.1 retries
+    /// no `GET` and reads any status but 200/404 as a fatal misconfiguration, so a busy gateway
+    /// answers the method's miss or refusal (05_gateway.md "Busy gateway"), never 429.
+    fn queue_limited() -> Self {
+        Self {
+            status: AuditStatus::Limited,
+            classification: "nx-queue-limited",
+            detail: None,
+            message: "gateway queue is full",
+        }
+    }
+
+    /// A startup-queue wait that reached its deadline: like a full queue, the method's miss or
+    /// refusal, never 504.
+    fn queue_timeout() -> Self {
+        Self {
+            status: AuditStatus::TimedOut,
+            classification: "queue-timeout",
+            detail: None,
+            message: "gateway queue wait timed out",
+        }
+    }
 }
 
 /// Which bounded active pool a permit is charged to.
@@ -1787,6 +1810,11 @@ impl Actor {
         if session.queued >= self.config.limits.workspace_queued
             || self.global_queued >= self.config.limits.global_queued
         {
+            if is_nx {
+                self.refuse_nx(&workspace_id, &intent, NxRefusal::queue_limited(), reply)
+                    .await;
+                return;
+            }
             let draft = denial_draft(
                 &workspace_id,
                 session,
@@ -1982,18 +2010,8 @@ impl Actor {
         if session.queued >= self.config.limits.workspace_queued
             || self.global_queued >= self.config.limits.global_queued
         {
-            self.refuse_nx(
-                &workspace_id,
-                &intent,
-                NxRefusal {
-                    status: AuditStatus::Limited,
-                    classification: "nx-queue-limited",
-                    detail: None,
-                    message: "gateway startup queue is full",
-                },
-                reply,
-            )
-            .await;
+            self.refuse_nx(&workspace_id, &intent, NxRefusal::queue_limited(), reply)
+                .await;
             return;
         }
         if let Some(session) = self.sessions.get_mut(&workspace_id) {
@@ -2345,16 +2363,8 @@ impl Actor {
                 .nx_queue
                 .remove(position)
                 .expect("queued position exists");
-            self.refuse_nx_pending(
-                pending,
-                NxRefusal {
-                    status: AuditStatus::TimedOut,
-                    classification: "queue-timeout",
-                    detail: None,
-                    message: "gateway queue wait timed out",
-                },
-            )
-            .await;
+            self.refuse_nx_pending(pending, NxRefusal::queue_timeout())
+                .await;
             return;
         }
         let Some(position) = self
@@ -2366,16 +2376,23 @@ impl Actor {
         };
         let pending = self.queue.remove(position).expect("queued position exists");
         let pending = self.take_pending(pending);
+        // Only an Nx seed carries a backend token. Its deadline is its method's miss or refusal,
+        // as in the startup queue (`NxRefusal::queue_timeout`); every other request's is 504.
+        let http_status = if pending.seed.nx_token.is_some() {
+            crate::nx_cache::unavailable_status(&pending.seed.method)
+        } else {
+            StatusCode::GATEWAY_TIMEOUT
+        };
         let draft = pending_audit_draft(
             &pending.seed,
             AuditStatus::TimedOut,
-            Some(StatusCode::GATEWAY_TIMEOUT),
+            Some(http_status),
             Some("queue-timeout"),
         );
         let recorded = self.record(draft).await;
         let _ = pending.reply.send(Err(if recorded {
             admission_error(
-                StatusCode::GATEWAY_TIMEOUT,
+                http_status,
                 "gateway queue wait timed out",
                 AuditStatus::TimedOut,
                 None,
@@ -3959,81 +3976,173 @@ mod tests {
         fixture.finish().await;
     }
 
+    /// Stock Nx 23.2.1 reads every GET status but 200/404 as a fatal misconfiguration and retries
+    /// no GET, so a full queue answers its method's miss/refusal whether the backend is starting
+    /// or Ready: a 429 here ends the caller's whole run.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn nx_startup_queue_capacity_is_a_cache_miss_not_429() {
-        let root = TestRoot::new("startup-capacity");
+    async fn nx_queue_capacity_is_a_cache_miss_not_429() {
+        let root = TestRoot::new("queue-capacity");
+        let mut fixture = TestActor::new(&root).await;
+        for (index, ready) in [false, true].into_iter().enumerate() {
+            let workspace = format!("nx-limited-{index}");
+            let repo = format!("owner/nx-limited-{index}");
+            let token = fixture
+                .install(&workspace, &repo, 96 + index as u8, 1)
+                .await;
+            if ready {
+                unit_ready(&mut fixture.actor, &repo);
+            } else {
+                unit_starting(&mut fixture.actor, &repo);
+            }
+            // The backend's origin pool and the global queue are both full: a Ready request can
+            // neither activate nor wait.
+            let origin = (workspace.clone(), unit_backend(&repo).target().origin());
+            let origin_active = fixture.actor.config.limits.origin_active;
+            fixture.actor.origins.insert(origin.clone(), origin_active);
+            fixture.actor.global_queued = fixture.actor.config.limits.global_queued;
+            let (mut receive, _cancel) = unit_queued_get(&mut fixture, &workspace, token).await;
+            let error = receive
+                .try_recv()
+                .expect("capacity refusal is immediate")
+                .err()
+                .expect("queue capacity");
+            assert_eq!(error.status, StatusCode::NOT_FOUND, "ready={ready}");
+            assert_eq!(error.audit_status, AuditStatus::Limited);
+            assert!(fixture.actor.nx_queue.is_empty());
+            assert!(fixture.actor.queue.is_empty());
+            assert!(unit_audited(
+                &fixture,
+                &workspace,
+                404,
+                AuditStatus::Limited,
+                "nx-queue-limited"
+            ));
+            let writer = WorkspaceToken::from_bytes([110 + index as u8; 32]);
+            let encoded = writer.encode();
+            fixture.actor.nx_publications.insert(
+                workspace.clone(),
+                NxPublication {
+                    workspace_id: workspace.clone(),
+                    repo_id: repo.clone(),
+                    expected_revision: 1,
+                    accepted_head: "a".repeat(40),
+                    hashes: std::collections::BTreeSet::from(["42".to_owned()]),
+                    token: writer,
+                },
+            );
+            let (reply, mut receive) = oneshot::channel();
+            let (_cancel, cancelled) = oneshot::channel();
+            fixture
+                .actor
+                .admit(
+                    workspace.clone(),
+                    Authentication::Bearer(Some(encoded)),
+                    nx_intent(Method::PUT, "/nx/v1/cache/42"),
+                    reply,
+                    cancelled,
+                )
+                .await;
+            let error = receive
+                .try_recv()
+                .expect("writer capacity refusal")
+                .err()
+                .expect("capacity is bounded");
+            assert_eq!(error.status, StatusCode::FORBIDDEN, "ready={ready}");
+            assert_eq!(error.audit_status, AuditStatus::Limited);
+            assert!(unit_audited(
+                &fixture,
+                &workspace,
+                403,
+                AuditStatus::Limited,
+                "nx-queue-limited"
+            ));
+            fixture.actor.global_queued = 0;
+            fixture.actor.origins.remove(&origin);
+        }
+        fixture.finish().await;
+    }
+
+    /// A Ready backend's request that waits out its queue deadline is a miss, not a 504 the
+    /// stock client cannot survive; the startup queue already answers its deadline this way.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn nx_ready_queue_deadline_is_a_cache_miss_not_504() {
+        let root = TestRoot::new("ready-deadline");
         let mut fixture = TestActor::new(&root).await;
         let token = fixture
-            .install("nx-limited", "owner/nx-limited", 96, 1)
+            .install("nx-deadline", "owner/nx-deadline", 98, 1)
             .await;
-        unit_starting(&mut fixture.actor, "owner/nx-limited");
-        fixture.actor.global_queued = fixture.actor.config.limits.global_queued;
-        let (mut receive, _cancel) = unit_queued_get(&mut fixture, "nx-limited", token).await;
-        let error = receive
-            .try_recv()
-            .expect("capacity refusal is immediate")
-            .err()
-            .expect("startup capacity");
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
-        assert_eq!(error.audit_status, AuditStatus::Limited);
-        assert!(fixture.actor.nx_queue.is_empty());
-        assert!(
-            fixture
-                .audit
-                .events
-                .lock()
-                .expect("unit audit")
-                .iter()
-                .any(|event| event.http_status == Some(404)
-                    && event.status == AuditStatus::Limited
-                    && event.classification.as_deref() == Some("nx-queue-limited"))
-        );
-        let writer = WorkspaceToken::from_bytes([97; 32]);
-        let encoded = writer.encode();
-        fixture.actor.nx_publications.insert(
-            "nx-limited".to_owned(),
-            NxPublication {
-                workspace_id: "nx-limited".to_owned(),
-                repo_id: "owner/nx-limited".to_owned(),
-                expected_revision: 1,
-                accepted_head: "a".repeat(40),
-                hashes: std::collections::BTreeSet::from(["42".to_owned()]),
-                token: writer,
-            },
-        );
-        let (reply, mut receive) = oneshot::channel();
-        let (_cancel, cancelled) = oneshot::channel();
+        unit_ready(&mut fixture.actor, "owner/nx-deadline");
+        let origin = unit_backend("owner/nx-deadline").target().origin();
+        let origin_active = fixture.actor.config.limits.origin_active;
         fixture
             .actor
-            .admit(
-                "nx-limited".to_owned(),
-                Authentication::Bearer(Some(encoded)),
-                nx_intent(Method::PUT, "/nx/v1/cache/42"),
-                reply,
-                cancelled,
-            )
-            .await;
+            .origins
+            .insert(("nx-deadline".to_owned(), origin.clone()), origin_active);
+        let (mut receive, _cancel) = unit_queued_get(&mut fixture, "nx-deadline", token).await;
+        assert!(matches!(
+            receive.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let queue_id = fixture.actor.queue.front().expect("queued Nx GET").queue_id;
+        fixture.actor.expire_queued(queue_id).await;
         let error = receive
             .try_recv()
-            .expect("writer capacity refusal")
+            .expect("deadline refusal")
             .err()
-            .expect("capacity is bounded");
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
-        assert_eq!(error.audit_status, AuditStatus::Limited);
-        assert!(
-            fixture
-                .audit
-                .events
-                .lock()
-                .expect("unit audit")
-                .iter()
-                .any(|event| event.http_status == Some(403)
-                    && event.status == AuditStatus::Limited
-                    && event.classification.as_deref() == Some("nx-queue-limited"))
-        );
-        fixture.actor.global_queued = 0;
+            .expect("queue deadline");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.audit_status, AuditStatus::TimedOut);
+        assert!(unit_audited(
+            &fixture,
+            "nx-deadline",
+            404,
+            AuditStatus::TimedOut,
+            "queue-timeout"
+        ));
+        assert!(fixture.actor.queue.is_empty());
+        assert_eq!(fixture.actor.global_queued, 0);
+        assert_eq!(fixture.actor.sessions["nx-deadline"].queued, 0);
+        fixture
+            .actor
+            .origins
+            .remove(&("nx-deadline".to_owned(), origin));
         fixture.finish().await;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn unit_ready(actor: &mut Actor, repo_id: &str) {
+        actor.nx_backends.insert(
+            repo_id.to_owned(),
+            NxBackendState::Ready {
+                backend: unit_backend(repo_id),
+                process: None,
+            },
+        );
+    }
+
+    /// Whether the audit trail holds one refusal of this workspace with exactly this outcome.
+    #[cfg(target_os = "macos")]
+    fn unit_audited(
+        fixture: &TestActor,
+        workspace: &str,
+        http_status: u16,
+        status: AuditStatus,
+        classification: &str,
+    ) -> bool {
+        fixture
+            .audit
+            .events
+            .lock()
+            .expect("unit audit")
+            .iter()
+            .any(|event| {
+                event.workspace_id == workspace
+                    && event.http_status == Some(http_status)
+                    && event.status == status
+                    && event.classification.as_deref() == Some(classification)
+            })
     }
 
     /// A failed single-flight start refuses only its own waiters. Another project's authenticated
