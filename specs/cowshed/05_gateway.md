@@ -307,8 +307,10 @@ never a successful read: its 404 is not evidence that a hash is absent and never
 `timed-out` `queue-timeout` 404/403, never a 429 or 504. Stock Nx 23.2.1 retries no `GET`, ignores `Retry-After`, and
 reads every status but `GET` 200/404 and `PUT` 200/403/409 as a fatal misconfiguration (`native/cache/errors.rs`
 `convert_response_to_error`), so a busy gateway answers what a cache may always answer: not served now. Like an outage,
-that 404 is not evidence of absence and never counts as a hit. Drain and audit fail-closed retain their own statuses;
-they are not backend outages. Unsupported Nx methods are denied before starting or waiting for a backend.
+that 404 is not evidence of absence and never counts as a hit. The price is work, not failure: a lookup wave wider than
+the queue re-runs its refused tasks, even ones the cache holds, and a refused publication is not stored. That extra work
+is the designed cost of a busy gateway, not a regression. Drain and audit fail-closed retain their own statuses; they
+are not backend outages. Unsupported Nx methods are denied before starting or waiting for a backend.
 
 **Backend lifecycle isolation.** Each repository's backend is supervised by a per-repository lifecycle state
 (`Starting`, `Ready`, or `Failed { retry_after }`) held by the actor; backend startup and readiness waiting run outside
