@@ -59,16 +59,18 @@ Two verbs own the host story, both runnable from any directory:
   cowshed — the gateway's binary and the `cowshed` on `PATH` alike — restarting a gateway that runs other bytes, and
   points the first `cowshed` on `PATH` at it when that entry is a symbolic link (05_gateway.md "The installed cowshed").
   Run from the installed copy it installs nothing and says so; another build is installed by running that build's own
-  `setup`. It refuses to replace the installed build with one of an older commit, or one that records no commit, naming
-  the binary and both builds, repairs everything else, and exits non-zero; `setup --downgrade` installs it anyway. It
-  then refreshes every adopted main's build state through the same runtime path jobs use (16_build_volumes.md).
-  Migration is rebuild-only: it announces the discard of contributed incremental directories before acting, protects
-  tracked source files, and links an empty build volume for the next build to repopulate. No build state is copied. A
-  project refusal is reported on stderr without hiding later projects; the command exits with the first typed failure
-  and the number of failed projects, never a success JSON envelope first. Uninstall and a failed storage repair never
-  run migration. A fully migrated healthy host changes nothing and says so. The non-destructive storage promise applies
-  to the host store volume, layer-3 caches and source data, not to rebuildable incremental state. On a host that still
-  has the retired caches volume, setup moves what the volume holds to the host HOME without authorization, and
+  `setup`. It holds the install slot for its whole run (05_gateway.md "The install slot") and refuses to replace the
+  installed build with one that does not contain it — one whose commit is on no adopted `main`, or which lacks an
+  installed commit by both ancestry and patch identity — or one that records no commit, naming the binary, both builds
+  and each lost commit; it repairs everything else and exits non-zero; `setup --downgrade` installs it anyway. It then
+  refreshes every adopted main's build state through the same runtime path jobs use (16_build_volumes.md). Migration is
+  rebuild-only: it announces the discard of contributed incremental directories before acting, protects tracked source
+  files, and links an empty build volume for the next build to repopulate. No build state is copied. A project refusal
+  is reported on stderr without hiding later projects; the command exits with the first typed failure and the number of
+  failed projects, never a success JSON envelope first. Uninstall and a failed storage repair never run migration. A
+  fully migrated healthy host changes nothing and says so. The non-destructive storage promise applies to the host store
+  volume, layer-3 caches and source data, not to rebuildable incremental state. On a host that still has the retired
+  caches volume, setup moves what the volume holds to the host HOME without authorization, and
   `setup --retire-caches-volume` deletes the emptied volume, its `/etc/fstab` pin and its mount-service entry inside
   that same single session, refusing while anything but the marker is left (03_caches.md "Retiring the caches volume").
 

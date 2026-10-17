@@ -2,10 +2,13 @@
 //! replacing one build with another (05_gateway.md "The installed cowshed").
 //!
 //! Every release build carries the commit it was made from and when that commit was committed
-//! (`build.rs`). The commit's time is the ordering: it is read from the one commit `HEAD` names,
-//! so it survives the shallow clone a release is built from and needs no history to compare, and
-//! a checkout whose build is stale is older than the build installed from a newer commit by
-//! construction. A build made without git, or made in the debug profile, records nothing.
+//! (`build.rs`). The commit is what an install is judged by: a build may replace the installed
+//! one only when it holds every change the installed commit carries, by ancestry or patch
+//! identity — the containment `cowshed rm` already requires of a workspace
+//! (`GitRepository::commits_not_held`). The time only describes a build to a person. It never
+//! orders two builds: two sibling commits are ordered by clock, and the later one carries none of
+//! the earlier one's fixes. A build made without git, or made in the debug profile, records
+//! nothing.
 //!
 //! The installing build writes its own record beside the stored copy it installs
 //! (`gateway_service`), so the installed build's record is read from a file rather than from a
@@ -13,6 +16,7 @@
 //! has none.
 
 use cowshed_core::CowshedError;
+use cowshed_core::git::CommitSubject;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -22,8 +26,8 @@ use std::path::Path;
 pub struct BuildRecord {
     /// The commit the build was made from.
     pub commit: String,
-    /// When that commit was committed, in seconds since the Unix epoch: what builds are ordered
-    /// by.
+    /// When that commit was committed, in seconds since the Unix epoch: how a person tells two
+    /// builds apart, never how they are ordered.
     pub commit_time: u64,
 }
 
@@ -52,36 +56,92 @@ impl BuildRecord {
     }
 }
 
-/// Whether installing `candidate` over the build `installed` records moves the host to an older
-/// build.
-///
-/// A candidate that records nothing cannot show it is not older, so it is refused: the installed
-/// build knows what it is, and a replacement that cannot say is the stale binary this exists to
-/// stop. Two builds of the same commit time are not ordered, so neither is older.
-pub fn is_downgrade(candidate: Option<&BuildRecord>, installed: &BuildRecord) -> bool {
-    candidate.is_none_or(|candidate| candidate.commit_time < installed.commit_time)
+/// How many lost commits a refusal names one by one before it counts the rest.
+const NAMED_LOST_COMMITS: usize = 20;
+
+/// The hint every basis refusal ends with: how to make a build that contains the installed one,
+/// and the override that goes back on purpose.
+fn rebase_hint(installed: &BuildRecord) -> String {
+    format!(
+        "rebase this build's checkout onto {} (or merge it), rebuild, and run that build's \
+         `cowshed setup`; `cowshed setup --downgrade` from this build installs it anyway and \
+         removes what it lacks",
+        installed.short_commit()
+    )
 }
 
-/// The refusal of a candidate older than the installed build, naming the binary it would have
-/// installed and both builds.
-pub fn downgrade_refusal(
+/// The refusal of a candidate that lacks changes the installed build carries: the binary it
+/// would have installed, both builds, and every commit the install would take off the host, so
+/// the reader does not have to go and find out what "older" meant.
+pub fn lost_commits_refusal(
     source: &Path,
-    candidate: Option<&BuildRecord>,
+    candidate: &BuildRecord,
     installed: &BuildRecord,
+    lost: &[CommitSubject],
+) -> CowshedError {
+    let mut message = format!(
+        "{} would take {} off this host: it is {}, and does not contain the installed cowshed, \
+         {}; these commits of the installed build have no ancestor or patch-identical commit in \
+         it:",
+        source.display(),
+        match lost.len() {
+            1 => String::from("1 commit"),
+            count => format!("{count} commits"),
+        },
+        candidate.describe(),
+        installed.describe(),
+    );
+    for commit in lost.iter().take(NAMED_LOST_COMMITS) {
+        let oid = commit.oid.as_str();
+        message.push_str(&format!(
+            "\n  {} {}",
+            oid.get(..12).unwrap_or(oid),
+            commit.subject
+        ));
+    }
+    if let Some(unnamed) = lost.len().checked_sub(NAMED_LOST_COMMITS)
+        && unnamed > 0
+    {
+        message.push_str(&format!(
+            "\n  … and {unnamed} more: git log {}..{}",
+            candidate.short_commit(),
+            installed.short_commit()
+        ));
+    }
+    CowshedError::conflict(message, rebase_hint(installed))
+}
+
+/// The refusal of a candidate that records no build: it cannot show that it contains the
+/// installed one, and a replacement that cannot say is the stale binary this exists to stop.
+pub fn unrecorded_refusal(source: &Path, installed: &BuildRecord) -> CowshedError {
+    CowshedError::conflict(
+        format!(
+            "{} records no build, so it cannot show that it contains the installed cowshed, {}",
+            source.display(),
+            installed.describe(),
+        ),
+        rebase_hint(installed),
+    )
+}
+
+/// The refusal of a candidate whose containment of the installed build could not be decided:
+/// `reason` says which commit could not be read, and where it was looked for. Not deciding is
+/// not permission; installing on it is the silent revert this check replaces.
+pub fn unproven_refusal(
+    source: &Path,
+    candidate: &BuildRecord,
+    installed: &BuildRecord,
+    reason: &str,
 ) -> CowshedError {
     CowshedError::conflict(
         format!(
-            "{} would replace the installed cowshed with an older build: it {}, and the installed \
-             cowshed is {}",
+            "{} cannot be shown to contain the installed cowshed: it is {}, the installed cowshed \
+             is {}, and {reason}",
             source.display(),
-            candidate.map_or_else(
-                || String::from("records no build"),
-                |candidate| format!("is {}", candidate.describe())
-            ),
+            candidate.describe(),
             installed.describe(),
         ),
-        "run `cowshed setup` from a build of a newer commit; `cowshed setup --downgrade` from this \
-         build installs it anyway",
+        rebase_hint(installed),
     )
 }
 
@@ -114,59 +174,109 @@ fn rfc3339_utc(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowshed_core::api::GitOid;
 
-    fn record(commit_time: u64) -> BuildRecord {
+    const SOURCE: &str = "/Users/dev/checkout/dist/bin/darwin-arm64/cowshed";
+
+    fn record(commit: &str, commit_time: u64) -> BuildRecord {
         BuildRecord {
-            commit: "51300433f2a1b0c9d8e7f60514233241506f7e8d".into(),
+            commit: commit.into(),
             commit_time,
         }
     }
 
-    #[test]
-    fn an_older_candidate_is_a_downgrade_and_a_newer_or_equal_one_is_not() {
-        let installed = record(1_000);
-        assert!(is_downgrade(Some(&record(999)), &installed));
-        assert!(!is_downgrade(Some(&record(1_000)), &installed));
-        assert!(!is_downgrade(Some(&record(1_001)), &installed));
+    fn lost(oid: &str, subject: &str) -> CommitSubject {
+        CommitSubject {
+            oid: GitOid::new(oid).unwrap(),
+            subject: subject.into(),
+        }
     }
 
+    /// Today's collision as the refusal would have said it: the release train's build of
+    /// 24acd8e7b684 over the installed f0bfb52de, which carries the gc fix the train lacks.
     #[test]
-    fn a_candidate_that_records_no_build_cannot_show_it_is_not_older() {
-        assert!(is_downgrade(None, &record(1_000)));
-    }
-
-    #[test]
-    fn the_refusal_names_the_binary_both_builds_and_the_override() {
-        let refusal = downgrade_refusal(
-            Path::new("/Users/dev/checkout/dist/bin/darwin-arm64/cowshed"),
-            Some(&record(1_790_000_000)),
-            &record(1_790_100_000),
+    fn the_refusal_names_the_binary_both_builds_every_lost_commit_and_the_override() {
+        let candidate = record("24acd8e7b684265b49135f2e29e885ab3f547e3b", 1_792_213_208);
+        let installed = record("f0bfb52defe2357afc492f6619789607acbc70ca", 1_792_232_045);
+        let refusal = lost_commits_refusal(
+            Path::new(SOURCE),
+            &candidate,
+            &installed,
+            &[lost(
+                "f0bfb52defe2357afc492f6619789607acbc70ca",
+                "fix(cowshed): judge strays by the project ignore rules and refuse a failed \
+                 judgement",
+            )],
         );
         assert_eq!(refusal.code.as_str(), "conflict");
+        assert_eq!(
+            refusal.message,
+            format!(
+                "{SOURCE} would take 1 commit off this host: it is commit 24acd8e7b684, committed \
+                 2026-10-17T05:00:08Z, and does not contain the installed cowshed, commit \
+                 f0bfb52defe2, committed 2026-10-17T10:14:05Z; these commits of the installed \
+                 build have no ancestor or patch-identical commit in it:\n  f0bfb52defe2 \
+                 fix(cowshed): judge strays by the project ignore rules and refuse a failed \
+                 judgement"
+            )
+        );
+        assert_eq!(
+            refusal.hint,
+            "rebase this build's checkout onto f0bfb52defe2 (or merge it), rebuild, and run that \
+             build's `cowshed setup`; `cowshed setup --downgrade` from this build installs it \
+             anyway and removes what it lacks"
+        );
+    }
+
+    /// A long list is named up to a bound and then counted, with the command that lists it all:
+    /// the count is never hidden, only the names past the bound.
+    #[test]
+    fn a_long_loss_names_twenty_commits_and_counts_the_rest() {
+        let commits: Vec<CommitSubject> = (0..23)
+            .map(|index| lost(&format!("{index:040x}"), &format!("fix: number {index}")))
+            .collect();
+        let refusal = lost_commits_refusal(
+            Path::new(SOURCE),
+            &record("a".repeat(40).as_str(), 1),
+            &record("b".repeat(40).as_str(), 2),
+            &commits,
+        );
+        assert!(
+            refusal.message.contains("23 commits"),
+            "{}",
+            refusal.message
+        );
+        assert!(
+            refusal.message.contains("fix: number 19"),
+            "{}",
+            refusal.message
+        );
+        assert!(
+            !refusal.message.contains("fix: number 20"),
+            "{}",
+            refusal.message
+        );
         assert!(
             refusal
                 .message
-                .contains("/Users/dev/checkout/dist/bin/darwin-arm64/cowshed"),
+                .ends_with("… and 3 more: git log aaaaaaaaaaaa..bbbbbbbbbbbb"),
             "{}",
             refusal.message
         );
+    }
+
+    #[test]
+    fn a_candidate_that_records_no_build_cannot_show_it_contains_the_installed_one() {
+        let installed = record("f0bfb52defe2357afc492f6619789607acbc70ca", 1_792_232_045);
+        let refusal = unrecorded_refusal(Path::new("/old/cowshed"), &installed);
+        assert_eq!(refusal.code.as_str(), "conflict");
         assert!(
-            refusal.message.contains("commit 51300433f2a1"),
+            refusal.message.contains("records no build")
+                && refusal.message.contains("commit f0bfb52defe2"),
             "{}",
-            refusal.message
-        );
-        assert!(
-            refusal.message.contains("2026-09-"),
-            "dates are spelled, not counted: {}",
             refusal.message
         );
         assert!(refusal.hint.contains("--downgrade"), "{}", refusal.hint);
-        let blind = downgrade_refusal(Path::new("/old/cowshed"), None, &record(1_790_100_000));
-        assert!(
-            blind.message.contains("records no build"),
-            "{}",
-            blind.message
-        );
     }
 
     #[test]

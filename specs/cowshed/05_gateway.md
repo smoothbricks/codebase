@@ -110,6 +110,7 @@ reaches it after a reboot whatever volume the build came from (a workspace image
 | `cowshed-<sha256>.build` | That copy's build record, JSON `{"commit","commitTime"}`, written by a build that records one. |
 
 `cowshed-source`, one level up beside `bin`, records the path the current install came from and its package version.
+`install.lock`, beside it, is the install slot's lock (below); it is never removed.
 
 **Content-addressed copies, one moving name.** A copy is written once: the build's bytes go into an exclusive temporary
 file in `bin`, are synced, and are renamed to the copy's name. A copy whose bytes and mode already match is never
@@ -142,40 +143,69 @@ gateway that answers while running other bytes than the build it leaves installe
 keeps a running process whatever the stable name now says, so this is what ends the disagreement the build refusal
 names.
 
-**Install order and rollback.** An install that replaces the running build refuses a debug build and a downgrade (below)
-before anything is installed. With the gateway agent installed it then writes the plist if it changed, and retains the
-previous build: when the stable name is a link, the copy it names is already stored; when it is the plain binary the
-layout before content-addressed copies left, that binary is first stored under its own digest through the same copy and
-rename. It stores the new copy, moves the stable name, records the source and the build record, and activates the agent.
-A failed activation points the stable name back at the retained copy, records `cowshed-source` as restored, and loads
-the agent again; the error says what failed and whether the restore and the reload did. A first install has nothing to
-roll back to and keeps its copy. A setup on a host with no gateway agent installs the same way without the activation.
-Setup installs only after its storage repair succeeded.
+**Install order and rollback.** Every install holds the install slot (below). An install that replaces the running build
+refuses a debug build and a build that does not contain the installed one (below) before anything is installed. With the
+gateway agent installed it then writes the plist if it changed, and retains the previous build: when the stable name is
+a link, the copy it names is already stored; when it is the plain binary the layout before content-addressed copies
+left, that binary is first stored under its own digest through the same copy and rename. It stores the new copy, moves
+the stable name, records the source and the build record, and activates the agent. A failed activation points the stable
+name back at the retained copy, records `cowshed-source` as restored, and loads the agent again; the error says what
+failed and whether the restore and the reload did. A first install has nothing to roll back to and keeps its copy. A
+setup on a host with no gateway agent installs the same way without the activation. Setup installs only after its
+storage repair succeeded.
 
 **Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
 the new build's and the one it replaced is removed. The replaced build stays one install longer: a workspace supervisor
 of that build, still draining its jobs (11_shell.md "Draining a supervisor of another build"), starts the shells those
 jobs need from the path it started from. A failed prune is reported on stderr and never fails the install.
 
-**Build records and downgrades.** A release build records the commit `HEAD` names and that commit's committer time
+**The install slot.** The installed cowshed is one slot, so one install fills it at a time. `setup` (repair and
+`--uninstall` alike), `gateway start` and `gateway stop --purge` each take an exclusive `flock(2)` on
+`dev.cowshed/install.lock` before they read what is installed, and hold it until the command exits; the kernel drops it
+when the process exits or dies, so no crash leaves the slot held. It is the lock `lockf(1)` takes, the shape of
+`~/Dev/.land-lock.sh`: a second installer waits in line, says on stderr that it is waiting and for which file, and then
+judges its build against whatever the install it waited for left behind, because the judgement below runs after the lock
+is taken. A host move inside `setup` restarts the gateway under the slot `setup` already holds. This exists because two
+workers each built and installed a cowshed within an hour, neither aware of the other's commits, and nothing serialized
+who filled the slot.
+
+**Build records and the basis.** A release build records the commit `HEAD` names and that commit's committer time
 (`build.rs`: `COWSHED_BUILD_COMMIT`, `COWSHED_BUILD_COMMIT_TIME`); the time is read from that one commit, so a shallow
 clone records it too. Its Git HEAD/reflog watch paths are emitted relative to the build-script manifest directory, so a
 warm Cargo target clone follows its own repository rather than retaining an absolute watch on its donor. The owner
 script directive control and a real warm Cargo clone pin this boundary. A debug build, and a build made where git cannot
 answer (a source archive, a nix build), records nothing. The installing build writes its record beside its stored copy,
 so the installed build's record is read from a file and nothing is executed to learn it; a record that cannot be written
-is said on stderr and does not fail the install. An install that would replace the installed build is refused when the
-installed build has a record and the candidate's commit time is older, or the candidate records nothing (it cannot show
-it is not older). Equal commit times are not ordered, so neither is older; the same bytes are never a downgrade of
-themselves; an installed build with no record — installed before records existed, or the plain binary of the old layout
-— is never an obstacle. The refusal is `Conflict` naming the binary it would have installed and both builds
-(`commit <12 hex>, committed <RFC 3339 UTC>`), with the hint "run `cowshed setup` from a build of a newer commit;
-`cowshed setup --downgrade` from this build installs it anyway". `setup` reports it once for the gateway and the CLI,
-repairs everything else, and exits non-zero with that `Conflict`; `gateway start` refuses before it installs anything.
-`setup --downgrade` installs the invoking build anyway, and is valid only for a run that installs: not with
-`--uninstall` or `--force`. An unreadable installed record is `Integrity`. This exists because twice a `cowshed setup`
-run through a launcher that resolved to a stale checkout build put back a gateway without a landed feature, and nothing
-said so.
+is said on stderr and does not fail the install. The time describes a build to a person and never orders two builds: two
+sibling commits are ordered by clock, and the later one carries none of the earlier one's fixes.
+
+An install that would replace the installed build is judged by containment. Nothing is judged, and the install proceeds,
+when nothing is installed, when the stable name is the plain binary of the old layout, when the installed copy has no
+`.build` record (installed before records existed, or by `--downgrade` from a build that records nothing — it names no
+commit to keep), when the bytes are the installed bytes, or when the candidate records the installed commit. An
+installed record that exists but cannot be read is `Integrity` naming the file, never read as absent: it says a commit
+was installed and will not say which. Otherwise the candidate must record a commit, and that commit must be on the
+`main` branch of an adopted project's own checkout (the adopted-project registry, read live). That main judges it: every
+commit of `<candidate>..<installed>` must be held by the candidate, by ancestry or by patch identity — exactly the
+containment `cowshed rm` requires (`GitRepository::commits_not_held`, the list form of `commits_already_held`:
+`git cherry` equivalence for ordinary commits that change something, and merges that author nothing). Main is the
+authority because it outlives every workspace: a workspace's commit may be rebased away when it lands and the workspace
+removed, while main only moves forward. A rebased or cherry-picked commit, or a squash of one commit, is held by patch
+identity; a squash of several commits matches none of them, and is refused naming each.
+
+Every refusal is `Conflict` naming the binary it would have installed and both builds
+(`commit <12 hex>, committed <RFC 3339 UTC>`). A candidate that lacks installed commits names each one as
+`<12 hex> <subject>`, the first 20 and then `… and <n> more: git log <candidate>..<installed>`. A candidate that records
+nothing, one whose commit is on no adopted main (each main and why is named), and one whose comparison git cannot make
+(the installed commit absent from that main) are refused too: not knowing is not permission. The hint is "rebase this
+build's checkout onto `<installed 12 hex>` (or merge it), rebuild, and run that build's `cowshed setup`;
+`cowshed setup --downgrade` from this build installs it anyway and removes what it lacks". `setup` reports it once for
+the gateway and the CLI, repairs everything else, and exits non-zero with that `Conflict`; `gateway start` refuses
+before it installs anything. `setup --downgrade` installs the invoking build without judging it, and is valid only for a
+run that installs: not with `--uninstall` or `--force`. This exists because a guard that compared commit times would
+have let a release train's build of a sibling commit replace an installed build carrying a gc fix it lacked, and said
+nothing; before that, twice a `cowshed setup` run through a launcher that resolved to a stale checkout build put back a
+gateway without a landed feature.
 
 **Uninstall.** `setup --uninstall` and `gateway stop --purge` remove, after the agent is gone, the stable name first (so
 nothing launchd could start dangles), then every stored copy with its `.build` record, and every `cowshed` on `PATH`

@@ -129,9 +129,11 @@ changes them. `start` installs without touching that entry. The previous build's
 because a workspace supervisor of that build still draining its jobs may start shells from its path; older copies are
 removed once the new build's agent is active. If activation fails, the stable name is pointed back at the previous copy
 and the agent is loaded again. A release build records its commit beside its copy (`cowshed-<sha256>.build`), and
-`start` and `setup` refuse to replace the installed cowshed with a build of an older commit, or one that records none,
-naming the binary and both builds; `cowshed setup --downgrade` installs it anyway. The full rules are in the spec,
-`specs/cowshed/05_gateway.md` "The installed cowshed".
+`start` and `setup` take the install slot (`dev.cowshed/install.lock`), one install at a time, and refuse to replace the
+installed cowshed with a build that does not contain it — one whose commit is not on an adopted `main`, or that lacks an
+installed commit by both ancestry and patch identity — naming the binary, both builds and each commit it lacks;
+`cowshed setup --downgrade` installs it anyway. The full rules are in the spec, `specs/cowshed/05_gateway.md` "The
+installed cowshed".
 
 `start` atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with the stable name
 followed by the fixed `gateway run` argv. The agent has `RunAtLoad` and `KeepAlive`; early startup failures go only to

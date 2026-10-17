@@ -1,5 +1,6 @@
 use crate::args::GatewayCommand;
-use crate::build_record::{BuildRecord, downgrade_refusal, is_downgrade};
+use crate::build_record::{BuildRecord, unproven_refusal, unrecorded_refusal};
+use crate::install_basis::{self, InstallSlot};
 use crate::launchd::{
     COWSHED_BINARY_NAME, ExecutableDigest, ExecutableInstallState, ExistingPlist, GATEWAY_LABEL,
     HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
@@ -518,10 +519,16 @@ where
 {
     match action {
         GatewayCommand::Start => {
+            let _slot = take_install_slot(&canonical_home()?).await?;
             let status = start_service(output, Downgrade::Refuse).await?;
             emit_gateway_status(output, json, status)?;
         }
         GatewayCommand::Stop { purge } => {
+            // A purge empties the install slot, so it waits its turn like any install does.
+            let _slot = match purge {
+                true => Some(take_install_slot(&canonical_home()?).await?),
+                false => None,
+            };
             let purged = stop_service(purge)?;
             if json {
                 output.success(EmptyResult {}).map_err(output_error)?;
@@ -570,7 +577,10 @@ where
     let candidate = Candidate::of(supervisable_running_executable()?, BuildRecord::running())?;
     let executable =
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
-    refuse_downgrade(&executable, &candidate, downgrade)?;
+    check_basis(&executable, &candidate, downgrade, async || {
+        adopted_mains(&home).await
+    })
+    .await?;
     install_nx_cache_server(&mut executor, &home, &candidate.source)?;
     let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
     let observed = inspect_install_state(&spec)?;
@@ -1323,7 +1333,7 @@ impl Candidate {
     }
 }
 
-/// Whether an install may replace the installed cowshed with an older build.
+/// Whether an install may replace the installed cowshed with a build that does not contain it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Downgrade {
     Refuse,
@@ -1522,9 +1532,10 @@ fn build_record_path(executable: &HostStableExecutable, digest: &ExecutableDiges
     PathBuf::from(path)
 }
 
-/// Write down which build the stored copy is, so a later install can tell whether it would move
-/// the host to an older one ([`refuse_downgrade`]). A build that records nothing writes nothing:
-/// the copy then has no record, and a copy with none is never refused a replacement.
+/// Write down which build the stored copy is, so a later install can tell whether it would take
+/// the installed build's changes off the host ([`check_basis`]). A build that records nothing
+/// writes nothing: the copy then has no record, and a copy with none is never refused a
+/// replacement.
 ///
 /// Best effort like [`record_installed_source`], and said out loud for the same reason.
 fn record_installed_build(executable: &HostStableExecutable, candidate: &Candidate) {
@@ -1579,7 +1590,8 @@ fn installed_build(executable: &HostStableExecutable) -> Result<Option<Installed
                     "the installed cowshed's build record {} is unreadable: {error}",
                     path.display()
                 ),
-                "delete the record, or run `cowshed setup --downgrade` from the build to install",
+                "rewrite it as the installed build's {\"commit\",\"commitTime\"}, or run `cowshed \
+                 setup --downgrade` from the build to install it without judging it",
             )
         })?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -1593,37 +1605,94 @@ fn installed_build(executable: &HostStableExecutable) -> Result<Option<Installed
     Ok(Some(InstalledBuild { digest, record }))
 }
 
-/// Refuse to move the host to a build older than the installed one, unless `downgrade` allows it.
+/// Take the install slot for `home`: one install at a time (`install_basis`). Every caller takes
+/// it before it reads what is installed, so the basis it judges against is whatever the install
+/// it waited for left behind.
+pub(crate) async fn take_install_slot(home: &Path) -> Result<InstallSlot> {
+    let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    ensure_private_directory(executable.support_directory())?;
+    InstallSlot::take(executable.support_directory()).await
+}
+
+/// The checkout of every adopted project's main, read for the host store: where a build's commit
+/// is judged.
+pub(crate) async fn adopted_mains(home: &Path) -> Result<install_basis::Mains> {
+    let storage = validate_existing_host_storage(home).await?;
+    let store = std::sync::Arc::clone(storage.roots().shared_store());
+    let projects = NativeGatewayInventory::new(storage)
+        .adopted_projects()
+        .await
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("could not enumerate adopted mains: {error}"),
+                "repair the adopted-project records, then rerun the install",
+            )
+        })?;
+    Ok(install_basis::Mains {
+        store,
+        roots: projects
+            .into_iter()
+            .map(|project| project.project_root)
+            .collect(),
+    })
+}
+
+/// Refuse to replace the installed cowshed with a build that does not contain it, unless
+/// `downgrade` allows it. Runs under the install slot ([`take_install_slot`]).
 ///
-/// This exists because it happened twice in an afternoon: `cowshed setup` run through a launcher
-/// that resolved to a checkout's stale build put an older gateway back, removing a landed feature
-/// from a host that was running it, and every gate after ran without it. The check compares the
-/// commit times the two builds record ([`BuildRecord`]); an installed build that records nothing
-/// has nothing to compare, and the same bytes are never a downgrade of themselves.
-pub(crate) fn refuse_downgrade(
+/// This exists because a guard that compared commit *times* let a sibling committed later
+/// replace a build carrying a gc fix it lacked, and said nothing. What decides now is whether
+/// the candidate holds every change of the installed commit, judged in main
+/// ([`install_basis::judge`]).
+///
+/// What is installed decides whether there is anything to judge. Nothing installed, or a plain
+/// binary of the layout before copies were content-addressed, is a host with nothing to lose: it
+/// installs. A stored copy with no `.build` record beside it was installed before records
+/// existed, or by `--downgrade` from a build that records nothing; it names no commit to keep,
+/// so it installs too. A record that is there but unreadable is `Integrity` and refuses: it
+/// says a commit was installed and will not say which, and reading it as absent would wave
+/// through exactly the replacement it exists to judge. The same bytes, or another build of the
+/// same commit, replace nothing. `mains` lists the adopted mains, and is asked only when there
+/// is a commit to judge.
+pub(crate) async fn check_basis<M>(
     executable: &HostStableExecutable,
     candidate: &Candidate,
     downgrade: Downgrade,
-) -> Result<()> {
+    mains: M,
+) -> Result<()>
+where
+    M: AsyncFnOnce() -> Result<install_basis::Mains>,
+{
     if downgrade == Downgrade::Allow {
         return Ok(());
     }
     let Some(installed) = installed_build(executable)? else {
         return Ok(());
     };
-    match installed.record {
-        Some(record)
-            if installed.digest != candidate.digest
-                && is_downgrade(candidate.record.as_ref(), &record) =>
-        {
-            Err(downgrade_refusal(
-                &candidate.source,
-                candidate.record.as_ref(),
-                &record,
-            ))
-        }
-        _ => Ok(()),
+    let Some(record) = installed.record else {
+        return Ok(());
+    };
+    if installed.digest == candidate.digest {
+        return Ok(());
     }
+    let Some(candidate_record) = &candidate.record else {
+        return Err(unrecorded_refusal(&candidate.source, &record));
+    };
+    if candidate_record.commit == record.commit {
+        return Ok(());
+    }
+    let mains = mains().await.map_err(|error| {
+        unproven_refusal(
+            &candidate.source,
+            candidate_record,
+            &record,
+            &format!(
+                "the adopted mains that judge it could not be listed: {}",
+                error.message
+            ),
+        )
+    })?;
+    install_basis::judge(&candidate.source, candidate_record, &record, &mains).await
 }
 
 /// Keep the build the stable name runs now through the install that replaces it, and name its
@@ -1810,8 +1879,9 @@ pub enum ServiceBinaryRefresh {
         reason: String,
         remedy: String,
     },
-    /// The installed cowshed is newer than the invoking build, and the run was not asked to go
-    /// back. Reported like a refusal, and ends the run non-zero: the install was the point.
+    /// The invoking build does not contain the installed cowshed ([`check_basis`]), and the run
+    /// was not asked to go back. Reported like a refusal, and ends the run non-zero: the install
+    /// was the point.
     Downgrade {
         service: String,
         reason: String,
@@ -1838,15 +1908,20 @@ pub fn installed_binary_is_stale(
 /// copy, which launchd keeps for as long as the process lives — restarting it is what makes the
 /// CLI on `PATH` and the daemon one artifact again.
 ///
-/// The build has to be fit to supervise, and not older than the installed one, *before* anything
-/// is copied, and a failed activation puts the old binary back: this is the function that,
+/// The build has to be fit to supervise, and contain the installed one, *before* anything is
+/// copied, and a failed activation puts the old binary back: this is the function that,
 /// unguarded, replaced a host's supervised gateway with a debug build and then stranded it with
-/// no loaded agent.
+/// no loaded agent. The caller holds the install slot ([`take_install_slot`]).
 pub async fn refresh_gateway_binary(
     home: &Path,
     downgrade: Downgrade,
 ) -> Result<Option<ServiceBinaryRefresh>> {
     let candidate = Candidate::of(running_executable()?, BuildRecord::running())?;
+    let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let basis = check_basis(&executable, &candidate, downgrade, async || {
+        adopted_mains(home).await
+    })
+    .await;
     let daemon = match GatewayControlClient::new(control_socket_path()) {
         Ok(client) => client.status().await.ok(),
         Err(_) => None,
@@ -1856,17 +1931,19 @@ pub async fn refresh_gateway_binary(
         home,
         &candidate,
         cfg!(debug_assertions),
-        downgrade,
+        basis,
         daemon.as_ref(),
         &mut executor,
     )
 }
 
+/// [`refresh_gateway_binary`] with its inputs given. `basis` is [`check_basis`]'s judgement of
+/// replacing the installed build with `candidate`, consulted only when the binary is replaced.
 fn refresh_gateway_from<C: LaunchctlCommand>(
     home: &Path,
     candidate: &Candidate,
     debug_build: bool,
-    downgrade: Downgrade,
+    basis: Result<()>,
     daemon: Option<&DaemonStatus>,
     executor: &mut LaunchdExecutor<NativeFilesystem, C>,
 ) -> Result<Option<ServiceBinaryRefresh>> {
@@ -1902,7 +1979,7 @@ fn refresh_gateway_from<C: LaunchctlCommand>(
                 remedy: refusal.hint,
             }));
         }
-        if let Err(refusal) = refuse_downgrade(&executable, candidate, downgrade) {
+        if let Err(refusal) = basis {
             return Ok(Some(ServiceBinaryRefresh::Downgrade {
                 service: spec.label().to_owned(),
                 reason: refusal.message,
@@ -1954,7 +2031,8 @@ pub enum CliInstall {
     },
     /// The invoking build must not be installed ([`refuse_unsupervisable_build`]).
     Refused { reason: String, remedy: String },
-    /// The invoking build is older than the installed one, and the run was not asked to go back.
+    /// The invoking build does not contain the installed one ([`check_basis`]), and the run was
+    /// not asked to go back.
     Downgrade { reason: String, remedy: String },
 }
 
@@ -1963,17 +2041,23 @@ pub enum CliInstall {
 /// The gateway's own refresh ([`refresh_gateway_binary`]) has already installed this build when an
 /// agent is installed — with the rollback an agent needs — and this finds that install current.
 /// On a host with no gateway agent this is the install: the copy, the stable name, the record.
-pub fn install_cli(
+/// The caller holds the install slot ([`take_install_slot`]).
+pub async fn install_cli(
     home: &Path,
     downgrade: Downgrade,
     path: &std::ffi::OsStr,
 ) -> Result<CliInstall> {
     let candidate = Candidate::of(running_executable()?, BuildRecord::running())?;
+    let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let basis = check_basis(&executable, &candidate, downgrade, async || {
+        adopted_mains(home).await
+    })
+    .await;
     install_cli_from(
         home,
         &candidate,
         cfg!(debug_assertions),
-        downgrade,
+        basis,
         path,
         &mut LaunchdExecutor::native(),
     )
@@ -1983,7 +2067,7 @@ fn install_cli_from<F, C>(
     home: &Path,
     candidate: &Candidate,
     debug_build: bool,
-    downgrade: Downgrade,
+    basis: Result<()>,
     path: &std::ffi::OsStr,
     executor: &mut LaunchdExecutor<F, C>,
 ) -> Result<CliInstall>
@@ -2000,7 +2084,7 @@ where
                 remedy: refusal.hint,
             });
         }
-        if let Err(refusal) = refuse_downgrade(&executable, candidate, downgrade) {
+        if let Err(refusal) = basis {
             return Ok(CliInstall::Downgrade {
                 reason: refusal.message,
                 remedy: refusal.hint,
@@ -2290,8 +2374,26 @@ mod tests {
     type RecordingExecutor = LaunchdExecutor<NativeFilesystem, RecordingGatewayLaunchctl>;
 
     /// A build file under `home` with a record of the commit it was made from, as a release
-    /// binary carries one.
+    /// binary carries one; the commit is the time spelled as hex, for tests that judge nothing.
     fn build(home: &Path, name: &str, bytes: &[u8], commit_time: Option<u64>) -> Candidate {
+        build_recording(
+            home,
+            name,
+            bytes,
+            commit_time.map(|commit_time| BuildRecord {
+                commit: format!("{commit_time:040x}"),
+                commit_time,
+            }),
+        )
+    }
+
+    /// A build file under `home` recording exactly `record`.
+    fn build_recording(
+        home: &Path,
+        name: &str,
+        bytes: &[u8],
+        record: Option<BuildRecord>,
+    ) -> Candidate {
         let directory = home.join("builds");
         fs::create_dir_all(&directory).expect("builds directory");
         let path = directory.join(name);
@@ -2302,14 +2404,7 @@ mod tests {
             b"the packaged nx cache server",
         )
         .expect("companion");
-        Candidate::of(
-            path,
-            commit_time.map(|commit_time| BuildRecord {
-                commit: format!("{commit_time:040x}"),
-                commit_time,
-            }),
-        )
-        .expect("candidate")
+        Candidate::of(path, record).expect("candidate")
     }
 
     /// A home whose gateway agent is installed with a current plist and no binary yet.
@@ -2489,15 +2584,9 @@ mod tests {
             executable.stored(&candidate.digest),
         ] {
             let candidate = Candidate::of(source, None).unwrap();
-            let refreshed = refresh_gateway_from(
-                &home,
-                &candidate,
-                false,
-                Downgrade::Refuse,
-                None,
-                &mut executor,
-            )
-            .unwrap();
+            let refreshed =
+                refresh_gateway_from(&home, &candidate, false, Ok(()), None, &mut executor)
+                    .unwrap();
             assert_eq!(
                 refreshed,
                 Some(ServiceBinaryRefresh::Refreshed {
@@ -2513,15 +2602,8 @@ mod tests {
                 "a stored copy is never rewritten"
             );
             assert_eq!(
-                refresh_gateway_from(
-                    &home,
-                    &candidate,
-                    false,
-                    Downgrade::Refuse,
-                    None,
-                    &mut executor
-                )
-                .unwrap(),
+                refresh_gateway_from(&home, &candidate, false, Ok(()), None, &mut executor)
+                    .unwrap(),
                 None
             );
             fs::write(spec.plist_path(), &legacy).unwrap();
@@ -2546,15 +2628,7 @@ mod tests {
             RecordingGatewayLaunchctl::default(),
         );
         let refresh = |executor: &mut RecordingExecutor, daemon: Option<&DaemonStatus>| {
-            refresh_gateway_from(
-                &home,
-                &candidate,
-                false,
-                Downgrade::Refuse,
-                daemon,
-                executor,
-            )
-            .unwrap()
+            refresh_gateway_from(&home, &candidate, false, Ok(()), daemon, executor).unwrap()
         };
         // The first run installs the build.
         assert!(matches!(
@@ -2579,39 +2653,72 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
-    /// The incident: `cowshed setup` through a launcher that resolved to a checkout's stale build
-    /// put an older gateway back over a newer one, and nothing said so. A build older than the
-    /// installed one — or one that records nothing, which cannot show it is not older — is refused
-    /// with the binary named and the host untouched; `--downgrade` installs it, and the build it
-    /// replaced stays one install longer for a supervisor still draining on it.
-    #[test]
-    fn setup_refuses_a_build_older_than_the_installed_one_unless_told_to_downgrade() {
-        let (home, executable, _) = host_with_agent("downgrade");
+    /// The incident, end to end through the gateway refresh: a build of a later sibling on main,
+    /// lacking the installed build's gc fix, is refused with the fix named and the host untouched;
+    /// a build that records nothing is refused too; the build of main that contains the fix
+    /// installs; and `--downgrade` goes back on purpose, keeping the replaced build one install
+    /// longer for a supervisor still draining on it.
+    ///
+    /// What this exercises and what it does not: the judgement is git's own, made in a real
+    /// repository standing in for an adopted main, and the install is the real copy, link and
+    /// prune in a scratch home. launchd is the recording fake, the main is handed in rather than
+    /// read from the host's project registry, and nothing is elevated or installed on this host.
+    #[tokio::test]
+    async fn setup_refuses_a_build_that_lacks_the_installed_fix_unless_told_to_downgrade() {
+        let (home, executable, _) = host_with_agent("basis");
+        let main = crate::install_basis::tests::Main::new("refresh");
+        let landing = cowshed_core::runtime::project::DEFAULT_LANDING_BRANCH;
+        main.git(["checkout", "-q", "-b", "gc-fix"]);
+        let fix = main.commit(
+            "gc.rs",
+            "judge strays by the ignore rules\n",
+            "fix(cowshed): judge strays by the project ignore rules",
+            2_000,
+        );
+        main.git(["checkout", "-q", landing]);
+        let sibling = main.commit(
+            "release.txt",
+            "next prerelease\n",
+            "chore(release): prepare next prerelease",
+            3_000,
+        );
+        main.git(["merge", "-q", "--no-edit", "gc-fix"]);
+        let merged = main.head(4_000);
+
+        let installed = build_recording(&home, "installed", b"the gc fix", Some(fix));
+        let lacking = build_recording(&home, "sibling", b"the later sibling", Some(sibling));
+        let blind = build(&home, "blind", b"records nothing", None);
+        let containing = build_recording(&home, "merged", b"main with the fix", Some(merged));
         let mut executor: RecordingExecutor = LaunchdExecutor::new(
             NativeFilesystem::new(),
             RecordingGatewayLaunchctl::default(),
         );
-        let mut refresh = |candidate: &Candidate, downgrade: Downgrade| {
-            refresh_gateway_from(&home, candidate, false, downgrade, None, &mut executor).unwrap()
+        let mains = main.mains();
+        let mut attempt = async |candidate: &Candidate, downgrade: Downgrade| {
+            let basis = check_basis(
+                &executable,
+                candidate,
+                downgrade,
+                async || Ok(mains.clone()),
+            )
+            .await;
+            refresh_gateway_from(&home, candidate, false, basis, None, &mut executor).unwrap()
         };
-        let installed = build(&home, "installed", b"installed at t=2000", Some(2_000));
-        let older = build(&home, "older", b"stale checkout build", Some(1_000));
-        let blind = build(&home, "blind", b"records nothing", None);
-        let newer = build(&home, "newer", b"built at t=3000", Some(3_000));
         let link = || fs::read_link(executable.path()).unwrap();
 
+        // A host with nothing installed has nothing to lose: the first install is admitted.
         assert!(matches!(
-            refresh(&installed, Downgrade::Refuse),
+            attempt(&installed, Downgrade::Refuse).await,
             Some(ServiceBinaryRefresh::Refreshed { .. })
         ));
         assert_eq!(link(), executable.stored_link(&installed.digest));
 
-        for refused in [&older, &blind] {
+        for refused in [&lacking, &blind] {
             let Some(ServiceBinaryRefresh::Downgrade {
                 service,
                 reason,
                 remedy,
-            }) = refresh(refused, Downgrade::Refuse)
+            }) = attempt(refused, Downgrade::Refuse).await
             else {
                 panic!("{} must be refused", refused.source.display());
             };
@@ -2628,29 +2735,40 @@ mod tests {
             );
             assert_eq!(stored(&executable), [short(&installed)]);
         }
+        let Some(ServiceBinaryRefresh::Downgrade { reason, .. }) =
+            attempt(&lacking, Downgrade::Refuse).await
+        else {
+            panic!("the sibling is refused");
+        };
+        assert!(
+            reason.contains("fix(cowshed): judge strays by the project ignore rules"),
+            "the refusal names the fix the sibling would remove, although its clock is later: \
+             {reason}"
+        );
 
-        // The installed build again is no downgrade of itself, and a newer one installs.
-        assert_eq!(refresh(&installed, Downgrade::Refuse), None);
+        // The installed build again replaces nothing, and the build of main holding the fix
+        // installs.
+        assert_eq!(attempt(&installed, Downgrade::Refuse).await, None);
         assert!(matches!(
-            refresh(&newer, Downgrade::Refuse),
+            attempt(&containing, Downgrade::Refuse).await,
             Some(ServiceBinaryRefresh::Refreshed { .. })
         ));
-        assert_eq!(link(), executable.stored_link(&newer.digest));
+        assert_eq!(link(), executable.stored_link(&containing.digest));
         // Each install keeps the build it replaced, and prunes the one before.
         assert_eq!(
             stored(&executable),
-            sorted(vec![short(&installed), short(&newer)])
+            sorted(vec![short(&installed), short(&containing)])
         );
 
         // Going back needs the flag, and then it is just an install.
         assert!(matches!(
-            refresh(&older, Downgrade::Allow),
+            attempt(&lacking, Downgrade::Allow).await,
             Some(ServiceBinaryRefresh::Refreshed { .. })
         ));
-        assert_eq!(link(), executable.stored_link(&older.digest));
+        assert_eq!(link(), executable.stored_link(&lacking.digest));
         assert_eq!(
             stored(&executable),
-            sorted(vec![short(&newer), short(&older)]),
+            sorted(vec![short(&containing), short(&lacking)]),
             "the build before the replaced one is pruned"
         );
         assert!(
@@ -2661,10 +2779,11 @@ mod tests {
     }
 
     /// An installed cowshed that records nothing — one from before records existed, or the plain
-    /// binary of the old layout — has nothing to compare, so it is never an obstacle: the first
-    /// install of a build that records is how the host starts having records at all.
-    #[test]
-    fn an_installed_cowshed_that_records_nothing_refuses_no_replacement() {
+    /// binary of the old layout — names no commit to keep, so it is never an obstacle and no main
+    /// is consulted: the first install of a build that records is how the host starts having
+    /// records at all.
+    #[tokio::test]
+    async fn an_installed_cowshed_that_records_nothing_refuses_no_replacement() {
         let (home, executable, _) = host_with_agent("legacy-install");
         fs::write(executable.path(), b"installed before records existed").unwrap();
         fs::set_permissions(
@@ -2673,7 +2792,11 @@ mod tests {
         )
         .unwrap();
         let candidate = build(&home, "old-checkout", b"an old build", Some(10));
-        refuse_downgrade(&executable, &candidate, Downgrade::Refuse)
+        let unconsulted = async || -> Result<install_basis::Mains> {
+            unreachable!("nothing installed records a commit, so no main is consulted")
+        };
+        check_basis(&executable, &candidate, Downgrade::Refuse, unconsulted)
+            .await
             .expect("the plain binary of the old layout records nothing");
 
         let mut executor: RecordingExecutor = LaunchdExecutor::new(
@@ -2681,15 +2804,7 @@ mod tests {
             RecordingGatewayLaunchctl::default(),
         );
         assert!(matches!(
-            refresh_gateway_from(
-                &home,
-                &candidate,
-                false,
-                Downgrade::Refuse,
-                None,
-                &mut executor
-            )
-            .unwrap(),
+            refresh_gateway_from(&home, &candidate, false, Ok(()), None, &mut executor).unwrap(),
             Some(ServiceBinaryRefresh::Refreshed { .. })
         ));
         assert_eq!(
@@ -2703,9 +2818,50 @@ mod tests {
             "the plain binary survives as the stored copy of the build it was"
         );
 
-        // And the install wrote its record, so the next older build is refused.
-        let older = build(&home, "older", b"older than the old checkout", Some(5));
-        assert!(refuse_downgrade(&executable, &older, Downgrade::Refuse).is_err());
+        // A stored copy with no record beside it names no commit either.
+        let record = build_record_path(&executable, &candidate.digest);
+        let written = fs::read(&record).expect("the install wrote its record");
+        fs::remove_file(&record).unwrap();
+        let other = build(&home, "other", b"another build", Some(5));
+        let unconsulted = async || -> Result<install_basis::Mains> {
+            unreachable!("a copy without a record names no commit, so no main is consulted")
+        };
+        check_basis(&executable, &other, Downgrade::Refuse, unconsulted)
+            .await
+            .expect("an absent record is nothing to keep");
+
+        // With the record back, a build no main can judge is refused rather than guessed.
+        fs::write(&record, &written).unwrap();
+        let unadopted = crate::install_basis::tests::Main::new("unadopted");
+        let refusal = check_basis(&executable, &other, Downgrade::Refuse, async || {
+            Ok(install_basis::Mains {
+                roots: Vec::new(),
+                ..unadopted.mains()
+            })
+        })
+        .await
+        .expect_err("a build no main can judge is refused");
+        assert!(
+            refusal.message.contains("no project is adopted"),
+            "{}",
+            refusal.message
+        );
+
+        // A record that is there but unreadable says a commit was installed and will not say
+        // which: Integrity, never read as absent.
+        fs::write(&record, b"{\"commit\":").unwrap();
+        let unconsulted = async || -> Result<install_basis::Mains> {
+            unreachable!("an unreadable record refuses before any main is consulted")
+        };
+        let corrupt = check_basis(&executable, &other, Downgrade::Refuse, unconsulted)
+            .await
+            .expect_err("an unreadable record refuses");
+        assert_eq!(corrupt.code.as_str(), "integrity", "{}", corrupt.message);
+        assert!(
+            corrupt.message.contains(&record.display().to_string()),
+            "{}",
+            corrupt.message
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2812,15 +2968,8 @@ mod tests {
             NativeFilesystem::new(),
             RecordingGatewayLaunchctl::default(),
         );
-        let error = refresh_gateway_from(
-            &home,
-            &candidate,
-            false,
-            Downgrade::Refuse,
-            None,
-            &mut executor,
-        )
-        .expect_err("the companion is required");
+        let error = refresh_gateway_from(&home, &candidate, false, Ok(()), None, &mut executor)
+            .expect_err("the companion is required");
         assert!(
             error.message.contains("nx-cache-server"),
             "{}",
