@@ -378,7 +378,7 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
     let handle = std::thread::spawn(move || run_at(&arguments, &sleeper_socket));
     let deadline = Instant::now() + Duration::from_secs(15);
     let pid = loop {
-        if held(&socket) == 4
+        if held(&socket) == u64::try_from(granted).expect("a grant fits u64")
             && let Ok(identity) = std::fs::read_to_string(&pid_file)
             && let Ok(pid) = identity.trim().parse::<i32>()
         {
