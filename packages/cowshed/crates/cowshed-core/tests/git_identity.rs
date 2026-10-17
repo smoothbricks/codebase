@@ -46,6 +46,11 @@ impl Fixture {
     fn path(&self, name: &str) -> PathBuf {
         self.root.join(name)
     }
+
+    /// This fixture's own store, where the controller Git it runs writes its sandbox profiles.
+    fn store(&self) -> std::sync::Arc<Path> {
+        std::sync::Arc::from(self.root.join("store"))
+    }
 }
 
 impl Drop for Fixture {
@@ -262,7 +267,7 @@ async fn captured_includeif_identity_authors_a_plain_commit_and_preserves_local_
             ("GIT_CONFIG_NOSYSTEM", Some(OsStr::new("1"))),
             ("GIT_ATTR_NOSYSTEM", Some(OsStr::new("1"))),
         ]);
-        GitRepository::from_root(&dest)
+        GitRepository::from_root(&fixture.store(), &dest)
             .inherit_identity_from(&source)
             .await
             .expect("capture includeIf identity from source");
@@ -298,7 +303,7 @@ async fn captured_includeif_identity_authors_a_plain_commit_and_preserves_local_
             ("GIT_CONFIG_NOSYSTEM", Some(OsStr::new("1"))),
             ("GIT_ATTR_NOSYSTEM", Some(OsStr::new("1"))),
         ]);
-        GitRepository::from_root(&forked)
+        GitRepository::from_root(&fixture.store(), &forked)
             .inherit_identity_from(&dest)
             .await
             .expect("capture already-inherited private identity");
@@ -369,7 +374,7 @@ async fn absent_source_identity_is_not_invented_for_a_destination_commit() {
             ("GIT_CONFIG_NOSYSTEM", Some(OsStr::new("1"))),
             ("GIT_ATTR_NOSYSTEM", Some(OsStr::new("1"))),
         ]);
-        GitRepository::from_root(&dest)
+        GitRepository::from_root(&fixture.store(), &dest)
             .inherit_identity_from(&source)
             .await
             .expect("absent identity is still a valid empty capture");

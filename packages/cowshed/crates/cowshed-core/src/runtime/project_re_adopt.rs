@@ -175,7 +175,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 "unmount it, leaving main's plain Git checkout at that path, then retry",
             ));
         }
-        let git = crate::git::GitRepository::discover(checkout).await?;
+        let git = crate::git::GitRepository::discover(self.git.store_root(), checkout).await?;
         let root = std::fs::canonicalize(git.root()).map_err(|error| inspect(git.root(), error))?;
         let named = std::fs::canonicalize(checkout).map_err(|error| inspect(checkout, error))?;
         require_checkout_of(

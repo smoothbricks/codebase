@@ -52,10 +52,11 @@ impl LandingTarget {
 /// refusal message explaining why a removal will not proceed. Both need the reason, neither needs
 /// to branch on it.
 pub async fn resolve_target(
+    store_root: &std::sync::Arc<Path>,
     target_mount: &Path,
     branch: &str,
 ) -> std::result::Result<LandingTarget, String> {
-    let target = GitRepository::from_root(target_mount);
+    let target = GitRepository::from_root(store_root, target_mount);
     let objects = target.object_directory().await.map_err(|error| {
         format!(
             "the repository at {} could not be read: {}",
@@ -96,21 +97,23 @@ pub async fn resolve_target(
 /// `head` is a revision in the workspace's own repository; pass `HEAD` unless a caller has already
 /// fenced a specific oid and needs that exact commit judged.
 pub async fn measure(
+    store_root: &std::sync::Arc<Path>,
     target: &std::result::Result<LandingTarget, String>,
     workspace_mount: &Path,
     head: &str,
 ) -> WorkspaceLanding {
-    let workspace = GitRepository::from_root(workspace_mount);
+    let workspace = GitRepository::from_root(store_root, workspace_mount);
     let dirty_files = workspace.dirty_file_count().await.ok();
     WorkspaceLanding {
         dirty_files,
-        commits: measure_commits(target, workspace_mount, head).await,
+        commits: measure_commits(store_root, target, workspace_mount, head).await,
     }
 }
 
 /// The commit half of [`measure`], separated so the gate can take it without a working-tree read it
 /// already performed through its own fence.
 pub async fn measure_commits(
+    store_root: &std::sync::Arc<Path>,
     target: &std::result::Result<LandingTarget, String>,
     workspace_mount: &Path,
     head: &str,
@@ -123,18 +126,19 @@ pub async fn measure_commits(
             };
         }
     };
-    match counted(target, workspace_mount, head).await {
+    match counted(store_root, target, workspace_mount, head).await {
         Ok(commits) => commits,
         Err(reason) => LandingCommits::Indeterminate { reason },
     }
 }
 
 async fn counted(
+    store_root: &std::sync::Arc<Path>,
     target: &LandingTarget,
     workspace_mount: &Path,
     head: &str,
 ) -> std::result::Result<LandingCommits, String> {
-    let workspace = GitRepository::from_root(workspace_mount)
+    let workspace = GitRepository::from_root(store_root, workspace_mount)
         .with_alternate_objects(&target.objects)
         .map_err(|error| error.message)?;
     let tip = target.tip.as_str();

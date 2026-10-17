@@ -106,7 +106,7 @@ fn workspace_hooks_cannot_run_as_controller_on_rebase() {
                 "job wrote {name} inside the checkout"
             );
         }
-        let rebase = sandboxed_git_command_at(&workspace)
+        let rebase = sandboxed_git_command_at(&temp.join("store"), &workspace)
             .expect("controller Git sandbox")
             .args(["rebase", "target"])
             .env("GIT_AUTHOR_NAME", "fixture")
@@ -214,7 +214,7 @@ fn repository_filter_cannot_write_to_controller_home() {
         );
         fs::remove_file(&marker).expect("reset marker");
         fs::remove_file(checkout.join("data")).expect("force sandboxed checkout");
-        let output = sandboxed_git_command_at(&checkout)
+        let output = sandboxed_git_command_at(&temp.join("store"), &checkout)
             .expect("sandboxed Git")
             .args(["checkout", "--", "data"])
             .output_locked()
@@ -249,7 +249,7 @@ fn controller_git_refuses_a_symlinked_workspace_identity() {
         let foreign = temp.join("foreign-identity.inc");
         fs::write(&foreign, b"[user]\n\tname = foreign\n").expect("foreign identity");
         std::os::unix::fs::symlink(&foreign, &identity).expect("symlinked identity");
-        let error = match sandboxed_git_command_at(&workspace) {
+        let error = match sandboxed_git_command_at(&temp.join("store"), &workspace) {
             Ok(_) => panic!("controller accepted a symlinked Git identity"),
             Err(error) => error,
         };

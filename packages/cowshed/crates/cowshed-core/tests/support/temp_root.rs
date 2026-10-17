@@ -62,3 +62,29 @@ impl Drop for TempRoot {
         }
     }
 }
+
+/// A test's own cowshed store. Controller Git a fixture runs writes its sandbox profiles into this
+/// store's `run/profiles`, never into the host's (04_sandbox.md, "Exec pipeline" step 4;
+/// 08_testing.md, "Fixtures"). It lives under the canonical `/tmp` parent and goes with its owner.
+#[allow(dead_code)]
+pub(crate) struct FixtureStore {
+    _root: TempRoot,
+    shared: std::sync::Arc<Path>,
+}
+
+#[allow(dead_code)]
+impl FixtureStore {
+    pub(crate) fn new() -> Self {
+        let root = TempRoot::new("cowshed-fixture-store");
+        let shared = std::sync::Arc::from(&*root);
+        Self {
+            _root: root,
+            shared,
+        }
+    }
+
+    /// The store root, shared as controller Git takes it.
+    pub(crate) fn shared(&self) -> &std::sync::Arc<Path> {
+        &self.shared
+    }
+}
