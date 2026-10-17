@@ -862,19 +862,19 @@ fn linux_process_event_sources_are_measured() {
             expected.threads > 0 && expected.thread_exits > 0 && expected.thread_execs > 0,
             "the workload runs threads and execs from them"
         );
-        if run.burst == COVERAGE_BURST {
-            assert!(
-                measured.wall_ns < CENSUS_WINDOW_NS,
-                "{:?} coverage burst, run {}: {} ns is not inside the {CENSUS_WINDOW_NS} ns census window",
-                run.mode,
-                run.repetition,
-                measured.wall_ns
-            );
-        }
         match run.mode {
             Mode::Baseline => {}
             Mode::Census => {
                 if run.burst == COVERAGE_BURST {
+                    // The window is this claim's premise, and only this claim's: a burst that outran it
+                    // could have been missed for time rather than for events. The baseline and ptrace
+                    // runs make no claim about a window, so their wall time is the host's, not theirs.
+                    assert!(
+                        measured.wall_ns < CENSUS_WINDOW_NS,
+                        "census coverage burst, run {}: {} ns is not inside the {CENSUS_WINDOW_NS} ns census window",
+                        run.repetition,
+                        measured.wall_ns
+                    );
                     assert_eq!(
                         coverage.births_missing.len(),
                         expected.births,
