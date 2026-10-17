@@ -6116,10 +6116,18 @@ mod tests {
         mount
     }
 
+    /// `git <args>` in `root`, its stdout, as the fixture's author like `git()`: a CI runner has no
+    /// global identity, and `commit-tree` reads one.
     fn git_stdout(root: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
             .arg(root)
+            .args([
+                "-c",
+                "user.name=Cowshed Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
             .args(args)
             .output_locked()
             .expect("run git");
