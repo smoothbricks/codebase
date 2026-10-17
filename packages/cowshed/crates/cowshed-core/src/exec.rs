@@ -108,7 +108,7 @@ pub fn plan_exec(
             stage: WrapperStage::ValidateProfile,
             message: format!(
                 "cannot write the sandbox profile into {}: {source}",
-                sandbox.profile_directory.display()
+                sandbox.profile_directory().display()
             ),
             source: Some(source),
         })?;
@@ -515,7 +515,7 @@ mod tests {
                 mount_root: self.root.clone(),
                 workspace_mount: self.workspace.clone(),
                 exec_temp_dir: self.root.join("tmp"),
-                profile_directory: self.root.join("store/run/profiles"),
+                store_root: self.root.join("store"),
                 port_block: PortBlock::new(40_960, 16).unwrap(),
                 retained_port_blocks: Vec::new(),
                 cpu_pool_directory: None,
@@ -1133,7 +1133,7 @@ mod tests {
         assert_eq!(plan.program, Path::new(SANDBOX_EXEC));
         assert_eq!(plan.args[0], "-f");
         assert!(
-            Path::new(&plan.args[1]).starts_with(&tree.sandbox().profile_directory),
+            Path::new(&plan.args[1]).starts_with(tree.sandbox().profile_directory()),
             "{:?}",
             plan.args[1]
         );

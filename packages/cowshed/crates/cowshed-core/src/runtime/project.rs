@@ -16254,7 +16254,7 @@ mod grant_unit_tests {
             workspace_mount: workspace_mount.to_path_buf(),
             shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-grant-unit"),
-            profile_directory: mount_root.join("store/run/profiles"),
+            store_root: mount_root.join("store"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,

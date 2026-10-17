@@ -2587,7 +2587,7 @@ fn supervisor_config_of(
             mount_root: root.join("mounts"),
             workspace_mount: workspace_root.clone(),
             exec_temp_dir: root.join("tmp"),
-            profile_directory: root.join("store/run/profiles"),
+            store_root: root.join("store"),
             port_block: cowshed_core::metadata::PortBlock::new(49_136, 16).expect("port block"),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,

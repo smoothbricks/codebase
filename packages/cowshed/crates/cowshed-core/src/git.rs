@@ -3282,7 +3282,7 @@ fn sandboxed_git_command_with_paths(
         // The profile file lives in the store this controller serves: the host's in production, a
         // fixture's own in a test, never one it does not serve (04_sandbox.md, "Exec pipeline"
         // step 4; 08_testing.md, "Fixtures").
-        profile_directory: crate::exec::profile_directory(store_root),
+        store_root: store_root.to_path_buf(),
         port_block: crate::metadata::PortBlock::new(40_960, 16).expect("static macOS port block"),
         retained_port_blocks: Vec::new(),
         cpu_pool_directory: None,
@@ -3327,7 +3327,7 @@ fn sandboxed_git_command_with_paths(
         CowshedError::environment_missing(
             format!(
                 "cannot write controller git's sandbox profile into {}: {error}",
-                config.profile_directory.display()
+                config.profile_directory().display()
             ),
             "run `cowshed setup` so the store's run directory exists and is yours",
         )

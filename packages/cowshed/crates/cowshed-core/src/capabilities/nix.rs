@@ -384,7 +384,7 @@ mod tests {
             workspace_mount: fixture.root.clone(),
             shed_links: Vec::new(),
             exec_temp_dir: fixture.root.join(".cowshed-tmp"),
-            profile_directory: fixture.root.join("store/run/profiles"),
+            store_root: fixture.root.join("store"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).unwrap(),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,

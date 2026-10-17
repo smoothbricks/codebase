@@ -303,7 +303,7 @@ impl Default for WorkspaceSupervisorConfig {
                 mount_root: PathBuf::from("/tmp/cowshed-mounts"),
                 workspace_mount: workspace_root,
                 exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
-                profile_directory: crate::exec::profile_directory(Path::new("/tmp/cowshed-store")),
+                store_root: PathBuf::from("/tmp/cowshed-store"),
                 port_block: crate::metadata::PortBlock::new(49_136, 16).expect("static port block"),
                 retained_port_blocks: Vec::new(),
                 mode: crate::sandbox::RunSandboxMode::ReadWrite,
@@ -455,7 +455,7 @@ impl ChildProfile {
     fn new(text: String, sandbox: &SandboxConfig) -> Self {
         Self {
             text,
-            directory: sandbox.profile_directory.clone(),
+            directory: sandbox.profile_directory(),
             build_volume: sandbox.build_volume_mount.clone(),
         }
     }
@@ -7358,7 +7358,7 @@ mod workspace_toolchain_tests {
             mount_root: mount.parent().expect("root").join("mounts"),
             workspace_mount: mount.to_path_buf(),
             exec_temp_dir: mount.parent().expect("root").join("tmp"),
-            profile_directory: mount.parent().expect("root").join("store/run/profiles"),
+            store_root: mount.parent().expect("root").join("store"),
             port_block: crate::metadata::PortBlock::new(40_960, 16).expect("port block"),
             retained_port_blocks: Vec::new(),
             mode: RunSandboxMode::ReadWrite,

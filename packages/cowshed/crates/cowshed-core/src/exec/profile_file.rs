@@ -175,7 +175,7 @@ impl ProfileLaunch {
     /// profile directory now, bound to `sandbox`'s build volume.
     pub fn write(sandbox: &SandboxConfig, profile: &str) -> io::Result<Self> {
         Ok(Self::bound(
-            ProfileFile::write(&sandbox.profile_directory, profile)?,
+            ProfileFile::write(&sandbox.profile_directory(), profile)?,
             sandbox.build_volume_mount.clone(),
         ))
     }
