@@ -10,8 +10,10 @@
 //! - a `bounded-exec` grant (`BOUNDED_EXEC_CPU_TOKENS` set) already sized
 //!   this run: no second grant, and the cargo sizing variables are set to
 //!   that count where unset;
-//! - a subcommand that compiles nothing runs directly, so rust-analyzer's
-//!   frequent `cargo metadata` never queues behind gates;
+//! - a subcommand that compiles nothing, or any subcommand asked only for
+//!   its version or usage, runs directly, so rust-analyzer's frequent
+//!   `cargo metadata` and Nx's sandboxed `cargo nextest --version` toolchain
+//!   input never queue behind gates or need the gateway;
 //! - any other subcommand asks the gateway for a jobserver grant and runs
 //!   under its fifo, with the test-thread sizing set to the grant where
 //!   unset. A managed checkout refuses every failed admission. Only gateway absence in a
@@ -58,6 +60,9 @@ const NONCOMPILING: &[&str] = &[
     "yank",
     "report",
 ];
+
+/// The flags that ask any subcommand for its version or usage instead of running it.
+const QUERIES: &[&str] = &["-V", "--version", "-h", "--help"];
 
 /// Absence is the only admission failure an explicitly nonmanaged host may bypass.
 #[derive(Debug)]
@@ -189,7 +194,7 @@ fn plan(get: &impl Fn(&str) -> Option<String>, arguments: &[OsString]) -> Plan {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
     {
-        if subcommand(arguments).is_none_or(|name| NONCOMPILING.contains(&name.as_str())) {
+        if compiles_nothing(arguments) {
             return Plan::Direct;
         }
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
@@ -204,12 +209,23 @@ fn plan(get: &impl Fn(&str) -> Option<String>, arguments: &[OsString]) -> Plan {
     {
         return Plan::Sized(tokens);
     }
+    if compiles_nothing(arguments) {
+        return Plan::Direct;
+    }
+    Plan::Ask {
+        want: std::thread::available_parallelism().map_or(1, usize::from),
+    }
+}
+
+/// The invocation compiles nothing: it names no subcommand, a noncompiling one, or any
+/// subcommand with a query flag as its whole argument list. The query is recognised by shape,
+/// not by subcommand, so a third-party subcommand's `--version` needs no list entry; a query
+/// flag among other arguments may reach a program that is built first (`cargo run -- -V`).
+fn compiles_nothing(arguments: &[OsString]) -> bool {
     match subcommand(arguments) {
-        None => Plan::Direct,
-        Some(name) if NONCOMPILING.contains(&name.as_str()) => Plan::Direct,
-        Some(_) => Plan::Ask {
-            want: std::thread::available_parallelism().map_or(1, usize::from),
-        },
+        None => true,
+        Some((_, [query])) if query.to_str().is_some_and(|flag| QUERIES.contains(&flag)) => true,
+        Some((name, _)) => NONCOMPILING.contains(&name.as_str()),
     }
 }
 
@@ -231,10 +247,10 @@ fn inherited_jobserver_live(get: &impl Fn(&str) -> Option<String>) -> bool {
     false
 }
 
-/// The invocation's subcommand: the first argument after cargo's global
-/// options and a `+toolchain` prefix, or `None` when there is none
-/// (`--version`, `--list`, a bare `cargo`).
-fn subcommand(arguments: &[OsString]) -> Option<String> {
+/// The invocation's subcommand and the arguments after it: the first argument after cargo's
+/// global options and a `+toolchain` prefix, or `None` when there is none (`--version`,
+/// `--list`, a bare `cargo`).
+fn subcommand(arguments: &[OsString]) -> Option<(String, &[OsString])> {
     let mut index = 0;
     if arguments
         .first()
@@ -247,7 +263,7 @@ fn subcommand(arguments: &[OsString]) -> Option<String> {
         match text.as_ref() {
             "--config" | "-Z" | "--color" => index += 2,
             _ if text.starts_with('-') => index += 1,
-            _ => return Some(text.into_owned()),
+            _ => return Some((text.into_owned(), &arguments[index + 1..])),
         }
     }
     None
@@ -489,25 +505,62 @@ mod tests {
     }
 
     #[test]
-    fn the_subcommand_follows_toolchains_and_global_options() {
+    fn a_version_or_help_query_compiles_nothing_whatever_the_subcommand() {
+        // Nx's Rust toolchain runtime input runs `cargo nextest --version` inside the shed
+        // sandbox, which cannot reach the gateway: a query must never ask for a grant.
+        let get = environment(&[]);
+        for query in [
+            ["nextest", "--version"],
+            ["clippy", "-V"],
+            ["machete", "--help"],
+            ["build", "-h"],
+        ] {
+            assert_eq!(plan(&get, &args(&query)), Plan::Direct, "{query:?}");
+        }
         assert_eq!(
-            subcommand(&args(&["+nightly", "build"])).as_deref(),
-            Some("build")
+            plan(
+                &get,
+                &args(&["+nightly", "--frozen", "nextest", "--version"])
+            ),
+            Plan::Direct
         );
+        let pool = environment(&[
+            ("BOUNDED_EXEC_CPU_POOL", "/nonexistent/pool.sock"),
+            ("BOUNDED_EXEC_CPU_TOKENS", "2"),
+        ]);
+        assert_eq!(plan(&pool, &args(&["nextest", "--version"])), Plan::Direct);
+        // A query flag that is not the subcommand's whole argument list may reach a program
+        // that compiles first: the binary `cargo run` builds, or the test binaries `cargo test`
+        // builds before passing them `--help`.
+        for build in [["run", "--", "--version"], ["test", "--", "--help"]] {
+            assert!(
+                matches!(plan(&get, &args(&build)), Plan::Ask { .. }),
+                "{build:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_subcommand_follows_toolchains_and_global_options() {
+        let name = |arguments: &[&str]| subcommand(&args(arguments)).map(|(name, _)| name);
+        assert_eq!(name(&["+nightly", "build"]).as_deref(), Some("build"));
         assert_eq!(
-            subcommand(&args(&["--config", "a.b=1", "metadata"])).as_deref(),
+            name(&["--config", "a.b=1", "metadata"]).as_deref(),
             Some("metadata")
         );
         assert_eq!(
-            subcommand(&args(&["-Z", "unstable-options", "build"])).as_deref(),
+            name(&["-Z", "unstable-options", "build"]).as_deref(),
             Some("build")
         );
+        assert_eq!(name(&["--frozen", "test"]).as_deref(), Some("test"));
+        assert_eq!(name(&["--version"]), None);
+        assert_eq!(name(&[]), None);
+        // The arguments after the subcommand are its own.
+        let arguments = args(&["+nightly", "--frozen", "nextest", "--version"]);
         assert_eq!(
-            subcommand(&args(&["--frozen", "test"])).as_deref(),
-            Some("test")
+            subcommand(&arguments),
+            Some(("nextest".to_owned(), &arguments[3..]))
         );
-        assert_eq!(subcommand(&args(&["--version"])), None);
-        assert_eq!(subcommand(&args(&[])), None);
     }
 
     #[test]

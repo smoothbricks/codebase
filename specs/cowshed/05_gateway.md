@@ -482,18 +482,18 @@ so attaches stall beside mount churn and stay fast once the two are kept apart. 
   one monotonic caller execution budget for admission and child execution; the gateway adds no command deadline.
   Control-socket establishment uses one nonblocking connect and any pending-connect poll is clipped to that same
   remaining budget; refusal (including a full-backlog EAGAIN) is an immediate unleased fallback, not a timeout or
-  authority to retry. Descriptor creation and close-on-exec/nonblocking flag installation alone run under the fork
-  lock, never connect or poll. Every failed connection closes its owned descriptor; no connector thread remains alive.
-  Each queued acknowledgement, grant and after-half-close wait is clipped to its remaining budget, including
-  old-gateway and alone-to-shared retries. The runner checks remaining time before spawn and inside its existing
-  pre-exec closure, after any fork-lock wait: exhausted admission never executes the native tool. A failed pre-exec
-  fork stub is reaped by the spawn operation; it performs no disk-tool effect. An overrun signals the owned process
-  group and waits to reap the child, retaining its actual exit or signal status. A kill failure retains the kill error,
-  exact child pid and a nonblocking observation of exited, still running or reap failure; it neither waits without bound
-  nor joins live output pipes. A reap failure is distinct and never claims the child was reaped. A protected disk-image
-  command (`diskutil image …`, `diskutil eject`, every `hdiutil` verb) instead warns at the caller's configured cadence
-  and is never killed, because interruption can leak its device until reboot (01a_apfs.md, "How the APFS host degrades"
-  §2). Its detached session, file-backed output and caller-bounded stop-wait policy are unchanged.
+  authority to retry. Descriptor creation and close-on-exec/nonblocking flag installation alone run under the fork lock,
+  never connect or poll. Every failed connection closes its owned descriptor; no connector thread remains alive. Each
+  queued acknowledgement, grant and after-half-close wait is clipped to its remaining budget, including old-gateway and
+  alone-to-shared retries. The runner checks remaining time before spawn and inside its existing pre-exec closure, after
+  any fork-lock wait: exhausted admission never executes the native tool. A failed pre-exec fork stub is reaped by the
+  spawn operation; it performs no disk-tool effect. An overrun signals the owned process group and waits to reap the
+  child, retaining its actual exit or signal status. A kill failure retains the kill error, exact child pid and a
+  nonblocking observation of exited, still running or reap failure; it neither waits without bound nor joins live output
+  pipes. A reap failure is distinct and never claims the child was reaped. A protected disk-image command
+  (`diskutil image …`, `diskutil eject`, every `hdiutil` verb) instead warns at the caller's configured cadence and is
+  never killed, because interruption can leak its device until reboot (01a_apfs.md, "How the APFS host degrades" §2).
+  Its detached session, file-backed output and caller-bounded stop-wait policy are unchanged.
 - **Wire.** The client writes `{"op":"disk-lease","class":"storage"|"namespace","command":"<argv>"}`, with
   `"share":"alone"` when it asks for the whole phase, and does not half-close. The gateway answers
   `{"ok":true,"lease":"queued"}` at once and `{"ok":true,"lease":"granted"}` when the command may run; the lease lasts
@@ -717,8 +717,14 @@ core count.
   - **A subcommand that compiles nothing** — `metadata`, `fmt`, `locate-project`, `tree`, `pkgid`, `read-manifest`,
     `verify-project`, `version`, `help`, `config`, `search`, `info`, `new`, `init`, `add`, `remove`, `update`, `fetch`,
     `vendor`, `generate-lockfile`, `clean`, `login`, `logout`, `owner`, `yank`, `report`, or none at all (`--version`,
-    `--list`): it runs `cargo` directly without asking. These runs are short and nearly idle, and a queue would make
-    rust-analyzer's frequent `cargo metadata` wait behind gates whenever the host is saturated.
+    `--list`), or any subcommand whose whole argument list is one query flag (`-V`, `--version`, `-h`, `--help`), so
+    `cargo nextest --version` and `cargo clippy -V` need no entry: it runs `cargo` directly without asking. These runs
+    are short and nearly idle, and a queue would make rust-analyzer's frequent `cargo metadata` wait behind gates
+    whenever the host is saturated. A sandboxed Nx daemon's toolchain runtime input asks for versions and cannot reach
+    the gateway, so a managed checkout would otherwise refuse it. A query flag beside other arguments is not a query:
+    `cargo run -- --version` builds the program it passes the flag to. The launcher does not expand aliases, so a query
+    against an alias whose expansion ends in `--` (lmao's `proptest-heavy`) builds unbudgeted; that is accepted, since
+    such a query is not a version probe and nothing issues one.
   - **Any other subcommand**, aliases and third-party `cargo-*` subcommands included, is a build. The launcher asks the
     gateway on the control socket (`{"op":"jobserver","want":<n>,"checkout":"<workspace root>","command":"<command>"}`)
     with `want` one per core, as for a cargo build under `bounded-exec`. The gateway queues and grants it like a
