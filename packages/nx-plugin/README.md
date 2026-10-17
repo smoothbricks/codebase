@@ -1303,12 +1303,13 @@ A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual toke
 that immediate parent pool for its own demand, instead of taking from the host while the parent holds its grant; the
 pool grants at most what it can. A lent pool accounts for siblings together; each admitted child serves only its own
 allocation to grandchildren. Closing a child's connection returns its local allocation, never the parent's upstream
-grant. Upstream loss revokes the downstream pool; losing a borrowed grant stops the command and records an ordinary
-failure, not a timeout. A bare count or absent endpoint follows normal host admission. A connected parent pool's refusal
-or protocol failure instead fails admission: taking from the host then could wait on the parent's own grant.
-`options.env` cannot inject either marker. Parent-pool grants record `cpu.inherited: true` and their actual local wait;
-the span also says `inherited=true`. Pool setup, listener and cleanup errors fail rather than bypassing accounting.
-Command bounds stay unchanged.
+grant. Upstream loss revokes the downstream pool, so a dead parent grants nothing more; a command whose grant closes
+while it runs (a gateway restart, or the lending parent's exit) runs on over budget to its own exit, and stderr says
+`cowshed: cpu-tokens grant ended`. A bare count or absent endpoint follows normal host admission. A connected parent
+pool's refusal or protocol failure instead fails admission: taking from the host then could wait on the parent's own
+grant. `options.env` cannot inject either marker. Parent-pool grants record `cpu.inherited: true` and their actual local
+wait; the span also says `inherited=true`. Pool setup, listener and cleanup errors fail rather than bypassing
+accounting. Command bounds stay unchanged.
 
 The absent-parent fixture uses the executor's injectable budget with a real, controlled outer pool as its backing. It
 proves a positive allocation and re-acquires it after the command ends, rather than depending on free tokens in the

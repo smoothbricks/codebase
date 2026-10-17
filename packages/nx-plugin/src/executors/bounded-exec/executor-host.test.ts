@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -60,7 +60,9 @@ interface ChildRun {
   askResources(): void;
   /** Resolves once `marker` has been printed to stdout; rejects if the child exits without printing it. */
   printed(marker: string): Promise<void>;
-  /** Stops a surviving runner after its test-owned pools have revoked all borrowed commands. */
+  /** Resolves once `marker` has been written to stderr; rejects if the child exits without writing it. */
+  said(marker: string): Promise<void>;
+  /** Stops a surviving runner with SIGTERM, which it forwards to its command's process tree, and awaits its exit. */
   stop(): Promise<void>;
 }
 
@@ -102,7 +104,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       child.askResources();
     }
 
-    // Pools close first: a command still running under a closed pool is stopped as a lost grant, so its runner exits.
+    // Pools close first, then every runner still open is stopped: a closed grant never stops a command on its own.
     const outcomes = await Promise.all([...pools].map((pool) => pool.close()));
     pools.clear();
     await Promise.all([...children].map((child) => child.stop()));
@@ -317,27 +319,32 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
     });
   }, 30_000);
 
-  it('stops a command whose parent pool closes under it, and fails its run', async () => {
+  it('keeps a command running when its parent pool closes under it, and judges it by its own exit', async () => {
     const root = await createRoot();
+    const go = join(root, 'go.fifo');
+    expect(spawnSync('mkfifo', [go]).status).toBe(0);
     await withPool(2, async (pool) => {
       const run = await startRunner(
         root,
-        'orphan',
+        'outlives',
         {
-          command: `node -e "console.log('started'); require('node:http').createServer().listen(0)"`,
+          command: `sh -c 'echo started; read -r line < "$0"; echo finished' '${go}'`,
           timeoutMs: 30_000,
           killAfterMs: 2_000,
           parallelism: 1,
         },
-        join(root, 'orphan'),
+        join(root, 'outlives'),
         childEnv(pool.environment),
       );
       await run.printed('started');
       const outcome = await pool.close();
       expect(outcome.ok).toBe(true);
-      expect(await run.exited, run.stderr()).toBe(1);
-      expect(run.stderr()).toContain('cowshed: cpu-tokens grant lost');
-      expect(await readFile(join(root, 'orphan', VERDICT_FILE), 'utf8')).toMatch(/"outcome":\s*"failed"/);
+      await run.said('cowshed: cpu-tokens grant ended: the parent pool closed its 1-token grant');
+      expect(run.closed()).toBe(false);
+      await writeFile(go, 'go\n');
+      expect(await run.exited, run.stderr()).toBe(0);
+      expect(run.stdout()).toContain('finished');
+      expect(await readFile(join(root, 'outlives', VERDICT_FILE), 'utf8')).toMatch(/"outcome":\s*"passed"/);
     });
   }, 30_000);
 
@@ -487,6 +494,7 @@ function startChild(script: string, env: NodeJS.ProcessEnv): ChildRun {
   });
   child.stderr.on('data', (chunk: Buffer) => {
     err += chunk.toString('utf8');
+    wake();
   });
   const exited = new Promise<number | null>((resolve) => {
     const done = (code: number | null): void => {
@@ -500,6 +508,21 @@ function startChild(script: string, env: NodeJS.ProcessEnv): ChildRun {
     });
     child.once('close', (code) => done(code));
   });
+  const appeared = (text: () => string, marker: string, what: string): Promise<void> => {
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    const check = (): void => {
+      if (text().includes(marker)) {
+        waiters.delete(check);
+        resolve();
+      } else if (closed) {
+        waiters.delete(check);
+        reject(new Error(`child exited before ${what} ${JSON.stringify(marker)}; stderr:\n${err}`));
+      }
+    };
+    waiters.add(check);
+    check();
+    return promise;
+  };
   const run: ChildRun = {
     label: basename(script),
     exited,
@@ -509,21 +532,8 @@ function startChild(script: string, env: NodeJS.ProcessEnv): ChildRun {
     askResources(): void {
       child.kill('SIGUSR2');
     },
-    printed(marker: string): Promise<void> {
-      return new Promise<void>((resolve, reject) => {
-        const check = (): void => {
-          if (out.includes(marker)) {
-            waiters.delete(check);
-            resolve();
-          } else if (closed) {
-            waiters.delete(check);
-            reject(new Error(`child exited before printing ${JSON.stringify(marker)}; stderr:\n${err}`));
-          }
-        };
-        waiters.add(check);
-        check();
-      });
-    },
+    printed: (marker) => appeared(() => out, marker, 'printing'),
+    said: (marker) => appeared(() => err, marker, 'writing to stderr'),
     async stop(): Promise<void> {
       if (!closed) child.kill('SIGTERM');
       await exited;

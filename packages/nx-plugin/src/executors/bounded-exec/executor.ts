@@ -89,8 +89,6 @@ interface RunState {
   settled: boolean;
   expiry: ExpiredBound | null;
   forceKillNeeded: boolean;
-  /** Set when a borrowed grant closed while the command ran, and the command was stopped as a lost grant. */
-  grantLost: boolean;
   /** The sub-pool's close error when it did not close cleanly: the run fails. */
   poolCloseError: string | null;
 }
@@ -220,8 +218,9 @@ export function recordContext(context: NxTaskContext): BoundedExecContext {
  *
  * `inherited` is the parent's CPU pool (`cpu-pool.ts`) that lends this run its tokens. The run asks that pool first
  * and the host budget only when the pool refuses. Whatever it is granted, the run serves its own sub-pool to its
- * descendants, closed before the grant returns. A borrowed grant that closes while the command runs stops the command
- * as a lost grant, which is a failure.
+ * descendants, closed before the grant returns. A grant whose connection closes while the command runs (a gateway
+ * restart, or the lending parent's exit) ends its accounting, never the command: the command runs on over budget to
+ * its own exit, and the run says so.
  */
 export async function runBoundedExec(
   options: BoundedExecOptions,
@@ -247,7 +246,6 @@ export async function runBoundedExec(
     settled: false,
     expiry: null,
     forceKillNeeded: false,
-    grantLost: false,
     poolCloseError: null,
   };
   const appendStdout = (chunk: Buffer | string): void => {
@@ -371,8 +369,8 @@ export async function runBoundedExec(
     return cpuReleased;
   };
   // Records the run's verdict when it has a task to record as. An `expiry` is set only when a bound ended the run.
-  // An `operational` run failed on its CPU budget (a lost grant, or a sub-pool that did not close): an ordinary
-  // failure, whatever bound also fired, so it is never judged as a bound.
+  // An `operational` run failed on its CPU budget (a sub-pool that did not close): an ordinary failure, whatever
+  // bound also fired, so it is never judged as a bound.
   const recordRun = async (
     exitCode: number,
     expiry: ExpiredBound | null,
@@ -576,7 +574,7 @@ export async function runBoundedExec(
   // two have opposite fixes.
   let termination: Promise<void> = Promise.resolve();
   const expire = (bound: ExpiredBound): void => {
-    if (state.settled || state.expiry !== null || state.grantLost) {
+    if (state.settled || state.expiry !== null) {
       return;
     }
     state.expiry = bound;
@@ -655,24 +653,20 @@ export async function runBoundedExec(
     timeoutMs === undefined ? undefined : setTimeout(() => expire({ kind: 'total', limitMs: timeoutMs }), timeoutMs);
   armIdleTimer();
 
-  // A borrowed grant ends with the ancestor that lent it, and the command runs on tokens that ancestor takes back
-  // then. Stopping the command is a lost grant: a failure, not a bound. Our own release after the command settled
-  // is not a loss; `cpuReleased` marks it.
-  const onGrantLost = (): void => {
-    if (state.settled || state.grantLost || cpuReleased !== null) {
-      return;
-    }
-    state.grantLost = true;
-    cancelCapture();
-    appendStderr(
-      `cowshed: cpu-tokens grant lost: its parent pool closed while the command ran; stopping it: ${command}\n`,
-    );
-    // A bound may already be terminating the still-running command. The loss remains an ordinary
-    // operational failure, but that existing termination owns the signals and grace.
-    if (state.expiry === null) termination = terminate();
-  };
-  if (grant?.inherited) {
-    void grant.closed.then(onGrantLost);
+  // A grant's connection is a ledger entry, not the command's owner (05_gateway.md "Host CPU budget": a gateway
+  // restart forgets every grant, and what runs under it runs on over budget until it finishes). Its close, while the
+  // command runs, is said and changes nothing else; only a bound or a signal stops the command. Our own release after
+  // the command settled is not a loss; `cpuReleased` marks it.
+  if (grant !== null) {
+    const held = grant;
+    void held.closed.then(() => {
+      if (state.settled || cpuReleased !== null) {
+        return;
+      }
+      appendStderr(
+        `cowshed: cpu-tokens grant ended: the ${held.inherited ? 'parent pool' : 'gateway'} closed its ${held.tokens}-token grant while the command ran; it runs on over budget until it ends: ${command}\n`,
+      );
+    });
   }
 
   const { code: exitCode, signal: exitSignal } = await exitPromise;
@@ -701,9 +695,9 @@ export async function runBoundedExec(
   }
   await releaseLease();
 
-  // A run whose grant was lost, or whose sub-pool did not close cleanly, fails even when the command exited 0, and
-  // whatever bound also fired: its verdict is an ordinary failure, never a bound.
-  const operationalFailure = state.grantLost || state.poolCloseError !== null;
+  // A run whose sub-pool did not close cleanly fails even when the command exited 0, and whatever bound also fired:
+  // its verdict is an ordinary failure, never a bound.
+  const operationalFailure = state.poolCloseError !== null;
   await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure);
 
   return {
