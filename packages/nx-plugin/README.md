@@ -1058,9 +1058,21 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   five-minute idle interval. Cowshed's existing usage-aware keeper remains authoritative for sheds whose tree changes
   without a job, session or task-database holder. No daemon is disabled and the next normal client starts one again. The
   non-default, uncached host proof is `bun nx run tooling:nx-daemon-idle-proof` from the checkout root. Its declared
-  compile dependency emits the Typia-transformed product before Bun runs it. The proof holds a real silent client beyond
-  five minutes, disconnects, and records the kernel and daemon-log evidence of the next five-minute departure. It stays
-  outside the bounded Bun shards; their fast regression checks the actual installed policy export.
+  compile dependency emits the Typia-transformed product before Bun runs it. The proof gives the daemon a resident
+  plugin worker that asks it for files, holds a real silent client beyond five minutes, disconnects, and records the
+  kernel and daemon-log evidence of the next five-minute departure, workers included. It stays outside the bounded Bun
+  shards; their fast regression checks the actual installed policy export.
+- **A plugin worker is its daemon's client only while it waits on a reply.** A plugin's `globWithWorkspaceContext`,
+  `hashWithWorkspaceContext` and the other workspace-context reads run through the worker's own daemon client, which
+  kept its connection open after the reply. The daemon keeps a worker with graph hooks for as long as it lives (above),
+  and that open connection retained the daemon, so neither ever reached the idle stop: on 2026-10-17 the 72 shed daemon
+  logs held 573 stops and not one `Server stopped because: "300000ms of inactivity"`, and every daemon a host client
+  started stayed behind as a `ppid 1` process until something signalled it. In a plugin worker the client now drops its
+  connection once its request queue drains, and the daemon is unchanged. The client also ignores the close of a
+  connection it already dropped, which stock Nx let reset whichever request was current. A bounded regression runs a
+  real daemon whose resident worker globs through it and requires zero open connections after the only client exits.
+  Stock Nx keeps a worker until its last registered phase, so a plugin with task hooks keeps the same connection open
+  there after a graph-only request; this hunk does not retire with the worker-retention hunk.
 - **The daemon stops for an ignore file only when its watcher's rules may be stale.** Nx's native watcher reads its
   ignore files once, in `watch()`, and the daemon stopped itself on every watcher event for a `.gitignore` or
   `.nxignore`, whatever the file then held. A rewrite with the same bytes (a checkout, a formatter) reports one, and so

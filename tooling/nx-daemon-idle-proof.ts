@@ -17,6 +17,7 @@ import {
   ownedSocketDirectory,
   processTable,
   stopNxDaemon,
+  withDescendants,
 } from '../packages/nx-plugin/src/testing.js';
 
 const root = findNxWorkspaceRoot(process.cwd());
@@ -47,6 +48,31 @@ const logPath = join(workspace, '.nx', 'workspace-data', 'd', 'daemon.log');
 let connection: Socket | undefined;
 let departed = false;
 
+// A graph plugin that asks its daemon for files, as globIndexedFiles does. The daemon keeps its isolated worker for as
+// long as it lives, and the worker's daemon client is a connection to that daemon while it waits on a reply.
+const DAEMON_GLOB_PLUGIN = `const { globWithWorkspaceContext } = require('nx/src/utils/workspace-context');
+const { workspaceRoot } = require('nx/src/utils/workspace-root');
+exports.createNodesV2 = ['**/project.json', async () => {
+  await globWithWorkspaceContext(workspaceRoot, ['**/project.json']);
+  return [];
+}];
+`;
+
+async function showProjects(): Promise<void> {
+  const child = Bun.spawn(['bun', nx, 'show', 'projects', '--json'], {
+    cwd: workspace,
+    env,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  if (code !== 0 || stdout.trim() !== '["p"]') throw new Error(`nx show projects exited ${code}: ${stdout}${stderr}`);
+}
+
 async function daemonCommand(command: '--start' | '--stop'): Promise<void> {
   const child = Bun.spawn(['bun', nx, 'daemon', command], { cwd: workspace, env, stdout: 'pipe', stderr: 'pipe' });
   const [code, stdout, stderr] = await Promise.all([
@@ -58,7 +84,10 @@ async function daemonCommand(command: '--start' | '--stop'): Promise<void> {
 }
 
 try {
-  await writeFile(join(workspace, 'nx.json'), '{}\n');
+  await writeFile(join(workspace, 'nx.json'), '{"plugins":["./daemon-glob-plugin.js"]}\n');
+  await writeFile(join(workspace, 'daemon-glob-plugin.js'), DAEMON_GLOB_PLUGIN);
+  await mkdir(join(workspace, 'p'));
+  await writeFile(join(workspace, 'p', 'project.json'), '{"name":"p"}\n');
   await writeFile(join(workspace, 'package.json'), '{"name":"connected-idle-proof","private":true}\n');
   await writeFile(join(workspace, '.gitignore'), 'node_modules\n.nx\n');
   await symlink(join(root, 'node_modules'), join(workspace, 'node_modules'), 'dir');
@@ -73,6 +102,11 @@ try {
   }
   const processes = (await processTable()).filter(({ pid }) => pid === record.processId);
   if (processes.length !== 1) throw new Error(`the kernel does not name daemon ${record.processId}`);
+  await showProjects();
+  const workers = withDescendants(await processTable(), [record.processId]).filter(({ command }) =>
+    command.includes('plugin-worker'),
+  );
+  if (workers.length === 0) throw new Error(`daemon ${record.processId} keeps no plugin worker after a graph request`);
   const client = connect(record.socketPath);
   connection = client;
   await new Promise<void>((resolve, reject) => {
@@ -80,7 +114,9 @@ try {
     client.once('error', reject);
   });
   const connectedAt = performance.now();
-  console.log(JSON.stringify({ phase: 'connected', workspace, implementation, record, timeoutMs, kernel: processes }));
+  console.log(
+    JSON.stringify({ phase: 'connected', workspace, implementation, record, timeoutMs, kernel: processes, workers }),
+  );
   await sleep(timeoutMs + 10_000);
   const still = parseRecord(await readFile(recordPath, 'utf8'));
   const alive = (await processTable()).find(({ pid }) => pid === record.processId);
@@ -104,7 +140,7 @@ try {
   if (beforeDeadline === undefined || beforeDeadline.stat.startsWith('Z')) {
     throw new Error(`daemon ${record.processId} retired before five minutes after the last client disconnected`);
   }
-  await awaitExit(processes, `owned idle daemon ${record.processId}`, 15_000);
+  await awaitExit([...processes, ...workers], `owned idle daemon ${record.processId} and its plugin workers`, 15_000);
   const elapsedMs = performance.now() - disconnectedAt;
   const log = await readFile(logPath, 'utf8');
   const stopped = log
