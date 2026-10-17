@@ -924,8 +924,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     // 1. A target-named executable wins, made absolute against the workspace root.
     expect(select('bin/cowshed', '/valid/bin/cowshed', '/opt/bin')).toBe('/workspace/bin/cowshed');
     // 2. An explicit inherited executable outranks PATH and the workspace launcher — the
-    //    precedence createHostCommands always had.
+    //    precedence createHostCommands always had — and keeps the coordinate the parent
+    //    gave it: absolute verbatim, relative untouched for spawn's own resolution,
+    //    never retargeted to the workspace root.
     expect(select(undefined, '/valid/bin/cowshed', '/opt/bin')).toBe('/valid/bin/cowshed');
+    expect(select(undefined, 'bin/cowshed', '/opt/bin')).toBe('bin/cowshed');
     // 3. An installed cowshed on PATH wins (undefined: the bare name spawn already finds it).
     expect(select(undefined, undefined, '/opt/bin')).toBeUndefined();
     // 3b. An empty PATH component (the leading ':' below) names the current directory, as

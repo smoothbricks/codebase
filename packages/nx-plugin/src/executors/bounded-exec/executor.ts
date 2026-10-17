@@ -132,8 +132,12 @@ export function resolveCowshedExecutable(
     }
   },
 ): string | undefined {
-  const explicit = named ?? inherited;
-  if (explicit !== undefined) return resolvePath(root, explicit);
+  // A target-named executable is workspace-relative or absolute against the workspace root.
+  // An inherited explicit keeps the coordinate the parent gave it, exactly as the host
+  // commands always spawned it: an absolute one verbatim, a relative or bare one for
+  // spawn's own resolution — retargeting it to the root would silently change the tool.
+  if (named !== undefined) return resolvePath(root, named);
+  if (inherited !== undefined) return inherited;
   // An empty PATH component names the spawning process's current directory, as POSIX
   // spawn resolution does — the executor never chdirs, so that is the caller's cwd,
   // not the workspace root.
