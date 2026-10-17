@@ -143,6 +143,19 @@ impl Entry {
     }
 }
 
+/// Whether two observations of one tree name the same entries with the same source identity.
+/// Allocation is left out: writeback and compression move st_blocks with no repository write
+/// (02_workspaces.md, adoption step 3), so a tree that only gained a block has not changed.
+fn same_tree(left: &Snapshot, right: &Snapshot) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|((left_path, left), (right_path, right))| {
+                left_path == right_path && left.same_source(right)
+            })
+}
+
 impl From<&Entry> for Mirrored {
     fn from(entry: &Entry) -> Self {
         Self {
@@ -472,7 +485,7 @@ fn verify_with_snapshot(
             }
         }
     }
-    if observe(source)? != before || observe(destination)? != copied {
+    if !same_tree(&observe(source)?, &before) || !same_tree(&observe(destination)?, &copied) {
         return Err(CowshedError::conflict(
             "source or copied tree changed during verification",
             "stop the writers and re-run adoption",
@@ -1665,6 +1678,47 @@ mod tests {
                 }
             }
         }
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// A copy is verified against its source by identity and content. Writeback giving a file a
+    /// block between the walk's first and last observation is no change (02_workspaces.md,
+    /// adoption step 3); a modification time that moves still is.
+    #[test]
+    fn verification_ignores_allocation_that_moves_during_the_walk() {
+        use std::cell::Cell;
+        let (root, source, destination) = copy_roots("allocation-moves");
+        fs::write(source.join("payload"), b"original").unwrap();
+        run(&source, &destination, 6);
+        let expected = super::verify_tree_blocking(&source, &destination)
+            .unwrap()
+            .digest;
+        // The walk observes source and copy before it reads them, then both again after.
+        let observed = |late: fn(&mut super::Entry)| {
+            let calls = Cell::new(0_u32);
+            move |tree: &Path| -> crate::Result<Snapshot> {
+                let mut entries = snapshot(tree)?;
+                calls.set(calls.get() + 1);
+                if calls.get() > 2 {
+                    entries.values_mut().for_each(late);
+                }
+                Ok(entries)
+            }
+        };
+        let grown = super::verify_with_snapshot(
+            &source,
+            &destination,
+            observed(|entry| entry.allocated_bytes += 4096),
+        )
+        .expect("a block that writeback added is not a change");
+        assert_eq!(grown.digest, expected);
+        let error = super::verify_with_snapshot(
+            &source,
+            &destination,
+            observed(|entry| entry.mtime.1 += 1),
+        )
+        .expect_err("a moved modification time is a change");
+        assert_eq!(error.code, crate::ErrorCode::Conflict);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
