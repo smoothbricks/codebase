@@ -456,14 +456,16 @@ impl Host {
             ));
         }
         let mut environment = self.environment.clone();
-        if let Some(tool_bin) = self
+        // Only the package-manager wrapper route leads the activated PATH; every other entry,
+        // the shell's declared toolchain included, reaches the command as activation left it.
+        if let Some(wrappers) = self
             .environment
-            .get(OsStr::new(cowshed_core::developer_links::TOOL_BIN_ENV))
+            .get(OsStr::new(cowshed_core::developer_links::MANAGER_BIN_ENV))
         {
-            let mut paths = vec![PathBuf::from(tool_bin)];
+            let mut paths = vec![PathBuf::from(wrappers)];
             if let Some(path) = environment.get(OsStr::new("PATH")) {
                 paths.extend(
-                    std::env::split_paths(path).filter(|entry| entry.as_os_str() != tool_bin),
+                    std::env::split_paths(path).filter(|entry| entry.as_os_str() != wrappers),
                 );
             }
             environment.insert(
@@ -1034,6 +1036,7 @@ fn utf8(bytes: &[u8]) -> io::Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn only_the_exact_allowed_rc_counts_as_approved() {
@@ -1043,5 +1046,50 @@ mod tests {
         let denied = br#"{"state":{"foundRC":{"allowed":1,"path":"/w/.envrc"}}}"#;
         assert!(!approved(denied, Path::new("/w/.envrc")));
         assert!(!approved(br#"{"state":{}}"#, Path::new("/w/.envrc")));
+    }
+
+    /// The activated shell's PATH reaches the command unchanged (04_sandbox.md, direnv): only
+    /// the package-manager wrapper route leads it, so the toolchain the repository's shell
+    /// declares wins over the bootstrap link of the same name.
+    #[test]
+    fn only_the_wrapper_route_leads_the_activated_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!("cowshed-shell-path-{}", std::process::id()));
+        let devenv = root.join("devenv/bin");
+        let tools = root.join("tools/bin");
+        let wrappers = root.join("tools/manager-bin");
+        for (directory, program) in [(&devenv, "cargo"), (&tools, "cargo"), (&wrappers, "bun")] {
+            fs::create_dir_all(directory).unwrap();
+            let file = directory.join(program);
+            fs::write(&file, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // direnv puts the shell's additions ahead of the inherited bootstrap PATH.
+        let activated =
+            std::env::join_paths([&devenv, &wrappers, &tools, &PathBuf::from("/usr/bin")]).unwrap();
+        let host = Host {
+            environment: BTreeMap::from([
+                ("PATH".into(), activated),
+                (
+                    cowshed_core::developer_links::MANAGER_BIN_ENV.into(),
+                    wrappers.clone().into_os_string(),
+                ),
+            ]),
+        };
+        let environment = host.command_environment(&root, &[]).unwrap();
+        let path: Vec<PathBuf> = std::env::split_paths(&environment[OsStr::new("PATH")]).collect();
+        let found = |program: &str| {
+            path.iter()
+                .map(|directory| directory.join(program))
+                .find(|file| file.is_file())
+        };
+        let resolved = (found("cargo"), found("bun"));
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            resolved,
+            (Some(devenv.join("cargo")), Some(wrappers.join("bun"))),
+            "{path:?}"
+        );
     }
 }
