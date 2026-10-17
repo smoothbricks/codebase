@@ -595,8 +595,9 @@ core count.
   is not free yet waits for it, and so does everyone behind it within the same priority. A large request is never
   starved by a stream of smaller requests at that priority; a gate with sixty runners queued cannot crowd out one with
   three at the same priority.
-- **All at once.** A request is granted once, in full, and never holds part of a grant while waiting for more, so no two
-  requests can deadlock on each other's tokens.
+- **All at once.** A request is granted once and never holds part of a grant while waiting for more, so no two requests
+  can deadlock on each other's tokens. A compile-only Cargo build may grow after it starts ("A short build grows"
+  below), but it runs from its first grant on and never waits for a growth.
 
 - **Gate admission: FIFO ahead of background, never starving it** (2026-10-17, Danny tg#6693: "The gate class is served
   FIFO at highest priority over all other execs … When gate runs it needs more tickets than background but not fully
@@ -617,6 +618,20 @@ core count.
   workspace's checkout. A land therefore takes returned tokens at every task, in the order its tasks ask, and is never
   frozen at the width of its first grant. Same-repo lands are already serialized by the per-repository land lock; lands
   of two repositories share by FIFO order, task by task, and neither holds the other out for its whole gate.
+- **A short build grows** (2026-10-17, Danny chose option C of tg#6761). A grant taken at the first returned token can
+  be far below its `want`: measured, a land task's nextest asked for 18 tokens on a host another shed held whole, waited
+  32 s and ran its whole suite with 1 (`tokens=1/18`). A runner whose parallelism is a make jobserver can use tokens
+  handed to it later; one whose test threads were sized at its start cannot. So only a Cargo invocation that compiles
+  and runs nothing it built — `build`, `check`, `clippy`, `doc`, `rustc`, `rustdoc`, `fix`, `test`/`bench` with
+  `--no-run`, `nextest archive` — asks with `"grow": true`; test runners keep their first grant, so no token sits idle
+  in a fifo nobody reads. A growing holder that holds less than its `want` takes `min(want − held, free)` more from
+  returned tokens that no waiter of its class takes: a gate-class build grows after every waiting gate-class request has
+  started and ahead of background, under the same background floor; a background build grows only while no background
+  request waits. It never passes its own `want`, so one task cannot starve the rest of its own gate. Conservation is
+  unchanged: growth moves tokens from `free` to that holder. The holder hears each new total as
+  `{"ok":true,"lease":"grown","tokens":<total>}` on its connection, and the launcher hands the difference to Cargo's
+  jobserver fifo and says `cowshed: cargo jobserver grew tokens=<from>/<want> -> <to>/<want>` on stderr, beside its
+  `cowshed: cargo jobserver granted tokens=<g>/<want>`. Closing the connection still returns everything held.
 - **What gate priority does not guarantee.** A background test's CPU grant cannot be shrunk mid-run: Cargo's implicit
   make token and libtest/nextest threads sized from the original grant do not return FIFO bytes. The gateway does not
   resize a running FIFO, kill peer work, or use `SIGSTOP`/`SIGCONT`: wall and idle bounds would keep advancing during a
@@ -719,14 +734,19 @@ core count.
 
   - **A live parent CPU pool** (`BOUNDED_EXEC_CPU_POOL` plus its positive count): a compiling Cargo asks that pool for
     one token per core, as a root build does, never a second host grant. It requests
-    `{"op":"cpu-pool","want":<n>,"children":true}`; the existing pool accounts for this holder and serves its actual
-    grant as a private child pool, named by `pool` in the granted reply. Cargo's jobs/test variables and inherited count
-    are set to the actual local grant, and descendants receive that child pool, not the occupied ancestor. Cargo's own
-    inherited make jobserver still comes first. Noncompiling subcommands still run directly. A connected parent's
-    refusal, connection failure, malformed grant or loss fails the command. A valid named pool never falls through to a
-    second root or an unbudgeted run. An absent or malformed descriptor alone follows normal host admission. The
-    launcher owns its unreaped Cargo process group, ends it on pool loss with the normal TERM/grace/KILL path (10
-    seconds grace), and releases its local grant after its command ends; it never freezes a test.
+    `{"op":"cpu-pool","want":<n>,"children":true,"grow":<compiles only>}`; the existing pool accounts for this holder
+    and serves its actual grant as a private child pool, named by `pool` in the granted reply. Cargo's test variables
+    and inherited count are set to the actual local grant, and descendants receive that child pool, not the occupied
+    ancestor. A growing build runs under a make jobserver fifo the launcher creates in its `TMPDIR` and holds open, with
+    `g − 1` token bytes, instead of `CARGO_BUILD_JOBS`; each `grown` line from the pool adds its difference to that
+    fifo, and the launcher unlinks it when Cargo ends. A gateway pool grows a child by the rules above; the
+    `bounded-exec` pool accepts the field and never grows. Any other line after the grant is a protocol failure and ends
+    the build as a loss. Cargo's own inherited make jobserver still comes first. Noncompiling subcommands still run
+    directly. A connected parent's refusal, connection failure, malformed grant or loss fails the command. A valid named
+    pool never falls through to a second root or an unbudgeted run. An absent or malformed descriptor alone follows
+    normal host admission. The launcher owns its unreaped Cargo process group, ends it on pool loss with the normal
+    TERM/grace/KILL path (10 seconds grace), and releases its local grant after its command ends; it never freezes a
+    test.
   - **A `bounded-exec` grant** (`BOUNDED_EXEC_CPU_TOKENS` set): it takes no second grant and runs `cargo` with
     `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to `BOUNDED_EXEC_CPU_TOKENS` where they are
     unset. `bounded-exec` sets the cargo variables only for a cargo runner, so a `cargo` that a `process` runner's
@@ -743,10 +763,12 @@ core count.
     against an alias whose expansion ends in `--` (lmao's `proptest-heavy`) builds unbudgeted; that is accepted, since
     such a query is not a version probe and nothing issues one.
   - **Any other subcommand**, aliases and third-party `cargo-*` subcommands included, is a build. The launcher asks the
-    gateway on the control socket (`{"op":"jobserver","want":<n>,"checkout":"<workspace root>","command":"<command>"}`)
-    with `want` one per core, as for a cargo build under `bounded-exec`. The gateway queues and grants it like a
-    `cpu-tokens` request (fairness, all at once), refuses the same malformed requests, and answers
-    `{"ok":true,"lease":"granted","tokens":<g>,"fifo":"<path>"}`.
+    gateway on the control socket
+    (`{"op":"jobserver","want":<n>,"checkout":"<workspace root>","command":"<command>","grow":<compiles only>}`) with
+    `want` one per core, as for a cargo build under `bounded-exec`. The gateway queues and grants it like a `cpu-tokens`
+    request (fairness, all at once), refuses the same malformed requests and a growing request that also asks for a
+    `pool` (a pool lends a fixed count), and answers `{"ok":true,"lease":"granted","tokens":<g>,"fifo":"<path>"}`. A
+    growing grant's gateway writes each grown token into that fifo and then answers `grown` with the new total.
 - **The jobserver fifo.** On the grant the gateway creates that fifo in its private runtime directory, mode `0600` and
   owned by the client's user (from the socket's peer credentials). It opens the fifo `O_RDWR` and keeps that descriptor
   until the drain, so the bytes survive while no client has it open, and writes `g − 1` token bytes into it: the
@@ -769,14 +791,15 @@ core count.
   unchanged; fixed test/nextest grants are never opted into cooperative FIFO reclaim. An inherited `CARGO_MAKEFLAGS`
   whose fifo is gone counts as no jobserver.
 
-Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave) and `tests/cpu_budget.rs`
-over a real socket (`SIGKILL` of a holding client returns its tokens to the waiter at once; checkouts share the host;
-refusals); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
-`executor.test.ts` (a granted run sized and released, a refused one run as asked); a jobserver test in which a
-`SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; the launcher's tests (each of its four
-cases, the `want` it sends, and the variables it sets or leaves on each path); and the dynamic-band tests: a starved
-foreground grant demotes a running normal job's band and restores it when the foreground job leaves, and an
-opportunistic job admitted in the background band never holds a foreground job's cores.
+Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave, gate FIFO and the
+background floor, a short build growing to and never past its `want`, a new land task starting before a running one
+grows) and `tests/cpu_budget.rs` over a real socket (`SIGKILL` of a holding client returns its tokens to the waiter at
+once; checkouts share the host; refusals); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed
+holder closing its grant) and `executor.test.ts` (a granted run sized and released, a refused one run as asked); a
+jobserver test in which a `SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; the launcher's
+tests (each of its four cases, the `want` it sends, and the variables it sets or leaves on each path); and the
+dynamic-band tests: a starved foreground grant demotes a running normal job's band and restores it when the foreground
+job leaves, and an opportunistic job admitted in the background band never holds a foreground job's cores.
 
 ## The task server schedules work units
 

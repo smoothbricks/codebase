@@ -4,7 +4,7 @@
 
 use std::io::{BufRead as _, BufReader as StdBufReader, Write as _};
 use std::num::NonZeroUsize;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -161,12 +161,17 @@ impl Asker {
 
     /// One child's ask on a job's CPU pool, as a nested `bounded-exec` or Cargo sends it.
     async fn child(pool: &Path, want: usize) -> Self {
-        let stream = UnixStream::connect(pool).await.expect("connect pool");
+        Self::send(pool, serde_json::json!({ "op": "cpu-pool", "want": want })).await
+    }
+
+    /// One held request line on `socket`, answered `queued`.
+    async fn send(socket: &Path, request: Value) -> Self {
+        let stream = UnixStream::connect(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
         writer
-            .write_all(format!("{{\"op\":\"cpu-pool\",\"want\":{want}}}\n").as_bytes())
+            .write_all(format!("{request}\n").as_bytes())
             .await
-            .expect("ask pool");
+            .expect("ask");
         let mut asker = Self {
             lines: BufReader::new(reader),
             _writer: writer,
@@ -491,6 +496,82 @@ async fn jobserver_class_and_gate_bounds_are_validated_without_changing_ordinary
         assert_eq!(refused["code"], "invalid-request", "{refused}");
     }
     assert_eq!(ledger(&socket).await.held, 0);
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+impl Asker {
+    /// The new total of the next `grown` answer within `within`, or `None`.
+    async fn grown(&mut self, within: Duration) -> Option<u64> {
+        let answer = tokio::time::timeout(within, self.answer()).await.ok()?;
+        assert_eq!(answer["lease"], "grown", "{answer}");
+        Some(answer["tokens"].as_u64().expect("a growth names its total"))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_land_build_granted_one_token_grows_through_its_gate_jobs_pool_up_to_its_want() {
+    let (gateway, root, socket) = gateway(5).await;
+    let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
+    let mut a = Asker::ask(&socket, 3, "/w/a").await;
+    assert_eq!(a.granted(Duration::from_secs(10)).await, Some(3));
+    let mut b = Asker::ask(&socket, 1, "/w/b").await;
+    assert_eq!(b.granted(Duration::from_secs(10)).await, Some(1));
+    // A land's Cargo build asks the gate job's pool for 3 on a full host.
+    let mut build = Asker::send(
+        &pool,
+        serde_json::json!({ "op": "cpu-pool", "want": 3, "grow": true }),
+    )
+    .await;
+    assert_eq!(build.granted(Duration::from_millis(50)).await, None);
+    drop(b);
+    assert_eq!(build.granted(Duration::from_secs(10)).await, Some(1));
+    // Three return: the build grows by two to its want of three, and never past it.
+    drop(a);
+    assert_eq!(build.grown(Duration::from_secs(10)).await, Some(3));
+    assert_eq!(build.grown(Duration::from_millis(50)).await, None);
+    let status = ledger(&socket).await;
+    assert_eq!(status.held, 4, "{status:?}");
+    drop((gate, build));
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_root_cargo_build_that_grows_is_handed_its_tokens_through_its_fifo() {
+    let (gateway, root, socket) = gateway(4).await;
+    let mut holder = Asker::ask(&socket, 3, "/w/x").await;
+    assert_eq!(holder.granted(Duration::from_secs(10)).await, Some(3));
+    let mut build = Asker::send(
+        &socket,
+        serde_json::json!({ "op": "jobserver", "want": 4, "checkout": "/w/build",
+            "command": "cargo build", "grow": true }),
+    )
+    .await;
+    let granted = tokio::time::timeout(Duration::from_secs(10), build.answer())
+        .await
+        .expect("granted");
+    assert_eq!(
+        (granted["lease"].as_str(), granted["tokens"].as_u64()),
+        (Some("granted"), Some(1))
+    );
+    let fifo = PathBuf::from(
+        granted["fifo"]
+            .as_str()
+            .expect("a jobserver grant names its fifo"),
+    );
+    drop(holder);
+    assert_eq!(build.grown(Duration::from_secs(10)).await, Some(4));
+    // The fifo now holds every token beyond the implicit first: none at the grant, three grown.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .expect("open the grant's fifo");
+    let mut bytes = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut file, &mut bytes);
+    assert_eq!(bytes, b"+++");
+    drop(build);
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }

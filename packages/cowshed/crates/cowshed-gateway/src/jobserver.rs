@@ -131,6 +131,11 @@ impl JobserverFifo {
         &self.path
     }
 
+    /// Hand `tokens` more token bytes to the running client: what a growing grant was given.
+    pub(crate) fn fill(&mut self, tokens: usize) -> io::Result<()> {
+        self.file.write_all(&vec![TOKEN_BYTE; tokens])
+    }
+
     /// Drain the token bytes left in the fifo and unlink it. A cargo that
     /// outlives its launcher keeps its own descriptor and runs over budget
     /// until it finishes; what it still holds is not the gateway's to reclaim.
@@ -276,6 +281,10 @@ enum PoolRequest {
         want: std::num::NonZeroUsize,
         #[serde(default)]
         children: bool,
+        /// The child is a Cargo build whose jobserver can hand out tokens it is given after it
+        /// starts: it is told each new total, up to `want`.
+        #[serde(default)]
+        grow: bool,
     },
 }
 
@@ -290,6 +299,11 @@ enum PoolGrant<'a> {
         tokens: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         pool: Option<&'a Path>,
+    },
+    /// A growing child now holds `tokens` in all.
+    Grown {
+        ok: bool,
+        tokens: usize,
     },
 }
 
@@ -326,7 +340,11 @@ async fn serve_pool(
             return;
         }
     };
-    let PoolRequest::Take { want, children } = match parsed {
+    let PoolRequest::Take {
+        want,
+        children,
+        grow,
+    } = match parsed {
         Ok(request) => request,
         Err(error) => {
             let _ = pool_reply(
@@ -337,12 +355,14 @@ async fn serve_pool(
             return;
         }
     };
-    let (stake, granted) = budget.ask(
-        checkout,
-        want,
-        crate::disk_lease::Claim::new("child CPU pool", None),
-        class,
-    );
+    let claim = crate::disk_lease::Claim::new("child CPU pool", None);
+    let (stake, granted, mut growth) = if grow {
+        let (stake, granted, growth) = budget.ask_growing(checkout, want, claim, class);
+        (stake, granted, Some(growth))
+    } else {
+        let (stake, granted) = budget.ask(checkout, want, claim, class);
+        (stake, granted, None)
+    };
     if pool_reply(reader.get_mut(), &PoolGrant::Queued { ok: true })
         .await
         .is_err()
@@ -387,7 +407,27 @@ async fn serve_pool(
     }
     // End of stream or post-request bytes end the local allocation; a child never releases the
     // parent's upstream grant and never takes a second host allocation while it is borrowed.
-    let _ = reader.read(&mut byte).await;
+    // Until then a growing child hears each new total its allocation reaches.
+    loop {
+        let grown = async {
+            match growth.as_mut() {
+                Some(growth) => growth.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = reader.read(&mut byte) => break,
+            grown = grown => match grown {
+                Some(tokens) => {
+                    if pool_reply(reader.get_mut(), &PoolGrant::Grown { ok: true, tokens }).await.is_err() {
+                        break;
+                    }
+                }
+                // The budget is gone: nothing more will grow, and the allocation stands.
+                None => growth = None,
+            },
+        }
+    }
     if let Some(pool) = pool
         && let Err(error) = pool.close().await
     {

@@ -48,6 +48,11 @@ interface CpuPoolRequest {
   want: number & typia.tags.Type<'uint32'> & typia.tags.Minimum<1>;
   /** Ask the owning pool to serve this allocation as its own child pool (Cargo's host launcher). */
   children?: boolean;
+  /**
+   * Cargo's launcher asks a compile-only build to grow. This pool lends a fixed count, so it accepts the field and never
+   * grows a child; the gateway's pools do (specs/cowshed/05_gateway.md, "A short build grows").
+   */
+  grow?: boolean;
 }
 
 /** The pool's answers, in `holdLease`'s framing. */

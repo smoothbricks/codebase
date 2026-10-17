@@ -64,6 +64,15 @@ pub(crate) enum Effect {
         checkout: Arc<str>,
         claim: Claim,
     },
+    /// A running holder that asked to grow now holds `to` tokens, up from `from`, never past
+    /// its `want`: its jobserver may hand out the difference.
+    Grow {
+        ticket: Ticket,
+        from: usize,
+        to: usize,
+        want: usize,
+        checkout: Arc<str>,
+    },
 }
 
 #[derive(Debug)]
@@ -72,6 +81,8 @@ struct Waiter {
     class: JobserverClass,
     /// The count asked for, as asked.
     want: usize,
+    /// The runner can use tokens handed to it after it starts (a Cargo build's jobserver).
+    grows: bool,
     asked: Instant,
     claim: Claim,
 }
@@ -81,6 +92,29 @@ struct Holder {
     ticket: Ticket,
     class: JobserverClass,
     tokens: usize,
+    want: usize,
+    grows: bool,
+}
+
+impl Holder {
+    /// A holder that can still use more than it holds.
+    fn short(&self) -> bool {
+        self.grows && self.tokens < self.want
+    }
+}
+
+/// The ledger's next step: start a waiter, or grow a running holder.
+enum Pick {
+    Grant {
+        checkout: Arc<str>,
+        position: usize,
+        tokens: usize,
+    },
+    Grow {
+        checkout: Arc<str>,
+        index: usize,
+        tokens: usize,
+    },
 }
 
 /// One checkout's stake: what its runners hold, and who of it waits, oldest first.
@@ -156,61 +190,116 @@ impl Ledger {
         self.admit(now, effects);
     }
 
-    /// Grant waiters while tokens are free: gate class FIFO first, background fairest.
+    /// Grant waiters while tokens are free: gate class FIFO first, background fairest, and grow
+    /// short running builds with what no waiter can take.
     ///
     /// While any gate-class request waits, the oldest one, wherever it sits in its checkout's
     /// queue, takes `min(want, free)` once a token is free: a land's tasks take returned tokens
-    /// before queued background work, in the order they asked. Background is not starved
-    /// meanwhile: a background checkout that waits holding nothing still gets one token first,
-    /// as long as background as a whole then still holds less than half the host, so gate-class
-    /// work always holds the larger part.
+    /// before queued background work, in the order they asked. With no gate-class request
+    /// waiting, the oldest running gate-class holder that asked to grow and holds less than its
+    /// `want` takes `min(want − held, free)` more, still ahead of background: a land task that
+    /// started narrow widens as tokens return, a new land task always starts first, and no
+    /// holder ever passes its own `want`. Background is not starved meanwhile: while gate-class
+    /// work wants tokens, a background checkout that waits holding nothing still gets one token
+    /// first, as long as background as a whole then still holds less than half the host, so
+    /// gate-class work always holds the larger part.
     ///
-    /// With no gate-class request waiting, background is fair between checkouts. The next grant
-    /// goes to the waiting checkout that holds the fewest tokens (the older head waiter on a
-    /// tie), to its oldest waiter. A checkout's fair share is the host total divided among the
-    /// checkouts holding or waiting; its claim is what remains of that share, at least one. While
-    /// another checkout waits, the grant is exactly the claim or the `want`, whichever is smaller,
-    /// so nobody outruns a waiting peer; with nobody else waiting it is every free token up to
+    /// With no gate-class demand, background is fair between checkouts. The next grant goes to
+    /// the waiting checkout that holds the fewest tokens (the older head waiter on a tie), to its
+    /// oldest waiter. A checkout's fair share is the host total divided among the checkouts
+    /// holding or waiting; its claim is what remains of that share, at least one. While another
+    /// checkout waits, the grant is exactly the claim or the `want`, whichever is smaller, so
+    /// nobody outruns a waiting peer; with nobody else waiting it is every free token up to
     /// `want`. A head waiter whose least grant is not free yet waits for it, and so does everyone
-    /// behind it: skipping to a smaller request would starve a large one for good.
+    /// behind it: skipping to a smaller request would starve a large one for good. Only with no
+    /// background request waiting at all does a short background holder grow.
     fn admit(&mut self, now: Instant, effects: &mut Vec<Effect>) {
         while self.free > 0 {
-            let Some((name, position, tokens)) =
-                self.next_gate().or_else(|| self.next_background())
-            else {
-                return;
-            };
-            let checkout = self
-                .checkouts
-                .get_mut(&name)
-                .expect("the chosen checkout is present");
-            let waiter = checkout
-                .waiting
-                .remove(position)
-                .expect("the chosen waiter is queued");
-            checkout.held += tokens;
-            checkout.running.push(Holder {
-                ticket: waiter.ticket,
-                class: waiter.class,
-                tokens,
-            });
-            self.free -= tokens;
-            effects.push(Effect::Grant {
-                ticket: waiter.ticket,
-                tokens,
-                want: waiter.want,
-                waited: now.saturating_duration_since(waiter.asked),
-                checkout: name,
-                claim: waiter.claim,
-            });
+            match self.next_gate().or_else(|| self.next_background()) {
+                None => return,
+                Some(Pick::Grant {
+                    checkout: name,
+                    position,
+                    tokens,
+                }) => {
+                    let checkout = self
+                        .checkouts
+                        .get_mut(&name)
+                        .expect("the chosen checkout is present");
+                    let waiter = checkout
+                        .waiting
+                        .remove(position)
+                        .expect("the chosen waiter is queued");
+                    checkout.held += tokens;
+                    checkout.running.push(Holder {
+                        ticket: waiter.ticket,
+                        class: waiter.class,
+                        tokens,
+                        want: waiter.want,
+                        grows: waiter.grows,
+                    });
+                    self.free -= tokens;
+                    effects.push(Effect::Grant {
+                        ticket: waiter.ticket,
+                        tokens,
+                        want: waiter.want,
+                        waited: now.saturating_duration_since(waiter.asked),
+                        checkout: name,
+                        claim: waiter.claim,
+                    });
+                }
+                Some(Pick::Grow {
+                    checkout: name,
+                    index,
+                    tokens,
+                }) => {
+                    let checkout = self
+                        .checkouts
+                        .get_mut(&name)
+                        .expect("the chosen checkout is present");
+                    let holder = &mut checkout.running[index];
+                    let from = holder.tokens;
+                    holder.tokens += tokens;
+                    checkout.held += tokens;
+                    self.free -= tokens;
+                    effects.push(Effect::Grow {
+                        ticket: holder.ticket,
+                        from,
+                        to: holder.tokens,
+                        want: holder.want,
+                        checkout: name,
+                    });
+                }
+            }
         }
     }
 
-    /// The next grant while gate-class work waits: a starved background checkout's one token,
-    /// else the oldest gate-class request's `min(want, free)`. `None` when no gate-class request
-    /// waits.
-    fn next_gate(&self) -> Option<(Arc<str>, usize, usize)> {
-        let (gate, position, _) = self
+    /// The oldest running holder of `class` that can still grow, and by how much.
+    fn grower(&self, class: JobserverClass) -> Option<Pick> {
+        let (name, index, holder) = self
+            .checkouts
+            .iter()
+            .flat_map(|(name, checkout)| {
+                checkout
+                    .running
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, holder)| holder.class == class && holder.short())
+                    .map(move |(index, holder)| (name, index, holder))
+            })
+            .min_by_key(|(_, _, holder)| holder.ticket)?;
+        Some(Pick::Grow {
+            checkout: Arc::clone(name),
+            index,
+            tokens: (holder.want - holder.tokens).min(self.free),
+        })
+    }
+
+    /// The next step while gate-class work wants tokens: a starved background checkout's one
+    /// token, else the oldest gate-class request's `min(want, free)`, else the oldest short
+    /// gate-class holder's growth. `None` when no gate-class work wants a token.
+    fn next_gate(&self) -> Option<Pick> {
+        let waiter = self
             .checkouts
             .iter()
             .flat_map(|(name, checkout)| {
@@ -219,9 +308,13 @@ impl Ledger {
                     .iter()
                     .enumerate()
                     .filter(|(_, waiter)| waiter.class == JobserverClass::Gate)
-                    .map(move |(position, waiter)| (name, position, waiter.ticket))
+                    .map(move |(position, waiter)| (name, position, waiter))
             })
-            .min_by_key(|(_, _, ticket)| *ticket)?;
+            .min_by_key(|(_, _, waiter)| waiter.ticket);
+        let grower = self.grower(JobserverClass::Gate);
+        if waiter.is_none() && grower.is_none() {
+            return None;
+        }
         let background: usize = self
             .checkouts
             .values()
@@ -245,22 +338,34 @@ impl Ledger {
                     .min_by_key(|(_, _, ticket)| *ticket)
             })
             .flatten();
-        Some(match starved {
-            Some((name, position, _)) => (Arc::clone(name), position, 1),
-            None => {
-                let want = self.checkouts[gate].waiting[position].want;
-                (Arc::clone(gate), position, want.min(self.free))
-            }
-        })
+        if let Some((name, position, _)) = starved {
+            return Some(Pick::Grant {
+                checkout: Arc::clone(name),
+                position,
+                tokens: 1,
+            });
+        }
+        match waiter {
+            Some((name, position, waiter)) => Some(Pick::Grant {
+                checkout: Arc::clone(name),
+                position,
+                tokens: waiter.want.min(self.free),
+            }),
+            None => grower,
+        }
     }
 
-    /// The next background grant by checkout fairness, or `None` when nobody can be granted now.
-    fn next_background(&self) -> Option<(Arc<str>, usize, usize)> {
-        let (name, checkout, head) = self
+    /// The next background grant by checkout fairness; with no background request waiting, the
+    /// oldest short background holder's growth; `None` when nobody can be granted now.
+    fn next_background(&self) -> Option<Pick> {
+        let Some((name, checkout, head)) = self
             .checkouts
             .iter()
             .filter_map(|(name, checkout)| Some((name, checkout, checkout.waiting.front()?)))
-            .min_by_key(|(_, checkout, head)| (checkout.held, head.ticket))?;
+            .min_by_key(|(_, checkout, head)| (checkout.held, head.ticket))
+        else {
+            return self.grower(JobserverClass::Background);
+        };
         let share = (self.total / self.checkouts.len()).max(1);
         let least = head.want.min(share.saturating_sub(checkout.held).max(1));
         let peers_wait = self
@@ -275,7 +380,11 @@ impl Ledger {
         } else {
             head.want.min(self.free)
         };
-        Some((Arc::clone(name), 0, tokens))
+        Some(Pick::Grant {
+            checkout: Arc::clone(name),
+            position: 0,
+            tokens,
+        })
     }
 
     pub(crate) fn status(&self) -> CpuBudgetStatus {
@@ -306,6 +415,8 @@ enum Message {
         claim: Claim,
         class: JobserverClass,
         granted: oneshot::Sender<usize>,
+        /// Where a growable holder hears its new total; `None` for a fixed grant.
+        growth: Option<mpsc::UnboundedSender<usize>>,
     },
     Leave {
         ticket: Ticket,
@@ -359,6 +470,35 @@ impl CpuBudget {
         claim: Claim,
         class: JobserverClass,
     ) -> (Stake, oneshot::Receiver<usize>) {
+        self.ask_with(checkout, want, claim, class, None)
+    }
+
+    /// [`ask`](Self::ask) for a runner that can use tokens handed to it after it starts: after
+    /// the grant, the growth receiver yields each new total it holds, never past `want`.
+    pub(crate) fn ask_growing(
+        &self,
+        checkout: Arc<str>,
+        want: NonZeroUsize,
+        claim: Claim,
+        class: JobserverClass,
+    ) -> (
+        Stake,
+        oneshot::Receiver<usize>,
+        mpsc::UnboundedReceiver<usize>,
+    ) {
+        let (growth, grown) = mpsc::unbounded_channel();
+        let (stake, granted) = self.ask_with(checkout, want, claim, class, Some(growth));
+        (stake, granted, grown)
+    }
+
+    fn ask_with(
+        &self,
+        checkout: Arc<str>,
+        want: NonZeroUsize,
+        claim: Claim,
+        class: JobserverClass,
+        growth: Option<mpsc::UnboundedSender<usize>>,
+    ) -> (Stake, oneshot::Receiver<usize>) {
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
         let (granted, receiver) = oneshot::channel();
         let _ = self.messages.send(Message::Ask {
@@ -368,6 +508,7 @@ impl CpuBudget {
             claim,
             class,
             granted,
+            growth,
         });
         (
             Stake {
@@ -388,6 +529,7 @@ impl CpuBudget {
 
 async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>) {
     let mut grants: HashMap<Ticket, oneshot::Sender<usize>> = HashMap::new();
+    let mut growers: HashMap<Ticket, mpsc::UnboundedSender<usize>> = HashMap::new();
     let mut effects = Vec::new();
     while let Some(message) = messages.recv().await {
         match message {
@@ -398,13 +540,19 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 claim,
                 class,
                 granted,
+                growth,
             } => {
                 grants.insert(ticket, granted);
+                let grows = growth.is_some();
+                if let Some(growth) = growth {
+                    growers.insert(ticket, growth);
+                }
                 ledger.ask(
                     checkout,
                     Waiter {
                         ticket,
                         want: want.get(),
+                        grows,
                         asked: Instant::now(),
                         claim,
                         class,
@@ -414,6 +562,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             }
             Message::Leave { ticket } => {
                 grants.remove(&ticket);
+                growers.remove(&ticket);
                 ledger.leave(Instant::now(), ticket, &mut effects);
             }
             Message::Status { reply } => {
@@ -421,27 +570,45 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             }
         }
         for effect in effects.drain(..) {
-            let Effect::Grant {
-                ticket,
-                tokens,
-                want,
-                waited,
-                checkout,
-                claim,
-            } = effect;
-            // A client gone before its grant leaves next, and its tokens come back with it.
-            if let Some(granted) = grants.remove(&ticket) {
-                let _ = granted.send(tokens);
+            match effect {
+                Effect::Grant {
+                    ticket,
+                    tokens,
+                    want,
+                    waited,
+                    checkout,
+                    claim,
+                } => {
+                    // A client gone before its grant leaves next, and its tokens come back with it.
+                    if let Some(granted) = grants.remove(&ticket) {
+                        let _ = granted.send(tokens);
+                    }
+                    cowshed_os::timing::event("cpu-tokens", || {
+                        format!(
+                            "grant {tokens}/{want} after {waited:?} to {checkout}: pid {} `{}`",
+                            claim
+                                .pid
+                                .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+                            claim.command,
+                        )
+                    });
+                }
+                Effect::Grow {
+                    ticket,
+                    from,
+                    to,
+                    want,
+                    checkout,
+                } => {
+                    // A holder gone before it hears leaves next, and its tokens come back with it.
+                    if let Some(growth) = growers.get(&ticket) {
+                        let _ = growth.send(to);
+                    }
+                    cowshed_os::timing::event("cpu-tokens", || {
+                        format!("grow {from}/{want} -> {to}/{want} in {checkout}")
+                    });
+                }
             }
-            cowshed_os::timing::event("cpu-tokens", || {
-                format!(
-                    "grant {tokens}/{want} after {waited:?} to {checkout}: pid {} `{}`",
-                    claim
-                        .pid
-                        .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
-                    claim.command,
-                )
-            });
         }
     }
 }
@@ -476,7 +643,14 @@ mod tests {
             checkout: &str,
             want: usize,
         ) -> Vec<(Ticket, usize)> {
-            self.ask_as(ms, ticket, checkout, want, JobserverClass::Background)
+            self.ask_as(
+                ms,
+                ticket,
+                checkout,
+                want,
+                JobserverClass::Background,
+                false,
+            )
         }
 
         /// A land task's ask: what a gate job's relay pool sends for each child.
@@ -487,7 +661,29 @@ mod tests {
             checkout: &str,
             want: usize,
         ) -> Vec<(Ticket, usize)> {
-            self.ask_as(ms, ticket, checkout, want, JobserverClass::Gate)
+            self.ask_as(ms, ticket, checkout, want, JobserverClass::Gate, false)
+        }
+
+        /// A land task that is a Cargo build: it can use tokens handed to it after it starts.
+        fn ask_land_build(
+            &mut self,
+            ms: u64,
+            ticket: Ticket,
+            checkout: &str,
+            want: usize,
+        ) -> Vec<(Ticket, usize)> {
+            self.ask_as(ms, ticket, checkout, want, JobserverClass::Gate, true)
+        }
+
+        /// A background Cargo build that can grow.
+        fn ask_build(
+            &mut self,
+            ms: u64,
+            ticket: Ticket,
+            checkout: &str,
+            want: usize,
+        ) -> Vec<(Ticket, usize)> {
+            self.ask_as(ms, ticket, checkout, want, JobserverClass::Background, true)
         }
 
         fn ask_as(
@@ -497,6 +693,7 @@ mod tests {
             checkout: &str,
             want: usize,
             class: JobserverClass,
+            grows: bool,
         ) -> Vec<(Ticket, usize)> {
             let now = self.origin + Duration::from_millis(ms);
             self.ledger.ask(
@@ -504,6 +701,7 @@ mod tests {
                 Waiter {
                     ticket,
                     want: NonZeroUsize::new(want).unwrap().get(),
+                    grows,
                     asked: now,
                     claim: Claim::new(&format!("t{ticket}"), Some(7)),
                     class,
@@ -519,10 +717,19 @@ mod tests {
             self.grants()
         }
 
+        /// Each step as `(ticket, tokens it now holds)`: a grant's count, or a growth's new total.
         fn grants(&mut self) -> Vec<(Ticket, usize)> {
             self.effects
                 .drain(..)
-                .map(|Effect::Grant { ticket, tokens, .. }| (ticket, tokens))
+                .map(|effect| match effect {
+                    Effect::Grant { ticket, tokens, .. } => (ticket, tokens),
+                    Effect::Grow {
+                        ticket, to, want, ..
+                    } => {
+                        assert!(to <= want, "a holder never grows past its want");
+                        (ticket, to)
+                    }
+                })
                 .collect()
         }
 
@@ -736,6 +943,67 @@ mod tests {
         // half the host; the land's oldest task takes the remaining four.
         assert_eq!(clock.leave(3, 1), [(4, 1), (5, 1), (2, 4)]);
         assert_eq!(clock.leave(4, 2), [(3, 4)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn a_land_build_granted_one_token_under_load_grows_as_tokens_return() {
+        // The measured case: another shed holds all 18 tokens, one per runner, and more of its
+        // work waits. A land's Cargo build asks for 18 and the first return gives it 1.
+        let mut clock = Clock::new(18);
+        for ticket in 1..=18 {
+            assert_eq!(clock.ask(0, ticket, "custody", 1), [(ticket, 1)]);
+        }
+        assert_eq!(clock.ask(1, 19, "custody", 1), []);
+        assert_eq!(clock.ask_land_build(2, 20, "land", 18), []);
+        assert_eq!(clock.leave(3, 1), [(20, 1)]);
+        // Every later return widens the running build, ahead of the queued background work.
+        for (ms, ticket) in (4..).zip(2..=17) {
+            let held = usize::try_from(ticket).unwrap();
+            assert_eq!(clock.leave(ms, ticket), [(20, held)]);
+        }
+        // The custody shed now holds nothing while it waits: it keeps its one token, and the
+        // build stays at 17 of 18.
+        assert_eq!(clock.leave(30, 18), [(19, 1)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn a_new_land_task_starts_before_a_running_one_grows() {
+        let mut clock = Clock::new(4);
+        assert_eq!(clock.ask(0, 1, "x", 3), [(1, 3)]);
+        assert_eq!(clock.ask_land_build(1, 2, "land", 4), [(2, 1)]);
+        assert_eq!(clock.ask_land(2, 3, "land", 2), []);
+        // Three tokens return: the waiting land task takes its two first, then the build grows.
+        assert_eq!(clock.leave(3, 1), [(3, 2), (2, 2)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn growth_never_passes_the_original_want_and_a_test_runner_never_grows() {
+        let mut clock = Clock::new(8);
+        assert_eq!(clock.ask(0, 1, "x", 6), [(1, 6)]);
+        assert_eq!(clock.ask_land_build(1, 2, "land", 4), [(2, 2)]);
+        assert_eq!(clock.ask(1, 3, "x", 1), []);
+        // Six return: x, holding nothing, keeps its one token; the build grows by two to its
+        // want of four, never further, and the last three stay free for whoever asks.
+        assert_eq!(clock.leave(2, 1), [(3, 1), (2, 4)]);
+        // nextest sizes its threads once, so a land test runner asks without growth: a token
+        // returned while it runs at three of eight stays free rather than held idle by it.
+        assert_eq!(clock.ask_land(3, 4, "land", 8), [(4, 3)]);
+        assert_eq!(clock.leave(4, 3), []);
+        assert_eq!(clock.ledger.status().held, 7);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn a_background_build_grows_only_while_no_background_work_waits() {
+        let mut clock = Clock::new(4);
+        assert_eq!(clock.ask(0, 1, "x", 3), [(1, 3)]);
+        assert_eq!(clock.ask_build(1, 2, "y", 4), [(2, 1)]);
+        assert_eq!(clock.ask(2, 3, "x", 1), []);
+        // A background request waits, so the returned tokens are its, not the build's growth.
+        assert_eq!(clock.leave(3, 1), [(3, 1), (2, 3)]);
         assert!(clock.balanced());
     }
 }
