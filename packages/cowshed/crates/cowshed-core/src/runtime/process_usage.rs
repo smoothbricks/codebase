@@ -1554,7 +1554,10 @@ mod tests {
             }
         }
 
-        /// Its resident bytes, read by a different kernel call than the reader under test.
+        /// Its resident bytes, read by a different kernel call than the reader under test. On
+        /// Linux that call reads the same mm RSS counter as `/proc/<pid>/stat`, which
+        /// proc_pid_statm(5) calls inaccurate "because of a kernel-internal scalability
+        /// optimization": a second sample of it, not an independent measurement.
         fn independent_resident(&self) -> u64 {
             let pid = libc::pid_t::try_from(self.life.identity.pid).expect("pid");
             #[cfg(target_os = "macos")]
@@ -1610,8 +1613,9 @@ mod tests {
         }
     }
 
-    /// Each process's resident memory is its own, matches an independent kernel read, and falls
-    /// when it releases memory while its peak stays.
+    /// Each process's resident memory is its own and falls when it releases memory while its peak
+    /// stays. The oracle is what each allocator touched; the kernel's second read is reported,
+    /// not compared, because it samples the same imprecise counter a moment later.
     #[test]
     fn each_process_holds_its_own_resident_memory_and_keeps_its_peak() {
         const MIB: u64 = 1 << 20;
@@ -1621,11 +1625,10 @@ mod tests {
         let read = |fold: &mut ProcessUsageFold, allocator: &Fixture| {
             assert!(matches!(tick(fold, &allocator.life), Sampled::Read(_)));
             let usage = fold.usage(allocator.life.identity).expect("usage");
-            let independent = allocator.independent_resident();
-            assert!(
-                usage.rss_bytes.get().abs_diff(independent) <= 2 * MIB,
-                "read {} bytes resident, the kernel's other call {independent}",
-                usage.rss_bytes.get()
+            println!(
+                "read {} bytes resident; the kernel's other call, a moment later, {}",
+                usage.rss_bytes.get(),
+                allocator.independent_resident()
             );
             usage
         };
