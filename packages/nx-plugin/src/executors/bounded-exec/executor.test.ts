@@ -943,9 +943,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(select(undefined, undefined, '/usr/bin')).toBe('/workspace/packages/cowshed/bin/cowshed');
     // 5. A linked workspace's launcher answers when the workspace has none of its own.
     everywhere.delete('/workspace/packages/cowshed/bin/cowshed');
-    expect(select(undefined, undefined, '/usr/bin')).toBe(
-      '/workspace/node_modules/@smoothbricks/cowshed/bin/cowshed',
-    );
+    expect(select(undefined, undefined, '/usr/bin')).toBe('/workspace/node_modules/@smoothbricks/cowshed/bin/cowshed');
     // 6. No cowshed anywhere keeps the bare name, so the spawn failure names the missing tool.
     everywhere.clear();
     expect(select(undefined, undefined, '/usr/bin')).toBeUndefined();

@@ -166,7 +166,13 @@ export function runDefaultBoundedExec(
   // for its command alike. Nx resolves `{workspaceRoot}/…` in an option to a workspace-relative path, which the
   // command, starting in another directory, could not find: it gets the absolute one.
   const named = options.env?.[COWSHED_EXECUTABLE_ENV];
-  const cowshed = resolveCowshedExecutable(context.root, named, process.env[COWSHED_EXECUTABLE_ENV], process.env.PATH, process.cwd());
+  const cowshed = resolveCowshedExecutable(
+    context.root,
+    named,
+    process.env[COWSHED_EXECUTABLE_ENV],
+    process.env.PATH,
+    process.cwd(),
+  );
   const run: BoundedExecOptions =
     cowshed === undefined ? options : { ...options, env: { ...options.env, [COWSHED_EXECUTABLE_ENV]: cowshed } };
   // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
