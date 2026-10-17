@@ -927,9 +927,9 @@ the exact caller-owned developer checkout and the actual shared store. Only reac
 grants, never the whole checkout or `.bun` root. Traversal deduplicates exact package identities, not read-grant
 prefixes: a covered local `@nx` scope can still contain a binding to the pinned native platform package in the shared
 store. A normal Bun store entry is never presented as a developer binding. Local file providers are checkout-relative
-directories that travel with the clone.
-Foreign-daemon retirement witnesses retain the daemon's own standalone root, state and short socket throughout the
-landing; its actual produced record is only a nomination, and its owner performs cleanup after the identity proof.
+directories that travel with the clone. Foreign-daemon retirement witnesses retain the daemon's own standalone root,
+state and short socket throughout the landing; its actual produced record is only a nomination, and its owner performs
+cleanup after the identity proof.
 
 The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's workspace-owner checks:
 
@@ -1235,11 +1235,14 @@ has something attached below it, is named in the task's error instead.
 
 Every `hdiutil` and `diskutil` execution goes through `cowshed disk-command`, including host-test inventory and cleanup.
 The cowshed is the installed one on `PATH`, which must provide this command, unless `COWSHED_EXECUTABLE` names another.
-A target may set it in its `env`, workspace-relative or absolute: the task's own RAM volume work and its command then
-both run that cowshed, given to the command as an absolute path. This repository sets it to
-`packages/cowshed/bin/cowshed`, after `cowshed:build`, on the targets that exercise the facade (both real-APFS groups
-and `nx-plugin:test-host`), so they test this checkout's cowshed, not an installed one that may predate a command the
-checkout added. Cowshed alone owns disk-lifecycle leasing. Safe disk commands use
+Where `PATH` provides no cowshed, a workspace that itself provides a launcher — its own cowshed package's
+`packages/cowshed/bin/cowshed`, or a linked one's `node_modules/@smoothbricks/cowshed/bin/cowshed` — names that launcher
+for the run and its command instead; an environment with no cowshed anywhere keeps the bare name, so its spawn failure
+names the missing installed tool. A target may set it in its `env`, workspace-relative or absolute: the task's own RAM
+volume work and its command then both run that cowshed, given to the command as an absolute path. This repository sets
+it to `packages/cowshed/bin/cowshed`, after `cowshed:build`, on the targets that exercise the facade (both real-APFS
+groups and `nx-plugin:test-host`), so they test this checkout's cowshed, not an installed one that may predate a command
+the checkout added. Cowshed alone owns disk-lifecycle leasing. Safe disk commands use
 `cowshed disk-command diskutil --deadline-ms <positive integer> -- <args>`: the CLI owns that total monotonic budget
 across lease admission and child execution, never starts a child after it expires, and kills and reaps an overrun safe
 child before returning. Node waits for the facade's actual terminal exit without a second timer or lease. Only protected
