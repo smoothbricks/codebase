@@ -73,6 +73,17 @@ impl FixtureRoot {
 /// The checkout's whole `.cowshed.toml`: the build-volume cap, nothing else.
 const FIXTURE_COWSHED_TOML: &str = "[build]\ncapacity = \"1g\"\n";
 
+/// The `cowshed` binary under test, read when the test runs. `env!` would bake in the path of
+/// the checkout that compiled this test, but the test runs from a cached nextest archive
+/// that is relocated into every checkout, and nextest re-points `CARGO_BIN_EXE_cowshed` at the
+/// extracted binary only at runtime.
+fn cowshed() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_cowshed")
+            .expect("cargo and nextest set CARGO_BIN_EXE_cowshed for an integration test"),
+    )
+}
+
 struct Fixture {
     _scratch: FixtureRoot,
     checkout: PathBuf,
@@ -5872,7 +5883,7 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
 async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans_absolute_bypass() {
     cowshed_core::runtime::shell_host::register(
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
-            env!("CARGO_BIN_EXE_cowshed"),
+            cowshed(),
             vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
         ),
     );
@@ -6112,7 +6123,7 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
 async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed() {
     cowshed_core::runtime::shell_host::register(
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
-            env!("CARGO_BIN_EXE_cowshed"),
+            cowshed(),
             vec![cowshed_core::runtime::shell_host::SHELL_HOST_ARGUMENT.into()],
         ),
     );
