@@ -106,17 +106,15 @@ export function readInheritedCpuPool(environment: Readonly<NodeJS.ProcessEnv>): 
 }
 
 /**
- * Ask the immediate parent pool for `min(want, parent.tokens, ceil(cores / 2))` tokens. A granted
+ * Ask the immediate parent pool for `want` tokens. Neither the inherited count nor the host's core count bounds the
+ * ask: a lent pool grants at most what it holds, and a gate's relay pool asks the host for each child. A granted
  * lease is the child's local allocation: its connection is the grant, and closing it returns only
  * that allocation. An absent endpoint allows normal host acquisition; a connected endpoint's refusal
  * or protocol failure must fail admission rather than taking a second grant above its parent.
  */
-export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number, cores: number): Promise<TokenGrant> {
-  const ask = Math.min(want, parent.tokens, Math.ceil(cores / 2));
-  if (!Number.isSafeInteger(ask) || ask < 1) {
-    throw new RangeError(
-      `a child asks its parent pool for a positive count, not ${ask} (want ${want}, pool ${parent.tokens}, cores ${cores})`,
-    );
+export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number): Promise<TokenGrant> {
+  if (!Number.isSafeInteger(want) || want < 1) {
+    throw new RangeError(`a child asks its parent pool for a positive count, not ${want} (pool ${parent.tokens})`);
   }
   if (parent.socket.length === 0 || parent.socket.includes('\0')) {
     return {
@@ -125,7 +123,7 @@ export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number
       reason: `the parent CPU pool's endpoint ${JSON.stringify(parent.socket)} is not a socket path`,
     };
   }
-  const lease = await holdLease(parent.socket, { op: 'cpu-pool', want: ask }, 'the parent CPU pool', {
+  const lease = await holdLease(parent.socket, { op: 'cpu-pool', want }, 'the parent CPU pool', {
     ackMs: 2_000,
     afterCloseMs: 5_000,
     grantMs: null,
@@ -134,12 +132,12 @@ export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number
     return lease;
   }
   const tokens = lease.answer.tokens;
-  if (typeof tokens !== 'number' || !Number.isInteger(tokens) || tokens < 1 || tokens > ask) {
+  if (typeof tokens !== 'number' || !Number.isInteger(tokens) || tokens < 1 || tokens > want) {
     lease.release();
     return {
       granted: false,
       cause: 'other',
-      reason: `the parent CPU pool granted ${JSON.stringify(tokens)} tokens for ${ask}`,
+      reason: `the parent CPU pool granted ${JSON.stringify(tokens)} tokens for ${want}`,
     };
   }
   return { granted: true, tokens, release: lease.release, closed: lease.closed, inherited: true };

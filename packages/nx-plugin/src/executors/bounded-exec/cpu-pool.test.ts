@@ -72,7 +72,7 @@ async function openPool(tokens: number, closed: Promise<void> = NEVER): Promise<
 
 /** A granted lease for a child that the pool must admit: a refusal here is a test failure. */
 async function takeOrThrow(parent: InheritedCpuPool, want: number): Promise<Granted> {
-  const grant = await takeParentCpuTokens(parent, want, 8);
+  const grant = await takeParentCpuTokens(parent, want);
   if (!grant.granted) {
     throw new Error(`the pool refused ${want} tokens: ${grant.reason}`);
   }
@@ -80,11 +80,11 @@ async function takeOrThrow(parent: InheritedCpuPool, want: number): Promise<Gran
 }
 
 /**
- * The count a child is granted for `want` at `cores`. The grant is released and its close awaited before
+ * The count a child is granted for `want`. The grant is released and its close awaited before
  * returning, so the next ask starts from the pool as this one left it.
  */
-async function grantedFor(parent: InheritedCpuPool, want: number, cores: number): Promise<number> {
-  const grant = await takeParentCpuTokens(parent, want, cores);
+async function grantedFor(parent: InheritedCpuPool, want: number): Promise<number> {
+  const grant = await takeParentCpuTokens(parent, want);
   if (!grant.granted) {
     throw new Error(`the pool refused ${want} tokens: ${grant.reason}`);
   }
@@ -301,18 +301,18 @@ describe('the parent-held CPU pool', () => {
   it('treats a dead or non-socket endpoint as absent, and a malformed endpoint as no pool', async () => {
     const { pool, parent } = await openPool(2);
     expect(await pool.close()).toEqual({ ok: true });
-    expect(await takeParentCpuTokens(parent, 1, 2)).toMatchObject({ granted: false, cause: 'absent' });
+    expect(await takeParentCpuTokens(parent, 1)).toMatchObject({ granted: false, cause: 'absent' });
 
     const stale = await ownedSocketDirectory('cpu-stale-', 'p.sock');
     directories.push(stale);
     await writeFile(join(stale, 'p.sock'), 'not a socket');
-    expect(await takeParentCpuTokens({ socket: join(stale, 'p.sock'), tokens: 2 }, 1, 2)).toMatchObject({
+    expect(await takeParentCpuTokens({ socket: join(stale, 'p.sock'), tokens: 2 }, 1)).toMatchObject({
       granted: false,
       cause: 'absent',
     });
 
     expect(readInheritedCpuPool({ [CPU_POOL_ENV]: 'a\0b', [CPU_TOKENS_ENV]: '2' })).toBeNull();
-    expect(await takeParentCpuTokens({ socket: 'a\0b', tokens: 2 }, 1, 2)).toMatchObject({
+    expect(await takeParentCpuTokens({ socket: 'a\0b', tokens: 2 }, 1)).toMatchObject({
       granted: false,
       cause: 'other',
     });
@@ -380,43 +380,40 @@ describe('the parent-held CPU pool', () => {
     const upstream = await openPool(4);
     const lent = await takeOrThrow(upstream.parent, 2);
     const sub = await openPool(lent.tokens, lent.closed);
-    const grandchild = await takeParentCpuTokens(sub.parent, 2, 2);
+    const grandchild = await takeParentCpuTokens(sub.parent, 2);
     if (!grandchild.granted) {
       throw new Error(`the sub-pool refused its grandchild: ${grandchild.reason}`);
     }
-    expect(grandchild.tokens).toBe(1);
+    // The grandchild asks its whole want and the sub-pool grants all it was lent.
+    expect(grandchild.tokens).toBe(2);
 
     expect(await upstream.pool.close()).toEqual({ ok: true });
     await lent.closed;
     await grandchild.closed;
     expect(await sub.pool.close()).toEqual({ ok: true });
     expect(existsSync(dirname(sub.parent.socket))).toBe(false);
-    expect(await takeParentCpuTokens(sub.parent, 1, 2)).toMatchObject({ granted: false, cause: 'absent' });
-    expect(await takeParentCpuTokens(upstream.parent, 1, 8)).toMatchObject({ granted: false, cause: 'absent' });
+    expect(await takeParentCpuTokens(sub.parent, 1)).toMatchObject({ granted: false, cause: 'absent' });
+    expect(await takeParentCpuTokens(upstream.parent, 1)).toMatchObject({ granted: false, cause: 'absent' });
   });
 
-  it('asks for min(want, inherited count, ceil(cores / 2)), and the grant follows that ask', async () => {
+  it('asks for its own want whatever count it inherited, and the grant follows that ask', async () => {
     const cases = [
-      { want: 1, inherited: 8, cores: 8, tokens: 1 },
-      { want: 8, inherited: 2, cores: 8, tokens: 2 },
-      { want: 8, inherited: 8, cores: 8, tokens: 4 },
-      { want: 8, inherited: 8, cores: 5, tokens: 3 },
-      { want: 8, inherited: 8, cores: 3, tokens: 2 },
-      { want: 8, inherited: 8, cores: 1, tokens: 1 },
+      { want: 1, inherited: 8, tokens: 1 },
+      { want: 8, inherited: 2, tokens: 8 },
+      { want: 8, inherited: 8, tokens: 8 },
+      { want: 3, inherited: 1, tokens: 3 },
     ];
     for (const check of cases) {
-      // A fresh full pool isolates the clamp from delivery of the previous client's close event.
+      // A fresh full pool isolates each ask from delivery of the previous client's close event.
       const { parent } = await openPool(8);
-      expect(await grantedFor({ socket: parent.socket, tokens: check.inherited }, check.want, check.cores)).toBe(
-        check.tokens,
-      );
+      expect(await grantedFor({ socket: parent.socket, tokens: check.inherited }, check.want)).toBe(check.tokens);
     }
   });
 
   it('never grants more than the live pool holds, even when the inherited count claims more', async () => {
     const { parent } = await openPool(2);
-    // The child's descriptor claims 8 tokens: the ask is min(8, 8, 8), but the live pool holds 2 and grants 2.
-    expect(await grantedFor({ socket: parent.socket, tokens: 8 }, 8, 16)).toBe(2);
+    // The child asks 8, but the live pool holds 2 and grants 2.
+    expect(await grantedFor({ socket: parent.socket, tokens: 8 }, 8)).toBe(2);
   });
 
   it('reports a teardown that cannot remove its directory, and reports the same outcome on every close', async () => {

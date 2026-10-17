@@ -15,9 +15,11 @@
 //!
 
 //! Fairness only acts when a grant is made: a running nextest or cargo cannot hand tokens back.
-//! A gate blocks new background root admissions and takes returned tokens first. Existing grants
-//! drain whole; their FIFOs, implicit make token and test-thread sizing are never resized. The
-//! gate's bounded admission diagnoses holders rather than freezing their running tests.
+//! Class ranks first: while any gate-class request waits, every returned token goes to gate-class
+//! work and background requests stay queued. A land's gate runs as a gate job whose pool relays
+//! each of its tasks' asks here at gate class (`jobserver.rs`), so land work is served at every
+//! return, task by task, and concurrent lands share by the same checkout fairness. Existing
+//! grants drain whole; their FIFOs, implicit make token and test-thread sizing are never resized.
 //!
 //! [`Ledger`] is the whole policy as a pure state machine; [`CpuBudget`] is the thin actor that
 //! feeds it requests and departures and answers status.
@@ -154,105 +156,38 @@ impl Ledger {
         self.admit(now, effects);
     }
 
-    /// Grant waiters while tokens are free, fairest first.
+    /// Grant waiters while tokens are free: gate class FIFO first, background fairest.
     ///
-    /// The next grant goes to the waiting checkout that holds the fewest tokens (the older head
-    /// waiter on a tie), to its oldest waiter. A checkout's fair share is the host total divided
-    /// among the checkouts holding or waiting; its claim is what remains of that share, at least
-    /// one. While another checkout waits, the grant is exactly the claim or the `want`, whichever
-    /// is smaller, so nobody outruns a waiting peer; with nobody else waiting it is every free
-    /// token up to `want`. A head waiter whose least grant is not free yet waits for it, and so
-    /// does everyone behind it: skipping to a smaller request would starve a large one for good.
+    /// While any gate-class request waits, the oldest one, wherever it sits in its checkout's
+    /// queue, takes `min(want, free)` once a token is free: a land's tasks take returned tokens
+    /// before queued background work, in the order they asked. Background is not starved
+    /// meanwhile: a background checkout that waits holding nothing still gets one token first,
+    /// as long as background as a whole then still holds less than half the host, so gate-class
+    /// work always holds the larger part.
+    ///
+    /// With no gate-class request waiting, background is fair between checkouts. The next grant
+    /// goes to the waiting checkout that holds the fewest tokens (the older head waiter on a
+    /// tie), to its oldest waiter. A checkout's fair share is the host total divided among the
+    /// checkouts holding or waiting; its claim is what remains of that share, at least one. While
+    /// another checkout waits, the grant is exactly the claim or the `want`, whichever is smaller,
+    /// so nobody outruns a waiting peer; with nobody else waiting it is every free token up to
+    /// `want`. A head waiter whose least grant is not free yet waits for it, and so does everyone
+    /// behind it: skipping to a smaller request would starve a large one for good.
     fn admit(&mut self, now: Instant, effects: &mut Vec<Effect>) {
         while self.free > 0 {
-            // One live fleet gate. Its children draw from its parent-held sub-ledger, not here.
-            if self.checkouts.values().any(|checkout| {
-                checkout
-                    .running
-                    .iter()
-                    .any(|holder| holder.class == JobserverClass::Gate)
-            }) {
-                return;
-            }
-            // A gate can be behind background work in the same checkout's queue. Select it by
-            // its ticket across every queue, without letting background churn consume returns.
-            let gate = self
-                .checkouts
-                .iter()
-                .flat_map(|(name, checkout)| {
-                    checkout
-                        .waiting
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, waiter)| waiter.class == JobserverClass::Gate)
-                        .map(move |(position, waiter)| (Arc::clone(name), position, waiter.ticket))
-                })
-                .min_by_key(|(_, _, ticket)| *ticket);
-            if let Some((name, position, _)) = gate {
-                let checkout = self
-                    .checkouts
-                    .get_mut(&name)
-                    .expect("chosen checkout exists");
-                let waiter = checkout
-                    .waiting
-                    .remove(position)
-                    .expect("chosen gate exists");
-                let tokens = waiter.want.min(self.free);
-                checkout.held += tokens;
-                checkout.running.push(Holder {
-                    ticket: waiter.ticket,
-                    class: waiter.class,
-                    tokens,
-                });
-                self.free -= tokens;
-                effects.push(Effect::Grant {
-                    ticket: waiter.ticket,
-                    tokens,
-                    want: waiter.want,
-                    waited: now.saturating_duration_since(waiter.asked),
-                    checkout: name,
-                    claim: waiter.claim,
-                });
-                return;
-            }
-
-            // Some checkout waits whenever the loop gets past this, so the map is not empty.
-            let Some((name, checkout)) = self
-                .checkouts
-                .iter()
-                .filter_map(|(name, checkout)| Some((name, checkout, checkout.waiting.front()?)))
-                .min_by_key(|(_, checkout, head)| (checkout.held, head.ticket))
-                .map(|(name, checkout, _)| (name, checkout))
+            let Some((name, position, tokens)) =
+                self.next_gate().or_else(|| self.next_background())
             else {
                 return;
             };
-            let share = (self.total / self.checkouts.len()).max(1);
-            let head = checkout
-                .waiting
-                .front()
-                .expect("chosen for its head waiter");
-            let least = head.want.min(share.saturating_sub(checkout.held).max(1));
-            let peers_wait = self
-                .checkouts
-                .iter()
-                .any(|(other, peer)| other != name && !peer.waiting.is_empty());
-            if peers_wait && self.free < least {
-                return;
-            }
-            let tokens = if peers_wait {
-                least
-            } else {
-                head.want.min(self.free)
-            };
-            let name = Arc::clone(name);
             let checkout = self
                 .checkouts
                 .get_mut(&name)
                 .expect("the chosen checkout is present");
             let waiter = checkout
                 .waiting
-                .pop_front()
-                .expect("chosen for its head waiter");
+                .remove(position)
+                .expect("the chosen waiter is queued");
             checkout.held += tokens;
             checkout.running.push(Holder {
                 ticket: waiter.ticket,
@@ -269,6 +204,78 @@ impl Ledger {
                 claim: waiter.claim,
             });
         }
+    }
+
+    /// The next grant while gate-class work waits: a starved background checkout's one token,
+    /// else the oldest gate-class request's `min(want, free)`. `None` when no gate-class request
+    /// waits.
+    fn next_gate(&self) -> Option<(Arc<str>, usize, usize)> {
+        let (gate, position, _) = self
+            .checkouts
+            .iter()
+            .flat_map(|(name, checkout)| {
+                checkout
+                    .waiting
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, waiter)| waiter.class == JobserverClass::Gate)
+                    .map(move |(position, waiter)| (name, position, waiter.ticket))
+            })
+            .min_by_key(|(_, _, ticket)| *ticket)?;
+        let background: usize = self
+            .checkouts
+            .values()
+            .flat_map(|checkout| &checkout.running)
+            .filter(|holder| holder.class == JobserverClass::Background)
+            .map(|holder| holder.tokens)
+            .sum();
+        let starved = (2 * (background + 1) < self.total)
+            .then(|| {
+                self.checkouts
+                    .iter()
+                    .filter(|(_, checkout)| checkout.held == 0)
+                    .filter_map(|(name, checkout)| {
+                        let (position, waiter) = checkout
+                            .waiting
+                            .iter()
+                            .enumerate()
+                            .find(|(_, waiter)| waiter.class == JobserverClass::Background)?;
+                        Some((name, position, waiter.ticket))
+                    })
+                    .min_by_key(|(_, _, ticket)| *ticket)
+            })
+            .flatten();
+        Some(match starved {
+            Some((name, position, _)) => (Arc::clone(name), position, 1),
+            None => {
+                let want = self.checkouts[gate].waiting[position].want;
+                (Arc::clone(gate), position, want.min(self.free))
+            }
+        })
+    }
+
+    /// The next background grant by checkout fairness, or `None` when nobody can be granted now.
+    fn next_background(&self) -> Option<(Arc<str>, usize, usize)> {
+        let (name, checkout, head) = self
+            .checkouts
+            .iter()
+            .filter_map(|(name, checkout)| Some((name, checkout, checkout.waiting.front()?)))
+            .min_by_key(|(_, checkout, head)| (checkout.held, head.ticket))?;
+        let share = (self.total / self.checkouts.len()).max(1);
+        let least = head.want.min(share.saturating_sub(checkout.held).max(1));
+        let peers_wait = self
+            .checkouts
+            .iter()
+            .any(|(other, peer)| other != name && !peer.waiting.is_empty());
+        if peers_wait && self.free < least {
+            return None;
+        }
+        let tokens = if peers_wait {
+            least
+        } else {
+            head.want.min(self.free)
+        };
+        Some((Arc::clone(name), 0, tokens))
     }
 
     pub(crate) fn status(&self) -> CpuBudgetStatus {
@@ -469,6 +476,28 @@ mod tests {
             checkout: &str,
             want: usize,
         ) -> Vec<(Ticket, usize)> {
+            self.ask_as(ms, ticket, checkout, want, JobserverClass::Background)
+        }
+
+        /// A land task's ask: what a gate job's relay pool sends for each child.
+        fn ask_land(
+            &mut self,
+            ms: u64,
+            ticket: Ticket,
+            checkout: &str,
+            want: usize,
+        ) -> Vec<(Ticket, usize)> {
+            self.ask_as(ms, ticket, checkout, want, JobserverClass::Gate)
+        }
+
+        fn ask_as(
+            &mut self,
+            ms: u64,
+            ticket: Ticket,
+            checkout: &str,
+            want: usize,
+            class: JobserverClass,
+        ) -> Vec<(Ticket, usize)> {
             let now = self.origin + Duration::from_millis(ms);
             self.ledger.ask(
                 Arc::from(checkout),
@@ -477,7 +506,7 @@ mod tests {
                     want: NonZeroUsize::new(want).unwrap().get(),
                     asked: now,
                     claim: Claim::new(&format!("t{ticket}"), Some(7)),
-                    class: JobserverClass::Background,
+                    class,
                 },
                 &mut self.effects,
             );
@@ -645,6 +674,68 @@ mod tests {
         assert_eq!(clock.leave(3, 1), [(3, 1)]);
         // a is gone: c holds least, and with nobody else waiting takes the free token.
         assert_eq!(clock.leave(4, 2), [(4, 1)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn land_work_takes_every_returned_token_while_background_stays_queued() {
+        let mut clock = Clock::new(4);
+        for ticket in 1..=4 {
+            assert_eq!(clock.ask(0, ticket, "fleet", 1), [(ticket, 1)]);
+        }
+        assert_eq!(clock.ask(1, 5, "fleet", 1), []);
+        assert_eq!(clock.ask(1, 6, "other", 1), []);
+        // A land's tasks ask last, through its gate job's relay pool.
+        assert_eq!(clock.ask_land(2, 7, "land", 1), []);
+        assert_eq!(clock.ask_land(2, 8, "land", 1), []);
+        // Each returned token goes to the land, ahead of the older background waiters (which
+        // already hold most of the host), and a land task already running does not stop the next
+        // one from being admitted.
+        assert_eq!(clock.leave(3, 1), [(7, 1)]);
+        assert_eq!(clock.leave(4, 2), [(8, 1)]);
+        // With no land work waiting, ordinary fairness resumes.
+        assert_eq!(clock.leave(5, 3), [(6, 1)]);
+        assert_eq!(clock.leave(6, 4), [(5, 1)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn a_land_task_queued_behind_background_in_its_own_checkout_goes_first() {
+        let mut clock = Clock::new(2);
+        assert_eq!(clock.ask(0, 1, "ws", 2), [(1, 2)]);
+        assert_eq!(clock.ask(1, 2, "ws", 1), []);
+        assert_eq!(clock.ask_land(2, 3, "ws", 1), []);
+        // The land task is granted first; the token it leaves is background's again.
+        assert_eq!(clock.leave(3, 1), [(3, 1), (2, 1)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn concurrent_lands_are_served_in_the_order_they_asked() {
+        let mut clock = Clock::new(18);
+        assert_eq!(clock.ask_land(0, 1, "a", 18), [(1, 18)]);
+        assert_eq!(clock.ask_land(1, 2, "b", 18), []);
+        assert_eq!(clock.ask_land(1, 3, "a", 18), []);
+        assert_eq!(clock.ask(2, 4, "c", 18), []);
+        // c holds nothing, so it gets its one token; then b's task, older than a's second,
+        // takes the rest. A second land is never shut out by a first that is still running.
+        assert_eq!(clock.leave(3, 1), [(4, 1), (2, 17)]);
+        assert_eq!(clock.leave(4, 2), [(3, 17)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn land_work_holds_the_larger_part_without_starving_background() {
+        let mut clock = Clock::new(6);
+        assert_eq!(clock.ask(0, 1, "x", 6), [(1, 6)]);
+        assert_eq!(clock.ask_land(1, 2, "land", 6), []);
+        assert_eq!(clock.ask_land(1, 3, "land", 6), []);
+        assert_eq!(clock.ask(2, 4, "y", 1), []);
+        assert_eq!(clock.ask(2, 5, "x", 1), []);
+        // Each background checkout holding nothing gets one token while background stays under
+        // half the host; the land's oldest task takes the remaining four.
+        assert_eq!(clock.leave(3, 1), [(4, 1), (5, 1), (2, 4)]);
+        assert_eq!(clock.leave(4, 2), [(3, 4)]);
         assert!(clock.balanced());
     }
 }

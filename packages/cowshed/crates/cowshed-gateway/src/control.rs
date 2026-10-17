@@ -921,8 +921,9 @@ async fn serve<R, W>(
             command,
             options,
         }) => {
-            let (stake, granted) = services.cpu_budget.ask(
-                Arc::from(checkout),
+            let checkout: Arc<str> = Arc::from(checkout);
+            let admission = services.cpu_budget.ask(
+                Arc::clone(&checkout),
                 want,
                 Claim::new(&command, pid),
                 options.admission.class(),
@@ -930,11 +931,11 @@ async fn serve<R, W>(
             hold_jobserver(
                 reader,
                 writer,
-                stake,
-                granted,
+                admission,
                 services.jobserver.clone(),
                 options,
                 services.cpu_budget.clone(),
+                checkout,
             )
             .await;
         }
@@ -1051,11 +1052,11 @@ async fn hold<R, W, S, G>(
 async fn hold_jobserver<R, W, S>(
     mut reader: R,
     mut writer: W,
-    stake: S,
-    granted: tokio::sync::oneshot::Receiver<usize>,
+    (stake, granted): (S, tokio::sync::oneshot::Receiver<usize>),
     fifos: crate::jobserver::JobserverFifos,
     options: JobserverOptions,
     budget: CpuBudget,
+    checkout: Arc<str>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -1116,7 +1117,20 @@ async fn hold_jobserver<R, W, S>(
         }
     };
     let pool = if let Some(job) = options.pool_job {
-        match fifos.create_pool(tokens, &job.workspace_incarnation) {
+        // A gate's children rank as the gate does, at every return; background children share
+        // the grant they were lent.
+        let source = match options.admission {
+            crate::jobserver::JobserverAdmission::Gate { .. } => {
+                crate::jobserver::PoolSource::Relay {
+                    host: budget.clone(),
+                    checkout,
+                }
+            }
+            crate::jobserver::JobserverAdmission::Background => crate::jobserver::PoolSource::Lent(
+                std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
+            ),
+        };
+        match fifos.create_pool(source, &job.workspace_incarnation) {
             Ok(pool) => {
                 cowshed_os::timing::event("jobserver", || {
                     format!(

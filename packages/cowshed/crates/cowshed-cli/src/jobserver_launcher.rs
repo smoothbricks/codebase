@@ -190,17 +190,19 @@ fn plan(get: &impl Fn(&str) -> Option<String>, arguments: &[OsString]) -> Plan {
 
     if let Some(socket) =
         get("BOUNDED_EXEC_CPU_POOL").filter(|value| !value.is_empty() && !value.contains('\0'))
-        && let Some(tokens) = get("BOUNDED_EXEC_CPU_TOKENS")
+        && get("BOUNDED_EXEC_CPU_TOKENS")
             .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
+            .is_some_and(|value| value > 0)
     {
         if compiles_nothing(arguments) {
             return Plan::Direct;
         }
-        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        // The count proves a whole descriptor; neither it nor half the host bounds the ask, as
+        // for a root build, one per core. A lent pool grants at most what it holds, and a gate's
+        // relay pool asks the host for each child at gate class.
         return Plan::Parent {
             socket: PathBuf::from(socket),
-            want: tokens.min(cores.div_ceil(2)),
+            want: std::thread::available_parallelism().map_or(1, usize::from),
         };
     }
     if let Some(tokens) = get("BOUNDED_EXEC_CPU_TOKENS")
@@ -739,10 +741,13 @@ mod parent_pool_tests {
             ("BOUNDED_EXEC_CPU_POOL", "/private/live-parent.sock"),
             ("BOUNDED_EXEC_CPU_TOKENS", "3"),
         ]);
-        assert!(matches!(
+        assert_eq!(
             plan(&get, &arguments),
-            Plan::Parent { want: 1..=3, .. }
-        ));
+            Plan::Parent {
+                socket: PathBuf::from("/private/live-parent.sock"),
+                want: std::thread::available_parallelism().map_or(1, usize::from),
+            }
+        );
         assert_eq!(plan(&get, &[OsString::from("metadata")]), Plan::Direct);
     }
 }

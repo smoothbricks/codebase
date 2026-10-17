@@ -551,31 +551,33 @@ core count.
   runner count.
 - **Nested runners use a parent-held sub-ledger.** A granted executor serves its T tokens on a private socket and
   publishes that endpoint as `BOUNDED_EXEC_CPU_POOL`, beside its `BOUNDED_EXEC_CPU_TOKENS` count. A default nested
-  executor connects to its immediate parent's live pool, requests at most `min(want, inherited)`, and holds one complete
-  local grant on that connection. The pool accounts for every holding sibling, so their sum never exceeds T. It serves
-  its own FIFO queue, granting the head `min(requested, free)` once at least one token is free; that count is final, not
-  a partial holding awaiting more tokens. Queued siblings wait only for that pool's own holders. Host checkout fairness
-  remains the upstream ledger's concern. An admitted child serves its granted count as its own pool, and grandchildren
-  draw only from that pool: no holder waits for another grant from an ancestor or the host. The parent remains the owner
-  of its upstream grant. A child returns only its local allocation by closing its connection; it never releases the
-  parent's connection. Upstream loss revokes the downstream pool and its connections, so a dead parent cannot grant
-  tokens to a descendant. Losing a borrowed grant ends its still-running command through the normal TERM/grace/KILL path
-  and reports an ordinary CPU-grant-loss failure, never a timeout. If a bound already started terminating the command,
-  the loss still makes its verdict an ordinary failure; the existing termination owns the signals and grace, so losing
-  the grant starts no second teardown. A bare or invalid count proves no allocation; an absent endpoint follows normal
-  host admission. Once connected to the parent, refusal, silence or protocol failure is an ordinary admission failure,
-  never a second host take while that parent may still hold its grant. A stale descriptor whose endpoint no longer
-  connects is treated as absent. Only the executor publishes its actual live pool; `options.env` cannot inject either
-  marker into a command. The span and `cpu.inherited: true` record identify a parent-pool grant and its actual local
-  wait. Pool setup or cleanup failure is an ordinary failure, never a successful unaccounted run. Real-process
-  default-runner proofs live in `executor-host.test.ts` under `test-host`, because the default macOS runner acquires a
-  real RAM volume. Node peers import the built executor artifact named by `executors.json`; the host target's existing
-  build dependency produces it, rather than compiling TypeScript inside a test's guard. Pure pool and executor unit
-  cases never attach images. **Known admission ambiguity:** a connect error is currently classified as an absent
-  endpoint. A full listen backlog or local file-descriptor exhaustion can also prevent connection to a live pool, so
-  this classification does not yet prove that its parent has released the upstream grant. Distinguishing those cases
-  before any host fallback remains an admission follow-up; connected refusals and protocol errors already fail without a
-  second take.
+  executor connects to its immediate parent's live pool, requests its own demand (the count is not a bound on the ask:
+  the pool grants at most what it can), and holds one complete local grant on that connection. A background pool
+  accounts for every holding sibling, so their sum never exceeds T. It serves its own FIFO queue, granting the head
+  `min(requested, free)` once at least one token is free; that count is final, not a partial holding awaiting more
+  tokens. Queued siblings wait only for that pool's own holders. Host checkout fairness remains the upstream ledger's
+  concern. A gate job's pool is the exception: it lends nothing of its own and relays each child's ask to the host
+  ledger as a gate-class request for the gate's checkout ("Gate admission" below). An admitted child serves its granted
+  count as its own pool, and grandchildren draw only from that pool: no holder waits for another grant from an ancestor
+  or the host. The parent remains the owner of its upstream grant. A child returns only its local allocation by closing
+  its connection; it never releases the parent's connection. Upstream loss revokes the downstream pool and its
+  connections, so a dead parent cannot grant tokens to a descendant. Losing a borrowed grant ends its still-running
+  command through the normal TERM/grace/KILL path and reports an ordinary CPU-grant-loss failure, never a timeout. If a
+  bound already started terminating the command, the loss still makes its verdict an ordinary failure; the existing
+  termination owns the signals and grace, so losing the grant starts no second teardown. A bare or invalid count proves
+  no allocation; an absent endpoint follows normal host admission. Once connected to the parent, refusal, silence or
+  protocol failure is an ordinary admission failure, never a second host take while that parent may still hold its
+  grant. A stale descriptor whose endpoint no longer connects is treated as absent. Only the executor publishes its
+  actual live pool; `options.env` cannot inject either marker into a command. The span and `cpu.inherited: true` record
+  identify a parent-pool grant and its actual local wait. Pool setup or cleanup failure is an ordinary failure, never a
+  successful unaccounted run. Real-process default-runner proofs live in `executor-host.test.ts` under `test-host`,
+  because the default macOS runner acquires a real RAM volume. Node peers import the built executor artifact named by
+  `executors.json`; the host target's existing build dependency produces it, rather than compiling TypeScript inside a
+  test's guard. Pure pool and executor unit cases never attach images. **Known admission ambiguity:** a connect error is
+  currently classified as an absent endpoint. A full listen backlog or local file-descriptor exhaustion can also prevent
+  connection to a live pool, so this classification does not yet prove that its parent has released the upstream grant.
+  Distinguishing those cases before any host fallback remains an admission follow-up; connected refusals and protocol
+  errors already fail without a second take.
 - **Queued priority** (2026-10-11). The coordinator supplies each job's priority, an unsigned 32-bit integer, higher
   first, default 0. It orders queued bulk work and queued lands within their own queues; no value outranks the active
   gate or manufactures gate authority. A priority change re-keys pending work, never interrupts, resizes or restarts an
@@ -591,21 +593,32 @@ core count.
 - **All at once.** A request is granted once, in full, and never holds part of a grant while waiting for more, so no two
   requests can deadlock on each other's tokens.
 
-- **Gate admission by whole-grant drain** (2026-10-14). A jobserver root request carries a typed
-  `class: "background" | "gate"`; omission is background. A queued gate stops **new background root admissions** (both
-  jobserver and `cpu-tokens`). An in-flight background grant stays exactly as it is until its child exits or its
-  connection closes. The oldest queued gate takes `min(want, free)` whole tokens ahead of all queued background work,
-  including background requests earlier in the same checkout. One gate is active host-wide; while it holds its grant,
-  later gates and background roots stay queued. When it ends, the next gate wins, otherwise ordinary checkout fairness
-  resumes. This is priority on genuinely returned tokens, not a reserved budget, budget increase, or stolen allocation.
+- **Gate admission: FIFO ahead of background, never starving it** (2026-10-17, Danny tg#6693: "The gate class is served
+  FIFO at highest priority over all other execs … When gate runs it needs more tickets than background but not fully
+  starve background"). A jobserver root request carries a typed `class: "background" | "gate"`; omission is background.
+  While any gate-class request waits, the oldest one, wherever it sits in its checkout's queue, takes `min(want, free)`
+  once a token is free, ahead of every queued background request (both jobserver and `cpu-tokens`). Background is not
+  starved meanwhile: a background checkout that waits holding nothing is granted one token first, as long as background
+  as a whole then still holds less than half of N, so gate-class work holds the larger part. A running gate grant blocks
+  nobody: with no gate-class request waiting, ordinary checkout fairness serves background and later gates alike from
+  the free tokens. An in-flight background grant stays exactly as it is until its child exits or its connection closes.
+  This is priority on genuinely returned tokens, not a reserved budget, budget increase, or stolen allocation.
   Conservation remains `free + Σ held = N`.
-- **What drain priority does not guarantee.** A background test's CPU grant cannot be shrunk mid-run: Cargo's implicit
+- **A land is a gate job, and its tasks are gate-class requests.** The selecting authority is the land queue holder:
+  `~/Dev/.land-lock.sh` runs main's `tooling/land-host.sh`, the only path that gates a tree before `cowshed land`
+  fast-forwards to it, and it runs that gate as `cowshed exec <workspace> --class gate --host -- …`. The trusted route
+  alone grants the class (class-not-permitted for a worker). The job's own grant is the one token its orchestrator uses;
+  its pool relays every task's ask, from the host or from inside the sandbox, as a gate-class request for the
+  workspace's checkout. A land therefore takes returned tokens at every task, in the order its tasks ask, and is never
+  frozen at the width of its first grant. Same-repo lands are already serialized by the per-repository land lock; lands
+  of two repositories share by FIFO order, task by task, and neither holds the other out for its whole gate.
+- **What gate priority does not guarantee.** A background test's CPU grant cannot be shrunk mid-run: Cargo's implicit
   make token and libtest/nextest threads sized from the original grant do not return FIFO bytes. The gateway does not
   resize a running FIFO, kill peer work, or use `SIGSTOP`/`SIGCONT`: wall and idle bounds would keep advancing during a
-  freeze. A gate may have to wait for a **whole grant** to return. It has guaranteed admission once the background set
-  drains while its request is live, and queued background churn cannot overtake it, but no fixed latency is promised
-  while every token is genuinely held. Drain priority promises admission, not a fixed test duration. The supervisor's
-  separate nice placement below lowers background scheduling weight without raising a gate above default.
+  freeze. A gate-class request may have to wait for a returned token. It has guaranteed admission ahead of queued
+  background churn, but no fixed latency is promised while every token is genuinely held. Gate priority promises
+  admission order, not a fixed test duration. The supervisor's separate nice placement below lowers background
+  scheduling weight without raising a gate above default.
 - **A gate wait is bounded and diagnosed.** A gate jobserver request must name an explicit positive uint32 `waitMs`. The
   trusted operator request `cowshed exec <workspace> --class gate --host --want N [--wait-ms N] -- COMMAND [ARGS...]`
   defaults its gate wait to **120000 ms**; the explicit per-invocation `--wait-ms` overrides that admission bound only.
@@ -626,29 +639,28 @@ core count.
   withdraws the request without spawning. Missing/refused admission never causes an unbudgeted server spawn. The
   supervisor retains the allocation until the owned job concludes. The gateway's existing CpuBudget ledger serves that
   exact allocation on a private workspace-scoped CPU-pool endpoint; Nx bounded-exec and Cargo descendants borrow only
-  from it, with sibling sums bounded by its actual count. The root FIFO is not offered alongside the pool: that would
-  spend the same tokens twice. Its canonical endpoint is `<store>/run/cpu/<base64url-incarnation>/<opaque-endpoint>`:
-  the unpadded 22-byte incarnation component losslessly encodes all 128 bits of the validated 32-lowercase-hex workspace
-  incarnation, never a digest or truncated prefix. The opaque endpoint is an independent 22-byte unpadded base64url
-  UUID. The gateway, sandbox builder and grant validator derive this one layout through the same helper; there is no
-  runtime alias or fallback. This adds 54 bytes to the store prefix, giving a 98-byte socket path for the existing
-  44-byte fixture store, within Darwin's 103-byte usable limit. Arbitrarily long store paths do not acquire a new
-  short-link lifecycle. A bare count/class is no gate role. The owned command is placed at **nice0 for Gate, nice+10 for
-  Background**, never the shared warm host or supervisor. Raising a gate above default requires root and is not
-  attempted; priority lowers background nice instead. Nice is applied and read back before command execution, using the
-  held-child fence on macOS and a private report pipe on Linux. Refusal is typed PriorityFailure, not an unobserved run.
-  Class, scope, actual tokens and observed nice are recorded; nice remains absent when never observed. A HostGate is a
-  coordinator-only argv one-shot on the host, outside ExecutedChild, preserving the real-APFS gate's host authority; no
-  ordinary workspace sandbox is loosened. Controller discovery uses only `cargo locate-project` and
-  `cargo metadata --no-deps --offline`, which retain their noncompiling exemption: no grant, class nice or job record is
-  claimed for that discovery.
+  from it, with sibling sums bounded by its actual count, or, for a gate job, through it as gate-class host requests.
+  The root FIFO is not offered alongside the pool: that would spend the same tokens twice. Its canonical endpoint is
+  `<store>/run/cpu/<base64url-incarnation>/<opaque-endpoint>`: the unpadded 22-byte incarnation component losslessly
+  encodes all 128 bits of the validated 32-lowercase-hex workspace incarnation, never a digest or truncated prefix. The
+  opaque endpoint is an independent 22-byte unpadded base64url UUID. The gateway, sandbox builder and grant validator
+  derive this one layout through the same helper; there is no runtime alias or fallback. This adds 54 bytes to the store
+  prefix, giving a 98-byte socket path for the existing 44-byte fixture store, within Darwin's 103-byte usable limit.
+  Arbitrarily long store paths do not acquire a new short-link lifecycle. A bare count/class is no gate role. The owned
+  command is placed at **nice0 for Gate, nice+10 for Background**, never the shared warm host or supervisor. Raising a
+  gate above default requires root and is not attempted; priority lowers background nice instead. Nice is applied and
+  read back before command execution, using the held-child fence on macOS and a private report pipe on Linux. Refusal is
+  typed PriorityFailure, not an unobserved run. Class, scope, actual tokens and observed nice are recorded; nice remains
+  absent when never observed. A HostGate is a coordinator-only argv one-shot on the host, outside ExecutedChild,
+  preserving the real-APFS gate's host authority; no ordinary workspace sandbox is loosened. Controller discovery uses
+  only `cargo locate-project` and `cargo metadata --no-deps --offline`, which retain their noncompiling exemption: no
+  grant, class nice or job record is claimed for that discovery.
 - **Work-conserving.** No grant is capped below `want` for fairness' sake: with nobody else waiting, a grant is
   `min(want, free)`, so a lone runner may hold all N tokens, because idle tokens help nobody and a gate's wall time is
   what the budget buys. A lone waiter also takes the remaining free tokens when fewer than its fair share are free: on
   an 18-token host, a runner holding 12 does not make the sole newcomer wait instead of taking the idle 6. What a
   newcomer does not get a reserved half. Ordinary checkout fairness (the share rule above) still bounds a grant while
-  another ordinary checkout waits. Gate admission is the explicit drain-priority exception: an active gate blocks new
-  background roots even when its requested count leaves tokens idle.
+  another ordinary checkout waits. Gate admission orders who is served first; it never leaves a token idle.
 - **Dynamic QoS.** A job's class states what it is; its band states how the host schedules it now, and the two move
   independently. Four bands, in scheduler order: **foreground**, **normal**, **utility**, **background**. The land turn
   — its holder and the gate lineage that follows it — and any job a model is waiting on run **foreground**. Ordinary
@@ -701,7 +713,7 @@ core count.
     `cargo` a build script starts: it runs `cargo` as asked, since that jobserver already counts it.
 
   - **A live parent CPU pool** (`BOUNDED_EXEC_CPU_POOL` plus its positive count): a compiling Cargo asks that pool for
-    at most `min(count, ceil(cores / 2))` local tokens, never a second host grant. It requests
+    one token per core, as a root build does, never a second host grant. It requests
     `{"op":"cpu-pool","want":<n>,"children":true}`; the existing pool accounts for this holder and serves its actual
     grant as a private child pool, named by `pool` in the granted reply. Cargo's jobs/test variables and inherited count
     are set to the actual local grant, and descendants receive that child pool, not the occupied ancestor. Cargo's own
@@ -799,8 +811,8 @@ chooses which ready unit acquires a lease. Strong models propose task boundaries
   observed stays unknown rather than becoming headroom. `TaskClass` is the work-unit ordering and placement axis, not
   the root-admission `JobserverClass` axis. Selected work-unit asks use `JobserverClass::Background`, including units in
   the `TaskClass::Gate` band; a task band must not create an exclusive gate root per group. The trusted execution
-  boundary owns the one host-wide `JobserverClass::Gate` grant; its coordinator groups share that grant's existing child
-  pool concurrently.
+  boundary owns the `JobserverClass::Gate` grant; its coordinator groups ask through that grant's relay pool
+  concurrently.
 - **Wire.** `task-admit` is held exactly like `cpu-tokens` —
   `{"op":"task-admit","unit":…,"owner":…,"incarnation": …,"deps":[…],"leases":[…],"want":<n>,"priority":<u32>,"urgent":true,"class":"background","cost":<u64>,"deadline": <epoch-ms>,"command":…}`
   — answered `queued` at once and a granted `taskGrant` (`unit`, `band`, `caps`, `cpuTokens`) when the scheduler selects

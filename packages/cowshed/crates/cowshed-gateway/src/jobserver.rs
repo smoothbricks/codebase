@@ -53,7 +53,7 @@ pub(crate) struct JobserverFifos {
 
 impl JobserverFifos {
     /// The trusted job identity chooses the workspace IPC scope; clients cannot name a path.
-    pub(crate) fn create_pool(&self, tokens: usize, incarnation: &str) -> io::Result<CpuPool> {
+    pub(crate) fn create_pool(&self, source: PoolSource, incarnation: &str) -> io::Result<CpuPool> {
         let store = self.directory.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -62,7 +62,7 @@ impl JobserverFifos {
         })?;
         let directory = cowshed_gateway_types::cpu_pool_directory(store, incarnation)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        CpuPool::start(std::sync::Arc::new(directory), tokens)
+        CpuPool::start(std::sync::Arc::new(directory), source)
     }
 
     /// Name the fifo directory, sweeping a previous gateway's leftover fifos.
@@ -155,15 +155,30 @@ impl JobserverFifo {
 
 use std::os::unix::io::AsRawFd as _;
 
-/// One actual parent allocation. Its actor uses the same ledger as host admission, with a single
-/// checkout so local sibling grants retain the existing parent pool's FIFO/min(want,free) policy.
+/// Where a pool's children take their tokens.
+pub(crate) enum PoolSource {
+    /// A background grant's own allocation. Its actor uses the same ledger as host admission,
+    /// with a single checkout, so sibling grants keep the parent pool's FIFO/min(want,free) policy
+    /// and never sum past it.
+    Lent(std::num::NonZeroUsize),
+    /// A gate grant: each child asks the host budget itself, at gate class, for the gate's
+    /// checkout. A land's tasks therefore rank ahead of background work at every token any holder
+    /// returns, and concurrent lands share by checkout fairness; no allocation is held idle
+    /// between tasks and no running grant needs to shrink.
+    Relay {
+        host: crate::cpu_budget::CpuBudget,
+        checkout: std::sync::Arc<str>,
+    },
+}
+
+/// One pool endpoint serving a granted job's children.
 pub(crate) struct CpuPool {
     path: PathBuf,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CpuPool {
-    fn start(directory: std::sync::Arc<PathBuf>, tokens: usize) -> io::Result<Self> {
+    fn start(directory: std::sync::Arc<PathBuf>, source: PoolSource) -> io::Result<Self> {
         use base64::Engine as _;
         use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
         std::fs::DirBuilder::new()
@@ -178,10 +193,16 @@ impl CpuPool {
         let listener =
             cowshed_os::fork_lock::Fenced::create(|| tokio::net::UnixListener::bind(&path))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        let budget = crate::cpu_budget::CpuBudget::start(crate::cpu_budget::CpuBudgetLimits {
-            tokens: std::num::NonZeroUsize::new(tokens).expect("a parent grant is nonzero"),
-        });
-        let checkout: std::sync::Arc<str> = std::sync::Arc::from("parent-pool");
+        let (budget, checkout, class) = match source {
+            PoolSource::Lent(tokens) => (
+                crate::cpu_budget::CpuBudget::start(crate::cpu_budget::CpuBudgetLimits { tokens }),
+                std::sync::Arc::from("parent-pool"),
+                cowshed_gateway_types::JobserverClass::Background,
+            ),
+            PoolSource::Relay { host, checkout } => {
+                (host, checkout, cowshed_gateway_types::JobserverClass::Gate)
+            }
+        };
         let task = tokio::spawn(async move {
             let mut children = tokio::task::JoinSet::new();
             loop {
@@ -193,7 +214,7 @@ impl CpuPool {
                             .expect("polling socket accept runs an infallible closure")).await
                     } => match accepted {
                         Ok((stream, _)) => {
-                            children.spawn(serve_pool(cowshed_os::fork_lock::Fenced::new(stream), budget.clone(), std::sync::Arc::clone(&checkout), std::sync::Arc::clone(&directory)));
+                            children.spawn(serve_pool(cowshed_os::fork_lock::Fenced::new(stream), budget.clone(), std::sync::Arc::clone(&checkout), class, std::sync::Arc::clone(&directory)));
                         }
                         Err(error) => { eprintln!("cowshed: CPU pool listener failed: {error}"); break; }
                     },
@@ -286,6 +307,7 @@ async fn serve_pool(
     stream: cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
     budget: crate::cpu_budget::CpuBudget,
     checkout: std::sync::Arc<str>,
+    class: cowshed_gateway_types::JobserverClass,
     directory: std::sync::Arc<PathBuf>,
 ) {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
@@ -319,7 +341,7 @@ async fn serve_pool(
         checkout,
         want,
         crate::disk_lease::Claim::new("child CPU pool", None),
-        cowshed_gateway_types::JobserverClass::Background,
+        class,
     );
     if pool_reply(reader.get_mut(), &PoolGrant::Queued { ok: true })
         .await
@@ -339,7 +361,8 @@ async fn serve_pool(
         _ = reader.read(&mut byte) => return,
     };
     let pool = if children {
-        match CpuPool::start(directory, tokens) {
+        let tokens = std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero");
+        match CpuPool::start(directory, PoolSource::Lent(tokens)) {
             Ok(pool) => Some(pool),
             Err(error) => {
                 let _ = pool_reply(reader.get_mut(), &serde_json::json!({"ok":false,"code":"rejected","error":format!("cannot serve child CPU pool: {error}")})).await;
@@ -433,7 +456,10 @@ mod tests {
         assert!(previous_layout.as_os_str().as_encoded_bytes().len() >= 104);
         let fifos = JobserverFifos::start(store.join("jobserver"));
         let pool = fifos
-            .create_pool(2, incarnation)
+            .create_pool(
+                PoolSource::Lent(std::num::NonZeroUsize::new(2).unwrap()),
+                incarnation,
+            )
             .expect("the actual private pool binds");
         let endpoint = pool.path().to_owned();
         assert_eq!(
