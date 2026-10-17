@@ -17,15 +17,18 @@ export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
  * A test target's one bound: the `idleTimeoutMs` with which no test may go unfinished, the hang backstop of
  * specs/cowshed/08_testing.md. It is no wall-clock ceiling: a suite that keeps finishing tests runs as long as it
  * needs. It is the longest any single test may run, so it stays above every slow-timeout class in the plugin's
- * nextest.toml and every bun `--timeout`.
+ * nextest.toml; a bun leg has no per-test deadline of its own (`BUN_TEST_TIMEOUT_FLAG`).
  */
 export const BOUNDED_TEST_IDLE_TIMEOUT_MS = 180_000;
 export const BOUNDED_TEST_KILL_AFTER_MS = 10_000;
-// Per-test timeout passed to `bun test --timeout=<ms>`. Bun's default is
-// 5000ms which is too tight for git-fixture tests on slower CI runners
-// (Actions). The bunfig.toml `[test] timeout` key is silently ignored by
-// Bun — the only working surfaces are this CLI flag and `setDefaultTimeout()`.
-export const BOUNDED_TEST_PER_TEST_TIMEOUT_MS = 30_000;
+/**
+ * Deletes Bun's per-test deadline: 5000 ms unless the command sets one, and Bun ignores a bunfig `[test] timeout`, so
+ * the flag is the one place to set it. `0` means no deadline (measured on the pinned Bun 1.4.2: a test blocked 12 s in
+ * `spawnSync` and one sleeping 7 s both pass under `--timeout=0`). A test waits for the event it is waiting for, and
+ * the leg's `idleTimeoutMs` ends a test that never returns; no per-test bound kills a test, however long a loaded host
+ * makes its work take (specs/cowshed/08_testing.md).
+ */
+export const BUN_TEST_TIMEOUT_FLAG = '--timeout=0';
 
 export interface BoundedTestPolicyPackageJson {
   name?: string;
@@ -428,7 +431,7 @@ function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowe
     // A test leg is bounded by progress alone: a wall-clock ceiling fails a suite that is only slow.
     rawOptions.timeoutMs === undefined &&
     isPositiveSafeInteger(rawOptions.idleTimeoutMs) &&
-    bunTestTimeoutIsBounded(command, rawOptions.idleTimeoutMs) &&
+    bunTestHasNoDeadline(command) &&
     typeof rawOptions.cwd === 'string' &&
     // `bun test` walks its working directory looking for test files, so it must start where that walk is cheap: the
     // project root or its `src/`. Any other command names what it runs and has no walk to bound. A cargo workspace's
@@ -439,21 +442,14 @@ function isBoundedExecutionTarget(executor: unknown, rawOptions: unknown, allowe
   );
 }
 
-/** A bun leg's per-test `--timeout` must fire before the leg's progress bound would. */
-function bunTestTimeoutIsBounded(command: string, idleTimeoutMs: number): boolean {
+/** A bun leg deletes Bun's per-test deadline with `BUN_TEST_TIMEOUT_FLAG` and sets no other. */
+function bunTestHasNoDeadline(command: string): boolean {
   if (!BUN_TEST_PREFIX.test(command)) {
     return true;
   }
   let found = false;
-  for (const match of command.matchAll(/(?:^|\s)--timeout(?==|\s|$)(?:=(\S*)|\s+(\S+))?/g)) {
-    const value = match[1] ?? match[2];
-    const perTestTimeoutMs = Number(value);
-    if (
-      value === undefined ||
-      !/^\d+$/.test(value) ||
-      !isPositiveSafeInteger(perTestTimeoutMs) ||
-      perTestTimeoutMs > idleTimeoutMs
-    ) {
+  for (const match of command.matchAll(/(?:^|\s)(--timeout(?==|\s|$)\S*)/g)) {
+    if (match[1] !== BUN_TEST_TIMEOUT_FLAG) {
       return false;
     }
     found = true;
@@ -605,23 +601,19 @@ function resolveTargetCommand(existingTarget: unknown): string | null {
 const BUN_TEST_PREFIX = /^bun\s+test(?=\s|$)/;
 const EXISTING_BUN_TIMEOUT = /(^|\s)--timeout(?:=|\s+)(\S+)/;
 
-// Bun's `[test] timeout` bunfig key is silently ignored — only the CLI flag
-// and `setDefaultTimeout()` actually take effect. Normalize every `bun test`
-// command so the policy enforces the workspace per-test timeout in the one
-// place where Bun will honor it.
-export function ensureBunTestTimeoutFlag(command: string, timeoutMs = BOUNDED_TEST_PER_TEST_TIMEOUT_MS): string {
+// Normalize every `bun test` command to `BUN_TEST_TIMEOUT_FLAG`, the one place Bun honors a per-test bound.
+export function ensureBunTestTimeoutFlag(command: string): string {
   if (!BUN_TEST_PREFIX.test(command)) {
     return command;
   }
-  const flag = `--timeout=${timeoutMs}`;
   const existing = EXISTING_BUN_TIMEOUT.exec(command);
   if (!existing) {
-    return command.replace(BUN_TEST_PREFIX, `bun test ${flag}`);
+    return command.replace(BUN_TEST_PREFIX, () => `bun test ${BUN_TEST_TIMEOUT_FLAG}`);
   }
-  if (existing[2] === String(timeoutMs)) {
+  if (existing[0].trimStart() === BUN_TEST_TIMEOUT_FLAG) {
     return command;
   }
-  return command.replace(EXISTING_BUN_TIMEOUT, `${existing[1]}${flag}`);
+  return command.replace(EXISTING_BUN_TIMEOUT, (_match, lead: string) => `${lead}${BUN_TEST_TIMEOUT_FLAG}`);
 }
 
 function isPackageTestScriptRunnerCommand(command: string): boolean {

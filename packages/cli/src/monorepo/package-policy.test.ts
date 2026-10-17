@@ -6,16 +6,13 @@ import {
   BOUNDED_TEST_EXECUTOR,
   BOUNDED_TEST_IDLE_TIMEOUT_MS,
   BOUNDED_TEST_KILL_AFTER_MS,
-  BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
+  BUN_TEST_TIMEOUT_FLAG as TIMEOUT_FLAG,
 } from '@smoothbricks/nx-plugin/bounded-test-policy';
 import { generateManagedFiles } from '@smoothbricks/nx-plugin/managed-files/generator';
 import { FsTree } from 'nx/src/generators/tree.js';
-import { finishManagedFiles } from './managed-fs.js';
-
-const TIMEOUT_FLAG = `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`;
-
 import { listPublicPackages, listPublishablePackages } from '../lib/workspace.js';
 import { validateCommitMessage } from './commit-msg.js';
+import { finishManagedFiles } from './managed-fs.js';
 import {
   applyFixableMonorepoDefaults,
   applyNxPatchDefaults,

@@ -61,7 +61,7 @@ describe('run progress', () => {
 
 describe('progress report', () => {
   it('asks a lone bun test for dots, keeping the runtime the target named', () => {
-    expect(withProgressReport('bun test --timeout=30000 src')).toBe('bun test --dots --timeout=30000 src');
+    expect(withProgressReport('bun test --timeout=0 src')).toBe('bun test --dots --timeout=0 src');
     expect(withProgressReport('../x/.runtime/bun test a')).toBe('../x/.runtime/bun test --dots a');
   });
 

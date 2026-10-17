@@ -71,7 +71,7 @@
           "pluginScenarioSources"
         ],
         "options": {
-          "command": "bun test --timeout=30000 src",
+          "command": "bun test --timeout=0 src",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000

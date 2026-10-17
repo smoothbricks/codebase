@@ -34,7 +34,7 @@
       "test": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --config=../bunfig.toml --timeout=30000",
+          "command": "bun test --config=../bunfig.toml --timeout=0",
           "cwd": "{projectRoot}/src",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000

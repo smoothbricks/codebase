@@ -616,9 +616,8 @@ Concrete targets come from concrete files:
   replace Cargo's `target` link. Its inputs, like every cargo-derived fileset, are anchored at `{workspaceRoot}`: Nx
   resolves a `{projectRoot}` glob against only the files its project owns, and a nested package owns the crates under
   it, so a root workspace's archive spelled that way hashes none of its members and replays stale binaries against
-  edited crates. Each member crate gets a cached `cargo-test-<package>` run (30s slow-test warning like
-  `bun test --timeout=30000`, no per-test kill) whose inputs include that crate and its path dependencies, and whose
-  command runs
+  edited crates. Each member crate gets a cached `cargo-test-<package>` run (30s slow-test warning, no per-test kill)
+  whose inputs include that crate and its path dependencies, and whose command runs
   `cargo --frozen nextest run --binaries-metadata … --cargo-metadata … --target-dir-remap … --workspace-remap . -E 'package(<crate>)'`
   from the archive's one extraction. Runners therefore execute rather than build: they compile nothing in cargo's build
   tree, and fan out instead of chaining. They do not unpack the archive each: before the run, `smoo-nx-nextest-extract`
@@ -1126,8 +1125,11 @@ therefore runs as long as it needs, however slow the host, and a test that never
 last test that finished. bun prints nothing per passing test when it believes an agent runs it, so the executor asks a
 lone `bun test` for `--dots`, one dot per finished test. A command that reports no tests makes progress only by exiting.
 nextest's slow-timeout and the serial groups' code-time classes only warn; no per-test bound kills a test or fails one
-that passed. `timeoutMs`, an absolute ceiling, is for commands that report no tests; a target names at least one of the
-two.
+that passed. Bun has a per-test deadline of its own, 5000 ms unless the command sets one, and it reads no bunfig for it,
+so every bun leg deletes it with `bun test --timeout=0` (`BUN_TEST_TIMEOUT_FLAG`; `0` means no deadline, measured on the
+pinned Bun 1.4.2). A test waits for the event it is waiting for, however long a loaded host makes the work take; one
+that never returns still ends the run through `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that
+report no tests; a target names at least one of the two.
 
 The final-five-second pre-signal snapshot attributes the runner's process tree and observed resources, with explicit
 incomplete/raced results and no delay to termination. Its timing, visibility and evidence contract is defined in
@@ -1358,11 +1360,11 @@ Workspace updates preserve no-op test targets rather than adding a second test r
 the check when it reaches at least one local test execution leg and every such leg is bounded, including through nested
 no-op aggregates: `bounded-exec` with a command, a `cwd`, a positive `idleTimeoutMs` and `killAfterMs`, and no
 `timeoutMs`. Upstream and non-test prerequisites such as `^build`, `build`, `typecheck-tests`, and Cargo
-compilation/archive targets are ignored by this test-leg check. Each bounded Bun leg must declare a positive per-test
-`--timeout` no greater than its own `idleTimeoutMs`; the migration's 30-second default is not a limit on explicitly
-bounded lanes. Only a leg that runs `bun test` must start in the project root or its `src/`, where Bun's test-file
-discovery is cheap; any other command (a cargo workspace's per-crate nextest legs run from the workspace root, a gate
-may run a script that lives in another project) may use any `cwd`.
+compilation/archive targets are ignored by this test-leg check. Each bounded Bun leg must delete Bun's per-test deadline
+with `BUN_TEST_TIMEOUT_FLAG` (`--timeout=0`) and set no other; a number is refused, since it bounds a test's wall-clock
+time, which is the host's, rather than its progress. Only a leg that runs `bun test` must start in the project root or
+its `src/`, where Bun's test-file discovery is cheap; any other command (a cargo workspace's per-crate nextest legs run
+from the workspace root, a gate may run a script that lives in another project) may use any `cwd`.
 
 ## Test Fixtures That Run Nx
 

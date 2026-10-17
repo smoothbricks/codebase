@@ -2347,7 +2347,7 @@ function createNapiTestTarget(projectRoot: string, hasDedicatedBunfig: boolean):
       // package's cargo target/ directory turns that scan into tens of
       // seconds. bun only auto-loads bunfig from the cwd, so the package
       // config is passed explicitly.
-      command: `bun test${configFlag} --timeout=30000 native.test.ts`,
+      command: `bun test${configFlag} --timeout=0 native.test.ts`,
       cwd: `${projectRoot}/src`,
       // Routes the package's native loader to the napi-debug artifact under
       // .cache/native-debug instead of the packaged dist/native tree.

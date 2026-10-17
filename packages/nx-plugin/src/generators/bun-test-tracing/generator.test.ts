@@ -5,7 +5,7 @@ import { createTreeWithEmptyWorkspace } from 'nx/src/devkit-testing-exports.js';
 import {
   BOUNDED_TEST_IDLE_TIMEOUT_MS,
   BOUNDED_TEST_KILL_AFTER_MS,
-  BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
+  BUN_TEST_TIMEOUT_FLAG,
 } from '../../bounded-test-policy.js';
 import generator from './generator.js';
 
@@ -77,7 +77,7 @@ describe('bun-test-tracing generator', () => {
       executor: '@smoothbricks/nx-plugin:bounded-exec',
       dependsOn: ['typecheck-tests', '^build'],
       options: {
-        command: `bun test --timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`,
+        command: `bun test ${BUN_TEST_TIMEOUT_FLAG}`,
         cwd: '{projectRoot}',
         idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,

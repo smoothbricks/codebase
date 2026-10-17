@@ -3,7 +3,6 @@ import { existsSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { BOUNDED_TEST_PER_TEST_TIMEOUT_MS } from '@smoothbricks/nx-plugin/bounded-test-policy';
 import {
   fixtureSocketDirectory,
   nxDaemonProcesses,
@@ -520,15 +519,12 @@ test('returns without its fixture body', async () => {
     );
     const config = join(scratch, 'bunfig.toml');
     await writeFile(config, '');
-    const run = Bun.spawn(
-      [process.execPath, 'test', `--config=${config}`, `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`, testFile],
-      {
-        cwd: join(import.meta.dir, '..', '..', '..'),
-        env: process.env,
-        stdout: 'pipe',
-        stderr: 'pipe',
-      },
-    );
+    const run = Bun.spawn([process.execPath, 'test', `--config=${config}`, '--timeout=0', testFile], {
+      cwd: join(import.meta.dir, '..', '..', '..'),
+      env: process.env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
     const [exitCode, stdout, stderr] = await Promise.all([
       run.exited,
       new Response(run.stdout).text(),

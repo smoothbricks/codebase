@@ -15,8 +15,8 @@ import {
 } from './test-timings.js';
 
 const SHARD = (n: number) =>
-  `bun test --timeout=30000 --timings=test-timings.json --shard=${n}/2 --path-ignore-patterns='**/*-host.test.ts'`;
-const SUITE_ARGS = ['--timeout=30000', '--timings=test-timings.json', '--path-ignore-patterns=**/*-host.test.ts'];
+  `bun test --timeout=0 --timings=test-timings.json --shard=${n}/2 --path-ignore-patterns='**/*-host.test.ts'`;
+const SUITE_ARGS = ['--timeout=0', '--timings=test-timings.json', '--path-ignore-patterns=**/*-host.test.ts'];
 
 function shardTargets(command: (n: number) => string = SHARD): Record<string, unknown> {
   return {

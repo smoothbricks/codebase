@@ -506,7 +506,8 @@ remains a separate guard before rebase.
 
 Every test target, the groups included, is bounded by progress alone: the run ends when the time since the last finished
 test reaches its configured `idleTimeoutMs` (`BOUNDED_TEST_IDLE_TIMEOUT_MS` in the plugin's test-target policy), and
-names the tests still running. There is no count-multiplied outer wall-clock budget and no per-test bound kills a test
+names the tests still running. There is no count-multiplied outer wall-clock budget and no per-test bound kills a test:
+a Bun leg deletes Bun's own 5000 ms per-test deadline with `--timeout=0`, and no test carries one of its own
 (`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries `--no-tests=fail`, so a filter that
 selects nothing fails rather than passing a run of no test. The RAM host walk and real-process CPU-pool
 production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing case bounds. The shards
