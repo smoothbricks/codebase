@@ -1073,6 +1073,16 @@ The Nx patch repairs upstream Nx runtime behavior, separately from this plugin's
   real daemon whose resident worker globs through it and requires zero open connections after the only client exits.
   Stock Nx keeps a worker until its last registered phase, so a plugin with task hooks keeps the same connection open
   there after a graph-only request; this hunk does not retire with the worker-retention hunk.
+- **A daemon whose workspace has gone stops instead of reading it.** Nx 23.2.1's native file worker reads an empty file
+  map as one it has not filled yet and waits on its condition variable for files (`FilesWorker::get_files`,
+  `while guard.len() == 0`). Once every file of a workspace is deleted under a running daemon, as when a checkout is
+  removed or unmounted before its daemon is stopped, the next glob blocks the daemon's only thread for good. It sits at
+  0% CPU in `WorkspaceContext::multi_glob`, no timer or request runs again, and SIGTERM does nothing because its handler
+  is JavaScript; only SIGKILL ends it. The daemon now stops itself when the workspace's `nx.json` is gone. It checks on
+  every watcher batch before applying it, on every request and on the 5 s safety poll, so the batch that would empty the
+  file map is never applied. A workspace without `nx.json` is no Nx workspace, and its client already runs without a
+  daemon. A bounded regression deletes every tracked file under a real daemon and requires it to exit with that reason;
+  against the unpatched daemon it hangs in that frame and survives its fixture's SIGTERM.
 - **The daemon stops for an ignore file only when its watcher's rules may be stale.** Nx's native watcher reads its
   ignore files once, in `watch()`, and the daemon stopped itself on every watcher event for a `.gitignore` or
   `.nxignore`, whatever the file then held. A rewrite with the same bytes (a checkout, a formatter) reports one, and so

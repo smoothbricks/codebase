@@ -678,10 +678,10 @@ index c2a2f8f70fe71940e47c97931c5925bac1fbd480..39582a8fc342ae59decd3d4ca25179f2
          // Bump generation synchronously so any in-flight compute fails its
 diff --git a/dist/src/daemon/server/restart-checks.d.ts b/dist/src/daemon/server/restart-checks.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..65660f0d5f7789d64ad26b0a9644f23949e79831
+index 0000000000000000000000000000000000000000..2a76dce933112854e34d61a44aa90b7c4e1d34e9
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.d.ts
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,10 @@
 +import type { Server, Socket } from 'net';
 +import type { WatchEvent } from '../../native';
 +export declare const DAEMON_VALIDITY_SAFETY_INTERVAL_MS = 5000;
@@ -691,12 +691,13 @@ index 0000000000000000000000000000000000000000..65660f0d5f7789d64ad26b0a9644f239
 +export declare function restartDaemonIfLockFilesChanged(paths: string[]): boolean;
 +export declare function stopDaemonIfReplaced(events: WatchEvent[]): boolean;
 +export declare function stopDaemonIfOutdated(): boolean;
++export declare function stopDaemonIfWorkspaceGone(): boolean;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..e45f9d2c918a1d33b6ebb29be76dfb2eecd37b45
+index 0000000000000000000000000000000000000000..6adb712340b154dcabb7570bc1b4c586f3416cdf
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.js
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,127 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
 +exports.relativeServerProcess = exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS = void 0;
@@ -705,6 +706,7 @@ index 0000000000000000000000000000000000000000..e45f9d2c918a1d33b6ebb29be76dfb2e
 +exports.restartDaemonIfLockFilesChanged = restartDaemonIfLockFilesChanged;
 +exports.stopDaemonIfReplaced = stopDaemonIfReplaced;
 +exports.stopDaemonIfOutdated = stopDaemonIfOutdated;
++exports.stopDaemonIfWorkspaceGone = stopDaemonIfWorkspaceGone;
 +const fs_1 = require("fs");
 +const path_1 = require("path");
 +const file_hasher_1 = require("../../hasher/file-hasher");
@@ -770,10 +772,23 @@ index 0000000000000000000000000000000000000000..e45f9d2c918a1d33b6ebb29be76dfb2e
 +    }
 +    return replaced;
 +}
++const nxJson = (0, path_1.join)(workspace_root_1.workspaceRoot, 'nx.json');
++// Nx 23.2.1's native file worker takes an empty file map for one it has not
++// filled yet and waits for it (`FilesWorker::get_files`), so the first read of
++// a workspace whose files have all gone blocks the daemon's only thread for
++// good: no timer, request or SIGTERM handler runs again, and only SIGKILL ends
++// it. nx.json is one of those files, and without it this is no Nx workspace,
++// so its absence stops the daemon before it reads the workspace again.
++function stopDaemonIfWorkspaceGone() {
++    if (terminating) return true;
++    if ((0, fs_1.existsSync)(nxJson)) return false;
++    stopDaemon(`its workspace ${workspace_root_1.workspaceRoot} has no nx.json any more`);
++    return true;
++}
 +// Once per request, including long-lived sockets, and on the slow safety poll.
 +// The socket guard uses the inode captured at bind, never a client's environment.
 +function stopDaemonIfOutdated() {
-+    if (terminating) return true;
++    if (stopDaemonIfWorkspaceGone()) return true;
 +    if (isReplaced()) {
 +        stopDaemon('this process is no longer the current daemon (native)');
 +        return true;
@@ -811,7 +826,7 @@ index 0000000000000000000000000000000000000000..e45f9d2c918a1d33b6ebb29be76dfb2e
 +    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets });
 +}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index b1c143e244efd435b28642ed86e999d6c86f7d94..9939d13d2845b63af8dfdfbba08a01d3832fe34d 100644
+index b1c143e244efd435b28642ed86e999d6c86f7d94..5f1157fd3e37afc8ef739a8adce78a2b472e08af 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -7,17 +7,13 @@ const fs_1 = require("fs");
@@ -945,7 +960,19 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..9939d13d2845b63af8dfdfbba08a01d3
  /**
   * When applicable files in the workspaces are changed (created, updated, deleted),
   * we need to recompute the cached serialized project graph so that it is readily
-@@ -348,7 +312,43 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+@@ -339,6 +303,11 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
+             return;
+         }
+         logger_1.serverLogger.watcherLog((0, watcher_1.convertChangeEventsToLogMessage)(changeEvents));
++        // Applying a batch that deleted the last file would leave the next read
++        // of the workspace blocked for good (restart-checks.js).
++        if ((0, restart_checks_1.stopDaemonIfWorkspaceGone)()) {
++            return;
++        }
+         (0, route_workspace_changes_1.routeWorkspaceChanges)(changeEvents);
+     }
+     catch (err) {
+@@ -348,7 +317,43 @@ const handleWorkspaceChanges = async (err, changeEvents) => {
          (0, file_watcher_sockets_1.notifyFileWatcherSocketsOfError)(err);
      }
  };
@@ -989,7 +1016,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..9939d13d2845b63af8dfdfbba08a01d3
      // Watch before scan: a file written during boot must be visible to the
      // watcher or the scan below. Scan-first left a blind window where such
      // files stayed invisible to both until an unrelated change arrived.
-@@ -359,54 +359,21 @@ async function startServer() {
+@@ -359,54 +364,21 @@ async function startServer() {
      (0, workspace_context_1.setupWorkspaceContext)(workspace_root_1.workspaceRoot);
      // Initialize analytics for daemon process
      await (0, analytics_1.startAnalytics)();
@@ -1049,7 +1076,7 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..9939d13d2845b63af8dfdfbba08a01d3
      return new Promise(async (resolve, reject) => {
          // `listen` reports a failed bind asynchronously on the server, which the
          // try below cannot catch — without this an EACCES became an uncaught
-@@ -432,8 +399,7 @@ async function startServer() {
+@@ -432,8 +404,7 @@ async function startServer() {
                              // Best effort; the 0700 socket directory is the primary control.
                          }
                      }
