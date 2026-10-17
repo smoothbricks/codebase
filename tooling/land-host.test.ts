@@ -19,7 +19,8 @@ import type { Call } from './land-host.plan.ts';
 // Behavioural tests of tooling/land-host.sh: the script runs for real, against real git repositories for main and the
 // workspace and the real ancestry guard and failure reporter. Three things are stand-ins on PATH, because they are this machine's
 // operator tooling and the gate itself: `cowshed` (a workspace is a git clone of main; rebase and land and their
-// fences are git operations), `direnv` (runs the command it is given) and `bun nx` (land-host.fake-nx.ts plays back
+// fences are git operations; the gate must run as `exec <ws> --class gate --host --`, at the workspace root),
+// `direnv` (runs the command it is given) and `bun nx` (land-host.fake-nx.ts plays back
 // the calls a scenario scripts: its exact output and exit status). A scenario names every nx call the land may make,
 // in order: a call it did not
 // script fails the land.
@@ -114,6 +115,11 @@ land)
   git -C "$FIX_MAIN" fetch -q "$FIX_WS" HEAD
   git -C "$FIX_MAIN" merge -q --ff-only FETCH_HEAD
   echo '{"ok":true}'
+  ;;
+exec)
+  [ -n "$1" ] && [ "$2" = --class ] && [ "$3" = gate ] && [ "$4" = --host ] && [ "$5" = -- ] || exit 64
+  shift 5
+  cd "$FIX_WS" && exec "$@"
   ;;
 *) exit 64 ;;
 esac
