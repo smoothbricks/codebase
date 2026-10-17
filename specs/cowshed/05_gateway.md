@@ -278,11 +278,29 @@ or the checksum database and verifies the database's signed tree.
 
 ### `/nx/v1/cache/{hash}` — accepted-project Nx artifacts
 
+**This cache is an optimization for cross-shed reuse and never blocks a build.** Every refusal or failure on this route
+reaches the client as a miss (`GET` 404) or not-stored (`PUT` 403). The task then runs, or keeps the result it already
+produced, exactly as it would with no cache. The only exception is a credential that is not this workspace's, which is
+401 (Placement and identity). Stock Nx 23.2.1 fails a task on any other status (Busy gateway, below), so the gateway
+never answers or forwards one: drain, a closed audit sink, a stopped actor, a queue bound, a body timeout and a backend
+response head that Nx cannot read are all the method's 404/403. The audit and the log record the cause.
+
 Every checkout may read its project's accepted task artifacts, during ordinary iteration as well as adoption. Nx keeps
 its local artifact cache and task database private to that checkout (16_build_volumes.md); this route shares neither
 path nor live database. The controller wires stock Nx's `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` to `<base>/nx`, without a
 trailing slash, and its access token to that endpoint's read authority. The backend's bearer credentials remain
 host-side. No scratch cache receives WIP artifacts.
+
+**Trust domain: one user, unverified producers.** This store is one host directory owned by one user. Every writer is
+that user's process, so the write boundary does not defend against a malicious writer, and CREEP's multi-tenant attacker
+(CVE-2025-36852) is not this deployment's threat. It defends against an unverified producer instead. A shed can build
+under an input its task does not declare, such as another toolchain resolved through a shed-private `tools/bin`. The
+result is stored under a hash that is correct by the declared inputs. The store is first-writer-wins: `link(2)` answers
+409 to every later writer, so that artifact becomes permanent. Every later reader would restore it, including a land
+gate and main's adoption checks, which must never be fed an artifact nobody verified. Only a land publishes, because the
+land gate verified its hashes. A shed holds read authority only. Its `PUT` 403 is an authority refusal, not a
+reachability failure: the backend is a local process. That 403 costs the shed the archive work below and the benefit of
+publishing, never the task.
 
 The listener or Linux socket selects the workspace, its session selects the project, and only the exact, query-free
 `/nx/v1/cache/{hash}` route accepts Nx's `Authorization: Bearer` credential. A hash is one validated Nx task key: 1-128
@@ -296,12 +314,13 @@ sibling token, an expired transaction token, an ambiguous path, or a different p
 
 Publication is private to an active, authorized land plan. The authorized initiation accepts the caller's exact expected
 source head; external source review remains the caller's workflow, not a gateway interpretation of a model's ACK. Before
-issuing temporary write authority, the controller requires the protected successful-check receipt specified in
-16_build_volumes.md "Accepted-project Nx cache". It binds the project, source incarnation, clean accepted head,
-successful check/job identities, and exact successful current task hashes. Only those hashes may be forwarded as `PUT`
-under that transaction. The ordinary worker cannot create or replace the receipt, request a publication operation, or
-obtain backend write credentials. A changed head or failed, forged, missing, or foreign receipt refuses publication.
-Land without qualification reports it explicitly and does not publish.
+issuing temporary write authority, the controller requires a protected successful-check receipt. That receipt is not yet
+specified (16_build_volumes.md has no section for it), so no controller path issues write authority and no land
+publishes. When the receipt is specified, it binds the project, source incarnation, clean accepted head, successful
+check/job identities, and exact successful current task hashes. Only those hashes may be forwarded as `PUT` under that
+transaction. The ordinary worker cannot create or replace the receipt, request a publication operation, or obtain
+backend write credentials. A changed head or failed, forged, missing, or foreign receipt refuses publication. Land
+without qualification reports it explicitly and does not publish.
 
 The public publication-control lane remains removed. The actor accepts only a hash-scoped capability installed by an
 in-process caller; it does not verify a land plan or protected receipt. Publication authority remains controller-owned,
@@ -331,10 +350,11 @@ refusal. An incomplete, interrupted, or evicted artifact is never a successful e
 and bounded eviction belong to 03_caches.md.
 
 **Backend outage.** Before committing a response head, the gateway maps a project's backend startup, health, connect,
-handshake, response-head or upstream-5xx failure to a miss (404) for `GET` and a refusal (403) for `PUT`. It audits each
-as `failed` with classification `nx-backend-unavailable` and logs the cause loudly. A startup or connection refusal
-forwards no artifact, but an upstream-5xx response may arrive after request bytes have already been sent. An outage is
-never a successful read: its 404 is not evidence that a hash is absent and never counts as a hit.
+handshake or response-head failure, and any upstream status Nx cannot read (5xx, or anything but `GET` 200/404 and `PUT`
+200/403/409), to a miss (404) for `GET` and a refusal (403) for `PUT`. It audits each as `failed` with classification
+`nx-backend-unavailable` and logs the cause loudly, naming the upstream status. A startup or connection refusal forwards
+no artifact, but an upstream status may arrive after request bytes have already been sent. An outage is never a
+successful read: its 404 is not evidence that a hash is absent and never counts as a hit.
 
 **Busy gateway.** Nx requests wait under the gateway's queued-request bounds whether their backend is starting or
 `Ready`. A full queue is an audited `limited` `nx-queue-limited` 404/403 and an expired queue wait an audited
@@ -343,8 +363,9 @@ reads every status but `GET` 200/404 and `PUT` 200/403/409 as a fatal misconfigu
 `convert_response_to_error`), so a busy gateway answers what a cache may always answer: not served now. Like an outage,
 that 404 is not evidence of absence and never counts as a hit. The price is work, not failure: a lookup wave wider than
 the queue re-runs its refused tasks, even ones the cache holds, and a refused publication is not stored. That extra work
-is the designed cost of a busy gateway, not a regression. Drain and audit fail-closed retain their own statuses; they
-are not backend outages. Unsupported Nx methods are denied before starting or waiting for a backend.
+is the designed cost of a busy gateway, not a regression. Drain and audit fail-closed keep their own audit status and
+classification, not a backend outage's, but answer the same 404/403. Unsupported Nx methods are denied before starting
+or waiting for a backend.
 
 **Backend lifecycle isolation.** Each repository's backend is supervised by a per-repository lifecycle state
 (`Starting`, `Ready`, or `Failed { retry_after }`) held by the actor; backend startup and readiness waiting run outside

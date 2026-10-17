@@ -287,8 +287,7 @@ task-result restoration or cutover evidence.
 ### Stock Nx read-only client cost control
 
 Governing sections: `specs/cowshed/05_gateway.md`, “`/nx/v1/cache/{hash}` — accepted-project Nx artifacts”;
-`specs/cowshed/13_telemetry.md`, “Accepted-project Nx cache measurements”; `specs/cowshed/16_build_volumes.md`,
-“Accepted-project Nx cache”.
+`specs/cowshed/13_telemetry.md`, “Accepted-project Nx cache measurements”.
 
 Nx 23.2.1's native HTTP cache has a zero-argument constructor configured by `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` and
 `NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN`. `DbCache` checks its local cache first. On a local miss, it can retrieve an
