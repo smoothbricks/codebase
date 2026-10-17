@@ -177,6 +177,13 @@ fn workspace_branch(name: &str) -> (String, String) {
     (branch, branch_ref)
 }
 
+/// A commit and the first line of its message: enough for a person to recognise the change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitSubject {
+    pub oid: GitOid,
+    pub subject: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct GitRepository {
     /// The store the controller running this Git serves: the host's `STORE_ROOT`, or a test
@@ -1529,6 +1536,65 @@ impl GitRepository {
     ///   deliberate marker whose message is its whole content, and a false equivalence between two
     ///   unrelated markers is not a proof of anything.
     pub async fn commits_already_held(&self, revision: &str, head: &str) -> Result<u64> {
+        let held = self.held_commits(revision, head).await?;
+        u64::try_from(held.len()).map_err(|_| {
+            CowshedError::integrity("held commit count overflow", "repair the git repository")
+        })
+    }
+
+    /// The commits of `revision..head` that `revision` does not hold, oldest first, each with its
+    /// subject: what `head` carries that replacing it with `revision` would lose.
+    ///
+    /// The same proof as [`Self::commits_already_held`], read as a list rather than a count, so
+    /// the two can never disagree about what "held" means. Strict on both endpoints like
+    /// [`Self::commits_ahead_of`]: a commit this repository cannot see has not been compared, and
+    /// an empty list for it would read as "nothing is lost".
+    pub async fn commits_not_held(&self, revision: &str, head: &str) -> Result<Vec<CommitSubject>> {
+        for endpoint in [revision, head] {
+            if !self.has_commit(endpoint).await? {
+                return Err(CowshedError::conflict(
+                    format!("{endpoint} is not a commit this repository can see"),
+                    "attach the object store that holds it, then retry",
+                ));
+            }
+        }
+        let held = self.held_commits(revision, head).await?;
+        let output = self
+            .run([
+                "log",
+                "--reverse",
+                "--format=%H%x00%s",
+                &format!("{revision}..{head}"),
+            ])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("list commits not held", &output));
+        }
+        let mut lost = Vec::new();
+        for line in parse_lines(&output.stdout, "commit subject")? {
+            let (oid, subject) = line.split_once('\0').ok_or_else(|| {
+                CowshedError::integrity(
+                    format!("git reported an unreadable commit subject line: {line}"),
+                    "repair the git installation",
+                )
+            })?;
+            if !held.contains(oid) {
+                lost.push(CommitSubject {
+                    oid: parse_oid(oid.to_owned(), "commit subject")?,
+                    subject: subject.to_owned(),
+                });
+            }
+        }
+        Ok(lost)
+    }
+
+    /// The commits of `revision..head` that `revision` already holds: patch-equivalent ordinary
+    /// commits that change something, and merges that author nothing.
+    async fn held_commits(
+        &self,
+        revision: &str,
+        head: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
         let output = self.run(["cherry", revision, head]).await?;
         if !output.status.success() {
             return Err(git_internal("compare commit patch identities", &output));
@@ -1554,19 +1620,14 @@ impl GitRepository {
                 }
             }
         }
-        let mut held = self.content_free_merge_count(revision, head).await?;
+        let mut held = self.content_free_merges(revision, head).await?;
         if !equivalent.is_empty() {
             let substantive = self.commits_changing_something(revision, head).await?;
-            for oid in &equivalent {
-                if substantive.contains(oid.as_str()) {
-                    held = held.checked_add(1).ok_or_else(|| {
-                        CowshedError::integrity(
-                            "held commit count overflow",
-                            "repair the git repository",
-                        )
-                    })?;
-                }
-            }
+            held.extend(
+                equivalent
+                    .into_iter()
+                    .filter(|oid| substantive.contains(oid.as_str())),
+            );
         }
         Ok(held)
     }
@@ -1579,7 +1640,11 @@ impl GitRepository {
     ///
     /// The record separator is a NUL, because the alternative is ambiguous: a header line has to be
     /// distinguishable from a pathname, and a pathname can contain anything except NUL.
-    async fn content_free_merge_count(&self, revision: &str, head: &str) -> Result<u64> {
+    async fn content_free_merges(
+        &self,
+        revision: &str,
+        head: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
         let output = self
             .run([
                 "log",
@@ -1593,25 +1658,26 @@ impl GitRepository {
         if !output.status.success() {
             return Err(git_internal("inspect merge combined diffs", &output));
         }
-        let mut count = 0_u64;
+        let mut merges = std::collections::BTreeSet::new();
         for record in output.stdout.split(|byte| *byte == 0) {
             // The first field is whatever preceded the first header, which is nothing.
             let mut lines = record
                 .split(|byte| *byte == b'\n')
                 .filter(|line| !line.is_empty());
-            if lines.next().is_none() {
+            let Some(oid) = lines.next() else {
                 continue;
-            }
+            };
             if lines.next().is_none() {
-                count = count.checked_add(1).ok_or_else(|| {
+                let oid = std::str::from_utf8(oid).map_err(|_| {
                     CowshedError::integrity(
-                        "content-free merge count overflow",
-                        "repair the git repository",
+                        "git reported a merge identity that is not UTF-8",
+                        "repair the git installation",
                     )
                 })?;
+                merges.insert(oid.to_owned());
             }
         }
-        Ok(count)
+        Ok(merges)
     }
 
     /// The commits of `revision..head` whose diff is not empty.
