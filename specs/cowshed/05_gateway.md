@@ -255,10 +255,14 @@ trailing slash, and its access token to that endpoint's read authority. The back
 host-side. No scratch cache receives WIP artifacts.
 
 The listener or Linux socket selects the workspace, its session selects the project, and only the exact, query-free
-`/nx/v1/cache/{hash}` route accepts Nx's `Authorization: Bearer` credential. A hash is one validated Nx task key, never
-a filesystem path. The gateway forwards `GET` to the selected project's backend as `GET /v1/cache/{hash}`. An ordinary
-workspace credential has read authority only: `PUT` is 403 before any artifact is staged or forwarded. A sibling token,
-an expired transaction token, an ambiguous path, or a different project never acquires write authority.
+`/nx/v1/cache/{hash}` route accepts Nx's `Authorization: Bearer` credential. A hash is one validated Nx task key: 1-128
+characters of `[A-Za-z0-9_-]`, the backend's own key charset. Nx uses a task's hash verbatim as its cache key, so this
+admits stock Nx's decimal hash and any hex, decimal or base64url value an executor's custom hasher returns; it excludes
+`/`, `\`, `.` and `%`, so a key is never a filesystem path or an escaped one. A final segment outside it does not name
+this route and is a 400 `invalid-target`. The gateway forwards `GET` to the selected project's backend as
+`GET /v1/cache/{hash}`. The publication receipt and the publication capability validate hashes by this same rule. An
+ordinary workspace credential has read authority only: `PUT` is 403 before any artifact is staged or forwarded. A
+sibling token, an expired transaction token, an ambiguous path, or a different project never acquires write authority.
 
 Publication is private to an active, authorized land plan. The authorized initiation accepts the caller's exact expected
 source head; external source review remains the caller's workflow, not a gateway interpretation of a model's ACK. Before

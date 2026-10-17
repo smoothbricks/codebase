@@ -786,6 +786,66 @@ async fn nx_route_ambiguous_paths_are_refused_without_an_upstream_request() {
     );
 }
 
+/// Every rendering of a task key Nx can send reaches the backend: stock Nx's decimal xxhash and a
+/// custom executor hasher's value (sha256 hex here) are both one validated key, 1-128 characters of
+/// `[A-Za-z0-9_-]`. A key one character longer is not, and is refused before any upstream request.
+#[tokio::test]
+async fn nx_route_accepts_every_key_the_backend_accepts() {
+    let (config, _cache) = super::test_config();
+    let (gateway, audit) = gateway_with(config, super::UpstreamHealth::Healthy).await;
+    let handle = gateway.handle();
+    let mut backend = spawn_backend(200, 200).await;
+    handle
+        .configure_nx_cache(backend_config(backend.address))
+        .await
+        .expect("configure fixture backend");
+    let (endpoint, token) = install_session(&handle, "nx-key-format", 85).await;
+    let get = |hash: &str| {
+        super::proxy_request(
+            endpoint,
+            format!(
+                "GET /nx/v1/cache/{hash} HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+    };
+    let longest = "a".repeat(128);
+    for hash in [
+        "10018087211778381691",
+        "6f1e2a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f",
+        "Ab9_-z",
+        longest.as_str(),
+    ] {
+        let response = get(hash).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{hash}: {response}");
+        let line = backend.lines.recv().await.expect("backend saw the GET");
+        assert!(
+            line.starts_with(&format!("GET /v1/cache/{hash} ")),
+            "{hash}: {line}"
+        );
+        assert_eq!(
+            nx_events(&audit, hash, "GET").last(),
+            Some(&(Some(200), None)),
+            "{hash}"
+        );
+    }
+    let too_long = "a".repeat(129);
+    let response = get(&too_long).await;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        nx_events(&audit, &too_long, "GET")
+            .iter()
+            .any(|(status, class)| *status == Some(400)
+                && class.as_deref() == Some("invalid-target")),
+        "an oversized key is an audited invalid target"
+    );
+    gateway.drain().await.expect("drain gateway");
+    backend.task.abort();
+    assert!(
+        backend.lines.try_recv().is_err(),
+        "an oversized key must not reach the backend"
+    );
+}
+
 /// One fresh-root cold measurement. `gateway` selects the normal read-only Gateway route, with a
 /// fixture backend that answers GET 404; `false` runs the stock client with no remote endpoint.
 /// Returns one observation row. Nothing here asserts a speed: the owner derives medians from rows.
