@@ -22,9 +22,9 @@ channel.publish({
 dispose();
 ```
 
-The channel reads production reducer state and delivers events after the complete StateBus wave is reduced. Screens
-read that state and publish intents. They do not call History or maintain a second location authority. Every logical
-request receives a distinct branded `NavigationRequestId`; brands are erased, not allocated wrapper objects.
+The channel reads production reducer state and delivers events after the complete StateBus wave is reduced. Screens read
+that state and publish intents. They do not call History or maintain a second location authority. Every logical request
+receives a distinct branded `NavigationRequestId`; brands are erased, not allocated wrapper objects.
 
 `navigate` avoids adding an identical URL. `push` adds an entry, `replace` preserves the current entry's history state,
 and `back`/`forward`/`go` call native traversal. The pure `planBrowserNavigation` resolves relative URLs, queries and
@@ -40,30 +40,30 @@ location object while the URL is unchanged. Callback functions are created at in
 
 `navigationDispatched` acknowledges primitive dispatch, not successful destination loading or a completed payment.
 Native traversal can be out of range and has no completion signal in that case. It remains `dispatched` until a real
-location observation or explicit cancellation; no timer guesses a URL. An abort prevents work that has not started
-and suppresses late adapter outcomes, but cannot undo a History/Location operation already issued.
+location observation or explicit cancellation; no timer guesses a URL. An abort prevents work that has not started and
+suppresses late adapter outcomes, but cannot undo a History/Location operation already issued.
 
 For integration with a router that writes history itself, use `createBrowserNavigation({ window })` and
-`connectNavigation({ channel, driver })`; call `driver.observe()` from the router's committed-location subscription.
-The adapter does not patch global `history.pushState`/`replaceState` or claim a React Router binding. Dispose both the
-connection and the driver in that lower-level composition. A future Expo implementation uses the platform-neutral
-core contracts without importing this browser package.
+`connectNavigation({ channel, driver })`; call `driver.observe()` from the router's committed-location subscription. The
+adapter does not patch global `history.pushState`/`replaceState` or claim a React Router binding. Dispose both the
+connection and the driver in that lower-level composition. A future Expo implementation uses the platform-neutral core
+contracts without importing this browser package.
 
 ## Guards and external navigation
 
-The reducer blocks bus-originated intents when `navigationGuardChanged` sets a reason. A matching
-`navigationConfirmed` admits that intent; `navigationCancelled` abandons it. A guard arriving later in the same wave
-still prevents execution. Browser Back/Forward has already happened at `popstate`: it is not vetoed or rolled back.
-The adapter always reports the actual location, even while a guard is active.
+The reducer blocks bus-originated intents when `navigationGuardChanged` sets a reason. A matching `navigationConfirmed`
+admits that intent; `navigationCancelled` abandons it. A guard arriving later in the same wave still prevents execution.
+Browser Back/Forward has already happened at `popstate`: it is not vetoed or rolled back. The adapter always reports the
+actual location, even while a guard is active.
 
 `connectBrowserNavigation` installs native `beforeunload` only while a guard is active and removes it when cleared or
-disposed. Browser user-activation and platform rules determine whether a dialog is displayed; the reason is not a
-custom native-dialog message. This is not guaranteed delivery protection on mobile/process termination.
+disposed. Browser user-activation and platform rules determine whether a dialog is displayed; the reason is not a custom
+native-dialog message. This is not guaranteed delivery protection on mobile/process termination.
 
 Explicit external intents support `assign`, `replace` and `new-tab`. New tabs use `noopener,noreferrer`; a null
 `window.open` result is not classified as failure because a successful opener-isolated tab can return null. Popup
-blocking and transient user-activation policy remain browser-owned. Do not use an animation-frame-delayed publisher
-for actions that require transient activation; the Chromium tests exercise microtask publication from an actual click.
+blocking and transient user-activation policy remain browser-owned. Do not use an animation-frame-delayed publisher for
+actions that require transient activation; the Chromium tests exercise microtask publication from an actual click.
 
 ## Tests
 
@@ -73,8 +73,11 @@ nx test statebus-navigation-browser
 nx run statebus-navigation-browser:test-browser
 ```
 
-Fast Bun properties test URL policy without a browser. The separate browser target uses Playwright with real Chromium,
-a real MicrotaskStateBus, the production reducer/driver, and a React StrictMode screen. It exercises URL writes,
-history, guard confirmation, external Location calls, opener isolation, unload dialogs and subscription disposal. Set
+Fast Bun properties test URL policy without a browser. The separate browser target uses Playwright with real Chromium, a
+real MicrotaskStateBus, the production reducer/driver, and a React StrictMode screen. It exercises URL writes, history,
+guard confirmation, external Location calls, opener isolation, unload dialogs and subscription disposal. Set
 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to a provisioned Chromium, use a detected system installation, or install the
 matching Playwright browser. The StateBus browser CI workflow runs this target independently of the fast unit lane.
+
+The browser and package-contract change filters include `.github/actions/cache-node-modules/**` alongside the shared
+shell setup, so dependency-restoration changes are verification inputs.

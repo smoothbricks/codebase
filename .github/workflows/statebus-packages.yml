@@ -8,6 +8,7 @@ on:
       - 'tsconfig*.json'
       - '.github/workflows/statebus-packages.yml'
       - '.github/actions/setup-devenv/**'
+      - '.github/actions/cache-node-modules/**'
       - 'tooling/direnv/**'
       - 'packages/nx-plugin/managed/raw/tooling/direnv/**'
   push:
@@ -19,6 +20,7 @@ on:
       - 'tsconfig*.json'
       - '.github/workflows/statebus-packages.yml'
       - '.github/actions/setup-devenv/**'
+      - '.github/actions/cache-node-modules/**'
       - 'tooling/direnv/**'
       - 'packages/nx-plugin/managed/raw/tooling/direnv/**'
 permissions:
