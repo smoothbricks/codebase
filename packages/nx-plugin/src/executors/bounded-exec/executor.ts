@@ -133,7 +133,9 @@ export function resolveCowshedExecutable(
 ): string | undefined {
   const explicit = named ?? inherited;
   if (explicit !== undefined) return resolvePath(root, explicit);
-  const onPath = (pathValue ?? '').split(delimiter).some((dir) => dir !== '' && exists(join(dir, 'cowshed')));
+  // An empty PATH component names the current directory, as POSIX spawn resolution does;
+  // the executor runs at the workspace root, so that is where an empty component looks.
+  const onPath = (pathValue ?? '').split(delimiter).some((dir) => exists(join(dir === '' ? root : dir, 'cowshed')));
   if (onPath) return undefined;
   for (const candidate of WORKSPACE_COWSHED_LAUNCHERS) {
     const launcher = join(root, candidate);
