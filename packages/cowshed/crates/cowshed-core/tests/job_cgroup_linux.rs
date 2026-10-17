@@ -563,12 +563,12 @@ fn burst_cpu_outlives_its_processes(jobs: &IncarnationCgroups) {
 fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     const MIB: u64 = 1 << 20;
     let job = jobs.admit(job_id(10)).expect("admit");
-    let file = in_scratch("page-cache");
+    let page_cache_file = in_scratch("page-cache");
     let mut running = Spawned::placed(
         &job,
         &Workload {
             allocate_mib: 128,
-            page_cache: Some((file, 64)),
+            page_cache: Some((page_cache_file.clone(), 64)),
             hold: true,
             ..Workload::default()
         },
@@ -596,15 +596,26 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
     let (file, shmem) = (counter("file"), counter("shmem"));
     let f_type = filesystem_type(&scratch_directory()).expect("scratch statfs");
     let regular_file = file.checked_sub(shmem).expect("shmem is part of file");
+    // The job's own file pages still in the page cache, read after memory.stat and memory.current:
+    // reclaim between the reads can only lower it. Page cache is reclaimable, so how much of the
+    // 64 MiB is still cached is the host's business; that whatever is cached is charged to the job
+    // as regular-file cache is the job's.
+    let cached = page_cached_bytes(&page_cache_file);
     println!(
         "charged memory: current {current} B, peak {peak} B (direct before {direct_before:?}, \
          after {direct_after:?}); live members resident {resident} B; memory.stat file {file} B, \
-         shmem {shmem} B, regular-file cache {regular_file} B; filesystem {f_type:#x}"
+         shmem {shmem} B, regular-file cache {regular_file} B; the job's file cached {cached} B; \
+         filesystem {f_type:#x}"
     );
     if f_type == libc::EXT4_SUPER_MAGIC {
         assert!(
-            regular_file >= 64 * MIB,
-            "the 64 MiB regular file is charged as non-shmem cache"
+            cached > 0,
+            "the job's 64 MiB file left no page in the cache to attribute"
+        );
+        assert!(
+            regular_file >= cached,
+            "every cached page of the job's regular file is charged as non-shmem cache: \
+             regular-file cache {regular_file} B, the file's cached pages {cached} B"
         );
     } else {
         assert_eq!(
@@ -630,9 +641,9 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
         "the reader's current charge {current} B lies near two direct reads around it"
     );
     assert!(
-        current >= resident + 48 * MIB,
-        "the 64 MiB of file-backed memory is charged though nothing holds it resident: charged {current} \
-         B, resident {resident} B"
+        current >= resident + cached,
+        "the job's cached file pages are charged though nothing holds them resident: charged \
+         {current} B, resident {resident} B, the file's cached pages {cached} B"
     );
     assert!(
         peak >= 128 * MIB && peak >= current + 32 * MIB,
@@ -1177,6 +1188,45 @@ fn fill_page_cache(path: &Path, mebibytes: u64) {
         file.write_all(&chunk)
             .expect("write through the page cache");
     }
+}
+
+/// Bytes of `path` in the page cache now, by mincore(2) over a read-only shared mapping. Mapping
+/// faults nothing in, and a page stays charged to the cgroup that first brought it into the cache.
+fn page_cached_bytes(path: &Path) -> u64 {
+    use std::os::fd::AsRawFd as _;
+
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
+    let length = usize::try_from(file.metadata().expect("cached file metadata").len())
+        .expect("cached file length");
+    if length == 0 {
+        return 0;
+    }
+    // SAFETY: sysconf has no preconditions.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
+    // SAFETY: a fresh shared read-only mapping of the whole open file.
+    let region = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            length,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(region, libc::MAP_FAILED, "mmap: {}", last_error());
+    let mut status = vec![0_u8; length.div_ceil(page)];
+    // SAFETY: the mapping made above, and one status byte per page of it.
+    let probed = unsafe { libc::mincore(region, length, status.as_mut_ptr()) };
+    let probe_error = (probed != 0).then(last_error);
+    // SAFETY: the whole mapping made above, unmapped once.
+    assert_eq!(unsafe { libc::munmap(region, length) }, 0, "munmap");
+    if let Some(error) = probe_error {
+        panic!("mincore {}: {error}", path.display());
+    }
+    let pages = status.iter().filter(|byte| **byte & 1 == 1).count();
+    u64::try_from(pages * page).expect("cached bytes")
 }
 
 /// The scratch directory the harness made ([`Scratch`]).
