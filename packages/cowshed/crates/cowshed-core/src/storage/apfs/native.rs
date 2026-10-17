@@ -6701,7 +6701,14 @@ fn remove_stray_junk(
         .map(|(_, relative, _, _)| relative.as_slice())
         .collect();
     let ignored: std::collections::BTreeSet<Vec<u8>> =
-        crate::git::ignored_by_blocking(checkout, &judged)
+        crate::git::ignored_by_rules(checkout, &judged)
+            .map_err(|error| {
+                io_error(
+                    "judge strays against the project's ignore rules",
+                    mount_point,
+                    error,
+                )
+            })?
             .into_iter()
             .collect();
     let mut unjudged_files = Vec::new();
@@ -6719,6 +6726,13 @@ fn remove_stray_junk(
     let unjudged: Vec<&Path> = unjudged_files.iter().map(PathBuf::as_path).collect();
     let held: std::collections::BTreeSet<PathBuf> =
         crate::git::held_by_repository_blocking(checkout, &unjudged)
+            .map_err(|error| {
+                io_error(
+                    "judge strays against the project's blobs",
+                    mount_point,
+                    error,
+                )
+            })?
             .into_iter()
             .collect();
     for path in unjudged_files {
@@ -7424,6 +7438,46 @@ mod tests {
         assert!(
             fs::read_dir(&mount).expect("mount").next().is_none(),
             "emptied bottom-up"
+        );
+        fs::remove_dir_all(root).expect("fixture");
+    }
+
+    /// The orphan mountpoints that pinned 763 MB each: a real `target/` that late cargo writers
+    /// left after the volume went, judged against a checkout whose `target` is a symlink to its
+    /// build volume. Git refused every path beyond that symlink, the refusal read as "nothing is
+    /// ignored", and the project's own `target/` rule kept every build artifact as work.
+    #[test]
+    fn an_ignored_directory_goes_though_the_checkout_links_it_elsewhere() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-stray-link-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let checkout = root.join("checkout");
+        let mount = root.join("mount");
+        fs::create_dir_all(checkout.join(".cowshed/build/target")).expect("build volume");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&checkout)
+                .status_locked()
+                .expect("git init")
+                .success()
+        );
+        fs::write(checkout.join(".gitignore"), "target/\n").expect("gitignore");
+        std::os::unix::fs::symlink(".cowshed/build/target", checkout.join("target"))
+            .expect("symlinked target");
+        let out = mount.join("target/debug/build/mio/7bbae8fbd3dfe80d/out");
+        fs::create_dir_all(&out).expect("late writer");
+        fs::write(out.join("libmio-7bbae8fbd3dfe80d.rmeta"), "rmeta").expect("build artifact");
+
+        assert!(matches!(
+            remove_stray_junk(&mount, &checkout).expect("sweep"),
+            StrayCleanup::Empty
+        ));
+        assert!(
+            fs::read_dir(&mount).expect("mount").next().is_none(),
+            "the ignored target/ went whole"
         );
         fs::remove_dir_all(root).expect("fixture");
     }
