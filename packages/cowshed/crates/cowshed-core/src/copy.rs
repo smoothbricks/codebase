@@ -1695,9 +1695,14 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(source_time))
             .unwrap();
+        // Content evidence, not allocation: writeback can give the copied payload its block
+        // between two walks with no repository write (specs/cowshed/02_workspaces.md, adoption
+        // step 3: allocation is fidelity and space-accounting evidence, not quiescence).
         assert_eq!(
-            super::verify_tree_blocking(&source, &destination).unwrap(),
-            original
+            super::verify_tree_blocking(&source, &destination)
+                .unwrap()
+                .digest,
+            original.digest
         );
 
         fs::write(destination.join("extra"), b"not in source").unwrap();
@@ -1707,8 +1712,10 @@ mod tests {
         fs::remove_file(destination.join("extra")).unwrap();
         super::native::directory_metadata(&source, &destination).unwrap();
         assert_eq!(
-            super::verify_tree_blocking(&source, &destination).unwrap(),
-            original
+            super::verify_tree_blocking(&source, &destination)
+                .unwrap()
+                .digest,
+            original.digest
         );
 
         #[cfg(target_os = "macos")]
