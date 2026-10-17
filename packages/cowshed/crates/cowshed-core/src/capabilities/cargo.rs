@@ -7,9 +7,12 @@
 //! dependency a clone's copied `target/` holds. Configuration, credentials and the rest of
 //! `~/.cargo` stay host-owned.
 //!
-//! A host whose toolchain is rustup's gets it read-only: the proxies in `~/.cargo/bin`, and the
-//! settings and toolchains under `~/.rustup`, reached through an owned `RUSTUP_HOME` because the
-//! sandbox HOME is private. Nothing a sandbox runs can install or update a toolchain there.
+//! The toolchain is the repository's to declare, through its own shell (devenv): this capability
+//! links no `cargo`, `rustc`, `rustdoc` or `rustup` program, so nothing of cowshed's can shadow or
+//! replace the declared one. A host whose toolchain is rustup's still lends it read-only to a
+//! shell that puts it on PATH: the proxies in `~/.cargo/bin`, and the settings and toolchains
+//! under `~/.rustup`, reached through an owned `RUSTUP_HOME` because the sandbox HOME is private.
+//! Nothing a sandbox runs can install or update a toolchain there.
 
 use std::ffi::OsString;
 use std::fs;
@@ -71,8 +74,6 @@ const RUSTUP_SETTINGS: &str = "settings.toml";
 const RUSTUP_TOOLCHAINS: &str = "toolchains";
 /// The directories a rustup proxy ensures exist on every dispatch.
 const RUSTUP_STATE_DIRECTORIES: [&str; 3] = ["update-hashes", "downloads", "tmp"];
-/// The commands a cargo project runs: rustup's proxies first, then the host's own installations.
-const PROGRAMS: [&str; 4] = ["cargo", "rustc", "rustdoc", "rustup"];
 
 fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> {
     let mut contribution = CapabilityContribution::default();
@@ -115,11 +116,6 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
             RUSTUP_STATE_DIRECTORIES
                 .map(|directory| read(rustup_home.join(directory), GrantScope::Literal)),
         );
-    }
-    let mut directories = vec![proxies];
-    directories.extend(super::host_program_directories(context));
-    for program in PROGRAMS {
-        super::add_bootstrap(&mut contribution, context, program, &directories)?;
     }
     Ok(contribution)
 }
@@ -197,25 +193,12 @@ mod tests {
     }
 
     /// What the sandboxed supervisor's repeat of the search probes beneath HOME: rustup's
-    /// settings file and each program's literal candidate path, nothing listable.
+    /// settings file alone. No program is searched for: the toolchain is the shell's to declare.
     fn probes(home: &Path) -> Vec<CapabilityGrant> {
-        let mut probes = vec![read(
+        vec![read(
             home.join(RUSTUP_HOME).join(RUSTUP_SETTINGS),
             GrantScope::Literal,
-        )];
-        for program in PROGRAMS {
-            for directory in [
-                RUSTUP_PROXIES,
-                ".nix-profile/bin",
-                ".local/state/nix/profile/bin",
-            ] {
-                probes.push(read(
-                    home.join(directory).join(program),
-                    GrantScope::Literal,
-                ));
-            }
-        }
-        probes
+        )]
     }
 
     #[test]
@@ -276,9 +259,10 @@ mod tests {
         assert_eq!(home_grants(&contribution, &fixture.home), expected);
     }
 
-    /// A rustup host lends its installed toolchains read-only: the proxies, settings and
-    /// toolchains, found through an owned `RUSTUP_HOME`, and `cargo` resolves to rustup's proxy
-    /// before any host installation. Nothing grants write to either home.
+    /// A rustup host lends its installed toolchains read-only to a shell that puts them on PATH:
+    /// the proxies, settings and toolchains, found through an owned `RUSTUP_HOME`. The capability
+    /// links no toolchain program, so rustup's default can never shadow a declared toolchain.
+    /// Nothing grants write to either home.
     #[test]
     fn a_rustup_host_lends_its_toolchains_read_only() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -328,15 +312,10 @@ mod tests {
                 .filter(|grant| grant.path.starts_with(&rustup) || grant.path.starts_with(&proxies))
                 .all(|grant| grant.access == GrantAccess::Read)
         );
-        assert!(
-            contribution
-                .bootstrap_programs
-                .contains(&crate::capabilities::BootstrapProgram {
-                    name: "cargo",
-                    target: cargo.clone(),
-                }),
-            "{:?}",
-            contribution.bootstrap_programs
+        assert_eq!(
+            contribution.bootstrap_programs,
+            Vec::new(),
+            "the capability links no toolchain program"
         );
     }
 

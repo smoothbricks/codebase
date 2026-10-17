@@ -162,9 +162,10 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
     macOS verifies through SecureTransport, which ignores `SSL_CERT_FILE`, so cargo needs its own variable.
     `index.crates.io` and `static.crates.io` are project-standing egress grants. Downloads land once per host in the
     shared registry. Git dependencies resolve through the fetch mappings to local clones when their checkouts are
-    granted, and otherwise through intercepted `github.com`. A host whose toolchain is rustup's lends it read-only: the
-    proxies in `~/.cargo/bin`, and `~/.rustup`'s settings and toolchains through an owned `RUSTUP_HOME`; nothing a
-    sandbox runs installs or updates a toolchain there.
+    granted, and otherwise through intercepted `github.com`. Cowshed links no toolchain: the repository's shell declares
+    it (15_capabilities.md, "Bootstrap executables"). A host whose toolchain is rustup's lends it read-only to a shell
+    that puts it on PATH: the proxies in `~/.cargo/bin`, and `~/.rustup`'s settings and toolchains through an owned
+    `RUSTUP_HOME`; nothing a sandbox runs installs or updates a toolchain there.
   - No git remote config or credential helper is written into the image: git reaches the network through the proxy
     variables like every other client, fetch-only (05_gateway.md "Egress modes"), and the fetch routes rewrite a bound
     repository's URLs onto its local clone (02_workspaces.md "Remote code ingress").
@@ -201,15 +202,15 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   gateway's `/sim/` endpoint (05_gateway.md) under the `sim` grant axis (04_sandbox.md). Tools that hardcode
   `/usr/bin/xcrun` bypass the shim and degrade to dev-local simulators — the safe default.
 - **The `cargo` jobserver launcher** is first on `PATH` in the managed environment, ahead of every directory that can
-  hold a real `cargo` (the private `tools/bin`, `.cowshed/bin/` tool links, shell activation's entries). Its install
-  path comes from the controller-selected host identity, never from the job's rebound private `HOME`. The served
-  `.cowshed/env` publishes that literal PATH prefix, and managed activation reapplies the same writer after project PATH
-  hooks; the child bootstrap uses the same host identity. It runs the next `cargo` on `PATH` sized to the host CPU
-  budget (05_gateway.md "Host CPU budget", Outside `bounded-exec`). Under an inherited jobserver (`CARGO_MAKEFLAGS`
-  names a live one, as for a `cargo` a build script starts) it runs that `cargo` as asked. A live parent CPU pool comes
-  next: compiling Cargo borrows its actual local allocation, sizes to it and inherits its own child sub-pool; it never
-  competes for the parent's held host grant. Pool refusal/loss fails the command (05 Gateway, gate admission by drain).
-  Under a `bounded-exec` grant (`BOUNDED_EXEC_CPU_TOKENS` set) it takes no second grant and sets `CARGO_BUILD_JOBS`,
+  hold a real `cargo` (`.cowshed/bin/` tool links, shell activation's entries). Its install path comes from the
+  controller-selected host identity, never from the job's rebound private `HOME`. The served `.cowshed/env` publishes
+  that literal PATH prefix, and managed activation reapplies the same writer after project PATH hooks; the child
+  bootstrap uses the same host identity. It runs the next `cargo` on `PATH` sized to the host CPU budget (05_gateway.md
+  "Host CPU budget", Outside `bounded-exec`). Under an inherited jobserver (`CARGO_MAKEFLAGS` names a live one, as for a
+  `cargo` a build script starts) it runs that `cargo` as asked. A live parent CPU pool comes next: compiling Cargo
+  borrows its actual local allocation, sizes to it and inherits its own child sub-pool; it never competes for the
+  parent's held host grant. Pool refusal/loss fails the command (05 Gateway, gate admission by drain). Under a
+  `bounded-exec` grant (`BOUNDED_EXEC_CPU_TOKENS` set) it takes no second grant and sets `CARGO_BUILD_JOBS`,
   `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` to that count where they are unset. A subcommand classified as
   non-compiling by [05 Gateway, Host CPU budget](05_gateway.md#host-cpu-budget) runs directly. Any other takes a
   jobserver grant of `g` tokens and runs with the grant's fifo, and with `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` and

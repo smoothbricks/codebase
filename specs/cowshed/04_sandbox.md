@@ -166,7 +166,7 @@ Shape:
 ;;   - every HOME path the sandboxed supervisor probes when it repeats detection:
 ;;     each bootstrap candidate as its literal program path
 ;;     (~/.nix-profile/bin/<tool>, ~/.local/state/nix/profile/bin/<tool>,
-;;     ~/.cargo/bin/<tool>, ~/.bun/bin/bun, ~/.local/bin/uv), rustup's
+;;     ~/.bun/bin/bun, ~/.local/bin/uv), rustup's
 ;;     settings file, and the sccache GC root that names RUSTC_WRAPPER.
 (allow file-read* file-read-data (literal "~/.nix-profile/bin/direnv"))  ;; … one per grant
 (allow file-read-metadata (literal "~/.nix-profile/bin") (literal "~/.nix-profile") (literal "~"))  ;; its ancestors beneath HOME
