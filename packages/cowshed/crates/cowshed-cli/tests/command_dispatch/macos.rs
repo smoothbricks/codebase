@@ -1444,13 +1444,262 @@ fn host_bun() -> PathBuf {
     executable
 }
 
-/// The pins `bun install` applies to Nx, read from the repository's own manifest.
-#[derive(serde::Deserialize)]
-struct NxPins {
-    #[serde(rename = "devDependencies")]
-    dev_dependencies: std::collections::BTreeMap<String, String>,
-    #[serde(rename = "patchedDependencies")]
-    patched_dependencies: std::collections::BTreeMap<String, String>,
+/// The installed dependency closure of `nx`, walked through the repository's own Bun store:
+/// each package's dependencies resolve to the sibling Bun linked beside it in the same store
+/// entry, so the walk yields the exact instances the repository runs, platform binaries for
+/// this host included and other platforms' absent, as Bun's linker left them.
+fn nx_install_closure(nx: &Path) -> std::collections::BTreeMap<String, PathBuf> {
+    let mut members = std::collections::BTreeMap::new();
+    let mut queue = vec![nx.to_path_buf()];
+    while let Some(directory) = queue.pop() {
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.join("package.json")).expect("an installed package manifest"),
+        )
+        .expect("an installed package manifest parses");
+        let name = manifest["name"]
+            .as_str()
+            .expect("an installed package names itself")
+            .to_owned();
+        if members.insert(name.clone(), directory.clone()).is_some() {
+            continue;
+        }
+        // The store's own neighbourhood for this package: <store>/node_modules/<name>, so
+        // dependencies are that node_modules directory's other entries, canonicalized
+        // through Bun's links to the store entries that hold them.
+        let neighbourhood = if name.starts_with('@') {
+            directory
+                .parent()
+                .and_then(Path::parent)
+                .expect("a scoped package sits in its store neighbourhood")
+        } else {
+            directory
+                .parent()
+                .expect("a package sits in its store neighbourhood")
+        };
+        for field in ["dependencies", "optionalDependencies", "peerDependencies"] {
+            let Some(dependencies) = manifest[field].as_object() else {
+                continue;
+            };
+            for dependency in dependencies.keys() {
+                let sibling = neighbourhood.join(dependency);
+                if sibling.exists() {
+                    queue.push(
+                        sibling
+                            .canonicalize()
+                            .expect("an installed dependency resolves through Bun's link"),
+                    );
+                }
+            }
+        }
+    }
+    members
+}
+
+/// Clone the repository's Bun-installed Nx namespace into `checkout`, offline.
+///
+/// This is a clone, not an install, and the difference is deliberate. The fixture used to
+/// resolve Nx from the registry with `bun install --offline`, which reads Bun's local
+/// cache — warm on a developer host because the repository's own install ran there, cold
+/// on a runner whose checkout was cloned with its `node_modules` already seeded, where it
+/// fails with `no cached manifest for "nx"`. No offline warmup exists (the repository
+/// root's `bun install --offline --frozen-lockfile` fails cold too: Bun does not populate
+/// its cache from a seeded `node_modules`), and seeding a cache from the fixture would
+/// add a host cache path, which 08_testing.md ("Fixtures") forbids. A workspace-member
+/// install does work offline, but leaves `node_modules/nx` canonicalizing into a plain
+/// `packages/` tree, which the shared read-grant traversal (`nx_reads.rs`) does not
+/// accept: a consumer's Nx must sit in its checkout's `.bun` namespace, with eligible
+/// dependencies shared through the global store. Bun cannot be made to produce that
+/// namespace from local packages either — it copies `file:` members as leaves and strips
+/// their nested `node_modules`, so their dependencies never link (measured: one missing
+/// edge, `figures` → `escape-string-regexp`, in every such variant). So the namespace Bun
+/// already produced for the repository is cloned whole: every `.bun` store entry Nx's
+/// closure reaches, the `node_modules/nx` link and the `.bin` entries, in the exact shape
+/// the repository's install left them (`developer_nx` clones the installed product the
+/// same way). What the fixture stops proving is that Bun can install Nx from a registry —
+/// the repository's own install in CI setup and the nx-plugin suites that execute the
+/// installed Nx carry that proof; what it keeps proving is everything downstream of an
+/// installed Nx, with byte-identical product files.
+fn clone_repository_nx_install(checkout: &Path, nx: &Path) {
+    let bun_root = nx
+        .ancestors()
+        .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new(".bun")))
+        .expect("the repository's Nx sits in its Bun install namespace");
+    let installed = checkout.join("node_modules");
+    let bun_destination = installed.join(".bun");
+    fs::create_dir_all(&bun_destination).unwrap();
+    // The store entries the closure reaches, by entry directory name: cloning an entry
+    // clones the package and the dependency links Bun left beside it in one move. The set
+    // is closed along the entries' own relative links, so a cloned entry never points at
+    // a sibling that was not cloned with it. Packages Bun shares through its global store
+    // are already installed on the host and stay there — the read-grant traversal expects
+    // them in the store, not in the checkout.
+    let mut entries = std::collections::BTreeMap::new();
+    for directory in nx_install_closure(nx).values() {
+        let Some(entry) = directory
+            .ancestors()
+            .find(|ancestor| ancestor.parent() == Some(bun_root))
+        else {
+            continue;
+        };
+        entries.insert(
+            entry
+                .file_name()
+                .expect("a store entry is named")
+                .to_string_lossy()
+                .into_owned(),
+            entry.to_path_buf(),
+        );
+    }
+    let mut pending: Vec<PathBuf> = entries.values().cloned().collect();
+    while let Some(entry) = pending.pop() {
+        let mut stack = vec![entry];
+        while let Some(directory) = stack.pop() {
+            // A store entry another process is pruning mid-walk simply contributes no
+            // links; a genuinely missing dependency still fails the assertions below.
+            let Ok(items) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for item in items {
+                let Ok(item) = item else { continue };
+                let path = item.path();
+                let Ok(file_type) = item.file_type() else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    let Ok(target) = fs::read_link(&path) else {
+                        continue;
+                    };
+                    if target.is_absolute() {
+                        continue;
+                    }
+                    // Resolve the link lexically against its own directory, then take the
+                    // store entry that holds the resolved path, if it is one of Bun's.
+                    let mut resolved = path
+                        .parent()
+                        .expect("a Bun store entry link has a directory")
+                        .to_path_buf();
+                    for component in target.components() {
+                        match component {
+                            std::path::Component::ParentDir => {
+                                resolved.pop();
+                            }
+                            std::path::Component::Normal(part) => resolved.push(part),
+                            _ => {}
+                        }
+                    }
+                    let Some(linked) = resolved
+                        .ancestors()
+                        .find(|ancestor| ancestor.parent() == Some(bun_root))
+                    else {
+                        continue;
+                    };
+                    let name = linked
+                        .file_name()
+                        .expect("a store entry is named")
+                        .to_string_lossy()
+                        .into_owned();
+                    if !entries.contains_key(&name) {
+                        entries.insert(name, linked.to_path_buf());
+                        pending.push(linked.to_path_buf());
+                    }
+                } else if file_type.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+    }
+    for (name, entry) in &entries {
+        // A link Bun left for a package this host never installed names an entry that
+        // does not exist; there is nothing to clone for it, and the traversal below
+        // asserts on whatever a consumer actually reaches.
+        if entry.exists() {
+            clone_or_copy_tree(entry, &bun_destination.join(name));
+        }
+    }
+    // The links Bun's install leaves at the namespace root, recreated relative so they
+    // survive the cloning every fixture performs: `node_modules/nx` and its `.bin` entries.
+    let nx_entry = nx
+        .ancestors()
+        .find(|ancestor| ancestor.parent() == Some(bun_root))
+        .expect("the repository's Nx sits in a Bun store entry");
+    std::os::unix::fs::symlink(
+        Path::new(".bun")
+            .join(nx_entry.file_name().expect("the Nx store entry is named"))
+            .join("node_modules/nx"),
+        installed.join("nx"),
+    )
+    .expect("the namespace's Nx link");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(nx.join("package.json")).expect("the repository's Nx manifest"),
+    )
+    .expect("the repository's Nx manifest parses");
+    let bins: Vec<(String, String)> = match &manifest["bin"] {
+        serde_json::Value::String(path) => vec![("nx".to_owned(), path.clone())],
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(name, path)| {
+                (
+                    name.clone(),
+                    path.as_str().expect("a bin entry is a path").to_owned(),
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    fs::create_dir_all(installed.join(".bin")).unwrap();
+    for (name, path) in bins {
+        std::os::unix::fs::symlink(
+            Path::new("../nx").join(path),
+            installed.join(".bin").join(&name),
+        )
+        .unwrap_or_else(|error| panic!("the namespace's .bin/{name} link: {error}"));
+    }
+}
+
+/// Clone `source`'s tree to `destination`, copying when the two live on different volumes
+/// (the repository's store and the fixture's scratch need not share one, where `clonefile`
+/// cannot reach). Links are recreated as links, so the installed namespace keeps the exact
+/// shape Bun produced.
+fn clone_or_copy_tree(source: &Path, destination: &Path) {
+    // An entry Bun itself keeps as a link into its global store stays that link: cloning
+    // its target into the checkout would strand the relative links inside it, which are
+    // written against the store's layout, and the traversal expects shared packages there.
+    if fs::symlink_metadata(source)
+        .expect("a closure member entry")
+        .file_type()
+        .is_symlink()
+    {
+        let target = fs::read_link(source).expect("a closure member link");
+        std::os::unix::fs::symlink(&target, destination).expect("recreate a member link");
+        return;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32)
+        -> libc::c_int;
+    }
+    let path = |path: &Path| std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
+    let (from, to) = (path(source), path(destination));
+    // SAFETY: both arguments are NUL-terminated strings that outlive the call.
+    if unsafe { clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        return;
+    }
+    fn copy(source: &Path, destination: &Path) {
+        let metadata = fs::symlink_metadata(source).expect("a closure member entry");
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(source).expect("a closure member link");
+            std::os::unix::fs::symlink(&target, destination).expect("recreate a member link");
+        } else if metadata.is_dir() {
+            fs::create_dir(destination).expect("a closure member directory");
+            for entry in fs::read_dir(source).expect("read a closure member directory") {
+                let entry = entry.expect("a closure member entry");
+                copy(&entry.path(), &destination.join(entry.file_name()));
+            }
+        } else {
+            fs::copy(source, destination).expect("copy a closure member file");
+        }
+    }
+    copy(source, destination);
 }
 
 /// An Nx project whose `a:build` writes `a/generated.txt` and whose `a:test` reads it (its
@@ -1468,28 +1717,11 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
         "[]"
     };
     let root = repository_root();
-    let pins: NxPins = serde_json::from_slice(
-        &fs::read(root.join("package.json")).expect("the repository manifest"),
-    )
-    .expect("the repository manifest's Nx pins");
-    let version = pins
-        .dev_dependencies
-        .get("nx")
-        .expect("the repository pins Nx");
-    let key = format!("nx@{version}");
-    let patch = pins
-        .patched_dependencies
-        .get(&key)
-        .expect("the repository patches Nx");
-    fs::create_dir_all(checkout.join(patch).parent().expect("patch directory")).unwrap();
-    fs::copy(root.join(patch), checkout.join(patch)).expect("the repository's maintained Nx patch");
     fs::copy(root.join("bunfig.toml"), checkout.join("bunfig.toml"))
         .expect("the repository's bunfig.toml");
     fs::write(
         checkout.join("package.json"),
-        format!(
-            r#"{{"name":"fixture","private":true,"dependencies":{{"nx":"{version}"}},"patchedDependencies":{{"{key}":"{patch}"}}}}"#
-        ),
+        r#"{"name":"fixture","private":true}"#,
     )
     .unwrap();
     // The genuine fixture uses the normal daemon: checks must share the keeper's warm graph,
@@ -1513,22 +1745,12 @@ fn write_nx_project(checkout: &Path, nx: &Path, node: &Path, declared: bool) {
         ),
     )
     .unwrap();
-    let bun = host_bun();
     let started = std::time::Instant::now();
-    let install = Command::new(&bun)
-        .args(["install", "--offline"])
-        .current_dir(checkout)
-        .output()
-        .expect("run the host bun");
+    clone_repository_nx_install(checkout, nx);
     eprintln!(
-        "bun install --offline of Nx {version} in {}: {:?}",
+        "cloned the repository's Bun-installed Nx namespace in {}: {:?}",
         checkout.display(),
         started.elapsed()
-    );
-    assert!(
-        install.status.success(),
-        "bun install --offline: {}",
-        String::from_utf8_lossy(&install.stderr)
     );
     for file in ["package.json", "dist/bin/nx.js"] {
         assert_eq!(
