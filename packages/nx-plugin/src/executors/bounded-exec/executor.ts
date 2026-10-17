@@ -111,14 +111,16 @@ const WORKSPACE_COWSHED_LAUNCHERS = [
 ] as const;
 
 /**
- * The cowshed a run's disk commands use: the target's named one, else the installed one on
- * PATH, else — only when PATH provides none — the launcher this workspace itself provides
- * (its own cowshed package, or a linked one's bin). An environment with no cowshed anywhere
- * keeps the bare name, so its spawn failure names the missing installed tool.
+ * The cowshed a run's disk commands use, in precedence order: the target's named one, an
+ * explicit one inherited from the parent process, the installed one on PATH, and — only when
+ * PATH provides none — the launcher this workspace itself provides (its own cowshed package,
+ * or a linked one's bin). An environment with no cowshed anywhere keeps the bare name, so
+ * its spawn failure names the missing installed tool.
  */
 export function resolveCowshedExecutable(
   root: string,
   named: string | undefined,
+  inherited: string | undefined,
   pathValue: string | undefined,
   exists: (path: string) => boolean = (path) => {
     try {
@@ -129,7 +131,8 @@ export function resolveCowshedExecutable(
     }
   },
 ): string | undefined {
-  if (named !== undefined) return resolvePath(root, named);
+  const explicit = named ?? inherited;
+  if (explicit !== undefined) return resolvePath(root, explicit);
   const onPath = (pathValue ?? '').split(delimiter).some((dir) => dir !== '' && exists(join(dir, 'cowshed')));
   if (onPath) return undefined;
   for (const candidate of WORKSPACE_COWSHED_LAUNCHERS) {
@@ -155,7 +158,7 @@ export function runDefaultBoundedExec(
   // for its command alike. Nx resolves `{workspaceRoot}/…` in an option to a workspace-relative path, which the
   // command, starting in another directory, could not find: it gets the absolute one.
   const named = options.env?.[COWSHED_EXECUTABLE_ENV];
-  const cowshed = resolveCowshedExecutable(context.root, named, process.env.PATH);
+  const cowshed = resolveCowshedExecutable(context.root, named, process.env[COWSHED_EXECUTABLE_ENV], process.env.PATH);
   const run: BoundedExecOptions =
     cowshed === undefined ? options : { ...options, env: { ...options.env, [COWSHED_EXECUTABLE_ENV]: cowshed } };
   // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.

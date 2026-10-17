@@ -911,11 +911,25 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       return (path: string) => set.has(path);
     };
     // A named executable wins and is made absolute against the workspace root.
-    expect(resolveCowshedExecutable(root, 'bin/cowshed', '/usr/bin', () => false)).toBe('/workspace/bin/cowshed');
+    expect(resolveCowshedExecutable(root, 'bin/cowshed', undefined, '/usr/bin', () => false)).toBe(
+      '/workspace/bin/cowshed',
+    );
+    // An explicit executable inherited from the parent process outranks both PATH and the
+    // workspace's own launcher — the precedence createHostCommands always had.
+    expect(
+      resolveCowshedExecutable(
+        root,
+        undefined,
+        '/valid/bin/cowshed',
+        '/usr/bin',
+        present('/workspace/packages/cowshed/bin/cowshed'),
+      ),
+    ).toBe('/valid/bin/cowshed');
     // An installed cowshed on PATH wins over the workspace's own launcher.
     expect(
       resolveCowshedExecutable(
         root,
+        undefined,
         undefined,
         '/usr/bin:/opt/bin',
         present('/opt/bin/cowshed', '/workspace/packages/cowshed/bin/cowshed'),
@@ -923,19 +937,26 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     ).toBeUndefined();
     // Only when PATH provides none does the workspace's own launcher answer.
     expect(
-      resolveCowshedExecutable(root, undefined, '/usr/bin', present('/workspace/packages/cowshed/bin/cowshed')),
+      resolveCowshedExecutable(
+        root,
+        undefined,
+        undefined,
+        '/usr/bin',
+        present('/workspace/packages/cowshed/bin/cowshed'),
+      ),
     ).toBe('/workspace/packages/cowshed/bin/cowshed');
     expect(
       resolveCowshedExecutable(
         root,
+        undefined,
         undefined,
         '/usr/bin',
         present('/workspace/node_modules/@smoothbricks/cowshed/bin/cowshed'),
       ),
     ).toBe('/workspace/node_modules/@smoothbricks/cowshed/bin/cowshed');
     // No cowshed anywhere keeps the bare name, so the spawn failure names the missing tool.
-    expect(resolveCowshedExecutable(root, undefined, '/usr/bin', () => false)).toBeUndefined();
-    expect(resolveCowshedExecutable(root, undefined, undefined, () => false)).toBeUndefined();
+    expect(resolveCowshedExecutable(root, undefined, undefined, '/usr/bin', () => false)).toBeUndefined();
+    expect(resolveCowshedExecutable(root, undefined, undefined, undefined, () => false)).toBeUndefined();
   });
 
   it('sizes a runner to the grant its parent pool lent, takes nothing from the host, and returns nothing to it', async () => {
