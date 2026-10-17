@@ -654,25 +654,32 @@ core count.
   can deadlock on each other's tokens. A compile-only Cargo build may grow after it starts ("A short build grows"
   below), but it runs from its first grant on and never waits for a growth.
 
-- **Gate admission: FIFO ahead of background, never starving it** (2026-10-17, Danny tg#6693: "The gate class is served
-  FIFO at highest priority over all other execs … When gate runs it needs more tickets than background but not fully
-  starve background"). A jobserver root request carries a typed `class: "background" | "gate"`; omission is background.
-  While any gate-class request waits, the oldest one, wherever it sits in its checkout's queue, takes `min(want, free)`
-  once a token is free, ahead of every queued background request (both jobserver and `cpu-tokens`). Background is not
-  starved meanwhile: a background checkout that waits holding nothing is granted one token first, as long as background
-  as a whole then still holds less than half of N, so gate-class work holds the larger part. A running gate grant blocks
-  nobody: with no gate-class request waiting, ordinary checkout fairness serves background and later gates alike from
-  the free tokens. An in-flight background grant stays exactly as it is until its child exits or its connection closes.
-  This is priority on genuinely returned tokens, not a reserved budget, budget increase, or stolen allocation.
-  Conservation remains `free + Σ held = N`.
+- **Gate admission: oldest gate job first, ahead of background, never starving it** (2026-10-17, Danny tg#6693: "The
+  gate class is served FIFO at highest priority over all other execs … When gate runs it needs more tickets than
+  background but not fully starve background"; tg#7019, of two concurrent lands: "first should be full priority and
+  second almost background until first completes"). A jobserver root request carries a typed
+  `class: "background" | "gate"`; omission is background. Gate-class work is ranked by the gate job it serves, by that
+  job's own admission: a gate root request is its own job, and every task its pool relays ranks by the root's admission,
+  not by when the task asked. While any gate-class work wants tokens, the oldest gate job's next want is served once a
+  token is free, wherever its requests sit in their checkouts' queues: a waiting task takes `min(want, free)`, in the
+  order that job's tasks asked, before a running task of that job grows ("A short build grows" below). All of it comes
+  ahead of every queued background request (both jobserver and `cpu-tokens`). Background is not starved meanwhile: a
+  background checkout that waits holding nothing is granted one token first, as long as background as a whole then still
+  holds less than half of N, so gate-class work holds the larger part. A running gate grant blocks nobody: with no
+  gate-class work wanting tokens, ordinary checkout fairness serves background from the free tokens. An in-flight
+  background grant stays exactly as it is until its child exits or its connection closes. This is priority on genuinely
+  returned tokens, not a reserved budget, budget increase, or stolen allocation. Conservation remains
+  `free + Σ held = N`.
 - **A land is a gate job, and its tasks are gate-class requests.** The selecting authority is the land queue holder:
   `~/Dev/.land-lock.sh` runs main's `tooling/land-host.sh`, the only path that gates a tree before `cowshed land`
   fast-forwards to it, and it runs that gate as `cowshed exec <workspace> --class gate --host -- …`. The trusted route
   alone grants the class (class-not-permitted for a worker). The job's own grant is the one token its orchestrator uses;
   its pool relays every task's ask, from the host or from inside the sandbox, as a gate-class request for the
-  workspace's checkout. A land therefore takes returned tokens at every task, in the order its tasks ask, and is never
-  frozen at the width of its first grant. Same-repo lands are already serialized by the per-repository land lock; lands
-  of two repositories share by FIFO order, task by task, and neither holds the other out for its whole gate.
+  workspace's checkout, ranked by the job's own admission. A land therefore takes returned tokens at every task, in the
+  order its tasks ask, and is never frozen at the width of its first grant. Same-repo lands are already serialized by
+  the per-repository land lock. Lands of two repositories are served oldest gate job first: the older land's tasks take
+  every returned token they want, the younger land's tasks take what the older one does not ask for, and the younger
+  takes the older one's place when it completes. Neither is preempted: a running task of either keeps its grant.
 - **A short build grows** (2026-10-17, Danny chose option C of tg#6761). A grant taken at the first returned token can
   be far below its `want`: measured, a land task's nextest asked for 18 tokens on a host another shed held whole, waited
   32 s and ran its whole suite with 1 (`tokens=1/18`). A runner whose parallelism is a make jobserver can use tokens
@@ -680,13 +687,13 @@ core count.
   and runs nothing it built — `build`, `check`, `clippy`, `doc`, `rustc`, `rustdoc`, `fix`, `test`/`bench` with
   `--no-run`, `nextest archive` — asks with `"grow": true`; test runners keep their first grant, so no token sits idle
   in a fifo nobody reads. A growing holder that holds less than its `want` takes `min(want − held, free)` more from
-  returned tokens that no waiter of its class takes: a gate-class build grows after every waiting gate-class request has
-  started and ahead of background, under the same background floor; a background build grows only while no background
-  request waits. It never passes its own `want`, so one task cannot starve the rest of its own gate. Conservation is
-  unchanged: growth moves tokens from `free` to that holder. The holder hears each new total as
-  `{"ok":true,"lease":"grown","tokens":<total>}` on its connection, and the launcher hands the difference to Cargo's
-  jobserver fifo and says `cowshed: cargo jobserver grew tokens=<from>/<want> -> <to>/<want>` on stderr, beside its
-  `cowshed: cargo jobserver granted tokens=<g>/<want>`. Closing the connection still returns everything held.
+  returned tokens that no waiter ahead of it takes: a gate-class build grows once no task of its own gate job or of an
+  older one waits, ahead of a younger gate job's tasks and of background, under the same background floor; a background
+  build grows only while no background request waits. It never passes its own `want`, so one task cannot starve the rest
+  of its own gate. Conservation is unchanged: growth moves tokens from `free` to that holder. The holder hears each new
+  total as `{"ok":true,"lease":"grown","tokens":<total>}` on its connection, and the launcher hands the difference to
+  Cargo's jobserver fifo and says `cowshed: cargo jobserver grew tokens=<from>/<want> -> <to>/<want>` on stderr, beside
+  its `cowshed: cargo jobserver granted tokens=<g>/<want>`. Closing the connection still returns everything held.
 - **What gate priority does not guarantee.** A background test's CPU grant cannot be shrunk mid-run: Cargo's implicit
   make token and libtest/nextest threads sized from the original grant do not return FIFO bytes. The gateway does not
   resize a running FIFO, kill peer work, or use `SIGSTOP`/`SIGCONT`: wall and idle bounds would keep advancing during a
@@ -761,8 +768,10 @@ core count.
   different job. The gateway answers `{"ok":true,"lease":"queued","id":"<lease id>"}` at once and
   `{"ok":true,"lease":"granted","id":"<lease id>","tokens":<g>}` when the runner may start. The same lease id identifies
   that admission until its connection closes. `want` 0, a missing or empty checkout, or one over 4096 bytes is refused
-  as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as `cpuBudget`: `total`, `held`, and
-  per checkout `held`, `running` and `waiting`.
+  as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as `cpuBudget`: `total`, `held`, per
+  checkout `held`, `running` and `waiting`, and `gateQueue`: the waiting gate-class requests in the order returned
+  tokens go to them, each with its `checkout`, its gate `job` (the job's admission number; the smaller is the older job)
+  and its `want`.
 - **Priority updates.** `{"op":"job-qos","job":{…}|"lease":"<lease id>","priority":<u32>}` is one-shot and answers
   `{"ok":true}`, or `not-found` for an admission that is not live. It re-keys the selected admission only while queued;
   a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions. This
@@ -846,15 +855,17 @@ core count.
   unchanged; fixed test/nextest grants are never opted into cooperative FIFO reclaim. An inherited `CARGO_MAKEFLAGS`
   whose fifo is gone counts as no jobserver.
 
-Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave, gate FIFO and the
-background floor, a short build growing to and never past its `want`, a new land task starting before a running one
-grows) and `tests/cpu_budget.rs` over a real socket (`SIGKILL` of a holding client returns its tokens to the waiter at
-once; checkouts share the host; refusals); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed
-holder closing its grant) and `executor.test.ts` (a granted run sized and released, a refused one run as asked); a
-jobserver test in which a `SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; the launcher's
-tests (each of its four cases, the `want` it sends, and the variables it sets or leaves on each path); and the
-dynamic-band tests: a starved foreground grant demotes a running normal job's band and restores it when the foreground
-job leaves, and an opportunistic job admitted in the background band never holds a foreground job's cores.
+Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave, the background floor, an
+older land served before a younger land that asked first and both before a feature build that asked before either, an
+older land's build growing before a younger land's task starts, a short build growing to and never past its `want`, a
+new land task starting before a running one of the same land grows) and `tests/cpu_budget.rs` over a real socket
+(`SIGKILL` of a holding client returns its tokens to the waiter at once; checkouts share the host; refusals); the
+plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
+`executor.test.ts` (a granted run sized and released, a refused one run as asked); a jobserver test in which a
+`SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; the launcher's tests (each of its four
+cases, the `want` it sends, and the variables it sets or leaves on each path); and the dynamic-band tests: a starved
+foreground grant demotes a running normal job's band and restores it when the foreground job leaves, and an
+opportunistic job admitted in the background band never holds a foreground job's cores.
 
 ## The task server schedules work units
 

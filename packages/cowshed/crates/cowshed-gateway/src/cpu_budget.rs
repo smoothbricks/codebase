@@ -17,9 +17,11 @@
 //! Fairness only acts when a grant is made: a running nextest or cargo cannot hand tokens back.
 //! Class ranks first: while any gate-class request waits, every returned token goes to gate-class
 //! work and background requests stay queued. A land's gate runs as a gate job whose pool relays
-//! each of its tasks' asks here at gate class (`jobserver.rs`), so land work is served at every
-//! return, task by task, and concurrent lands share by the same checkout fairness. Existing
-//! grants drain whole; their FIFOs, implicit make token and test-thread sizing are never resized.
+//! each of its tasks' asks here at gate class (`jobserver.rs`), ranked by the gate job's own
+//! admission: gate work is served oldest job first, and within one job in the order its tasks
+//! asked, so an older land takes every returned token its tasks want before a younger land's
+//! tasks get one. Existing grants drain whole; their FIFOs, implicit make token and test-thread
+//! sizing are never resized.
 //!
 //! [`Ledger`] is the whole policy as a pure state machine; [`CpuBudget`] is the thin actor that
 //! feeds it requests and departures and answers status.
@@ -30,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cowshed_gateway_types::{CpuBudgetStatus, CpuCheckoutStatus, JobserverClass};
+use cowshed_gateway_types::{CpuBudgetStatus, CpuCheckoutStatus, CpuGateWaiter, JobserverClass};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::disk_lease::{Claim, Ticket};
@@ -50,6 +52,21 @@ impl Default for CpuBudgetLimits {
                 .expect("every supported host reports how many CPUs it has"),
         }
     }
+}
+
+/// The gate job a request serves, as that job's own admission ticket: the smaller ticket is the
+/// older job, and gate-class work is served oldest job first.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct JobAge(Ticket);
+
+/// Where a request stands in the order: its class and, for gate work, the job whose age ranks it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Rank {
+    Background,
+    /// A gate job's own admission: its ticket is the job's age.
+    Gate,
+    /// A task a gate job relays: it ranks by that job's age, not by when it asked.
+    GateTask(JobAge),
 }
 
 /// What a [`Ledger`] transition did, for the actor to carry out.
@@ -79,6 +96,8 @@ pub(crate) enum Effect {
 struct Waiter {
     ticket: Ticket,
     class: JobserverClass,
+    /// The job that ranks it: the gate job it serves, or its own ticket.
+    job: Ticket,
     /// The count asked for, as asked.
     want: usize,
     /// The runner can use tokens handed to it after it starts (a Cargo build's jobserver).
@@ -87,10 +106,18 @@ struct Waiter {
     claim: Claim,
 }
 
+impl Waiter {
+    /// Gate-class order: the older job first, then the request that asked first.
+    fn order(&self) -> (Ticket, Ticket) {
+        (self.job, self.ticket)
+    }
+}
+
 #[derive(Debug)]
 struct Holder {
     ticket: Ticket,
     class: JobserverClass,
+    job: Ticket,
     tokens: usize,
     want: usize,
     grows: bool,
@@ -101,6 +128,13 @@ impl Holder {
     fn short(&self) -> bool {
         self.grows && self.tokens < self.want
     }
+}
+
+/// Within one gate job, a waiting task starts before a running one grows.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum GateStep {
+    Start,
+    Grow,
 }
 
 /// The ledger's next step: start a waiter, or grow a running holder.
@@ -190,19 +224,19 @@ impl Ledger {
         self.admit(now, effects);
     }
 
-    /// Grant waiters while tokens are free: gate class FIFO first, background fairest, and grow
-    /// short running builds with what no waiter can take.
+    /// Grant waiters while tokens are free: gate class oldest job first, background fairest, and
+    /// grow short running builds with what no waiter can take.
     ///
-    /// While any gate-class request waits, the oldest one, wherever it sits in its checkout's
-    /// queue, takes `min(want, free)` once a token is free: a land's tasks take returned tokens
-    /// before queued background work, in the order they asked. With no gate-class request
-    /// waiting, the oldest running gate-class holder that asked to grow and holds less than its
-    /// `want` takes `min(want − held, free)` more, still ahead of background: a land task that
-    /// started narrow widens as tokens return, a new land task always starts first, and no
-    /// holder ever passes its own `want`. Background is not starved meanwhile: while gate-class
-    /// work wants tokens, a background checkout that waits holding nothing still gets one token
-    /// first, as long as background as a whole then still holds less than half the host, so
-    /// gate-class work always holds the larger part.
+    /// Gate-class work is ranked by the gate job it serves: the oldest job's wants come first,
+    /// wherever its requests sit in their checkouts' queues, and within one job a waiting task
+    /// takes `min(want, free)` before a running one grows, in the order they asked. A short
+    /// gate-class holder — one that asked to grow and holds less than its `want` — takes
+    /// `min(want − held, free)` more once no task of its own job or an older one waits. So a land
+    /// takes every returned token its tasks want before a younger land gets one, and both before
+    /// queued background work; no holder ever passes its own `want`. Background is not starved
+    /// meanwhile: while gate-class work wants tokens, a background checkout that waits holding
+    /// nothing still gets one token first, as long as background as a whole then still holds
+    /// less than half the host, so gate-class work always holds the larger part.
     ///
     /// With no gate-class demand, background is fair between checkouts. The next grant goes to
     /// the waiting checkout that holds the fewest tokens (the older head waiter on a tie), to its
@@ -234,6 +268,7 @@ impl Ledger {
                     checkout.running.push(Holder {
                         ticket: waiter.ticket,
                         class: waiter.class,
+                        job: waiter.job,
                         tokens,
                         want: waiter.want,
                         grows: waiter.grows,
@@ -274,8 +309,8 @@ impl Ledger {
         }
     }
 
-    /// The oldest running holder of `class` that can still grow, and by how much.
-    fn grower(&self, class: JobserverClass) -> Option<Pick> {
+    /// The oldest running background holder that can still grow, and by how much.
+    fn background_grower(&self) -> Option<Pick> {
         let (name, index, holder) = self
             .checkouts
             .iter()
@@ -284,7 +319,9 @@ impl Ledger {
                     .running
                     .iter()
                     .enumerate()
-                    .filter(move |(_, holder)| holder.class == class && holder.short())
+                    .filter(|(_, holder)| {
+                        holder.class == JobserverClass::Background && holder.short()
+                    })
                     .map(move |(index, holder)| (name, index, holder))
             })
             .min_by_key(|(_, _, holder)| holder.ticket)?;
@@ -296,25 +333,35 @@ impl Ledger {
     }
 
     /// The next step while gate-class work wants tokens: a starved background checkout's one
-    /// token, else the oldest gate-class request's `min(want, free)`, else the oldest short
-    /// gate-class holder's growth. `None` when no gate-class work wants a token.
+    /// token, else the oldest gate job's next want — a waiting task's `min(want, free)` before a
+    /// short holder's growth. `None` when no gate-class work wants a token.
     fn next_gate(&self) -> Option<Pick> {
-        let waiter = self
+        let free = self.free;
+        let ((_, step, _), name, index, tokens) = self
             .checkouts
             .iter()
             .flat_map(|(name, checkout)| {
-                checkout
+                let starts = checkout
                     .waiting
                     .iter()
                     .enumerate()
                     .filter(|(_, waiter)| waiter.class == JobserverClass::Gate)
-                    .map(move |(position, waiter)| (name, position, waiter))
+                    .map(move |(position, waiter)| {
+                        let key = (waiter.job, GateStep::Start, waiter.ticket);
+                        (key, name, position, waiter.want.min(free))
+                    });
+                let grows = checkout
+                    .running
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, holder)| holder.class == JobserverClass::Gate && holder.short())
+                    .map(move |(index, holder)| {
+                        let key = (holder.job, GateStep::Grow, holder.ticket);
+                        (key, name, index, (holder.want - holder.tokens).min(free))
+                    });
+                starts.chain(grows)
             })
-            .min_by_key(|(_, _, waiter)| waiter.ticket);
-        let grower = self.grower(JobserverClass::Gate);
-        if waiter.is_none() && grower.is_none() {
-            return None;
-        }
+            .min_by_key(|(key, _, _, _)| *key)?;
         let background: usize = self
             .checkouts
             .values()
@@ -345,14 +392,19 @@ impl Ledger {
                 tokens: 1,
             });
         }
-        match waiter {
-            Some((name, position, waiter)) => Some(Pick::Grant {
-                checkout: Arc::clone(name),
-                position,
-                tokens: waiter.want.min(self.free),
-            }),
-            None => grower,
-        }
+        let checkout = Arc::clone(name);
+        Some(match step {
+            GateStep::Start => Pick::Grant {
+                checkout,
+                position: index,
+                tokens,
+            },
+            GateStep::Grow => Pick::Grow {
+                checkout,
+                index,
+                tokens,
+            },
+        })
     }
 
     /// The next background grant by checkout fairness; with no background request waiting, the
@@ -364,7 +416,7 @@ impl Ledger {
             .filter_map(|(name, checkout)| Some((name, checkout, checkout.waiting.front()?)))
             .min_by_key(|(_, checkout, head)| (checkout.held, head.ticket))
         else {
-            return self.grower(JobserverClass::Background);
+            return self.background_grower();
         };
         let share = (self.total / self.checkouts.len()).max(1);
         let least = head.want.min(share.saturating_sub(checkout.held).max(1));
@@ -399,10 +451,30 @@ impl Ledger {
             })
             .collect();
         checkouts.sort_unstable_by(|left, right| left.checkout.cmp(&right.checkout));
+        let mut gate_queue: Vec<(&Waiter, &Arc<str>)> = self
+            .checkouts
+            .iter()
+            .flat_map(|(name, checkout)| {
+                checkout
+                    .waiting
+                    .iter()
+                    .filter(|waiter| waiter.class == JobserverClass::Gate)
+                    .map(move |waiter| (waiter, name))
+            })
+            .collect();
+        gate_queue.sort_unstable_by_key(|(waiter, _)| waiter.order());
         CpuBudgetStatus {
             total: self.total,
             held: self.total - self.free,
             checkouts,
+            gate_queue: gate_queue
+                .into_iter()
+                .map(|(waiter, name)| CpuGateWaiter {
+                    checkout: name.to_string(),
+                    job: waiter.job,
+                    want: waiter.want,
+                })
+                .collect(),
         }
     }
 }
@@ -414,6 +486,8 @@ enum Message {
         want: NonZeroUsize,
         claim: Claim,
         class: JobserverClass,
+        /// The job whose age ranks it.
+        job: Ticket,
         granted: oneshot::Sender<usize>,
         /// Where a growable holder hears its new total; `None` for a fixed grant.
         growth: Option<mpsc::UnboundedSender<usize>>,
@@ -438,6 +512,13 @@ pub(crate) struct CpuBudget {
 pub(crate) struct Stake {
     ticket: Ticket,
     messages: mpsc::UnboundedSender<Message>,
+}
+
+impl Stake {
+    /// The age of the job this stake admits, for the tasks it relays as [`Rank::GateTask`].
+    pub(crate) fn job(&self) -> JobAge {
+        JobAge(self.ticket)
+    }
 }
 
 impl Drop for Stake {
@@ -468,9 +549,9 @@ impl CpuBudget {
         checkout: Arc<str>,
         want: NonZeroUsize,
         claim: Claim,
-        class: JobserverClass,
+        rank: Rank,
     ) -> (Stake, oneshot::Receiver<usize>) {
-        self.ask_with(checkout, want, claim, class, None)
+        self.ask_with(checkout, want, claim, rank, None)
     }
 
     /// [`ask`](Self::ask) for a runner that can use tokens handed to it after it starts: after
@@ -480,14 +561,14 @@ impl CpuBudget {
         checkout: Arc<str>,
         want: NonZeroUsize,
         claim: Claim,
-        class: JobserverClass,
+        rank: Rank,
     ) -> (
         Stake,
         oneshot::Receiver<usize>,
         mpsc::UnboundedReceiver<usize>,
     ) {
         let (growth, grown) = mpsc::unbounded_channel();
-        let (stake, granted) = self.ask_with(checkout, want, claim, class, Some(growth));
+        let (stake, granted) = self.ask_with(checkout, want, claim, rank, Some(growth));
         (stake, granted, grown)
     }
 
@@ -496,10 +577,15 @@ impl CpuBudget {
         checkout: Arc<str>,
         want: NonZeroUsize,
         claim: Claim,
-        class: JobserverClass,
+        rank: Rank,
         growth: Option<mpsc::UnboundedSender<usize>>,
     ) -> (Stake, oneshot::Receiver<usize>) {
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
+        let (class, job) = match rank {
+            Rank::Background => (JobserverClass::Background, ticket),
+            Rank::Gate => (JobserverClass::Gate, ticket),
+            Rank::GateTask(JobAge(job)) => (JobserverClass::Gate, job),
+        };
         let (granted, receiver) = oneshot::channel();
         let _ = self.messages.send(Message::Ask {
             ticket,
@@ -507,6 +593,7 @@ impl CpuBudget {
             want,
             claim,
             class,
+            job,
             granted,
             growth,
         });
@@ -539,6 +626,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 want,
                 claim,
                 class,
+                job,
                 granted,
                 growth,
             } => {
@@ -556,6 +644,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                         asked: Instant::now(),
                         claim,
                         class,
+                        job,
                     },
                     &mut effects,
                 );
@@ -648,12 +737,12 @@ mod tests {
                 ticket,
                 checkout,
                 want,
-                JobserverClass::Background,
+                (JobserverClass::Background, ticket),
                 false,
             )
         }
 
-        /// A land task's ask: what a gate job's relay pool sends for each child.
+        /// A gate job's own ask: its ticket is the job's age.
         fn ask_land(
             &mut self,
             ms: u64,
@@ -661,18 +750,53 @@ mod tests {
             checkout: &str,
             want: usize,
         ) -> Vec<(Ticket, usize)> {
-            self.ask_as(ms, ticket, checkout, want, JobserverClass::Gate, false)
+            self.ask_as(
+                ms,
+                ticket,
+                checkout,
+                want,
+                (JobserverClass::Gate, ticket),
+                false,
+            )
         }
 
-        /// A land task that is a Cargo build: it can use tokens handed to it after it starts.
-        fn ask_land_build(
+        /// A land task's ask: what gate job `job`'s relay pool sends for one child.
+        fn ask_task(
             &mut self,
             ms: u64,
             ticket: Ticket,
+            job: Ticket,
             checkout: &str,
             want: usize,
         ) -> Vec<(Ticket, usize)> {
-            self.ask_as(ms, ticket, checkout, want, JobserverClass::Gate, true)
+            self.ask_as(
+                ms,
+                ticket,
+                checkout,
+                want,
+                (JobserverClass::Gate, job),
+                false,
+            )
+        }
+
+        /// A land task of gate job `job` that is a Cargo build: it can use tokens handed to it
+        /// after it starts.
+        fn ask_task_build(
+            &mut self,
+            ms: u64,
+            ticket: Ticket,
+            job: Ticket,
+            checkout: &str,
+            want: usize,
+        ) -> Vec<(Ticket, usize)> {
+            self.ask_as(
+                ms,
+                ticket,
+                checkout,
+                want,
+                (JobserverClass::Gate, job),
+                true,
+            )
         }
 
         /// A background Cargo build that can grow.
@@ -683,7 +807,14 @@ mod tests {
             checkout: &str,
             want: usize,
         ) -> Vec<(Ticket, usize)> {
-            self.ask_as(ms, ticket, checkout, want, JobserverClass::Background, true)
+            self.ask_as(
+                ms,
+                ticket,
+                checkout,
+                want,
+                (JobserverClass::Background, ticket),
+                true,
+            )
         }
 
         fn ask_as(
@@ -692,7 +823,7 @@ mod tests {
             ticket: Ticket,
             checkout: &str,
             want: usize,
-            class: JobserverClass,
+            (class, job): (JobserverClass, Ticket),
             grows: bool,
         ) -> Vec<(Ticket, usize)> {
             let now = self.origin + Duration::from_millis(ms);
@@ -700,11 +831,12 @@ mod tests {
                 Arc::from(checkout),
                 Waiter {
                     ticket,
+                    class,
+                    job,
                     want: NonZeroUsize::new(want).unwrap().get(),
                     grows,
                     asked: now,
                     claim: Claim::new(&format!("t{ticket}"), Some(7)),
-                    class,
                 },
                 &mut self.effects,
             );
@@ -918,16 +1050,45 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_lands_are_served_in_the_order_they_asked() {
+    fn an_older_land_is_served_before_a_younger_land_and_both_before_a_feature_build() {
+        let mut clock = Clock::new(6);
+        // Two land gate jobs start: a's is older than b's.
+        assert_eq!(clock.ask_land(0, 1, "a", 1), [(1, 1)]);
+        assert_eq!(clock.ask_land(1, 2, "b", 1), [(2, 1)]);
+        // A feature shed's builds hold the rest of the host, and its next build waits first.
+        assert_eq!(clock.ask(2, 3, "feature", 2), [(3, 2)]);
+        assert_eq!(clock.ask(2, 4, "feature", 2), [(4, 2)]);
+        assert_eq!(clock.ask(3, 5, "feature", 2), []);
+        // Then the younger land's task asks, and the older land's task asks last of all.
+        assert_eq!(clock.ask_task(4, 6, 2, "b", 2), []);
+        assert_eq!(clock.ask_task(5, 7, 1, "a", 2), []);
+        let queue: Vec<(String, u64)> = clock
+            .ledger
+            .status()
+            .gate_queue
+            .into_iter()
+            .map(|waiter| (waiter.checkout, waiter.job))
+            .collect();
+        assert_eq!(queue, [("a".to_owned(), 1), ("b".to_owned(), 2)]);
+        // Served in the reverse of the order they asked: the older land, the younger land, then
+        // the feature build.
+        assert_eq!(clock.leave(6, 3), [(7, 2)]);
+        assert_eq!(clock.leave(7, 7), [(6, 2)]);
+        assert_eq!(clock.leave(8, 6), [(5, 2)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn an_older_land_takes_every_token_its_tasks_want_before_a_younger_land_gets_one() {
         let mut clock = Clock::new(18);
-        assert_eq!(clock.ask_land(0, 1, "a", 18), [(1, 18)]);
-        assert_eq!(clock.ask_land(1, 2, "b", 18), []);
-        assert_eq!(clock.ask_land(1, 3, "a", 18), []);
+        assert_eq!(clock.ask_task(0, 1, 0, "a", 18), [(1, 18)]);
+        assert_eq!(clock.ask_task(1, 2, 9, "b", 18), []);
+        assert_eq!(clock.ask_task(1, 3, 0, "a", 18), []);
         assert_eq!(clock.ask(2, 4, "c", 18), []);
-        // c holds nothing, so it gets its one token; then b's task, older than a's second,
-        // takes the rest. A second land is never shut out by a first that is still running.
-        assert_eq!(clock.leave(3, 1), [(4, 1), (2, 17)]);
-        assert_eq!(clock.leave(4, 2), [(3, 17)]);
+        // c holds nothing, so it keeps its one token; then a's second task, though it asked after
+        // b's, takes the rest, because a's gate job is older.
+        assert_eq!(clock.leave(3, 1), [(4, 1), (3, 17)]);
+        assert_eq!(clock.leave(4, 3), [(2, 17)]);
         assert!(clock.balanced());
     }
 
@@ -955,7 +1116,7 @@ mod tests {
             assert_eq!(clock.ask(0, ticket, "custody", 1), [(ticket, 1)]);
         }
         assert_eq!(clock.ask(1, 19, "custody", 1), []);
-        assert_eq!(clock.ask_land_build(2, 20, "land", 18), []);
+        assert_eq!(clock.ask_task_build(2, 20, 0, "land", 18), []);
         assert_eq!(clock.leave(3, 1), [(20, 1)]);
         // Every later return widens the running build, ahead of the queued background work.
         for (ms, ticket) in (4..).zip(2..=17) {
@@ -969,13 +1130,26 @@ mod tests {
     }
 
     #[test]
-    fn a_new_land_task_starts_before_a_running_one_grows() {
+    fn a_new_land_task_starts_before_a_running_one_of_the_same_land_grows() {
         let mut clock = Clock::new(4);
         assert_eq!(clock.ask(0, 1, "x", 3), [(1, 3)]);
-        assert_eq!(clock.ask_land_build(1, 2, "land", 4), [(2, 1)]);
-        assert_eq!(clock.ask_land(2, 3, "land", 2), []);
+        assert_eq!(clock.ask_task_build(1, 2, 0, "land", 4), [(2, 1)]);
+        assert_eq!(clock.ask_task(2, 3, 0, "land", 2), []);
         // Three tokens return: the waiting land task takes its two first, then the build grows.
         assert_eq!(clock.leave(3, 1), [(3, 2), (2, 2)]);
+        assert!(clock.balanced());
+    }
+
+    #[test]
+    fn an_older_land_build_grows_before_a_younger_land_task_starts() {
+        let mut clock = Clock::new(4);
+        assert_eq!(clock.ask(0, 1, "x", 3), [(1, 3)]);
+        assert_eq!(clock.ask_task_build(1, 2, 0, "a", 4), [(2, 1)]);
+        assert_eq!(clock.ask_task(2, 3, 9, "b", 2), []);
+        // Three tokens return: a's build takes them all to reach its want, since a's gate job is
+        // older; b's task starts when a returns its tokens.
+        assert_eq!(clock.leave(3, 1), [(2, 4)]);
+        assert_eq!(clock.leave(4, 2), [(3, 2)]);
         assert!(clock.balanced());
     }
 
@@ -983,14 +1157,14 @@ mod tests {
     fn growth_never_passes_the_original_want_and_a_test_runner_never_grows() {
         let mut clock = Clock::new(8);
         assert_eq!(clock.ask(0, 1, "x", 6), [(1, 6)]);
-        assert_eq!(clock.ask_land_build(1, 2, "land", 4), [(2, 2)]);
+        assert_eq!(clock.ask_task_build(1, 2, 0, "land", 4), [(2, 2)]);
         assert_eq!(clock.ask(1, 3, "x", 1), []);
         // Six return: x, holding nothing, keeps its one token; the build grows by two to its
         // want of four, never further, and the last three stay free for whoever asks.
         assert_eq!(clock.leave(2, 1), [(3, 1), (2, 4)]);
         // nextest sizes its threads once, so a land test runner asks without growth: a token
         // returned while it runs at three of eight stays free rather than held idle by it.
-        assert_eq!(clock.ask_land(3, 4, "land", 8), [(4, 3)]);
+        assert_eq!(clock.ask_task(3, 4, 0, "land", 8), [(4, 3)]);
         assert_eq!(clock.leave(4, 3), []);
         assert_eq!(clock.ledger.status().held, 7);
         assert!(clock.balanced());

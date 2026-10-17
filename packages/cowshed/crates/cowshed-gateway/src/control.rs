@@ -904,7 +904,7 @@ async fn serve<R, W>(
                 Arc::from(checkout),
                 want,
                 Claim::new(&command, pid),
-                cowshed_gateway_types::JobserverClass::Background,
+                crate::cpu_budget::Rank::Background,
             );
             hold(
                 reader,
@@ -927,18 +927,18 @@ async fn serve<R, W>(
         }) => {
             let checkout: Arc<str> = Arc::from(checkout);
             let claim = Claim::new(&command, pid);
-            let class = options.admission.class();
+            let rank = options.admission.rank();
             let admission = if options.grow {
                 let (stake, granted, growth) =
                     services
                         .cpu_budget
-                        .ask_growing(Arc::clone(&checkout), want, claim, class);
+                        .ask_growing(Arc::clone(&checkout), want, claim, rank);
                 (stake, granted, Some(growth))
             } else {
                 let (stake, granted) =
                     services
                         .cpu_budget
-                        .ask(Arc::clone(&checkout), want, claim, class);
+                        .ask(Arc::clone(&checkout), want, claim, rank);
                 (stake, granted, None)
             };
             hold_jobserver(
@@ -1062,11 +1062,11 @@ async fn hold<R, W, S, G>(
 /// fifo, name it in the granted answer, and hold until the client closes. The
 /// fifo is then drained and unlinked, and dropping the stake returns all of
 /// its tokens, including any a killed client read and never wrote back.
-async fn hold_jobserver<R, W, S>(
+async fn hold_jobserver<R, W>(
     mut reader: R,
     mut writer: W,
     (stake, granted, mut growth): (
-        S,
+        crate::cpu_budget::Stake,
         tokio::sync::oneshot::Receiver<usize>,
         Option<tokio::sync::mpsc::UnboundedReceiver<usize>>,
     ),
@@ -1134,13 +1134,14 @@ async fn hold_jobserver<R, W, S>(
         }
     };
     let pool = if let Some(job) = options.pool_job {
-        // A gate's children rank as the gate does, at every return; background children share
-        // the grant they were lent.
+        // A gate's children rank as the gate job does, by its age, at every return; background
+        // children share the grant they were lent.
         let source = match options.admission {
             crate::jobserver::JobserverAdmission::Gate { .. } => {
                 crate::jobserver::PoolSource::Relay {
                     host: budget.clone(),
                     checkout,
+                    job: stake.job(),
                 }
             }
             crate::jobserver::JobserverAdmission::Background => crate::jobserver::PoolSource::Lent(

@@ -183,6 +183,9 @@ pub struct CpuBudgetStatus {
     pub held: usize,
     /// One entry per checkout holding or waiting for tokens.
     pub checkouts: Vec<CpuCheckoutStatus>,
+    /// The gate-class requests waiting, in the order returned tokens go to them: the oldest gate
+    /// job's first, and within one job in the order its tasks asked.
+    pub gate_queue: Vec<CpuGateWaiter>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -195,6 +198,17 @@ pub struct CpuCheckoutStatus {
     pub running: usize,
     /// Runners waiting for a grant.
     pub waiting: usize,
+}
+
+/// One waiting gate-class request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuGateWaiter {
+    pub checkout: String,
+    /// The gate job it serves, as that job's admission number: the smaller is the older job.
+    pub job: u64,
+    /// The tokens it asked for.
+    pub want: usize,
 }
 
 #[cfg(test)]

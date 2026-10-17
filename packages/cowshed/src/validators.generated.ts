@@ -234,6 +234,12 @@ export const assertCpuCheckoutStatusList = typia.createAssertEquals<readonly Api
 export const parseCpuCheckoutStatusList = (json: string): readonly Api.CpuCheckoutStatus[] =>
   assertCpuCheckoutStatusList(JSON.parse(json));
 
+export const assertCpuGateWaiter = typia.createAssertEquals<Api.CpuGateWaiter>();
+export const parseCpuGateWaiter = (json: string): Api.CpuGateWaiter => assertCpuGateWaiter(JSON.parse(json));
+export const assertCpuGateWaiterList = typia.createAssertEquals<readonly Api.CpuGateWaiter[]>();
+export const parseCpuGateWaiterList = (json: string): readonly Api.CpuGateWaiter[] =>
+  assertCpuGateWaiterList(JSON.parse(json));
+
 export const assertCpuMicros = typia.createAssertEquals<Api.CpuMicros>();
 export const parseCpuMicros = (json: string): Api.CpuMicros => assertCpuMicros(JSON.parse(json));
 export const assertCpuMicrosList = typia.createAssertEquals<readonly Api.CpuMicros[]>();
