@@ -834,37 +834,40 @@ impl GitRepository {
             );
             return Ok(work);
         };
-        // One check-ignore for every untracked path, not one process per path. It answers in
-        // input order, so the ignored paths are a subsequence of `untracked` and one pass
-        // separates them.
-        let ignored = ignored_by(checkout, &untracked).await;
-        let mut ignored = ignored.iter().map(Vec::as_slice).peekable();
-        let unignored: Vec<PathBuf> = untracked
-            .into_iter()
-            .filter(|path| {
-                let is_ignored = ignored.peek() == Some(path);
-                if is_ignored {
-                    ignored.next();
-                }
-                !is_ignored
-            })
-            .map(|path| PathBuf::from(OsStr::from_bytes(path)))
-            .collect();
-        if unignored.is_empty() {
-            return Ok(work);
-        }
+        let untracked: Vec<Vec<u8>> = untracked.into_iter().map(<[u8]>::to_vec).collect();
         let root = self.root.clone();
         let checkout = checkout.to_path_buf();
         let unheld = tokio::task::spawn_blocking(move || {
-            unignored
-                .into_iter()
-                .filter(|relative| !held_by_checkout(&root, &checkout, relative))
-                .collect::<Vec<_>>()
+            // One check-ignore for every untracked path, not one process per path. It answers
+            // in input order, so the ignored paths are a subsequence of `untracked` and one pass
+            // separates them.
+            let asked: Vec<&[u8]> = untracked.iter().map(Vec::as_slice).collect();
+            let ignored = ignored_by_rules(&checkout, &asked)?;
+            let mut ignored = ignored.iter().map(Vec::as_slice).peekable();
+            Ok::<_, std::io::Error>(
+                untracked
+                    .into_iter()
+                    .filter(|path| {
+                        let is_ignored = ignored.peek() == Some(&path.as_slice());
+                        if is_ignored {
+                            ignored.next();
+                        }
+                        !is_ignored
+                    })
+                    .map(|path| PathBuf::from(OsString::from_vec(path)))
+                    .filter(|relative| !held_by_checkout(&root, &checkout, relative))
+                    .collect::<Vec<_>>(),
+            )
         })
         .await
         .map_err(|source| {
             CowshedError::internal(format!(
                 "comparing untracked files with main's checkout panicked: {source}"
+            ))
+        })?
+        .map_err(|error| {
+            CowshedError::internal(format!(
+                "cannot judge untracked files against main's ignore rules: {error}"
             ))
         })?;
         work.extend(unheld);
@@ -3374,58 +3377,138 @@ fn ensure_git_success(operation: &str, output: Output) -> Result<()> {
     }
 }
 
-/// The subset of `relative` paths that `checkout`'s gitignore rules ignore - one
-/// `git check-ignore --stdin -z` over all of them, index-blind, each path judged as a fresh
-/// entry in that tree would be. Returns the ignored paths in git's order.
-pub async fn ignored_by(checkout: &Path, relative: &[&[u8]]) -> Vec<Vec<u8>> {
-    use tokio::io::AsyncWriteExt;
-    let mut child = match Command::from(git_command_at(checkout))
-        .args(CHECK_IGNORE_BATCH)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn_locked()
-    {
-        Ok(child) => child,
-        Err(_) => return Vec::new(),
-    };
-    let input = nul_joined(relative);
-    let stdin = child.stdin.take();
-    // Written while `wait_with_output` drains stdout, never before it: see `git_batch_blocking`.
-    let write = async move {
-        if let Some(mut stdin) = stdin {
-            let _ = stdin.write_all(&input).await;
-        }
-    };
-    let ((), output) = tokio::join!(write, child.wait_with_output());
-    match output {
-        Ok(output) => nul_fields(&output.stdout),
-        Err(_) => Vec::new(),
+/// The subset of `relative` paths that `checkout`'s ignore rules ignore, in git's order. Each
+/// path names an entry of another tree - a workspace, a retired mountpoint - and is judged as a
+/// fresh entry in `checkout` would be: by the rules alone, a trailing `/` marking a directory.
+///
+/// `git check-ignore` run in `checkout` itself does not judge by the rules alone. It dies, and
+/// refuses the whole batch, the moment one path leads through a symlink there (a checkout whose
+/// `target` links to its build volume refuses `target/`), and it reads a path's type from
+/// whatever sits at that path in `checkout`. So one `git check-ignore --stdin -z --no-index`
+/// runs in a scratch work tree holding only the `.gitignore` files git reads in `checkout` on the
+/// way to those paths, against `checkout`'s repository for `info/exclude`. A batch git does not
+/// answer is an error, never an empty answer.
+pub fn ignored_by_rules(checkout: &Path, relative: &[&[u8]]) -> std::io::Result<Vec<Vec<u8>>> {
+    if relative.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rules = IgnoreRuleTree::stage(checkout, relative)?;
+    let mut command = git_command_at(rules.path());
+    command
+        .arg("--git-dir")
+        .arg(checkout.join(".git"))
+        .arg("--work-tree")
+        .arg(rules.path());
+    let output = git_batch_blocking(command, CHECK_IGNORE_BATCH, nul_joined(relative))?;
+    // check-ignore exits 1 when it ignores none of the paths; anything else is a failure.
+    match output.status.code() {
+        Some(0 | 1) => Ok(nul_fields(&output.stdout)),
+        _ => Err(git_batch_failure(
+            &format!("judge paths against {}'s ignore rules", checkout.display()),
+            &output,
+        )),
     }
 }
 
-/// [`ignored_by`] for a caller that is not async.
-pub fn ignored_by_blocking(checkout: &Path, relative: &[&[u8]]) -> Vec<Vec<u8>> {
-    nul_fields(&git_batch_blocking(
-        checkout,
-        CHECK_IGNORE_BATCH,
-        nul_joined(relative),
-    ))
+/// A scratch work tree holding copies of the `.gitignore` files a checkout holds on the way to
+/// some paths, and nothing else. It belongs to one [`ignored_by_rules`] call and goes with it.
+struct IgnoreRuleTree {
+    path: PathBuf,
+}
+
+impl IgnoreRuleTree {
+    /// Copies the `.gitignore` of every directory a `relative` path passes through, where git
+    /// would read one in `checkout`: in a real directory reached without crossing a symlink, and
+    /// only a regular file. Directories sort before their children, so a directory's parent is
+    /// judged before it.
+    fn stage(checkout: &Path, relative: &[&[u8]]) -> std::io::Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "cowshed-ignore-rules-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&path).map_err(|error| at_path(&path, error))?;
+        let tree = Self { path };
+        let mut directories = std::collections::BTreeSet::new();
+        for judged in relative {
+            let judged = judged.strip_suffix(b"/").unwrap_or(judged);
+            directories.insert(&judged[..0]);
+            for (end, byte) in judged.iter().enumerate() {
+                if *byte == b'/' {
+                    directories.insert(&judged[..end]);
+                }
+            }
+        }
+        let mut real = std::collections::BTreeSet::new();
+        for directory in directories {
+            let source = checkout.join(OsStr::from_bytes(directory));
+            if !directory.is_empty() {
+                let parent = directory
+                    .iter()
+                    .rposition(|byte| *byte == b'/')
+                    .map_or(&directory[..0], |end| &directory[..end]);
+                if !real.contains(parent) {
+                    continue;
+                }
+                match fs::symlink_metadata(&source) {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(at_path(&source, error)),
+                }
+            }
+            real.insert(directory);
+            let rules = source.join(".gitignore");
+            match fs::symlink_metadata(&rules) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(at_path(&rules, error)),
+            }
+            let copy = tree.path.join(OsStr::from_bytes(directory));
+            fs::create_dir_all(&copy).map_err(|error| at_path(&copy, error))?;
+            fs::copy(&rules, copy.join(".gitignore")).map_err(|error| at_path(&rules, error))?;
+        }
+        Ok(tree)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for IgnoreRuleTree {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "cowshed: could not remove ignore-rule scratch tree {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+fn at_path(path: &Path, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
 
 /// The regular `files` whose exact bytes are already a blob in `checkout`'s repository: content
 /// git can reproduce, so deleting the file loses nothing. `--no-filters` hashes the bytes as they
 /// are, so a file only a clean filter would turn into a stored blob is never judged held; a path
 /// that cannot travel on one line of `--stdin-paths` (it contains a newline) is never judged held.
-/// Any disagreement between what was asked and what git answered judges nothing held.
-pub fn held_by_repository_blocking(checkout: &Path, files: &[&Path]) -> Vec<PathBuf> {
+/// A batch git does not finish, or answers for other than what was asked, is an error.
+pub fn held_by_repository_blocking(
+    checkout: &Path,
+    files: &[&Path],
+) -> std::io::Result<Vec<PathBuf>> {
     let asked: Vec<&Path> = files
         .iter()
         .copied()
         .filter(|path| !path.as_os_str().as_bytes().contains(&b'\n'))
         .collect();
     if asked.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut paths = Vec::new();
     for path in &asked {
@@ -3433,31 +3516,51 @@ pub fn held_by_repository_blocking(checkout: &Path, files: &[&Path]) -> Vec<Path
         paths.push(b'\n');
     }
     let hashes = git_batch_blocking(
-        checkout,
+        git_command_at(checkout),
         &["hash-object", "--no-filters", "--stdin-paths"],
         paths,
-    );
+    )?;
+    if !hashes.status.success() {
+        return Err(git_batch_failure("hash stray files", &hashes));
+    }
     let oids: Vec<&[u8]> = hashes
+        .stdout
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         .collect();
     if oids.len() != asked.len() {
-        return Vec::new();
+        return Err(std::io::Error::other(format!(
+            "git hash-object answered {} of {} stray files",
+            oids.len(),
+            asked.len()
+        )));
     }
     let mut query = Vec::new();
     for oid in &oids {
         query.extend_from_slice(oid);
         query.push(b'\n');
     }
-    let answers = git_batch_blocking(checkout, &["cat-file", "--batch-check"], query);
+    let answers = git_batch_blocking(
+        git_command_at(checkout),
+        &["cat-file", "--batch-check"],
+        query,
+    )?;
+    if !answers.status.success() {
+        return Err(git_batch_failure("look up stray file blobs", &answers));
+    }
     let answers: Vec<&[u8]> = answers
+        .stdout
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         .collect();
     if answers.len() != oids.len() {
-        return Vec::new();
+        return Err(std::io::Error::other(format!(
+            "git cat-file answered {} of {} stray file blobs",
+            answers.len(),
+            oids.len()
+        )));
     }
-    asked
+    Ok(asked
         .into_iter()
         .zip(oids)
         .zip(answers)
@@ -3468,27 +3571,28 @@ pub fn held_by_repository_blocking(checkout: &Path, files: &[&Path]) -> Vec<Path
                     .is_some_and(|rest| rest.starts_with(b" blob "))
         })
         .map(|((path, _), _)| path.to_path_buf())
-        .collect()
+        .collect())
 }
 
 const CHECK_IGNORE_BATCH: &[&str] = &["check-ignore", "--stdin", "-z", "--no-index"];
 
-/// Runs one batch git verb in `checkout` with `input` on stdin and returns its stdout, empty when
-/// git cannot be started. The input is written from its own thread while this one drains stdout.
-/// Batch verbs answer as they read, so writing all of the input before reading any answer
-/// deadlocks as soon as the answers fill the stdout pipe: git blocks writing its stdout, the
-/// caller blocks writing git's stdin, and neither returns.
-fn git_batch_blocking(checkout: &Path, args: &[&str], input: Vec<u8>) -> Vec<u8> {
-    let mut child = match git_command_at(checkout)
+/// Runs one batch git verb through `command` with `input` on stdin and returns everything git
+/// said: its status, stdout and stderr, for the caller to judge. The input is written from its
+/// own thread while this one drains git's output. Batch verbs answer as they read, so writing
+/// all of the input before reading any answer deadlocks as soon as the answers fill the stdout
+/// pipe: git blocks writing its stdout, the caller blocks writing git's stdin, and neither
+/// returns. A write that fails because git exited early is not reported: git's status is.
+fn git_batch_blocking(
+    mut command: std::process::Command,
+    args: &[&str],
+    input: Vec<u8>,
+) -> std::io::Result<Output> {
+    let mut child = command
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn_locked()
-    {
-        Ok(child) => child,
-        Err(_) => return Vec::new(),
-    };
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()?;
     let writer = child.stdin.take().map(|mut stdin| {
         std::thread::spawn(move || {
             let _ = stdin.write_all(&input);
@@ -3496,9 +3600,15 @@ fn git_batch_blocking(checkout: &Path, args: &[&str], input: Vec<u8>) -> Vec<u8>
     });
     let output = child.wait_with_output();
     if let Some(writer) = writer {
-        let _ = writer.join();
+        writer
+            .join()
+            .map_err(|_| std::io::Error::other("git batch input writer panicked"))?;
     }
-    output.map(|output| output.stdout).unwrap_or_default()
+    output
+}
+
+fn git_batch_failure(operation: &str, output: &Output) -> std::io::Error {
+    std::io::Error::other(git_message(operation, output))
 }
 
 fn nul_joined(relative: &[&[u8]]) -> Vec<u8> {
@@ -3964,8 +4074,8 @@ mod tests {
     use super::{
         BundleVerificationScratch, CloneOrigin, CowshedUpstream, FALLBACK_MAIN_REMOTE,
         GitRepository, MAIN_REMOTE, MainRemote, RemoteUrl, WorkspaceRepository, ensure_git_success,
-        git_ended, git_message, held_by_repository_blocking, ignored_by, ignored_by_blocking,
-        is_git_repository, parse_lines, workspace_remote_name,
+        git_ended, git_message, held_by_repository_blocking, ignored_by_rules, is_git_repository,
+        parse_lines, workspace_remote_name,
     };
 
     #[cfg(target_os = "macos")]
@@ -4847,27 +4957,73 @@ mod tests {
         let asked = paths.clone();
         std::thread::spawn(move || {
             let borrowed: Vec<&[u8]> = asked.iter().map(Vec::as_slice).collect();
-            let _ = sender.send(ignored_by_blocking(&checkout, &borrowed));
+            let _ = sender.send(ignored_by_rules(&checkout, &borrowed));
         });
         let ignored = receiver
             .recv_timeout(std::time::Duration::from_secs(120))
-            .expect("check-ignore batch deadlocked");
+            .expect("check-ignore batch deadlocked")
+            .expect("check-ignore batch answered");
         assert_eq!(ignored, paths);
     }
 
-    #[tokio::test]
-    async fn an_async_check_ignore_batch_larger_than_the_pipe_finishes() {
+    /// A checkout whose `target` links to its build volume made git refuse every path under
+    /// `target/` ("beyond a symbolic link"), and the refusal read as "nothing is ignored": a
+    /// retired mountpoint's real `target/` was kept as work the project's own `target/` rule
+    /// ignores. The rules decide the same for a real directory and a symlinked one; a
+    /// `.gitignore` git would not read in the checkout - through a symlink, or itself a symlink -
+    /// decides nothing, and one it would read in a real subdirectory decides for its paths.
+    #[test]
+    fn paths_are_judged_by_the_rules_whatever_the_checkout_holds_at_them() {
         let root = repository();
-        fs::write(root.join(".gitignore"), "node_modules/\n").expect("ignore rules");
-        let paths = pipe_overflowing_paths();
-        let borrowed: Vec<&[u8]> = paths.iter().map(Vec::as_slice).collect();
-        let ignored = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            ignored_by(&root, &borrowed),
+        fs::write(root.join(".gitignore"), "target/\n").expect("root rules");
+        fs::create_dir_all(root.join(".cowshed/build/target")).expect("build volume");
+        std::os::unix::fs::symlink(".cowshed/build/target", root.join("target"))
+            .expect("symlinked target");
+        fs::create_dir_all(root.join(".cowshed/docs")).expect("linked directory");
+        fs::write(root.join(".cowshed/docs/.gitignore"), "*.md\n").expect("unread rules");
+        std::os::unix::fs::symlink(".cowshed/docs", root.join("docs")).expect("symlinked docs");
+        fs::create_dir_all(root.join("packages/wire")).expect("real subdirectory");
+        fs::write(root.join("packages/wire/.gitignore"), "generated/\n").expect("nested rules");
+        fs::create_dir_all(root.join("packages/linked")).expect("linked rules directory");
+        std::os::unix::fs::symlink(
+            "../wire/.gitignore",
+            root.join("packages/linked/.gitignore"),
         )
-        .await
-        .expect("check-ignore batch deadlocked");
-        assert_eq!(ignored, paths);
+        .expect("symlinked rules");
+        let asked: [&[u8]; 8] = [
+            b"target/",
+            b"target/debug/",
+            b"target/debug/build/mio/out/libmio.rmeta",
+            b"src/lib.rs",
+            b"docs/notes.md",
+            b"packages/wire/generated/vo1gen.ts",
+            b"packages/wire/src/lib.rs",
+            b"packages/linked/generated/kept.ts",
+        ];
+        let ignored = ignored_by_rules(&root, &asked).expect("check-ignore answered");
+        assert_eq!(
+            ignored,
+            [
+                &b"target/"[..],
+                b"target/debug/",
+                b"target/debug/build/mio/out/libmio.rmeta",
+                b"packages/wire/generated/vo1gen.ts",
+            ]
+            .map(<[u8]>::to_vec)
+        );
+    }
+
+    /// A batch git refuses is an error naming git's reason, never an empty answer that reads as
+    /// "nothing is ignored".
+    #[test]
+    fn a_check_ignore_git_refuses_is_an_error() {
+        let root = repository();
+        fs::remove_dir_all(root.join(".git")).expect("unmake repository");
+        let error = ignored_by_rules(&root, &[&b"target/"[..]]).expect_err("git refuses");
+        assert!(
+            error.to_string().contains("ignore rules"),
+            "names the failed judgement: {error}"
+        );
     }
 
     /// Only a regular file whose exact bytes the repository already stores is held; a
@@ -4882,9 +5038,14 @@ mod tests {
         fs::write(&edited, "test, edited\n").expect("unheld edit");
         let newline = outside.join("two\nlines");
         fs::write(&newline, "test\n").expect("held bytes, unsendable name");
-        let held = held_by_repository_blocking(&root, &[&copy, &edited, &newline]);
+        let held = held_by_repository_blocking(&root, &[&copy, &edited, &newline])
+            .expect("held lookup answered");
         assert_eq!(held, vec![copy]);
-        assert!(held_by_repository_blocking(&root, &[]).is_empty());
+        assert!(
+            held_by_repository_blocking(&root, &[])
+                .expect("empty lookup")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
