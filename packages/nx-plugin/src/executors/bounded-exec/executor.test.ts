@@ -906,17 +906,20 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   it('resolves the cowshed a run uses, in full precedence order', () => {
     const root = '/workspace';
+    // The executor never chdirs, so an empty PATH component names its actual spawn cwd,
+    // deliberately not the workspace root: the two directories differ on purpose here.
+    const cwd = '/elsewhere';
     // Every level present at once, removed one at a time from the top: each step must fall
     // to exactly the next level, so the order itself is the assertion, not each level alone.
     const everywhere = new Set([
       '/opt/bin/cowshed',
-      '/workspace/cowshed',
+      '/elsewhere/cowshed',
       '/workspace/packages/cowshed/bin/cowshed',
       '/workspace/node_modules/@smoothbricks/cowshed/bin/cowshed',
     ]);
     const present = (path: string) => everywhere.has(path);
     const select = (named?: string, inherited?: string, pathValue?: string) =>
-      resolveCowshedExecutable(root, named, inherited, pathValue, present);
+      resolveCowshedExecutable(root, named, inherited, pathValue, cwd, present);
 
     // 1. A target-named executable wins, made absolute against the workspace root.
     expect(select('bin/cowshed', '/valid/bin/cowshed', '/opt/bin')).toBe('/workspace/bin/cowshed');
@@ -926,13 +929,20 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     // 3. An installed cowshed on PATH wins (undefined: the bare name spawn already finds it).
     expect(select(undefined, undefined, '/opt/bin')).toBeUndefined();
     // 3b. An empty PATH component (the leading ':' below) names the current directory, as
-    //     POSIX spawn resolution does — a cowshed there is installed too, not a typo.
+    //     POSIX spawn resolution does — here the executor's cwd, not the workspace root:
+    //     a cowshed in the cwd is installed too, and one merely in the root is not.
     expect(select(undefined, undefined, ':/usr/bin')).toBeUndefined();
+    everywhere.delete('/elsewhere/cowshed');
+    everywhere.add('/workspace/cowshed');
+    expect(select(undefined, undefined, ':/usr/bin')).toBe('/workspace/packages/cowshed/bin/cowshed');
+    everywhere.delete('/workspace/cowshed');
     // 4. Only when PATH provides none does the workspace's own launcher answer.
     expect(select(undefined, undefined, '/usr/bin')).toBe('/workspace/packages/cowshed/bin/cowshed');
     // 5. A linked workspace's launcher answers when the workspace has none of its own.
     everywhere.delete('/workspace/packages/cowshed/bin/cowshed');
-    expect(select(undefined, undefined, '/usr/bin')).toBe('/workspace/node_modules/@smoothbricks/cowshed/bin/cowshed');
+    expect(select(undefined, undefined, '/usr/bin')).toBe(
+      '/workspace/node_modules/@smoothbricks/cowshed/bin/cowshed',
+    );
     // 6. No cowshed anywhere keeps the bare name, so the spawn failure names the missing tool.
     everywhere.clear();
     expect(select(undefined, undefined, '/usr/bin')).toBeUndefined();

@@ -122,6 +122,7 @@ export function resolveCowshedExecutable(
   named: string | undefined,
   inherited: string | undefined,
   pathValue: string | undefined,
+  cwd: string,
   exists: (path: string) => boolean = (path) => {
     try {
       accessSync(path, constants.X_OK);
@@ -133,9 +134,10 @@ export function resolveCowshedExecutable(
 ): string | undefined {
   const explicit = named ?? inherited;
   if (explicit !== undefined) return resolvePath(root, explicit);
-  // An empty PATH component names the current directory, as POSIX spawn resolution does;
-  // the executor runs at the workspace root, so that is where an empty component looks.
-  const onPath = (pathValue ?? '').split(delimiter).some((dir) => exists(join(dir === '' ? root : dir, 'cowshed')));
+  // An empty PATH component names the spawning process's current directory, as POSIX
+  // spawn resolution does — the executor never chdirs, so that is the caller's cwd,
+  // not the workspace root.
+  const onPath = (pathValue ?? '').split(delimiter).some((dir) => exists(join(dir === '' ? cwd : dir, 'cowshed')));
   if (onPath) return undefined;
   for (const candidate of WORKSPACE_COWSHED_LAUNCHERS) {
     const launcher = join(root, candidate);
@@ -160,7 +162,7 @@ export function runDefaultBoundedExec(
   // for its command alike. Nx resolves `{workspaceRoot}/…` in an option to a workspace-relative path, which the
   // command, starting in another directory, could not find: it gets the absolute one.
   const named = options.env?.[COWSHED_EXECUTABLE_ENV];
-  const cowshed = resolveCowshedExecutable(context.root, named, process.env[COWSHED_EXECUTABLE_ENV], process.env.PATH);
+  const cowshed = resolveCowshedExecutable(context.root, named, process.env[COWSHED_EXECUTABLE_ENV], process.env.PATH, process.cwd());
   const run: BoundedExecOptions =
     cowshed === undefined ? options : { ...options, env: { ...options.env, [COWSHED_EXECUTABLE_ENV]: cowshed } };
   // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.
