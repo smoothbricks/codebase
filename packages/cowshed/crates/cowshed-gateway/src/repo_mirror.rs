@@ -1371,7 +1371,7 @@ pub enum RepoMirrorError {
 mod tests {
     use std::{
         collections::{BTreeSet, VecDeque},
-        os::{fd::FromRawFd as _, unix::fs::PermissionsExt as _},
+        os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1562,9 +1562,8 @@ mod tests {
                 })
                 .await
         });
-        timeout(Duration::from_secs(1), started_wait)
-            .await
-            .expect("fetch started");
+        // The transport says when the fetch has started; that notice is the event, not a clock.
+        started_wait.await;
         timeout(Duration::from_millis(100), handle.shutdown())
             .await
             .expect("shutdown signal");
@@ -1925,42 +1924,40 @@ mod tests {
                 None,
                 Arc::clone(&cancellation),
             );
-            let fetch = tokio::spawn({
+            let mut fetch = tokio::spawn({
                 let helper = helper.clone();
                 async move { run_fetch_helper(&helper, plan).await }
             });
-            let fifo_writer = timeout(Duration::from_secs(1), async {
-                loop {
-                    let descriptor = unsafe {
-                        libc::open(
-                            fifo_path.as_ptr(),
-                            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                        )
-                    };
-                    if descriptor >= 0 {
-                        break unsafe { std::fs::File::from_raw_fd(descriptor) };
-                    }
-                    let error = std::io::Error::last_os_error();
-                    assert_eq!(
-                        error.raw_os_error(),
-                        Some(libc::ENXIO),
-                        "open helper FIFO: {error}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+            // The helper opens the FIFO's read end once it has started, and a blocking open of
+            // the write end returns exactly then, however long a loaded host takes to start a
+            // shell. A helper that exits first ends the fetch instead.
+            let opener = tokio::task::spawn_blocking({
+                let fifo = fifo.clone();
+                move || {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_CLOEXEC)
+                        .open(fifo)
                 }
-            })
-            .await
-            .expect("helper startup deadline");
+            });
+            let fifo_writer = tokio::select! {
+                opened = opener => opened.expect("FIFO opener joined").expect("open helper FIFO"),
+                ended = &mut fetch => {
+                    // Release the blocked open, so no thread outlives the failure.
+                    let _reader = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                        .open(&fifo);
+                    panic!("helper ended before it opened its FIFO: {ended:?}");
+                }
+            };
             let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
                 .expect("read helper pid")
                 .trim()
                 .parse()
                 .expect("parse helper pid");
             cancellation.cancel();
-            let result = timeout(Duration::from_secs(1), fetch)
-                .await
-                .expect("helper cancellation deadline")
-                .expect("helper task joined");
+            let result = fetch.await.expect("helper task joined");
             assert!(
                 matches!(result, Err(RepoMirrorError::Cancelled)),
                 "unexpected helper cancellation result: {result:?}"
