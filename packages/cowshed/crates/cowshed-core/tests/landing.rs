@@ -23,21 +23,25 @@ use cowshed_os::fork_lock::Run as _;
 mod temp_parent;
 #[path = "support/temp_root.rs"]
 mod temp_root;
-use temp_root::TempRoot;
+use temp_root::{FixtureStore, TempRoot};
 
 const TARGET: &str = "main";
 
 /// A parent repository plus clones of it, deleted with the test. Under `/tmp`, not TMPDIR: the
 /// measurement runs controller git sandboxed, and the sandbox never grants a workspace's TMPDIR,
-/// which is inside the protected store.
-struct Fixture(TempRoot);
+/// which is inside the protected store. The second field is the fixture's own store, where that
+/// sandboxed controller Git writes its profiles.
+struct Fixture(TempRoot, FixtureStore);
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let fixture = Self(TempRoot::new_in(
-            &temp_parent::canonical_parent(),
-            &format!("cowshed-landing-{label}"),
-        ));
+        let fixture = Self(
+            TempRoot::new_in(
+                &temp_parent::canonical_parent(),
+                &format!("cowshed-landing-{label}"),
+            ),
+            FixtureStore::new(),
+        );
         git(
             fixture.parent_unchecked(),
             ["init", "-q", "-b", TARGET, "."],
@@ -46,6 +50,10 @@ impl Fixture {
         git(fixture.parent_unchecked(), ["add", "-A"]);
         commit(fixture.parent_unchecked(), "base");
         fixture
+    }
+
+    fn store(&self) -> &std::sync::Arc<Path> {
+        self.1.shared()
     }
 
     /// The parent directory before it is known to be a repository, for `init` and for the case that
@@ -151,8 +159,8 @@ fn workspace_commit(mount: &Path, file: &str, contents: &str, message: &str) {
 }
 
 async fn measured(fixture: &Fixture, mount: &Path) -> WorkspaceLanding {
-    let target = resolve_target(&fixture.parent(), TARGET).await;
-    measure(&target, mount, "HEAD").await
+    let target = resolve_target(fixture.store(), &fixture.parent(), TARGET).await;
+    measure(fixture.store(), &target, mount, "HEAD").await
 }
 
 /// The counts, or a panic naming the reason the measurement was declined.
@@ -527,8 +535,8 @@ async fn a_target_branch_that_does_not_exist_is_indeterminate_rather_than_landed
     let mount = fixture.clone_workspace("topic-branch");
     workspace_commit(&mount, "wave.txt", "wave\n", "wave work");
 
-    let target = resolve_target(&fixture.parent(), "release").await;
-    let landing = measure(&target, &mount, "HEAD").await;
+    let target = resolve_target(fixture.store(), &fixture.parent(), "release").await;
+    let landing = measure(fixture.store(), &target, &mount, "HEAD").await;
     assert!(
         reason(&landing).contains("no release branch"),
         "reason must name the missing branch: {}",
@@ -559,8 +567,8 @@ async fn a_main_mount_that_is_not_a_repository_is_indeterminate_and_says_so() {
     let stub = fixture.0.join("unmounted-stub");
     fs::create_dir_all(stub.join(".devenv")).expect("mountpoint stub");
 
-    let target = resolve_target(&stub, TARGET).await;
-    let landing = measure(&target, &mount, "HEAD").await;
+    let target = resolve_target(fixture.store(), &stub, TARGET).await;
+    let landing = measure(fixture.store(), &target, &mount, "HEAD").await;
     let reason = reason(&landing);
     assert!(
         reason.contains("could not be read") && reason.contains("unmounted-stub"),
@@ -620,7 +628,8 @@ async fn classification_follows_head_and_not_a_registered_branch_that_has_drifte
 
     // The label really is landed, so a check reading it would wave this workspace through.
     let by_label = measure(
-        &resolve_target(&fixture.parent(), TARGET).await,
+        fixture.store(),
+        &resolve_target(fixture.store(), &fixture.parent(), TARGET).await,
         &mount,
         &registered,
     )

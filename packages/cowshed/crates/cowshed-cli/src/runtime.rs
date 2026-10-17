@@ -1185,9 +1185,13 @@ async fn resolve_project_context(cli: &Cli) -> Result<ResolvedProjectRoot> {
             )
         })?,
     };
-    let root = GitRepository::discover(&start)
-        .await
-        .map(|repository| repository.root().to_path_buf());
+    // The CLI process serves the host store; its controller Git writes profiles there.
+    let root = GitRepository::discover(
+        cowshed_core::storage::bootstrap::CanonicalRoots::global().shared_store(),
+        &start,
+    )
+    .await
+    .map(|repository| repository.root().to_path_buf());
     // A retained source can be restored read-only while recovery is pending. Its Git
     // checkout then exists again, but this invocation still finishes the recorded intent.
     if matches!(&cli.command, Command::Adopt(args) if args.re_adopt) {
@@ -3508,8 +3512,13 @@ async fn annotate_landing(workspaces: &mut [WorkspaceInfo]) {
         }
         return;
     };
+    // `ls` reads the host's projects, so its Git runs for the host store.
+    let host_store = std::sync::Arc::clone(
+        cowshed_core::storage::bootstrap::CanonicalRoots::global().shared_store(),
+    );
     let target = std::sync::Arc::new(
-        cowshed_core::landing::resolve_target(&main.mount, LANDING_TARGET_BRANCH).await,
+        cowshed_core::landing::resolve_target(&host_store, &main.mount, LANDING_TARGET_BRANCH)
+            .await,
     );
     let mut tasks = tokio::task::JoinSet::new();
     for (index, workspace) in workspaces.iter().enumerate() {
@@ -3520,11 +3529,12 @@ async fn annotate_landing(workspaces: &mut [WorkspaceInfo]) {
             continue;
         }
         let target = std::sync::Arc::clone(&target);
+        let host_store = std::sync::Arc::clone(&host_store);
         let mount = workspace.mount.clone();
         tasks.spawn(async move {
             (
                 index,
-                cowshed_core::landing::measure(&target, &mount, "HEAD").await,
+                cowshed_core::landing::measure(&host_store, &target, &mount, "HEAD").await,
             )
         });
     }

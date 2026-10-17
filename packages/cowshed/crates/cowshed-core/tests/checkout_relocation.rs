@@ -107,6 +107,11 @@ impl Relocated {
         fixture
     }
 
+    /// The fixture's own store root, where the controller Git it runs writes its sandbox profiles.
+    fn store(&self) -> std::sync::Arc<Path> {
+        std::sync::Arc::from(self.root.join("store"))
+    }
+
     /// Plant exactly the four stale facts observed on the host.
     fn record_stale_state(&self) {
         // 1 and 2: the marker and the detached sidecar, both naming the dead root.
@@ -235,7 +240,7 @@ impl Relocated {
         self.record()
             .rewrite_project_root(&self.live_root)
             .expect("record rewrite");
-        let repository = GitRepository::from_root(&self.session);
+        let repository = GitRepository::from_root(&self.store(), &self.session);
         repository
             .repair_merge_drivers()
             .await
@@ -433,7 +438,7 @@ async fn a_live_foreign_main_remote_is_never_retargeted() {
         ],
     );
 
-    let outcome = GitRepository::from_root(&fixture.session)
+    let outcome = GitRepository::from_root(&fixture.store(), &fixture.session)
         .configure_main_remote(&fixture.live_root)
         .await
         .expect("configure");
@@ -464,7 +469,7 @@ async fn a_recorded_owner_lets_cowshed_retarget_a_remote_whose_path_still_resolv
     commit(&elsewhere, "elsewhere base");
 
     // Cowshed configures the remote, so ownership is recorded, and then the mount moves.
-    let repository = GitRepository::from_root(&fixture.session);
+    let repository = GitRepository::from_root(&fixture.store(), &fixture.session);
     assert_eq!(
         repository
             .configure_main_remote(&elsewhere)
@@ -494,7 +499,7 @@ async fn inspecting_merge_drivers_reports_without_repairing() {
     let fixture = Relocated::new("inspect-only");
     let before = fixture.driver("ledger-union");
 
-    let drivers = GitRepository::from_root(&fixture.session)
+    let drivers = GitRepository::from_root(&fixture.store(), &fixture.session)
         .inspect_merge_drivers()
         .await
         .expect("inspect");

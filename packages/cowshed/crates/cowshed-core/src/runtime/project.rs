@@ -3099,19 +3099,28 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             gateway_factory,
         } = services;
 
+        // The store this controller serves: a fixture's supplied one, or the host store that
+        // system bootstrap serves. Controller Git writes its sandbox profiles there and nowhere
+        // else (04_sandbox.md, "Exec pipeline" step 4).
+        let served_store = match &supplied_storage {
+            Some(storage) => std::sync::Arc::clone(storage.roots().shared_store()),
+            None => std::sync::Arc::clone(
+                crate::storage::bootstrap::CanonicalRoots::global().shared_store(),
+            ),
+        };
         // A re-adoption interrupted between retiring the replaced main and mounting its
         // replacement leaves the checkout an empty mountpoint, where no repository is discovered.
         // Such an open goes on as far as reading the project's journal, and only continues if that
         // journal holds the forming re-adoption that owns the checkout; any other open of an empty
         // directory fails as discovery did.
         let (git, undiscovered) = spanned("open", "git-discover", async {
-            match crate::git::GitRepository::discover(project_root).await {
+            match crate::git::GitRepository::discover(&served_store, project_root).await {
                 Ok(git) => {
                     git.ensure_adoptable().await?;
                     Ok::<_, CowshedError>((git, None))
                 }
                 Err(error) if is_empty_directory(project_root) => Ok((
-                    crate::git::GitRepository::from_root(project_root),
+                    crate::git::GitRepository::from_root(&served_store, project_root),
                     Some(error),
                 )),
                 Err(error) => Err(error),
@@ -3217,7 +3226,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let (git_root, git) = match origin.as_ref() {
             Some(origin) if !names_one_root(&origin.project_root, &git_root) => {
                 let root = origin.project_root.clone();
-                let git = crate::git::GitRepository::from_root(&root);
+                let git = crate::git::GitRepository::from_root(&served_store, &root);
                 (root, git)
             }
             _ => (git_root, git),
@@ -4642,6 +4651,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         carry_stopped: Option<String>,
     ) -> Result<crate::api::dto::LandBuildVolume> {
         use crate::api::dto::{Adoption, AdoptionSkip, LandBuildVolume, LandSeed};
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
         let volumes = self.build_volumes()?;
         let skipped = |reason| LandBuildVolume {
             seed: LandSeed::Unchanged,
@@ -4756,7 +4766,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             Ok(quiet) => quiet,
             Err(reason) => return Ok(skipped(reason)),
         };
-        let tree = git_revision_oid(landing, "HEAD^{tree}").await?;
+        let tree = git_revision_oid(store_root, landing, "HEAD^{tree}").await?;
         let target = self.current(&into.name).await?;
         let owner = super::build_volumes::Owner {
             name: into.name.clone(),
@@ -4909,9 +4919,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         target_mount: &Path,
         revision: Option<&GitOid>,
     ) -> Result<super::build_volumes::Aim> {
-        let head = git_revision_oid(target_mount, "HEAD^{tree}").await?;
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
+        let head = git_revision_oid(store_root, target_mount, "HEAD^{tree}").await?;
         let tree = match revision {
-            Some(commit) => git_revision_oid(target_mount, &format!("{commit}^{{tree}}")).await?,
+            Some(commit) => {
+                git_revision_oid(store_root, target_mount, &format!("{commit}^{{tree}}")).await?
+            }
             None => head.clone(),
         };
         let landed = if tree == head {
@@ -5293,7 +5306,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let config = self.substrate_config.rebind_checkout(checkout_path);
         self.rebind_substrate(config)?;
         self.descriptor.git_root = std::sync::Arc::from(checkout_path);
-        self.git = crate::git::GitRepository::from_root(checkout_path);
+        self.git = crate::git::GitRepository::from_root(self.git.store_root(), checkout_path);
         Ok(())
     }
 
@@ -5405,6 +5418,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         main_mount: &Path,
         project_root: &Path,
     ) -> Result<()> {
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
         let record = crate::checkout::CheckoutRecord {
             mount_point: self.workspace_mount_path(name)?,
             image: workspace.image.clone(),
@@ -5436,16 +5450,16 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             return Ok(());
         }
         let mount = self.workspace_mount_path(name)?;
-        crate::git::GitRepository::from_root(&mount)
+        crate::git::GitRepository::from_root(self.git.store_root(), &mount)
             .repair_merge_drivers()
             .await?;
         if name.is_main() {
             return Ok(());
         }
         if is_git_worktree(&workspace.metadata) {
-            return repair_git_worktree_link(main_mount, &mount).await;
+            return repair_git_worktree_link(store_root, main_mount, &mount).await;
         }
-        crate::git::GitRepository::from_root(&mount)
+        crate::git::GitRepository::from_root(self.git.store_root(), &mount)
             .configure_main_remote(main_mount)
             .await
             .map(|_| ())
@@ -5637,7 +5651,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     async fn register_workspace_in_main(&self, workspace: &WorkspaceName) -> Result<()> {
         let main_mount = self.workspace_mount_path(&main_name())?;
         let workspace_mount = self.workspace_mount_path(workspace)?;
-        crate::git::GitRepository::from_root(&main_mount)
+        crate::git::GitRepository::from_root(self.git.store_root(), &main_mount)
             .register_workspace_remote(workspace.as_str(), &workspace_mount)
             .await
     }
@@ -5660,7 +5674,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         if !main_mount.join(".git").exists() {
             return Ok(());
         }
-        let main = crate::git::GitRepository::from_root(&main_mount);
+        let main = crate::git::GitRepository::from_root(self.git.store_root(), &main_mount);
         main.unregister_workspace_remote(workspace.as_str()).await?;
         if git_worktree {
             main.unregister_linked_worktree(workspace.as_str()).await?;
@@ -5703,6 +5717,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         source_name: &WorkspaceName,
         revision: &crate::api::dto::RevisionTarget,
     ) -> Result<GitOid> {
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
         let named = revision_target(revision);
         match source.derived.mount_state {
             crate::storage::lifecycle::MountState::Mounted { .. } => {}
@@ -5716,7 +5731,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
         }
         let mount = self.workspace_mount_path(source_name)?;
-        git_optional_ref_oid(&mount, &format!("{named}^{{commit}}"))
+        git_optional_ref_oid(store_root, &mount, &format!("{named}^{{commit}}"))
             .await?
             .ok_or_else(|| {
                 CowshedError::not_found(
@@ -5804,9 +5819,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     ) -> Result<crate::storage::lifecycle::OperationIdentity> {
         let base_commit = match forked_from.as_ref() {
             Some(source) => {
-                crate::git::GitRepository::from_root(self.workspace_mount_path(source)?)
-                    .head_oid()
-                    .await?
+                crate::git::GitRepository::from_root(
+                    self.git.store_root(),
+                    self.workspace_mount_path(source)?,
+                )
+                .head_oid()
+                .await?
             }
             None => self.git.head_oid().await?,
         };
@@ -5840,7 +5858,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         mount: &Path,
         incarnation: &WorkspaceIncarnation,
     ) -> Result<NativeRemovalGitFence> {
-        let git = crate::git::GitRepository::from_root(mount);
+        let git = crate::git::GitRepository::from_root(self.git.store_root(), mount);
         let head = git.head_oid().await?;
         Ok(NativeRemovalGitFence {
             incarnation: incarnation.clone(),
@@ -6040,11 +6058,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         head: &GitOid,
         containment: &NativeContainment,
     ) -> Result<NativeLandedState> {
-        let target = crate::landing::resolve_target(&containment.mount, &containment.branch).await;
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
+        let target =
+            crate::landing::resolve_target(store_root, &containment.mount, &containment.branch)
+                .await;
         let mount = self.workspace_mount_path(workspace)?;
         Ok(NativeLandedState {
             branch: containment.branch.clone(),
-            commits: crate::landing::measure_commits(&target, &mount, head.as_str()).await,
+            commits: crate::landing::measure_commits(store_root, &target, &mount, head.as_str())
+                .await,
         })
     }
 
@@ -6083,12 +6105,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     ) -> Result<AbandonedWork> {
         let mount = self.workspace_mount_path(workspace)?;
         let target_head = landed.commits.target_head().cloned();
-        let git = crate::git::GitRepository::from_root(&mount);
+        let git = crate::git::GitRepository::from_root(self.git.store_root(), &mount);
         let git = match target_head.as_ref() {
             Some(_) => {
-                let target_objects = crate::git::GitRepository::from_root(&containment.mount)
-                    .object_directory()
-                    .await?;
+                let target_objects =
+                    crate::git::GitRepository::from_root(self.git.store_root(), &containment.mount)
+                        .object_directory()
+                        .await?;
                 git.with_alternate_objects(target_objects)?
             }
             None => git,
@@ -6643,6 +6666,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         workspace: &NativeWorkspace,
         pre_cowshed_checkout: &Path,
     ) -> Result<MainPreservation> {
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
         let fence = self.removal_git_fence(workspace).await?;
         if fence.dirty || fence.in_progress.is_some() {
             return Err(CowshedError::conflict(
@@ -6650,16 +6674,21 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 "commit or discard the changes, then retry",
             ));
         }
-        let current_git =
-            crate::git::GitRepository::from_root(current_snapshot_mount(self, workspace)?);
-        let retained_git = crate::git::GitRepository::discover(pre_cowshed_checkout)
-            .await
-            .map_err(|_| {
-                CowshedError::conflict(
-                    "retained pre-cowshed checkout cannot prove main commit preservation",
-                    "restore the exact retained checkout, or push main to its remote, then retry",
-                )
-            })?;
+        let current_git = crate::git::GitRepository::from_root(
+            self.git.store_root(),
+            current_snapshot_mount(self, workspace)?,
+        );
+        let retained_git = crate::git::GitRepository::discover(
+            self.git.store_root(),
+            pre_cowshed_checkout,
+        )
+        .await
+        .map_err(|_| {
+            CowshedError::conflict(
+                "retained pre-cowshed checkout cannot prove main commit preservation",
+                "restore the exact retained checkout, or push main to its remote, then retry",
+            )
+        })?;
         let preserved_locally = retained_git
             .commit_is_preserved(fence.head.as_str())
             .await?;
@@ -6672,7 +6701,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // A retained checkout with no resolvable HEAD (an unborn branch) only widens an
         // abandonment's bundle to main's whole history; it never makes a restore lose commits.
         // Any other failure to read that HEAD is a broken repository, and says so.
-        let retained_head = git_optional_ref_oid(retained_git.root(), "HEAD").await?;
+        let retained_head = git_optional_ref_oid(store_root, retained_git.root(), "HEAD").await?;
         Ok(MainPreservation::Unpreserved {
             head: fence.head,
             retained_head,
@@ -6691,8 +6720,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         head: GitOid,
         retained_head: Option<GitOid>,
     ) -> Result<AbandonedWork> {
-        let main_git =
-            crate::git::GitRepository::from_root(current_snapshot_mount(self, workspace)?);
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
+        let main_git = crate::git::GitRepository::from_root(
+            self.git.store_root(),
+            current_snapshot_mount(self, workspace)?,
+        );
         let base = match retained_head {
             Some(retained)
                 if main_git
@@ -6705,6 +6737,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         };
         let name = format!("abandoned-main-{head}.bundle");
         let git_dir = invoke_git(
+            store_root,
             pre_cowshed_checkout,
             &["rev-parse", "--path-format=absolute", "--git-dir"],
         )
@@ -6735,10 +6768,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             Ok(inside) => self.descriptor.git_root.join(inside),
             Err(_) => staged_directory.clone(),
         };
-        let target_branch = crate::git::GitRepository::from_root(pre_cowshed_checkout)
-            .current_branch()
-            .await?
-            .unwrap_or_else(|| "HEAD".to_owned());
+        let target_branch =
+            crate::git::GitRepository::from_root(self.git.store_root(), pre_cowshed_checkout)
+                .current_branch()
+                .await?
+                .unwrap_or_else(|| "HEAD".to_owned());
         let directory = staged_directory.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
             std::fs::create_dir_all(&directory).map_err(|error| {
@@ -6784,7 +6818,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let resolved =
             resolve_checkout_identity_path(path, &path_metadata, &main_mount, description).await?;
         let path = resolved.as_path();
-        let git = crate::git::GitRepository::discover(path)
+        let git = crate::git::GitRepository::discover(self.git.store_root(), path)
             .await
             .map_err(|_| {
                 CowshedError::conflict(
@@ -7401,7 +7435,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         cowshed_os::timing::spanned(
             "supervisor",
             "excludes",
-            crate::git::GitRepository::from_root(excludes_in).ensure_cowshed_excludes(),
+            crate::git::GitRepository::from_root(self.git.store_root(), excludes_in)
+                .ensure_cowshed_excludes(),
         )
         .await?;
         let needed = super::supervisor::WorkspaceAuthoritySnapshot {
@@ -8753,11 +8788,11 @@ struct NativeLandingInto {
 impl NativeLandingInto {
     /// The branch a land moves when the caller names none: `main` for main, and whatever branch
     /// a lane base has checked out.
-    async fn checked_out_branch(&self) -> Result<String> {
+    async fn checked_out_branch(&self, store_root: &std::sync::Arc<Path>) -> Result<String> {
         if self.name.is_main() {
             return Ok(DEFAULT_LANDING_BRANCH.to_owned());
         }
-        target_checked_out_branch(&self.root, &self.name).await
+        target_checked_out_branch(store_root, &self.root, &self.name).await
     }
 
     fn containment(&self, branch: String) -> NativeContainment {
@@ -8808,6 +8843,8 @@ mod rebase_recovery_tests {
 
     #[tokio::test]
     async fn land_moves_only_the_branch_main_has_checked_out() {
+        let store = crate::temp_root::FixtureStore::new();
+        let store_root = store.shared();
         let root = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::canonical_parent(),
             "cowshed-land-target",
@@ -8816,12 +8853,12 @@ mod rebase_recovery_tests {
         run_git(&root, &["config", "user.name", "Cowshed Test"]);
         run_git(&root, &["config", "user.email", "cowshed@example.invalid"]);
         commit_file(&root, "base\n", "base");
-        require_target_checked_out(&root, "main")
+        require_target_checked_out(store_root, &root, "main")
             .await
             .expect("main is checked out");
 
         run_git(&root, &["checkout", "-b", "probe"]);
-        let error = require_target_checked_out(&root, "main")
+        let error = require_target_checked_out(store_root, &root, "main")
             .await
             .expect_err("a checkout on another branch would move that branch");
         assert_eq!(error.code, crate::error::ErrorCode::Conflict);
@@ -8843,7 +8880,7 @@ mod rebase_recovery_tests {
         );
 
         run_git(&root, &["checkout", "--detach"]);
-        let error = require_target_checked_out(&root, "main")
+        let error = require_target_checked_out(store_root, &root, "main")
             .await
             .expect_err("a detached checkout has no branch to move");
         assert!(
@@ -8859,6 +8896,8 @@ mod rebase_recovery_tests {
 
     #[tokio::test]
     async fn a_failed_rebase_restores_the_attached_branch_and_allows_the_next_rebase() {
+        let store = crate::temp_root::FixtureStore::new();
+        let store_root = store.shared();
         let root = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::canonical_parent(),
             "cowshed-rebase-recovery",
@@ -8869,12 +8908,12 @@ mod rebase_recovery_tests {
         commit_file(&root, "base\n", "base");
         run_git(&root, &["checkout", "-b", "squashed-feature"]);
         commit_file(&root, "feature\n", "feature side");
-        let source_head = git_oid(&root).await.expect("source head");
+        let source_head = git_oid(store_root, &root).await.expect("source head");
         run_git(&root, &["checkout", "main"]);
         commit_file(&root, "main\n", "main side");
         run_git(&root, &["checkout", "squashed-feature"]);
 
-        let error = run_git_rebase_atomically(&root, "main", &source_head)
+        let error = run_git_rebase_atomically(store_root, &root, "main", &source_head)
             .await
             .expect_err("the conflicting rebase fails");
         assert!(
@@ -8905,17 +8944,22 @@ mod rebase_recovery_tests {
             String::from_utf8_lossy(&branch.stdout).trim(),
             "squashed-feature"
         );
-        assert_eq!(git_oid(&root).await.expect("restored head"), source_head);
+        assert_eq!(
+            git_oid(store_root, &root).await.expect("restored head"),
+            source_head
+        );
         assert!(!root.join(".git/rebase-merge").exists());
         assert!(!root.join(".git/rebase-apply").exists());
 
-        run_git_rebase_atomically(&root, source_head.as_str(), &source_head)
+        run_git_rebase_atomically(store_root, &root, source_head.as_str(), &source_head)
             .await
             .expect("a following cowshed rebase can start");
     }
 
     #[tokio::test]
     async fn a_dirty_tree_refuses_even_under_autostash_instead_of_succeeding_over_conflicts() {
+        let store = crate::temp_root::FixtureStore::new();
+        let store_root = store.shared();
         let root = crate::temp_root::TempRoot::new_in(
             &crate::temp_parent::canonical_parent(),
             "cowshed-rebase-autostash",
@@ -8928,13 +8972,13 @@ mod rebase_recovery_tests {
         run_git(&root, &["config", "rebase.autoStash", "true"]);
         commit_file(&root, "base\n", "base");
         run_git(&root, &["checkout", "-b", "workspace"]);
-        let source_head = git_oid(&root).await.expect("source head");
+        let source_head = git_oid(store_root, &root).await.expect("source head");
         run_git(&root, &["checkout", "main"]);
         commit_file(&root, "main\n", "main side");
         run_git(&root, &["checkout", "workspace"]);
         std::fs::write(root.join("README.md"), "uncommitted\n").expect("dirty the tree");
 
-        let error = run_git_rebase_atomically(&root, "main", &source_head)
+        let error = run_git_rebase_atomically(store_root, &root, "main", &source_head)
             .await
             .expect_err("a dirty tree is refused, not autostashed");
         assert_eq!(error.code, crate::error::ErrorCode::Conflict);
@@ -8958,7 +9002,10 @@ mod rebase_recovery_tests {
             " M README.md\n",
             "the uncommitted change is still in place and nothing is unmerged"
         );
-        assert_eq!(git_oid(&root).await.expect("unmoved head"), source_head);
+        assert_eq!(
+            git_oid(store_root, &root).await.expect("unmoved head"),
+            source_head
+        );
         assert!(git(&root, &["stash", "list"]).stdout.is_empty());
     }
 
@@ -8968,6 +9015,8 @@ mod rebase_recovery_tests {
         base: crate::temp_root::TempRoot,
         main: PathBuf,
         lane: PathBuf,
+        /// The store the lane's controller Git serves.
+        store: crate::temp_root::FixtureStore,
     }
 
     impl Lane {
@@ -8982,7 +9031,12 @@ mod rebase_recovery_tests {
             Self::identify(&main);
             commit_file(&main, "base\n", "base");
             let lane = Self::clone_of(&base, &main, "lane");
-            Self { base, main, lane }
+            Self {
+                base,
+                main,
+                lane,
+                store: crate::temp_root::FixtureStore::new(),
+            }
         }
 
         fn identify(root: &Path) {
@@ -9020,15 +9074,17 @@ mod rebase_recovery_tests {
     }
 
     async fn contained_in(
+        store_root: &std::sync::Arc<Path>,
         target: &Path,
         branch: &str,
         unit: &Path,
     ) -> Result<Option<NativeLandedState>> {
-        let head = git_oid(unit).await.expect("unit head");
-        let resolved = crate::landing::resolve_target(target, branch).await;
+        let head = git_oid(store_root, unit).await.expect("unit head");
+        let resolved = crate::landing::resolve_target(store_root, target, branch).await;
         let landed = NativeLandedState {
             branch: branch.to_owned(),
-            commits: crate::landing::measure_commits(&resolved, unit, head.as_str()).await,
+            commits: crate::landing::measure_commits(store_root, &resolved, unit, head.as_str())
+                .await,
         };
         removal_landed_decision(&Lane::name("unit"), &head, landed, false)
     }
@@ -9036,14 +9092,15 @@ mod rebase_recovery_tests {
     #[tokio::test]
     async fn a_unit_lands_into_its_lane_base_and_is_then_contained_there_not_in_main() {
         let lane = Lane::new("land");
+        let store_root = lane.store.shared();
         let unit = lane.unit("unit");
         unit_commit(&unit, "unit.txt", "unit work");
-        let unit_head = git_oid(&unit).await.expect("unit head");
-        let main_before = git_oid(&lane.main).await.expect("main head");
+        let unit_head = git_oid(store_root, &unit).await.expect("unit head");
+        let main_before = git_oid(store_root, &lane.main).await.expect("main head");
 
         deliver_into(
             &Lane::name("lane"),
-            &lane.lane,
+            &crate::git::GitRepository::from_root(store_root, &lane.lane),
             &unit,
             &Lane::name("unit"),
             "cowshed/unit",
@@ -9054,25 +9111,25 @@ mod rebase_recovery_tests {
         .expect("land into the lane base");
 
         assert_eq!(
-            git_oid(&lane.lane).await.expect("lane head"),
+            git_oid(store_root, &lane.lane).await.expect("lane head"),
             unit_head,
             "the lane base's checked-out branch fast-forwarded to the unit"
         );
         assert_eq!(
-            git_oid(&lane.main).await.expect("main head"),
+            git_oid(store_root, &lane.main).await.expect("main head"),
             main_before,
             "main is untouched until the lane itself lands"
         );
         // The retire gate, measured against the branch the unit landed on, lets it go…
         assert!(
-            contained_in(&lane.lane, "cowshed/lane", &unit)
+            contained_in(store_root, &lane.lane, "cowshed/lane", &unit)
                 .await
                 .expect("contained in the lane base")
                 .is_none()
         );
         // …and the same gate measured against main would refuse it: that is why land passes the
         // target it delivered into, and why a standalone `rm` still measures against main.
-        let refused = contained_in(&lane.main, "main", &unit)
+        let refused = contained_in(store_root, &lane.main, "main", &unit)
             .await
             .expect_err("main does not hold the unit's commit");
         assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
@@ -9081,15 +9138,16 @@ mod rebase_recovery_tests {
     #[tokio::test]
     async fn a_land_into_a_lane_base_refuses_a_unit_that_moved_after_validation() {
         let lane = Lane::new("moved");
+        let store_root = lane.store.shared();
         let unit = lane.unit("unit");
         unit_commit(&unit, "unit.txt", "validated");
-        let validated = git_oid(&unit).await.expect("validated head");
+        let validated = git_oid(store_root, &unit).await.expect("validated head");
         unit_commit(&unit, "unit.txt", "unvalidated");
-        let lane_before = git_oid(&lane.lane).await.expect("lane head");
+        let lane_before = git_oid(store_root, &lane.lane).await.expect("lane head");
 
         let error = deliver_into(
             &Lane::name("lane"),
-            &lane.lane,
+            &crate::git::GitRepository::from_root(store_root, &lane.lane),
             &unit,
             &Lane::name("unit"),
             "cowshed/unit",
@@ -9102,22 +9160,26 @@ mod rebase_recovery_tests {
         assert_eq!(
             error.fence_source(),
             Some(&FenceRefusal::SourceMoved {
-                observed: git_oid(&unit).await.expect("unvalidated head")
+                observed: git_oid(store_root, &unit).await.expect("unvalidated head")
             })
         );
-        assert_eq!(git_oid(&lane.lane).await.expect("lane head"), lane_before);
+        assert_eq!(
+            git_oid(store_root, &lane.lane).await.expect("lane head"),
+            lane_before
+        );
     }
 
     #[tokio::test]
     async fn a_unit_behind_its_lane_base_is_told_to_rebase_into_it_and_then_lands() {
         let lane = Lane::new("rebase");
+        let store_root = lane.store.shared();
         let first = lane.unit("first");
         let second = lane.unit("second");
         unit_commit(&first, "first.txt", "first unit");
-        let first_head = git_oid(&first).await.expect("first head");
+        let first_head = git_oid(store_root, &first).await.expect("first head");
         deliver_into(
             &Lane::name("lane"),
-            &lane.lane,
+            &crate::git::GitRepository::from_root(store_root, &lane.lane),
             &first,
             &Lane::name("first"),
             "cowshed/first",
@@ -9127,14 +9189,14 @@ mod rebase_recovery_tests {
         .await
         .expect("first unit lands");
         unit_commit(&second, "second.txt", "second unit");
-        let second_head = git_oid(&second).await.expect("second head");
-        let lane_before = git_oid(&lane.lane).await.expect("lane head");
+        let second_head = git_oid(store_root, &second).await.expect("second head");
+        let lane_before = git_oid(store_root, &lane.lane).await.expect("lane head");
 
         // The lane base moved past the second unit's base, so it cannot fast-forward; the next
         // move named is the rebase onto the lane base, since a bare rebase would go onto main.
         let behind = deliver_into(
             &Lane::name("lane"),
-            &lane.lane,
+            &crate::git::GitRepository::from_root(store_root, &lane.lane),
             &second,
             &Lane::name("second"),
             "cowshed/second",
@@ -9155,23 +9217,28 @@ mod rebase_recovery_tests {
             "{}",
             behind.hint
         );
-        assert_eq!(git_oid(&lane.lane).await.expect("lane head"), lane_before);
+        assert_eq!(
+            git_oid(store_root, &lane.lane).await.expect("lane head"),
+            lane_before
+        );
 
-        let onto = fetch_target_branch(&second, &lane.lane, &Lane::name("lane"))
+        let onto = fetch_target_branch(store_root, &second, &lane.lane, &Lane::name("lane"))
             .await
             .expect("fetch the lane base's branch");
-        run_git_rebase_atomically(&second, &onto, &second_head)
+        run_git_rebase_atomically(store_root, &second, &onto, &second_head)
             .await
             .expect("rebase into the lane");
 
-        let parent = git_revision_oid(&second, "HEAD^").await.expect("parent");
+        let parent = git_revision_oid(store_root, &second, "HEAD^")
+            .await
+            .expect("parent");
         assert_eq!(parent, first_head, "the second unit now sits on the first");
         assert!(second.join("first.txt").exists() && second.join("second.txt").exists());
         // And it lands into the lane base as a fast-forward.
-        let rebased = git_oid(&second).await.expect("rebased head");
+        let rebased = git_oid(store_root, &second).await.expect("rebased head");
         deliver_into(
             &Lane::name("lane"),
-            &lane.lane,
+            &crate::git::GitRepository::from_root(store_root, &lane.lane),
             &second,
             &Lane::name("second"),
             "cowshed/second",
@@ -9180,7 +9247,10 @@ mod rebase_recovery_tests {
         )
         .await
         .expect("second unit lands");
-        assert_eq!(git_oid(&lane.lane).await.expect("lane head"), rebased);
+        assert_eq!(
+            git_oid(store_root, &lane.lane).await.expect("lane head"),
+            rebased
+        );
     }
 
     #[test]
@@ -9209,15 +9279,16 @@ mod rebase_recovery_tests {
     #[tokio::test]
     async fn a_target_tree_with_work_the_fast_forward_would_overwrite_names_it() {
         let lane = Lane::new("target-dirty");
+        let store_root = lane.store.shared();
         let unit = lane.unit("unit");
         commit_file(&unit, "unit\n", "unit rewrites the readme");
-        let unit_head = git_oid(&unit).await.expect("unit head");
-        let lane_before = git_oid(&lane.lane).await.expect("lane head");
+        let unit_head = git_oid(store_root, &unit).await.expect("unit head");
+        let lane_before = git_oid(store_root, &lane.lane).await.expect("lane head");
         std::fs::write(lane.lane.join("README.md"), "lane edit\n").expect("dirty the lane base");
 
         let error = deliver_into(
             &Lane::name("lane"),
-            &lane.lane,
+            &crate::git::GitRepository::from_root(store_root, &lane.lane),
             &unit,
             &Lane::name("unit"),
             "cowshed/unit",
@@ -9233,7 +9304,10 @@ mod rebase_recovery_tests {
                 total: 1,
             })
         );
-        assert_eq!(git_oid(&lane.lane).await.expect("lane head"), lane_before);
+        assert_eq!(
+            git_oid(store_root, &lane.lane).await.expect("lane head"),
+            lane_before
+        );
         assert_eq!(
             std::fs::read_to_string(lane.lane.join("README.md")).expect("lane readme"),
             "lane edit\n"
@@ -9392,6 +9466,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
 
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceSnapshot> {
         use crate::storage::lifecycle::LifecyclePlanner;
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
         if options.re_adopt {
             return self.re_adopt(options).await;
         }
@@ -9555,7 +9630,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         ),
                     )
                     .await?;
-                    let repository = crate::git::GitRepository::from_root(&stage.mount_point);
+                    let repository =
+                        crate::git::GitRepository::from_root(store_root, &stage.mount_point);
                     // The image's volume is case-sensitive; the tree it was copied from may not be.
                     timed_async(
                         "adopt",
@@ -9586,6 +9662,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     ) -> Result<WorkspaceSnapshot> {
         use super::supervisor::CommitmentSink;
         use crate::storage::lifecycle::LifecyclePlanner;
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
         self.validate_binding().await?;
         let intent = crate::storage::recovery::LifecycleIntent::Create {
             workspace: workspace.clone(),
@@ -9798,7 +9875,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             ),
                         )
                         .await?;
-                        crate::git::GitRepository::from_root(&stage.mount_point)
+                        crate::git::GitRepository::from_root(store_root, &stage.mount_point)
                             .mint_workspace(
                                 &destination.to_string(),
                                 crate::git::CloneOrigin {
@@ -9940,6 +10017,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     ) -> Result<WorkspaceSnapshot> {
         use super::supervisor::{CommitmentDraft, CommitmentSink};
         use crate::storage::lifecycle::LifecyclePlanner;
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
         let journal_rename = match purpose {
             ClonePurpose::HistoricalFork => false,
             ClonePurpose::Rename => true,
@@ -10057,9 +10135,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     ));
                 }
                 source_fact = current;
-                let source_git = crate::git::GitRepository::from_root(
-                    &self.workspace_mount_path(&source)?,
-                );
+                let source_git = crate::git::GitRepository::from_root(self.git.store_root(), &self.workspace_mount_path(&source)?);
                 // The source's planned restored links, read once after the fence and used by every
                 // digest of this rename: only those exact links may differ, nothing else.
                 let restored_links = source_git.rename_link_paths().await?;
@@ -10090,7 +10166,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 let branch = match purpose {
                     ClonePurpose::HistoricalFork => Some(format!("cowshed/{destination}")),
                     ClonePurpose::Rename => {
-                        crate::git::GitRepository::from_root(&source_mount)
+                        crate::git::GitRepository::from_root(self.git.store_root(), &source_mount)
                             .current_branch()
                             .await?
                     }
@@ -10169,7 +10245,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                 )
                                 .await?;
                             let repository =
-                                crate::git::GitRepository::from_root(&stage.mount_point);
+                                crate::git::GitRepository::from_root(store_root, &stage.mount_point);
                             repository.restore_inherited_links(&source_mount).await?;
                             if source_is_git_worktree {
                                 match purpose {
@@ -10241,16 +10317,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         ),
                     ));
                 }
-                let destination_git = crate::git::GitRepository::from_root(
-                    &self.workspace_mount_path(&destination)?,
-                );
+                let destination_git = crate::git::GitRepository::from_root(self.git.store_root(), &self.workspace_mount_path(&destination)?);
                 let destination_head = destination_git.head_oid().await?;
                 let destination_work = destination_git
                     .rename_work_state(source_is_git_worktree, &restored_links)
                     .await?;
-                let source_git = crate::git::GitRepository::from_root(
-                    &self.workspace_mount_path(&source)?,
-                );
+                let source_git = crate::git::GitRepository::from_root(self.git.store_root(), &self.workspace_mount_path(&source)?);
                 let fresh_work = source_git
                     .rename_work_state(source_is_git_worktree, &restored_links)
                     .await?;
@@ -11668,6 +11740,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         into: Option<WorkspaceTarget>,
         options: RebaseOptions,
     ) -> Result<RebaseReport> {
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
         require_single_destination(options.onto.as_ref(), into.as_ref())?;
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
@@ -11676,7 +11749,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         }
         let into = self.landing_into(&workspace, into).await?;
         let root = current_snapshot_mount(self, &current)?;
-        let source_head = git_oid(&root).await?;
+        let source_head = git_oid(store_root, &root).await?;
         require_source_head(
             options.expected_source_head.as_ref(),
             &source_head,
@@ -11686,7 +11759,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             // A lane base is its own repository: its branch reaches the unit by a fetch from its
             // mount into a cowshed-owned ref, which is also what keeps it current. `onto` was
             // refused above, so this is the only destination.
-            fetch_target_branch(&root, &into.root, &into.name).await?
+            fetch_target_branch(store_root, &root, &into.root, &into.name).await?
         } else if is_git_worktree(&current.metadata) {
             // A git-worktree workspace reads main's branches straight out of the shared ref
             // namespace, so there is nothing to refresh and no remote to refresh it from.
@@ -11701,20 +11774,26 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             // workspace: rebasing onto `main/main` resolves a ref only a fetch creates, and a stale
             // one silently replays onto yesterday's base.
             let main_mount = self.workspace_mount_path(&main_name())?;
-            let main_remote = crate::git::GitRepository::from_root(&root)
+            let main_remote = crate::git::GitRepository::from_root(self.git.store_root(), &root)
                 .configure_main_remote(&main_mount)
                 .await?;
             let remote = main_remote.remote_name();
-            run_git_fetch(&root, &main_mount, ["fetch", "--no-tags", remote]).await?;
+            run_git_fetch(
+                store_root,
+                &root,
+                &main_mount,
+                ["fetch", "--no-tags", remote],
+            )
+            .await?;
             options.onto.as_ref().map_or_else(
                 || format!("{remote}/{DEFAULT_LANDING_BRANCH}"),
                 revision_target,
             )
         };
-        let onto_head = git_revision_oid(&root, &onto).await?;
+        let onto_head = git_revision_oid(store_root, &root, &onto).await?;
         require_onto_head(options.expected_onto_head.as_ref(), &onto, &onto_head)?;
-        run_git_rebase_atomically(&root, &onto, &source_head).await?;
-        let oid = git_oid(&root).await?;
+        run_git_rebase_atomically(store_root, &root, &onto, &source_head).await?;
+        let oid = git_oid(store_root, &root).await?;
         // The rebase has happened: a failed carry reads as such, never as a refused rebase.
         let build_volume = timed_async("rebase", "carry", async {
             // Only what the rebased tree will look up is carried, so the hashes come from it, as
@@ -11751,6 +11830,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         into: Option<WorkspaceTarget>,
         options: LandOptions,
     ) -> Result<LandReport> {
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
         timed_async("land", "binding", self.validate_binding()).await?;
         let current = timed_async("land", "source", self.current(&workspace)).await?;
         if let Some(expected) = options.expected_workspace_incarnation.as_ref() {
@@ -11760,8 +11840,10 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // here, not after minutes of checks.
         let into = timed_async("land", "target", self.landing_into(&workspace, into)).await?;
         let source_mount = current_snapshot_mount(self, &current)?;
-        let source_repository = crate::git::GitRepository::from_root(&source_mount);
-        let source_head = timed_async("land", "source-head", git_oid(&source_mount)).await?;
+        let source_repository =
+            crate::git::GitRepository::from_root(self.git.store_root(), &source_mount);
+        let source_head =
+            timed_async("land", "source-head", git_oid(store_root, &source_mount)).await?;
         require_source_head(options.expected_source_head.as_ref(), &source_head, "land")?;
         // The check runs in the working tree but only the head commit lands, so uncommitted work
         // would pass validation without landing, and would then refuse the retire after main had
@@ -11786,19 +11868,21 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         }
         let target_branch = match options.target_branch.clone() {
             Some(branch) => branch,
-            None => timed_async("land", "target-branch", into.checked_out_branch()).await?,
+            None => {
+                timed_async("land", "target-branch", into.checked_out_branch(store_root)).await?
+            }
         };
         timed_async(
             "land",
             "target-check",
-            require_target_checked_out(&into.root, &target_branch),
+            require_target_checked_out(store_root, &into.root, &target_branch),
         )
         .await?;
         let target_ref = format!("refs/heads/{target_branch}");
         let previous = timed_async(
             "land",
             "target-head",
-            git_optional_ref_oid(&into.root, &target_ref),
+            git_optional_ref_oid(store_root, &into.root, &target_ref),
         )
         .await?;
         require_target_head(options.expected_target_head.as_ref(), previous.as_ref())?;
@@ -11900,6 +11984,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 "land",
                 "preservation",
                 preserve_workspace_branch(
+                    store_root,
                     &self.descriptor.git_root,
                     &source_mount,
                     &workspace,
@@ -11916,7 +12001,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             "delivery",
             deliver_into(
                 &into.name,
-                &into.root,
+                &crate::git::GitRepository::from_root(store_root, &into.root),
                 &source_mount,
                 &workspace,
                 &source_branch,
@@ -12041,6 +12126,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         expected_incarnation: WorkspaceIncarnation,
         options: PushOptions,
     ) -> Result<PushReport> {
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &expected_incarnation)?;
@@ -12051,6 +12137,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 .map_err(|error| CowshedError::internal(error.to_string()))?,
         };
         preserve_workspace_branch(
+            store_root,
             &self.descriptor.git_root,
             &source_mount,
             &workspace,
@@ -12070,7 +12157,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         if tokio::fs::try_exists(&root).await.map_err(|error| {
             CowshedError::environment_missing(error.to_string(), "check cache permissions")
         })? {
-            run_git(&root, ["remote", "update", "--prune"]).await?;
+            run_git(
+                self.git.store_root(),
+                &root,
+                ["remote", "update", "--prune"],
+            )
+            .await?;
         } else {
             let parent = root
                 .parent()
@@ -12130,6 +12222,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
 
     async fn doctor(&mut self) -> Result<DoctorReport> {
         use crate::storage::lifecycle::{StorageGcReason, Substrate};
+        let store_root = &std::sync::Arc::clone(self.git.store_root());
 
         let mut findings = Vec::new();
         match self.binding_move().await {
@@ -12434,9 +12527,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                     )),
                                 )),
                             }
-                            match crate::git::GitRepository::from_root(&expected_mount)
-                                .inspect_merge_drivers()
-                                .await
+                            match crate::git::GitRepository::from_root(
+                                self.git.store_root(),
+                                &expected_mount,
+                            )
+                            .inspect_merge_drivers()
+                            .await
                             {
                                 Ok(drivers) => {
                                     for driver in drivers {
@@ -12458,9 +12554,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             if !workspace_name.is_main()
                                 && let Some(main_mount) = main_mount.as_ref()
                             {
-                                match crate::git::GitRepository::from_root(&expected_mount)
-                                    .inspect_cowshed_upstream(main_mount)
-                                    .await
+                                match crate::git::GitRepository::from_root(
+                                    self.git.store_root(),
+                                    &expected_mount,
+                                )
+                                .inspect_cowshed_upstream(main_mount)
+                                .await
                                 {
                                     Ok(upstream) => {
                                         if let Some(finding) = cowshed_upstream_finding(
@@ -12484,9 +12583,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                     incarnation: workspace.derived.workspace.incarnation().clone(),
                                 };
                                 let diagnosed = async {
-                                    let Some(tree) =
-                                        git_optional_ref_oid(&expected_mount, "HEAD^{tree}")
-                                            .await?
+                                    let Some(tree) = git_optional_ref_oid(
+                                        store_root,
+                                        &expected_mount,
+                                        "HEAD^{tree}",
+                                    )
+                                    .await?
                                     else {
                                         return Ok::<_, CowshedError>(Vec::new());
                                     };
@@ -12498,6 +12600,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                         return Ok(Vec::new());
                                     };
                                     let mut result = seed_tree_findings(
+                                        store_root,
                                         &workspace_name,
                                         &age,
                                         &tree,
@@ -13614,9 +13717,12 @@ pub async fn bind_remote_identity(
                 "cowshed doctor --json",
             )
         })?;
-        let remotes = crate::git::GitRepository::from_root(&*descriptor.git_root)
-            .remotes()
-            .await?;
+        let remotes = crate::git::GitRepository::from_root(
+            descriptor.storage.roots().shared_store(),
+            &*descriptor.git_root,
+        )
+        .remotes()
+        .await?;
         let store = descriptor.storage.store().to_path_buf();
         let project = descriptor.repo_id.clone();
         let others =
@@ -14769,8 +14875,12 @@ fn current_snapshot_mount<H: RuntimeStorageHost>(
 /// checkout is on, so any other target would be reported as landed while a different branch moved.
 /// Updating a branch that is not checked out is a separate path this runtime does not have.
 #[cfg(target_os = "macos")]
-async fn require_target_checked_out(git_root: &Path, target_branch: &str) -> Result<()> {
-    let checked_out = crate::git::GitRepository::from_root(git_root)
+async fn require_target_checked_out(
+    store_root: &std::sync::Arc<Path>,
+    git_root: &Path,
+    target_branch: &str,
+) -> Result<()> {
+    let checked_out = crate::git::GitRepository::from_root(store_root, git_root)
         .current_branch()
         .await?;
     if checked_out.as_deref() == Some(target_branch) {
@@ -14795,8 +14905,12 @@ async fn require_target_checked_out(git_root: &Path, target_branch: &str) -> Res
 
 /// The branch a lane base has checked out: what its units land on and rebase onto.
 #[cfg(target_os = "macos")]
-async fn target_checked_out_branch(root: &Path, target: &WorkspaceName) -> Result<String> {
-    crate::git::GitRepository::from_root(root)
+async fn target_checked_out_branch(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    target: &WorkspaceName,
+) -> Result<String> {
+    crate::git::GitRepository::from_root(store_root, root)
         .current_branch()
         .await?
         .ok_or_else(|| {
@@ -14819,15 +14933,18 @@ async fn target_checked_out_branch(root: &Path, target: &WorkspaceName) -> Resul
 #[cfg(target_os = "macos")]
 async fn deliver_into(
     target: &WorkspaceName,
-    target_root: &Path,
+    repository: &crate::git::GitRepository,
     source_mount: &Path,
     unit: &WorkspaceName,
     source_branch: &str,
     source_head: &GitOid,
     target_branch: &str,
 ) -> Result<()> {
+    let store_root = repository.store_root();
+    let target_root = repository.root();
     let preservation_ref = format!("refs/cowshed/{unit}/heads/{source_branch}");
     run_git_fetch(
+        store_root,
         target_root,
         source_mount,
         [
@@ -14840,7 +14957,7 @@ async fn deliver_into(
         ],
     )
     .await?;
-    let fetched = git_revision_oid(target_root, &preservation_ref).await?;
+    let fetched = git_revision_oid(store_root, target_root, &preservation_ref).await?;
     if &fetched != source_head {
         return Err(CowshedError::fence_refusal(
             crate::error::FenceRefusal::SourceMoved {
@@ -14852,11 +14969,10 @@ async fn deliver_into(
     }
     // Read again at the merge: the check can run for minutes, and the target's checkout can be
     // switched to another branch while it does.
-    require_target_checked_out(target_root, target_branch).await?;
+    require_target_checked_out(store_root, target_root, target_branch).await?;
     // A target that moved past the unit's base cannot fast-forward. The next move is the unit's
     // rebase onto that target, and for a lane unit a bare `cowshed rebase` would rebase onto main,
     // so the hint names the destination.
-    let repository = crate::git::GitRepository::from_root(target_root);
     if let Some(tip) = repository.branch_tip(target_branch).await?
         && !repository
             .commit_is_ancestor(tip.as_str(), source_head.as_str())
@@ -14878,7 +14994,12 @@ async fn deliver_into(
             format!("cowshed rebase {unit}{into}, re-run the check, then retry land"),
         ));
     }
-    let merge = invoke_git(target_root, &["merge", "--ff-only", source_head.as_str()]).await?;
+    let merge = invoke_git(
+        store_root,
+        target_root,
+        &["merge", "--ff-only", source_head.as_str()],
+    )
+    .await?;
     let Err(refused) = require_git_success("git operation", &merge) else {
         return Ok(());
     };
@@ -14904,6 +15025,7 @@ async fn deliver_into(
 /// against, in one compare-and-swap `update-ref`. The staging ref is removed on every path.
 #[cfg(target_os = "macos")]
 async fn preserve_workspace_branch(
+    store_root: &std::sync::Arc<Path>,
     main_root: &Path,
     source_mount: &Path,
     workspace: &WorkspaceName,
@@ -14913,7 +15035,7 @@ async fn preserve_workspace_branch(
 ) -> Result<PushReport> {
     let branch = source_branch.as_str();
     let source_ref = format!("refs/heads/{branch}");
-    if git_optional_ref_oid(source_mount, &source_ref)
+    if git_optional_ref_oid(store_root, source_mount, &source_ref)
         .await?
         .is_none()
     {
@@ -14930,6 +15052,7 @@ async fn preserve_workspace_branch(
         uuid::Uuid::new_v4().simple()
     );
     run_git_fetch(
+        store_root,
         main_root,
         source_mount,
         [
@@ -14944,6 +15067,7 @@ async fn preserve_workspace_branch(
     )
     .await?;
     let installed = install_preserved(
+        store_root,
         main_root,
         &staging_ref,
         destination_ref,
@@ -14951,7 +15075,7 @@ async fn preserve_workspace_branch(
         expected_destination_head,
     )
     .await;
-    let unstaged = run_git(main_root, ["update-ref", "-d", &staging_ref]).await;
+    let unstaged = run_git(store_root, main_root, ["update-ref", "-d", &staging_ref]).await;
     match (installed, unstaged) {
         (installed, Ok(())) => installed,
         (installed, Err(leak)) => Err(CowshedError::integrity(
@@ -14976,15 +15100,17 @@ async fn preserve_workspace_branch(
 /// Move `destination_ref` to what `staging_ref` holds, refusing any expectation that moved.
 #[cfg(target_os = "macos")]
 async fn install_preserved(
+    store_root: &std::sync::Arc<Path>,
     main_root: &Path,
     staging_ref: &str,
     destination_ref: String,
     expected_source_head: Option<&GitOid>,
     expected_destination_head: Option<&crate::api::dto::ExpectedRefHead>,
 ) -> Result<PushReport> {
-    let source_head = git_revision_oid(main_root, staging_ref).await?;
+    let source_head = git_revision_oid(store_root, main_root, staging_ref).await?;
     require_source_head(expected_source_head, &source_head, "push")?;
-    let previous_destination_head = git_optional_ref_oid(main_root, &destination_ref).await?;
+    let previous_destination_head =
+        git_optional_ref_oid(store_root, main_root, &destination_ref).await?;
     require_expected_ref(
         expected_destination_head,
         previous_destination_head.as_ref(),
@@ -14996,6 +15122,7 @@ async fn install_preserved(
         .as_ref()
         .map_or("", GitOid::as_str);
     run_git(
+        store_root,
         main_root,
         [
             "update-ref",
@@ -15020,13 +15147,15 @@ async fn install_preserved(
 /// keeps the destination current as lane-mates land.
 #[cfg(target_os = "macos")]
 async fn fetch_target_branch(
+    store_root: &std::sync::Arc<Path>,
     unit_root: &Path,
     target_root: &Path,
     target: &WorkspaceName,
 ) -> Result<String> {
-    let branch = target_checked_out_branch(target_root, target).await?;
+    let branch = target_checked_out_branch(store_root, target_root, target).await?;
     let reference = format!("refs/cowshed/targets/{target}/{branch}");
     run_git_fetch(
+        store_root,
         unit_root,
         target_root,
         [
@@ -15147,15 +15276,25 @@ fn require_target_head(
 }
 
 #[cfg(target_os = "macos")]
-async fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> Result<()> {
-    let output = invoke_git(root, &args).await?;
+async fn run_git<const N: usize>(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    args: [&str; N],
+) -> Result<()> {
+    let output = invoke_git(store_root, root, &args).await?;
     require_git_success("git operation", &output)
 }
 
 #[cfg(target_os = "macos")]
-async fn run_git_fetch<const N: usize>(root: &Path, source: &Path, args: [&str; N]) -> Result<()> {
-    let mut command =
-        tokio::process::Command::from(crate::git::sandboxed_git_fetch_command(root, source)?);
+async fn run_git_fetch<const N: usize>(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    source: &Path,
+    args: [&str; N],
+) -> Result<()> {
+    let mut command = tokio::process::Command::from(crate::git::sandboxed_git_fetch_command(
+        store_root, root, source,
+    )?);
     let output = command.args(args).output_locked().await.map_err(|error| {
         CowshedError::environment_missing(
             error.to_string(),
@@ -15168,8 +15307,13 @@ async fn run_git_fetch<const N: usize>(root: &Path, source: &Path, args: [&str; 
 /// Repository-selected Git commands (including merge drivers and filters) run
 /// with a write boundary around the checkout, not with controller host reach.
 #[cfg(target_os = "macos")]
-async fn invoke_git(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-    let mut command = tokio::process::Command::from(crate::git::sandboxed_git_command_at(root)?);
+async fn invoke_git(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    args: &[&str],
+) -> Result<std::process::Output> {
+    let mut command =
+        tokio::process::Command::from(crate::git::sandboxed_git_command_at(store_root, root)?);
     command.args(args).output_locked().await.map_err(|error| {
         CowshedError::environment_missing(
             error.to_string(),
@@ -15179,16 +15323,21 @@ async fn invoke_git(root: &Path, args: &[&str]) -> Result<std::process::Output> 
 }
 
 #[cfg(target_os = "macos")]
-async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid) -> Result<()> {
+async fn run_git_rebase_atomically(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    onto: &str,
+    source_head: &GitOid,
+) -> Result<()> {
     use self::invoke_git as invoke;
 
-    let source_ref_output = invoke(root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
+    let source_ref_output = invoke(store_root, root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
     require_git_success("resolve workspace branch", &source_ref_output)?;
     let source_ref = String::from_utf8(source_ref_output.stdout)
         .map_err(|error| CowshedError::integrity(error.to_string(), "repair the git repository"))?;
     let source_ref = source_ref.trim_end();
 
-    let git_dir_output = invoke(root, &["rev-parse", "--absolute-git-dir"]).await?;
+    let git_dir_output = invoke(store_root, root, &["rev-parse", "--absolute-git-dir"]).await?;
     require_git_success("resolve git directory", &git_dir_output)?;
     let git_dir = String::from_utf8(git_dir_output.stdout)
         .map_err(|error| CowshedError::integrity(error.to_string(), "repair the git repository"))?;
@@ -15202,7 +15351,7 @@ async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid
     // and a parked stash yet exits 0, so this verb would report success over a conflicted tree.
     // Without it git refuses a dirty tree before touching anything, which the classifier below
     // turns into "commit or discard the uncommitted work".
-    let output = invoke(root, &["rebase", "--no-autostash", onto]).await?;
+    let output = invoke(store_root, root, &["rebase", "--no-autostash", onto]).await?;
     let primary = match require_git_success("git operation", &output) {
         Ok(()) => return Ok(()),
         Err(error) => error,
@@ -15219,17 +15368,17 @@ async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid
     }
 
     let owns_rebase_state = rebase_state.iter().any(|path| path.exists());
-    let current_ref = invoke(root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
+    let current_ref = invoke(store_root, root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
     let current_ref_matches = current_ref.status.success()
         && String::from_utf8_lossy(&current_ref.stdout).trim_end() == source_ref;
-    let current_head = invoke(root, &["rev-parse", "--verify", "HEAD"]).await?;
+    let current_head = invoke(store_root, root, &["rev-parse", "--verify", "HEAD"]).await?;
     let current_head_matches = current_head.status.success()
         && String::from_utf8_lossy(&current_head.stdout).trim_end() == source_head.as_str();
     if !owns_rebase_state && current_ref_matches && current_head_matches {
         // git refused before touching anything. A dirty tree is the refusal a caller acts on, so
         // it names the paths that block the rebase.
         if String::from_utf8_lossy(&output.stderr).contains("cannot rebase: ") {
-            let work = crate::git::GitRepository::from_root(root)
+            let work = crate::git::GitRepository::from_root(store_root, root)
                 .tracked_change_paths()
                 .await?;
             return Err(CowshedError::fence_refusal(
@@ -15244,14 +15393,14 @@ async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid
     // Abort is the lossless path because Git owns the sequencer state. A damaged sequencer may
     // refuse abort, so cowshed then removes only the two rebase directories it just created and
     // restores the exact ref and commit captured before mutation.
-    let _ = invoke(root, &["rebase", "--abort"]).await;
+    let _ = invoke(store_root, root, &["rebase", "--abort"]).await;
     for path in &rebase_state {
         if path.exists() {
             let _ = tokio::fs::remove_dir_all(path).await;
         }
     }
-    let _ = invoke(root, &["symbolic-ref", "HEAD", source_ref]).await;
-    let _ = invoke(root, &["reset", "--hard", source_head.as_str()]).await;
+    let _ = invoke(store_root, root, &["symbolic-ref", "HEAD", source_ref]).await;
+    let _ = invoke(store_root, root, &["reset", "--hard", source_head.as_str()]).await;
 
     let mut failures = Vec::new();
     for path in &rebase_state {
@@ -15261,13 +15410,13 @@ async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid
             Err(error) => failures.push(format!("cannot inspect {}: {error}", path.display())),
         }
     }
-    let restored_ref = invoke(root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
+    let restored_ref = invoke(store_root, root, &["symbolic-ref", "--quiet", "HEAD"]).await?;
     if !restored_ref.status.success()
         || String::from_utf8_lossy(&restored_ref.stdout).trim_end() != source_ref
     {
         failures.push(format!("HEAD is not attached to {source_ref}"));
     }
-    match git_oid(root).await {
+    match git_oid(store_root, root).await {
         Ok(restored) if &restored == source_head => {}
         Ok(restored) => failures.push(format!(
             "HEAD is {}, expected {}",
@@ -15302,13 +15451,17 @@ async fn run_git_rebase_atomically(root: &Path, onto: &str, source_head: &GitOid
 }
 
 #[cfg(target_os = "macos")]
-async fn git_oid(root: &Path) -> Result<GitOid> {
-    git_revision_oid(root, "HEAD").await
+async fn git_oid(store_root: &std::sync::Arc<Path>, root: &Path) -> Result<GitOid> {
+    git_revision_oid(store_root, root, "HEAD").await
 }
 
 #[cfg(target_os = "macos")]
-async fn git_revision_oid(root: &Path, revision: &str) -> Result<GitOid> {
-    let output = invoke_git(root, &["rev-parse", "--verify", revision]).await?;
+async fn git_revision_oid(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    revision: &str,
+) -> Result<GitOid> {
+    let output = invoke_git(store_root, root, &["rev-parse", "--verify", revision]).await?;
     require_git_success("resolve git revision", &output)?;
     let value = String::from_utf8(output.stdout)
         .map_err(|error| CowshedError::integrity(error.to_string(), "repair the git repository"))?;
@@ -15321,8 +15474,17 @@ async fn git_revision_oid(root: &Path, revision: &str) -> Result<GitOid> {
 /// --verify` is *fatal* (exit 128) on an absent ref, which would turn "the target branch does not
 /// exist yet" into an internal error instead of the `None` every caller here is written for.
 #[cfg(target_os = "macos")]
-async fn git_optional_ref_oid(root: &Path, reference: &str) -> Result<Option<GitOid>> {
-    let output = invoke_git(root, &["rev-parse", "--verify", "--quiet", reference]).await?;
+async fn git_optional_ref_oid(
+    store_root: &std::sync::Arc<Path>,
+    root: &Path,
+    reference: &str,
+) -> Result<Option<GitOid>> {
+    let output = invoke_git(
+        store_root,
+        root,
+        &["rev-parse", "--verify", "--quiet", reference],
+    )
+    .await?;
     if output.status.code() == Some(1) {
         return Ok(None);
     }
@@ -17680,8 +17842,12 @@ fn git_worktree_repository(
 /// whichever of the two is still intact, which is what makes it correct whether main moved or the
 /// workspace did.
 #[cfg(target_os = "macos")]
-async fn repair_git_worktree_link(main_mount: &Path, mount: &Path) -> Result<()> {
-    crate::git::GitRepository::from_root(main_mount)
+async fn repair_git_worktree_link(
+    store_root: &std::sync::Arc<Path>,
+    main_mount: &Path,
+    mount: &Path,
+) -> Result<()> {
+    crate::git::GitRepository::from_root(store_root, main_mount)
         .repair_linked_worktree(mount)
         .await
 }
@@ -18071,6 +18237,7 @@ fn build_link_finding(
 
 #[cfg(target_os = "macos")]
 async fn seed_tree_findings(
+    store_root: &std::sync::Arc<Path>,
     workspace: &WorkspaceName,
     age: &super::build_volumes::SeedAge,
     tree: &GitOid,
@@ -18091,8 +18258,12 @@ async fn seed_tree_findings(
     {
         let seed_tree = age.seed.as_ref().and_then(|seed| seed.tree.as_ref());
         let distance = if let Some(seed_tree) = seed_tree {
-            let history =
-                invoke_git(checkout, &["log", "--first-parent", "--format=%T", "HEAD"]).await?;
+            let history = invoke_git(
+                store_root,
+                checkout,
+                &["log", "--first-parent", "--format=%T", "HEAD"],
+            )
+            .await?;
             require_git_success("count commits since the seed tree", &history)?;
             String::from_utf8(history.stdout)
                 .map_err(|error| {
@@ -19380,6 +19551,8 @@ mod git_worktree_tests {
     #[tokio::test]
     async fn a_lane_fetch_under_main_tree_include_grants_is_refused_by_name() {
         use cowshed_os::fork_lock::Run as _;
+        let store = crate::temp_root::FixtureStore::new();
+        let store_root = store.shared();
         let scratch = crate::temp_root::TempRoot::new("cowshed-lane-include");
         let git = |directory: &Path, args: &[&str]| {
             let status = std::process::Command::new("git")
@@ -19436,9 +19609,14 @@ mod git_worktree_tests {
         );
         let unit = unit.canonicalize().expect("canonical unit");
         let lane = lane.canonicalize().expect("canonical lane");
-        let error = fetch_target_branch(&unit, &lane, &WorkspaceName::new("lane").expect("lane"))
-            .await
-            .expect_err("a fetch under main-tree include grants is refused");
+        let error = fetch_target_branch(
+            store_root,
+            &unit,
+            &lane,
+            &WorkspaceName::new("lane").expect("lane"),
+        )
+        .await
+        .expect_err("a fetch under main-tree include grants is refused");
         assert_eq!(
             error.code,
             crate::error::ErrorCode::SandboxDenied,
@@ -19527,10 +19705,13 @@ mod workspace_origin_tests {
     async fn doctor_names_seed_tree_drift_and_keeps_a_nearer_landed_seed() {
         use super::super::build_volumes::{Frozen, Nearness, SeedAge};
         use crate::build_volume::BuildVolumeId;
+        let store = crate::temp_root::FixtureStore::new();
+        let store_root = store.shared();
         let root = temp_directory("seed-tree-doctor");
         let checkout = root.as_path();
         let commit = |message: &'static str| async move {
             let output = invoke_git(
+                store_root,
                 checkout,
                 &[
                     "-c",
@@ -19546,17 +19727,23 @@ mod workspace_origin_tests {
             .await
             .unwrap();
             require_git_success("commit fixture", &output).unwrap();
-            git_revision_oid(checkout, "HEAD^{tree}").await.unwrap()
+            git_revision_oid(store_root, checkout, "HEAD^{tree}")
+                .await
+                .unwrap()
         };
         require_git_success(
             "init fixture",
-            &invoke_git(&root, &["init", "--quiet"]).await.unwrap(),
+            &invoke_git(store_root, &root, &["init", "--quiet"])
+                .await
+                .unwrap(),
         )
         .unwrap();
         std::fs::write(root.join("file"), "one").unwrap();
         require_git_success(
             "add fixture",
-            &invoke_git(&root, &["add", "file"]).await.unwrap(),
+            &invoke_git(store_root, &root, &["add", "file"])
+                .await
+                .unwrap(),
         )
         .unwrap();
         let previous = commit("before").await;
@@ -19575,7 +19762,7 @@ mod workspace_origin_tests {
                 written: frozen,
             }),
         };
-        let findings = seed_tree_findings(&main_name(), &age, &current, &root)
+        let findings = seed_tree_findings(store_root, &main_name(), &age, &current, &root)
             .await
             .unwrap();
         assert_eq!(
@@ -19590,7 +19777,7 @@ mod workspace_origin_tests {
         seed.tree = Some(current.clone());
         seed.nearness = Nearness::Equal;
         assert!(
-            seed_tree_findings(&main_name(), &age, &current, &root)
+            seed_tree_findings(store_root, &main_name(), &age, &current, &root)
                 .await
                 .unwrap()
                 .is_empty()

@@ -4251,10 +4251,13 @@ async fn prove_re_adoption(proof: ReAdoptionProof) {
         assert_eq!(refused.raw_os_error(), Some(libc::EROFS));
     }
     assert_eq!(
-        cowshed_core::git::GitRepository::discover(&fixture.checkout)
-            .await
-            .unwrap()
-            .root(),
+        cowshed_core::git::GitRepository::discover(
+            fixture.storage.roots().shared_store(),
+            &fixture.checkout
+        )
+        .await
+        .unwrap()
+        .root(),
         fixture.checkout,
         "Git is now present, but the pending replacement still owns this retry"
     );
