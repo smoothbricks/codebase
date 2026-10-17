@@ -67,7 +67,7 @@ describe('Bun bootstrap imports', () => {
     expect(typeof policy.BOUNDED_TEST_EXECUTOR).toBe('string');
     expect(typeof policy.BOUNDED_TEST_IDLE_TIMEOUT_MS).toBe('number');
     expect(typeof policy.BOUNDED_TEST_KILL_AFTER_MS).toBe('number');
-    expect(typeof policy.BOUNDED_TEST_PER_TEST_TIMEOUT_MS).toBe('number');
+    expect(typeof policy.BUN_TEST_TIMEOUT_FLAG).toBe('string');
   });
 
   it('imports workspace-config-policy', async () => {

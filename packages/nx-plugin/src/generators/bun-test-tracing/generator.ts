@@ -141,8 +141,8 @@ function writeBunfig(tree: Tree, projectRoot: string): void {
   // Bun silently ignores `[test] timeout` in bunfig.toml — only the `--timeout`
   // CLI flag and `setDefaultTimeout()` actually take effect. Strip any stale
   // `timeout = N` lines so the file isn't lying about what's enforced; the real
-  // per-test timeout is wired into `bun test --timeout=N` by the bounded-test
-  // policy (see BOUNDED_TEST_PER_TEST_TIMEOUT_MS).
+  // per-test timeout is the leg's `--timeout`, which the bounded-test policy
+  // derives from bounded-exec's progress bound (see BUN_TEST_TIMEOUT_FLAG).
   const current = stripBunTestTimeoutLine(tree.read(bunfigPath, 'utf-8') ?? '');
 
   // Already has the package specifier preloads

@@ -1139,7 +1139,7 @@ async function toolingShapedWorkspace(root: string): Promise<void> {
       targets: {
         test: {
           executor: '@smoothbricks/nx-plugin:bounded-exec',
-          options: { command: 'bun test --timeout=30000 direnv', cwd: '{projectRoot}' },
+          options: { command: 'bun test --timeout=0 direnv', cwd: '{projectRoot}' },
         },
       },
     },

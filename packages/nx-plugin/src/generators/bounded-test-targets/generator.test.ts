@@ -6,10 +6,8 @@ import {
   BOUNDED_TEST_EXECUTOR,
   BOUNDED_TEST_IDLE_TIMEOUT_MS,
   BOUNDED_TEST_KILL_AFTER_MS,
-  BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
+  BUN_TEST_TIMEOUT_FLAG as TIMEOUT_FLAG,
 } from '../../bounded-test-policy.js';
-
-const TIMEOUT_FLAG = `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`;
 
 import generator from './generator.js';
 

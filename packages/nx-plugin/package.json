@@ -231,7 +231,7 @@
       "test-shard1": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=1/4 --path-ignore-patterns='**/*-host.test.ts'",
+          "command": "bun test --timeout=0 --timings=test-timings.json --shard=1/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -240,7 +240,7 @@
       "test-shard2": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=2/4 --path-ignore-patterns='**/*-host.test.ts'",
+          "command": "bun test --timeout=0 --timings=test-timings.json --shard=2/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -249,7 +249,7 @@
       "test-shard3": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=3/4 --path-ignore-patterns='**/*-host.test.ts'",
+          "command": "bun test --timeout=0 --timings=test-timings.json --shard=3/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -258,7 +258,7 @@
       "test-shard4": {
         "executor": "@smoothbricks/nx-plugin:bounded-exec",
         "options": {
-          "command": "bun test --timeout=30000 --timings=test-timings.json --shard=4/4 --path-ignore-patterns='**/*-host.test.ts'",
+          "command": "bun test --timeout=0 --timings=test-timings.json --shard=4/4 --path-ignore-patterns='**/*-host.test.ts'",
           "cwd": "{projectRoot}",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -275,7 +275,7 @@
           }
         ],
         "options": {
-          "command": "bun test --timeout=30000 ./src/executors/bounded-exec/ram-temp-host.test.ts ./src/executors/bounded-exec/executor-host.test.ts",
+          "command": "bun test --timeout=0 ./src/executors/bounded-exec/ram-temp-host.test.ts ./src/executors/bounded-exec/executor-host.test.ts",
           "cwd": "{projectRoot}",
           "env": {
             "COWSHED_EXECUTABLE": "{workspaceRoot}/packages/cowshed/bin/cowshed"

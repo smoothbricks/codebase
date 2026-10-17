@@ -358,8 +358,8 @@ setInterval(() => console.log('running'), 10);
     const directory = context.record?.directory ?? '';
     await mkdir(directory, { recursive: true });
     const report = join(directory, JUNIT_FILE);
-    expect(await withJunitReport('bun test --timeout=30000 src', directory)).toBe(
-      `bun test --reporter=junit --reporter-outfile='${report}' --timeout=30000 src`,
+    expect(await withJunitReport('bun test --timeout=0 src', directory)).toBe(
+      `bun test --reporter=junit --reporter-outfile='${report}' --timeout=0 src`,
     );
     const nextest = await withJunitReport('extracted="$(x)" && cargo --frozen nextest run -E all', directory);
     expect(nextest).toBe(
@@ -377,15 +377,15 @@ setInterval(() => console.log('running'), 10);
     const directory = context.record?.directory ?? '';
     await mkdir(directory, { recursive: true });
     const flags = `--reporter=junit --reporter-outfile='${join(directory, JUNIT_FILE)}'`;
-    expect(await withJunitReport('../bun-runtime/.runtime/bun test --timeout=30000 --shard=1/4', directory)).toBe(
-      `../bun-runtime/.runtime/bun test ${flags} --timeout=30000 --shard=1/4`,
+    expect(await withJunitReport('../bun-runtime/.runtime/bun test --timeout=0 --shard=1/4', directory)).toBe(
+      `../bun-runtime/.runtime/bun test ${flags} --timeout=0 --shard=1/4`,
     );
     expect(
       await withJunitReport(
-        'BUN_EXE=../bun-runtime/.runtime/bun ../bun-runtime/.runtime/bun test --timeout=30000 tests',
+        'BUN_EXE=../bun-runtime/.runtime/bun ../bun-runtime/.runtime/bun test --timeout=0 tests',
         directory,
       ),
-    ).toBe(`BUN_EXE=../bun-runtime/.runtime/bun ../bun-runtime/.runtime/bun test ${flags} --timeout=30000 tests`);
+    ).toBe(`BUN_EXE=../bun-runtime/.runtime/bun ../bun-runtime/.runtime/bun test ${flags} --timeout=0 tests`);
     expect(await withJunitReport('cd pkg && $RUNTIME/bun test src', directory)).toBe(
       `cd pkg && $RUNTIME/bun test ${flags} src`,
     );

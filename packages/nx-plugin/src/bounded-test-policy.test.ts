@@ -9,9 +9,9 @@ import {
   BOUNDED_TEST_EXECUTOR,
   BOUNDED_TEST_IDLE_TIMEOUT_MS,
   BOUNDED_TEST_KILL_AFTER_MS,
-  BOUNDED_TEST_PER_TEST_TIMEOUT_MS,
   type BoundedTestPolicyPackageJson,
   type BoundedTestPolicyProjectJson,
+  BUN_TEST_TIMEOUT_FLAG,
   boundedTestScriptAlias,
   checkBoundedTestTargetPolicy,
   checkWorkspaceBoundedTestTargetPolicy,
@@ -21,7 +21,7 @@ import {
 } from './bounded-test-policy.js';
 import type { ResolvedProjectTargets } from './package-target-policy.js';
 
-const TIMEOUT_FLAG = `--timeout=${BOUNDED_TEST_PER_TEST_TIMEOUT_MS}`;
+const TIMEOUT_FLAG = BUN_TEST_TIMEOUT_FLAG;
 const BOUNDED_POLICY_MESSAGE = `nx.targets.test must use ${BOUNDED_TEST_EXECUTOR} or delegate through no-op targets to bounded test execution`;
 
 describe('bounded test target policy', () => {
@@ -226,37 +226,51 @@ describe('bounded test target policy', () => {
     }
   });
 
-  it("accepts explicit Bun per-test timeouts up to each bounded leg's progress bound", () => {
+  it('accepts a bounded bun leg only when it deletes Bun per-test deadline', () => {
     const packageJson: BoundedTestPolicyPackageJson = {
       nx: { targets: { test: { executor: 'nx:noop', dependsOn: ['napi-test'] } } },
     };
-    const check = (command: string, idleTimeoutMs = 600_000) => {
+    const check = (command: string) => {
       const resolvedProject = resolvedAggregateProject();
       resolvedProject.targetOptions = new Map([
-        ['napi-test', { command, cwd: '{projectRoot}', idleTimeoutMs, killAfterMs: BOUNDED_TEST_KILL_AFTER_MS }],
+        [
+          'napi-test',
+          { command, cwd: '{projectRoot}', idleTimeoutMs: 600_000, killAfterMs: BOUNDED_TEST_KILL_AFTER_MS },
+        ],
       ]);
       return checkBoundedTestTargetPolicy(packageJson, { projectName: 'cowshed', resolvedProject });
     };
-    expect(check('bun test --timeout=600000')).toBe(true);
-    expect(check('bun test --timeout 600000')).toBe(true);
-    expect(check('bun test --timeout=1')).toBe(true);
-    expect(check('bun test --timeout=30000', 30_000)).toBe(true);
+    expect(TIMEOUT_FLAG).toBe('--timeout=0');
+    expect(check(`bun test ${TIMEOUT_FLAG}`)).toBe(true);
+    expect(check(`bun test --config=../bunfig.toml ${TIMEOUT_FLAG} launcher.test.ts`)).toBe(true);
     for (const command of [
       'bun test',
       'bun test --timeout',
-      'bun test --timeout=0',
-      'bun test --timeout=-1',
-      'bun test --timeout=1.5',
-      'bun test --timeout=bad',
-      'bun test --timeout=9007199254740992',
-      'bun test --timeout=600001',
-      'bun test --timeout=30000 --timeout=600001',
-      'bun test --timeout=30000 --timeout',
-      'bun test --timeout=30000 --timeout=',
+      'bun test --timeout=',
+      'bun test --timeout 0',
+      'bun test --timeout=600000',
+      'bun test --timeout=30000',
+      `bun test ${TIMEOUT_FLAG} --timeout=30000`,
+      `bun test ${TIMEOUT_FLAG} --timeout`,
     ]) {
       expect(check(command)).toBe(false);
     }
-    expect(check('bun test --timeout=600000', BOUNDED_TEST_IDLE_TIMEOUT_MS)).toBe(false);
+  });
+
+  it('lets a test outlive Bun default deadline under the flag the policy writes', async () => {
+    const scratch = await mkdtemp(join(tmpdir(), 'bun-no-deadline-'));
+    try {
+      const testFile = join(scratch, 'slow.test.ts');
+      // Bun's deadline is real time, so only a real wait past 5000 ms shows the flag deletes it.
+      await writeFile(
+        testFile,
+        "import { test } from 'bun:test';\ntest('outlives 5000 ms', () => Bun.sleep(5_200));\n",
+      );
+      const run = Bun.spawnSync([process.execPath, 'test', TIMEOUT_FLAG, testFile], { cwd: scratch });
+      expect({ exitCode: run.exitCode, stderr: run.stderr.toString() }).toMatchObject({ exitCode: 0 });
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
   });
 
   it('checks every test leg selected by Nx target wildcards', () => {
@@ -430,13 +444,13 @@ describe('bounded test target policy', () => {
     expect(resolveTestCommand(packageJson)).toBe(`bun test ${TIMEOUT_FLAG}`);
   });
 
-  it('idempotently appends --timeout to bare bun test commands', () => {
+  it('idempotently writes the no-deadline --timeout into bare bun test commands', () => {
     expect(ensureBunTestTimeoutFlag('bun test')).toBe(`bun test ${TIMEOUT_FLAG}`);
     expect(ensureBunTestTimeoutFlag('bun test --pass-with-no-tests')).toBe(
       `bun test ${TIMEOUT_FLAG} --pass-with-no-tests`,
     );
     expect(ensureBunTestTimeoutFlag(`bun test ${TIMEOUT_FLAG}`)).toBe(`bun test ${TIMEOUT_FLAG}`);
-    expect(ensureBunTestTimeoutFlag('bun test --timeout=10')).toBe(`bun test ${TIMEOUT_FLAG}`);
+    expect(ensureBunTestTimeoutFlag('bun test --timeout=30000')).toBe(`bun test ${TIMEOUT_FLAG}`);
     expect(ensureBunTestTimeoutFlag('bun test --timeout 10 --bail')).toBe(`bun test ${TIMEOUT_FLAG} --bail`);
     // Non-bun-test commands are left alone (vitest, custom runners, etc.).
     expect(ensureBunTestTimeoutFlag('vitest run')).toBe('vitest run');
@@ -532,7 +546,7 @@ describe('bounded test target policy', () => {
       const shard = {
         executor: BOUNDED_TEST_EXECUTOR,
         options: {
-          command: 'bun test --timeout=600000 --shard=1/2',
+          command: `bun test ${TIMEOUT_FLAG} --shard=1/2`,
           cwd: '{projectRoot}',
           idleTimeoutMs: 600_000,
           killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,

@@ -1,5 +1,5 @@
 # Injected by @smoothbricks/nx-plugin as `--config-file` on inferred cargo-test
-# package targets. `period` matches bun's `--timeout=30000`. A slow-timeout here
+# package targets. A 30 s `period` names a slow test early. A slow-timeout here
 # only warns: nextest prints a `SLOW` line naming the test every period, and
 # never kills it. The run's no-progress bound (`idleTimeoutMs`, README "Bounded
 # Test Targets") ends a test that never returns, and names it from those lines.

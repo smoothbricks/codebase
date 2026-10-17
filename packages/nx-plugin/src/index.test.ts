@@ -2058,7 +2058,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         cache: true,
         dependsOn: ['cargo-test', 'napi-debug', 'tsc-js', '^build'],
         options: {
-          command: 'bun test --config=../bunfig.toml --timeout=30000 native.test.ts',
+          command: 'bun test --config=../bunfig.toml --timeout=0 native.test.ts',
           cwd: 'packages/cowshed/src',
           env: { NAPI_DEBUG_ADDON: '1' },
           idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
@@ -2069,7 +2069,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       await workspace.write('packages/cowshed/bunfig.napi-test.toml', '[test]\n');
       const targetsWithDedicatedBunfig = await inferProjectTargets(workspace, 'packages/cowshed/package.json');
       expect(targetsWithDedicatedBunfig['napi-test']?.options?.command).toBe(
-        'bun test --config=../bunfig.napi-test.toml --timeout=30000 native.test.ts',
+        'bun test --config=../bunfig.napi-test.toml --timeout=0 native.test.ts',
       );
     } finally {
       await workspace.cleanup();

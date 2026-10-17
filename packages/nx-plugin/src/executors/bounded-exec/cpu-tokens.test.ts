@@ -54,7 +54,7 @@ describe('cowshed CPU budget client', () => {
       want: 12,
     });
     expect(runnerDemand('cargo nextest run --test-threads=4', undefined, 18, {})).toEqual({ kind: 'nextest', want: 4 });
-    expect(runnerDemand('bun test --timeout=30000 --parallel=3', undefined, 18, {})).toEqual({
+    expect(runnerDemand('bun test --timeout=0 --parallel=3', undefined, 18, {})).toEqual({
       kind: 'bun-parallel',
       want: 3,
     });
@@ -68,7 +68,7 @@ describe('cowshed CPU budget client', () => {
       want: 5,
     });
     // One bun process: `test.concurrent` inside it is not another CPU.
-    expect(runnerDemand('bun test --timeout=30000 native.test.ts', undefined, 18, {})).toEqual({
+    expect(runnerDemand('bun test --timeout=0 native.test.ts', undefined, 18, {})).toEqual({
       kind: 'process',
       want: 1,
     });

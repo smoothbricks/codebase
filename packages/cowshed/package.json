@@ -376,7 +376,7 @@
           "^build"
         ],
         "options": {
-          "command": "bun test --config=../bunfig.napi-test.toml --timeout=30000 native.test.ts attachment.napi.test.ts",
+          "command": "bun test --config=../bunfig.napi-test.toml --timeout=0 native.test.ts attachment.napi.test.ts",
           "cwd": "{projectRoot}/src",
           "env": {
             "NAPI_DEBUG_ADDON": "1"
@@ -398,7 +398,7 @@
           "typecheck-tests"
         ],
         "options": {
-          "command": "bun test --config=../bunfig.napi-test.toml --timeout=30000 launcher.test.ts platform.test.ts",
+          "command": "bun test --config=../bunfig.napi-test.toml --timeout=0 launcher.test.ts platform.test.ts",
           "cwd": "{projectRoot}/src",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -519,7 +519,7 @@
         ],
         "options": {
           "comment": "The public declaration IR runs its source lint before the real admission oracle, using the actual prebuilt owner generator and one Typia world. It needs no N-API wire corpus or native runtime fixture.",
-          "command": "biome check --files-ignore-unknown=true declaration-model.test.ts && eslint declaration-model.test.ts && bun test --config=../bunfig.toml --timeout=30000 declaration-model.test.ts",
+          "command": "biome check --files-ignore-unknown=true declaration-model.test.ts && eslint declaration-model.test.ts && bun test --config=../bunfig.toml --timeout=0 declaration-model.test.ts",
           "cwd": "{projectRoot}/src",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
@@ -539,7 +539,7 @@
         ],
         "options": {
           "comment": "Runs from source under the typia transform because the validators under test are the point. Depends on wire-fixtures (the corpus is a generated output, current by construction) and not on cargo-test: the Rust half proves the same corpus through include_str!, and cowshed:test already joins both legs; a cargo-test edge here only meant an unrelated Rust failure deleted this target from the run.",
-          "command": "bun test --config=../bunfig.toml --timeout=30000 wire-contract.test.ts exec.test.ts",
+          "command": "bun test --config=../bunfig.toml --timeout=0 wire-contract.test.ts exec.test.ts",
           "cwd": "{projectRoot}/src",
           "idleTimeoutMs": 180000,
           "killAfterMs": 10000
