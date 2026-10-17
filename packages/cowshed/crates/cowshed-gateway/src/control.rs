@@ -441,11 +441,15 @@ struct JobserverIn {
     #[serde(default)]
     pool: bool,
     job: Option<JobserverJobIn>,
+    /// A Cargo build whose fifo may be given more tokens after it starts, up to `want`.
+    #[serde(default)]
+    grow: bool,
 }
 
 struct JobserverOptions {
     admission: crate::jobserver::JobserverAdmission,
     pool_job: Option<JobserverJobIn>,
+    grow: bool,
 }
 
 #[derive(Deserialize)]
@@ -922,12 +926,21 @@ async fn serve<R, W>(
             options,
         }) => {
             let checkout: Arc<str> = Arc::from(checkout);
-            let admission = services.cpu_budget.ask(
-                Arc::clone(&checkout),
-                want,
-                Claim::new(&command, pid),
-                options.admission.class(),
-            );
+            let claim = Claim::new(&command, pid);
+            let class = options.admission.class();
+            let admission = if options.grow {
+                let (stake, granted, growth) =
+                    services
+                        .cpu_budget
+                        .ask_growing(Arc::clone(&checkout), want, claim, class);
+                (stake, granted, Some(growth))
+            } else {
+                let (stake, granted) =
+                    services
+                        .cpu_budget
+                        .ask(Arc::clone(&checkout), want, claim, class);
+                (stake, granted, None)
+            };
             hold_jobserver(
                 reader,
                 writer,
@@ -1052,7 +1065,11 @@ async fn hold<R, W, S, G>(
 async fn hold_jobserver<R, W, S>(
     mut reader: R,
     mut writer: W,
-    (stake, granted): (S, tokio::sync::oneshot::Receiver<usize>),
+    (stake, granted, mut growth): (
+        S,
+        tokio::sync::oneshot::Receiver<usize>,
+        Option<tokio::sync::mpsc::UnboundedReceiver<usize>>,
+    ),
     fifos: crate::jobserver::JobserverFifos,
     options: JobserverOptions,
     budget: CpuBudget,
@@ -1102,7 +1119,7 @@ async fn hold_jobserver<R, W, S>(
         },
         _ = reader.read(&mut discard) => return,
     };
-    let fifo = match fifos.create(tokens) {
+    let mut fifo = match fifos.create(tokens) {
         Ok(fifo) => fifo,
         Err(error) => {
             let _ = write_response(
@@ -1171,9 +1188,37 @@ async fn hold_jobserver<R, W, S>(
         fifo.drain_and_unlink();
         return;
     }
-    while let Ok(read) = reader.read(&mut discard).await
-        && read > 0
-    {}
+    // Hold until the client closes. A growing grant writes each token it is given into the
+    // fifo, where the running Cargo's jobserver takes it, and tells the client its new total.
+    let mut held = tokens;
+    loop {
+        let grown = async {
+            match growth.as_mut() {
+                Some(growth) => growth.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            read = reader.read(&mut discard) => if !matches!(read, Ok(read) if read > 0) { break },
+            grown = grown => match grown {
+                Some(to) => match fifo.fill(to - held) {
+                    Ok(()) => {
+                        held = to;
+                        let answer = ControlResponse { tokens: Some(to), ..lease(LeaseState::Grown) };
+                        if write_response(&mut writer, &answer).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => eprintln!(
+                        "cowshed: cannot hand {} grown token(s) to jobserver fifo {}: {error}; they stay held until the build ends",
+                        to - held,
+                        fifo.path().display()
+                    ),
+                },
+                None => growth = None,
+            },
+        }
+    }
     if let Some(pool) = pool
         && let Err(error) = pool.close().await
     {
@@ -1229,7 +1274,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         DISK_LEASE_OP => &["op", "class", "share", "command"],
         CPU_TOKENS_OP => &["op", "want", "checkout", "command"],
         JOBSERVER_OP => &[
-            "op", "want", "checkout", "command", "class", "waitMs", "pool", "job",
+            "op", "want", "checkout", "command", "class", "waitMs", "pool", "job", "grow",
         ],
         _ => {
             return Err(ControlError::Encoding(
@@ -1264,7 +1309,14 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 wait_ms,
                 pool,
                 job,
+                grow,
             } = serde_json::from_value(value).map_err(encoding)?;
+            if grow && pool {
+                return Err(ControlError::Encoding(
+                    "a growing jobserver grant serves no CPU pool: a pool lends a fixed count"
+                        .to_owned(),
+                ));
+            }
             let admission = match (class, wait_ms) {
                 (cowshed_gateway_types::JobserverClass::Background, None) => crate::jobserver::JobserverAdmission::Background,
                 (cowshed_gateway_types::JobserverClass::Gate, Some(wait_ms)) => crate::jobserver::JobserverAdmission::Gate { wait_ms },
@@ -1295,6 +1347,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 JobserverOptions {
                     admission,
                     pool_job,
+                    grow,
                 },
             )
         } else {
@@ -1303,6 +1356,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 JobserverOptions {
                     admission: crate::jobserver::JobserverAdmission::Background,
                     pool_job: None,
+                    grow: false,
                 },
             )
         };

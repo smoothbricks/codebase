@@ -18,6 +18,10 @@
 //!   under its fifo, with the test-thread sizing set to the grant where
 //!   unset. A managed checkout refuses every failed admission. Only gateway absence in a
 //!   positively nonmanaged host/CI checkout permits an unbudgeted run.
+//!
+//! A build that only compiles asks to grow: a token returned after it started is handed to its
+//! jobserver as one more rustc, up to what it asked for, and each growth is said on stderr. A
+//! command that also runs what it built sizes its test threads once and never grows.
 
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
 
@@ -231,6 +235,112 @@ fn compiles_nothing(arguments: &[OsString]) -> bool {
     }
 }
 
+/// The invocation only compiles: a jobserver token handed to it after it starts is one more
+/// rustc it can run. A command that also runs what it built (tests, benches, `run`) sizes its
+/// test threads once at its start, so a token it was given later would sit idle in its fifo.
+fn compiles_only(arguments: &[OsString]) -> bool {
+    let Some((name, rest)) = subcommand(arguments) else {
+        return false;
+    };
+    match name.as_str() {
+        "build" | "b" | "check" | "c" | "clippy" | "doc" | "d" | "rustc" | "rustdoc" | "fix" => {
+            true
+        }
+        "test" | "t" | "bench" => rest.iter().any(|argument| argument == "--no-run"),
+        "nextest" => rest.first().is_some_and(|argument| argument == "archive"),
+        _ => false,
+    }
+}
+
+/// A growing grant's `grown` answer: its new total, which must exceed `held` and stay within
+/// `want`; `None` for any other line.
+fn grown_total(line: &str, held: usize, want: usize) -> Option<usize> {
+    let answer: serde_json::Value = serde_json::from_str(line).ok()?;
+    (answer["ok"] == true && answer["lease"] == "grown")
+        .then(|| answer["tokens"].as_u64())
+        .flatten()
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .filter(|tokens| *tokens > held && *tokens <= want)
+}
+
+/// The line a growing build prints for each growth, beside the grant it started with.
+fn say_grown(from: usize, to: usize, want: usize) {
+    eprintln!("cowshed: cargo jobserver grew tokens={from}/{want} -> {to}/{want}");
+}
+
+/// The make jobserver fifo a launcher owns for one growing build under a parent pool: it holds
+/// the grant's tokens beyond Cargo's implicit first and takes each grown token. The launcher's
+/// own descriptor keeps the bytes alive; dropping it unlinks the path. The pool connection, not
+/// this fifo, is what returns the tokens.
+struct OwnedFifo {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl OwnedFifo {
+    fn create(tokens: usize) -> Result<Self, String> {
+        use std::os::unix::ffi::OsStrExt as _;
+        // A process id is unique among live processes, so a fifo at this path is a dead one's.
+        let path = env::temp_dir().join(format!("cowshed-cargo-{}.fifo", std::process::id()));
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot clear {}: {error}", path.display())),
+        }
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| format!("jobserver fifo path {} has a NUL", path.display()))?;
+        // SAFETY: c_path is a valid NUL-terminated path for the duration of the call.
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            return Err(format!(
+                "cannot create jobserver fifo {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| format!("cannot open jobserver fifo {}: {error}", path.display()));
+        let mut fifo = Self {
+            file: match file {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+            },
+            path,
+        };
+        fifo.fill(tokens - 1)
+            .map_err(|error| format!("cannot fill jobserver fifo: {error}"))?;
+        Ok(fifo)
+    }
+
+    /// Hand the build `tokens` more token bytes.
+    fn fill(&mut self, tokens: usize) -> io::Result<()> {
+        self.file.write_all(&vec![b'+'; tokens])
+    }
+
+    /// `CARGO_MAKEFLAGS`/`MAKEFLAGS` naming this fifo.
+    fn flags(&self) -> String {
+        format!("-j --jobserver-auth=fifo:{}", self.path.display())
+    }
+}
+
+impl Drop for OwnedFifo {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "cowshed: cannot remove jobserver fifo {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 /// `CARGO_MAKEFLAGS` names a jobserver that is still there: a `fifo:` one
 /// whose path exists, or a pipe one, which only exists while it is live.
 fn inherited_jobserver_live(get: &impl Fn(&str) -> Option<String>) -> bool {
@@ -315,11 +425,13 @@ fn ask(
         )
         .collect::<Vec<_>>()
         .join(" ");
+    let grow = compiles_only(arguments);
     let request = serde_json::json!({
         "op": "jobserver",
         "want": want,
         "checkout": checkout.to_string_lossy(),
         "command": command,
+        "grow": grow,
     });
     stream
         .write_all(format!("{request}\n").as_bytes())
@@ -377,9 +489,28 @@ fn ask(
         "MAKEFLAGS".to_owned(),
         format!("-j --jobserver-auth=fifo:{fifo}"),
     ));
+    if grow {
+        eprintln!("cowshed: cargo jobserver granted tokens={tokens}/{want}");
+    }
+    // The gateway fills the fifo itself as the grant grows; it says so on this connection.
+    let growth = grow.then(|| {
+        std::thread::spawn(move || {
+            let mut held = tokens;
+            for line in lines.lines() {
+                let Ok(line) = line else { break };
+                if let Some(to) = grown_total(&line, held, want) {
+                    say_grown(held, to, want);
+                    held = to;
+                }
+            }
+        })
+    });
     let code = exec_with(arguments, &environment);
-    drop(lines);
-    drop(stream);
+    // Closing both directions ends the reader and returns the whole grant.
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    if let Some(growth) = growth {
+        let _ = growth.join();
+    }
     Ok(code)
 }
 
@@ -600,11 +731,12 @@ fn ask_parent(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32,
             socket.display()
         )
     })?;
+    let grow = compiles_only(arguments);
     stream
         .write_all(
             format!(
                 "{}\n",
-                serde_json::json!({ "op": "cpu-pool", "want": want, "children": true })
+                serde_json::json!({ "op": "cpu-pool", "want": want, "children": true, "grow": grow })
             )
             .as_bytes(),
         )
@@ -649,12 +781,26 @@ fn ask_parent(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32,
         .ok_or_else(|| format!("parent supplied no live child pool: {granted}"))?;
     let mut environment = sizing(tokens, &|_| None);
     environment.push(("BOUNDED_EXEC_CPU_POOL".to_owned(), subpool.to_owned()));
+    // A build that only compiles runs under a fifo this launcher owns, so a token the pool
+    // grows it by is one more rustc; anything else keeps its fixed sizing.
+    let mut fifo = if grow {
+        let fifo = OwnedFifo::create(tokens)?;
+        environment.retain(|(name, _)| name != "CARGO_BUILD_JOBS");
+        environment.push(("CARGO_MAKEFLAGS".to_owned(), fifo.flags()));
+        environment.push(("MAKEFLAGS".to_owned(), fifo.flags()));
+        eprintln!("cowshed: cargo jobserver granted tokens={tokens}/{want}");
+        Some(fifo)
+    } else {
+        None
+    };
     cowshed_os::timing::event("jobserver", || {
         format!(
             "cargo parent-pool granted tokens={tokens}/{want} pool={}",
             socket.display()
         )
     });
+    // Bytes the handshake read past the grant are the pool's next lines.
+    let mut carry = String::from_utf8_lossy(lines.buffer()).into_owned();
     drop(lines);
     stream
         .set_nonblocking(true)
@@ -664,9 +810,9 @@ fn ask_parent(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32,
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(async {
-        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncBufReadExt as _;
         use std::os::unix::process::CommandExt as _;
-        let mut pool = tokio::net::UnixStream::from_std(stream).map_err(|error| error.to_string())?;
+        let mut pool = tokio::io::BufReader::new(tokio::net::UnixStream::from_std(stream).map_err(|error| error.to_string())?);
         let cargo = real_cargo().ok_or_else(|| "no cargo on PATH beyond the launcher".to_owned())?;
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|error| error.to_string())?;
         let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).map_err(|error| error.to_string())?;
@@ -685,13 +831,29 @@ fn ask_parent(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32,
                 if exits.recv().await.is_none() { return Err("child-exit notifications ended".to_owned()); }
             }
         });
-        let mut byte = [0_u8; 1];
         let ending = async {
-            tokio::select! {
-                end = pool.read(&mut byte) => (true, libc::SIGTERM, format!("parent CPU grant lost: {end:?}")),
-                interrupt = tokio::signal::ctrl_c() => (false, libc::SIGINT, format!("SIGINT: {interrupt:?}")),
-                _ = terminate.recv() => (false, libc::SIGTERM, "SIGTERM".to_owned()),
-                _ = hangup.recv() => (false, libc::SIGHUP, "SIGHUP".to_owned()),
+            let mut held = tokens;
+            loop {
+                // The pool says nothing after the grant but a growth; its end is the grant's loss.
+                while let Some(newline) = carry.find('\n') {
+                    let line: String = carry.drain(..=newline).collect();
+                    let (Some(fifo), Some(to)) = (fifo.as_mut(), grown_total(&line, held, want)) else {
+                        return (true, libc::SIGTERM, format!("parent CPU pool answered out of turn: {}", line.trim_end()));
+                    };
+                    if let Err(error) = fifo.fill(to - held) {
+                        return (true, libc::SIGTERM, format!("cannot hand grown tokens to the jobserver: {error}"));
+                    }
+                    say_grown(held, to, want);
+                    held = to;
+                }
+                tokio::select! {
+                    read = pool.read_line(&mut carry) => if !matches!(read, Ok(read) if read > 0) {
+                        return (true, libc::SIGTERM, format!("parent CPU grant lost: {read:?}"));
+                    },
+                    interrupt = tokio::signal::ctrl_c() => return (false, libc::SIGINT, format!("SIGINT: {interrupt:?}")),
+                    _ = terminate.recv() => return (false, libc::SIGTERM, "SIGTERM".to_owned()),
+                    _ = hangup.recv() => return (false, libc::SIGHUP, "SIGHUP".to_owned()),
+                }
             }
         };
         let (observed, lost) = tokio::select! {
@@ -749,5 +911,60 @@ mod parent_pool_tests {
             }
         );
         assert_eq!(plan(&get, &[OsString::from("metadata")]), Plan::Direct);
+    }
+
+    fn words(arguments: &[&str]) -> Vec<OsString> {
+        arguments.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn only_a_build_that_runs_nothing_it_built_asks_to_grow() {
+        for growing in [
+            &["build"][..],
+            &["+nightly", "--frozen", "check", "--workspace"],
+            &["clippy", "--all-targets"],
+            &["test", "--workspace", "--no-run"],
+            &["nextest", "archive", "--workspace"],
+        ] {
+            assert!(compiles_only(&words(growing)), "{growing:?}");
+        }
+        for fixed in [
+            &["test"][..],
+            &["nextest", "run"],
+            &["bench"],
+            &["run"],
+            &["machete"],
+            &[],
+        ] {
+            assert!(!compiles_only(&words(fixed)), "{fixed:?}");
+        }
+    }
+
+    #[test]
+    fn a_growth_line_names_a_larger_total_within_the_want() {
+        let line = r#"{"ok":true,"lease":"grown","tokens":5}"#;
+        assert_eq!(grown_total(line, 1, 18), Some(5));
+        assert_eq!(grown_total(line, 5, 18), None, "not larger than held");
+        assert_eq!(grown_total(line, 1, 4), None, "past the want");
+        assert_eq!(
+            grown_total(r#"{"ok":true,"lease":"granted","tokens":5}"#, 1, 18),
+            None
+        );
+    }
+
+    #[test]
+    fn an_owned_fifo_holds_every_token_beyond_the_first_and_takes_grown_ones() {
+        let mut fifo = OwnedFifo::create(3).expect("create");
+        let path = fifo.path.clone();
+        fifo.fill(2).expect("grow");
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open");
+        let mut bytes = [0_u8; 4];
+        std::io::Read::read_exact(&mut reader, &mut bytes).expect("four tokens");
+        assert_eq!(&bytes, b"++++");
+        drop(fifo);
+        assert!(!path.exists(), "dropping the fifo unlinks it");
     }
 }
