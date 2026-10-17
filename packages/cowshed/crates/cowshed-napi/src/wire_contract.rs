@@ -24,19 +24,19 @@ use std::{
 
 use cowshed_core::{
     api::{
-        AbandonedWork, BinaryData, CarrySide, CheckpointInfo, CommandArg, CpuMicros,
-        CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule, ExecScope, ExitStatus,
-        Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason, GcReport, GitOid, GrantSet,
-        HostLoadSample, JobAccounting, JobId, JobInfo, JobLeafAttribution, JobProcessLeaf,
-        JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage, JobserverClass,
-        LandReport, LandingCommits, OneCoreCpuPercent, OutputLimitInfo, OutputStorage,
-        OutputSummary, PortBlock, ProcessCoverage, ProcessCoverageGap, ProtectedOutput, PushReport,
-        RebaseBuildVolume, RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule, ResidentBytes,
-        ResizeResult, ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind,
-        StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId, UsageReconciliation,
-        UtcTimestamp, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros,
-        WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath,
-        WorkspaceRole, WorkspaceState,
+        AbandonedWork, BinaryData, BranchLandings, CarrySide, CheckpointInfo, CommandArg,
+        CpuMicros, CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule, ExecScope,
+        ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason, GcReport, GitOid,
+        GrantSet, HostLoadSample, JobAccounting, JobId, JobInfo, JobLeafAttribution,
+        JobProcessLeaf, JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage,
+        JobserverClass, LandReport, LandingCommits, OneCoreCpuPercent, OutputLimitInfo,
+        OutputStorage, OutputSummary, PortBlock, ProcessCoverage, ProcessCoverageGap,
+        ProtectedOutput, PushReport, RebaseBuildVolume, RebaseCarrySkip, RebaseReport,
+        RemoveReport, RepoRule, ResidentBytes, ResizeResult, ResizeVolume, Sha256Digest, SimVerb,
+        SpanId, StdinInfo, StdinKind, StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId,
+        UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta,
+        WallMicros, WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName,
+        WorkspacePath, WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -640,6 +640,9 @@ fn workspace_infos() -> BTreeMap<&'static str, Value> {
                 landed: 1,
                 behind: 5,
             },
+            branches: BranchLandings::Measured {
+                unlanded: Vec::new(),
+            },
         }),
         ..main.clone()
     };
@@ -652,6 +655,9 @@ fn workspace_infos() -> BTreeMap<&'static str, Value> {
         landing: Some(WorkspaceLanding {
             dirty_files: None,
             commits: LandingCommits::Indeterminate {
+                reason: "the target branch does not exist".to_owned(),
+            },
+            branches: BranchLandings::Indeterminate {
                 reason: "the target branch does not exist".to_owned(),
             },
         }),
@@ -960,6 +966,7 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             target_branch: "main".to_owned(),
             target_head: Some(oid("6666666666666666666666666666666666666666")),
             unlanded_commits: 4,
+            branches: Vec::new(),
             bundle: PathBuf::from("/Users/fixture/Dev/.cowshed/abandoned/cs-seam.bundle"),
         }),
     };

@@ -2161,7 +2161,7 @@ const LIST: CommandSpec = CommandSpec {
     summary: "list workspaces",
     about: &[
         "One line per workspace of the project selected by the cwd or `--project`: name, state, branch, and mountpoint (empty when detached).",
-        "`--landing` and `--landed` answer a different question: is this workspace's work already in main? Both compare each workspace's HEAD — not its recorded branch, which is a label that can drift — against main's branch tip as it stands right now in main's own repository. A commit counts as landed when main holds its patch, so work that reached main by squash-merge, cherry-pick, or a history rewrite counts even though it is not an ancestor. A commit whose equivalence cannot be computed — a merge, or a commit with an empty diff — counts as unlanded, because the only safe error is to refuse. A workspace whose target cannot be resolved reports `indeterminate` with the reason on stderr and is never treated as landed.",
+        "`--landing` and `--landed` answer a different question: is this workspace's work already in main? Both compare each workspace's HEAD — not its recorded branch, which is a label that can drift — against main's branch tip as it stands right now in main's own repository, and then every other local branch the same way, because `rm` destroys them all. A commit counts as landed when main holds its patch, so work that reached main by squash-merge, cherry-pick, or a history rewrite counts even though it is not an ancestor. A branch other than HEAD also counts as landed when main's repository preserves it under its own name or as the ref `cowshed push --branch` writes. A commit whose equivalence cannot be computed — a merge, or a commit with an empty diff — counts as unlanded, because the only safe error is to refuse. A workspace whose target cannot be resolved reports `indeterminate` with the reason on stderr and is never treated as landed.",
         "Neither flag is on by default because the measurement costs git processes per workspace, and `ls` is used interactively and in scripts.",
     ],
     options: &[
@@ -2171,7 +2171,7 @@ const LIST: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--landing",
-            meaning: "add a header row and four columns — unlanded, landed, behind, dirty — measured against main; `?` where the measurement could not be made",
+            meaning: "add a header row and five columns — unlanded, landed, behind, dirty, unlanded-branches — measured against main; `?` where the measurement could not be made. unlanded-branches counts the local branches besides HEAD that `rm` would refuse for",
         },
         Opt {
             spelling: "--landed",
@@ -2705,7 +2705,7 @@ const REMOVE: CommandSpec = CommandSpec {
     trailing: "",
     summary: "remove a workspace",
     about: &[
-        "Retires one workspace, deleting the image its commits live in. The gate is containment, not preservation: `rm` refuses unless every commit the workspace's HEAD carries is already in the project's main branch. The workspace is marked deleted immediately; detach and image deletion finish in the background.",
+        "Retires one workspace, deleting the image its commits live in. The gate is containment, not preservation: `rm` refuses unless every commit the workspace carries — on HEAD and on every other local branch, since the image takes them all — is already in the project's main branch. A branch other than HEAD also passes when main's repository preserves it: its tip equals or is an ancestor of main's branch of that name or of the ref `cowshed push --branch` writes. A refusal names each branch that did not pass. The workspace is marked deleted immediately; detach and image deletion finish in the background.",
         "Build volumes are collected before rm returns: a volume with no checkout link and no seed owner is detached and deleted unless a running job's hold or an unfinished create/fork in the lifecycle intent journal owns it. Release tries an unforced unmount with bounded grace, then forces it if needed, naming each initial holder's pid and command and whether the release needed force. Collection says why a volume is retained; an editor or indexer alone cannot strand an unlinked volume.",
         "Containment means ancestry *or* patch equivalence. Work that reached main by squash-merge, cherry-pick, or a history rewrite is not an ancestor of main and is still landed, so retiring it needs no flag — passing a commit-destroying flag to remove work main already has is exactly the habit this gate exists to prevent. A commit whose equivalence cannot be computed — a merge, or one with an empty diff — is treated as not contained. The target tip is read live from main's own repository, never from the workspace's `main` remote, which is a clone-time snapshot; when it cannot be read the answer is `cannot determine`, which is refused exactly as unlanded work is.",
         "The two overrides authorize different losses and neither substitutes for the other, so a script carrying one has not acquired the other.",
@@ -2721,7 +2721,7 @@ const REMOVE: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--abandon",
-            meaning: "the sole authorization for destroying commits main does not contain, and needed only for those: a workspace whose work is upstream by patch equivalence passes without it. Before deleting, main..HEAD is bundled into sessions/.trash/<ws>-<tip>.bundle and the abandonment reported, so the commits stay recoverable by fetching that bundle — the uncommitted tree is not bundled and does not survive. With --restore on main, it authorizes restoring past commits nothing else preserves: they are bundled into .git/cowshed/abandoned-main-<tip>.bundle of the restored checkout first",
+            meaning: "the sole authorization for destroying commits main does not contain, and needed only for those: a workspace whose work is upstream by patch equivalence passes without it. Before deleting, HEAD and every local branch that did not pass are bundled into sessions/.trash/<ws>-<tip>.bundle and the abandonment reported branch by branch, so the commits stay recoverable by fetching that bundle — the uncommitted tree is not bundled and does not survive. With --restore on main, it authorizes restoring past commits nothing else preserves: they are bundled into .git/cowshed/abandoned-main-<tip>.bundle of the restored checkout first",
         },
         Opt {
             spelling: "--purge",

@@ -80,7 +80,8 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
    then fast-forward. A bare `cowshed land` is refused when the repository requires its own route. Elsewhere:
    `cowshed land <ws> --check '<cmd>'` (repeatable; runs inside the sandbox after grant sync).
 4. A successful land retires by default. If retire was refused after the fast-forward, main already moved: run
-   `cowshed rm <ws>`, never land again. With `--no-retire` or after `push`, `rm` once main contains HEAD.
+   `cowshed rm <ws>`, never land again. With `--no-retire` or after `push`, `rm` once main contains HEAD and every other
+   local branch (a fork keeps only `cowshed/<ws>`; one branch per shed).
 5. `--force` on `rm` waives only transient state (dirty tree, busy mount) and destroys the uncommitted tree; it can
    never waive containment. `--abandon` is the sole way to destroy unlanded commits (they are bundled to
    `sessions/.trash/` first). Never answer an `rm` refusal by adding a flag.

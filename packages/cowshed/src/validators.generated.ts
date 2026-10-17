@@ -103,6 +103,18 @@ export const assertBoundIdentityList = typia.createAssertEquals<readonly Api.Bou
 export const parseBoundIdentityList = (json: string): readonly Api.BoundIdentity[] =>
   assertBoundIdentityList(JSON.parse(json));
 
+export const assertBranchLanding = typia.createAssertEquals<Api.BranchLanding>();
+export const parseBranchLanding = (json: string): Api.BranchLanding => assertBranchLanding(JSON.parse(json));
+export const assertBranchLandingList = typia.createAssertEquals<readonly Api.BranchLanding[]>();
+export const parseBranchLandingList = (json: string): readonly Api.BranchLanding[] =>
+  assertBranchLandingList(JSON.parse(json));
+
+export const assertBranchLandings = typia.createAssertEquals<Api.BranchLandings>();
+export const parseBranchLandings = (json: string): Api.BranchLandings => assertBranchLandings(JSON.parse(json));
+export const assertBranchLandingsList = typia.createAssertEquals<readonly Api.BranchLandings[]>();
+export const parseBranchLandingsList = (json: string): readonly Api.BranchLandings[] =>
+  assertBranchLandingsList(JSON.parse(json));
+
 export const assertBranchName = typia.createAssertEquals<Api.BranchName>();
 export const parseBranchName = (json: string): Api.BranchName => assertBranchName(JSON.parse(json));
 export const assertBranchNameList = typia.createAssertEquals<readonly Api.BranchName[]>();

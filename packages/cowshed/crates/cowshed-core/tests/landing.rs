@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cowshed_core::api::{LandingCommits, WorkspaceLanding};
+use cowshed_core::api::{BranchLandings, LandingCommits, WorkspaceLanding};
 use cowshed_core::landing::{measure, resolve_target};
 use cowshed_os::fork_lock::Run as _;
 
@@ -160,7 +160,7 @@ fn workspace_commit(mount: &Path, file: &str, contents: &str, message: &str) {
 
 async fn measured(fixture: &Fixture, mount: &Path) -> WorkspaceLanding {
     let target = resolve_target(fixture.store(), &fixture.parent(), TARGET).await;
-    measure(fixture.store(), &target, mount, "HEAD").await
+    measure(fixture.store(), &target, mount, "topic", "HEAD").await
 }
 
 /// The counts, or a panic naming the reason the measurement was declined.
@@ -536,7 +536,7 @@ async fn a_target_branch_that_does_not_exist_is_indeterminate_rather_than_landed
     workspace_commit(&mount, "wave.txt", "wave\n", "wave work");
 
     let target = resolve_target(fixture.store(), &fixture.parent(), "release").await;
-    let landing = measure(fixture.store(), &target, &mount, "HEAD").await;
+    let landing = measure(fixture.store(), &target, &mount, "topic", "HEAD").await;
     assert!(
         reason(&landing).contains("no release branch"),
         "reason must name the missing branch: {}",
@@ -568,7 +568,7 @@ async fn a_main_mount_that_is_not_a_repository_is_indeterminate_and_says_so() {
     fs::create_dir_all(stub.join(".devenv")).expect("mountpoint stub");
 
     let target = resolve_target(fixture.store(), &stub, TARGET).await;
-    let landing = measure(fixture.store(), &target, &mount, "HEAD").await;
+    let landing = measure(fixture.store(), &target, &mount, "topic", "HEAD").await;
     let reason = reason(&landing);
     assert!(
         reason.contains("could not be read") && reason.contains("unmounted-stub"),
@@ -631,6 +631,7 @@ async fn classification_follows_head_and_not_a_registered_branch_that_has_drifte
         fixture.store(),
         &resolve_target(fixture.store(), &fixture.parent(), TARGET).await,
         &mount,
+        "topic",
         &registered,
     )
     .await;
@@ -735,5 +736,66 @@ async fn a_stale_cached_remote_ref_has_no_influence_on_the_verdict() {
             .to_owned(),
         clone_time_tip,
         "nothing may fetch: a refreshed cache would hide the property under test"
+    );
+}
+
+/// Every local branch besides HEAD dies with the workspace image, so each one is measured too. A
+/// branch the target repository preserves - its own branch of that name, or the
+/// `refs/cowshed/<ws>/heads/<branch>` ref `cowshed push` writes - or whose patches the target
+/// holds is never named; one carrying work found nowhere upstream is, with its tip.
+#[tokio::test]
+async fn other_local_branches_are_measured_and_only_unpreserved_work_is_named() {
+    let fixture = Fixture::new("branches");
+    let mount = fixture.clone_workspace("topic");
+
+    git(&mount, ["checkout", "-q", "-b", "parked"]);
+    workspace_commit(&mount, "parked.txt", "parked\n", "parked work");
+    let parked = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+
+    git(&mount, ["checkout", "-q", "-b", "pushed", "topic"]);
+    workspace_commit(&mount, "pushed.txt", "pushed\n", "pushed work");
+    git(
+        fixture.parent(),
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            mount.as_os_str(),
+            OsStr::new("refs/heads/pushed:refs/cowshed/topic/heads/pushed"),
+        ],
+    );
+
+    git(&mount, ["checkout", "-q", "-b", "squashed", "topic"]);
+    workspace_commit(&mount, "squashed.txt", "squashed\n", "squashed work");
+    fixture.land_content_separately("squashed.txt", "squashed\n", "squashed upstream");
+
+    // `main` came with the clone and is now an ancestor of the parent's `main`.
+    git(&mount, ["checkout", "-q", "topic"]);
+    let landing = measured(&fixture, &mount).await;
+    assert!(
+        landing.commits.fully_landed(),
+        "the head itself carries nothing"
+    );
+    let BranchLandings::Measured { unlanded } = &landing.branches else {
+        panic!("the branches were not judged: {:?}", landing.branches);
+    };
+    assert_eq!(
+        unlanded
+            .iter()
+            .map(|branch| (branch.branch.as_str(), branch.tip.as_str()))
+            .collect::<Vec<_>>(),
+        [("parked", parked.as_str())],
+        "only the branch whose work exists nowhere upstream is named"
+    );
+    assert!(
+        matches!(
+            unlanded[0].commits,
+            LandingCommits::Measured { unlanded: 1, .. }
+        ),
+        "{:?}",
+        unlanded[0].commits
+    );
+    assert!(
+        !landing.fully_landed(),
+        "a landed head beside an unlanded branch is not a landed workspace"
     );
 }

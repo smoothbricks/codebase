@@ -2329,6 +2329,10 @@
     "landingIndeterminate": {
       "checkpoints": [],
       "landing": {
+        "branches": {
+          "reason": "the target branch does not exist",
+          "state": "indeterminate"
+        },
         "commits": {
           "reason": "the target branch does not exist",
           "state": "indeterminate"
@@ -2359,6 +2363,10 @@
       ],
       "createdAt": "2026-01-02T03:04:05Z",
       "landing": {
+        "branches": {
+          "state": "measured",
+          "unlanded": []
+        },
         "commits": {
           "behind": 5,
           "landed": 1,
@@ -2405,6 +2413,10 @@
         ],
         "createdAt": "2026-01-02T03:04:05Z",
         "landing": {
+          "branches": {
+            "state": "measured",
+            "unlanded": []
+          },
           "commits": {
             "behind": 5,
             "landed": 1,
@@ -2426,6 +2438,10 @@
       {
         "checkpoints": [],
         "landing": {
+          "branches": {
+            "reason": "the target branch does not exist",
+            "state": "indeterminate"
+          },
           "commits": {
             "reason": "the target branch does not exist",
             "state": "indeterminate"

@@ -1157,17 +1157,17 @@ impl GitRepository {
         self.count_range(&range).await
     }
 
-    /// Write and verify a self-contained bundle of `head` and the live target it was measured
-    /// against, returning the number of commits in that exact range.
+    /// Write and verify a self-contained bundle of `heads` and the live target they were measured
+    /// against, returning the number of commits reachable from any head and not from the target.
     ///
     /// A target is included as a positive revision, never an exclusion. This deliberately makes
     /// the bundle larger than a thin `target..head` bundle: both histories travel in the artifact,
     /// so a rewritten target cannot leave recovery dependent on an orphaned clone-time snapshot.
-    /// Including both endpoints also lets recovery reconstruct and audit the same `target..head`
-    /// range that the removal report counted.
+    /// Including both endpoints also lets recovery reconstruct and audit the same range that the
+    /// removal report counted.
     ///
-    /// `head` MUST be a ref spelling — `HEAD` or a branch — never a raw oid. `git bundle create`
-    /// names a bundle's fetchable tip after refs in its revision arguments, so a raw oid alone
+    /// Each head MUST be a ref spelling — `HEAD` or a branch — never a raw oid. `git bundle create`
+    /// names a bundle's fetchable tips after refs in its revision arguments, so a raw oid alone
     /// produces a bundle with no advertised ref and git rejects it as empty.
     ///
     /// A retried removal finds the bundle its earlier attempt already wrote for this exact range
@@ -1178,16 +1178,17 @@ impl GitRepository {
         &self,
         destination: &Path,
         target: Option<&str>,
-        head: &str,
+        heads: &[&str],
     ) -> Result<u64> {
-        let head_commit = format!("{head}^{{commit}}");
-        let expected_head = self
-            .read_one(["rev-parse", head_commit.as_str()], "read bundle tip")
-            .await?;
-        let commit_count = match target {
-            Some(target) => self.commits_ahead_of(target, head).await?,
-            None => self.commits_ahead(None, head).await?,
-        };
+        let mut expected_heads = Vec::with_capacity(heads.len());
+        for head in heads {
+            let head_commit = format!("{head}^{{commit}}");
+            expected_heads.push(
+                self.read_one(["rev-parse", head_commit.as_str()], "read bundle tip")
+                    .await?,
+            );
+        }
+        let commit_count = self.commits_reachable(target, heads).await?;
         let existing = tokio::fs::try_exists(destination).await.map_err(|error| {
             CowshedError::environment_missing(
                 format!(
@@ -1199,7 +1200,7 @@ impl GitRepository {
         })?;
         if existing {
             match self
-                .verify_bundle(destination, &expected_head, target, commit_count)
+                .verify_bundle(destination, heads, &expected_heads, target, commit_count)
                 .await
             {
                 Ok(()) => return Ok(commit_count),
@@ -1227,8 +1228,8 @@ impl GitRepository {
             OsString::from("bundle"),
             OsString::from("create"),
             staged.as_os_str().to_owned(),
-            OsString::from(head),
         ];
+        args.extend(heads.iter().map(OsString::from));
         if let Some(target) = target {
             args.push(OsString::from(target));
         }
@@ -1236,7 +1237,7 @@ impl GitRepository {
             let output =
                 run_git_bundle_at(&self.root, self.alternate_objects.as_deref(), args).await?;
             ensure_git_success("write commit bundle", output)?;
-            self.verify_bundle(&staged, &expected_head, target, commit_count)
+            self.verify_bundle(&staged, heads, &expected_heads, target, commit_count)
                 .await?;
             tokio::fs::rename(&staged, destination)
                 .await
@@ -1272,12 +1273,13 @@ impl GitRepository {
     /// Prove the artifact works in the environment its promise names: a repository with no
     /// prerequisite objects. Verification alone is insufficient when run in the source repository,
     /// because that repository can satisfy a thin bundle's prerequisites immediately before it is
-    /// destroyed. Fetching into a fresh bare repository proves both self-containment and that the
-    /// advertised tip resolves to the fenced commit.
+    /// destroyed. Fetching into a fresh bare repository proves both self-containment and that each
+    /// advertised tip resolves to its fenced commit.
     async fn verify_bundle(
         &self,
         bundle: &Path,
-        expected_head: &str,
+        heads: &[&str],
+        expected_heads: &[String],
         target: Option<&str>,
         expected_count: u64,
     ) -> Result<()> {
@@ -1318,59 +1320,74 @@ impl GitRepository {
             )
             .await?;
             if !output.status.success() {
-                return Err(bundle_artifact_error(
-                    "verify abandonment bundle",
-                    &output,
-                ));
+                return Err(bundle_artifact_error("verify abandonment bundle", &output));
             }
-            let output = run_git_bundle_at(
-                &scratch.path,
-                None,
-                [
-                    OsStr::new("fetch"),
-                    OsStr::new("--quiet"),
-                    OsStr::new("--no-tags"),
-                    bundle.as_os_str(),
-                    OsStr::new("HEAD"),
-                ],
-            )
-            .await?;
+            // Each advertised head lands on its own ref, so every tip is checked, not only the
+            // first one FETCH_HEAD would name.
+            let recovered_refs: Vec<String> = (0..heads.len())
+                .map(|index| format!("refs/recovered/{index}"))
+                .collect();
+            let mut fetch = vec![
+                OsString::from("fetch"),
+                OsString::from("--quiet"),
+                OsString::from("--no-tags"),
+                bundle.as_os_str().to_owned(),
+            ];
+            fetch.extend(
+                heads
+                    .iter()
+                    .zip(&recovered_refs)
+                    .map(|(head, recovered)| OsString::from(format!("{head}:{recovered}"))),
+            );
+            let output = run_git_bundle_at(&scratch.path, None, fetch).await?;
             if !output.status.success() {
                 return Err(bundle_artifact_error(
                     "fetch abandonment bundle into an empty repository",
                     &output,
                 ));
             }
-            let recovered_head = recovery
-                .read_one(["rev-parse", "FETCH_HEAD^{commit}"], "read recovered bundle tip")
+            for ((head, recovered), expected_head) in
+                heads.iter().zip(&recovered_refs).zip(expected_heads)
+            {
+                let recovered_commit = format!("{recovered}^{{commit}}");
+                let recovered_head = recovery
+                    .read_one(
+                        ["rev-parse", recovered_commit.as_str()],
+                        "read recovered bundle tip",
+                    )
+                    .await
+                    .map_err(|error| {
+                        CowshedError::integrity(
+                            format!(
+                                "abandonment bundle tip {head} is not retrievable: {}",
+                                error.message
+                            ),
+                            "inspect the bundle and cowshed store, then retry removal",
+                        )
+                    })?;
+                if recovered_head != *expected_head {
+                    return Err(CowshedError::integrity(
+                        format!(
+                            "abandonment bundle recovered {head} at {recovered_head}, expected \
+                             {expected_head}"
+                        ),
+                        "inspect the bundle and cowshed store, then retry removal",
+                    ));
+                }
+            }
+            let recovered_heads: Vec<&str> = recovered_refs.iter().map(String::as_str).collect();
+            let recovered_count = recovery
+                .commits_reachable(target, &recovered_heads)
                 .await
                 .map_err(|error| {
                     CowshedError::integrity(
-                        format!("abandonment bundle tip is not retrievable: {}", error.message),
+                        format!(
+                            "abandonment bundle cannot reconstruct its reported commit range: {}",
+                            error.message
+                        ),
                         "inspect the bundle and cowshed store, then retry removal",
                     )
                 })?;
-            if recovered_head != expected_head {
-                return Err(CowshedError::integrity(
-                    format!(
-                        "abandonment bundle recovered tip {recovered_head}, expected {expected_head}"
-                    ),
-                    "inspect the bundle and cowshed store, then retry removal",
-                ));
-            }
-            let recovered_count = match target {
-                Some(target) => recovery.commits_ahead_of(target, "FETCH_HEAD").await,
-                None => recovery.commits_ahead(None, "FETCH_HEAD").await,
-            }
-            .map_err(|error| {
-                CowshedError::integrity(
-                    format!(
-                        "abandonment bundle cannot reconstruct its reported commit range: {}",
-                        error.message
-                    ),
-                    "inspect the bundle and cowshed store, then retry removal",
-                )
-            })?;
             if recovered_count != expected_count {
                 return Err(CowshedError::integrity(
                     format!(
@@ -1394,6 +1411,32 @@ impl GitRepository {
                 "inspect the bundle and cowshed store, then retry removal",
             )),
         }
+    }
+
+    /// How many commits are reachable from any of `heads` and not from `target`.
+    ///
+    /// Strict about the target like [`Self::commits_ahead_of`]: a target this repository cannot
+    /// see is refused rather than dropped from the range. `None` counts every commit the heads
+    /// reach: nothing proves any of it is held elsewhere.
+    async fn commits_reachable(&self, target: Option<&str>, heads: &[&str]) -> Result<u64> {
+        let mut args = vec![OsString::from("rev-list"), OsString::from("--count")];
+        if let Some(target) = target {
+            if !self.has_commit(target).await? {
+                return Err(CowshedError::conflict(
+                    format!("{target} is not a commit this repository can see"),
+                    "attach the object store that holds it, then retry",
+                ));
+            }
+            args.push(OsString::from(format!("^{target}")));
+        }
+        args.extend(heads.iter().map(OsString::from));
+        let count = self.read_one(args, "count commits").await?;
+        count.parse().map_err(|_| {
+            CowshedError::integrity(
+                format!("git reported an unparseable commit count: {count}"),
+                "repair the git repository",
+            )
+        })
     }
 
     /// The `exclude` endpoint of a range, reduced to an oid this repository holds.
@@ -1953,9 +1996,11 @@ impl GitRepository {
     /// longer listed.
     async fn prune_inherited_branches(&self, name: &str, source: &Path) -> Result<()> {
         let (_, own) = workspace_branch(name);
-        let source_tips = Self::from_root(source).local_branch_tips().await?;
+        let source_tips = Self::from_root(&self.store_root, source)
+            .ref_tips(&["refs/heads"])
+            .await?;
         let carried: Vec<OsString> = self
-            .local_branch_tips()
+            .ref_tips(&["refs/heads"])
             .await?
             .into_iter()
             .filter(|(branch, tip)| {
@@ -1976,17 +2021,17 @@ impl GitRepository {
         ensure_git_success("delete branches the clone carried from its source", output)
     }
 
-    /// Every local branch's full ref name and tip, as git spells them.
-    async fn local_branch_tips(&self) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>> {
-        let output = self
-            .run([
-                "for-each-ref",
-                "--format=%(objectname) %(refname)",
-                "refs/heads",
-            ])
-            .await?;
+    /// The full name and tip of every ref under `namespaces` (`refs/heads`, say), as git spells
+    /// them.
+    pub async fn ref_tips(
+        &self,
+        namespaces: &[&str],
+    ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>> {
+        let mut args = vec!["for-each-ref", "--format=%(objectname) %(refname)"];
+        args.extend_from_slice(namespaces);
+        let output = self.run(args).await?;
         if !output.status.success() {
-            return Err(git_internal("list local branches", &output));
+            return Err(git_internal("list refs", &output));
         }
         output
             .stdout
@@ -7337,7 +7382,7 @@ mod tests {
             .expect("attach live main objects");
         let bundle = workspace.join("history-diverged.bundle");
         let reported_count = workspace_repo
-            .bundle_commits(&bundle, Some(live_main.as_str()), "HEAD")
+            .bundle_commits(&bundle, Some(live_main.as_str()), &["HEAD"])
             .await
             .expect("write and verify self-contained abandonment bundle");
         let claimed = workspace_repo
@@ -7358,7 +7403,7 @@ mod tests {
             .bundle_commits(
                 &workspace.join("refless.bundle"),
                 Some(live_main.as_str()),
-                &tip,
+                &[tip.as_str()],
             )
             .await
             .expect_err("an oid tip produces a ref-less bundle git will not write");
@@ -7437,7 +7482,13 @@ mod tests {
         );
 
         let error = repo
-            .verify_bundle(&thin, &tip, Some(base.as_str()), 2)
+            .verify_bundle(
+                &thin,
+                &["HEAD"],
+                std::slice::from_ref(&tip),
+                Some(base.as_str()),
+                2,
+            )
             .await
             .expect_err("a prerequisite-dependent artifact must abort abandonment");
         assert!(
@@ -7483,12 +7534,12 @@ mod tests {
             .expect("plant the other writer's lock");
 
         let written = repo
-            .bundle_commits(&bundle, Some(base.as_str()), "HEAD")
+            .bundle_commits(&bundle, Some(base.as_str()), &["HEAD"])
             .await
             .expect("a lock at the bundle's name cannot fail the removal");
         let first = fs::metadata(&bundle).expect("bundle written").ino();
         let retried = repo
-            .bundle_commits(&bundle, Some(base.as_str()), "HEAD")
+            .bundle_commits(&bundle, Some(base.as_str()), &["HEAD"])
             .await
             .expect("the retry reports the same range");
         assert_eq!(written, 2);
