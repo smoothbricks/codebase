@@ -640,10 +640,13 @@ fn charged_memory_is_not_resident_memory(jobs: &IncarnationCgroups) {
         (low.saturating_sub(4 * MIB)..=high + 4 * MIB).contains(&current),
         "the reader's current charge {current} B lies near two direct reads around it"
     );
+    // No inequality between the charge and RSS holds by construction: RSS also counts pages
+    // charged to other cgroups (the binary, shared libraries). The job maps none of its cached
+    // file, so those pages are charged without being resident by how the workload is built.
     assert!(
-        current >= resident + cached,
-        "the job's cached file pages are charged though nothing holds them resident: charged \
-         {current} B, resident {resident} B, the file's cached pages {cached} B"
+        current >= cached,
+        "the job's cached file pages are in its charge: charged {current} B, resident \
+         {resident} B, the file's cached pages {cached} B"
     );
     assert!(
         peak >= 128 * MIB && peak >= current + 32 * MIB,
