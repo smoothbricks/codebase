@@ -5805,10 +5805,12 @@ async fn a_job_s_cpu_keeps_the_descendants_that_ended_between_samples() {
     let own = cowshed_core::runtime::job_accounting::read_leader(&Birth::of(pid))
         .unwrap()
         .own;
+    // Had the leader been charged its reaped children's CPU, its own would hold all `burned`:
+    // each burner stops at a fixed CPU it measured itself, while `sh`'s own cost is the host's.
     let live = own.user_us.get() + own.sys_us.get();
     assert!(
-        live * 10 < burned,
-        "the live members' own CPU ({live} us) misses what the reaped children cost"
+        live < burned,
+        "the live members' own CPU ({live} us) misses the {burned} us the reaped children cost"
     );
 
     let leader = leader.exit();
