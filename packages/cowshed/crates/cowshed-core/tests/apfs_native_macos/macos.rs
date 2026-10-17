@@ -1500,6 +1500,19 @@ fn real_apfs_gc_reports_item_local_deferrals_and_reclaims_later_session_images()
     let mount_point = layout.project().mount_root.join("a-mounted");
     fixture.mount_left_behind(&mounted_image, &mount_point, "nobrowse,owners");
 
+    // The stray is judged against the project's repository; with none to judge against, the
+    // deferral names the failed judgement instead of the file.
+    let checkout = fixture.config().checkout_path;
+    std::fs::create_dir_all(&checkout).expect("project checkout");
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .arg(&checkout)
+        .stdout(Stdio::null())
+        .spawn_locked()
+        .expect("git init")
+        .wait()
+        .expect("wait for git init");
+    assert!(status.success(), "git init the project checkout");
     let orphan_mountpoint = layout.project().mount_root.join("stray");
     std::fs::create_dir_all(&orphan_mountpoint).expect("orphan mountpoint");
     let kept_work = orphan_mountpoint.join("unsaved.rs");
