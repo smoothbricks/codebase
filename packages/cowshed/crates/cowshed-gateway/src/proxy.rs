@@ -413,6 +413,7 @@ async fn handle_request(
     {
         Ok(prepared) => prepared,
         Err(status) => {
+            let status = admission.refusal_status(status);
             complete_now(
                 &context,
                 admission,
@@ -532,6 +533,7 @@ async fn handle_request(
                     )
                 },
             );
+            let http_status = admission.refusal_status(http_status);
             complete_now(
                 &context,
                 admission,
@@ -565,26 +567,28 @@ async fn handle_request(
                 },
                 RequestBodyTimeout::classification,
             );
+            let http_status = admission.refusal_status(StatusCode::GATEWAY_TIMEOUT);
             complete_now(
                 &context,
                 admission,
                 AuditStatus::TimedOut,
-                Some(StatusCode::GATEWAY_TIMEOUT),
+                Some(http_status),
                 Some(classification),
                 0,
                 audit_kind,
             )
             .await;
             return Ok(problem(
-                StatusCode::GATEWAY_TIMEOUT,
+                http_status,
                 "upstream response headers timed out",
                 None,
             ));
         }
     };
     let status = response.status();
-    if admission.nx_token.is_some() && status.is_server_error() {
-        return Ok(nx_backend_unavailable(&context, admission, "upstream-5xx", audit_kind).await);
+    if admission.nx_token.is_some() && !crate::nx_cache::client_reads(&admission.method, status) {
+        let reason = format!("upstream-status-{}", status.as_u16());
+        return Ok(nx_backend_unavailable(&context, admission, &reason, audit_kind).await);
     }
     let (mut parts, body) = response.into_parts();
     strip_upstream_response_headers(&mut parts.headers);
@@ -2656,10 +2660,16 @@ async fn admit(
     authentication: Authentication,
     intent: RequestIntent,
 ) -> Result<Admission, AdmissionError> {
+    let stopped = AdmissionError {
+        status: intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE),
+        message: "gateway stopped",
+        hint: None,
+        audit_status: AuditStatus::Failed,
+    };
     let (reply, receive) = oneshot::channel();
     let (cancel, cancelled) = oneshot::channel();
     let _cancellation = AdmissionCancellation(Some(cancel));
-    context
+    if context
         .commands
         .send(Command::Admit {
             workspace_id: context.workspace_id.clone(),
@@ -2669,18 +2679,11 @@ async fn admit(
             cancelled,
         })
         .await
-        .map_err(|_| AdmissionError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "gateway stopped",
-            hint: None,
-            audit_status: AuditStatus::Failed,
-        })?;
-    receive.await.map_err(|_| AdmissionError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        message: "gateway stopped",
-        hint: None,
-        audit_status: AuditStatus::Failed,
-    })?
+        .is_err()
+    {
+        return Err(stopped);
+    }
+    receive.await.map_err(|_| stopped)?
 }
 
 struct AdmissionCancellation(Option<oneshot::Sender<()>>);

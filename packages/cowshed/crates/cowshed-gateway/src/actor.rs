@@ -521,6 +521,19 @@ pub(crate) struct RequestIntent {
     pub npm_mirror: bool,
 }
 
+impl RequestIntent {
+    /// The status this request hears when the gateway refuses it. The Nx cache route never blocks
+    /// a build (05_gateway.md "`/nx/v1/cache/{hash}`"): every refusal there is its method's miss or
+    /// not-stored answer, because stock Nx fails a task on any other status. Other routes keep
+    /// `otherwise`.
+    pub(crate) fn refusal_status(&self, otherwise: StatusCode) -> StatusCode {
+        match self.target {
+            RequestTarget::LocalNx => crate::nx_cache::unavailable_status(&self.method),
+            RequestTarget::Generic(_) | RequestTarget::LocalSim => otherwise,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AuditAttempt {
     pub kind: AuditKind,
@@ -559,6 +572,18 @@ pub(crate) struct Admission {
     completion: Option<CompletionLease>,
 }
 
+impl Admission {
+    /// `RequestIntent::refusal_status` for an admitted request: only an Nx admission carries a
+    /// backend token.
+    pub(crate) fn refusal_status(&self, otherwise: StatusCode) -> StatusCode {
+        if self.nx_token.is_some() {
+            crate::nx_cache::unavailable_status(&self.method)
+        } else {
+            otherwise
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AdmissionSeed {
     workspace_id: String,
@@ -580,6 +605,16 @@ struct AdmissionSeed {
 }
 
 impl AdmissionSeed {
+    /// `RequestIntent::refusal_status` for a queued request: only an Nx seed carries a backend
+    /// token.
+    fn refusal_status(&self, otherwise: StatusCode) -> StatusCode {
+        if self.nx_token.is_some() {
+            crate::nx_cache::unavailable_status(&self.method)
+        } else {
+            otherwise
+        }
+    }
+
     fn activate(self, permit_id: u64, completion: CompletionLease) -> Admission {
         Admission {
             permit_id,
@@ -1645,7 +1680,7 @@ impl Actor {
         let _ = reply.send(Err(if recorded {
             admission_error(http_status, message, status, detail)
         } else {
-            audit_unavailable()
+            audit_unavailable(http_status)
         }));
     }
 
@@ -1659,7 +1694,7 @@ impl Actor {
     ) {
         if self.draining {
             let _ = reply.send(Err(admission_error(
-                StatusCode::SERVICE_UNAVAILABLE,
+                intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE),
                 "gateway is draining",
                 AuditStatus::Cancelled,
                 None,
@@ -1667,7 +1702,9 @@ impl Actor {
             return;
         }
         let Some(session) = self.sessions.get(&workspace_id) else {
-            let _ = reply.send(Err(audit_unavailable()));
+            let _ = reply.send(Err(audit_unavailable(
+                intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE),
+            )));
             return;
         };
         let is_nx = matches!(intent.target, RequestTarget::LocalNx);
@@ -1707,7 +1744,7 @@ impl Actor {
                     None,
                 )
             } else {
-                audit_unavailable()
+                audit_unavailable(intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE))
             }));
             return;
         }
@@ -1764,7 +1801,9 @@ impl Actor {
             }
         }
         let Some(session) = self.sessions.get(&workspace_id) else {
-            let _ = reply.send(Err(audit_unavailable()));
+            let _ = reply.send(Err(audit_unavailable(
+                intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE),
+            )));
             return;
         };
         let seed = match build_seed(
@@ -1796,7 +1835,7 @@ impl Actor {
                 let _ = reply.send(Err(if recorded {
                     admission_error(StatusCode::FORBIDDEN, denial, AuditStatus::Denied, hint)
                 } else {
-                    audit_unavailable()
+                    audit_unavailable(intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE))
                 }));
                 return;
             }
@@ -1832,7 +1871,7 @@ impl Actor {
                     None,
                 )
             } else {
-                audit_unavailable()
+                audit_unavailable(StatusCode::SERVICE_UNAVAILABLE)
             }));
             return;
         }
@@ -2003,7 +2042,9 @@ impl Actor {
         cancelled: oneshot::Receiver<()>,
     ) {
         let Some(session) = self.sessions.get(&workspace_id) else {
-            let _ = reply.send(Err(audit_unavailable()));
+            let _ = reply.send(Err(audit_unavailable(
+                intent.refusal_status(StatusCode::SERVICE_UNAVAILABLE),
+            )));
             return;
         };
         let generation = session.generation;
@@ -2252,7 +2293,7 @@ impl Actor {
                         None,
                     )
                 } else {
-                    audit_unavailable()
+                    audit_unavailable(StatusCode::FORBIDDEN)
                 }));
             } else {
                 retained.push_back(pending);
@@ -2288,22 +2329,23 @@ impl Actor {
         while let Some(pending) = self.queue.pop_front() {
             if pending.seed.workspace_id == workspace_id {
                 let pending = self.take_pending(pending);
+                let http_status = pending.seed.refusal_status(StatusCode::SERVICE_UNAVAILABLE);
                 let draft = pending_audit_draft(
                     &pending.seed,
                     AuditStatus::Cancelled,
-                    Some(StatusCode::SERVICE_UNAVAILABLE),
+                    Some(http_status),
                     Some("session-rotated"),
                 );
                 let recorded = self.record(draft).await;
                 let _ = pending.reply.send(Err(if recorded {
                     admission_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        http_status,
                         "workspace session rotated",
                         AuditStatus::Cancelled,
                         None,
                     )
                 } else {
-                    audit_unavailable()
+                    audit_unavailable(http_status)
                 }));
             } else {
                 retained.push_back(pending);
@@ -2376,13 +2418,9 @@ impl Actor {
         };
         let pending = self.queue.remove(position).expect("queued position exists");
         let pending = self.take_pending(pending);
-        // Only an Nx seed carries a backend token. Its deadline is its method's miss or refusal,
-        // as in the startup queue (`NxRefusal::queue_timeout`); every other request's is 504.
-        let http_status = if pending.seed.nx_token.is_some() {
-            crate::nx_cache::unavailable_status(&pending.seed.method)
-        } else {
-            StatusCode::GATEWAY_TIMEOUT
-        };
+        // Its deadline is an Nx seed's method miss or refusal, as in the startup queue
+        // (`NxRefusal::queue_timeout`); every other request's is 504.
+        let http_status = pending.seed.refusal_status(StatusCode::GATEWAY_TIMEOUT);
         let draft = pending_audit_draft(
             &pending.seed,
             AuditStatus::TimedOut,
@@ -2398,7 +2436,7 @@ impl Actor {
                 None,
             )
         } else {
-            audit_unavailable()
+            audit_unavailable(http_status)
         }));
     }
 
@@ -2530,11 +2568,15 @@ impl Actor {
         }
         while let Some(pending) = self.queue.pop_front() {
             let pending = self.take_pending(pending);
-            let _ = pending.reply.send(Err(audit_unavailable()));
+            let status = pending.seed.refusal_status(StatusCode::SERVICE_UNAVAILABLE);
+            let _ = pending.reply.send(Err(audit_unavailable(status)));
         }
         while let Some(pending) = self.nx_queue.pop_front() {
             let pending = self.take_nx_pending(pending);
-            let _ = pending.reply.send(Err(audit_unavailable()));
+            let status = pending
+                .intent
+                .refusal_status(StatusCode::SERVICE_UNAVAILABLE);
+            let _ = pending.reply.send(Err(audit_unavailable(status)));
         }
         let starting: Vec<String> = self
             .nx_backends
@@ -2595,22 +2637,23 @@ impl Actor {
         }
         while let Some(pending) = self.queue.pop_front() {
             let pending = self.take_pending(pending);
+            let http_status = pending.seed.refusal_status(StatusCode::SERVICE_UNAVAILABLE);
             let draft = pending_audit_draft(
                 &pending.seed,
                 AuditStatus::Cancelled,
-                Some(StatusCode::SERVICE_UNAVAILABLE),
+                Some(http_status),
                 Some("gateway-draining"),
             );
             let recorded = self.record(draft).await;
             let _ = pending.reply.send(Err(if recorded {
                 admission_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    http_status,
                     "gateway is draining",
                     AuditStatus::Cancelled,
                     None,
                 )
             } else {
-                audit_unavailable()
+                audit_unavailable(http_status)
             }));
         }
         while let Some(pending) = self.nx_queue.pop_front() {
@@ -2886,9 +2929,12 @@ fn admission_error(
     }
 }
 
-fn audit_unavailable() -> AdmissionError {
+/// The audit sink failed, so the gateway refuses without recording. `status` is the refused
+/// request's route status (`RequestIntent::refusal_status`), so an Nx request still hears its
+/// method's miss or not-stored answer.
+fn audit_unavailable(status: StatusCode) -> AdmissionError {
     admission_error(
-        StatusCode::SERVICE_UNAVAILABLE,
+        status,
         "audit service is unavailable",
         AuditStatus::Failed,
         None,
@@ -4108,6 +4154,109 @@ mod tests {
             .actor
             .origins
             .remove(&("nx-deadline".to_owned(), origin));
+        fixture.finish().await;
+    }
+
+    /// The Nx cache never blocks a build (05_gateway.md): a draining gateway answers a queued or
+    /// fresh Nx request with its method's miss or not-stored answer, never a 503 the stock client
+    /// would turn into a failed task.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn nx_refusals_while_draining_are_a_miss_or_not_stored() {
+        let root = TestRoot::new("nx-draining");
+        let mut fixture = TestActor::new(&root).await;
+        let token = fixture
+            .install("nx-draining", "owner/nx-draining", 99, 1)
+            .await;
+        unit_ready(&mut fixture.actor, "owner/nx-draining");
+        let origin = (
+            "nx-draining".to_owned(),
+            unit_backend("owner/nx-draining").target().origin(),
+        );
+        let origin_active = fixture.actor.config.limits.origin_active;
+        fixture.actor.origins.insert(origin.clone(), origin_active);
+        let (mut queued, _cancel) =
+            unit_queued_get(&mut fixture, "nx-draining", token.clone()).await;
+        let (drained, _drained) = oneshot::channel();
+        fixture.actor.begin_drain(drained).await;
+        let error = queued
+            .try_recv()
+            .expect("drain refuses the queued GET")
+            .err()
+            .expect("a draining gateway admits nothing");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert!(unit_audited(
+            &fixture,
+            "nx-draining",
+            404,
+            AuditStatus::Cancelled,
+            "gateway-draining"
+        ));
+        for (method, status) in [
+            (Method::GET, StatusCode::NOT_FOUND),
+            (Method::PUT, StatusCode::FORBIDDEN),
+        ] {
+            let (reply, mut receive) = oneshot::channel();
+            let (_cancel, cancelled) = oneshot::channel();
+            fixture
+                .actor
+                .admit(
+                    "nx-draining".to_owned(),
+                    Authentication::Bearer(Some(token.clone())),
+                    nx_intent(method.clone(), "/nx/v1/cache/42"),
+                    reply,
+                    cancelled,
+                )
+                .await;
+            let error = receive
+                .try_recv()
+                .expect("draining refusal is immediate")
+                .err()
+                .expect("a draining gateway admits nothing");
+            assert_eq!(error.status, status, "{method}");
+        }
+        fixture.actor.origins.remove(&origin);
+        fixture.finish().await;
+    }
+
+    /// A failed audit sink closes the gateway, and a queued Nx request still hears its method's
+    /// miss rather than a 503.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn nx_requests_refused_by_a_failed_audit_are_a_miss() {
+        let root = TestRoot::new("nx-audit-failed");
+        let mut fixture = TestActor::new(&root).await;
+        let ready_token = fixture
+            .install("nx-audit-ready", "owner/nx-audit-ready", 100, 1)
+            .await;
+        let starting_token = fixture
+            .install("nx-audit-starting", "owner/nx-audit-starting", 101, 1)
+            .await;
+        unit_ready(&mut fixture.actor, "owner/nx-audit-ready");
+        unit_starting(&mut fixture.actor, "owner/nx-audit-starting");
+        let origin = (
+            "nx-audit-ready".to_owned(),
+            unit_backend("owner/nx-audit-ready").target().origin(),
+        );
+        let origin_active = fixture.actor.config.limits.origin_active;
+        fixture.actor.origins.insert(origin.clone(), origin_active);
+        let (mut ready, _ready_cancel) =
+            unit_queued_get(&mut fixture, "nx-audit-ready", ready_token).await;
+        let (mut starting, _starting_cancel) =
+            unit_queued_get(&mut fixture, "nx-audit-starting", starting_token).await;
+        fixture
+            .actor
+            .fail_closed(AuditError("unit audit sink failed".to_owned()));
+        for receive in [&mut ready, &mut starting] {
+            let error = receive
+                .try_recv()
+                .expect("a failed audit refuses every queued request")
+                .err()
+                .expect("nothing is admitted unaudited");
+            assert_eq!(error.status, StatusCode::NOT_FOUND);
+            assert_eq!(error.audit_status, AuditStatus::Failed);
+        }
+        fixture.actor.origins.remove(&origin);
         fixture.finish().await;
     }
 

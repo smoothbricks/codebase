@@ -96,6 +96,20 @@ pub(crate) fn unavailable_status(method: &http::Method) -> http::StatusCode {
     }
 }
 
+/// Whether stock Nx 23.2.1 reads `status` for `method` without failing the task
+/// (`native/cache/http_remote_cache.rs`): `GET` 200/404, `PUT` 200/403/409. Every other status is
+/// its fatal "misconfigured remote cache", so the gateway never forwards one.
+pub(crate) fn client_reads(method: &http::Method, status: http::StatusCode) -> bool {
+    if *method == http::Method::GET {
+        matches!(status, http::StatusCode::OK | http::StatusCode::NOT_FOUND)
+    } else {
+        matches!(
+            status,
+            http::StatusCode::OK | http::StatusCode::FORBIDDEN | http::StatusCode::CONFLICT
+        )
+    }
+}
+
 /// Installed standalone server bytes and a host-private artifact root. A backend is started only
 /// when an Nx client first asks for its project, not for every non-Nx workspace in inventory.
 #[derive(Clone, Debug)]
