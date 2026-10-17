@@ -747,11 +747,16 @@ async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed(
 async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
     let fixture = Fixture::new("rm-gone-source");
     let runtime = fixture.adopt().await;
-    fixture.plant_workspace_branch("wedged");
-    fixture
+    let source = fixture
         .mint(&runtime, "source", ForkOptions::default())
         .await
         .expect("mint source");
+    // In the source, not main: a fork keeps none of its source's branches but its own, so only
+    // a branch the source itself carries reaches the fork's clone.
+    git(
+        Path::new(source["info"]["mount"].as_str().expect("source mount")),
+        &["branch", "cowshed/wedged"],
+    );
     fixture
         .fork(&runtime, "source", "wedged")
         .await
@@ -1647,16 +1652,17 @@ fn porcelain(directory: &Path) -> String {
     String::from_utf8(output.stdout).expect("status is UTF-8")
 }
 
-/// Captures the rename's clone of `a` as `b`, then switches `b` onto `cowshed/a`, the branch the
-/// clone carries from its source. This is the raw rename's original-branch shape: the source
-/// repository is left alone, and nothing is forced.
+/// Captures the rename's clone of `a` as `b`, then puts `b` on `cowshed/a` at the tip it was
+/// cloned from. This is the raw rename's original-branch shape: the source repository is left
+/// alone, and nothing is forced. A public fork prunes the source's branches at mint, so the
+/// capture recreates the carried branch rather than switching to it.
 async fn capture_rename(fixture: &Fixture, runtime: &ProjectRuntime) -> Value {
     let forked = fixture
         .fork(runtime, "a", "b")
         .await
         .expect("fork a to b at the captured state");
     let b_mount = PathBuf::from(forked["info"]["mount"].as_str().expect("b mount"));
-    git(&b_mount, &["switch", "cowshed/a"]);
+    git(&b_mount, &["switch", "-c", "cowshed/a"]);
     forked
 }
 

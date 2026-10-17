@@ -566,9 +566,14 @@ image remains live and mounted throughout capture.
    ancestor dependency store or the source's main root, and the source's owned-link marker is migrated first. Finding
    them reads every directory of the fresh volume, concurrently, and is the largest setup cost after the clone's first
    write. Then, inside the mount, under the workspace's closed sandbox: configure the `main` remote (see "The `main`
-   remote") and `git switch -c cowshed/<name>` from the checked-out state. The `.git` directory arrived complete via CoW
-   — the workspace is a standalone repository with **no linked-worktree registration and no back-references** into the
-   host checkout, unless it was created with `--git-worktree` (see "Git-worktree workspaces").
+   remote") and `git switch -c cowshed/<name>` from the checked-out state, then delete every other local branch whose
+   tip equals the source repository's branch of the same name. One branch per workspace: the clone carried every branch
+   its source had, the source still holds each one, and a copy left in the workspace is a branch work can land on
+   unseen. A carried branch whose tip no longer matches the source's stays, and `rm` judges it like any other. A fork
+   from a session keeps none of the source's branches, its `cowshed/<src>` included. The `.git` directory arrived
+   complete via CoW — the workspace is a standalone repository with **no linked-worktree registration and no
+   back-references** into the host checkout, unless it was created with `--git-worktree` (see "Git-worktree
+   workspaces").
 7. Record the audit
    `ControllerCommitment::Fork(ForkCommitment { version, order, repo_id, source_incarnation, destination_incarnation })`;
    the new marker carries `lineage` = source incarnation followed by the source's own lineage, which authorizes the job

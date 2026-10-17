@@ -1839,7 +1839,7 @@ impl GitRepository {
                 .await?;
             }
             WorkspaceRepository::Standalone => {
-                self.prepare_workspace(name, origin.main, start, resuming)
+                self.prepare_workspace(name, origin.main, origin.source, start, resuming)
                     .await?;
             }
         }
@@ -1879,11 +1879,12 @@ impl GitRepository {
 
     /// Configure local-only workspace Git. A fresh preparation refuses an existing branch; it
     /// continues this clone's branch only when `resuming` proves the canonical image came from
-    /// the pending lifecycle record.
+    /// the pending lifecycle record. `source` is the repository the clone was taken from.
     async fn prepare_workspace(
         &self,
         name: &str,
         main_mount: &Path,
+        source: &Path,
         start: Option<&str>,
         resuming: bool,
     ) -> Result<MainRemote> {
@@ -1934,7 +1935,73 @@ impl GitRepository {
             }
         })
         .await?;
+        timed_async(
+            "fork",
+            "inherited-branches",
+            self.prune_inherited_branches(name, source),
+        )
+        .await?;
         Ok(main_remote)
+    }
+
+    /// Delete every local branch this clone carried from `source` unchanged, keeping only its own
+    /// `cowshed/<name>`: one branch per workspace, so the branches removal measures are the
+    /// branches the workspace's own work made (02_workspaces.md, fork mint step 6). A carried
+    /// branch is deleted only while its tip equals the source's branch of the same name - the
+    /// source still holds that branch, so the copy carries nothing of its own. Any other branch
+    /// stays for removal's containment gate to judge. Replaying is safe: a deleted branch is no
+    /// longer listed.
+    async fn prune_inherited_branches(&self, name: &str, source: &Path) -> Result<()> {
+        let (_, own) = workspace_branch(name);
+        let source_tips = Self::from_root(source).local_branch_tips().await?;
+        let carried: Vec<OsString> = self
+            .local_branch_tips()
+            .await?
+            .into_iter()
+            .filter(|(branch, tip)| {
+                branch.as_slice() != own.as_bytes() && source_tips.get(branch) == Some(tip)
+            })
+            .filter_map(|(branch, _)| {
+                branch
+                    .strip_prefix(b"refs/heads/")
+                    .map(|short| OsString::from_vec(short.to_vec()))
+            })
+            .collect();
+        if carried.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec![OsString::from("branch"), OsString::from("-D")];
+        args.extend(carried);
+        let output = self.run(args).await?;
+        ensure_git_success("delete branches the clone carried from its source", output)
+    }
+
+    /// Every local branch's full ref name and tip, as git spells them.
+    async fn local_branch_tips(&self) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>> {
+        let output = self
+            .run([
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/heads",
+            ])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("list local branches", &output));
+        }
+        output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let space = line.iter().position(|byte| *byte == b' ').ok_or_else(|| {
+                    CowshedError::internal(format!(
+                        "git for-each-ref answered a line without a ref name: {}",
+                        String::from_utf8_lossy(line)
+                    ))
+                })?;
+                Ok((line[space + 1..].to_vec(), line[..space].to_vec()))
+            })
+            .collect()
     }
 
     /// Drop the linked-worktree registrations this standalone clone inherited from main, before any
@@ -5889,7 +5956,7 @@ mod tests {
         );
         let repo = GitRepository::from_root(store.shared(), &mount);
         assert_eq!(
-            repo.prepare_workspace("raven", &main, Some("main"), false)
+            repo.prepare_workspace("raven", &main, &main, Some("main"), false)
                 .await
                 .expect("prepare workspace"),
             MainRemote::Canonical
@@ -5916,12 +5983,55 @@ mod tests {
         assert_eq!(Path::new(&remotes[0].url), &*main);
     }
 
+    /// A clone carries every branch its source had. Mint keeps the workspace's own branch and
+    /// any branch whose tip no longer equals the source's, and deletes the rest: the source still
+    /// holds them, and a branch removal does not measure is a branch whose work it can destroy.
+    #[tokio::test]
+    async fn mint_prunes_the_branches_the_clone_carried_unchanged() {
+        let store = crate::temp_root::FixtureStore::new();
+        let main = repository();
+        git(&main, &["branch", "carried"]);
+        git(&main, &["branch", "moved"]);
+        let mount = clone_image(&main);
+        let advanced = git_stdout(
+            &mount,
+            &[
+                "commit-tree",
+                "HEAD^{tree}",
+                "-p",
+                "HEAD",
+                "-m",
+                "begun in the clone",
+            ],
+        );
+        git(&mount, &["update-ref", "refs/heads/moved", advanced.trim()]);
+        let repo = GitRepository::from_root(store.shared(), &mount);
+        repo.prepare_workspace("raven", &main, &main, Some("main"), false)
+            .await
+            .expect("prepare workspace");
+        let branches =
+            |root: &Path| git_stdout(root, &["for-each-ref", "--format=%(refname)", "refs/heads"]);
+        assert_eq!(
+            branches(&mount),
+            "refs/heads/cowshed/raven\nrefs/heads/moved\n",
+            "only the workspace's own branch and the one that moved in the clone remain"
+        );
+        assert_eq!(
+            branches(&main),
+            "refs/heads/carried\nrefs/heads/main\nrefs/heads/moved\n",
+            "the source keeps every branch"
+        );
+    }
+
     #[tokio::test]
     async fn standalone_workspace_resume_accepts_only_its_current_branch() {
         let store = crate::temp_root::FixtureStore::new();
         let root = repository();
         let repo = GitRepository::from_root(store.shared(), &root);
-        repo.prepare_workspace("raven", &root, Some("main"), false)
+        // A different repository: two fixtures made in one second can share a commit id.
+        let source = repository();
+        git(&source, &["commit", "--allow-empty", "-qm", "source only"]);
+        repo.prepare_workspace("raven", &root, &source, Some("main"), false)
             .await
             .expect("initial preparation");
 
@@ -5932,7 +6042,7 @@ mod tests {
             .status_locked()
             .expect("move HEAD away after branch creation");
         assert!(switched.success());
-        repo.prepare_workspace("raven", &root, Some("main"), true)
+        repo.prepare_workspace("raven", &root, &source, Some("main"), true)
             .await
             .expect("resume current workspace branch");
         assert_eq!(
@@ -5943,7 +6053,7 @@ mod tests {
             Some("cowshed/raven")
         );
         let error = repo
-            .prepare_workspace("raven", &root, Some("main"), false)
+            .prepare_workspace("raven", &root, &source, Some("main"), false)
             .await
             .expect_err("fresh operation still refuses the existing branch");
         assert_eq!(error.code.as_str(), "conflict");
@@ -6786,7 +6896,9 @@ mod tests {
         let root = repository();
         let main_mount = PathBuf::from(OsString::from_vec(b"/tmp/cowshed-main-\xff".to_vec()));
         let repo = GitRepository::from_root(store.shared(), &root);
-        repo.prepare_workspace("raven", &main_mount, None, false)
+        let source = repository();
+        git(&source, &["commit", "--allow-empty", "-qm", "source only"]);
+        repo.prepare_workspace("raven", &main_mount, &source, None, false)
             .await
             .expect("prepare workspace");
 
