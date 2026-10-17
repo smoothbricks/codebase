@@ -16,6 +16,12 @@
 //!   state of a real project — the target detached, its mount no longer a repository, no such
 //!   branch — so each one becomes [`LandingCommits::Indeterminate`] carrying the reason.
 //!   Consumers treat that exactly as they treat unlanded work.
+//!
+//! One reading here is not a verdict: [`published_holding`] measures the target repository's own
+//! tracking ref for its published branch, the same way, so a refusal can say when that ref already
+//! holds every commit of the workspace head that the live target does not. It is read only to
+//! explain a refusal and decides nothing — `rm`'s gate is the live target alone
+//! (`specs/cowshed/02_workspaces.md`, `rm` step 1).
 
 use std::path::{Path, PathBuf};
 
@@ -87,6 +93,68 @@ pub async fn resolve_target(
         tip,
         objects,
         repository: target_mount.to_path_buf(),
+    })
+}
+
+/// What the target repository's published branch holds of a workspace head the live target refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedHolding {
+    /// The tracking ref as the target repository names it: `<remote>/<branch>`.
+    pub reference: String,
+    pub tip: GitOid,
+    /// Commits the live target has that the published tip does not.
+    pub target_ahead: u64,
+    /// Commits the published tip has that the live target does not.
+    pub target_behind: u64,
+}
+
+/// Whether `remote`'s tracking ref for `branch`, in the target's own repository, holds every
+/// commit `head` carries — counted exactly as [`measure_commits`] counts against the live target —
+/// and if so how far the live tip `target_tip` has drifted from it.
+///
+/// It measures the head alone, never the workspace's other local branches: it explains the head's
+/// count in a refusal and nothing else. Diagnostic only, and it never authorizes anything: a
+/// refusal reads it to say "reconcile the target" instead of reading as missing work, and no gate
+/// consults it. Nothing is fetched, so this is what the target repository last fetched. Every
+/// answer short of "holds all of them" — no such ref, an unreadable repository, a git
+/// disagreement, unheld work — is `None`, which claims nothing: the refusal then says exactly what
+/// the gate measured and no more.
+pub async fn published_holding(
+    store_root: &std::sync::Arc<Path>,
+    target_mount: &Path,
+    remote: &str,
+    branch: &str,
+    target_tip: &GitOid,
+    workspace_mount: &Path,
+    head: &str,
+) -> Option<PublishedHolding> {
+    let target = GitRepository::from_root(store_root, target_mount);
+    let published = LandingTarget {
+        branch: format!("{remote}/{branch}"),
+        tip: target.remote_tracking_tip(remote, branch).await.ok()??,
+        objects: target.object_directory().await.ok()?,
+        repository: target_mount.to_path_buf(),
+    };
+    if !counted(store_root, &published, workspace_mount, head)
+        .await
+        .ok()?
+        .fully_landed()
+    {
+        return None;
+    }
+    let target_ahead = target
+        .commits_ahead_of(published.tip.as_str(), target_tip.as_str())
+        .await
+        .ok()?;
+    let target_behind = target
+        .commits_ahead_of(target_tip.as_str(), published.tip.as_str())
+        .await
+        .ok()?;
+    Some(PublishedHolding {
+        reference: published.branch,
+        tip: published.tip,
+        target_ahead,
+        target_behind,
     })
 }
 

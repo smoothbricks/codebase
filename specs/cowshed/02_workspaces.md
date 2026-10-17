@@ -1122,6 +1122,20 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and every branch that did not pass as
    refs, before retiring unlanded work. It is written beside that name and renamed into place once verified; a retried
    removal that finds a bundle verifying for the same range keeps it instead of writing another.
+
+   **Proposed addition, awaiting Danny's ruling** (rm-basis design 2026-10-17, §3 "What A changes", item 3; the spec is
+   otherwise silent on refusal text). On the refusal path only, when HEAD itself did not pass, the refusal also measures
+   HEAD against the primary bound remote's tracking ref of main's branch in main's own repository
+   (`refs/remotes/<remote>/main`, as main last fetched it; nothing is fetched). If that ref holds every commit HEAD
+   carries, HEAD's finding gains: "codebase/main (published, `9474e561a`) holds all of them; local main has diverged
+   from it (32 ahead, 34 behind): reconcile main, do not abandon." This never authorizes anything: the gate stays live
+   main, and the measurement runs only after the gate has refused. It reads the same landing module that `ls` reads. It
+   speaks for HEAD alone: the other branches the refusal names follow it as the gate measured them, and a refusal for
+   other branches alone measures nothing published. Where the code changed the wording: the tip is the full oid that the
+   refusal already prints; one commit reads "holds it"; a local main with no commits of its own reads "local main is N
+   behind it", because "diverged" would be false there; and the text joins the refusal with "; " and has no closing
+   period, as other refusals do. Whatever the ref says, the hint stays the same.
+
 2. Stop the supervisor. Ordinary removal quiesces, letting running jobs finish before retirement. `--force` retires
    directly: TERM → grace → KILL across the workspace's descendant process trees (11_shell.md), without waiting for a
    job to complete. Teardown precedes image retirement — live children would otherwise hold the mount busy and keep

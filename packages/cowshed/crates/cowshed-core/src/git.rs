@@ -1125,6 +1125,13 @@ impl GitRepository {
         self.resolve_commit(&format!("refs/heads/{branch}")).await
     }
 
+    /// The tip of `remote`'s tracking ref for `branch` — what this repository last fetched of it —
+    /// or `None` when this repository has no such ref. Never fetches.
+    pub async fn remote_tracking_tip(&self, remote: &str, branch: &str) -> Result<Option<GitOid>> {
+        self.resolve_commit(&format!("refs/remotes/{remote}/{branch}"))
+            .await
+    }
+
     /// Whether `commit` is reachable from `descendant` in *this* repository.
     ///
     /// This is the proof that destroying the object store `commit` lives in loses nothing:
