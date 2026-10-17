@@ -168,5 +168,5 @@ describe('linked snapshots vouched for by the provider’s real Nx', () => {
     } finally {
       await rm(consumer, { recursive: true, force: true });
     }
-  }, 60_000);
+  });
 });

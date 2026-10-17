@@ -588,18 +588,15 @@ describe('temporary-directory policy on this host', () => {
     it(
       'reclaims what a dead creator left, shares the volume between leases, and detaches it at the last release, never mounting beside it as "<name> 1"',
       nativeRamVolume,
-      60_000,
     );
     it(
       'leaves no volume under its final name, and no staging directory, when any provisioning step fails',
       aFailedStepLeavesNoNamedVolume,
-      180_000,
     );
   } else {
     it(
       'keeps inherited temporary storage, honors a target override, and never provisions an APFS disk',
       inheritedTempDirectory,
-      30_000,
     );
   }
 });

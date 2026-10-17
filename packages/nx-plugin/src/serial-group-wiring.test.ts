@@ -81,7 +81,7 @@ describe('the real-APFS serial groups of this repository', () => {
     for (const inputs of [device, host]) {
       expect(inputs.filter((input) => input.startsWith('!') && /\btests?\b/.test(input))).toEqual([]);
     }
-  }, 60_000);
+  });
 
   it('run the host group after the device group, so two real-image runners never overlap', async () => {
     const nx = await readRecord('nx.json', JSON.parse);
@@ -160,7 +160,7 @@ describe('the real-APFS serial groups of this repository', () => {
     expect(planned(['host-e2e']).filter((id) => id !== hostGate)).toEqual(planned([DEVICE_GROUP, HOST_GROUP]));
     expect(planned(['test'])).not.toContain(device);
     expect(planned(['test'])).not.toContain(host);
-  }, 120_000);
+  });
 
   it('wrap exactly their tests in the 30s code-bound class, behind the 60s class that wins first', async () => {
     const config = await readRecord(NEXTEST_REPO_CONFIG_PATH, parseToml);
@@ -198,7 +198,7 @@ describe('the real-APFS serial groups of this repository', () => {
     // ordinary shard beside every other test, not in a serial group.
     expect([...owners].filter((name) => !scoped.has(name))).toEqual([]);
     expect([...owners].sort()).toEqual(['cowshed-apfs-tests', 'cowshed-cli', 'cowshed-core']);
-  }, 60_000);
+  });
 
   it('pin each exact test by a function that exists at that module path', async () => {
     const groups = serialTestGroups(join(REPOSITORY, NEXTEST_REPO_CONFIG_PATH));
@@ -217,7 +217,7 @@ describe('the real-APFS serial groups of this repository', () => {
       expect(holders[0]?.path, exactName).toMatch(new RegExp(`/src/${modulePath}(?:/mod)?\\.rs$`));
       expect(holders[0]?.text, exactName).toContain('mod tests');
     }
-  }, 60_000);
+  });
 });
 
 /** `path` of the repository, parsed by `parse`, which must be an object. */

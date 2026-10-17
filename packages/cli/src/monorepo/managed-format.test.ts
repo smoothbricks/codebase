@@ -109,7 +109,7 @@ describe('managed files in a consumer whose formatter disagrees with the generat
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  });
 
   it('reports no drift on a tree the consumer formatter has already touched', async () => {
     const root = await makeConsumerRepo();
@@ -121,7 +121,7 @@ describe('managed files in a consumer whose formatter disagrees with the generat
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  });
 
   it('still reports and names a file whose content really changed', async () => {
     const root = await makeConsumerRepo();
@@ -147,7 +147,7 @@ describe('managed files in a consumer whose formatter disagrees with the generat
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  });
 
   it('is idempotent: a second update writes the same bytes, and so does the formatter', async () => {
     const root = await makeConsumerRepo();
@@ -170,7 +170,7 @@ describe('managed files in a consumer whose formatter disagrees with the generat
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  });
 });
 
 describe('which formatter owns a managed target', () => {
@@ -220,7 +220,7 @@ describe('which formatter owns a managed target', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  });
 
   it('keeps unsupported bytes through the real stdin hook while formatting supported YAML', async () => {
     const root = await makeConsumerRepo();

@@ -66,7 +66,7 @@ it('exits 1, not 130, when a failed task leaves a task that depends on it unrun'
       expect(JSON.parse(await readFile(join(workspace, 'task-results.json'), 'utf8'))).toEqual({ 'p:fail': 'failure' });
     }
   });
-}, 60_000);
+});
 
 it('distinguishes parallel failure bailout from a real interrupt with pending tasks', async () => {
   for (const interrupt of [false, true]) {
@@ -177,4 +177,4 @@ if (existsSync(wanted)) { watcher.close(); process.exit(1); }
       }
     });
   }
-}, 60_000);
+});

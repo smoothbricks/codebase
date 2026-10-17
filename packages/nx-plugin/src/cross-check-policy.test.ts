@@ -117,7 +117,7 @@ describe('Linux cross-check policy', () => {
     } finally {
       await rm(project, { recursive: true, force: true });
     }
-  }, 60_000);
+  });
 
   it('fails closed on Darwin without the linux-cross compiler instead of compiling', () => {
     // Without this guard a Darwin cache miss sits in ring's cc-rs looking for
@@ -167,7 +167,7 @@ describe('Linux cross-check policy', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  });
 
   it('pins clippy to the committed lockfile and local cache', () => {
     expect(cargoFrozen('clippy --workspace')).toBe('cargo --frozen clippy --workspace');

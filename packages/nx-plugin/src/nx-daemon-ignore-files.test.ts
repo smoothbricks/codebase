@@ -154,7 +154,7 @@ it('keeps serving when a watched ignore file is rewritten with the bytes the dae
       await client.end();
     }
   });
-}, 60_000);
+});
 
 /** A workspace whose context walk takes long enough that a write right after `watch()` lands before it. */
 async function largeWorkspace(workspace: string): Promise<void> {
@@ -207,4 +207,4 @@ it('stops when an ignore file changes after the watcher read it and before the d
       }
     }
   });
-}, 60_000);
+});

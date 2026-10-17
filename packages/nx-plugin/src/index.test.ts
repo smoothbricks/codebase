@@ -1559,7 +1559,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
     } finally {
       await workspace.cleanup();
     }
-  }, 60_000);
+  });
 
   // A consumer links the plugin from a checkout of its own, outside the
   // workspace, and its forks sit at different depths. Nx hashes a project's

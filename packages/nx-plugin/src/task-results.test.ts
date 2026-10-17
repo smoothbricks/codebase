@@ -135,7 +135,7 @@ it('records a task hint only under a controller receipt, and never on an ordinar
     },
     '.',
   );
-}, 180_000);
+});
 
 it('records a failed task as a failure under a receipt, never as a success', async () => {
   await withNxFixture(
@@ -153,7 +153,7 @@ it('records a failed task as a failure under a receipt, never as a success', asy
     },
     '.',
   );
-}, 120_000);
+});
 
 it('records hints through a daemon-backed Nx only under a checked receipt', async () => {
   await withNxFixture(
@@ -223,4 +223,4 @@ it('records hints through a daemon-backed Nx only under a checked receipt', asyn
     },
     '.',
   );
-}, 120_000);
+});

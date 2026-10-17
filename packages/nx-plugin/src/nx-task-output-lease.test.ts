@@ -186,7 +186,7 @@ it('leases a target across clients through producer completion, cache capture an
       await Promise.all(children.map((child) => child.exited));
     }
   });
-}, 120_000);
+});
 
 it('shares ownership across configurations without blocking independent targets, and cancels lock waiters', async () => {
   const owner = new TaskOutputLeases(2, null, 'output');
@@ -287,7 +287,7 @@ it('refuses an ancestor-owned target before waiting for its output lease', async
       await child.exited;
     }
   });
-}, 60_000);
+});
 
 it('shares one continuous producer between simultaneous cold clients without waiting for its lifetime lease', async () => {
   await withNxFixture('nx-task-output-continuous-', async ({ workspace, socketDirectory }) => {
@@ -411,4 +411,4 @@ SharedRunningTask.prototype.waitForTaskToFinish = async function(...args) {
       await Promise.all(children.map((child) => child.exited));
     }
   });
-}, 60_000);
+});

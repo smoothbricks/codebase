@@ -167,7 +167,7 @@ it('indexes every tracked dot input and none of the untracked dot state', async 
   expect(after).toEqual(before.filter((path) => tracked.includes(path)));
   expect(after).toContain('.github/workflows/ci.yml');
   expect(after).toContain('.cargo/config.toml');
-}, 120_000);
+});
 
 it('keeps the watcher reporting tracked dot inputs and silent about untracked dot state', async () => {
   const nxignore = await readFile(join(repositoryRoot, '.nxignore'), 'utf8');
@@ -179,7 +179,7 @@ it('keeps the watcher reporting tracked dot inputs and silent about untracked do
   const current = await withWorkspace(nxignore, reportedAfterWrites);
   expect(current).toContain(TRACKED_DOT_WRITE);
   expect(current.filter((path) => RUNTIME_DOT_STATE.includes(path))).toEqual([]);
-}, 120_000);
+});
 
 it('fails the lint when a tracked dot path lacks its re-include line, and passes with it', async () => {
   const nxignore = await readFile(join(repositoryRoot, '.nxignore'), 'utf8');
@@ -203,7 +203,7 @@ it('fails the lint when a tracked dot path lacks its re-include line, and passes
   const checkout = runLint(repositoryRoot);
   expect(checkout.stderr).toBe('');
   expect(checkout.status).toBe(0);
-}, 120_000);
+});
 
 it('rejects a newly tracked dot input until its explicit negation is added', async () => {
   const nxignore = await readFile(join(repositoryRoot, '.nxignore'), 'utf8');
@@ -217,7 +217,7 @@ it('rejects a newly tracked dot input until its explicit negation is added', asy
     const included = runLint(root);
     expect(included.status, included.stderr).toBe(0);
   });
-}, 120_000);
+});
 
 it('preserves tracked input hashes and the graph while dot staging never causes graph passes', async () => {
   const nxignore = await readFile(join(repositoryRoot, '.nxignore'), 'utf8');
@@ -350,4 +350,4 @@ it('preserves tracked input hashes and the graph while dot staging never causes 
       await ended;
     }
   });
-}, 120_000);
+});

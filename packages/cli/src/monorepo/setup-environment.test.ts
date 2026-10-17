@@ -2361,7 +2361,7 @@ describe('what shell entry syncs for a uv project', () => {
       expect(cloneScript.exitCode).toBe(0);
       expect(cloneScript.stdout.toString()).toBe('tool\n');
     });
-  }, 120_000);
+  });
 });
 
 describe('what shell entry fetches for a Cargo workspace', () => {

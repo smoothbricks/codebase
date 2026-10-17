@@ -123,7 +123,7 @@ it('stops the Nx daemon of a fixture whose body throws, and deletes its socket a
   expect(await pidsWorkingIn(root)).toEqual([]);
   expect(existsSync(root)).toBe(false);
   expect(lstatSync(alias, { throwIfNoEntry: false })).toBeUndefined();
-}, 120_000);
+});
 
 it('ends owned Nx processes before daemon publication and after daemon exit', async () => {
   let root = '';
@@ -196,7 +196,7 @@ it('ends owned Nx processes before daemon publication and after daemon exit', as
     }
   });
   expect(await pidsWorkingIn(root)).toEqual([]);
-}, 120_000);
+});
 
 it('binds and connects through its short alias without granting the long fixture root a socket namespace', async () => {
   let alias = '';
@@ -363,7 +363,7 @@ it('starts and connects to a fixture daemon through owned short aliases with a l
     expect(daemon.some(({ pid }) => pid === record.processId)).toBe(true);
     expect(await stillRunning(daemon)).not.toEqual([]);
   });
-}, 120_000);
+});
 
 /**
  * The alias a killed fixture leaves: what {@link publishFixtureSocketDirectory} makes, planted for a workspace in
@@ -441,7 +441,7 @@ it("reclaims a dead run's Nx daemon, helper processes and socket aliases, and no
     }
     await rm(suiteDirectory, { recursive: true, force: true });
   }
-}, 120_000);
+});
 
 it('stops what works in every run it owns when the process is signalled, then dies of the signal', async () => {
   const suite = `signal-regression-${process.pid}`;
@@ -506,4 +506,4 @@ setInterval(() => {}, 1 << 30);
     await rm(suiteDirectory, { recursive: true, force: true });
     await rm(otherParent, { recursive: true, force: true });
   }
-}, 120_000);
+});

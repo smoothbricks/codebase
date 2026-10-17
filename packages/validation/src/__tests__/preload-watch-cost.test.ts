@@ -32,5 +32,5 @@ describe('ttsc directory watching', () => {
     // the entry point imports, and its own callsite.
     expect(JSON.parse(result.stdout)).toEqual({ all: true, count: 9 });
     expect(elapsedMs).toBeLessThan(BUDGET_MS);
-  }, 120_000);
+  });
 });

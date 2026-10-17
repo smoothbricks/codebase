@@ -177,7 +177,7 @@ describe('a second daemon started for a workspace a daemon serves', () => {
         });
       });
     });
-  }, 60_000);
+  });
 
   it('exits and leaves the serving daemon alone when both use one socket directory', async () => {
     await withNxFixture('nx-daemon-claim-shared-', async ({ socketDirectory, workspace }) => {
@@ -187,7 +187,7 @@ describe('a second daemon started for a workspace a daemon serves', () => {
         await secondDaemonDefers(workspace, env, env);
       });
     });
-  }, 60_000);
+  });
 });
 
 it('replaces a daemon whose socket was removed, which no client could reach', async () => {
@@ -204,7 +204,7 @@ it('replaces a daemon whose socket was removed, which no client could reach', as
     const replacement = await daemonRecord(workspace);
     expect(replacement?.processId).not.toBe(lost.processId);
   });
-}, 60_000);
+});
 
 it('keeps serving clients whose socket directory differs from the one it bound', async () => {
   await withNxFixture('nx-daemon-claim-env-', async ({ socketDirectory, workspace }) => {
@@ -229,7 +229,7 @@ it('keeps serving clients whose socket directory differs from the one it bound',
       });
     });
   });
-}, 60_000);
+});
 
 it('replaces a record whose pid now belongs to an unrelated live process', async () => {
   await withNxFixture('nx-daemon-claim-reused-', async ({ socketDirectory, workspace }) => {
@@ -274,4 +274,4 @@ it('replaces a record whose pid now belongs to an unrelated live process', async
       await unrelatedExited;
     }
   });
-}, 60_000);
+});

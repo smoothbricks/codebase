@@ -348,7 +348,7 @@ it('concurrent resolutions of one Cargo workspace share one cargo child, and an 
     expect(await members()).toEqual(['after']);
     expect(await spawned(cargo)).toBe(2);
   });
-}, 20_000);
+});
 
 it("a failed resolution rejects every sharer with a CargoMetadataError carrying Cargo's stderr, and is not kept for the next call", async () => {
   await withCannedWorkspace(async ({ cargo, answer, members, workspace, manifest }) => {
@@ -380,7 +380,7 @@ it("a failed resolution rejects every sharer with a CargoMetadataError carrying 
     expect(await members()).toEqual(['recovered']);
     expect(await spawned(cargo)).toBe(2);
   });
-}, 20_000);
+});
 
 it('a Cargo that cannot run, or whose answer is not metadata, is a CargoMetadataError', async () => {
   await withCannedWorkspace(async ({ cargo, workspace, manifest }) => {
@@ -395,7 +395,7 @@ it('a Cargo that cannot run, or whose answer is not metadata, is a CargoMetadata
     });
     expect(await spawned(cargo)).toBe(2);
   });
-}, 20_000);
+});
 
 it('source edits, non-Rust edits and a rewrite of the same bytes never run Cargo', async () => {
   await withCannedWorkspace(async ({ root, cargo, answer, members, workspace }) => {
@@ -421,7 +421,7 @@ it('source edits, non-Rust edits and a rewrite of the same bytes never run Cargo
     }
     expect(await spawned(cargo)).toBe(1);
   });
-}, 20_000);
+});
 
 interface KeyedFile {
   readonly name: string;
@@ -493,7 +493,7 @@ for (const file of KEYED_FILES) {
       expect(await resolvesAs('settled')).toEqual([file.removable ? 'removed' : 'two']);
       expect(await spawned(cargo)).toBe(file.removable ? 4 : 3);
     });
-  }, 30_000);
+  });
 }
 
 it('resolves again exactly once when the cargo on PATH or the rustup selection changes', async () => {
@@ -527,7 +527,7 @@ it('resolves again exactly once when the cargo on PATH or the rustup selection c
     expect(await resolvesAs('same cargo', elsewhere)).toEqual(['another cargo']);
     expect(await spawned(cargo)).toBe(5);
   });
-}, 30_000);
+});
 
 it('a discovered manifest outside the workspace, edited while the first resolution holds, is never answered from before the edit', async () => {
   await withCannedWorkspace(async ({ root, cargo, answer, members, workspace, manifest }) => {
@@ -550,7 +550,7 @@ it('a discovered manifest outside the workspace, edited while the first resoluti
     expect(await members()).toEqual(['after']);
     expect(await spawned(cargo)).toBe(2);
   });
-}, 20_000);
+});
 
 it('an edit made while Cargo resolves is answered by a resolution that follows the first, never beside it', async () => {
   await withCannedWorkspace(async ({ cargo, answer, members, workspace, manifest }) => {
@@ -576,7 +576,7 @@ it('an edit made while Cargo resolves is answered by a resolution that follows t
     expect(await members()).toEqual(['after']);
     expect(await spawned(cargo)).toBe(2);
   });
-}, 20_000);
+});
 
 it('an answer Cargo read after an edit is never kept for the workspace as it was before the edit', async () => {
   await withCannedWorkspace(async ({ cargo, answer, members, workspace, manifest }) => {
@@ -598,7 +598,7 @@ it('an answer Cargo read after an edit is never kept for the workspace as it was
     await answer('before');
     expect(await members()).toEqual(['before']);
   });
-}, 20_000);
+});
 
 it('a process that has never resolved an unchanged workspace reads the answer an earlier one left, without Cargo', async () => {
   await withCannedWorkspace(async (fixture) => {
@@ -626,7 +626,7 @@ it('a process that has never resolved an unchanged workspace reads the answer an
     expect(await freshResolver(fixture, 'edited again').result).toEqual(edited);
     expect(await spawned(cargo)).toBe(2);
   });
-}, 60_000);
+});
 
 it('fresh processes that ask at once for a workspace nobody has resolved share one cargo child', async () => {
   await withCannedWorkspace(async (fixture) => {
@@ -645,7 +645,7 @@ it('fresh processes that ask at once for a workspace nobody has resolved share o
     expect(results[0]).toMatchObject({ members: ['cold'] });
     expect(await spawned(cargo)).toBe(1);
   });
-}, 60_000);
+});
 
 it('a worker that exits on SIGTERM while Cargo resolves leaves no cargo child behind', async () => {
   await withCannedWorkspace(async ({ root, workspace, manifest, cargo, answer, environment }) => {
@@ -673,7 +673,7 @@ it('a worker that exits on SIGTERM while Cargo resolves leaves no cargo child be
     // The child's end is the end of its connection to the fixture, killed before it answered.
     await cargo.waitForDisconnects([pid]);
   });
-}, 20_000);
+});
 
 it("a worker that exits with callers waiting on two resolutions leaves none of Cargo's processes behind, and the next process resolves normally", async () => {
   await withCannedWorkspace(async (fixture) => {
@@ -730,7 +730,7 @@ it("a worker that exits with callers waiting on two resolutions leaves none of C
     expect(await freshResolver(fixture, 'again').result).toEqual(next);
     expect(await spawned(cargo)).toBe(3);
   });
-}, 60_000);
+});
 
 // A standalone `smoo-nx-cargo-hash` has no handler of its own, so a signal would end it on the spot,
 // before any exit hook could take the Cargo it started along. The module forwards the signal to
@@ -754,7 +754,7 @@ for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
       expect(ended.signalCode, proc.describe()).toBe(signal);
       await cargo.waitForDisconnects(running);
     });
-  }, 30_000);
+  });
 }
 
 /* ---- The same, with the real Cargo, through the project graph and the hash command ---- */
@@ -912,7 +912,7 @@ it('a project graph over an unchanged Cargo workspace runs Cargo once, however o
     expect(byFile(await graph())).toEqual(edited);
     expect(await spawned(cargo)).toBe(expected + 1);
   });
-}, 120_000);
+});
 
 it('a Cargo workspace Cargo refuses fails the project graph with a CargoMetadataError, and no runtime hash stands in', async () => {
   await withGraphWorkspace(async ({ workspace, cargo, graph }) => {
@@ -937,7 +937,7 @@ it('a Cargo workspace Cargo refuses fails the project graph with a CargoMetadata
     expect(byFile(await graph())).toEqual(repaired);
     expect(await spawned(cargo)).toBe(4);
   });
-}, 120_000);
+});
 
 it('fresh smoo-nx-cargo-hash processes over an unchanged Cargo workspace run Cargo once between them', async () => {
   await withGraphWorkspace(async ({ root, workspace, cargo }) => {
@@ -982,7 +982,7 @@ it('fresh smoo-nx-cargo-hash processes over an unchanged Cargo workspace run Car
     expect(await hash()).toBe(manifestEdited);
     expect(await spawned(cargo)).toBe(2);
   });
-}, 120_000);
+});
 
 it('a Cargo child that never answers is killed and named at the resolve bound', async () => {
   await withCannedWorkspace(async ({ cargo, answer, workspace, manifest }) => {
@@ -995,7 +995,7 @@ it('a Cargo child that never answers is killed and named at the resolve bound', 
       await cargo.beforeAnswer.open();
     }
   });
-}, 20_000);
+});
 
 it('a held resolve lock times out with its name and elapsed wait and leaves no lock child', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-resolve-lock-')));
@@ -1023,7 +1023,7 @@ it('a held resolve lock times out with its name and elapsed wait and leaves no l
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}, 20_000);
+});
 
 it('a successful resolve lock lease holds the kernel lock until its child is released and reaped', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-resolve-lease-')));
@@ -1041,4 +1041,4 @@ it('a successful resolve lock lease holds the kernel lock until its child is rel
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}, 20_000);
+});

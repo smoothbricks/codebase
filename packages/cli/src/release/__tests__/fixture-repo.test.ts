@@ -231,8 +231,6 @@ describe('release planning with fixture git repositories', () => {
     expect(await survivors(fixtureRoot, daemonPids)).toEqual([]);
   });
 
-  // The two abandoned-fixture tests start a nested `bun test` process and a real
-  // daemon: the default 30 s is the budget of one test, not of a second runner in it.
   it('stops the Nx daemon of a fixture whose test finished without its body', async () => {
     const { root, pids } = await abandonFixture(`
       await runFixtureNx(root, ['show', 'projects'], { daemon: true });
@@ -242,7 +240,7 @@ describe('release planning with fixture git repositories', () => {
 
     expect(pids.length).toBeGreaterThan(1);
     expect(await survivors(root, pids)).toEqual([]);
-  }, 120_000);
+  });
 
   it('stops an abandoned fixture nx client still starting its daemon, and that daemon', async () => {
     // The client logs this line just before it spawns the daemon, which records
@@ -259,7 +257,7 @@ describe('release planning with fixture git repositories', () => {
     `);
 
     expect(await survivors(root, [])).toEqual([]);
-  }, 120_000);
+  });
 
   it('repairs multiple fetched remote targets from a runner clone, building each at its own checkout', async () => {
     await withFixtureRepo(async (author) => {
@@ -370,11 +368,13 @@ describe('release planning with fixture git repositories', () => {
 
   it('kills timed-out fixture Git process groups so descendants cannot hold output pipes open', async () => {
     await withFixtureRepo(async (root) => {
+      // The descendant outlives any run: a broken group kill leaves its pipes open, so the test never returns and the
+      // leg's no-progress bound fails the run, rather than passing once a shorter sleep ended on its own.
       await expect(
-        git(root, ['-c', "alias.hold-pipes=!sh -c 'sleep 120 & exit 0'", 'hold-pipes'], undefined, 100),
+        git(root, ['-c', "alias.hold-pipes=!sh -c 'sleep 86400 & exit 0'", 'hold-pipes'], undefined, 100),
       ).rejects.toThrow('timed out after 100ms');
     });
-  }, 30_000);
+  });
 
   it('repairs a scoped package from its project-name release tag without creating a package-name tag', async () => {
     await withFixtureRepo(async (author) => {

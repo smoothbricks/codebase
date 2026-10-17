@@ -77,5 +77,4 @@ it.skipIf(process.env.NX_DAEMON_CPU_PROOF !== 'true')(
       expect(wallSeconds).toBeGreaterThanOrEqual(30);
     });
   },
-  120_000,
 );

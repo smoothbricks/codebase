@@ -575,7 +575,7 @@ it('awaits an answerable daemon after a closed PING without another socket-direc
       await closed.promise;
     }
   });
-}, 45_000);
+});
 
 /** Valid lockfiles keep the real graph usable while the watcher judges byte changes. */
 async function lockContents(
@@ -665,7 +665,7 @@ for (const lockfile of LOCKFILES) {
       },
       FIXTURE_WORKSPACE,
     );
-  }, 180_000);
+  });
 }
 
 it('does not serve a request sent on a connection opened before a lockfile change', async () => {
@@ -703,7 +703,7 @@ it('does not serve a request sent on a connection opened before a lockfile chang
     },
     FIXTURE_WORKSPACE,
   );
-}, 180_000);
+});
 
 it('stops a daemon at the next request after an ignored lockfile changes, then its successor within its safety poll with no request', async () => {
   await withNxFixture(
@@ -753,7 +753,7 @@ it('stops a daemon at the next request after an ignored lockfile changes, then i
     },
     FIXTURE_WORKSPACE,
   );
-}, 180_000);
+});
 
 it('stops a daemon, refusing its next request, once the installed nx version changes in place', async () => {
   await withNxFixture(
@@ -781,7 +781,7 @@ it('stops a daemon, refusing its next request, once the installed nx version cha
     },
     FIXTURE_WORKSPACE,
   );
-}, 180_000);
+});
 
 it('stops a daemon once the workspace nx link points at a different version', async () => {
   await withNxFixture(
@@ -806,7 +806,7 @@ it('stops a daemon once the workspace nx link points at a different version', as
     },
     FIXTURE_WORKSPACE,
   );
-}, 180_000);
+});
 
 it('leaves a successor record and socket in place when another process takes the record', async () => {
   await withNxFixture(
@@ -840,7 +840,7 @@ it('leaves a successor record and socket in place when another process takes the
     },
     FIXTURE_WORKSPACE,
   );
-}, 180_000);
+});
 
 it("leaves a replacement socket in place when the daemon's own socket path is replaced", async () => {
   await withNxFixture(
@@ -863,7 +863,7 @@ it("leaves a replacement socket in place when the daemon's own socket path is re
     },
     FIXTURE_WORKSPACE,
   );
-}, 180_000);
+});
 
 it('stops a daemon whose own socket path is removed with nothing taking its place', async () => {
   await withNxFixture(
@@ -878,7 +878,7 @@ it('stops a daemon whose own socket path is removed with nothing taking its plac
     },
     FIXTURE_WORKSPACE,
   );
-}, 180_000);
+});
 
 it('stops a daemon whose workspace files are all deleted before it reads the emptied workspace', async () => {
   await withNxFixture(
@@ -944,4 +944,4 @@ it('keeps an idle daemon off the lockfiles, record, and socket between its safet
     },
     FIXTURE_WORKSPACE,
   );
-}, 120_000);
+});

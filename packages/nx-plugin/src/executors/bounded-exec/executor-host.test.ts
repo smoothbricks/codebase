@@ -12,7 +12,7 @@ import { VERDICT_FILE } from './verdict.js';
 
 /**
  * The production runner's built Node artifact, run in its own process, with the real RAM volume and CPU-budget owners.
- * `test-host` already depends on this package's build; these peers must not compile TypeScript inside a test's guard.
+ * `test-host` already depends on this package's build; these peers must not compile TypeScript inside a test.
  * These proofs need the host (`hdiutil` on darwin), so the pure shards exclude this file.
  */
 const PACKAGE_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
@@ -95,12 +95,12 @@ const children = new Set<ChildRun>();
 
 describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
   afterEach(async () => {
-    // A child still open here was not awaited by its case: its guard fired, or the case failed before awaiting it. Its
-    // cumulative output is written before anything waits, so a hook timeout below cannot lose it. Each live runner is
+    // A child still open here was not awaited by its case: the case failed before awaiting it. Its cumulative output is
+    // written before anything waits, so a kill of the run during the waits below cannot lose it. Each live runner is
     // also asked, by SIGUSR2, what Node still has active; the answer lands in its stdout before the child closes.
     const live = [...children].filter((child) => !child.closed());
     for (const child of live) {
-      process.stderr.write(attribution(child, 'at guard teardown'));
+      process.stderr.write(attribution(child, 'before teardown'));
       child.askResources();
     }
 
@@ -161,7 +161,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       }
       await expectChurn(churn);
     });
-  }, 30_000);
+  });
 
   it('admits five concurrent RAM leases without blocking the lock holder behind filesystem workers', async () => {
     const root = await createRoot();
@@ -194,7 +194,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       expect(run.stdout()).toContain('leases-complete');
       expect([...run.stderr().matchAll(/inherited=true tokens=1\/1/g)]).toHaveLength(5);
     });
-  }, 30_000);
+  });
 
   it('holds a parent pool to its count: three siblings on a pool of two never hold more than two', async () => {
     const root = await createRoot();
@@ -258,7 +258,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
         await barrier.close();
       }
     });
-  }, 30_000);
+  });
 
   it('uses a real backing budget after its named pool is absent and returns the allocation', async () => {
     const root = await createRoot();
@@ -317,7 +317,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       expect(run.stdout()).not.toContain('977');
       expect(await readFile(join(directory, VERDICT_FILE), 'utf8')).toMatch(/"tokens":\s*1/);
     });
-  }, 30_000);
+  });
 
   it('keeps a command running when its parent pool closes under it, and judges it by its own exit', async () => {
     const root = await createRoot();
@@ -346,7 +346,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       expect(run.stdout()).toContain('finished');
       expect(await readFile(join(root, 'outlives', VERDICT_FILE), 'utf8')).toMatch(/"outcome":\s*"passed"/);
     });
-  }, 30_000);
+  });
 
   it('fails a run whose sub-pool does not close cleanly, even when its command exits 0', async () => {
     const root = await createRoot();
@@ -385,7 +385,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
         await rm(dirname(stuck), { recursive: true, force: true });
       }
     }
-  }, 30_000);
+  });
 });
 
 async function createRoot(): Promise<string> {
@@ -545,7 +545,7 @@ function startChild(script: string, env: NodeJS.ProcessEnv): ChildRun {
 
 /**
  * What a runner has printed and written so far, named by its script and the stage it is attributed at. Cumulative and
- * untrimmed: a guard flap says what the runner was doing, not just that it was late.
+ * untrimmed: a runner still open at teardown says what it was doing, not just that it never finished.
  */
 function attribution(child: ChildRun, stage: string): string {
   return [
