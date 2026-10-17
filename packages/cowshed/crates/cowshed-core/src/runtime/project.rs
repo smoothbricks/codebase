@@ -6094,7 +6094,58 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let landed = self
             .landed_state(workspace, &fence.head, containment)
             .await?;
-        removal_landed_decision(workspace, &fence.head, landed, abandon)
+        let refused = match removal_landed_decision(landed, abandon) {
+            RemovalLandedDecision::Landed => return Ok(None),
+            RemovalLandedDecision::Abandoned(landed) => return Ok(Some(landed)),
+            RemovalLandedDecision::Refused(refused) => refused,
+        };
+        // Refused, finally. Only now is the published branch read, and only to explain the head's
+        // count: whatever it says, this path ends in the refusal. A refusal for other branches
+        // alone has no head count to explain, so nothing is read for it.
+        let published = match refused.commits.target_head() {
+            Some(target_tip) if !refused.commits.fully_landed() => {
+                self.published_holding(workspace, fence, containment, target_tip)
+                    .await
+            }
+            _ => None,
+        };
+        Err(removal_unlanded_refusal(
+            workspace,
+            &fence.head,
+            &refused,
+            published.as_ref(),
+        ))
+    }
+
+    /// What the containment repository's tracking ref of the primary bound remote's branch holds of
+    /// a refused workspace (`crate::landing::published_holding`). A project bound to no remote, or
+    /// a binding that cannot name its primary, has no published branch to explain with: `None`,
+    /// which leaves the refusal saying exactly what the gate measured.
+    async fn published_holding(
+        &self,
+        workspace: &WorkspaceName,
+        fence: &NativeRemovalGitFence,
+        containment: &NativeContainment,
+        target_tip: &GitOid,
+    ) -> Option<crate::landing::PublishedHolding> {
+        let remote = self
+            .descriptor
+            .binding
+            .primary()
+            .ok()?
+            .remote_name
+            .as_deref()?;
+        let mount = self.workspace_mount_path(workspace).ok()?;
+        crate::landing::published_holding(
+            self.git.store_root(),
+            &containment.mount,
+            remote,
+            &containment.branch,
+            target_tip,
+            &mount,
+            fence.head.as_str(),
+        )
+        .await
     }
 
     /// Write and verify the commits that are about to lose their only workspace ref.
@@ -9130,7 +9181,7 @@ mod rebase_recovery_tests {
         target: &Path,
         branch: &str,
         unit: &Path,
-    ) -> Result<Option<NativeLandedState>> {
+    ) -> RemovalLandedDecision {
         let head = git_oid(store_root, unit).await.expect("unit head");
         let resolved = crate::landing::resolve_target(store_root, target, branch).await;
         let landed = NativeLandedState {
@@ -9139,7 +9190,7 @@ mod rebase_recovery_tests {
                 .await,
             branches: crate::landing::measure_branches(store_root, &resolved, unit, "unit").await,
         };
-        removal_landed_decision(&Lane::name("unit"), &head, landed, false)
+        removal_landed_decision(landed, false)
     }
 
     #[tokio::test]
@@ -9174,18 +9225,113 @@ mod rebase_recovery_tests {
             "main is untouched until the lane itself lands"
         );
         // The retire gate, measured against the branch the unit landed on, lets it go…
-        assert!(
-            contained_in(store_root, &lane.lane, "cowshed/lane", &unit)
-                .await
-                .expect("contained in the lane base")
-                .is_none()
+        assert_eq!(
+            contained_in(store_root, &lane.lane, "cowshed/lane", &unit).await,
+            RemovalLandedDecision::Landed,
+            "contained in the lane base"
         );
         // …and the same gate measured against main would refuse it: that is why land passes the
         // target it delivered into, and why a standalone `rm` still measures against main.
-        let refused = contained_in(store_root, &lane.main, "main", &unit)
-            .await
-            .expect_err("main does not hold the unit's commit");
-        assert_eq!(refused.code, crate::error::ErrorCode::Conflict);
+        let RemovalLandedDecision::Refused(refused) =
+            contained_in(store_root, &lane.main, "main", &unit).await
+        else {
+            panic!("main does not hold the unit's commit");
+        };
+        assert!(
+            matches!(
+                refused.commits,
+                LandingCommits::Measured { unlanded: 1, .. }
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// `rm`'s refusal path against real repositories. A workspace forked from published main, whose
+    /// one commit main's tracking ref of `codebase/main` holds while local main has diverged, is
+    /// refused exactly as before, and the published measurement explains why — for the head only:
+    /// the clone's other branch, `cowshed/forge`, is still named after it as the gate measured it.
+    /// One commit the forge never saw, and the published branch claims nothing.
+    #[tokio::test]
+    async fn a_refusal_names_the_published_branch_only_when_it_holds_every_commit() {
+        let lane = Lane::new("published");
+        let store_root = lane.store.shared();
+        let forge = Lane::clone_of(&lane.base, &lane.main, "forge");
+        unit_commit(&forge, "release.txt", "release");
+        let published_tip = git_oid(store_root, &forge).await.expect("published tip");
+        run_git(
+            &lane.main,
+            &[
+                "fetch",
+                "--quiet",
+                forge.to_str().expect("UTF-8 forge path"),
+                "cowshed/forge:refs/remotes/codebase/main",
+            ],
+        );
+        unit_commit(&lane.main, "local.txt", "committed in the main checkout");
+        let main_tip = git_oid(store_root, &lane.main).await.expect("main tip");
+        let shed = Lane::clone_of(&lane.base, &forge, "shed");
+        let published_holding = |head: GitOid| {
+            let (main, shed, main_tip) = (&lane.main, &shed, &main_tip);
+            async move {
+                crate::landing::published_holding(
+                    store_root,
+                    main,
+                    "codebase",
+                    "main",
+                    main_tip,
+                    shed,
+                    head.as_str(),
+                )
+                .await
+            }
+        };
+
+        let head = git_oid(store_root, &shed).await.expect("shed head");
+        let RemovalLandedDecision::Refused(refused) =
+            contained_in(store_root, &lane.main, "main", &shed).await
+        else {
+            panic!("local main does not hold the published commit");
+        };
+        assert_eq!(refused.commits.target_head(), Some(&main_tip));
+        let holding = published_holding(head.clone()).await;
+        assert_eq!(
+            holding,
+            Some(crate::landing::PublishedHolding {
+                reference: String::from("codebase/main"),
+                tip: published_tip.clone(),
+                target_ahead: 1,
+                target_behind: 1,
+            })
+        );
+        let message =
+            removal_unlanded_refusal(&Lane::name("shed"), &head, &refused, holding.as_ref())
+                .message;
+        assert!(
+            message.ends_with(&format!(
+                "(main is at {main_tip}); codebase/main (published, {published_tip}) holds it; \
+                 local main has diverged from it (1 ahead, 1 behind): reconcile main, do not \
+                 abandon; workspace shed holds 1 other branch that main does not hold, by \
+                 ancestry or by patch equivalence, and that no branch or push ref in main's \
+                 repository preserves: cowshed/forge at {published_tip} (1 commit)"
+            )),
+            "{message}"
+        );
+
+        unit_commit(&shed, "unpublished.txt", "unpublished");
+        let head = git_oid(store_root, &shed).await.expect("shed head");
+        let RemovalLandedDecision::Refused(refused) =
+            contained_in(store_root, &lane.main, "main", &shed).await
+        else {
+            panic!("nothing holds the unpublished commit");
+        };
+        assert!(
+            matches!(
+                refused.commits,
+                LandingCommits::Measured { unlanded: 2, .. }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(published_holding(head).await, None);
     }
 
     #[tokio::test]
@@ -14439,13 +14585,28 @@ mod removal_refusal_tests {
         })
     }
 
+    fn published(target_ahead: u64, target_behind: u64) -> crate::landing::PublishedHolding {
+        crate::landing::PublishedHolding {
+            reference: String::from("codebase/main"),
+            tip: oid('9'),
+            target_ahead,
+            target_behind,
+        }
+    }
+
     /// Every refusal a removal can answer with, so the sweep below cannot miss one.
     fn every_removal_refusal() -> Vec<CowshedError> {
         vec![
             removal_in_progress_refusal(&workspace(), "rebase-merge"),
             removal_dirty_refusal(&workspace()),
-            removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1)),
-            removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate()),
+            removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1), None),
+            removal_unlanded_refusal(
+                &workspace(),
+                &oid('4'),
+                &measured(3, 1),
+                Some(&published(32, 34)),
+            ),
+            removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate(), None),
             removal_head_moved_refusal(&workspace(), &oid('1'), &oid('4')),
             main_removal_mode_refusal(),
             NativeProjectRuntimeHost::require_session_state_clean(&workspace(), &fence(true, None))
@@ -14498,7 +14659,7 @@ mod removal_refusal_tests {
     /// it is unheld, the branch that does not hold it, and where that branch stands.
     #[test]
     fn the_unlanded_refusal_names_the_head_the_count_the_branch_and_the_tip() {
-        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1));
+        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1), None);
         assert_eq!(
             refusal.message,
             format!(
@@ -14512,14 +14673,14 @@ mod removal_refusal_tests {
 
         // One commit reads as one commit. A gate that says "1 commits" is a gate nobody trusts.
         assert!(
-            removal_unlanded_refusal(&workspace(), &oid('4'), &measured(1, 0))
+            removal_unlanded_refusal(&workspace(), &oid('4'), &measured(1, 0), None)
                 .message
                 .contains("carries 1 commit that main"),
         );
 
         // No measurement names the unanswered question rather than printing an absence, because the
         // caller is being refused for a missing proof and not for work they can see.
-        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate());
+        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate(), None);
         assert_eq!(
             refusal.message,
             format!(
@@ -14527,6 +14688,104 @@ mod removal_refusal_tests {
                  main branch",
                 oid('4')
             )
+        );
+    }
+
+    /// The refusal that read as missing work when the work was published: when main's tracking ref
+    /// of its published branch holds every commit, the refusal says so, names that tip and how far
+    /// local main has drifted from it, and points at main rather than at the workspace. The verdict
+    /// and the hint are the plain refusal's (02_workspaces.md, `rm` step 1).
+    #[test]
+    fn the_unlanded_refusal_says_when_the_published_branch_holds_every_commit() {
+        let plain = removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1), None);
+        let refusal = removal_unlanded_refusal(
+            &workspace(),
+            &oid('4'),
+            &measured(3, 1),
+            Some(&published(32, 34)),
+        );
+        assert_eq!(
+            refusal.message,
+            format!(
+                "{}; codebase/main (published, {}) holds all of them; local main has diverged from \
+                 it (32 ahead, 34 behind): reconcile main, do not abandon",
+                plain.message,
+                oid('9')
+            )
+        );
+        assert_eq!((refusal.code, &refusal.hint), (plain.code, &plain.hint));
+
+        // A main that is only behind — the lag after a release — has not diverged, and says so.
+        assert!(
+            removal_unlanded_refusal(
+                &workspace(),
+                &oid('4'),
+                &measured(1, 0),
+                Some(&published(0, 4))
+            )
+            .message
+            .ends_with(
+                "codebase/main (published, 9999999999999999999999999999999999999999) holds it; \
+                 local main is 4 behind it: reconcile main, do not abandon"
+            ),
+        );
+
+        // No measurement, no published claim: the line explains a count, and there is none.
+        assert_eq!(
+            removal_unlanded_refusal(
+                &workspace(),
+                &oid('4'),
+                &indeterminate(),
+                Some(&published(32, 34))
+            )
+            .message,
+            removal_unlanded_refusal(&workspace(), &oid('4'), &indeterminate(), None).message
+        );
+
+        // The line measured the head alone, so it speaks for the head alone. Beside an unheld
+        // branch it stays inside the head's finding, ahead of the branch's, and claims nothing for
+        // the branch; a refusal for branches alone has no head count to explain and is unchanged.
+        let branches = BranchLandings::Measured {
+            unlanded: vec![crate::api::dto::BranchLanding {
+                branch: String::from("side"),
+                tip: oid('5'),
+                commits: LandingCommits::Measured {
+                    target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
+                    target_head: oid('1'),
+                    unlanded: 2,
+                    landed: 0,
+                    behind: 0,
+                },
+            }],
+        };
+        let branch_only = NativeLandedState {
+            branches: branches.clone(),
+            ..measured(0, 0)
+        };
+        let branch_finding =
+            removal_unlanded_refusal(&workspace(), &oid('4'), &branch_only, None).message;
+        assert_eq!(
+            removal_unlanded_refusal(
+                &workspace(),
+                &oid('4'),
+                &NativeLandedState {
+                    branches,
+                    ..measured(3, 1)
+                },
+                Some(&published(32, 34)),
+            )
+            .message,
+            format!("{}; {branch_finding}", refusal.message)
+        );
+        assert_eq!(
+            removal_unlanded_refusal(
+                &workspace(),
+                &oid('4'),
+                &branch_only,
+                Some(&published(32, 34))
+            )
+            .message,
+            branch_finding
         );
     }
 
@@ -14538,41 +14797,46 @@ mod removal_refusal_tests {
         // Landed by patch identity alone: nothing ahead is unheld, though one commit is not an
         // ancestor of main. No flag, and nothing to bundle.
         assert_eq!(
-            removal_landed_decision(&workspace(), &oid('4'), measured(0, 1), false)
-                .expect("patch-equivalent work needs no authorization"),
-            None
+            removal_landed_decision(measured(0, 1), false),
+            RemovalLandedDecision::Landed,
+            "patch-equivalent work needs no authorization"
         );
 
         // Nothing ahead at all — landed by ancestry — is the same answer by the same rule.
         assert_eq!(
-            removal_landed_decision(&workspace(), &oid('4'), measured(0, 0), false)
-                .expect("a workspace with nothing ahead needs no authorization"),
-            None
+            removal_landed_decision(measured(0, 0), false),
+            RemovalLandedDecision::Landed,
+            "a workspace with nothing ahead needs no authorization"
         );
 
         // Partly landed is not landed, and the refusal stands without `--abandon`.
-        let refused = removal_landed_decision(&workspace(), &oid('4'), measured(2, 1), false)
-            .expect_err("unheld commits must be refused");
-        assert_eq!(refused.code, ErrorCode::Conflict);
+        // The refusal is the measured state itself, so its text — and whatever explains it — is
+        // built after the decision and cannot reach back into it.
+        assert_eq!(
+            removal_landed_decision(measured(2, 1), false),
+            RemovalLandedDecision::Refused(measured(2, 1)),
+            "unheld commits must be refused"
+        );
 
         // `--abandon` is what turns that refusal into an authorized loss, and it answers with the
         // state to bundle rather than with a bare go-ahead.
         assert_eq!(
-            removal_landed_decision(&workspace(), &oid('4'), measured(2, 1), true)
-                .expect("--abandon authorizes the loss"),
-            Some(measured(2, 1))
+            removal_landed_decision(measured(2, 1), true),
+            RemovalLandedDecision::Abandoned(measured(2, 1)),
+            "--abandon authorizes the loss"
         );
 
         // An unanswered question is refused exactly as unheld work is, and `--abandon` is still the
         // only way past it — so a stale or unreadable target can never authorize a deletion.
-        assert!(
-            removal_landed_decision(&workspace(), &oid('4'), indeterminate(), false).is_err(),
+        assert_eq!(
+            removal_landed_decision(indeterminate(), false),
+            RemovalLandedDecision::Refused(indeterminate()),
             "an indeterminate verdict must never read as landed"
         );
         assert_eq!(
-            removal_landed_decision(&workspace(), &oid('4'), indeterminate(), true)
-                .expect("--abandon authorizes a loss it cannot measure"),
-            Some(indeterminate())
+            removal_landed_decision(indeterminate(), true),
+            RemovalLandedDecision::Abandoned(indeterminate()),
+            "--abandon authorizes a loss it cannot measure"
         );
     }
 
@@ -14599,11 +14863,16 @@ mod removal_refusal_tests {
         let unlanded = with_branches(BranchLandings::Measured {
             unlanded: vec![side],
         });
-        let refused = removal_landed_decision(&workspace(), &oid('4'), unlanded.clone(), false)
-            .expect_err("an unheld branch must be refused");
-        assert_eq!(refused.code, ErrorCode::Conflict);
+        let RemovalLandedDecision::Refused(refused) =
+            removal_landed_decision(unlanded.clone(), false)
+        else {
+            panic!("an unheld branch must be refused");
+        };
+        assert_eq!(refused, unlanded);
+        let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &refused, None);
+        assert_eq!(refusal.code, ErrorCode::Conflict);
         assert_eq!(
-            refused.message,
+            refusal.message,
             format!(
                 "workspace raven holds 1 other branch that main does not hold, by ancestry or by \
                  patch equivalence, and that no branch or push ref in main's repository \
@@ -14612,20 +14881,21 @@ mod removal_refusal_tests {
             )
         );
         assert_eq!(
-            refused.hint,
+            refusal.hint,
             "preserve each branch: cowshed push raven --branch side"
         );
         assert_eq!(
-            removal_landed_decision(&workspace(), &oid('4'), unlanded.clone(), true)
-                .expect("--abandon authorizes the loss"),
-            Some(unlanded)
+            removal_landed_decision(unlanded.clone(), true),
+            RemovalLandedDecision::Abandoned(unlanded),
+            "--abandon authorizes the loss"
         );
 
         let unjudged = with_branches(BranchLandings::Indeterminate {
             reason: String::from("git for-each-ref failed"),
         });
-        assert!(
-            removal_landed_decision(&workspace(), &oid('4'), unjudged, false).is_err(),
+        assert_eq!(
+            removal_landed_decision(unjudged.clone(), false),
+            RemovalLandedDecision::Refused(unjudged),
             "branches that could not be judged must never read as landed"
         );
     }
@@ -17802,35 +18072,52 @@ fn removal_dirty_refusal(workspace: &WorkspaceName) -> CowshedError {
     )
 }
 
+/// What the removal gate decided about a session's commits. The refusal is an outcome of the
+/// decision, not a failure to make one, so it is a variant here rather than an `Err`.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum RemovalLandedDecision {
+    /// The head and every other local branch are held: nothing to bundle.
+    Landed,
+    /// Unheld, and `--abandon` authorized the loss: the state to bundle before deleting.
+    Abandoned(NativeLandedState),
+    /// Unheld, and nothing authorized the loss: the measured state the gate refused.
+    Refused(NativeLandedState),
+}
+
 /// The one place that decides whether a removal may destroy a session's object store.
 ///
 /// Pure, and separated from the measurement on purpose: this is the decision that destroys commits
 /// or refuses to, and a decision worth testing directly is worth being able to test without a
-/// substrate. `Some` means the caller authorized an abandonment and there is genuinely something to
-/// bundle before deleting.
+/// substrate. `Refused` carries the measured state it refused: the decision is final there, and the
+/// caller only turns it into text with [`removal_unlanded_refusal`] — which is the one point
+/// allowed to read more, to explain it.
 #[cfg(target_os = "macos")]
-fn removal_landed_decision(
-    workspace: &WorkspaceName,
-    head: &GitOid,
-    landed: NativeLandedState,
-    abandon: bool,
-) -> Result<Option<NativeLandedState>> {
+fn removal_landed_decision(landed: NativeLandedState, abandon: bool) -> RemovalLandedDecision {
     if landed.commits.fully_landed() && landed.branches.fully_landed() {
-        return Ok(None);
+        RemovalLandedDecision::Landed
+    } else if abandon {
+        RemovalLandedDecision::Abandoned(landed)
+    } else {
+        RemovalLandedDecision::Refused(landed)
     }
-    if abandon {
-        return Ok(Some(landed));
-    }
-    Err(removal_unlanded_refusal(workspace, head, &landed))
 }
 
 /// Why the gate exists: these commits exist nowhere but the image about to be deleted. Names the
 /// head and every branch that did not pass, each with its tip and what it carries.
+///
+/// `published` is what the containment repository's own tracking ref of its published branch
+/// holds of the head, measured only once the decision has refused. When it holds every commit the
+/// head carries, the head's finding says so and names the drift, because "main does not hold"
+/// alone reads as missing work when the work is in fact published and it is local main that has
+/// fallen out of step. It speaks for the head alone, so it joins the head's finding and never a
+/// branch's, and it is silent when the head passed. It explains; the refusal stands either way.
 #[cfg(target_os = "macos")]
 fn removal_unlanded_refusal(
     workspace: &WorkspaceName,
     head: &GitOid,
     landed: &NativeLandedState,
+    published: Option<&crate::landing::PublishedHolding>,
 ) -> CowshedError {
     let branch = &landed.branch;
     let mut findings = Vec::new();
@@ -17840,11 +18127,29 @@ fn removal_unlanded_refusal(
             target_head,
             unlanded,
             ..
-        } => findings.push(format!(
-            "workspace {workspace} head {head} carries {unlanded} commit{} that {branch} does \
-             not hold, by ancestry or by patch equivalence ({branch} is at {target_head})",
-            if *unlanded == 1 { "" } else { "s" }
-        )),
+        } => {
+            let mut finding = format!(
+                "workspace {workspace} head {head} carries {unlanded} commit{} that {branch} does \
+                 not hold, by ancestry or by patch equivalence ({branch} is at {target_head})",
+                if *unlanded == 1 { "" } else { "s" }
+            );
+            if let Some(published) = published {
+                let drift = match (published.target_ahead, published.target_behind) {
+                    (0, behind) => format!("local {branch} is {behind} behind it"),
+                    (ahead, 0) => format!("local {branch} is {ahead} ahead of it"),
+                    (ahead, behind) => format!(
+                        "local {branch} has diverged from it ({ahead} ahead, {behind} behind)"
+                    ),
+                };
+                finding.push_str(&format!(
+                    "; {} (published, {}) holds {}; {drift}: reconcile {branch}, do not abandon",
+                    published.reference,
+                    published.tip,
+                    if *unlanded == 1 { "it" } else { "all of them" }
+                ));
+            }
+            findings.push(finding);
+        }
         // Saying which question went unanswered is the whole value of this branch: the caller
         // is being refused for a missing proof, not for work they can see.
         LandingCommits::Indeterminate { reason } => findings.push(format!(
