@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 import { dlopen, FFIType, read as ffiRead } from 'bun:ffi';
 import {
-  type Dirent,
   chmodSync,
   closeSync,
   cpSync,
+  type Dirent,
   existsSync,
   lstatSync,
   mkdirSync,
