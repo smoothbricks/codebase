@@ -245,8 +245,8 @@ pub struct SetupArgs {
     /// Delete the retired caches volume inside setup's one authorization, once the migration has
     /// left it holding nothing but its marker. A plain setup never escalates for it.
     pub retire_caches_volume: bool,
-    /// Install the invoking build even when the installed cowshed was built from a newer commit.
-    /// Without it a build older than the installed one is refused, naming the binary.
+    /// Install the invoking build without judging it, even when it does not contain the installed
+    /// cowshed. Without it such a build is refused, naming the binary and the commits it lacks.
     pub downgrade: bool,
 }
 
@@ -1497,7 +1497,7 @@ const GATEWAY: CommandSpec = CommandSpec {
     about: &[
         "The gateway is the one trusted process outside every sandbox: workspaces reach the network, main's repository, and each other only through its authenticated Unix socket. `start` installs and loads the per-user LaunchAgent and waits until that socket answers; `stop` boots it out; `status` reports health without starting anything. Both mutations are idempotent.",
         "`run` is the LaunchAgent's own foreground entrypoint. It validates already-mounted storage and never creates any, so a background start can report missing setup but can never raise an authorization prompt.",
-        "An ordinary `stop` leaves the installed cowshed the agent ran — the content-addressed copies and the stable name linking to one of them: that is host state rather than agent state, and keeping it makes the next `start` a plist write instead of a file copy. `stop --purge` deletes them, and the `cowshed` links on your `PATH` that name them, for a host that is done with the gateway rather than pausing it. `start` installs the running build as the installed cowshed the way `setup` does, and refuses a build older than the installed one.",
+        "An ordinary `stop` leaves the installed cowshed the agent ran — the content-addressed copies and the stable name linking to one of them: that is host state rather than agent state, and keeping it makes the next `start` a plist write instead of a file copy. `stop --purge` deletes them, and the `cowshed` links on your `PATH` that name them, for a host that is done with the gateway rather than pausing it. `start` installs the running build as the installed cowshed the way `setup` does, and refuses a build that does not contain the installed one.",
     ],
     options: &[Opt {
         spelling: "--purge",
@@ -1871,7 +1871,7 @@ const SETUP: CommandSpec = CommandSpec {
         "On a host that still has the retired `cowshed.caches` volume, setup moves everything it holds to its home in the host HOME — each tool's cache to the tool's own default, the gateway's mirrors to cowshed's cache directory, sccache's store to sccache's default, a repository's cache to the `[caches] home` path its main declares — merging where both sides hold a cache and naming, with its size, anything it cannot place. That migration needs no authorization. Once the volume holds nothing but its marker, setup names `cowshed setup --retire-caches-volume` as the attended step that deletes it.",
         "Everything that can require elevation happens inside one authorization session, and every volume's exact intent is printed before the dialog appears; a run with nothing to escalate raises no prompt at all. A volume that exists but is not this host's — a `cowshed.store` in another container — is reported with its device and left exactly as it is, never adopted and never re-created, because re-creating means deleting a volume. `cowshed doctor` explains a host; this repairs one.",
         "Setup installs the invoking build as the host's cowshed — the CLI and the daemon alike, as one artifact. The build is copied to a content-addressed file beside the plists' volume, `~/Library/Application Support/dev.cowshed/bin/cowshed-<sha256>`; the stable name `cowshed` there becomes a link to it; the gateway agent runs that name; and the first `cowshed` on your `PATH`, when it is a symbolic link — what `bun link` of the package or a link made by hand leaves — is pointed at it too. The `cowshed` you type and the daemon are then the same bytes, and only `cowshed setup` changes them: rebuilding a checkout changes nothing on `PATH` until a setup runs from that build. A setup run from the installed copy therefore installs nothing; install another build by running that build's own `cowshed setup` — a checkout's `packages/cowshed/bin/cowshed`, or its `dist/bin/<platform>/cowshed`. A gateway that answers while running other bytes than the installed copy is restarted onto it, and a stale installed copy is replaced through the same atomic plan `gateway start` uses, with the previous build put back if the agent cannot be activated. A service left running a binary from before this build is host drift a repair ends — setup never reports such a host as set up. Run setup from a release build — the platform `cli-*` target's `production` configuration (`nx run cowshed:cli-arm64-macos:production` on Apple silicon) or `cargo build --release -p cowshed-cli`; `nx run cowshed:build` builds a debug one, and a debug build is refused as the supervised binary.",
-        "Release builds record the commit they were made from, and the installed cowshed keeps the record of its build. Setup refuses to install a build older than the installed one — or one that records nothing, which cannot show it is not older — naming the binary it would have installed, and exits non-zero after repairing everything else. A stale checkout's build on `PATH` is how a host once lost a landed gateway feature without anyone asking for it. `--downgrade` installs the invoking build anyway.",
+        "Release builds record the commit they were made from, and the installed cowshed keeps the record of its build. One install runs at a time: setup holds the install slot, `dev.cowshed/install.lock`, for its whole run, and a second setup or `gateway start` waits for it and then judges its own build against whatever was installed meanwhile. Setup refuses to replace the installed cowshed with a build that does not contain it: the build's commit must be on an adopted project's `main`, and that main must show the build holding every installed commit, by ancestry or patch identity, as `cowshed rm` requires of a workspace. The refusal names the binary, both builds and each commit the install would remove; a build that records nothing is refused too. Setup repairs everything else and exits non-zero. `--downgrade` installs the invoking build without judging it.",
         "After successful storage repair, setup refreshes every adopted main's build state through the same path jobs use. It announces rebuild-only migration before discarding contributed incremental directories, protects tracked source files, and links an empty build volume for the next build to repopulate. No build state is copied. One refusing project does not hide later projects: each is reported on stderr, then setup exits with the first typed failure and a count. Uninstall never migrates build state.",
         "The host session workspace mount root is fixed, and setup has no option or setting to change it. On macOS it is `/private/var/folders/cowshed/<uid>/mnt` (also spelled `/var/folders/cowshed/<uid>/mnt`), using the invoking numeric uid, not HOME or a random temporary directory; on Linux it is `~/.cowshed/mnt`. Setup creates or repairs the stable macOS prefix root:wheel 0755 and its user directories uid:gid 0700 through the same single authorization, refusing symlinks, non-directories and foreign ownership. Session workspaces mount at `<root>/<owner>/<repo>/<ws>`, and build volumes also derive from that root; mains stay mounted directly at their checkout paths.",
         "To reach workspaces through a preferred path, make a symbolic link at that path pointing to the root, for example `ln -s /private/var/folders/cowshed/$(id -u)/mnt ~/workspaces` (on Linux, point it at `~/.cowshed/mnt`). The link runs from the preferred path to the root, never the other way round: the root stays a real directory, because the kernel-resolved physical mount path is what Spotlight's indexer admits. Cowshed's identity probe and workspace jobs use canonical mount paths; identity rules anchored only at an alias are not reliable.",
@@ -1899,7 +1899,7 @@ const SETUP: CommandSpec = CommandSpec {
         },
         Opt {
             spelling: "--downgrade",
-            meaning: "install the invoking build although the installed cowshed was built from a newer commit",
+            meaning: "install the invoking build without judging whether it contains the installed cowshed",
         },
     ],
 };
@@ -4363,8 +4363,8 @@ mod tests {
             "--retire-caches-volume repairs a host; --uninstall tears it down"
         );
 
-        // Installing a build older than the installed one is asked for by name, and only by a run
-        // that installs a build at all.
+        // Installing a build that does not contain the installed one is asked for by name, and
+        // only by a run that installs a build at all.
         assert_eq!(
             parse_args(["setup", "--downgrade"]).unwrap().command,
             Command::Setup(SetupArgs {

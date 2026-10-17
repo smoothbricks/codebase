@@ -314,7 +314,7 @@ pub trait HostSetup: Send {
 /// The real host, rooted at the canonical home every other host verb resolves.
 pub struct NativeHostSetup {
     home: PathBuf,
-    /// Whether this run may install a build older than the installed cowshed.
+    /// Whether this run may install a build that does not contain the installed cowshed.
     downgrade: Downgrade,
 }
 
@@ -356,7 +356,9 @@ impl HostSetup for NativeHostSetup {
 
     async fn install_cli(&mut self) -> Result<Option<CliInstall>> {
         let path = std::env::var_os("PATH").unwrap_or_default();
-        crate::gateway_service::install_cli(&self.home, self.downgrade, &path).map(Some)
+        crate::gateway_service::install_cli(&self.home, self.downgrade, &path)
+            .await
+            .map(Some)
     }
 
     /// Count what the store holds, or say why it could not be counted.
@@ -741,6 +743,10 @@ fn count_project_workspaces(layout: &StorageLayout) -> std::result::Result<usize
 }
 
 /// Resolve the real host and run the verb against it.
+///
+/// The whole run holds the install slot (05_gateway.md "The install slot"): a second `setup` or
+/// `gateway start` waits for this one, and then judges its build against what this one left
+/// installed, because every judgement is made after the slot is taken.
 pub async fn dispatch_native<W, E>(
     args: &SetupArgs,
     json: bool,
@@ -750,6 +756,7 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    let _slot = crate::gateway_service::take_install_slot(&canonical_home()?).await?;
     let mut host = NativeHostSetup::for_canonical_home(if args.downgrade {
         Downgrade::Allow
     } else {

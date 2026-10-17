@@ -83,8 +83,9 @@ host Node-API addon), which writes `dist/bin/<platform>/cowshed`, then run that 
 rebuild changes nothing there until you run the checkout's `setup` again. Do not put a link to the checkout's
 `bin/cowshed` on `PATH` — it would run whatever the checkout last built, under a daemon still running the build setup
 installed, and the daemon refuses another build's commands. The default `cli-*` configuration builds cargo's dev
-profile, which is for tests and local iteration, and setup refuses to install it; setup also refuses a build of an older
-commit than the installed one unless you pass `--downgrade`.
+profile, which is for tests and local iteration, and setup refuses to install it; setup also refuses a build that does
+not contain the installed one — its commit must be on `main` and hold every installed commit — unless you pass
+`--downgrade`.
 
 A daemon/caller “the cowshed daemon is build X; this cowshed is build Y” refusal (exit 4) is a build-identity conflict,
 not workspace corruption; install the intended build with its own setup before retrying

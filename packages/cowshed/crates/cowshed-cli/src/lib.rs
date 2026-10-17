@@ -9,6 +9,7 @@ pub mod forget;
 pub mod gateway_service;
 pub mod help;
 pub mod identity_service;
+pub mod install_basis;
 pub mod jobserver_launcher;
 pub mod launchd;
 pub mod mount_main;

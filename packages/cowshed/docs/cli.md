@@ -102,12 +102,16 @@ nothing on `PATH` until a setup runs from that build. The details are in
 another build, run that build's own setup: a checkout's `packages/cowshed/bin/cowshed setup`, or its
 `dist/bin/<platform>/cowshed setup`. A debug build is never installed.
 
-Release builds record the commit they were built from. Setup refuses to replace the installed cowshed with a build of an
-older commit, or with one that records no commit (it cannot show it is not older), naming the binary it would have
-installed and both builds; it repairs everything else, prints the reason and the remedy, and exits non-zero with a
-`conflict`. An installed cowshed that records nothing — installed before builds recorded their commit — never blocks an
-install. `--downgrade` installs the invoking build anyway; it is refused with `--uninstall` and `--force`, which install
-nothing.
+Release builds record the commit they were built from. One install runs at a time: setup holds the install slot,
+`~/Library/Application Support/dev.cowshed/install.lock`, for its whole run, and a second `setup` or `gateway start`
+waits for it, then judges its own build against whatever was installed meanwhile. Setup refuses to replace the installed
+cowshed with a build that does not contain it: the build's commit must be on an adopted project's `main`, and that main
+must show the build holding every installed commit, by ancestry or patch identity (the containment `cowshed rm`
+requires). The refusal names the binary, both builds and each commit the install would take off the host; a build that
+records no commit is refused too. Setup repairs everything else, prints the reason and the remedy, and exits non-zero
+with a `conflict`. An installed cowshed that records nothing — installed before builds recorded their commit — never
+blocks an install; an installed record that cannot be read is an `integrity` refusal. `--downgrade` installs the
+invoking build without judging it; it is refused with `--uninstall` and `--force`, which install nothing.
 
 The commands that change a workspace or run work in one — `adopt`, `fork`, `mv`, `checkpoint`, `restore`, `path`,
 `exec`, `grant`, `rm`, `forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`, `gc`, `push`, `rebase`,
@@ -1187,15 +1191,15 @@ build. `start` installs the running executable the way [`cowshed setup`](#cowshe
 does — copying it in when no stored copy holds its bytes, whatever volume it came from, and moving the link to it in one
 rename — but leaves the `cowshed` on your `PATH` alone. A build inside a workspace or the nix store is copied rather
 than refused — the copy is precisely what makes the agent independent of a path that only exists once cowshed has
-mounted it. A debug build is refused, and so is a build of an older commit than the installed one (or one that records
-no commit), before anything is installed; `start` has no `--downgrade`, which is `setup`'s. A failed activation puts the
-previous build back. `stop` boots out the agent and removes the plist, leaving the installed cowshed — host state rather
-than agent state, and keeping it makes the next `start` a plist write instead of a fresh multi-megabyte copy.
-`stop --purge` deletes it too — the stable name, every stored copy and its build record, and the `cowshed` links on your
-`PATH` that name the stable name — for a host that is done with the gateway rather than pausing it;
-`cowshed setup --uninstall` removes the system storage daemon, both user agents, the installed cowshed with its `PATH`
-links and sccache's nix GC root at once. All of these are idempotent, and a `--purge` with nothing installed says so
-rather than failing.
+mounted it. A debug build is refused, and so is a build that does not contain the installed one (or one that records no
+commit), before anything is installed; `start` waits for the install slot like `setup` and has no `--downgrade`, which
+is `setup`'s. A failed activation puts the previous build back. `stop` boots out the agent and removes the plist,
+leaving the installed cowshed — host state rather than agent state, and keeping it makes the next `start` a plist write
+instead of a fresh multi-megabyte copy. `stop --purge` deletes it too — the stable name, every stored copy and its build
+record, and the `cowshed` links on your `PATH` that name the stable name — for a host that is done with the gateway
+rather than pausing it; `cowshed setup --uninstall` removes the system storage daemon, both user agents, the installed
+cowshed with its `PATH` links and sccache's nix GC root at once. All of these are idempotent, and a `--purge` with
+nothing installed says so rather than failing.
 
 `status` and `doctor` call the gateway healthy only when the daemon runs the same bytes as the CLI asking; a daemon
 running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
