@@ -1,11 +1,12 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are asserted literally. */
 import { describe, expect, it } from 'bun:test';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { managedNxPatch } from '@smoothbricks/nx-plugin/managed-files/files';
 import { renderPublishWorkflowYaml } from '@smoothbricks/nx-plugin/managed-files/publish-workflow';
 import { LINUX_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
+import typia from 'typia';
 import { type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import {
   anyProjectHasTagForTest,
@@ -393,6 +394,52 @@ describe('managed cache actions', () => {
         expect(osKeyLines).toHaveLength(action.osKeyLines);
         expect(osKeyLines.every((line) => line.includes(ARCHITECTURE_SCOPED_PREFIX))).toBe(true);
       }
+    }
+  });
+
+  it('restores isolated Bun aliases with the cache targets they name', async () => {
+    const action = typia.assert<{ runs: { steps: [{ with: { path: string } }] } }>(
+      Bun.YAML.parse(await readFile(join(REPO_ROOT, '.github/actions/cache-node-modules/action.yml'), 'utf8')),
+    );
+    const paths = typia.assert<Array<'node_modules' | '~/.bun/install/cache/links'>>(
+      action.runs.steps[0].with.path.trim().split('\n'),
+    );
+    const temp = await mkdtemp(join(tmpdir(), 'smoo-bun-cache-'));
+    const modules = join(temp, 'checkout', 'node_modules');
+    const links = join(temp, 'home', '.bun', 'install', 'cache', 'links');
+    const entry = join(links, 'fixture@1.0.0-cache');
+    const storeAlias = join(modules, '.bun', 'fixture@1.0.0');
+    const manifest = join(modules, 'fixture', 'package.json');
+    const content = `${JSON.stringify({ name: 'fixture', version: '1.0.0' })}\n`;
+    const modulesOnly = join(temp, 'modules-only.tar');
+    const configured = join(temp, 'configured.tar');
+    const tar = (...args: string[]): void => {
+      expect(Bun.spawnSync(['tar', ...args], { cwd: temp, stderr: 'inherit' }).exitCode).toBe(0);
+    };
+    try {
+      await mkdir(join(entry, 'node_modules', 'fixture'), { recursive: true });
+      await mkdir(join(modules, '.bun'), { recursive: true });
+      await writeFile(join(entry, 'node_modules', 'fixture', 'package.json'), content);
+      await symlink(entry, storeAlias);
+      await symlink(join('.bun', 'fixture@1.0.0', 'node_modules', 'fixture'), join(modules, 'fixture'));
+      expect(await readFile(manifest, 'utf8')).toBe(content);
+
+      tar('-cf', modulesOnly, relative(temp, modules));
+      tar('-cf', configured, ...paths.map((path) => relative(temp, path === 'node_modules' ? modules : links)));
+      await rm(modules, { recursive: true, force: true });
+      await rm(links, { recursive: true, force: true });
+
+      tar('-xf', modulesOnly);
+      await expect(readFile(manifest, 'utf8')).rejects.toThrow('ENOENT');
+      expect(await readlink(storeAlias)).toBe(entry);
+      await rm(modules, { recursive: true, force: true });
+
+      tar('-xf', configured);
+      expect(await readlink(storeAlias)).toBe(entry);
+      expect(await readFile(manifest, 'utf8')).toBe(content);
+      expect(paths).toEqual(['node_modules', '~/.bun/install/cache/links']);
+    } finally {
+      await rm(temp, { recursive: true, force: true });
     }
   });
 });
