@@ -931,7 +931,7 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
       },
       'workspace',
     );
-  }, 60_000);
+  });
 
   it('replays current outputs and refreshes stale snapshots without running unrelated edits', async () => {
     // A socket path has a 95 character budget and macOS's temp directory spends most of it, so the
@@ -1258,5 +1258,5 @@ console.log(JSON.stringify(await ensureBuilt({ target: 'app:build', cwd: process
         cause: failure.error,
       });
     }
-  }, 60_000);
+  });
 });

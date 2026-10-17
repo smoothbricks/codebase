@@ -296,7 +296,7 @@ describe('the parent-held CPU pool', () => {
       holder.kill('SIGKILL');
       await holder.exited;
     }
-  }, 20_000);
+  });
 
   it('treats a dead or non-socket endpoint as absent, and a malformed endpoint as no pool', async () => {
     const { pool, parent } = await openPool(2);

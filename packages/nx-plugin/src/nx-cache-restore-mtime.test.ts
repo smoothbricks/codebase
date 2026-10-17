@@ -127,7 +127,7 @@ it('restores a locally cached output newer than the output it replaces', async (
     expect(restored.log).toContain('[local cache]');
     expectRestoredNewer(restored, fromB, 'A');
   });
-}, 60_000);
+});
 
 it('restores a remotely cached output newer than the output it replaces', async () => {
   // The self-hosted remote cache protocol Nx's native HTTP cache speaks: GET and PUT of an
@@ -167,4 +167,4 @@ it('restores a remotely cached output newer than the output it replaces', async 
     expect(restored.log).toContain('[remote cache]');
     expectRestoredNewer(restored, fromB, 'A');
   });
-}, 60_000);
+});

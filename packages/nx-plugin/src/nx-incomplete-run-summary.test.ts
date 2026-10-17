@@ -67,4 +67,4 @@ it('does not report success for a run the orchestrator abandoned part way throug
       expect(output).toContain('Tasks the run ended without finishing:\n\n- p:second');
     }
   });
-}, 60_000);
+});

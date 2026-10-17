@@ -656,7 +656,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(await straggler).toBe('');
     expect(result.success).toBe(false);
     expect(result.terminalOutput).toContain('Force-killing what the timed-out command left in its process group');
-  }, 60_000);
+  });
 
   it('runs the command with its RAM lease as TMPDIR, names held dead leases, and ends the lease after it exits', async () => {
     const workspace = await createWorkspace();

@@ -150,7 +150,7 @@ it('keys a custom target on exactly its Cargo closure, inside the workspace and 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}, 120_000);
+});
 
 it('keys literal compiled-in data inside and outside crate directories without keying comments or unrelated crates', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-compiled-data-')));
@@ -208,7 +208,7 @@ it('keys literal compiled-in data inside and outside crate directories without k
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}, 120_000);
+});
 
 it('refuses a closure member in an ignored directory, which no fileset can see, instead of hashing the whole workspace', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-ignored-')));
@@ -226,7 +226,7 @@ it('refuses a closure member in an ignored directory, which no fileset can see, 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}, 120_000);
+});
 
 it('leaves a closure inside the workspace to Nx: no process runs when its tasks are hashed', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-inferred-')));
@@ -257,7 +257,7 @@ it('leaves a closure inside the workspace to Nx: no process runs when its tasks 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}, 120_000);
+});
 
 /** `leaf` as the fixture writes it, and the dependency that draws `unrelated` into every closure reaching `leaf`. */
 const LEAF_MANIFEST = '[package]\nname="leaf"\nversion="0.1.0"\nedition="2021"\n';
@@ -333,7 +333,7 @@ it('delegates counted Cargo through the caller launcher without re-entering its 
     await fixtureCargo?.release();
     await rm(root, { recursive: true, force: true });
   }
-}, 30_000);
+});
 
 it('shares one Cargo child among overlapping graph computations, and an unchanged workspace never asks Cargo again', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-overlap-')));
@@ -388,7 +388,7 @@ it('shares one Cargo child among overlapping graph computations, and an unchange
     await fixtureCargo?.release();
     await rm(root, { recursive: true, force: true });
   }
-}, 120_000);
+});
 
 it('refuses with a typed error what Cargo refuses, and follows an edit made while a child holds its answer with a resolution after it', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-pending-')));
@@ -454,7 +454,7 @@ it('refuses with a typed error what Cargo refuses, and follows an edit made whil
     await fixtureCargo?.release();
     await rm(root, { recursive: true, force: true });
   }
-}, 120_000);
+});
 
 it("indexes a source tree's Cargo manifests and none of the runtime state a cowshed keeps in it", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-runtime-state-')));
@@ -477,7 +477,7 @@ it("indexes a source tree's Cargo manifests and none of the runtime state a cows
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}, 120_000);
+});
 
 const SOURCE_FILE = 'src/lib.rs';
 
@@ -551,4 +551,4 @@ it("keeps a cowshed's runtime state from waking the watcher that recomputes the 
   const paths = await watchedPaths(await readFile(join(repositoryRoot, '.nxignore'), 'utf8'));
   expect(paths).toContain(SOURCE_FILE);
   expect(paths.filter((path) => path.startsWith('.cowshed'))).toEqual([]);
-}, 120_000);
+});

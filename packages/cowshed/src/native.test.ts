@@ -288,9 +288,6 @@ async function scriptedController(client: string): Promise<ScriptedRun> {
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
-    // Bounds only a deadlocked pair; a working client ends in milliseconds. Killing the
-    // controller closes the client's endpoint, which ends the client too.
-    timeout: 20_000,
   });
   const [exitCode, stdout, stderr] = await Promise.all([
     node.exited,
@@ -409,7 +406,7 @@ describe('Cowshed Node-API bindings', () => {
       { repoId: 'acme/widget', workspace: 'raven', from: 'main', dryRun: true },
       { repoId: 'acme/widget', workspace: 'raven', from: 'lane-base', dryRun: false },
     ]);
-  }, 30_000);
+  });
 
   /**
    * One `Cowshed` holds one controller connection for every handle, and `job.wait()` lasts as
@@ -419,7 +416,7 @@ describe('Cowshed Node-API bindings', () => {
    * Node client as fd 3, the way a trusted spawner hands an endpoint over. The controller keeps
    * the wait open until it has answered non-follow logs and the job's status. Logs reach an empty
    * current-end chunk with eof=false; this is not the end of the running job. A client that holds
-   * these other calls behind the wait deadlocks with it, and the spawn's deadline ends the pair.
+   * these other calls behind the wait deadlocks with it, and the leg's no-progress bound ends the pair.
    */
   it('reads current raw logs and status while job.wait() is pending on one connection', async () => {
     const client = `
@@ -506,7 +503,7 @@ describe('Cowshed Node-API bindings', () => {
       stdout: JSON.stringify({ bytes: [0, 255, 128, 10], offset: 4, eof: false, status: 'running', ended: 'exited' }),
       stderr: '',
     });
-  }, 30_000);
+  });
 
   /**
    * 07_api "Keyed admission": the actual addon carries an exec's admission key onto the
@@ -615,7 +612,7 @@ describe('Cowshed Node-API bindings', () => {
       ],
       stderr: '',
     });
-  }, 30_000);
+  });
 
   /**
    * `job.progress` is an `AsyncIterable` whose every step is one demand: the controller hears the
@@ -648,7 +645,7 @@ describe('Cowshed Node-API bindings', () => {
       stderr: '',
       heard: ['open every 10', 'next', 'next', 'next', 'next', 'next'],
     });
-  }, 30_000);
+  });
 
   /**
    * Breaking out of the loop closes the call and nothing else: the controller hears the close,
@@ -683,13 +680,13 @@ describe('Cowshed Node-API bindings', () => {
       stderr: '',
       heard: ['open every 25', 'next', 'close'],
     });
-  }, 30_000);
+  });
 
   /**
    * The addon's `close` ends the call while a demand waits unanswered: the controller withholds the
    * second sample, and answers the status only once that demand has reached it, so the close is
    * sent after it. The waiting `next` resolves to the end. A close that waited behind the demand
-   * would never reach the controller, which deadlocks the pair until the spawn's deadline.
+   * would never reach the controller, which deadlocks the pair until the leg's no-progress bound ends it.
    */
   it('closes a stream from the addon while a demand waits for its event', async () => {
     const nativeUrl = pathToFileURL(join(import.meta.dir, '..', 'dist', 'ts', 'native.js')).href;
@@ -717,7 +714,7 @@ describe('Cowshed Node-API bindings', () => {
       stderr: '',
       heard: ['open every 999', 'next', 'close'],
     });
-  }, 30_000);
+  });
 
   /** The public iterator's `return` closes the call at once, never behind the `next` that waits. */
   it('returns from job progress while a demand waits for its event', async () => {
@@ -740,7 +737,7 @@ describe('Cowshed Node-API bindings', () => {
       stderr: '',
       heard: ['open every 999', 'next', 'close'],
     });
-  }, 30_000);
+  });
 
   /**
    * A reader that already holds a stream's first bytes continues from there, never from zero; a
@@ -776,14 +773,14 @@ describe('Cowshed Node-API bindings', () => {
       stderr: '',
       heard: [`logs from ${offset}`, 'tail latest', `tail after {"stdout":${offset},"stderr":0}`],
     });
-  }, 30_000);
+  });
 });
 
 /**
  * A Node controller serves the wire on one end of a socket pair and hands the other end to a Node
  * `client` as fd 3, the way a trusted spawner hands an endpoint over. It greets, opens the project
  * and the worker; `calls` defines `call(message)`, which answers the rest and returns false for a
- * call it does not script. The spawn's deadline ends a deadlocked pair.
+ * call it does not script. The leg's no-progress bound ends a deadlocked pair.
  */
 async function scriptedPair(
   client: string,
@@ -860,9 +857,6 @@ async function scriptedPair(
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
-    // Bounds only a deadlocked pair; a working client ends in milliseconds. Killing the
-    // controller closes the client's endpoint, which ends the client too.
-    timeout: 20_000,
   });
   const [exitCode, stdout, stderr] = await Promise.all([
     node.exited,

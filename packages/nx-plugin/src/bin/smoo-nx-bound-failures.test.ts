@@ -106,7 +106,7 @@ it('names the failed dependency Nx recorded in cacheDir, not the checkout-local 
     if (published) await retireFixtureSocketDirectory(workspace);
     await rm(root, { recursive: true, force: true });
   }
-}, 90_000);
+});
 
 function nxPath(script: string, env: NodeJS.ProcessEnv): string {
   const printed = spawnSync('node', ['-e', script], { cwd: repositoryRoot, env, encoding: 'utf8' });

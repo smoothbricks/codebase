@@ -41,7 +41,7 @@ it('names the duplicate project and both roots when local plugin resolution fail
     expect(output).toContain('- packages/second');
     expect(output).not.toContain('fixture-plugin-executed');
   });
-}, 60_000);
+});
 
 for (const fixture of [
   {
@@ -116,5 +116,5 @@ throw failure;
       for (const message of fixture.messages) expect(output).toContain(message);
       if (fixture.repeated !== undefined) expect(output.split(fixture.repeated).length - 1).toBe(2);
     });
-  }, 60_000);
+  });
 }

@@ -94,4 +94,4 @@ it('hashes an input rewritten in the second its archived hash was taken', async 
     expect(skewed.log).not.toContain('[local cache]');
     expect(skewed.result).toBe('E');
   });
-}, 60_000);
+});

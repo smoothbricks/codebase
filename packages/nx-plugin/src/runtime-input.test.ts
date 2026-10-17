@@ -141,7 +141,7 @@ describe('a planted runtime input failure through real Nx', () => {
         expect(await readFile(join(record, 'stderr'), 'utf8')).toBe('planted-cause\n');
         expect(await readFile(join(record, 'report'), 'utf8')).toContain('runtime input exited 3: sh -c');
       });
-    }, 60_000);
+    });
   }
 });
 
