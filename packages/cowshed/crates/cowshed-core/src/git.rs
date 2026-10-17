@@ -1554,9 +1554,13 @@ impl GitRepository {
     /// hold.
     ///
     /// `git cherry` semantics for ordinary commits, and the semantics matter: equivalence is decided
-    /// by patch-id, so a commit that reached `revision` by squash-merge, cherry-pick, or a history
-    /// rewrite counts as held even though it is not an ancestor. A rebase that resolved a conflict
-    /// produces a different patch and correctly does not count.
+    /// by patch-id, so a commit that reached `revision` by cherry-pick, a history rewrite, or a
+    /// squash of that one commit alone counts as held even though it is not an ancestor. A squash
+    /// of several commits does not: its patch is the sum of theirs and matches none of them, so
+    /// each squashed commit stays unheld. Measured: `d7d73bdf9`, `5f4a38df7` and `0461d3a41`
+    /// reached published main as the single commit `ea73984d9`, and `git cherry` marks all three
+    /// `+`. A rebase that resolved a conflict produces a different patch and correctly does not
+    /// count.
     ///
     /// Callers derive `unlanded` by subtracting this from the total ahead count, so anything this
     /// does not count blocks a no-flag removal. Three kinds need care, because git treats them
