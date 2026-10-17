@@ -1598,8 +1598,9 @@ fn clone_repository_nx_install(checkout: &Path, nx: &Path) {
                         .expect("a store entry is named")
                         .to_string_lossy()
                         .into_owned();
-                    if !entries.contains_key(&name) {
-                        entries.insert(name, linked.to_path_buf());
+                    if let std::collections::btree_map::Entry::Vacant(vacant) = entries.entry(name)
+                    {
+                        vacant.insert(linked.to_path_buf());
                         pending.push(linked.to_path_buf());
                     }
                 } else if file_type.is_dir() {
