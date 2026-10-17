@@ -621,23 +621,25 @@ core count.
   count as its own pool, and grandchildren draw only from that pool: no holder waits for another grant from an ancestor
   or the host. The parent remains the owner of its upstream grant. A child returns only its local allocation by closing
   its connection; it never releases the parent's connection. Upstream loss revokes the downstream pool and its
-  connections, so a dead parent cannot grant tokens to a descendant. Losing a borrowed grant ends its still-running
-  command through the normal TERM/grace/KILL path and reports an ordinary CPU-grant-loss failure, never a timeout. If a
-  bound already started terminating the command, the loss still makes its verdict an ordinary failure; the existing
-  termination owns the signals and grace, so losing the grant starts no second teardown. A bare or invalid count proves
-  no allocation; an absent endpoint follows normal host admission. Once connected to the parent, refusal, silence or
-  protocol failure is an ordinary admission failure, never a second host take while that parent may still hold its
-  grant. A stale descriptor whose endpoint no longer connects is treated as absent. Only the executor publishes its
-  actual live pool; `options.env` cannot inject either marker into a command. The span and `cpu.inherited: true` record
-  identify a parent-pool grant and its actual local wait. Pool setup or cleanup failure is an ordinary failure, never a
-  successful unaccounted run. Real-process default-runner proofs live in `executor-host.test.ts` under `test-host`,
-  because the default macOS runner acquires a real RAM volume. Node peers import the built executor artifact named by
-  `executors.json`; the host target's existing build dependency produces it, rather than compiling TypeScript inside a
-  test's guard. Pure pool and executor unit cases never attach images. **Known admission ambiguity:** a connect error is
-  currently classified as an absent endpoint. A full listen backlog or local file-descriptor exhaustion can also prevent
-  connection to a live pool, so this classification does not yet prove that its parent has released the upstream grant.
-  Distinguishing those cases before any host fallback remains an admission follow-up; connected refusals and protocol
-  errors already fail without a second take.
+  connections, so a dead parent cannot grant tokens to a descendant. Revocation ends accounting, never work: a command
+  whose borrowed or host grant closes while it runs — the gateway restarting, which every install does, or the lending
+  parent exiting — runs on over budget to its own exit, says so on stderr
+  (`cowshed: cpu-tokens grant ended: … it runs on over budget until it ends`), and is judged by that exit alone, as
+  "Crash safety by connection" below says of every runner across a gateway restart. A connection is a ledger entry, not
+  the work's owner; only a bound, a signal or the process that started the command stops it. A grant loss is never a
+  failure and starts no teardown. A bare or invalid count proves no allocation; an absent endpoint follows normal host
+  admission. Once connected to the parent, refusal, silence or protocol failure is an ordinary admission failure, never
+  a second host take while that parent may still hold its grant. A stale descriptor whose endpoint no longer connects is
+  treated as absent. Only the executor publishes its actual live pool; `options.env` cannot inject either marker into a
+  command. The span and `cpu.inherited: true` record identify a parent-pool grant and its actual local wait. Pool setup
+  or cleanup failure is an ordinary failure, never a successful unaccounted run. Real-process default-runner proofs live
+  in `executor-host.test.ts` under `test-host`, because the default macOS runner acquires a real RAM volume. Node peers
+  import the built executor artifact named by `executors.json`; the host target's existing build dependency produces it,
+  rather than compiling TypeScript inside a test's guard. Pure pool and executor unit cases never attach images. **Known
+  admission ambiguity:** a connect error is currently classified as an absent endpoint. A full listen backlog or local
+  file-descriptor exhaustion can also prevent connection to a live pool, so this classification does not yet prove that
+  its parent has released the upstream grant. Distinguishing those cases before any host fallback remains an admission
+  follow-up; connected refusals and protocol errors already fail without a second take.
 - **Queued priority** (2026-10-11). The coordinator supplies each job's priority, an unsigned 32-bit integer, higher
   first, default 0. It orders queued bulk work and queued lands within their own queues; no value outranks the active
   gate or manufactures gate authority. A priority change re-keys pending work, never interrupts, resizes or restarts an
@@ -758,7 +760,11 @@ core count.
   host leaves every band's work at full speed.
 - **Crash safety by connection.** The grant is tied to the connection: on exit, `SIGKILL` included, the kernel closes
   the socket and the gateway returns the tokens at once. A request that closes while queued leaves the queue. A gateway
-  restart forgets every grant, so runners started under the old one overshoot until they finish.
+  restart forgets every grant, so runners started under the old one overshoot until they finish. The gateway does not
+  drain held grants before it exits: its drain (`Gateway::drain`) stops the control socket first, aborting every held
+  lease connection, and a crash closes them the same way. Holders therefore read a closed grant as the end of its
+  accounting and keep running; no holder stops work because its connection closed. A request still queued when the
+  gateway goes is refused, as any premature close is, and its runner never starts.
 - **The bounds start at the grant.** The executor's `timeoutMs` and `idleTimeoutMs` start when the command starts, after
   the grant: a wait for the host is not the command's time.
 - **Wire.** The client writes
@@ -805,12 +811,14 @@ core count.
     `g − 1` token bytes, instead of `CARGO_BUILD_JOBS`; each `grown` line from the pool adds its difference to that
     fifo, and the launcher unlinks it when Cargo ends. A gateway pool grows a child by the rules above; the
     `bounded-exec` pool accepts the field and never grows. Any other line after the grant is a protocol failure and ends
-    the build as a loss. Cargo's own inherited make jobserver still comes first. Noncompiling subcommands still run
-    directly. A connected parent's refusal, connection failure, malformed grant or loss fails the command. A valid named
-    pool never falls through to a second root or an unbudgeted run. An absent or malformed descriptor alone follows
-    normal host admission. The launcher owns its unreaped Cargo process group, ends it on pool loss with the normal
-    TERM/grace/KILL path (10 seconds grace), and releases its local grant after its command ends; it never freezes a
-    test.
+    the pool's accounting as its close does. Cargo's own inherited make jobserver still comes first. Noncompiling
+    subcommands still run directly. A connected parent's refusal, connection failure or malformed grant fails the
+    command. A valid named pool never falls through to a second root or an unbudgeted run. An absent or malformed
+    descriptor alone follows normal host admission. The launcher owns its unreaped Cargo process group. Its pool's close
+    (a gateway restart, or the lending parent's exit) is said on stderr and stops nothing: Cargo runs on over budget and
+    the launcher exits with Cargo's status. Only a signal sent to the launcher ends the group, through the normal
+    TERM/grace/KILL path (10 seconds grace), so a launcher killed by its own parent never leaves Cargo's separate group
+    behind. It releases its local grant after its command ends; it never freezes a test.
   - **A `bounded-exec` grant** (`BOUNDED_EXEC_CPU_TOKENS` set): it takes no second grant and runs `cargo` with
     `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to `BOUNDED_EXEC_CPU_TOKENS` where they are
     unset. `bounded-exec` sets the cargo variables only for a cargo runner, so a `cargo` that a `process` runner's

@@ -724,6 +724,11 @@ mod tests {
     }
 }
 
+/// Borrow from the parent CPU pool at `socket` and run Cargo in its own process group under that
+/// grant. The pool's connection is a ledger entry, not the build's owner: its close (the gateway
+/// restarting, or the lending parent exiting) is said and stops nothing, so Cargo runs on over
+/// budget and its status is the launcher's (05_gateway.md "Host CPU budget"). Only a signal sent
+/// to the launcher ends the group.
 fn ask_parent(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32, String> {
     let mut stream = UnixStream::connect(socket).map_err(|error| {
         format!(
@@ -831,39 +836,50 @@ fn ask_parent(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32,
                 if exits.recv().await.is_none() { return Err("child-exit notifications ended".to_owned()); }
             }
         });
-        let ending = async {
+        let mut released = std::pin::pin!(async {
             let mut held = tokens;
-            loop {
-                // The pool says nothing after the grant but a growth; its end is the grant's loss.
+            // The pool says nothing after the grant but a growth. Anything else ends its ledger as
+            // its close does: said once, and Cargo keeps what it holds.
+            let end = 'ledger: loop {
                 while let Some(newline) = carry.find('\n') {
                     let line: String = carry.drain(..=newline).collect();
                     let (Some(fifo), Some(to)) = (fifo.as_mut(), grown_total(&line, held, want)) else {
-                        return (true, libc::SIGTERM, format!("parent CPU pool answered out of turn: {}", line.trim_end()));
+                        break 'ledger format!("answered out of turn ({})", line.trim_end());
                     };
                     if let Err(error) = fifo.fill(to - held) {
-                        return (true, libc::SIGTERM, format!("cannot hand grown tokens to the jobserver: {error}"));
+                        break 'ledger format!("grew past what the jobserver could take ({error})");
                     }
                     say_grown(held, to, want);
                     held = to;
                 }
-                tokio::select! {
-                    read = pool.read_line(&mut carry) => if !matches!(read, Ok(read) if read > 0) {
-                        return (true, libc::SIGTERM, format!("parent CPU grant lost: {read:?}"));
-                    },
-                    interrupt = tokio::signal::ctrl_c() => return (false, libc::SIGINT, format!("SIGINT: {interrupt:?}")),
-                    _ = terminate.recv() => return (false, libc::SIGTERM, "SIGTERM".to_owned()),
-                    _ = hangup.recv() => return (false, libc::SIGHUP, "SIGHUP".to_owned()),
+                match pool.read_line(&mut carry).await {
+                    Ok(0) => break "closed".to_owned(),
+                    Ok(_) => {}
+                    Err(error) => break format!("failed ({error})"),
                 }
+            };
+            eprintln!(
+                "cowshed: cargo's CPU pool {} {end}; its grant is gone, and Cargo process group {pid} runs on over budget until it ends",
+                socket.display()
+            );
+            std::future::pending::<std::convert::Infallible>().await
+        });
+        let signalled = async {
+            tokio::select! {
+                interrupt = tokio::signal::ctrl_c() => (libc::SIGINT, format!("SIGINT: {interrupt:?}")),
+                _ = terminate.recv() => (libc::SIGTERM, "SIGTERM".to_owned()),
+                _ = hangup.recv() => (libc::SIGHUP, "SIGHUP".to_owned()),
             }
         };
-        let (observed, lost) = tokio::select! {
-            observed = &mut exited => (observed, false),
-            (lost, signal, reason) = ending => {
+        let observed = tokio::select! {
+            observed = &mut exited => observed,
+            never = &mut released => match never {},
+            (signal, reason) = signalled => {
                 eprintln!("cowshed: cargo {reason}; stopping owned Cargo process group {pid}");
                 if let Err(error) = signal_borrowed_group(group, signal) {
                     eprintln!("cowshed: {error}; retaining the allocation until the owned child exits");
                 }
-                let observed = match tokio::time::timeout(std::time::Duration::from_secs(10), &mut exited).await {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), &mut exited).await {
                     Ok(observed) => observed,
                     Err(_) => {
                         if let Err(error) = signal_borrowed_group(group, libc::SIGKILL) {
@@ -871,15 +887,14 @@ fn ask_parent(arguments: &[OsString], want: usize, socket: &Path) -> Result<i32,
                         }
                         exited.await
                     }
-                };
-                (observed, lost)
+                }
             }
         };
         observed?;
         // The leader remains unreaped here. Never signal a numeric group after its id can be reused.
         signal_borrowed_group(group, libc::SIGKILL)?;
         let status = child.wait().map_err(|error| error.to_string())?;
-        Ok(if lost { 1 } else { exit_code(status) })
+        Ok(exit_code(status))
     })
 }
 
