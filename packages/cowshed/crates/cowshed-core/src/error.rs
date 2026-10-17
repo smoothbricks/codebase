@@ -1173,6 +1173,7 @@ mod tests {
                 request: CommandRequest::new("/sbin/mount_apfs", ["-o", "nobrowse,owners"]),
                 failure: CommandRunFailure::Deadline {
                     deadline: std::time::Duration::from_secs(120),
+                    pid: 4242,
                     ended: cowshed_apfs::ProcessStatus::Signal(libc::SIGKILL),
                 },
             })

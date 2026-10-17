@@ -227,6 +227,7 @@ mod tests {
             request: request.clone(),
             failure: CommandRunFailure::Deadline {
                 deadline: std::time::Duration::from_secs(120),
+                pid: 4242,
                 ended: ProcessStatus::Signal(libc::SIGKILL),
             },
         });
