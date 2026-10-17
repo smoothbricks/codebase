@@ -12,6 +12,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   readlinkSync,
   realpathSync,
   renameSync,
@@ -1203,6 +1204,178 @@ function bunInstaller(inputs: readonly string[]): Installer {
  * in the checkout is part of the identity: the relative `.pth` lines hold only
  * there.
  */
+function sitePackagesDirectories(environment: string): string[] {
+  const lib = path.join(environment, 'lib');
+  const directories: string[] = [];
+  for (const python of existsSync(lib) ? readdirSync(lib) : []) {
+    if (!python.startsWith('python')) continue;
+    const sitePackages = path.join(lib, python, 'site-packages');
+    if (existsSync(sitePackages)) directories.push(sitePackages);
+  }
+  return directories;
+}
+
+/**
+ * Whether an existing environment is the relocatable one install would leave: its config says
+ * so, no launcher or interpreter link names an environment or a checkout (its own, a foreign
+ * one, or a checkout's .devenv profile, in a shebang, a wrapper's exec argv, or the link
+ * itself), and no `.pth` line is an absolute path. The stamp alone cannot witness this — a
+ * copied checkout carries a matching
+ * stamp and an old absolute launcher together, and admits the launcher forever.
+ */
+/** One shell command line as its words: quotes group, backslash escapes, no expansion. */
+function shellWords(line: string): string[] {
+  const words: string[] = [];
+  let word = '';
+  let quote: string | null = null;
+  let started = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index] ?? '';
+    if (quote !== null) {
+      if (char === quote) quote = null;
+      else if (char === '\\' && quote === '"' && index + 1 < line.length) word += line[++index];
+      else word += char;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      started = true;
+    } else if (char === '\\' && index + 1 < line.length) {
+      word += line[++index];
+      started = true;
+    } else if (/\s/.test(char)) {
+      if (started || word !== '') words.push(word);
+      word = '';
+      started = false;
+    } else {
+      word += char;
+    }
+  }
+  if (started || word !== '') words.push(word);
+  return words;
+}
+
+function uvEnvironmentRelocatable(environment: string): boolean {
+  const config = readFileIfPresent(path.join(environment, 'pyvenv.cfg'));
+  if (config === null || !/^relocatable\s*=\s*true\s*$/m.test(config.toString('utf8'))) return false;
+  const environmentReal = realpathSync(environment);
+  // Whether an absolute interpreter path names an environment or a checkout, as opposed to a
+  // store or system interpreter, which names neither: it is inside this environment, inside
+  // another environment (its home carries pyvenv.cfg), under a checkout's .devenv state, or
+  // it no longer exists at all.
+  const namesEnvironment = (interpreter: string): boolean => {
+    if (interpreter.startsWith(`${environment}/`) || interpreter.startsWith(`${environmentReal}/`)) return true;
+    if (!existsSync(interpreter)) return true;
+    if (interpreter.split(path.sep).includes('.devenv')) return true;
+    const home = path.dirname(path.dirname(interpreter));
+    return existsSync(path.join(home, 'pyvenv.cfg')) && home !== environment && home !== environmentReal;
+  };
+  const bin = path.join(environment, 'bin');
+  if (existsSync(bin)) {
+    const buffer = Buffer.alloc(256);
+    for (const name of readdirSync(bin)) {
+      const file = path.join(bin, name);
+      let size: number;
+      let isFile: boolean;
+      let isLink = false;
+      try {
+        const stat = statSync(file);
+        size = stat.size;
+        isFile = stat.isFile();
+        isLink = lstatSync(file).isSymbolicLink();
+      } catch {
+        return false;
+      }
+      if (!isFile) continue;
+      if (isLink) {
+        // The interpreter link itself is witnessed lexically, but only when it leaves the
+        // environment: a relative alias (bin/python3 -> python) is the layout uv itself
+        // writes and stays inside it. An absolute link into another checkout's .devenv
+        // state names that checkout even when its final target is a store interpreter,
+        // and no shebang reading ever sees it.
+        let linkTarget: string;
+        try {
+          linkTarget = readlinkSync(file);
+        } catch {
+          return false;
+        }
+        if (path.isAbsolute(linkTarget)) {
+          const lexical = path.resolve(bin, linkTarget);
+          if (lexical.split(path.sep).includes('.devenv')) return false;
+          const linkHome = path.dirname(path.dirname(lexical));
+          if (existsSync(path.join(linkHome, 'pyvenv.cfg')) && linkHome !== environment && linkHome !== environmentReal)
+            return false;
+        } else {
+          // A relative alias that resolves outside the environment is judged by where it
+          // lands, like an absolute one; only aliases staying inside are uv's own layout.
+          const lexical = path.resolve(bin, linkTarget);
+          if (
+            !lexical.startsWith(`${environment}${path.sep}`) &&
+            !lexical.startsWith(`${environmentReal}${path.sep}`) &&
+            namesEnvironment(lexical)
+          )
+            return false;
+        }
+      }
+      let head: string;
+      try {
+        const fd = openSync(file, 'r');
+        try {
+          head = buffer.toString('utf8', 0, readSync(fd, buffer, 0, buffer.length, 0));
+        } finally {
+          closeSync(fd);
+        }
+      } catch {
+        return false;
+      }
+      const shebang = /^#!\s*(\/\S+)(?:\s+(.*))?$/.exec(head.split('\n')[0] ?? '');
+      if (shebang === null) continue;
+      const interpreter = shebang[1] ?? '';
+      const program = path.basename(interpreter);
+      if (program === 'env') {
+        // An env trampoline naming a bare program resolves through PATH; one naming an
+        // absolute interpreter (after any flags, -S included) is judged as that interpreter.
+        const tokens = shellWords(shebang[2] ?? '');
+        let index = 0;
+        while (index < tokens.length && tokens[index]?.startsWith('-')) index += tokens[index] === '-u' ? 2 : 1;
+        const target = tokens[index];
+        if (target !== undefined && target.startsWith('/') && namesEnvironment(target)) return false;
+        continue;
+      }
+      if (['sh', 'bash', 'dash', 'zsh'].includes(program)) {
+        // A relocatable wrapper execs a self-locating interpreter; a legacy one execs an
+        // absolute environment path. Only exec lines are judged, tokenized as shell words
+        // (quotes group, so spaced paths stay whole; a $VAR expansion is not an absolute
+        // path and is never classified).
+        if (size > 262_144) return false;
+        let body: string;
+        try {
+          body = readFileSync(file, 'utf8');
+        } catch {
+          return false;
+        }
+        for (const line of body.split('\n')) {
+          // Producer headers are shell words too: a uv console script's polyglot first
+          // line tokenizes to the same exec argv as a plain exec line.
+          const words = shellWords(line);
+          if (words[0] !== 'exec') continue;
+          const target = words.find((word) => word.includes('/bin/python')) ?? words[1];
+          if (target !== undefined && target.startsWith('/') && namesEnvironment(target)) return false;
+        }
+        continue;
+      }
+      if (namesEnvironment(interpreter)) return false;
+    }
+  }
+  for (const sitePackages of sitePackagesDirectories(environment)) {
+    for (const name of readdirSync(sitePackages).filter((entry) => entry.endsWith('.pth'))) {
+      const content = readFileSync(path.join(sitePackages, name), 'utf8');
+      if (content.split('\n').some((line) => path.isAbsolute(line))) return false;
+    }
+  }
+  return true;
+}
+
 function uvInstaller(inputs: readonly string[], options: { locked: boolean }): Installer | null {
   const python = flags.python;
   if (python === undefined || !existsSync(path.join(projectRoot, 'pyproject.toml'))) {
@@ -1226,15 +1399,20 @@ function uvInstaller(inputs: readonly string[], options: { locked: boolean }): I
     uv === null ? 'uv not on PATH' : realpathSync(uv),
   ];
   return {
-    isCurrent: () => readInstallStamp(stampPath)?.inputs === inputsDigest(identity, inputs),
+    isCurrent: () => {
+      const stampOk = readInstallStamp(stampPath)?.inputs === inputsDigest(identity, inputs);
+      const witnessOk = uvEnvironmentRelocatable(environment);
+      return stampOk && witnessOk;
+    },
     install: async ({ quiet }) => {
       // An inherited VIRTUAL_ENV names some other environment; uv would warn
       // that it does not match the project environment and ignore it.
       const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name !== 'VIRTUAL_ENV'));
-      // pyvenv.cfg records `relocatable = true` for an environment uv created
-      // with --relocatable. uv venv refuses a directory that already holds one.
-      const config = readFileIfPresent(path.join(environment, 'pyvenv.cfg'));
-      if (config === null || !/^relocatable\s*=\s*true\s*$/m.test(config.toString('utf8'))) {
+      // Replacement is gated on the same witness currentness uses, not only on the config
+      // line: a valid config beside an absolute launcher or .pth would otherwise sync over
+      // the escape and stamp it. uv venv refuses a directory that already holds an
+      // environment, so a witness failure removes it first.
+      if (!uvEnvironmentRelocatable(environment)) {
         rmSync(environment, { recursive: true, force: true });
         await runSetupCommand(`uv ${create.join(' ')}`, $`uv ${create}`.env(env), { quiet });
       }
@@ -1314,12 +1492,7 @@ function cargoFetcher(workspace: string): Installer {
  */
 function relativizeCheckoutPaths(environment: string): void {
   const root = `${realpathSync(projectRoot)}${path.sep}`;
-  const lib = path.join(environment, 'lib');
-  for (const python of existsSync(lib) ? readdirSync(lib) : []) {
-    const sitePackages = path.join(lib, python, 'site-packages');
-    if (!python.startsWith('python') || !existsSync(sitePackages)) {
-      continue;
-    }
+  for (const sitePackages of sitePackagesDirectories(environment)) {
     const site = realpathSync(sitePackages);
     for (const name of readdirSync(site).filter((entry) => entry.endsWith('.pth'))) {
       const file = path.join(site, name);
