@@ -45,7 +45,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       try {
         process.kill(-pid, 'SIGKILL');
       } catch (cause) {
-        if (!(cause instanceof Error && 'code' in cause && cause.code === 'ESRCH')) {
+        const code = cause instanceof Error && 'code' in cause ? cause.code : undefined;
+        // Darwin answers EPERM, not ESRCH, for a group whose only members are unreaped zombies (a killed
+        // descendant waiting for launchd to reap it): such a group has nothing left to kill.
+        if (code !== 'ESRCH' && !(code === 'EPERM' && onlyZombiesIn(pid))) {
           throw new Error(`cleanup owned readiness process group pgid=${pid} failed`, { cause });
         }
       } finally {
@@ -1499,4 +1502,17 @@ function inheritedFrom(pool: CpuPool): InheritedCpuPool {
 /** The count a pool of `tokens` lends a run that wants `want`: min(want, tokens). */
 function lentCount(want: number, tokens: number): number {
   return Math.min(want, tokens);
+}
+
+/** Every process left in group `pgid` is a zombie: `ps` lists no member in any other state. */
+function onlyZombiesIn(pgid: number): boolean {
+  const listed = spawnSync('ps', ['-A', '-o', 'pgid=,stat='], { encoding: 'utf8' });
+  if (listed.status !== 0) {
+    return false;
+  }
+  return listed.stdout
+    .split('\n')
+    .map((line) => line.trim().split(/\s+/))
+    .filter(([group]) => Number(group) === pgid)
+    .every(([, state]) => state?.startsWith('Z') === true);
 }
