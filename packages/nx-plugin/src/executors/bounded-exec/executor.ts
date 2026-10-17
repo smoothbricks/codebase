@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from 'node:child_process';
+import { accessSync, constants } from 'node:fs';
 import { availableParallelism, userInfo } from 'node:os';
-import { isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 
 import {
@@ -103,6 +104,41 @@ export interface ProcessTreeKiller {
 /** Where the command's TMPDIR comes from; `null` leaves the inherited one. */
 export type TempVolume = Pick<RamTempVolume, 'acquire' | 'release' | 'fullness' | 'reap'>;
 
+/** Workspace-provided cowshed launchers, in the order a workspace that provides one names them. */
+const WORKSPACE_COWSHED_LAUNCHERS = [
+  'packages/cowshed/bin/cowshed',
+  'node_modules/@smoothbricks/cowshed/bin/cowshed',
+] as const;
+
+/**
+ * The cowshed a run's disk commands use: the target's named one, else the installed one on
+ * PATH, else — only when PATH provides none — the launcher this workspace itself provides
+ * (its own cowshed package, or a linked one's bin). An environment with no cowshed anywhere
+ * keeps the bare name, so its spawn failure names the missing installed tool.
+ */
+export function resolveCowshedExecutable(
+  root: string,
+  named: string | undefined,
+  pathValue: string | undefined,
+  exists: (path: string) => boolean = (path) => {
+    try {
+      accessSync(path, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+): string | undefined {
+  if (named !== undefined) return resolvePath(root, named);
+  const onPath = (pathValue ?? '').split(delimiter).some((dir) => dir !== '' && exists(join(dir, 'cowshed')));
+  if (onPath) return undefined;
+  for (const candidate of WORKSPACE_COWSHED_LAUNCHERS) {
+    const launcher = join(root, candidate);
+    if (exists(launcher)) return launcher;
+  }
+  return undefined;
+}
+
 export default function boundedExecExecutor(
   options: BoundedExecOptions,
   context: NxTaskContext,
@@ -119,7 +155,7 @@ export function runDefaultBoundedExec(
   // for its command alike. Nx resolves `{workspaceRoot}/…` in an option to a workspace-relative path, which the
   // command, starting in another directory, could not find: it gets the absolute one.
   const named = options.env?.[COWSHED_EXECUTABLE_ENV];
-  const cowshed = named === undefined ? undefined : resolvePath(context.root, named);
+  const cowshed = resolveCowshedExecutable(context.root, named, process.env.PATH);
   const run: BoundedExecOptions =
     cowshed === undefined ? options : { ...options, env: { ...options.env, [COWSHED_EXECUTABLE_ENV]: cowshed } };
   // Only macOS has `hdiutil ram://`; elsewhere the command keeps the inherited TMPDIR.

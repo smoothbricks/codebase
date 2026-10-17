@@ -12,6 +12,7 @@ import {
   type BoundedExecContext,
   createProcessTreeKiller,
   type ProcessTreeKiller,
+  resolveCowshedExecutable,
   runBoundedExec,
   type TempVolume,
 } from './executor.js';
@@ -901,6 +902,40 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     expect(result.success).toBe(true);
     expect(result.terminalOutput).toBe('ran\n');
+  });
+
+  it('resolves the cowshed a run uses: named, then installed, then the workspace’s own launcher', () => {
+    const root = '/workspace';
+    const present = (...paths: string[]) => {
+      const set = new Set(paths);
+      return (path: string) => set.has(path);
+    };
+    // A named executable wins and is made absolute against the workspace root.
+    expect(resolveCowshedExecutable(root, 'bin/cowshed', '/usr/bin', () => false)).toBe('/workspace/bin/cowshed');
+    // An installed cowshed on PATH wins over the workspace's own launcher.
+    expect(
+      resolveCowshedExecutable(
+        root,
+        undefined,
+        '/usr/bin:/opt/bin',
+        present('/opt/bin/cowshed', '/workspace/packages/cowshed/bin/cowshed'),
+      ),
+    ).toBeUndefined();
+    // Only when PATH provides none does the workspace's own launcher answer.
+    expect(
+      resolveCowshedExecutable(root, undefined, '/usr/bin', present('/workspace/packages/cowshed/bin/cowshed')),
+    ).toBe('/workspace/packages/cowshed/bin/cowshed');
+    expect(
+      resolveCowshedExecutable(
+        root,
+        undefined,
+        '/usr/bin',
+        present('/workspace/node_modules/@smoothbricks/cowshed/bin/cowshed'),
+      ),
+    ).toBe('/workspace/node_modules/@smoothbricks/cowshed/bin/cowshed');
+    // No cowshed anywhere keeps the bare name, so the spawn failure names the missing tool.
+    expect(resolveCowshedExecutable(root, undefined, '/usr/bin', () => false)).toBeUndefined();
+    expect(resolveCowshedExecutable(root, undefined, undefined, () => false)).toBeUndefined();
   });
 
   it('sizes a runner to the grant its parent pool lent, takes nothing from the host, and returns nothing to it', async () => {
