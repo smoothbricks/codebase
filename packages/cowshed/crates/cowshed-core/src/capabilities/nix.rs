@@ -179,6 +179,11 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
             EnvAction::Append(format!("ssl-cert-file = {}", bundle.display())),
         );
     }
+    // Plain links to the host's programs, not wrappers: they exist so direnv and `use devenv` can
+    // run before activation, when no shell exists yet. Nix reaches the network through the
+    // socket and trust settings above, never through these links. They stay in `tools/bin`,
+    // behind the activated shell; leading it from `tools/manager-bin` would override a nix the
+    // shell declares (15_capabilities.md, "Bootstrap executables").
     let directories = host_program_directories(context);
     for name in [
         "nix",

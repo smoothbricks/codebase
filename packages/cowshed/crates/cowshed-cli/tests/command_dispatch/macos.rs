@@ -118,12 +118,6 @@ impl Fixture {
         clone_tree(&checkout_template(project), &checkout);
         let storage =
             ValidatedHostStorage::new(scratch.path().to_path_buf(), CanonicalRoots::at(store));
-        if let Project::Build {
-            rust: Some(rust), ..
-        } = project
-        {
-            install_rust(storage.home(), rust);
-        }
         Self {
             _scratch: scratch,
             checkout,
@@ -2184,12 +2178,13 @@ fn rust_toolchain() -> PathBuf {
     bin
 }
 
-/// Install `rust` where a host keeps its own toolchain, `~/.cargo/bin` of the fixture's home,
-/// so the Cargo capability finds it as it finds a real host's (15_capabilities.md, "Bootstrap
-/// executables"): every job then runs plain `cargo`, and build-state discovery asks that same
-/// Cargo for the target directory.
-fn install_rust(home: &Path, rust: &Path) {
-    let bin = home.join(".cargo/bin");
+/// The fixture repository declares its own toolchain, as a real one does through its shell:
+/// cowshed links no Rust program (15_capabilities.md, "Bootstrap executables"). Like the Nx
+/// fixture's `node`, the programs resolve through the checkout's shim directory, which travels
+/// with every clone (03_caches.md), so every job runs plain `cargo` and build-state discovery
+/// asks that same Cargo for the target directory.
+fn declare_rust(checkout: &Path, rust: &Path) {
+    let bin = checkout.join(".cowshed/bin");
     fs::create_dir_all(&bin).unwrap();
     for program in ["cargo", "rustc", "rustdoc"] {
         std::os::unix::fs::symlink(rust.join(program), bin.join(program)).unwrap();
@@ -2243,6 +2238,7 @@ fn write_build_project(checkout: &Path, nx: Option<(&Path, &Path)>, rust: Option
         write_nx_project(checkout, nx, node, true);
     }
     if let Some(rust) = rust {
+        declare_rust(checkout, rust);
         write_cargo_workspace(checkout, rust);
     }
     fs::write(
