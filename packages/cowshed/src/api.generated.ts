@@ -12,7 +12,14 @@ export type AbandonedWork = {
   readonly head: GitOid;
   readonly targetBranch: string;
   readonly targetHead?: GitOid;
+  /**
+   * Commits reachable from `head` or any of `branches` and not from the target.
+   */
   readonly unlandedCommits: number & tags.Type<'uint64'>;
+  /**
+   * The local branches besides `head` whose unheld commits went into the bundle as refs.
+   */
+  readonly branches?: ReadonlyArray<BranchLanding>;
   readonly bundle: string;
 };
 
@@ -206,6 +213,35 @@ export type BoundIdentity = {
   readonly remoteUrl: string | null;
   readonly primary: boolean;
 };
+
+/**
+ * One local branch whose commits the target does not hold and no target ref preserves.
+ */
+export type BranchLanding = {
+  /**
+   * The branch's short name, `refs/heads/` dropped.
+   */
+  readonly branch: string;
+  readonly tip: GitOid;
+  /**
+   * The branch measured against the target like a head: never `fully_landed` here.
+   */
+  readonly commits: LandingCommits;
+};
+
+/**
+ * What the workspace's local branches other than the checked-out one hold that the target does
+ * not. A branch passes when its tip equals or is an ancestor of the target repository's branch of
+ * the same name or of its `push` ref `refs/cowshed/<ws>/heads/<branch>`, or when the target
+ * branch holds its commits by ancestry or patch equivalence; every other branch is listed.
+ */
+export type BranchLandings =
+  | ({ readonly state: 'measured' } & {
+      readonly unlanded: ReadonlyArray<BranchLanding>;
+    })
+  | ({ readonly state: 'indeterminate' } & {
+      readonly reason: string;
+    });
 
 export type BranchName = string;
 
@@ -2553,6 +2589,10 @@ export type WorkspaceLanding = {
    */
   readonly dirtyFiles?: number & tags.Type<'uint64'>;
   readonly commits: LandingCommits;
+  /**
+   * The workspace's other local branches, measured the way `commits` measures its head.
+   */
+  readonly branches: BranchLandings;
 };
 
 /**

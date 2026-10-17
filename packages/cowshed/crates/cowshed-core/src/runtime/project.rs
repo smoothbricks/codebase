@@ -16,8 +16,6 @@ use super::storage_host::RuntimeStorageHost;
 use crate::api::dto::AbandonedWork;
 #[cfg(target_os = "macos")]
 use crate::api::dto::GitOid;
-#[cfg(target_os = "macos")]
-use crate::api::dto::LandingCommits;
 use crate::api::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions,
@@ -27,6 +25,8 @@ use crate::api::dto::{
     RemoveProjectReport, RemoveReport, RemovedWorkspace, SealedJob, StdinSource,
     WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
+#[cfg(target_os = "macos")]
+use crate::api::dto::{BranchLandings, LandingCommits};
 #[cfg(target_os = "macos")]
 use crate::api::dto::{LandedReport, RunSandboxMode};
 use crate::api::operations::{
@@ -6039,7 +6039,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         })
     }
 
-    /// Where a session's commits stand relative to the branch that has to hold them.
+    /// Where a session's commits stand relative to the branch that has to hold them: its head,
+    /// and every other local branch, which the image takes with it just the same.
     ///
     /// The target tip is read out of *the target's own repository* — main's, or the lane base a
     /// unit landed into: the object store that survives this workspace — and never out of a
@@ -6067,6 +6068,13 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             branch: containment.branch.clone(),
             commits: crate::landing::measure_commits(store_root, &target, &mount, head.as_str())
                 .await,
+            branches: crate::landing::measure_branches(
+                store_root,
+                &target,
+                &mount,
+                workspace.as_str(),
+            )
+            .await,
         })
     }
 
@@ -6138,17 +6146,57 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         .map_err(|error| {
             CowshedError::internal(format!("trash directory task failed: {error}"))
         })??;
-        // `HEAD`, not the fence oid, is load-bearing: a raw oid does not advertise a fetchable ref
-        // in a bundle. The fence already proved HEAD is exactly `fence.head`, and bundle creation
-        // verifies that exact tip and commit range by fetching it into an empty repository.
+        // `HEAD` and branch refs, not the fence oid, are load-bearing: a raw oid does not
+        // advertise a fetchable ref in a bundle. The fence already proved HEAD is exactly
+        // `fence.head`, and bundle creation verifies each exact tip and the commit range by
+        // fetching it into an empty repository.
+        let branches = match landed.branches {
+            BranchLandings::Measured { unlanded } => unlanded,
+            // Abandoning branches that could not be judged bundles every local branch but the
+            // checked-out one: nothing proves any of them is held elsewhere.
+            BranchLandings::Indeterminate { reason } => {
+                let checked_out = git
+                    .current_branch()
+                    .await?
+                    .map(|branch| format!("refs/heads/{branch}").into_bytes());
+                git.ref_tips(&["refs/heads"])
+                    .await?
+                    .into_iter()
+                    .filter(|(name, _)| Some(name) != checked_out.as_ref())
+                    .map(|(name, tip)| {
+                        let short = name.strip_prefix(b"refs/heads/").unwrap_or(&name);
+                        Ok(crate::api::dto::BranchLanding {
+                            branch: String::from_utf8_lossy(short).into_owned(),
+                            tip: GitOid::new(String::from_utf8_lossy(&tip).into_owned())
+                                .map_err(|error| {
+                                    CowshedError::integrity(
+                                        format!("git listed a branch tip that is not an object id: {error}"),
+                                        "repair the workspace's git repository",
+                                    )
+                                })?,
+                            commits: LandingCommits::Indeterminate {
+                                reason: reason.clone(),
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        let branch_refs: Vec<String> = branches
+            .iter()
+            .map(|branch| format!("refs/heads/{}", branch.branch))
+            .collect();
+        let mut heads = vec!["HEAD"];
+        heads.extend(branch_refs.iter().map(String::as_str));
         let unlanded_commits = git
-            .bundle_commits(&bundle, target_head.as_ref().map(GitOid::as_str), "HEAD")
+            .bundle_commits(&bundle, target_head.as_ref().map(GitOid::as_str), &heads)
             .await?;
         Ok(AbandonedWork {
             head: fence.head.clone(),
             target_branch: landed.branch,
             target_head,
             unlanded_commits,
+            branches,
             bundle,
         })
     }
@@ -6795,7 +6843,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .bundle_commits(
                 &staged_directory.join(&name),
                 base.as_ref().map(GitOid::as_str),
-                "HEAD",
+                &["HEAD"],
             )
             .await?;
         Ok(AbandonedWork {
@@ -6803,6 +6851,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             target_branch,
             target_head: base,
             unlanded_commits,
+            // The restored checkout keeps main's other branches; only HEAD's range is abandoned.
+            branches: Vec::new(),
             bundle: final_directory.join(name),
         })
     }
@@ -8761,6 +8811,8 @@ struct NativeLandedState {
     /// The measurement, or the reason there is none. A missing measurement is never landed: there
     /// is no shape here in which the absence of an answer can be read as a permissive one.
     commits: LandingCommits,
+    /// The workspace's other local branches, which die with the image the same as its head.
+    branches: BranchLandings,
 }
 
 /// The branch a removal measures a session against, in the repository that holds it: main's
@@ -9085,6 +9137,7 @@ mod rebase_recovery_tests {
             branch: branch.to_owned(),
             commits: crate::landing::measure_commits(store_root, &resolved, unit, head.as_str())
                 .await,
+            branches: crate::landing::measure_branches(store_root, &resolved, unit, "unit").await,
         };
         removal_landed_decision(&Lane::name("unit"), &head, landed, false)
     }
@@ -14364,6 +14417,9 @@ mod removal_refusal_tests {
         NativeLandedState {
             branch: DEFAULT_LANDING_BRANCH.to_owned(),
             commits,
+            branches: BranchLandings::Measured {
+                unlanded: Vec::new(),
+            },
         }
     }
 
@@ -14517,6 +14573,60 @@ mod removal_refusal_tests {
             removal_landed_decision(&workspace(), &oid('4'), indeterminate(), true)
                 .expect("--abandon authorizes a loss it cannot measure"),
             Some(indeterminate())
+        );
+    }
+
+    /// A landed head is not a landed workspace: every other local branch dies with the image, so
+    /// one the target does not hold refuses removal the way an unlanded head does, named with its
+    /// tip and count; and a branch list that could not be judged refuses too.
+    #[test]
+    fn an_unlanded_other_branch_refuses_removal_by_name() {
+        let with_branches = |branches| NativeLandedState {
+            branches,
+            ..measured(0, 0)
+        };
+        let side = crate::api::dto::BranchLanding {
+            branch: String::from("side"),
+            tip: oid('5'),
+            commits: LandingCommits::Measured {
+                target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
+                target_head: oid('1'),
+                unlanded: 2,
+                landed: 0,
+                behind: 0,
+            },
+        };
+        let unlanded = with_branches(BranchLandings::Measured {
+            unlanded: vec![side],
+        });
+        let refused = removal_landed_decision(&workspace(), &oid('4'), unlanded.clone(), false)
+            .expect_err("an unheld branch must be refused");
+        assert_eq!(refused.code, ErrorCode::Conflict);
+        assert_eq!(
+            refused.message,
+            format!(
+                "workspace raven holds 1 other branch that main does not hold, by ancestry or by \
+                 patch equivalence, and that no branch or push ref in main's repository \
+                 preserves: side at {} (2 commits)",
+                oid('5')
+            )
+        );
+        assert_eq!(
+            refused.hint,
+            "preserve each branch: cowshed push raven --branch side"
+        );
+        assert_eq!(
+            removal_landed_decision(&workspace(), &oid('4'), unlanded.clone(), true)
+                .expect("--abandon authorizes the loss"),
+            Some(unlanded)
+        );
+
+        let unjudged = with_branches(BranchLandings::Indeterminate {
+            reason: String::from("git for-each-ref failed"),
+        });
+        assert!(
+            removal_landed_decision(&workspace(), &oid('4'), unjudged, false).is_err(),
+            "branches that could not be judged must never read as landed"
         );
     }
 
@@ -17705,7 +17815,7 @@ fn removal_landed_decision(
     landed: NativeLandedState,
     abandon: bool,
 ) -> Result<Option<NativeLandedState>> {
-    if landed.commits.fully_landed() {
+    if landed.commits.fully_landed() && landed.branches.fully_landed() {
         return Ok(None);
     }
     if abandon {
@@ -17714,7 +17824,8 @@ fn removal_landed_decision(
     Err(removal_unlanded_refusal(workspace, head, &landed))
 }
 
-/// Why the gate exists: these commits exist nowhere but the image about to be deleted.
+/// Why the gate exists: these commits exist nowhere but the image about to be deleted. Names the
+/// head and every branch that did not pass, each with its tip and what it carries.
 #[cfg(target_os = "macos")]
 fn removal_unlanded_refusal(
     workspace: &WorkspaceName,
@@ -17722,25 +17833,64 @@ fn removal_unlanded_refusal(
     landed: &NativeLandedState,
 ) -> CowshedError {
     let branch = &landed.branch;
-    CowshedError::conflict(
-        match &landed.commits {
-            LandingCommits::Measured {
-                target_head,
-                unlanded,
-                ..
-            } => format!(
-                "workspace {workspace} head {head} carries {unlanded} commit{} that {branch} does \
-                 not hold, by ancestry or by patch equivalence ({branch} is at {target_head})",
-                if *unlanded == 1 { "" } else { "s" }
-            ),
-            // Saying which question went unanswered is the whole value of this branch: the caller
-            // is being refused for a missing proof, not for work they can see.
-            LandingCommits::Indeterminate { reason } => format!(
-                "workspace {workspace} head {head} cannot be proven to be in {branch}: {reason}"
-            ),
-        },
-        format!("land the workspace: cowshed land {workspace}"),
-    )
+    let mut findings = Vec::new();
+    match &landed.commits {
+        commits if commits.fully_landed() => {}
+        LandingCommits::Measured {
+            target_head,
+            unlanded,
+            ..
+        } => findings.push(format!(
+            "workspace {workspace} head {head} carries {unlanded} commit{} that {branch} does \
+             not hold, by ancestry or by patch equivalence ({branch} is at {target_head})",
+            if *unlanded == 1 { "" } else { "s" }
+        )),
+        // Saying which question went unanswered is the whole value of this branch: the caller
+        // is being refused for a missing proof, not for work they can see.
+        LandingCommits::Indeterminate { reason } => findings.push(format!(
+            "workspace {workspace} head {head} cannot be proven to be in {branch}: {reason}"
+        )),
+    }
+    let mut first_branch = None;
+    match &landed.branches {
+        BranchLandings::Measured { unlanded } if unlanded.is_empty() => {}
+        BranchLandings::Measured { unlanded } => {
+            first_branch = unlanded.first().map(|branch| branch.branch.as_str());
+            let named = unlanded
+                .iter()
+                .map(|other| match &other.commits {
+                    LandingCommits::Measured { unlanded, .. } => format!(
+                        "{} at {} ({unlanded} commit{})",
+                        other.branch,
+                        other.tip,
+                        if *unlanded == 1 { "" } else { "s" }
+                    ),
+                    LandingCommits::Indeterminate { reason } => {
+                        format!("{} at {} (unmeasured: {reason})", other.branch, other.tip)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            findings.push(format!(
+                "workspace {workspace} holds {} other branch{} that {branch} does not hold, by \
+                 ancestry or by patch equivalence, and that no branch or push ref in {branch}'s \
+                 repository preserves: {named}",
+                unlanded.len(),
+                if unlanded.len() == 1 { "" } else { "es" }
+            ));
+        }
+        BranchLandings::Indeterminate { reason } => findings.push(format!(
+            "workspace {workspace}'s other local branches cannot be proven to be in {branch}: \
+             {reason}"
+        )),
+    }
+    let hint = match (landed.commits.fully_landed(), first_branch) {
+        (true, Some(other)) => {
+            format!("preserve each branch: cowshed push {workspace} --branch {other}")
+        }
+        _ => format!("land the workspace: cowshed land {workspace}"),
+    };
+    CowshedError::conflict(findings.join("; "), hint)
 }
 
 /// A refused slot binding is the caller's problem, not the store's: the slot is taken, or the

@@ -387,6 +387,19 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
             landed: 541,
             behind: 673,
         },
+        branches: BranchLandings::Measured {
+            unlanded: vec![BranchLanding {
+                branch: "side".into(),
+                tip: oid('c'),
+                commits: LandingCommits::Measured {
+                    target_branch: "main".into(),
+                    target_head: oid('b'),
+                    unlanded: 2,
+                    landed: 0,
+                    behind: 673,
+                },
+            }],
+        },
     };
     assert_eq!(
         serde_json::to_value(&measured).expect("measured JSON"),
@@ -399,6 +412,21 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
                 "unlanded": 4,
                 "landed": 541,
                 "behind": 673
+            },
+            "branches": {
+                "state": "measured",
+                "unlanded": [{
+                    "branch": "side",
+                    "tip": "cccccccccccccccccccccccccccccccccccccccc",
+                    "commits": {
+                        "state": "measured",
+                        "targetBranch": "main",
+                        "targetHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "unlanded": 2,
+                        "landed": 0,
+                        "behind": 673
+                    }
+                }]
             }
         })
     );
@@ -410,11 +438,18 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
         commits: LandingCommits::Indeterminate {
             reason: "main's repository has no main branch".into(),
         },
+        branches: BranchLandings::Indeterminate {
+            reason: "main's repository has no main branch".into(),
+        },
     };
     assert_eq!(
         serde_json::to_value(&indeterminate).expect("indeterminate JSON"),
         json!({
             "commits": {
+                "state": "indeterminate",
+                "reason": "main's repository has no main branch"
+            },
+            "branches": {
                 "state": "indeterminate",
                 "reason": "main's repository has no main branch"
             }
@@ -426,21 +461,30 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
     );
     assert!(indeterminate.commits.target_head().is_none());
 
-    // Nothing unlanded is the one shape that authorizes a no-flag removal.
+    // Nothing unlanded, at the head or on any other branch, is the one shape that authorizes a
+    // no-flag removal; a landed head beside an unlanded branch does not.
+    let landed_head = |branches| WorkspaceLanding {
+        dirty_files: Some(0),
+        commits: LandingCommits::Measured {
+            target_branch: "main".into(),
+            target_head: oid('b'),
+            unlanded: 0,
+            landed: 1,
+            behind: 1,
+        },
+        branches,
+    };
     assert!(
-        WorkspaceLanding {
-            dirty_files: Some(0),
-            commits: LandingCommits::Measured {
-                target_branch: "main".into(),
-                target_head: oid('b'),
-                unlanded: 0,
-                landed: 1,
-                behind: 1,
-            },
-        }
-        .commits
+        landed_head(BranchLandings::Measured {
+            unlanded: Vec::new()
+        })
         .fully_landed()
     );
+    let BranchLandings::Measured { unlanded } = measured.branches.clone() else {
+        unreachable!("measured above")
+    };
+    assert!(!landed_head(BranchLandings::Measured { unlanded }).fully_landed());
+    assert!(!landed_head(indeterminate.branches.clone()).fully_landed());
 }
 
 #[test]
@@ -871,6 +915,7 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
                 target_branch: "main".into(),
                 target_head: Some(GitOid::new("1".repeat(40)).unwrap()),
                 unlanded_commits: 3,
+                branches: Vec::new(),
                 bundle: PathBuf::from("/store/acme/widget/sessions/.trash/raven-tip.bundle"),
             }),
         })

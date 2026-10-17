@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::api::dto::{GitOid, LandingCommits, WorkspaceLanding};
+use crate::api::dto::{BranchLanding, BranchLandings, GitOid, LandingCommits, WorkspaceLanding};
 use crate::git::GitRepository;
 
 /// The branch a workspace's work has to reach, resolved live, with the object store that holds it.
@@ -28,6 +28,8 @@ pub struct LandingTarget {
     branch: String,
     tip: GitOid,
     objects: PathBuf,
+    /// The target's canonical mount, whose refs say which workspace branches it preserves.
+    repository: PathBuf,
 }
 
 impl LandingTarget {
@@ -84,10 +86,11 @@ pub async fn resolve_target(
         branch: branch.to_owned(),
         tip,
         objects,
+        repository: target_mount.to_path_buf(),
     })
 }
 
-/// Measure one workspace tree against `target`.
+/// Measure one workspace tree against `target`: its head, and every other local branch.
 ///
 /// Total by construction: there is no error return, because every failure has a truthful
 /// representation as [`LandingCommits::Indeterminate`] and no failure may be allowed to read as
@@ -95,19 +98,118 @@ pub async fn resolve_target(
 /// is consumed — it can never authorize a deletion, only decline to.
 ///
 /// `head` is a revision in the workspace's own repository; pass `HEAD` unless a caller has already
-/// fenced a specific oid and needs that exact commit judged.
+/// fenced a specific oid and needs that exact commit judged. `workspace` names the workspace's
+/// `push` refs in the target repository.
 pub async fn measure(
     store_root: &std::sync::Arc<Path>,
     target: &std::result::Result<LandingTarget, String>,
     workspace_mount: &Path,
+    workspace: &str,
     head: &str,
 ) -> WorkspaceLanding {
-    let workspace = GitRepository::from_root(store_root, workspace_mount);
-    let dirty_files = workspace.dirty_file_count().await.ok();
+    let repository = GitRepository::from_root(store_root, workspace_mount);
+    let dirty_files = repository.dirty_file_count().await.ok();
     WorkspaceLanding {
         dirty_files,
         commits: measure_commits(store_root, target, workspace_mount, head).await,
+        branches: measure_branches(store_root, target, workspace_mount, workspace).await,
     }
+}
+
+/// Judge every local branch of the workspace except the checked-out one, which the head
+/// measurement covers.
+///
+/// A branch passes when its tip equals or is an ancestor of the target repository's branch of the
+/// same name or of `refs/cowshed/<workspace>/heads/<branch>`, where `cowshed push` preserves it -
+/// destroying the workspace's copy then loses nothing - or when the target branch holds its
+/// commits by ancestry or patch equivalence. Every other branch is named with its measurement. A
+/// tip equal to the target's same-named tip is decided without a process, which is what keeps a
+/// workspace carrying its source's branches cheap to list.
+pub async fn measure_branches(
+    store_root: &std::sync::Arc<Path>,
+    target: &std::result::Result<LandingTarget, String>,
+    workspace_mount: &Path,
+    workspace: &str,
+) -> BranchLandings {
+    match judged_branches(store_root, target, workspace_mount, workspace).await {
+        Ok(unlanded) => BranchLandings::Measured { unlanded },
+        Err(reason) => BranchLandings::Indeterminate { reason },
+    }
+}
+
+async fn judged_branches(
+    store_root: &std::sync::Arc<Path>,
+    target: &std::result::Result<LandingTarget, String>,
+    workspace_mount: &Path,
+    workspace: &str,
+) -> std::result::Result<Vec<BranchLanding>, String> {
+    let local = GitRepository::from_root(store_root, workspace_mount);
+    let checked_out = local
+        .current_branch()
+        .await
+        .map_err(|error| error.message)?
+        .map(|branch| format!("refs/heads/{branch}").into_bytes());
+    let branches = local
+        .ref_tips(&["refs/heads"])
+        .await
+        .map_err(|error| error.message)?;
+    let mut candidates = branches
+        .into_iter()
+        .filter(|(name, _)| Some(name) != checked_out.as_ref())
+        .peekable();
+    if candidates.peek().is_none() {
+        return Ok(Vec::new());
+    }
+    let target = target.as_ref().map_err(Clone::clone)?;
+    let preserving_namespace = format!("refs/cowshed/{workspace}/heads");
+    let target_repository = GitRepository::from_root(store_root, &target.repository);
+    let preserving = target_repository
+        .ref_tips(&["refs/heads", preserving_namespace.as_str()])
+        .await
+        .map_err(|error| error.message)?;
+    let mut unlanded = Vec::new();
+    for (name, tip) in candidates {
+        let short = name.strip_prefix(b"refs/heads/").unwrap_or(&name);
+        let preserving_refs = [
+            name.clone(),
+            [preserving_namespace.as_bytes(), b"/".as_slice(), short].concat(),
+        ];
+        let mut preserved = false;
+        for preserving_ref in &preserving_refs {
+            let Some(preserving_tip) = preserving.get(preserving_ref) else {
+                continue;
+            };
+            if *preserving_tip == tip
+                || target_repository
+                    .commit_is_ancestor(
+                        &String::from_utf8_lossy(&tip),
+                        &String::from_utf8_lossy(preserving_tip),
+                    )
+                    .await
+                    .map_err(|error| error.message)?
+            {
+                preserved = true;
+                break;
+            }
+        }
+        if preserved {
+            continue;
+        }
+        let tip = GitOid::new(String::from_utf8_lossy(&tip).into_owned()).map_err(|error| {
+            format!("git listed a branch tip that is not an object id: {error}")
+        })?;
+        let commits = counted(store_root, target, workspace_mount, tip.as_str())
+            .await
+            .unwrap_or_else(|reason| LandingCommits::Indeterminate { reason });
+        if !commits.fully_landed() {
+            unlanded.push(BranchLanding {
+                branch: String::from_utf8_lossy(short).into_owned(),
+                tip,
+                commits,
+            });
+        }
+    }
+    Ok(unlanded)
 }
 
 /// The commit half of [`measure`], separated so the gate can take it without a working-tree read it

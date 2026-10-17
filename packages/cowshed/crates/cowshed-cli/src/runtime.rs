@@ -15,11 +15,11 @@ use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
-    AdoptOptions, AttachOptions, BranchName, CheckpointInfo, CheckpointOptions, CheckpointResult,
-    CommandArg, Coordinator, DefragmentResult, DoctorReport, EmptyResult, ExecRequest, ExitStatus,
-    ExpectedRefHead, Finding, FindingSeverity, ForkOptions, GatewayStatus, GcOptions, GcReason,
-    GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions, LandReport,
-    LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
+    AdoptOptions, AttachOptions, BranchLandings, BranchName, CheckpointInfo, CheckpointOptions,
+    CheckpointResult, CommandArg, Coordinator, DefragmentResult, DoctorReport, EmptyResult,
+    ExecRequest, ExitStatus, ExpectedRefHead, Finding, FindingSeverity, ForkOptions, GatewayStatus,
+    GcOptions, GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions,
+    LandReport, LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
     PublicationPolicy, PushOptions, PushReport, RebaseBuildVolume, RebaseOptions, RebaseReport,
     RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult,
     ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus,
@@ -1614,7 +1614,7 @@ where
             if let Some(abandoned) = report.abandoned.as_ref() {
                 output
                     .guidance(&format!(
-                        "abandoned {} commit{} at {} that {} ({}) did not contain",
+                        "abandoned {} commit{} at {}{} that {} ({}) did not contain",
                         abandoned.unlanded_commits,
                         if abandoned.unlanded_commits == 1 {
                             ""
@@ -1622,6 +1622,11 @@ where
                             "s"
                         },
                         abandoned.head,
+                        match abandoned.branches.len() {
+                            0 => String::new(),
+                            1 => String::from(" and 1 other branch"),
+                            count => format!(" and {count} other branches"),
+                        },
                         abandoned.target_branch,
                         match abandoned.target_head.as_ref() {
                             Some(head) => format!("at {head}"),
@@ -1629,6 +1634,14 @@ where
                         }
                     ))
                     .map_err(output_error)?;
+                for branch in &abandoned.branches {
+                    output
+                        .guidance(&format!(
+                            "abandoned branch {} at {}",
+                            branch.branch, branch.tip
+                        ))
+                        .map_err(output_error)?;
+                }
                 output
                     .guidance(&format!("bundled to {}", abandoned.bundle.display()))
                     .map_err(output_error)?;
@@ -3531,10 +3544,11 @@ async fn annotate_landing(workspaces: &mut [WorkspaceInfo]) {
         let target = std::sync::Arc::clone(&target);
         let host_store = std::sync::Arc::clone(&host_store);
         let mount = workspace.mount.clone();
+        let name = workspace.workspace.as_str().to_owned();
         tasks.spawn(async move {
             (
                 index,
-                cowshed_core::landing::measure(&host_store, &target, &mount, "HEAD").await,
+                cowshed_core::landing::measure(&host_store, &target, &mount, &name, "HEAD").await,
             )
         });
     }
@@ -3565,36 +3579,43 @@ async fn annotate_landing(workspaces: &mut [WorkspaceInfo]) {
 fn indeterminate_landing(reason: String) -> WorkspaceLanding {
     WorkspaceLanding {
         dirty_files: None,
+        branches: BranchLandings::Indeterminate {
+            reason: reason.clone(),
+        },
         commits: LandingCommits::Indeterminate { reason },
     }
 }
 
 /// Keep only the workspaces `--landed` may name, and report which of the rest went unanswered.
 ///
-/// The output of `--landed` is meant to be piped into `rm`, so the bar for staying in it is a
-/// measurement that says nothing is unlanded — never an absent measurement, and never main. Rows
-/// dropped for having real unlanded work need no explanation; a row dropped because the question
-/// could not be answered does, or the silence reads as "nothing here".
+/// The output of `--landed` is meant to be piped into `rm`, so the bar for staying in it is the
+/// measurement `rm` gates on saying nothing is unlanded - its head and every other local branch -
+/// never an absent measurement, and never main. Rows dropped for having real unlanded work need no
+/// explanation; a row dropped because the question could not be answered does, or the silence
+/// reads as "nothing here".
 fn retain_fully_landed(workspaces: &mut Vec<WorkspaceInfo>) -> Vec<(String, String)> {
     let mut withheld = Vec::new();
     workspaces.retain(|workspace| {
         if workspace.role == WorkspaceRole::Main {
             return false;
         }
-        match workspace.landing.as_ref().map(|landing| &landing.commits) {
-            Some(LandingCommits::Indeterminate { reason }) => {
-                withheld.push((workspace.workspace.as_str().to_owned(), reason.clone()));
-                false
-            }
-            Some(commits) => commits.fully_landed(),
-            None => {
-                withheld.push((
-                    workspace.workspace.as_str().to_owned(),
-                    String::from("no landing measurement was taken"),
-                ));
-                false
-            }
+        let Some(landing) = workspace.landing.as_ref() else {
+            withheld.push((
+                workspace.workspace.as_str().to_owned(),
+                String::from("no landing measurement was taken"),
+            ));
+            return false;
+        };
+        let unanswered = match (&landing.commits, &landing.branches) {
+            (LandingCommits::Indeterminate { reason }, _)
+            | (_, BranchLandings::Indeterminate { reason }) => Some(reason),
+            _ => None,
+        };
+        if let Some(reason) = unanswered {
+            withheld.push((workspace.workspace.as_str().to_owned(), reason.clone()));
+            return false;
         }
+        landing.fully_landed()
     });
     withheld
 }
@@ -3644,6 +3665,7 @@ fn landing_header(with_repo: bool) -> Vec<String> {
         "LANDED",
         "BEHIND",
         "DIRTY",
+        "UNLANDED-BRANCHES",
         "BRANCH",
         "MOUNT",
     ] {
@@ -3664,7 +3686,7 @@ fn landing_row(repo_id: Option<&RepoId>, workspace: &WorkspaceInfo) -> Vec<Strin
 
 /// `-` where nothing was measured by design, `?` where the answer could not be had. Keeping those
 /// two apart is the whole point: one is main, the other is a workspace nobody can vouch for.
-fn landing_cells(workspace: &WorkspaceInfo) -> [String; 4] {
+fn landing_cells(workspace: &WorkspaceInfo) -> [String; 5] {
     let unknown = || String::from("?");
     let Some(landing) = workspace.landing.as_ref() else {
         return std::array::from_fn(|_| String::from("-"));
@@ -3672,6 +3694,10 @@ fn landing_cells(workspace: &WorkspaceInfo) -> [String; 4] {
     let dirty = landing
         .dirty_files
         .map_or_else(unknown, |count| count.to_string());
+    let branches = match &landing.branches {
+        BranchLandings::Measured { unlanded } => unlanded.len().to_string(),
+        BranchLandings::Indeterminate { .. } => unknown(),
+    };
     match &landing.commits {
         LandingCommits::Measured {
             unlanded,
@@ -3683,8 +3709,9 @@ fn landing_cells(workspace: &WorkspaceInfo) -> [String; 4] {
             landed.to_string(),
             behind.to_string(),
             dirty,
+            branches,
         ],
-        LandingCommits::Indeterminate { .. } => [unknown(), unknown(), unknown(), dirty],
+        LandingCommits::Indeterminate { .. } => [unknown(), unknown(), unknown(), dirty, branches],
     }
 }
 

@@ -1057,6 +1057,7 @@ impl ProjectRuntimeHost for FakeHost {
                     target_branch: "main".to_owned(),
                     target_head: Some(GitOid::new("1".repeat(40)).expect("fixed tip")),
                     unlanded_commits: 3,
+                    branches: Vec::new(),
                     bundle: self.descriptor.storage.store().join(format!(
                         "sessions/.trash/{workspace}-{}.bundle",
                         "4".repeat(40)

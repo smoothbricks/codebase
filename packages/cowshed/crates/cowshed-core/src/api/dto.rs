@@ -682,6 +682,50 @@ pub struct WorkspaceLanding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dirty_files: Option<u64>,
     pub commits: LandingCommits,
+    /// The workspace's other local branches, measured the way `commits` measures its head.
+    pub branches: BranchLandings,
+}
+
+impl WorkspaceLanding {
+    /// Whether retiring the workspace destroys no commit: its head and every other local branch
+    /// are held by, or preserved in, the target's repository.
+    pub fn fully_landed(&self) -> bool {
+        self.commits.fully_landed() && self.branches.fully_landed()
+    }
+}
+
+/// What the workspace's local branches other than the checked-out one hold that the target does
+/// not. A branch passes when its tip equals or is an ancestor of the target repository's branch of
+/// the same name or of its `push` ref `refs/cowshed/<ws>/heads/<branch>`, or when the target
+/// branch holds its commits by ancestry or patch equivalence; every other branch is listed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum BranchLandings {
+    /// Every local branch was judged; `unlanded` names each one that did not pass.
+    #[serde(rename_all = "camelCase")]
+    Measured { unlanded: Vec<BranchLanding> },
+    /// The branches could not be listed or judged, and nothing may be inferred: every consumer
+    /// treats this exactly as it treats an unlanded branch.
+    #[serde(rename_all = "camelCase")]
+    Indeterminate { reason: String },
+}
+
+impl BranchLandings {
+    /// Whether no local branch carries a commit the target lacks.
+    pub fn fully_landed(&self) -> bool {
+        matches!(self, Self::Measured { unlanded } if unlanded.is_empty())
+    }
+}
+
+/// One local branch whose commits the target does not hold and no target ref preserves.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BranchLanding {
+    /// The branch's short name, `refs/heads/` dropped.
+    pub branch: String,
+    pub tip: GitOid,
+    /// The branch measured against the target like a head: never `fully_landed` here.
+    pub commits: LandingCommits,
 }
 
 /// Where a workspace's commits stand relative to the branch that outlives it.
@@ -3667,7 +3711,11 @@ pub struct AbandonedWork {
     pub target_branch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_head: Option<GitOid>,
+    /// Commits reachable from `head` or any of `branches` and not from the target.
     pub unlanded_commits: u64,
+    /// The local branches besides `head` whose unheld commits went into the bundle as refs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<BranchLanding>,
     pub bundle: PathBuf,
 }
 

@@ -1112,11 +1112,14 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
 
 ## `cowshed rm <ws>` — perceived-instant deletion
 
-1. Refuse (exit 4) unless the workspace's HEAD is contained in live main by ancestry or patch equivalence. `--force`
-   permits loss of dirty/in-progress state, not unlanded commits. Explicit `--abandon` requires a verified recovery
-   bundle, `sessions/.trash/<ws>-<head>.bundle`, before retiring unlanded work. It is written beside that name and
-   renamed into place once verified; a retried removal that finds a bundle verifying for the same range keeps it instead
-   of writing another.
+1. Refuse (exit 4) unless every local branch (HEAD included) is contained in live main by ancestry or patch equivalence:
+   the image takes every branch with it. A branch other than HEAD also passes when its tip equals or is an ancestor of
+   main's repository branch of the same name or of `refs/cowshed/<ws>/heads/<branch>`, where `push` preserves it. The
+   refusal names each branch that did not pass with its tip and unlanded count, and `ls --landed` applies the same
+   measurement. `--force` permits loss of dirty/in-progress state, not unlanded commits. Explicit `--abandon` requires a
+   verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and every branch that did not pass as
+   refs, before retiring unlanded work. It is written beside that name and renamed into place once verified; a retried
+   removal that finds a bundle verifying for the same range keeps it instead of writing another.
 2. Stop the supervisor. Ordinary removal quiesces, letting running jobs finish before retirement. `--force` retires
    directly: TERM → grace → KILL across the workspace's descendant process trees (11_shell.md), without waiting for a
    job to complete. Teardown precedes image retirement — live children would otherwise hold the mount busy and keep
