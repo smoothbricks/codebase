@@ -4,9 +4,10 @@
 //! job's process group, streams and status, which no sandbox changes. The workspace has no
 //! `.envrc`, so the host holds exactly the environment it was started with.
 //!
-//! Protocol-position checkpoints are diagnostic only: they do not repair the historical
-//! isolation-case wedge or change its bound. `specs/cowshed/08_testing.md`, CI, records the
-//! unresolved observation and the negative diagnostic runs.
+//! A fixture ends a host as a supervisor does: it closes its end of the control socket, never
+//! `shutdown(2)`s it. Darwin can lose a peer shutdown's wakeup for a host already asleep in
+//! `recvmsg`; `specs/cowshed/08_testing.md`, CI, records the measurement. Protocol-position
+//! checkpoints stay as diagnostics.
 
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -38,7 +39,9 @@ fn shell_host() -> PathBuf {
 
 struct Host {
     child: std::process::Child,
-    control: std::os::unix::net::UnixStream,
+    /// The supervisor's end of the control socket, the only descriptor for it outside the host;
+    /// `None` once closed. Closing it is the host's end of stream.
+    control: Option<std::os::unix::net::UnixStream>,
     directory: PathBuf,
     finished: bool,
 }
@@ -84,7 +87,7 @@ impl Host {
             drop(theirs);
             Ok(Self {
                 child,
-                control: ours,
+                control: Some(ours),
                 directory: canonical,
                 finished: false,
             })
@@ -98,13 +101,27 @@ impl Host {
         }
     }
 
+    fn control(&self) -> &std::os::unix::net::UnixStream {
+        self.control
+            .as_ref()
+            .expect("the control socket is open until the fixture closes it")
+    }
+
     fn run(&mut self, script: &RenderedScript) -> Ran {
-        run_on(&self.control, &self.directory, script, None)
+        run_on(self.control(), &self.directory, script, None)
     }
 
     /// Run `script`, sending the host `signal` for it once it has started.
     fn run_signalled(&mut self, script: &RenderedScript, signal: i32) -> Ran {
-        run_on(&self.control, &self.directory, script, Some(signal))
+        run_on(self.control(), &self.directory, script, Some(signal))
+    }
+
+    /// Go away as a supervisor does: close the control socket, which the host reads as its end
+    /// of stream, retiring any command it holds and exiting. Not `shutdown(2)`: on Darwin a
+    /// peer's shutdown sometimes never wakes a host already asleep in `recvmsg`, which then
+    /// sleeps forever; closing the socket's last descriptor wakes it.
+    fn close_control(&mut self) {
+        drop(self.control.take());
     }
 
     fn finish(&mut self) -> std::io::Result<()> {
@@ -112,13 +129,9 @@ impl Host {
             return Ok(());
         }
         // The actual parent host must retire its held group before it is joined.
+        self.close_control();
         eprintln!(
-            "script-fixture host={} phase=control-shutdown",
-            self.child.id()
-        );
-        let shutdown = self.control.shutdown(std::net::Shutdown::Both);
-        eprintln!(
-            "script-fixture host={} phase=host-wait shutdown={shutdown:?}",
+            "script-fixture host={} phase=control-closed",
             self.child.id()
         );
         let joined = self.child.wait();
@@ -128,13 +141,10 @@ impl Host {
         );
         let removed = std::fs::remove_dir_all(&self.directory);
         self.finished = joined.is_ok() && removed.is_ok();
-        match (&shutdown, &joined, &removed) {
-            (Ok(()), Ok(_), Ok(())) => Ok(()),
-            (Err(cause), Ok(_), Ok(())) if cause.kind() == std::io::ErrorKind::NotConnected => {
-                Ok(())
-            }
+        match (&joined, &removed) {
+            (Ok(_), Ok(())) => Ok(()),
             _ => Err(std::io::Error::other(format!(
-                "fixture teardown: control shutdown={shutdown:?}; host join={joined:?}; directory removal={removed:?}"
+                "fixture teardown: host join={joined:?}; directory removal={removed:?}"
             ))),
         }
     }
@@ -449,8 +459,6 @@ fn alive(pid: i32) -> bool {
 }
 
 struct ScriptJobGuard {
-    /// Closing this actual parent-control capability retires its held command, never a bare PID.
-    control: Option<std::os::unix::net::UnixStream>,
     /// Only this direct child may be killed and reaped here, never a script grandchild.
     child: Option<std::process::Child>,
 }
@@ -472,14 +480,6 @@ impl ScriptJobGuard {
 
 impl Drop for ScriptJobGuard {
     fn drop(&mut self) {
-        if let Some(control) = self.control.take()
-            && let Err(cause) = control.shutdown(std::net::Shutdown::Both)
-            && cause.kind() != std::io::ErrorKind::NotConnected
-        {
-            report_fixture_cleanup(format_args!(
-                "script fixture controller EOF failed: {cause}"
-            ));
-        }
         if let Some(child) = &mut self.child {
             drop(child.stdin.take());
             if let Err(cause) = child.kill() {
@@ -549,13 +549,13 @@ fn the_host_signals_its_command_s_group_until_it_is_released() {
 
     let marker = host.directory.join("descendant");
     let Submitted { reply, readers } = submit(
-        &host.control,
+        host.control(),
         &host.directory,
         &outliving_descendant(&marker, 3),
     );
     let (tag, _) = FrameReader::new(&reply).unwrap();
     assert_eq!(tag, REPLY_STARTED);
-    assert_eq!(read_exit(&host.control), ExitStatus::Exited { code: 3 });
+    assert_eq!(read_exit(host.control()), ExitStatus::Exited { code: 3 });
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let descendant = loop {
         if let Some(pid) = std::fs::read_to_string(&marker)
@@ -570,14 +570,6 @@ fn the_host_signals_its_command_s_group_until_it_is_released() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    let mut job = ScriptJobGuard {
-        control: Some(
-            host.control
-                .try_clone()
-                .expect("retain actual parent control"),
-        ),
-        child: None,
-    };
     std::thread::sleep(Duration::from_millis(100));
     assert!(alive(descendant), "the descendant outlives the leader");
     assert!(
@@ -585,12 +577,11 @@ fn the_host_signals_its_command_s_group_until_it_is_released() {
         "the descendant holds the job's output open"
     );
 
-    send_signal(&host.control, libc::SIGKILL);
+    send_signal(host.control(), libc::SIGKILL);
     let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
     assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
     assert!(gone(descendant), "the signal reached the descendant");
-    job.control.take();
-    release(&host.control);
+    release(host.control());
 
     let ran = host.run(&text("printf after"));
     assert_eq!(
@@ -607,13 +598,13 @@ fn a_host_whose_supervisor_goes_away_ends_the_command_it_holds() {
     let mut host = Host::start("orphan");
     let marker = host.directory.join("descendant");
     let Submitted { reply, readers } = submit(
-        &host.control,
+        host.control(),
         &host.directory,
         &outliving_descendant(&marker, 0),
     );
     let (tag, _) = FrameReader::new(&reply).unwrap();
     assert_eq!(tag, REPLY_STARTED);
-    assert_eq!(read_exit(&host.control), ExitStatus::Exited { code: 0 });
+    assert_eq!(read_exit(host.control()), ExitStatus::Exited { code: 0 });
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let descendant = loop {
         if let Some(pid) = std::fs::read_to_string(&marker)
@@ -628,17 +619,7 @@ fn a_host_whose_supervisor_goes_away_ends_the_command_it_holds() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    let mut job = ScriptJobGuard {
-        control: Some(
-            host.control
-                .try_clone()
-                .expect("retain actual parent control"),
-        ),
-        child: None,
-    };
-    host.control
-        .shutdown(std::net::Shutdown::Both)
-        .expect("close the supervisor's end");
+    host.close_control();
     let [stdout, _] = readers.map(|reader| reader.join().expect("stream reader"));
     assert_eq!(stdout, "");
     let host_status = loop {
@@ -653,7 +634,6 @@ fn a_host_whose_supervisor_goes_away_ends_the_command_it_holds() {
     };
     assert_eq!(host_status.code(), Some(0));
     assert!(gone(descendant), "the host ended the descendant");
-    job.control.take();
 }
 
 /// Whether `pid` stops existing within a bound: a killed descendant whose parent already exited
@@ -688,7 +668,7 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     eprintln!(
         "script-group phase=host-started host_pid={} control_fd={} fixture={}",
         host.child.id(),
-        host.control.as_raw_fd(),
+        host.control().as_raw_fd(),
         host.directory.display()
     );
     let leader = host.directory.join("leader");
@@ -710,16 +690,8 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
         hold.display(),
         leader.display()
     ));
-    let mut job = ScriptJobGuard {
-        control: Some(
-            host.control
-                .try_clone()
-                .expect("retain actual parent control"),
-        ),
-        child: None,
-    };
     eprintln!("script-group phase=submitting");
-    let Submitted { reply, readers } = submit(&host.control, &host.directory, &rendered);
+    let Submitted { reply, readers } = submit(host.control(), &host.directory, &rendered);
     eprintln!("script-group phase=start-reply");
     let (tag, mut fields) = FrameReader::new(&reply).expect("start reply");
     assert_eq!(tag, REPLY_STARTED);
@@ -764,9 +736,9 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     });
     // A real group signal must end both retained lives, not just the leader or its output pipes.
     eprintln!("script-group phase=signalling signal={}", libc::SIGTERM);
-    send_signal(&host.control, libc::SIGTERM);
+    send_signal(host.control(), libc::SIGTERM);
     eprintln!("script-group phase=reading-exit");
-    let status = read_exit(&host.control);
+    let status = read_exit(host.control());
     eprintln!("script-group phase=exit-read status={status:?}");
     assert_eq!(signaled(Some(&status)), Some(libc::SIGTERM));
     for (pid, exit) in pids.into_iter().zip(exits) {
@@ -783,9 +755,8 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
     eprintln!("script-group phase=outputs-ended");
     assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
     eprintln!("script-group phase=releasing-leader");
-    release(&host.control); // Only its actual parent reaps the script's leader.
+    release(host.control()); // Only its actual parent reaps the script's leader.
     eprintln!("script-group phase=leader-reaped");
-    job.control.take();
     assert!(
         host.child.try_wait().expect("host status").is_none(),
         "the host is not in the job's group"
@@ -808,10 +779,7 @@ fn an_unreaped_zombie_is_exited_even_while_the_null_signal_reaches_it() {
         .spawn()
         .expect("owned pipe-held child");
     let pid = i32::try_from(child.id()).expect("child PID");
-    let mut owner = ScriptJobGuard {
-        control: None,
-        child: Some(child),
-    };
+    let mut owner = ScriptJobGuard { child: Some(child) };
     let child = owner
         .child
         .as_mut()
@@ -1044,14 +1012,14 @@ fn a_host_that_cannot_run_direnv_says_so() {
         .finish()
         .unwrap();
     let sent = send_with_descriptors(
-        host.control.as_raw_fd(),
+        host.control().as_raw_fd(),
         &frame,
         &[stdout_write.as_raw_fd(), stderr_write.as_raw_fd()],
     )
     .expect("send the request");
-    std::io::Write::write_all(&mut &host.control, &frame[sent..]).expect("send the rest");
+    std::io::Write::write_all(&mut host.control(), &frame[sent..]).expect("send the rest");
     drop((stdout_write, stderr_write));
-    let (reply, _) = read_frame(&host.control)
+    let (reply, _) = read_frame(host.control())
         .expect("a readable reply")
         .expect("a reply, not a closed socket");
     let (tag, mut fields) = FrameReader::new(&reply).unwrap();
