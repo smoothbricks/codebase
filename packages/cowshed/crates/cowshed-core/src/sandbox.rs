@@ -145,10 +145,11 @@ pub struct SandboxConfig {
     /// Operator-planted symlinks beside the workspace mount; see [`ShedLink`].
     pub shed_links: Vec<ShedLink>,
     pub exec_temp_dir: PathBuf,
-    /// Where launches under this sandbox keep their profile file: the `run/profiles` directory of
-    /// the store the launcher serves ([`crate::exec::profile_directory`]), so a fixture's
-    /// launches stay in its own store (04_sandbox.md, "Exec pipeline" step 4).
-    pub profile_directory: PathBuf,
+    /// The store the launcher serves: the host's in production, a fixture's own in a test. Launches
+    /// keep their profile file in its `run/profiles` ([`Self::profile_directory`]), and host-side
+    /// preparation reads only its bindings (04_sandbox.md, "Exec pipeline" step 4; 08_testing.md,
+    /// "Fixtures").
+    pub store_root: PathBuf,
 
     /// Gateway-derived workspace IPC scope. None when an injected provider needs no extra socket scope.
     pub cpu_pool_directory: Option<PathBuf>,
@@ -194,6 +195,12 @@ pub struct SandboxConfig {
 }
 
 impl SandboxConfig {
+    /// Where launches under this sandbox keep their profile file: the `run/profiles` directory of
+    /// the store the launcher serves.
+    pub fn profile_directory(&self) -> PathBuf {
+        crate::exec::profile_directory(&self.store_root)
+    }
+
     /// [`Self::configure_capabilities_for`] a command at the workspace root: the snapshot a
     /// supervisor starts with.
     pub fn configure_capabilities(&mut self) -> crate::Result<()> {
@@ -218,7 +225,7 @@ impl SandboxConfig {
             workspace_mount: self.workspace_mount.clone(),
             shed_links: self.shed_links.clone(),
             exec_temp_dir: self.exec_temp_dir.clone(),
-            profile_directory: self.profile_directory.clone(),
+            store_root: self.store_root.clone(),
             cpu_pool_directory: self.cpu_pool_directory.clone(),
             port_block: self.port_block,
             retained_port_blocks: self.retained_port_blocks.clone(),
@@ -367,7 +374,7 @@ pub fn workspace_sandbox(workspace: WorkspaceSandbox<'_>) -> crate::Result<Sandb
         home: home.to_path_buf(),
         mount_root: mount_root.to_path_buf(),
         exec_temp_dir,
-        profile_directory: crate::exec::profile_directory(store_root),
+        store_root: store_root.to_path_buf(),
 
         cpu_pool_directory: Some(
             cowshed_gateway_types::cpu_pool_directory(store_root, workspace_incarnation.as_str())
@@ -1461,7 +1468,7 @@ mod tests {
             ),
             shed_links: Vec::new(),
             exec_temp_dir: PathBuf::from("/private/tmp/cowshed-raven"),
-            profile_directory: PathBuf::from("/private/tmp/cowshed-raven-store/run/profiles"),
+            store_root: PathBuf::from("/private/tmp/cowshed-raven-store"),
             port_block: PortBlock::new(40_960, 16).unwrap(),
             retained_port_blocks: Vec::new(),
             mode,
@@ -1535,7 +1542,7 @@ mod tests {
         sandbox.mount_root = fixture.root.join("mounts");
         sandbox.workspace_mount = sandbox.mount_root.join("workspace");
         sandbox.exec_temp_dir = fixture.root.join("exec-temp");
-        sandbox.profile_directory = fixture.root.join("store/run/profiles");
+        sandbox.store_root = fixture.root.join("store");
         sandbox.grants = SandboxGrants::default();
         sandbox.allowed_unix_sockets.clear();
         let volumes = sandbox.mount_root.join(".build/example-org/example-app");
@@ -1667,7 +1674,7 @@ mod tests {
         sandbox.mount_root = fixture.root.join("mounts");
         sandbox.workspace_mount = sandbox.mount_root.join("workspace");
         sandbox.exec_temp_dir = fixture.root.join("exec-temp");
-        sandbox.profile_directory = fixture.root.join("store/run/profiles");
+        sandbox.store_root = fixture.root.join("store");
         sandbox.grants = SandboxGrants::default();
         sandbox.allowed_unix_sockets.clear();
         fs::create_dir_all(&sandbox.workspace_mount).unwrap();
@@ -1736,7 +1743,7 @@ mod tests {
         sandbox.mount_root = fixture.root.join("mounts");
         sandbox.workspace_mount = sandbox.mount_root.join("workspace");
         sandbox.exec_temp_dir = fixture.root.join("exec-temp");
-        sandbox.profile_directory = fixture.root.join("store/run/profiles");
+        sandbox.store_root = fixture.root.join("store");
         sandbox.grants = SandboxGrants::default();
         sandbox.allowed_unix_sockets.clear();
         let runtime = shared_daemon_runtime_dir(&sandbox);

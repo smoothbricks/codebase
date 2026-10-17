@@ -214,7 +214,7 @@ async fn probe_git(root: &Path, args: &[&str], sandbox: &SandboxConfig) -> Resul
     let profile = crate::exec::ProfileLaunch::write(sandbox, &profile).map_err(|error| {
         failure(format!(
             "cannot write the Git probe's sandbox profile into {}: {error}",
-            sandbox.profile_directory.display()
+            sandbox.profile_directory().display()
         ))
     })?;
     let mut command = tokio::process::Command::new(crate::exec::SANDBOX_EXEC);
@@ -405,12 +405,11 @@ async fn repository_object_store(root: &Path, sandbox: &SandboxConfig) -> Result
 }
 
 /// Called host-side immediately before child spawn. The registry, binding and main image
-/// sidecar are controller authority. A checkout's mutable remotes cannot invent routes.
+/// sidecar are controller authority, read from the store the sandbox's launcher serves and from
+/// no other (04_sandbox.md, "Exec pipeline" step 4). A checkout's mutable remotes cannot invent
+/// routes.
 pub async fn refresh_git_fetch_config(sandbox: &SandboxConfig) -> Result<Option<PathBuf>> {
-    refresh_from_store(Path::new(cowshed_gateway_types::STORE_ROOT), sandbox).await
-}
-
-async fn refresh_from_store(store: &Path, sandbox: &SandboxConfig) -> Result<Option<PathBuf>> {
+    let store = sandbox.store_root.as_path();
     crate::sandbox::validate_sandbox_config(sandbox).map_err(|error| failure(error.to_string()))?;
     let mut mappings = Vec::new();
     // No external read capability means no discovery and no dependency on store availability.
@@ -651,6 +650,33 @@ mod tests {
         std::fs::remove_dir_all(outside).expect("cleanup");
     }
 
+    /// Routes come from the store the sandbox's launcher serves, never the host's: a fixture
+    /// whose own store is not there is refused by that store's path, where reading the host
+    /// store would have answered from another installation's bindings (04_sandbox.md, "Exec
+    /// pipeline" step 4).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn routes_are_read_from_the_store_the_sandbox_serves() {
+        // Under the canonical /tmp parent: a grant inside the cowshed store is refused before any
+        // store is read (08_testing.md, "Fixtures").
+        let root = crate::temp_root::TempRoot::new("cowshed-git-fetch-store");
+        let checkout = root.join("checkout");
+        std::fs::create_dir(&checkout).expect("checkout");
+        let config = sandbox(&root, &checkout);
+        std::fs::create_dir_all(config.workspace_mount.join(".cowshed"))
+            .expect("workspace metadata");
+        let error = refresh_git_fetch_config(&config)
+            .await
+            .expect_err("a store that is not there is not read around");
+        assert!(
+            error
+                .message
+                .contains(&config.store_root.display().to_string()),
+            "{}",
+            error.message
+        );
+    }
+
     #[cfg(target_os = "macos")]
     fn sandbox(root: &Path, checkout: &Path) -> SandboxConfig {
         SandboxConfig {
@@ -659,7 +685,7 @@ mod tests {
             workspace_mount: root.join("mounts/workspace"),
             shed_links: Vec::new(),
             exec_temp_dir: root.join("temp"),
-            profile_directory: root.join("store/run/profiles"),
+            store_root: root.join("store"),
             port_block: crate::metadata::PortBlock::new(49_136, 16).expect("ports"),
             retained_port_blocks: Vec::new(),
             cpu_pool_directory: None,
@@ -904,14 +930,14 @@ mod tests {
         )
         .expect("stale route");
         assert_eq!(
-            refresh_from_store(&store, &config).await.expect("refresh"),
+            refresh_git_fetch_config(&config).await.expect("refresh"),
             None
         );
         assert!(!git_fetch_config_path(&config.workspace_mount).exists());
         // Mutable Git config is not consulted even when the checkout holds a read grant.
         std::fs::write(checkout.join(".git/config"), "[broken\n").expect("poison config");
         assert_eq!(
-            refresh_from_store(&store, &config)
+            refresh_git_fetch_config(&config)
                 .await
                 .expect("no Git config discovery"),
             None

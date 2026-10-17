@@ -431,7 +431,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
             mount_root: root.join("mounts"),
             workspace_mount: workspace_root,
             exec_temp_dir: PathBuf::from("/tmp/cowshed-exec"),
-            profile_directory: root.join("store/run/profiles"),
+            store_root: root.join("store"),
             port_block: PortBlock::new(49_136, 16).unwrap(),
             retained_port_blocks: Vec::new(),
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,

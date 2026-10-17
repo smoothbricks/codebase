@@ -103,7 +103,7 @@ fn workspace(root: &Path, port_base: u16) -> SandboxConfig {
         mount_root,
         workspace_mount: mount,
         exec_temp_dir,
-        profile_directory: root.join("store/run/profiles"),
+        store_root: root.join("store"),
         port_block: PortBlock::new(port_base, 16).expect("port block"),
         retained_port_blocks: Vec::new(),
         cpu_pool_directory: None,
