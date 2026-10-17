@@ -71,8 +71,13 @@ impl NxPublication {
     }
 }
 
+/// One validated Nx task key (05_gateway.md): 1-128 characters of `[A-Za-z0-9_-]`, the backend's
+/// own key charset. Nx sends a task's hash verbatim, stock decimal or a custom hasher's value.
 pub(crate) fn is_task_hash(hash: &str) -> bool {
-    !hash.is_empty() && hash.len() <= 20 && hash.bytes().all(|byte| byte.is_ascii_digit())
+    (1..=128).contains(&hash.len())
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 /// Recognize only stock Nx's exact route; no query, escaping, or path suffix can acquire it.

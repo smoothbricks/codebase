@@ -17,7 +17,8 @@ const { HttpRemoteCache } = requireNx('nx/src/native');
 const SUCCESS = new Set(['success', 'local-cache', 'local-cache-kept-existing', 'remote-cache']);
 
 function localResult(hash) {
-  if (typeof hash !== 'string' || !/^\d{1,20}$/.test(hash)) {
+  // One validated Nx task key (05_gateway.md), the rule the gateway's publication capability checks.
+  if (typeof hash !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(hash)) {
     throw new Error('the qualified receipt contains an invalid Nx task hash');
   }
   const result = getLocal(hash);
