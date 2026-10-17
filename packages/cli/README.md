@@ -867,6 +867,9 @@ Managed CI setup is split across local composite actions:
   the shell produced `nix-eval-cache.db`. The store cache saves itself in `setup-devenv`'s post phase, which collects
   garbage down to the live closure before uploading.
 - `cache-nix-devenv` is the shared restore/save primitive for the `.devenv`/`.direnv` segment.
+- `cache-node-modules` restores `node_modules` together with `~/.bun/install/cache/links`. Bun's isolated-store aliases
+  name those global targets by absolute path, so archiving the aliases alone is incomplete. Both paths share one cache
+  artifact and its path-versioned identity; ttsc plugins remain in their separate cache.
 
 The cache split is intentional. The store segment is large and keyed by the expensive shell closure inputs
 (`devenv.yaml`, `devenv.nix`, `devenv.lock`), and it carries store content only — never the Nix profiles, which exist to
