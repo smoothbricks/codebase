@@ -1,9 +1,10 @@
 #![cfg(target_os = "macos")]
 //! The `cargo` jobserver launcher against a real gateway: each of its four
-//! cases, the variables it sets or leaves, and a `SIGKILL`ed `cargo`
-//! mid-build leaving the ledger whole and its fifo unlinked.
+//! cases, the variables it sets or leaves, a `SIGKILL`ed `cargo` mid-build
+//! leaving the ledger whole and its fifo unlinked, and a build under a job's
+//! CPU pool running on through a gateway restart.
 
-use cowshed_os::fork_lock::Run as _;
+use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use std::io::Write as _;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
@@ -97,9 +98,11 @@ fn held(socket: &Path) -> u64 {
     answer["cpuBudget"]["held"].as_u64().expect("a ledger")
 }
 
-async fn gateway(root: &Path, tokens: usize) -> (Gateway, PathBuf) {
+/// A gateway on `root`'s control socket. A restarted gateway starts on the same root and reuses
+/// its cache, as launchd's restart of the installed daemon does.
+async fn start_gateway(root: &Path, tokens: usize) -> (Gateway, PathBuf) {
     let cache = root.join("cache");
-    std::fs::create_dir(&cache).expect("cache");
+    std::fs::create_dir_all(&cache).expect("cache");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700))
         .expect("private cache");
     let socket = root.join("gateway.sock");
@@ -132,6 +135,10 @@ const FAKE_CARGO: &str = r#"#!/bin/sh
 } > "$FAKE_CARGO_OUT"
 echo $$ > "$FAKE_CARGO_PID"
 if [ "$FAKE_CARGO_SLEEP" = "1" ]; then exec sleep 60; fi
+if [ -n "$FAKE_CARGO_WAIT" ]; then
+  while [ ! -e "$FAKE_CARGO_WAIT" ]; do sleep 0.05; done
+  echo finished >> "$FAKE_CARGO_OUT"
+fi
 exit "${FAKE_CARGO_EXIT:-0}"
 "#;
 
@@ -148,7 +155,7 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
     let out = root.join("env.txt");
     let pid_file = root.join("pid.txt");
 
-    let (gateway, socket) = gateway(&root, 4).await;
+    let (gateway, socket) = start_gateway(&root, 4).await;
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     set("PATH", &format!("{}:{original_path}", bin.display()));
@@ -415,6 +422,118 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
         std::thread::sleep(Duration::from_millis(25));
     }
     unset("FAKE_CARGO_SLEEP");
+
+    // A gateway restart under a running build (05_gateway.md "Host CPU budget": a restart forgets
+    // every grant, and what runs under the old gateway runs on over budget until it finishes). A
+    // land gate's job holds its root grant and the gateway serves the job's CPU pool; the real
+    // CLI, as `cargo` under that pool, holds a child grant from it. The gateway then takes the
+    // drain a SIGTERM'd daemon takes and a new one starts on its socket, as launchd's restart of
+    // an install does. The build hears its pool close, says so, and ends with its own status.
+    let job = {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let mut stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect the gate job");
+        let request = serde_json::json!({ "op": "jobserver", "want": 1,
+            "checkout": root.display().to_string(), "command": "nx run-many -t gate",
+            "class": "gate", "waitMs": 120_000, "pool": true,
+            "job": { "repoId": "owner/repo",
+                "workspaceIncarnation": "0123456789abcdef0123456789abcdef", "jobId": 1 } });
+        stream
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("ask for the gate job's grant");
+        let mut lines = tokio::io::BufReader::new(stream);
+        let pool = loop {
+            let mut line = String::new();
+            lines.read_line(&mut line).await.expect("gate job answer");
+            let answer: serde_json::Value = serde_json::from_str(&line).expect("gate job JSON");
+            if answer["lease"] == "queued" {
+                continue;
+            }
+            assert_eq!(answer["lease"], "granted", "{answer}");
+            break PathBuf::from(
+                answer["cpuPool"]
+                    .as_str()
+                    .expect("a gate job names its pool"),
+            );
+        };
+        (lines, pool)
+    };
+    let go = root.join("go");
+    std::fs::remove_file(&pid_file).expect("discard the previous child identity");
+    let mut build = std::process::Command::new(&launcher)
+        .arg("build")
+        .env(
+            "PATH",
+            format!("{}:{}:{original_path}", installed.display(), bin.display()),
+        )
+        .env("BOUNDED_EXEC_CPU_POOL", &job.1)
+        .env("BOUNDED_EXEC_CPU_TOKENS", "1")
+        .env("FAKE_CARGO_WAIT", &go)
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .expect("start a build under the job's pool");
+    let (tell, heard) = std::sync::mpsc::channel::<String>();
+    let stderr = build.stderr.take().expect("the build's stderr is piped");
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if tell.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !pid_file.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the build never started under the job's pool"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    gateway
+        .drain()
+        .await
+        .expect("drain the gateway for its restart");
+    let (gateway, restarted) = start_gateway(&root, 4).await;
+    assert_eq!(restarted, socket);
+    assert_eq!(held(&socket), 0, "a restarted gateway forgets every grant");
+
+    let mut said = Vec::new();
+    loop {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default()
+            .max(Duration::from_secs(5));
+        let line = heard.recv_timeout(left).unwrap_or_else(|error| {
+            panic!("the build never said its pool closed ({error}); it said: {said:#?}")
+        });
+        let closed = line.contains("runs on over budget until it ends");
+        said.push(line);
+        if closed {
+            break;
+        }
+    }
+    assert!(
+        build.try_wait().expect("poll the build").is_none(),
+        "the build outlives the restart: {said:#?}"
+    );
+    std::fs::write(&go, []).expect("let the build finish");
+    let status = build.wait().expect("the build ends");
+    reader.join().expect("stderr reader ends");
+    said.extend(heard.try_iter());
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the build ends with its own status: {said:#?}"
+    );
+    assert!(env_out().contains("finished"), "the build ran to its end");
+    assert_eq!(held(&socket), 0, "the restarted gateway never held it");
+    drop(job);
+    std::fs::remove_file(&go).expect("retire the go file");
 
     gateway.drain().await.expect("drain");
     std::env::set_current_dir(original_cwd).expect("restore original cwd");

@@ -209,11 +209,12 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   "Host CPU budget", Outside `bounded-exec`). Under an inherited jobserver (`CARGO_MAKEFLAGS` names a live one, as for a
   `cargo` a build script starts) it runs that `cargo` as asked. A live parent CPU pool comes next: compiling Cargo
   borrows its actual local allocation, sizes to it and inherits its own child sub-pool; it never competes for the
-  parent's held host grant. Pool refusal/loss fails the command (05 Gateway, gate admission by drain). Under a
-  `bounded-exec` grant (`BOUNDED_EXEC_CPU_TOKENS` set) it takes no second grant and sets `CARGO_BUILD_JOBS`,
-  `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` to that count where they are unset. A subcommand classified as
-  non-compiling by [05 Gateway, Host CPU budget](05_gateway.md#host-cpu-budget) runs directly. Any other takes a
-  jobserver grant of `g` tokens and runs with the grant's fifo, and with `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` and
+  parent's held host grant. Pool refusal fails the command; pool loss (a gateway restart, or the lending parent's exit)
+  is said and leaves Cargo running over budget to its own status (05 Gateway, Host CPU budget). Under a `bounded-exec`
+  grant (`BOUNDED_EXEC_CPU_TOKENS` set) it takes no second grant and sets `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and
+  `NEXTEST_TEST_THREADS` to that count where they are unset. A subcommand classified as non-compiling by
+  [05 Gateway, Host CPU budget](05_gateway.md#host-cpu-budget) runs directly. Any other takes a jobserver grant of `g`
+  tokens and runs with the grant's fifo, and with `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` and
   `BOUNDED_EXEC_CPU_TOKENS` set to `g` where they are unset. For a root admission, the launcher scans cwd ancestors with
   lstat for `.cowshed/workspace.json`: presence only tightens admission and grants no authority; inspection errors
   refuse. A managed checkout never starts Cargo on an absent/refused/protocol-failed grant. Only positively nonmanaged
