@@ -505,9 +505,11 @@ nothing when nothing changed:
   interpreter devenv provides, and activated after the sync. Its inputs are the root `pyproject.toml`, `uv.lock` and
   every workspace member's `pyproject.toml`. The environment names no path of its checkout, so a copy-on-write clone of
   an installed checkout enters installed: uv creates it relocatable, each workspace member's editable `.pth` line is
-  rewritten relative to site-packages after every sync, and the managed module clears `languages.python.libraries`,
-  whose default would put the checkout's `.devenv/profile` into the interpreter's store path. devenv's own
-  `languages.python.venv` and `uv.sync` must stay off; the module refuses them.
+  rewritten relative to site-packages after every sync, currentness and replacement share one witness that the
+  environment is still the relocatable one that sync would leave (no launcher or interpreter link naming an environment
+  or a checkout, no absolute `.pth` line), and the managed module clears `languages.python.libraries`, whose default
+  would put the checkout's `.devenv/profile` into the interpreter's store path. devenv's own `languages.python.venv` and
+  `uv.sync` must stay off; the module refuses them.
 - Shell entries in one checkout install one at a time: the install runs under a flock(2) on
   `node_modules/.smoo-install.lock`, so a second shell loading at the same moment waits (and says so), then finds the
   first entry's stamps current. The kernel releases the lock when its holder exits, so a killed shell entry leaves

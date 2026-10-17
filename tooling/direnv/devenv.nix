@@ -47,6 +47,10 @@ in {
       direnv # Cowshed .envrc activation; hosted CI has no ambient direnv
       # Bun.sh for javascript dependencies
       bun
+      # The managed shell's uv installer is exercised against the real producer in
+      # packages/cli's shell-entry tests; those tests must find uv on PATH in CI,
+      # where no ambient profile provides it.
+      uv
       # The toolchain itself comes from ./devenv.smoo.nix (one nightly for every
       # repository, pinned by devenv.lock). Only this repository's extra targets
       # are declared here, below, via languages.rust.targets.
