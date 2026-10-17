@@ -174,7 +174,11 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
     };
     let env_out = || std::fs::read_to_string(&out).expect("fake cargo ran");
 
-    // A build asks, is granted the whole budget of 4, and runs under the fifo.
+    // A build asks for one token per core and is granted min(cores, 4) on this budget of 4: a
+    // 3-core runner asks for, and runs with, 3. It runs under the fifo.
+    let granted = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4);
     let code = run(&["build"], &socket).expect("launcher thread");
     assert_eq!(code, 7, "the child's status is the launcher's");
     let shown = env_out();
@@ -189,9 +193,18 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
         fifo.starts_with(&*root.join("jobserver").display().to_string()),
         "{fifo}"
     );
-    assert!(shown.contains("BOUNDED_EXEC_CPU_TOKENS=4"), "{shown}");
-    assert!(shown.contains("RUST_TEST_THREADS=4"), "{shown}");
-    assert!(shown.contains("NEXTEST_TEST_THREADS=4"), "{shown}");
+    assert!(
+        shown.contains(&format!("BOUNDED_EXEC_CPU_TOKENS={granted}\n")),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!("RUST_TEST_THREADS={granted}\n")),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!("NEXTEST_TEST_THREADS={granted}\n")),
+        "{shown}"
+    );
     assert!(
         shown.contains("CARGO_BUILD_JOBS=\n"),
         "no static job count under a jobserver: {shown}"
