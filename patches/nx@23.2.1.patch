@@ -343,7 +343,7 @@ index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..c552b4b252c2d0496312ddb6ff481699
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a0389a0c54c40d43cf863b899bf49193d2918332 100644
+index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..31fcb14fbf3811f0e1c545791026e5a6a3133399 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -382,7 +382,54 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a0389a0c54c40d43cf863b899bf49193
      getSyncGeneratorChanges(generators) {
          const message = {
              type: get_sync_generator_changes_1.GET_SYNC_GENERATOR_CHANGES,
-@@ -1132,8 +1110,11 @@ class DaemonClient {
+@@ -831,13 +809,24 @@ class DaemonClient {
+         }
+     }
+     async sendToDaemonViaQueue(messageToDaemon, parser) {
+-        return this.queue.sendToQueue(async () => {
+-            // Set currentSpinner inside the queued function so it's only
+-            // active while this specific message is in flight — preventing
+-            // concurrent callers from overwriting each other's spinner
+-            // reference before their turn arrives.
+-            return await this.sendMessageToDaemon(messageToDaemon, parser);
+-        });
++        try {
++            return await this.queue.sendToQueue(async () => {
++                // Set currentSpinner inside the queued function so it's only
++                // active while this specific message is in flight — preventing
++                // concurrent callers from overwriting each other's spinner
++                // reference before their turn arrives.
++                return await this.sendMessageToDaemon(messageToDaemon, parser);
++            });
++        }
++        finally {
++            // A plugin worker is a client of its daemon only while it waits on a
++            // reply. The daemon keeps a worker with graph hooks alive, and an open
++            // request connection keeps the daemon from its idle stop, so a worker
++            // that stayed connected would keep its own host alive forever.
++            if (global.NX_PLUGIN_WORKER && this.queue.isEmpty()) {
++                this.reset();
++            }
++        }
+     }
+     setUpConnection() {
+         const socketPath = this.getSocketPath();
+@@ -846,7 +835,13 @@ class DaemonClient {
+         // sendMessageToDaemon method uses a keep-alive setTimeout to
+         // explicitly hold the event loop open while awaiting a response.
+         socket.unref();
+-        this.socketMessenger = new daemon_socket_messenger_1.DaemonSocketMessenger(socket).listen((message) => this.handleMessage(message), () => {
++        const messenger = new daemon_socket_messenger_1.DaemonSocketMessenger(socket);
++        this.socketMessenger = messenger.listen((message) => this.handleMessage(message), () => {
++            // A connection reset() already let go says nothing about the current
++            // one, which may be carrying a request by the time this close arrives.
++            if (this.socketMessenger !== messenger) {
++                return;
++            }
+             // it's ok for the daemon to terminate if the client doesn't wait on
+             // any messages from the daemon
+             if (this.queue.isEmpty()) {
+@@ -1132,8 +1127,11 @@ class DaemonClient {
           */
          const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
          if (available) {
