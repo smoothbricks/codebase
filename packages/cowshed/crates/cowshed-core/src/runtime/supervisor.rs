@@ -1174,16 +1174,17 @@ fn one_shot_plan(
 }
 
 /// The installed cargo launcher leads exact private-bin tool links; no host tool profile joins PATH.
+/// The package-manager wrapper route sits just ahead of the other bootstrap links: it is the one
+/// directory the exec host re-leads after shell activation, so it leads before activation too.
 fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
     let tools = match sandbox.mode {
-        crate::sandbox::RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.join("tools/bin"),
-        crate::sandbox::RunSandboxMode::ReadWrite => {
-            sandbox.workspace_mount.join(".cowshed/tools/bin")
-        }
+        crate::sandbox::RunSandboxMode::ReadOnly => sandbox.exec_temp_dir.join("tools"),
+        crate::sandbox::RunSandboxMode::ReadWrite => sandbox.workspace_mount.join(".cowshed/tools"),
     };
     let mut paths = vec![
         crate::host_dirs::installed_binary_directory(&sandbox.home),
-        tools,
+        tools.join("manager-bin"),
+        tools.join("bin"),
     ];
     paths.push(sandbox.workspace_mount.join(".cowshed/bin"));
     if let Some(path) = developer_directory().map(|directory| directory.join("usr/bin"))
@@ -1243,10 +1244,10 @@ fn prepare_private_environment(
     for name in [c"home", c"config", c"cache", c"data", c"state", c"run"] {
         environment.child(name).map_err(private_environment_error)?;
     }
-    let bin = environment
+    let tools = environment
         .child(c"tools")
-        .and_then(|tools| tools.child(c"bin"))
         .map_err(private_environment_error)?;
+    let bin = tools.child(c"bin").map_err(private_environment_error)?;
     let manager_host = if contribution
         .bootstrap_programs
         .iter()
@@ -1263,11 +1264,16 @@ fn prepare_private_environment(
         .as_ref()
         .map(|program| super::shell_job::stage_host_executable(workspace_root, program))
         .transpose()?;
-    let real_bin = environment
-        .child(c"tools")
-        .and_then(|tools| tools.child(c"real-bin"))
+    let real_bin = tools
+        .child(c"real-bin")
+        .map_err(private_environment_error)?;
+    // Wrappers live apart from the other bootstrap links: the exec host leads PATH with this
+    // directory alone after activation, so a bootstrap toolchain never shadows the shell's.
+    let manager_bin = tools
+        .child(c"manager-bin")
         .map_err(private_environment_error)?;
     let mut managers = Vec::new();
+    let mut wrappers = Vec::new();
     let mut programs = Vec::with_capacity(contribution.bootstrap_programs.len());
     for program in &contribution.bootstrap_programs {
         if program.name.is_empty() || program.name.contains('/') {
@@ -1283,13 +1289,16 @@ fn prepare_private_environment(
             && let Some(host) = manager_host.as_deref()
         {
             managers.push((name.clone(), program.target.as_path()));
-            programs.push((name, host));
+            wrappers.push((name, host));
         } else {
             programs.push((name, program.target.as_path()));
         }
     }
     real_bin
         .reconcile_links(c".links", &managers)
+        .map_err(private_environment_error)?;
+    manager_bin
+        .reconcile_links(c".links", &wrappers)
         .map_err(private_environment_error)?;
     bin.reconcile_links(c".links", &programs)
         .map_err(private_environment_error)?;
@@ -1689,8 +1698,8 @@ pub(super) async fn sandbox_environment(
         sandbox.workspace_mount.as_os_str(),
     );
     own(
-        crate::developer_links::TOOL_BIN_ENV,
-        environment_root.join("tools/bin").as_os_str(),
+        crate::developer_links::MANAGER_BIN_ENV,
+        environment_root.join("tools/manager-bin").as_os_str(),
     );
     own("HOME", private_home.as_os_str());
     own("XDG_CONFIG_HOME", private_config.as_os_str());
@@ -8056,6 +8065,7 @@ mod workspace_toolchain_tests {
             let path = bootstrap_path(&sandbox).expect("bootstrap PATH");
             let mut expected = vec![
                 crate::host_dirs::installed_binary_directory(&sandbox.home),
+                environment_root.join("tools/manager-bin"),
                 environment_root.join("tools/bin"),
                 mount.join(".cowshed/bin"),
             ];
@@ -8063,7 +8073,7 @@ mod workspace_toolchain_tests {
             assert_eq!(
                 std::env::split_paths(&path).collect::<Vec<_>>(),
                 expected,
-                "{mode:?}: the installed launcher leads, then private tools, workspace bin and platform"
+                "{mode:?}: the installed launcher leads, then the wrapper route, private tools, workspace bin and platform"
             );
 
             prepare_private_environment(

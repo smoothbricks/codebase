@@ -148,13 +148,18 @@ Each detector returns data through one `CapabilityContribution`:
   missing-owner panic.
 
   When the registered `cowshed` multicall executable owns the exec host, detected `bun`, `npm` and `pnpm` entries use
-  that same staged executable as their install wrapper. Their actual capability-resolved executables stay under the
-  reconciled `tools/real-bin`; neither route is writable by job code. The private `tools/bin` leads PATH after shell
-  activation. A first-argument install verb is covered immediately: Bun `install`, `i`, `add`, `remove`, `update`; npm
-  `install`, `i`, `ci`, `add`, `uninstall`, `remove`, `update`; pnpm `install`, `i`, `add`, `remove`, `update`. Other
-  invocations execute the recorded program directly, without guessing another CLI or changing explicit relinks. The
-  wrapper snapshots live developer package links and their executable aliases before the install, and restores them
-  before returning its actual exit or signal, so `bun install && nx ...` uses those links in one job.
+  that same staged executable as their install wrapper, linked in the mode's private `tools/manager-bin` rather than
+  `tools/bin`. Their actual capability-resolved executables stay under the reconciled `tools/real-bin`; no route is
+  writable by job code. The bootstrap PATH lists `tools/manager-bin` just ahead of `tools/bin`, and after shell
+  activation `tools/manager-bin` alone leads PATH. Every other bootstrap link, the toolchain among them (`cargo`,
+  `rustc`, `rustdoc` and `rustup` resolved to rustup's proxies), keeps its bootstrap position behind the activated
+  shell, so the toolchain a repository's shell declares is the one its jobs and its Nx daemon run (04_sandbox.md,
+  "direnv trust is path-keyed"; Cargo build-state discovery above). A first-argument install verb is covered
+  immediately: Bun `install`, `i`, `add`, `remove`, `update`; npm `install`, `i`, `ci`, `add`, `uninstall`, `remove`,
+  `update`; pnpm `install`, `i`, `add`, `remove`, `update`. Other invocations execute the recorded program directly,
+  without guessing another CLI or changing explicit relinks. The wrapper snapshots live developer package links and
+  their executable aliases before the install, and restores them before returning its actual exit or signal, so
+  `bun install && nx ...` uses those links in one job.
 
   The supervisor uses the same snapshot/restore implementation at job admission and terminal cleanup, including failed
   or killed installs. Terminal cleanup has two distinct failures, each labelled in the sealed job's stderr: a link

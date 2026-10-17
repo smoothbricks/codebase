@@ -6030,7 +6030,7 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
         fs::read_link(topic.join("node_modules/.bin/nx")).unwrap(),
     );
     for script in [
-        "rm .cowshed/tools/bin/bun",
+        "rm .cowshed/tools/manager-bin/bun",
         ": > .cowshed/tools/real-bin/bun",
     ] {
         let (exit, _, stderr) = run(

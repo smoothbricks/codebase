@@ -18,7 +18,9 @@ use cowshed_os::fork_lock::Run as _;
 use cowshed_os::fsio::AnchoredDirectory;
 
 pub const ROOT_ENV: &str = "COWSHED_PACKAGE_MANAGER_ROOT";
-pub const TOOL_BIN_ENV: &str = "COWSHED_TOOL_BIN";
+/// The mode's private `tools/manager-bin`: the package-manager wrapper links, the only route that
+/// leads PATH after shell activation (15_capabilities.md, "Bootstrap executables").
+pub const MANAGER_BIN_ENV: &str = "COWSHED_MANAGER_BIN";
 pub const INSTALL_OBSERVED_ENV: &str = "COWSHED_INSTALL_OBSERVED";
 
 /// The shared package-store roots a checkout's installers write to. A link into one is the
@@ -667,11 +669,13 @@ pub fn dispatch() -> io::Result<Option<ExitStatus>> {
     else {
         return Ok(None);
     };
-    let tool = std::env::var_os(TOOL_BIN_ENV)
-        .ok_or_else(|| io::Error::other("managed package manager has no tool route"))?;
-    let mut real = PathBuf::from(tool);
+    let route = std::env::var_os(MANAGER_BIN_ENV)
+        .ok_or_else(|| io::Error::other("managed package manager has no wrapper route"))?;
+    let mut real = PathBuf::from(route);
     if !real.pop() {
-        return Err(io::Error::other("the bootstrap bin has no parent"));
+        return Err(io::Error::other(
+            "the package-manager wrapper route has no parent",
+        ));
     }
     real.push("real-bin");
     real.push(manager);
