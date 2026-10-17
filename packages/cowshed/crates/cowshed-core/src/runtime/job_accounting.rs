@@ -340,6 +340,7 @@ mod tests {
             crate::runtime::job_groups::GroupLeader::from_parts(
                 i32::try_from(pid).expect("pid"),
                 u64::from(pid) * 10,
+                u64::from(pid) * 10,
             )
             .expect("a leader"),
         )
@@ -559,6 +560,7 @@ mod tests {
             crate::runtime::job_groups::GroupLeader::from_parts(
                 i32::try_from(me).expect("pid"),
                 mine.started + 1,
+                0,
             )
             .expect("a leader"),
         );

@@ -2028,7 +2028,7 @@ fn owned_group() -> std::process::Child {
         .expect("a test-owned process group")
 }
 
-/// `(job id, leader birth)` for every group the ledger at `path` names.
+/// `(job id, leader start)` for every group the ledger at `path` names.
 fn ledger_leaders(path: &std::path::Path) -> Vec<(u64, Option<u64>)> {
     let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     ledger["groups"]
@@ -2038,7 +2038,7 @@ fn ledger_leaders(path: &std::path::Path) -> Vec<(u64, Option<u64>)> {
         .map(|group| {
             (
                 group["jobId"].as_u64().unwrap(),
-                group["leaderBirth"].as_u64(),
+                group["leaderStart"].as_u64(),
             )
         })
         .collect()
@@ -2085,7 +2085,7 @@ async fn the_ledger_names_each_group_by_its_parent_s_observation() {
     .unwrap();
     let birth = |birth: Birth| {
         let leader = birth.leader().expect("the parent identified the leader");
-        Some(leader.birth())
+        Some(leader.start())
     };
 
     handle
