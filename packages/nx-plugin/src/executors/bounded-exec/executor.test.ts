@@ -1089,41 +1089,45 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(ownedRecord).not.toHaveProperty('cpu.inherited');
   });
 
-  it('records borrowed grant loss during timeout termination as an ordinary failure, not a bound', async () => {
+  it('keeps a command running when its borrowed grant closes, and judges it by its own exit', async () => {
     if (process.platform === 'win32') return;
     const workspace = await createWorkspace();
-    const directory = join(workspace.root, 'lost-during-timeout');
-    const ignoring = ignoresTerm(workspace.root);
-    const calls: NodeJS.Signals[] = [];
-    const result = await withPool(1, (pool) =>
-      runBoundedExec(
+    const directory = join(workspace.root, 'outlives-its-grant');
+    const started = join(workspace.root, 'started.fifo');
+    const go = join(workspace.root, 'go.fifo');
+    expect(spawnSync('mkfifo', [started, go]).status).toBe(0);
+    // The run says the grant ended on its stderr; that line is the signal the close was heard while the command runs.
+    const { promise: heard, resolve: hear } = Promise.withResolvers<void>();
+    process.stderr.write = captureWrite([], (text) => {
+      if (text.includes('cpu-tokens grant ended')) hear();
+    });
+    const result = await withPool(1, async (pool) => {
+      const running = runBoundedExec(
         {
-          command: ignoring.command,
-          timeoutMs: 50,
-          killAfterMs: 50,
+          command: `sh -c 'echo started > "$0"; read -r line < "$1"' '${started}' '${go}'`,
+          timeoutMs: 20_000,
         },
-        { ...workspace.context, record: { task: { id: 'lost-during-timeout', hash: null }, directory } },
-        {
-          async kill(pid, signal) {
-            if (signal === 'SIGTERM') {
-              await ignoring.armed();
-              const closed = await pool.close();
-              if (!closed.ok) throw new Error(closed.error);
-            }
-            calls.push(signal);
-            await createProcessTreeKiller().kill(pid, signal);
-          },
-        },
+        { ...workspace.context, record: { task: { id: 'outlives-its-grant', hash: null }, directory } },
+        createProcessTreeKiller(),
         null,
         null,
         inheritedFrom(pool),
-      ),
+      );
+      // The command has started and waits on `go` while its borrowed grant closes under it.
+      expect(await readToEnd(started)).toBe('started\n');
+      const closed = await pool.close();
+      if (!closed.ok) throw new Error(closed.error);
+      await heard;
+      await writeFile(go, 'go\n');
+      return running;
+    });
+    expect(result.terminalOutput).toContain(
+      'cowshed: cpu-tokens grant ended: the parent pool closed its 1-token grant while the command ran; it runs on over budget until it ends',
     );
-    expect(result.success).toBe(false);
-    expect(calls).toEqual(['SIGTERM', 'SIGKILL']);
-    expect(result.terminalOutput).toContain('cpu-tokens grant lost');
+    expect(result.terminalOutput).not.toContain('Force-killing');
+    expect(result.success).toBe(true);
     const record: unknown = JSON.parse(await readFile(join(directory, VERDICT_FILE), 'utf8'));
-    expect(record).toHaveProperty('verdict.outcome', 'failed');
+    expect(record).toHaveProperty('verdict.outcome', 'passed');
   });
 
   it('asks the host budget when a parent pool refuses its descriptor, and says why', async () => {
@@ -1430,13 +1434,15 @@ function scriptedVolume(
   };
 }
 
-function captureWrite(chunks: string[]): typeof process.stdout.write {
+function captureWrite(chunks: string[], onChunk?: (text: string) => void): typeof process.stdout.write {
   return ((
     chunk: string | Uint8Array,
     encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
     callback?: (error?: Error | null) => void,
   ) => {
-    chunks.push(chunk.toString());
+    const text = chunk.toString();
+    chunks.push(text);
+    onChunk?.(text);
     const cb = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback;
     cb?.();
     return true;
