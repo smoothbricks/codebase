@@ -82,25 +82,28 @@ describe('code time', () => {
 
 describe('nextest-code-bound wrapper', () => {
   /**
-   * A stand-in test binary: it records `wait` seconds of lease wait in the record its wrapper names,
-   * from a child process as a disk-lease client in the test's tree would, then works `work` seconds
-   * and exits `status`.
+   * A stand-in test binary: when `wait` is a number, a child process, as a disk-lease client in the
+   * test's tree would, records one wait in the record its wrapper names, sleeps `wait` seconds and
+   * ends it; then the binary works `work` seconds and exits `status`. The recorded wait starts at
+   * the epoch and ends at the largest safe integer, so the wrapper's clipping to the run makes it
+   * cover the whole run: the code time is exactly zero however long process startup takes on a
+   * busy host. A `null` wait records nothing, so the code time is the whole wall time.
    */
-  const runWrapped = (bound: string, wait: number, work: number, status: number) => {
+  const runWrapped = (bound: string, wait: number | null, work: number, status: number) => {
     const root = mkdtempSync(join(tmpdir(), 'nextest-code-bound-'));
     try {
       const binary = join(root, 'fake-test');
+      const lease =
+        wait === null
+          ? []
+          : [
+              'sh -c \'echo "start $$ 0 0 namespace" >> "$COWSHED_LEASE_WAIT_RECORD"; ' +
+                `sleep ${wait}; ` +
+                `echo "end $$ 0 ${Number.MAX_SAFE_INTEGER}" >> "$COWSHED_LEASE_WAIT_RECORD"'`,
+            ];
       writeFileSync(
         binary,
-        [
-          '#!/bin/sh',
-          'sh -c \'echo "start $$ 0 $(perl -MTime::HiRes=time -e "printf q(%d), time() * 1000000") namespace" >> "$COWSHED_LEASE_WAIT_RECORD"; ' +
-            `sleep ${wait}; ` +
-            'echo "end $$ 0 $(perl -MTime::HiRes=time -e "printf q(%d), time() * 1000000")" >> "$COWSHED_LEASE_WAIT_RECORD"\'',
-          `sleep ${work}`,
-          'echo "argument $1"',
-          `exit ${status}`,
-        ].join('\n'),
+        ['#!/bin/sh', ...lease, `sleep ${work}`, 'echo "argument $1"', `exit ${status}`].join('\n'),
       );
       chmodSync(binary, 0o755);
       // The wrapper makes its record in its TMPDIR: this case's own root, so the count below is this run's alone.
@@ -115,22 +118,24 @@ describe('nextest-code-bound wrapper', () => {
     }
   };
 
-  // Real processes and real time, so the cases sleep as little as proves each verdict: 0.75s in all.
+  // Real processes and real time, so the cases sleep as little as proves each verdict: 0.75s in all. No verdict
+  // depends on how fast the host starts a process: a covered run's code time is zero, and an uncovered one only grows.
   it('passes a test whose wall time is over its class only by its lease waits', () => {
     const run = runWrapped('0.3', 0.4, 0, 0);
     expect(run.stdout).toContain('argument --exact');
     expect(run.stderr).toMatch(
-      /nextest-code-bound: code 0\.\d+s of 0\.3s, within its class \(wall \d+\.\d+s less \d+\.\ds waiting/,
+      /nextest-code-bound: code 0\.0s of 0\.3s, within its class \(wall (?:0\.[4-9]|[1-9]\d*\.\d)s less \d+\.\ds waiting/,
     );
     expect(run.status).toBe(0);
     expect(run.recordsLeft).toBe(0);
   });
 
   it('reports code-time verdicts without changing the test exit status', () => {
-    for (const { label, bound, work, status, verdict } of [
+    for (const { label, bound, wait, work, status, verdict } of [
       {
         label: 'warns of a passing test whose code time is over its class, and still passes it',
         bound: '0.3',
+        wait: null,
         work: 0.35,
         status: 0,
         verdict: 'OVER its class (a warning)',
@@ -138,12 +143,13 @@ describe('nextest-code-bound wrapper', () => {
       {
         label: "keeps a failing test's own exit status and still reports its split",
         bound: '30',
+        wait: 0,
         work: 0,
         status: 3,
         verdict: 'within its class',
       },
     ]) {
-      const run = runWrapped(bound, 0, work, status);
+      const run = runWrapped(bound, wait, work, status);
       expect(run.stderr, label).toContain(verdict);
       expect(run.status, label).toBe(status);
     }
