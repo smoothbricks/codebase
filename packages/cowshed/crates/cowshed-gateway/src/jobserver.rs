@@ -27,10 +27,11 @@ pub(crate) enum JobserverAdmission {
 }
 
 impl JobserverAdmission {
-    pub(crate) fn class(self) -> cowshed_gateway_types::JobserverClass {
+    /// The root request's rank: a gate admission is a gate job of its own, its ticket its age.
+    pub(crate) fn rank(self) -> crate::cpu_budget::Rank {
         match self {
-            Self::Background => cowshed_gateway_types::JobserverClass::Background,
-            Self::Gate { .. } => cowshed_gateway_types::JobserverClass::Gate,
+            Self::Background => crate::cpu_budget::Rank::Background,
+            Self::Gate { .. } => crate::cpu_budget::Rank::Gate,
         }
     }
 
@@ -167,12 +168,14 @@ pub(crate) enum PoolSource {
     /// and never sum past it.
     Lent(std::num::NonZeroUsize),
     /// A gate grant: each child asks the host budget itself, at gate class, for the gate's
-    /// checkout. A land's tasks therefore rank ahead of background work at every token any holder
-    /// returns, and concurrent lands share by checkout fairness; no allocation is held idle
-    /// between tasks and no running grant needs to shrink.
+    /// checkout, ranked by the gate job's own admission. A land's tasks therefore rank ahead of
+    /// background work at every token any holder returns, and an older land's tasks ahead of a
+    /// younger one's; no allocation is held idle between tasks and no running grant needs to
+    /// shrink.
     Relay {
         host: crate::cpu_budget::CpuBudget,
         checkout: std::sync::Arc<str>,
+        job: crate::cpu_budget::JobAge,
     },
 }
 
@@ -198,15 +201,17 @@ impl CpuPool {
         let listener =
             cowshed_os::fork_lock::Fenced::create(|| tokio::net::UnixListener::bind(&path))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        let (budget, checkout, class) = match source {
+        let (budget, checkout, rank) = match source {
             PoolSource::Lent(tokens) => (
                 crate::cpu_budget::CpuBudget::start(crate::cpu_budget::CpuBudgetLimits { tokens }),
                 std::sync::Arc::from("parent-pool"),
-                cowshed_gateway_types::JobserverClass::Background,
+                crate::cpu_budget::Rank::Background,
             ),
-            PoolSource::Relay { host, checkout } => {
-                (host, checkout, cowshed_gateway_types::JobserverClass::Gate)
-            }
+            PoolSource::Relay {
+                host,
+                checkout,
+                job,
+            } => (host, checkout, crate::cpu_budget::Rank::GateTask(job)),
         };
         let task = tokio::spawn(async move {
             let mut children = tokio::task::JoinSet::new();
@@ -219,7 +224,7 @@ impl CpuPool {
                             .expect("polling socket accept runs an infallible closure")).await
                     } => match accepted {
                         Ok((stream, _)) => {
-                            children.spawn(serve_pool(cowshed_os::fork_lock::Fenced::new(stream), budget.clone(), std::sync::Arc::clone(&checkout), class, std::sync::Arc::clone(&directory)));
+                            children.spawn(serve_pool(cowshed_os::fork_lock::Fenced::new(stream), budget.clone(), std::sync::Arc::clone(&checkout), rank, std::sync::Arc::clone(&directory)));
                         }
                         Err(error) => { eprintln!("cowshed: CPU pool listener failed: {error}"); break; }
                     },
@@ -321,7 +326,7 @@ async fn serve_pool(
     stream: cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
     budget: crate::cpu_budget::CpuBudget,
     checkout: std::sync::Arc<str>,
-    class: cowshed_gateway_types::JobserverClass,
+    rank: crate::cpu_budget::Rank,
     directory: std::sync::Arc<PathBuf>,
 ) {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
@@ -357,10 +362,10 @@ async fn serve_pool(
     };
     let claim = crate::disk_lease::Claim::new("child CPU pool", None);
     let (stake, granted, mut growth) = if grow {
-        let (stake, granted, growth) = budget.ask_growing(checkout, want, claim, class);
+        let (stake, granted, growth) = budget.ask_growing(checkout, want, claim, rank);
         (stake, granted, Some(growth))
     } else {
-        let (stake, granted) = budget.ask(checkout, want, claim, class);
+        let (stake, granted) = budget.ask(checkout, want, claim, rank);
         (stake, granted, None)
     };
     if pool_reply(reader.get_mut(), &PoolGrant::Queued { ok: true })

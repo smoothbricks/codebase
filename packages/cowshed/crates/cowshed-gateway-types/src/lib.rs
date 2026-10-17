@@ -24,8 +24,9 @@ pub mod status;
 pub mod task_server;
 
 pub use cpu_budget::{
-    CPU_TOKENS_OP, CpuBudgetStatus, CpuCheckoutStatus, CpuTokensRequest, JOBSERVER_OP,
-    JobserverAnswer, JobserverClass, JobserverJob, JobserverRequest, cpu_pool_directory,
+    CPU_TOKENS_OP, CpuBudgetStatus, CpuCheckoutStatus, CpuGateWaiter, CpuTokensRequest,
+    JOBSERVER_OP, JobserverAnswer, JobserverClass, JobserverJob, JobserverRequest,
+    cpu_pool_directory,
 };
 pub use disk_lease::{
     DISK_LEASE_OP, DiskClass, DiskLeaseAnswer, DiskLeaseRequest, LeaseState, PhaseShare,

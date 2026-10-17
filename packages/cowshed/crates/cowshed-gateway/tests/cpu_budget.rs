@@ -449,6 +449,50 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_builds_that_asked_first()
+{
+    let (gateway, root, socket) = gateway(4).await;
+    let (older, older_pool) = Asker::gate_job(&socket, "/w/older").await;
+    let (younger, younger_pool) = Asker::gate_job(&socket, "/w/younger").await;
+    // A feature shed holds the rest of the host with two runners, and its next one waits first.
+    let mut feature_one = Asker::ask(&socket, 1, "/w/feature").await;
+    assert_eq!(feature_one.granted(Duration::from_secs(10)).await, Some(1));
+    let mut feature_two = Asker::ask(&socket, 1, "/w/feature").await;
+    assert_eq!(feature_two.granted(Duration::from_secs(10)).await, Some(1));
+    let mut feature_next = Asker::ask(&socket, 1, "/w/feature").await;
+    // Then the younger land's task asks through its pool, and the older land's task asks last.
+    let mut younger_task = Asker::child(&younger_pool, 1).await;
+    let mut older_task = Asker::child(&older_pool, 1).await;
+    let queue: Vec<(String, u64)> = ledger(&socket)
+        .await
+        .gate_queue
+        .into_iter()
+        .map(|waiter| (waiter.checkout, waiter.job))
+        .collect();
+    assert_eq!(
+        queue
+            .iter()
+            .map(|(checkout, _)| checkout.as_str())
+            .collect::<Vec<_>>(),
+        ["/w/older", "/w/younger"],
+        "{queue:?}"
+    );
+    assert!(queue[0].1 < queue[1].1, "{queue:?}");
+    // Each returned token goes to the oldest land first, then the younger land, then the feature.
+    drop(feature_one);
+    assert_eq!(older_task.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(younger_task.granted(Duration::from_millis(50)).await, None);
+    drop(older_task);
+    assert_eq!(younger_task.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(feature_next.granted(Duration::from_millis(50)).await, None);
+    drop(feature_two);
+    assert_eq!(feature_next.granted(Duration::from_secs(10)).await, Some(1));
+    drop((older, younger, younger_task, feature_next));
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bounded_gate_timeout_names_unchanged_live_holders_and_leaves_no_queue_barrier() {
     let (gateway, root, socket) = gateway(4).await;
     let mut holder = Asker::ask(&socket, 4, "/w/live-test").await;
