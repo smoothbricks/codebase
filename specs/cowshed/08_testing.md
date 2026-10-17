@@ -525,15 +525,19 @@ changing process identity is incomplete evidence, never an empty holder set. Suc
 successful observations without matches and incomplete/raced captures remain distinct. An open file is not proof of a
 contested lock, and an admission token count or one CPU/state sample does not establish CPU starvation or its absence.
 
-**Unresolved script-host wedge (2026-10-16).** The isolation case
-`nothing_one_script_does_to_its_process_reaches_the_next` reached the unchanged 180s no-progress bound in a full gate.
-The pre-expiry snapshot showed the test and exec host sleeping at 0% CPU, a connected control-socket pair, and no script
-child in that snapshot; this does not establish that a child never ran. With diagnostic-only protocol checkpoints, the
-exact case passed at one token in 0.109s, and the original captured owner target passed all 13 tests in 1.186s at 3/18
-tokens. The exact-case trace completed both script lifecycles through `STARTED → EXITED → stream EOF → RELEASED`, then
-host shutdown and join. The cause remains unknown: those are negative diagnostic results, not a wedge repair or
-permission to raise the bound. Checkpoints retain request, observation, exit, stream, release and shutdown positions for
-the next occurrence.
+**Script-host fixture wedge (2026-10-16, resolved 2026-10-17).** The isolation case
+`nothing_one_script_does_to_its_process_reaches_the_next` once and `scripts_forked_at_once_each_run_whole` four times
+reached the unchanged 180s no-progress bound with the test and one exec host sleeping at 0% CPU on a connected
+control-socket pair; in both of its gate logs with checkpoints, all 800 scripts had completed through `RELEASED`.
+Reproduced in 5 of 502 local runs of the scripts case, every wedge had the same `sample` stacks: the test thread in
+`wait4` for the host it had `shutdown(SHUT_RDWR)`, the host in `recvmsg` in its idle request read. A non-blocking
+`MSG_PEEK` on the host's socket returned 0, end of stream, while the blocked `recvmsg` slept; interrupting it ended the
+host normally. Darwin can lose a peer shutdown's wakeup for a reader already asleep in `recvmsg`. A cowshed-free C model
+of 8 pairs that end with a peer shutdown wedged within 50–750 trials of 8 teardowns for `SHUT_RDWR` and `SHUT_WR`. The
+same model never wedged in 3000 trials when the peer `close`s instead, with or without `SCM_RIGHTS`, nor when the reader
+waits in `kevent` before reading. Fixtures therefore end a host as a supervisor does: they close the control socket's
+last outside descriptor (11_shell.md, controller EOF), never `shutdown(2)` it while holding it. The supervisor's
+`ExecHost` already ends a host by closing its socket.
 
 The real process-snapshot witness keeps its child, grandchild and opened file alive through capture. Its readiness PID
 is a tagged, newline-terminated string, not a console-inspected number that inherited color settings can decorate. The
