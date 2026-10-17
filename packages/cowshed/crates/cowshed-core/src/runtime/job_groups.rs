@@ -59,13 +59,16 @@ struct Ledger {
 struct Group {
     job_id: u64,
     pgid: i32,
-    /// The leader's birth time as its parent observed it ([`birth_time`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    leader_birth: Option<u64>,
-    /// What earlier builds recorded instead: the leader's start time as observed when the ledger
-    /// was written, `None` when it was already gone. Only read, so their ledgers stay recoverable.
+    /// The leader's start time as its parent observed it ([`start_time`]): the identity the
+    /// kernel answers for every process, whoever owns it, so a pid another user's process now
+    /// holds is told from the leader rather than refused unread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     leader_start: Option<u64>,
+    /// What earlier builds recorded instead: the leader's `proc_pid_rusage` birth
+    /// ([`birth_time`]), a per-boot clock the kernel reads back only for the caller's own
+    /// processes. Only read, so their ledgers stay recoverable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    leader_birth: Option<u64>,
 }
 
 /// A group a lost supervisor recorded whose leader was gone when a later supervisor took the
@@ -120,12 +123,15 @@ pub enum UnresolvedReason {
     LeaderNeverIdentified,
 }
 
-/// A job's process-group leader as its parent observed it: the group id and the leader's birth
-/// time. Carried unchanged into every ledger rewrite; see [`Birth`].
+/// A job's process-group leader as its parent observed it: the group id, the leader's birth time
+/// (its rusage clock, which [`crate::runtime::job_accounting`] matches the leader's usage reads
+/// against) and its start time (the identity a ledger records). Carried unchanged into every
+/// ledger rewrite; see [`Birth`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GroupLeader {
     pgid: i32,
     birth: u64,
+    start: u64,
 }
 
 impl GroupLeader {
@@ -134,25 +140,31 @@ impl GroupLeader {
     pub fn observe(pid: u32) -> io::Result<Self> {
         let pgid = i32::try_from(pid)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let leader = Self::from_parts(pgid, 0)?;
-        let birth = birth_time(pgid)?.ok_or_else(|| {
+        let leader = Self::from_parts(pgid, 0, 0)?;
+        let reaped = || {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("process {pgid} was already reaped"),
             )
-        })?;
-        Ok(Self { birth, ..leader })
+        };
+        let birth = birth_time(pgid)?.ok_or_else(reaped)?;
+        let start = start_time(pgid)?.ok_or_else(reaped)?;
+        Ok(Self {
+            birth,
+            start,
+            ..leader
+        })
     }
 
     /// A leader another process observed and reported over the shell-host wire.
-    pub(super) fn from_parts(pgid: i32, birth: u64) -> io::Result<Self> {
+    pub(super) fn from_parts(pgid: i32, birth: u64, start: u64) -> io::Result<Self> {
         if pgid <= 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "a job process group must be positive",
             ));
         }
-        Ok(Self { pgid, birth })
+        Ok(Self { pgid, birth, start })
     }
 
     pub fn pgid(self) -> i32 {
@@ -161,6 +173,10 @@ impl GroupLeader {
 
     pub fn birth(self) -> u64 {
         self.birth
+    }
+
+    pub fn start(self) -> u64 {
+        self.start
     }
 }
 
@@ -249,8 +265,8 @@ pub fn record(
             .map(|&(job_id, leader)| Group {
                 job_id,
                 pgid: leader.pgid,
-                leader_birth: Some(leader.birth),
-                leader_start: None,
+                leader_start: Some(leader.start),
+                leader_birth: None,
             })
             .collect(),
         unresolved: carried.clone(),
@@ -480,21 +496,27 @@ fn ownership(group: &Group) -> io::Result<Ownership> {
             "a recorded job process group must be positive",
         ));
     }
-    let unverifiable = |error: io::Error| {
+    let unverifiable = |recorded: &str, error: io::Error| {
         io::Error::new(
             error.kind(),
-            format!("cannot verify process group {}: {error}", group.pgid),
+            format!(
+                "cannot verify process group {} against its recorded {recorded}: {error}",
+                group.pgid
+            ),
         )
     };
     // `Some(true)` while the recorded leader holds its pid, `Some(false)` while another process
-    // does; `None` once no process holds it, or the group never had an identified leader.
+    // does; `None` once no process holds it, or the group never had an identified leader. A
+    // start time is read for any process, so a pid another user's process took is `Some(false)`.
+    // An earlier build's birth is read back only for this user's processes: where another
+    // user's process holds the pid the kernel declines, and nothing tells it from the leader.
     let leader = || -> io::Result<Option<bool>> {
-        Ok(match (group.leader_birth, group.leader_start) {
-            (Some(recorded), _) => birth_time(group.pgid)
-                .map_err(unverifiable)?
+        Ok(match (group.leader_start, group.leader_birth) {
+            (Some(recorded), _) => start_time(group.pgid)
+                .map_err(|error| unverifiable("start time", error))?
                 .map(|now| now == recorded),
-            (None, Some(recorded)) => start_time(group.pgid)
-                .map_err(unverifiable)?
+            (None, Some(recorded)) => birth_time(group.pgid)
+                .map_err(|error| unverifiable("rusage birth from an earlier build", error))?
                 .map(|now| now == recorded),
             (None, None) => None,
         })
@@ -1388,41 +1410,64 @@ fn pidfd_exited(handle: &std::os::fd::OwnedFd) -> io::Result<bool> {
     Ok(exited.revents != 0)
 }
 
-/// The leader's start time, or confirmed absence. An unreadable process is never absent.
+/// `struct kinfo_proc` (`<sys/sysctl.h>`), which the `libc` crate does not declare. Only its
+/// leading field is read: `kp_proc.p_un.__p_starttime`, the `p_start` the kernel stamps at fork
+/// and `proc_pidinfo` reports as `pbi_start`.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct KinfoProc {
+    start: libc::timeval,
+    _rest: [u8; 632],
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<KinfoProc>() == 648);
+
+/// A process's start time: the calendar time its fork stamped, in microseconds, or confirmed
+/// absence. `KERN_PROC_PID` answers it for every process whoever owns it -- unlike
+/// `proc_pidinfo` and `proc_pid_rusage`, which decline another user's process with `EPERM` --
+/// and for one that exited and is not yet reaped; `None` once nothing holds the pid. An
+/// unreadable process is never absent.
 #[cfg(target_os = "macos")]
 fn start_time(pid: i32) -> io::Result<Option<u64>> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size =
-        i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).map_err(io::Error::other)?;
-    // SAFETY: `info` is writable storage of exactly `size` bytes.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
+    let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut info = std::mem::MaybeUninit::<KinfoProc>::zeroed();
+    let mut size = std::mem::size_of::<KinfoProc>();
+    // SAFETY: `name` holds the four MIB entries passed, and `info` is writable storage of
+    // `size` bytes.
+    let read = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            4,
             info.as_mut_ptr().cast(),
-            size,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
         )
     };
-    if written != size {
-        if written <= 0 {
-            let error = io::Error::last_os_error();
-            return if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(None)
-            } else {
-                Err(error)
-            };
-        }
+    if read != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if size == 0 {
+        return Ok(None);
+    }
+    if size != std::mem::size_of::<KinfoProc>() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("proc_pidinfo returned {written} bytes, expected {size}"),
+            format!(
+                "KERN_PROC_PID returned {size} bytes, expected {}",
+                std::mem::size_of::<KinfoProc>()
+            ),
         ));
     }
-    // SAFETY: proc_pidinfo filled all `size` bytes.
-    let info = unsafe { info.assume_init() };
-    info.pbi_start_tvsec
+    // SAFETY: sysctl filled all `size` bytes.
+    let start = unsafe { info.assume_init() }.start;
+    let invalid = |error| io::Error::new(io::ErrorKind::InvalidData, error);
+    let seconds = u64::try_from(start.tv_sec).map_err(invalid)?;
+    let micros = u64::try_from(start.tv_usec).map_err(invalid)?;
+    seconds
         .checked_mul(1_000_000)
-        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+        .and_then(|seconds| seconds.checked_add(micros))
         .map(Some)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process start time overflowed"))
 }
@@ -1743,11 +1788,9 @@ mod tests {
         let (_scratch, ledger) = scratch();
         record(&ledger, &[(9, leader(group.0.id()))], &[]).unwrap();
         group.0.kill().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while super::start_time(pgid).unwrap().is_some() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(super::start_time(pgid).unwrap().is_none());
+        // The leader exited; this test holds it unreaped, so its start time still answers.
+        super::await_exit_unreaped(pgid).expect("leader exit");
+        assert!(super::start_time(pgid).unwrap().is_some());
         assert!(super::group_has_live_members(pgid).unwrap());
         assert_eq!(
             end_recorded(&ledger, Writer::Any, Duration::ZERO)
@@ -1866,12 +1909,13 @@ mod tests {
         let mut stranger = job_group();
         let stranger_pgid = i32::try_from(stranger.id()).unwrap();
         let stranger_leader = leader(stranger.id());
-        // The job was born before the stranger that took its pid. Linux counts birth in clock
-        // ticks, so a job killed and replaced within one tick shares the stranger's birth there;
-        // a job that truly held this pid earlier was then born at least one tick sooner.
+        // The job started before the stranger that took its pid. Linux counts starts in clock
+        // ticks, so a job killed and replaced within one tick shares the stranger's start there;
+        // a job that truly held this pid earlier started at least one tick sooner.
         let reused = GroupLeader {
             pgid: stranger_pgid,
             birth: first_seen.birth.min(stranger_leader.birth - 1),
+            start: first_seen.start.min(stranger_leader.start - 1),
         };
         assert_ne!(reused, stranger_leader);
         let (_scratch, ledger) = scratch();
@@ -2048,7 +2092,7 @@ mod tests {
     /// Once a group's leader is reaped, the processes holding its id cannot be told from a
     /// stranger's group that took the id after the job's group ended: here a group whose leader
     /// exited and was reaped, leaving a descendant that holds the id. Whatever identity the ledger
-    /// recorded -- this build's birth time, an earlier build's start time, or none -- recovery
+    /// recorded -- this build's start time, an earlier build's birth time, or none -- recovery
     /// never signals it. The next supervisor takes it over as unresolved and every later ledger
     /// carries it until nothing holds the id; only then is its record dropped.
     #[cfg(target_os = "macos")]
@@ -2058,9 +2102,9 @@ mod tests {
 
         type Recorded = fn(i32) -> (Option<u64>, Option<u64>);
         let identities: [(&str, Recorded); 3] = [
-            ("birth", |pgid| (super::birth_time(pgid).unwrap(), None)),
-            ("legacy start", |pgid| {
-                (None, super::start_time(pgid).unwrap())
+            ("start", |pgid| (super::start_time(pgid).unwrap(), None)),
+            ("legacy birth", |pgid| {
+                (None, super::birth_time(pgid).unwrap())
             }),
             ("none", |_| (None, None)),
         ];
@@ -2079,15 +2123,15 @@ mod tests {
                 .read_line(&mut ready)
                 .unwrap();
             assert_eq!(ready.trim(), "READY");
-            let (leader_birth, leader_start) = recorded(pgid);
+            let (leader_start, leader_birth) = recorded(pgid);
             assert_eq!(
-                (leader_birth.is_some(), leader_start.is_some()),
-                (label == "birth", label == "legacy start"),
+                (leader_start.is_some(), leader_birth.is_some()),
+                (label == "start", label == "legacy birth"),
                 "{label}: recorded while the leader ran"
             );
             group.0.kill().unwrap();
             group.0.wait().unwrap();
-            assert_eq!(super::birth_time(pgid).unwrap(), None, "{label}");
+            assert_eq!(super::start_time(pgid).unwrap(), None, "{label}");
             assert!(super::group_has_live_members(pgid).unwrap(), "{label}");
 
             let (_scratch, ledger) = scratch();
@@ -2100,8 +2144,8 @@ mod tests {
                     groups: vec![super::Group {
                         job_id: 4,
                         pgid,
-                        leader_birth,
                         leader_start,
+                        leader_birth,
                     }],
                     unresolved: Vec::new(),
                 },
@@ -2158,6 +2202,65 @@ mod tests {
             );
             assert!(!ledger.exists(), "{label}");
         }
+    }
+
+    /// A pid another user's process now holds is told from the recorded leader by its start
+    /// time, which the kernel answers whoever owns the process: a start that differs names
+    /// another process, so the group is not the job's, and a lost supervisor's ledger naming it is
+    /// taken without a signal or a refusal. A start that matches is still inspected, and another
+    /// user's members cannot be, so that stays a refusal. An earlier build's rusage birth cannot
+    /// be compared at all -- the kernel declines another user's rusage -- and stays a refusal.
+    /// launchd (pid 1, root) stands in for the recycled pid.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pid_another_user_now_holds_is_told_from_the_leader_by_its_start_time() {
+        const HOLDER: i32 = 1;
+        let started = super::start_time(HOLDER)
+            .unwrap()
+            .expect("launchd holds pid 1");
+        assert_eq!(
+            super::birth_time(HOLDER).unwrap_err().raw_os_error(),
+            Some(libc::EPERM),
+            "the kernel declines this user another user's rusage"
+        );
+        let group = |leader_start, leader_birth| super::Group {
+            job_id: 68,
+            pgid: HOLDER,
+            leader_start,
+            leader_birth,
+        };
+        assert!(matches!(
+            super::ownership(&group(Some(started + 1), None)).unwrap(),
+            super::Ownership::NotOwned
+        ));
+        assert!(
+            super::ownership(&group(Some(started), None)).is_err(),
+            "a holder whose start matches the record is never released uninspected"
+        );
+        let Err(legacy) = super::ownership(&group(None, Some(3_131_429_805_919))) else {
+            panic!("an earlier build's birth was compared against another user's process");
+        };
+        assert_eq!(legacy.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            legacy
+                .to_string()
+                .contains("against its recorded rusage birth from an earlier build"),
+            "{legacy}"
+        );
+
+        let (_scratch, ledger) = scratch();
+        super::replace(
+            &ledger,
+            &super::Ledger {
+                supervisor: std::process::id() + 1,
+                ended: true,
+                groups: vec![group(Some(started + 1), None)],
+                unresolved: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(take_lost(&ledger, Duration::ZERO).unwrap().is_empty());
+        assert!(!ledger.exists());
     }
 
     #[cfg(target_os = "macos")]

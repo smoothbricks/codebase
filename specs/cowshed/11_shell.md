@@ -693,8 +693,12 @@ admitted but never sealed. Two things put that right:
 - **The group ledger.** A served supervisor keeps `<store>/run/<digest>.groups` beside its socket: each job's process
   group and the leader's immutable birth identity observed by its parent before reaping, naming the supervisor that
   wrote it. Every rewrite carries that original observation; it never samples an old pid again to renew a claim. A
-  watcher acts only on its own lost supervisor's ledger, never one a newer supervisor has written. Older protected
-  ledgers with a recorded start time remain readable, but new writers record the birth identity.
+  watcher acts only on its own lost supervisor's ledger, never one a newer supervisor has written. New writers record
+  the leader's start time as `sysctl(KERN_PROC_PID)` reports it on macOS (`/proc/<pid>/stat` on Linux), which the kernel
+  answers for every process of any owner, running or exited and unreaped, so a pid another user's process now holds is
+  compared and found to be another process. Older protected ledgers with a recorded `proc_pid_rusage` birth remain
+  readable, but the kernel reads that birth back only for the caller's own processes: one whose pid another owner now
+  holds cannot be compared and stays a refusal, whatever process now holds that pid.
 
   Recovery proves that the recorded leader held its id throughout the membership snapshot. Only those proven members are
   signalled, through a kernel identity that cannot target a later process: the pid/version audit token on macOS, a pidfd

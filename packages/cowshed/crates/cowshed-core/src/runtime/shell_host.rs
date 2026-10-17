@@ -166,14 +166,15 @@ impl FrameWriter {
         self
     }
 
-    /// `[kind]` then, for an observed leader, `[pgid, birth]`; for an unobserved one,
+    /// `[kind]` then, for an observed leader, `[pgid, birth, start]`; for an unobserved one,
     /// `[pid, reason]`.
     pub fn birth(self, birth: &Birth) -> io::Result<Self> {
         match birth {
             Birth::Observed(leader) => Ok(self
                 .u32(BIRTH_OBSERVED)
                 .i32(leader.pgid())
-                .u64(leader.birth())),
+                .u64(leader.birth())
+                .u64(leader.start())),
             Birth::Unobserved { pid, reason } => self
                 .u32(BIRTH_UNOBSERVED)
                 .u32(*pid)
@@ -307,7 +308,8 @@ impl<'a> FrameReader<'a> {
         match self.u32()? {
             BIRTH_OBSERVED => {
                 let pgid = self.i32()?;
-                GroupLeader::from_parts(pgid, self.u64()?).map(Birth::Observed)
+                let birth = self.u64()?;
+                GroupLeader::from_parts(pgid, birth, self.u64()?).map(Birth::Observed)
             }
             BIRTH_UNOBSERVED => Ok(Birth::Unobserved {
                 pid: self.u32()?,
@@ -873,8 +875,8 @@ mod tests {
     #[test]
     fn a_birth_crosses_the_wire_unchanged_and_a_malformed_one_is_refused() {
         let births = [
-            Birth::Observed(GroupLeader::from_parts(41, 0).unwrap()),
-            Birth::Observed(GroupLeader::from_parts(41, u64::MAX).unwrap()),
+            Birth::Observed(GroupLeader::from_parts(41, 0, 0).unwrap()),
+            Birth::Observed(GroupLeader::from_parts(41, u64::MAX, u64::MAX - 1).unwrap()),
             Birth::Unobserved {
                 pid: 41,
                 reason: "unreadable".into(),
@@ -894,6 +896,7 @@ mod tests {
             FrameWriter::new(REPLY_STARTED)
                 .u32(BIRTH_OBSERVED)
                 .i32(0)
+                .u64(7)
                 .u64(7),
             FrameWriter::new(REPLY_STARTED).u32(9).i32(41).u64(7),
         ] {
