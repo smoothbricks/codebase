@@ -127,6 +127,54 @@ impl Asker {
         assert_eq!(asker.answer().await["lease"], "queued");
         asker
     }
+
+    /// A gate job's root request with its trusted job identity, as the supervisor sends it; the
+    /// grant names the job's private CPU pool.
+    async fn gate_job(socket: &Path, checkout: &str) -> (Self, PathBuf) {
+        let stream = UnixStream::connect(socket).await.expect("connect");
+        let (reader, mut writer) = stream.into_split();
+        let request = serde_json::json!({ "op": "jobserver", "want": 1, "checkout": checkout,
+            "command": "nx run-many -t gate", "class": "gate", "waitMs": 120_000, "pool": true,
+            "job": { "repoId": "owner/repo", "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+                "jobId": 1 } });
+        writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("ask gate job");
+        let mut asker = Self {
+            lines: BufReader::new(reader),
+            _writer: writer,
+        };
+        let queued = asker.answer().await;
+        assert_eq!(queued["lease"], "queued", "{queued}");
+        let granted = tokio::time::timeout(Duration::from_secs(10), asker.answer())
+            .await
+            .expect("gate job granted");
+        assert_eq!(granted["tokens"], 1, "{granted}");
+        let pool = PathBuf::from(
+            granted["cpuPool"]
+                .as_str()
+                .expect("a gate job names its pool"),
+        );
+        (asker, pool)
+    }
+
+    /// One child's ask on a job's CPU pool, as a nested `bounded-exec` or Cargo sends it.
+    async fn child(pool: &Path, want: usize) -> Self {
+        let stream = UnixStream::connect(pool).await.expect("connect pool");
+        let (reader, mut writer) = stream.into_split();
+        writer
+            .write_all(format!("{{\"op\":\"cpu-pool\",\"want\":{want}}}\n").as_bytes())
+            .await
+            .expect("ask pool");
+        let mut asker = Self {
+            lines: BufReader::new(reader),
+            _writer: writer,
+        };
+        assert_eq!(asker.answer().await["lease"], "queued");
+        asker
+    }
+
     async fn ask(socket: &Path, want: usize, checkout: &str) -> Self {
         let stream = UnixStream::connect(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
@@ -317,12 +365,11 @@ async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_gate_wins_whole_returned_tokens_before_older_background_work() {
+async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background_work() {
     let (gateway, root, socket) = gateway(4).await;
     let mut holder = Asker::ask(&socket, 4, "/w/background").await;
     assert_eq!(holder.granted(Duration::from_secs(10)).await, Some(4));
     let mut old_background = Asker::ask(&socket, 4, "/w/same").await;
-    let asked = std::time::Instant::now();
     let mut gate = Asker::jobserver(&socket, 4, "/w/same", 120_000).await;
     assert_eq!(gate.granted(Duration::from_millis(50)).await, None);
     assert_eq!(
@@ -336,53 +383,62 @@ async fn a_gate_wins_whole_returned_tokens_before_older_background_work() {
         4,
         "the in-flight background grant must not be fictionally shrunk"
     );
-    let returned = std::time::Instant::now();
     drop(holder);
-    assert_eq!(gate.granted(Duration::from_secs(10)).await, Some(4));
-    let admitted = std::time::Instant::now();
-    let status = ledger(&socket).await;
-    assert_eq!((status.total, status.held), (4, 4));
-    assert!(
-        status
-            .checkouts
-            .iter()
-            .all(|checkout| checkout.checkout != "/w/background")
-    );
-    assert_eq!(
-        old_background.granted(Duration::from_millis(50)).await,
-        None
-    );
-    eprintln!(
-        "gate-drain proof: background=4->0 gate=0->4 request-to-grant={:?} return-to-grant={:?}",
-        admitted.duration_since(asked),
-        admitted.duration_since(returned)
-    );
-    drop(gate);
+    // The starved background checkout keeps one token; the gate takes the other three.
+    assert_eq!(gate.granted(Duration::from_secs(10)).await, Some(3));
     assert_eq!(
         old_background.granted(Duration::from_secs(10)).await,
-        Some(4)
+        Some(1)
     );
-    drop(old_background);
+    let status = ledger(&socket).await;
+    assert_eq!((status.total, status.held), (4, 4));
+    drop((gate, old_background));
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_active_gate_blocks_new_background_roots_and_later_gates_even_with_free_tokens() {
+async fn a_running_gate_holds_up_neither_background_nor_a_later_gate_while_tokens_are_free() {
     let (gateway, root, socket) = gateway(8).await;
     let mut gate = Asker::jobserver(&socket, 4, "/w/gate", 120_000).await;
     assert_eq!(gate.granted(Duration::from_secs(10)).await, Some(4));
     let mut background = Asker::ask(&socket, 1, "/w/background").await;
-    let mut next_gate = Asker::jobserver(&socket, 2, "/w/next-gate", 120_000).await;
-    assert_eq!(background.granted(Duration::from_millis(50)).await, None);
-    assert_eq!(next_gate.granted(Duration::from_millis(50)).await, None);
-    assert_eq!(ledger(&socket).await.held, 4);
-    drop(gate);
-    assert_eq!(next_gate.granted(Duration::from_secs(10)).await, Some(2));
-    assert_eq!(background.granted(Duration::from_millis(50)).await, None);
-    drop(next_gate);
     assert_eq!(background.granted(Duration::from_secs(10)).await, Some(1));
-    drop(background);
+    let mut next_gate = Asker::jobserver(&socket, 2, "/w/next-gate", 120_000).await;
+    assert_eq!(next_gate.granted(Duration::from_secs(10)).await, Some(2));
+    assert_eq!(ledger(&socket).await.held, 7);
+    drop((gate, background, next_gate));
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_queued() {
+    let (gateway, root, socket) = gateway(4).await;
+    // The land's gate job holds only its orchestrator's token.
+    let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
+    let mut a = Asker::ask(&socket, 2, "/w/a").await;
+    assert_eq!(a.granted(Duration::from_secs(10)).await, Some(2));
+    let mut b = Asker::ask(&socket, 1, "/w/b").await;
+    assert_eq!(b.granted(Duration::from_secs(10)).await, Some(1));
+    let mut queued = Asker::ask(&socket, 1, "/w/c").await;
+    // A land task asks the gate job's pool after c queued. The pool lends nothing of its own: the
+    // child waits for the host, not for the gate's single token.
+    let mut task = Asker::child(&pool, 2).await;
+    assert_eq!(task.granted(Duration::from_millis(50)).await, None);
+    drop(b);
+    assert_eq!(task.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(queued.granted(Duration::from_millis(50)).await, None);
+    let status = ledger(&socket).await;
+    let land = status
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.checkout == "/w/land")
+        .expect("the land holds");
+    assert_eq!((land.held, land.running), (2, 2), "{status:?}");
+    drop(task);
+    assert_eq!(queued.granted(Duration::from_secs(10)).await, Some(1));
+    drop((gate, a, queued));
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }

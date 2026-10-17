@@ -1275,31 +1275,31 @@ when the command exits, or with the executor's socket when it is killed. The wai
 `cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. With no gateway listening, the command runs
 exactly as configured and nothing is said; a gateway from before the budget runs it unbudgeted and stderr says so.
 
-A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual token count. A nested default executor takes
-from that immediate parent pool, capped at `min(asked, inherited, ceil(cores/2))`, instead of taking from the host while
-the parent holds its grant. The pool accounts for siblings together; each admitted child serves only its own allocation
-to grandchildren. Closing a child's connection returns its local allocation, never the parent's upstream grant. Upstream
-loss revokes the downstream pool; losing a borrowed grant stops the command and records an ordinary failure, not a
-timeout. A bare count or absent endpoint follows normal host admission. A connected parent pool's refusal or protocol
-failure instead fails admission: taking from the host then could wait on the parent's own grant. `options.env` cannot
-inject either marker. Parent-pool grants record `cpu.inherited: true` and their actual local wait; the span also says
-`inherited=true`. Pool setup, listener and cleanup errors fail rather than bypassing accounting. Command bounds stay
-unchanged.
+A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual token count. A nested default executor asks
+that immediate parent pool for its own demand, instead of taking from the host while the parent holds its grant; the
+pool grants at most what it can. A lent pool accounts for siblings together; each admitted child serves only its own
+allocation to grandchildren. Closing a child's connection returns its local allocation, never the parent's upstream
+grant. Upstream loss revokes the downstream pool; losing a borrowed grant stops the command and records an ordinary
+failure, not a timeout. A bare count or absent endpoint follows normal host admission. A connected parent pool's refusal
+or protocol failure instead fails admission: taking from the host then could wait on the parent's own grant.
+`options.env` cannot inject either marker. Parent-pool grants record `cpu.inherited: true` and their actual local wait;
+the span also says `inherited=true`. Pool setup, listener and cleanup errors fail rather than bypassing accounting.
+Command bounds stay unchanged.
 
 The absent-parent fixture uses the executor's injectable budget with a real, controlled outer pool as its backing. It
 proves a positive allocation and re-acquires it after the command ends, rather than depending on free tokens in the
 host-wide gateway while the test runner itself holds an allocation. A bare count or unbudgeted success is not proof. A
-land gate enters the existing task server with
-`cowshed exec <workspace> --class gate --host --want N [--wait-ms N] -- COMMAND [ARGS...]` before daemon-stop and Nx
-gate work. It requires a real gateway jobserver `class: "gate"` grant and serves that exact count as an existing live
-parent CPU pool; no environment-only class or unbudgeted fallback is accepted. The default **120000 ms** admission wait
-is explicitly overridable per invocation. A queued gate stops new background root admissions and takes whole tokens as
-in-flight grants end. Running background tests/FIFOs are never shrunk, frozen or killed to manufacture tokens. An
-expired wait returns `gate-admission-timeout` naming the wait and current checkout holders; it changes no task wall/idle
-bound. Requested/granted count and actual queue wait are logged, and a child's nonzero exit is preserved exactly.
-Compiling Cargo under the live pool borrows a sibling-accounted local allocation and receives its own private child
-pool, so grandchildren never compete with their occupied ancestor. See `specs/cowshed/05_gateway.md`, "Gate admission by
-whole-grant drain", for the guarantee and its deliberate limits.
+land gate (`tooling/land-host.sh`) enters the existing task server with
+`cowshed exec <workspace> --class gate --host [--want N] [--wait-ms N] -- COMMAND [ARGS...]` after daemon-stop. It
+requires a real gateway jobserver `class: "gate"` grant for its own orchestrator; its live pool lends nothing of its own
+and relays every child's ask to the host as a gate-class request, so each task the gate starts is served FIFO ahead of
+every other exec's queued work. No environment-only class or unbudgeted fallback is accepted. The default **120000 ms**
+admission wait is explicitly overridable per invocation. Running background tests/FIFOs are never shrunk, frozen or
+killed to manufacture tokens. An expired wait returns `gate-admission-timeout` naming the wait and current checkout
+holders; it changes no task wall/idle bound. Requested/granted count and actual queue wait are logged, and a child's
+nonzero exit is preserved exactly. Compiling Cargo under the live pool takes a local allocation and receives its own
+private child pool, so grandchildren never compete with their occupied ancestor. See `specs/cowshed/05_gateway.md`,
+"Gate admission: FIFO ahead of background, never starving it", for the guarantee and its deliberate limits.
 
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:

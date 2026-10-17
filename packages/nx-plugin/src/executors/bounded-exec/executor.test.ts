@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { access, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
-import { availableParallelism, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { ownedSocketDirectory } from '../../testing.js';
@@ -1496,7 +1496,7 @@ function inheritedFrom(pool: CpuPool): InheritedCpuPool {
   return parent;
 }
 
-/** The count a pool of `tokens` lends a run that wants `want`: min(want, tokens, ceil(cores / 2)). */
+/** The count a pool of `tokens` lends a run that wants `want`: min(want, tokens). */
 function lentCount(want: number, tokens: number): number {
-  return Math.min(want, tokens, Math.ceil(availableParallelism() / 2));
+  return Math.min(want, tokens);
 }
