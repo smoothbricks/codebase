@@ -146,9 +146,11 @@ pub enum CommandRunFailure {
     VolumeRename,
     /// The total budget expired before the native tool executed.
     Unspawned(Duration),
-    /// The deadline expired; the owned group was signalled and the child's actual end observed.
+    /// The deadline expired; the owned group `pid` leads was signalled and the child's actual end
+    /// observed by reaping it.
     Deadline {
         deadline: Duration,
+        pid: u32,
         ended: ProcessStatus,
     },
     /// Signalling the owned group failed. The subsequent wait's outcome is retained too.
@@ -201,11 +203,15 @@ impl fmt::Display for CommandRunError {
                     " exhausted its total {deadline:?} deadline before native execution; no disk tool was started"
                 )
             }
-            CommandRunFailure::Deadline { deadline, ended } => {
+            CommandRunFailure::Deadline {
+                deadline,
+                pid,
+                ended,
+            } => {
                 fmt_command(f, program, args)?;
                 write!(
                     f,
-                    " did not finish within {deadline:?}; the owned process group was signalled and the child reaped with {ended}; its item deferred for the next pass"
+                    " did not finish within {deadline:?}; the owned process group {pid} was signalled and the child reaped with {ended}; its item deferred for the next pass"
                 )
             }
             CommandRunFailure::Kill {
@@ -655,6 +661,7 @@ impl SystemCommandRunner {
                                     let _ = collect(stdout, stderr);
                                     CommandRunFailure::Deadline {
                                         deadline: policy.deadline,
+                                        pid,
                                         ended: ProcessStatus::from(status),
                                     }
                                 }
@@ -6487,20 +6494,13 @@ mod tests {
         // Linux runners (NixOS provides only `/bin/sh`), so the hang and the follow-up probe
         // must use `/bin/sh` builtins only. A child that is no disk-image command is killed at
         // the deadline, and the queue continues; a disk-image command is never killed (the tests
-        // below), only warned about.
-        let pid_file = temp_path("safe-child-pid", "txt");
+        // below), only warned about. The child's identity comes from the runner that spawned and
+        // reaped it, never from the child: a loaded host can kill the shell at 250 ms before it
+        // runs a single builtin, and a pid the child had to write itself was then empty.
         let started = std::time::Instant::now();
         let error = SystemCommandRunner
             .run_with_deadline(
-                &CommandRequest::new(
-                    "/bin/sh",
-                    [
-                        OsString::from("-c"),
-                        OsString::from("printf '%s' $$ > \"$1\"; while true; do :; done"),
-                        OsString::from("owned-safe-child"),
-                        pid_file.clone().into_os_string(),
-                    ],
-                ),
+                &CommandRequest::new("/bin/sh", ["-c", "while true; do :; done"]),
                 Duration::from_millis(250),
             )
             .unwrap_err();
@@ -6509,21 +6509,26 @@ mod tests {
             "hung child held the store for {:?}; the deadline never fired",
             started.elapsed()
         );
-        assert!(
-            matches!(error.failure, CommandRunFailure::Deadline { deadline, ended: ProcessStatus::Signal(libc::SIGKILL) } if deadline == Duration::from_millis(250)),
-            "{error:?}"
-        );
+        let CommandRunFailure::Deadline {
+            deadline,
+            pid,
+            ended: ProcessStatus::Signal(libc::SIGKILL),
+        } = error.failure
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!(deadline, Duration::from_millis(250));
         // The child ran; the report must say it hung, never that it could not be started.
         let report = error.to_string();
         assert!(!report.contains("could not run"), "{report}");
         assert!(report.contains("did not finish within 250ms"), "{report}");
         assert!(report.contains("deferred"), "{report}");
+        assert!(
+            report.contains(&format!("process group {pid} was signalled")),
+            "{report}"
+        );
         assert!(report.contains("reaped with signal"), "{report}");
-        let pid = fs::read_to_string(&pid_file)
-            .expect("the real owned child ran")
-            .parse::<libc::pid_t>()
-            .expect("child pid");
-        fs::remove_file(&pid_file).expect("remove owned pid receipt");
+        let pid = libc::pid_t::try_from(pid).expect("a process id fits pid_t");
         // SAFETY: waitpid only observes our already-reaped child, without waiting.
         assert_eq!(
             unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
@@ -6534,7 +6539,7 @@ mod tests {
             Some(libc::ECHILD),
             "the runner actually reaped its child"
         );
-        // SAFETY: signal zero observes this exact fixture PID; it sends no signal.
+        // SAFETY: signal zero observes this exact reaped PID; it sends no signal.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(
             io::Error::last_os_error().raw_os_error(),
