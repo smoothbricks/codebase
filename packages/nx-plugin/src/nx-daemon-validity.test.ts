@@ -880,6 +880,28 @@ it('stops a daemon whose own socket path is removed with nothing taking its plac
   );
 }, 180_000);
 
+it('stops a daemon whose workspace files are all deleted before it reads the emptied workspace', async () => {
+  await withNxFixture(
+    'nx-daemon-validity-emptied-',
+    async ({ socketDirectory, workspace }) => {
+      await fixtureWorkspace(workspace);
+      const env = fixtureNxEnv(workspace, socketDirectory);
+      const daemon = await startDaemon(workspace, env);
+      expect(JSON.parse(nx(workspace, { ...env, NX_DAEMON: 'true' }, 'show', 'projects', '--json'))).toEqual(['p']);
+      // Every tracked file goes, as when a checkout is removed or unmounted under its daemon; the daemon's own record
+      // under .nx stays, so only the workspace check can stop it. Reading the emptied file map instead would block
+      // the daemon's only thread for good, where no SIGTERM handler runs.
+      await rm(join(workspace, 'p'), { recursive: true });
+      await unlink(join(workspace, 'package.json'));
+      await unlink(join(workspace, 'nx.json'));
+      await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after every workspace file was deleted`);
+      const log = await readFile(join(workspace, '.nx', 'workspace-data', 'd', 'daemon.log'), 'utf8');
+      expect(log).toMatch(/Server stopped because: "its workspace \S+ has no nx\.json any more"/);
+    },
+    FIXTURE_WORKSPACE,
+  );
+}, 180_000);
+
 it('keeps an idle daemon off the lockfiles, record, and socket between its safety polls', async () => {
   await withNxFixture(
     'nx-daemon-validity-idle-',
