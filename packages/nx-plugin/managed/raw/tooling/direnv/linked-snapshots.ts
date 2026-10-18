@@ -679,7 +679,11 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-/** The blob HEAD tracks at each planned provider path, with its mode. */
+/**
+ * The blob HEAD tracks at each planned provider path, with its mode. Git runs under the provider's own configuration
+ * alone: a sandboxed shell entry keeps the operator's HOME but may not read the operator's global configuration, and
+ * git dies on it (specs/cowshed/04_sandbox.md, the runtime-input contract).
+ */
 function trackedBlobs(
   plan: SnapshotPlan,
   head: string,
@@ -689,6 +693,7 @@ function trackedBlobs(
     .map(([relative]) => relative);
   const run = spawnSync('git', ['-C', plan.root, 'ls-tree', '-z', head, '--', ...paths], {
     encoding: 'utf8',
+    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
     maxBuffer: 1 << 28,
   });
   if (run.error !== undefined || run.status !== 0) {
