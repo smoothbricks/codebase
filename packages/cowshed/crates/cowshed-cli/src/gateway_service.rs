@@ -2,8 +2,8 @@ use crate::args::GatewayCommand;
 use crate::build_record::{BuildRecord, unproven_refusal, unrecorded_refusal};
 use crate::install_basis::{self, InstallSlot};
 use crate::launchd::{
-    COWSHED_BINARY_NAME, ExecutableDigest, ExecutableInstallState, ExistingPlist, GATEWAY_LABEL,
-    HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
+    BunDirectory, COWSHED_BINARY_NAME, ExecutableDigest, ExecutableInstallState, ExistingPlist,
+    GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
     JOBSERVER_LAUNCHER_NAME, LaunchAgentSpec, LaunchAgentTarget, LaunchctlCommand, LaunchdExecutor,
     LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand,
     PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink, kickstart_hint, plan_executable_install,
@@ -587,9 +587,10 @@ where
         adopted_mains(&home).await
     })
     .await?;
+    let bun = invoking_bun()?;
     install_nx_cache_server(&mut executor, &home, &candidate.source)?;
-    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
-    let observed = inspect_install_state(&spec)?;
+    let spec = LaunchAgentSpec::gateway(&executable, &bun).map_err(launchd_error)?;
+    let observed = inspect_install_state(spec.target())?;
     let plan = plan_install(
         &spec,
         InstallState {
@@ -841,14 +842,26 @@ fn stored_files(
     Ok(files)
 }
 
-/// The gateway agent's own spec, resolved from the canonical home rather than the running binary.
+/// The gateway agent's control target and installed cowshed, resolved from the canonical home
+/// rather than the running binary.
 ///
 /// Deterministic on purpose: stop and uninstall have to reach the agent `start` installed however
-/// this process was invoked.
-pub fn gateway_launch_agent(home: &Path) -> Result<(HostStableExecutable, LaunchAgentSpec)> {
+/// this process was invoked, and need neither the plist's contents nor a `bun` on this `PATH`.
+pub fn gateway_launch_agent(home: &Path) -> Result<(HostStableExecutable, LaunchAgentTarget)> {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
-    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
-    Ok((executable, spec))
+    let target = LaunchAgentTarget::new(home, GATEWAY_LABEL).map_err(launchd_error)?;
+    Ok((executable, target))
+}
+
+/// The `bun` this invocation's `PATH` provides, for the gateway agent's `PATH`. Its absence is a
+/// setup error, refused before anything is installed: cowshed bundles no interpreter (tg#7504).
+fn invoking_bun() -> Result<BunDirectory> {
+    BunDirectory::on_path(&std::env::var_os("PATH").unwrap_or_default()).map_err(|reason| {
+        CowshedError::environment_missing(
+            format!("the gateway runs its Nx cache server with bun: {reason}"),
+            "run this cowshed's setup from a shell whose PATH has bun (devenv provides it)",
+        )
+    })
 }
 
 /// Stop the gateway; with `purge`, also delete the installed cowshed and its installed Nx cache
@@ -859,8 +872,8 @@ pub fn gateway_launch_agent(home: &Path) -> Result<(HostStableExecutable, Launch
 /// the next `start` a plist write instead of a fresh multi-megabyte copy.
 fn stop_service(purge: bool) -> Result<RemovalOutcome> {
     let home = canonical_home()?;
-    let (executable, spec) = gateway_launch_agent(&home)?;
-    remove_launch_agent(spec.target())?;
+    let (executable, target) = gateway_launch_agent(&home)?;
+    remove_launch_agent(&target)?;
     if purge {
         remove_path_entries(executable.path())?;
         let companion =
@@ -925,13 +938,13 @@ pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
     let executable =
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     let pending_install = InstallSlot::observe(executable.support_directory())?;
-    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
+    let target = LaunchAgentTarget::new(&home, GATEWAY_LABEL).map_err(launchd_error)?;
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let installed = matches!(
         executor
             .execute_status(&crate::launchd::ControlPlan::print(
                 effective_uid(),
-                spec.target()
+                &target
             ))
             .map_err(launchd_error)?,
         LaunchdServiceStatus::Loaded { .. }
@@ -1104,10 +1117,12 @@ async fn run_daemon() -> Result<()> {
             manager: Arc::clone(&manager),
         })),
         nx_cache: Some(cowshed_gateway::NxCacheServiceConfig {
-            executable: HostStableExecutable::new(&home, "nx-cache-server")
+            script: HostStableExecutable::new(&home, "nx-cache-server")
                 .map_err(launchd_error)?
                 .path()
                 .to_path_buf(),
+            // The agent's PATH, which setup led with the directory of the bun it found.
+            path: std::env::var_os("PATH").unwrap_or_default(),
             directory: paths.cache_dir.join("nx"),
             max_bytes: 1024 * 1024 * 1024,
             cap_bytes: 10 * 1024 * 1024 * 1024,
@@ -1562,8 +1577,66 @@ pub enum Downgrade {
     Allow,
 }
 
-/// Install the exact server artifact packaged beside this cowshed. Never resolve a source
-/// checkout, an ambient PATH server, or a separate live workspace at daemon startup.
+/// Where `@smoothbricks/nx-cache-server` keeps its server: one JavaScript bundle (its `bundle`
+/// target), the same on every platform, run by the gateway's `bun` (tg#7504).
+const NX_CACHE_SERVER_BUNDLE: &str =
+    "node_modules/@smoothbricks/nx-cache-server/dist/server/nx-cache-server.js";
+
+/// The Nx cache server bundle that belongs to the cowshed build at `cowshed_source`.
+///
+/// A build the install slot holds (`installed`'s directory) has its server beside it, where its
+/// install put it. Any other build is a distribution, `<package>/dist/bin/<platform>/cowshed`,
+/// and its server is the bundle of the package's `@smoothbricks/nx-cache-server` dependency,
+/// found the way Node resolves a dependency: `node_modules` in the package and then in each
+/// ancestor. That covers an isolated Bun store, a hoisted install and a checkout's workspace link
+/// alike. Neither package carries a compiled server: four `bun build --compile` binaries put
+/// cowshed's tarball over npm's ceiling (Publish run 39150196802), and an interpreter is the
+/// shell's to provide (tg#6789).
+fn packaged_nx_cache_server(
+    installed: &HostStableExecutable,
+    cowshed_source: &Path,
+) -> Result<PathBuf> {
+    if cowshed_source.parent() == Some(installed.directory()) {
+        return Ok(installed.path().to_path_buf());
+    }
+    let missing = |searched: String| {
+        CowshedError::environment_missing(
+            format!(
+                "the cowshed build {} has no Nx cache server artifact: {searched}",
+                cowshed_source.display()
+            ),
+            "install @smoothbricks/cowshed with its dependencies (in a checkout, build nx-cache-server), then run that cowshed's setup",
+        )
+    };
+    let mut layout = cowshed_source.ancestors().skip(2);
+    let (Some(bin), Some(dist), Some(package)) = (layout.next(), layout.next(), layout.next())
+    else {
+        return Err(missing(
+            "it is not inside a package's dist/bin/<platform>".to_owned(),
+        ));
+    };
+    if bin.file_name() != Some("bin".as_ref()) || dist.file_name() != Some("dist".as_ref()) {
+        return Err(missing(
+            "it is not inside a package's dist/bin/<platform>".to_owned(),
+        ));
+    }
+    let artifact = Path::new(NX_CACHE_SERVER_BUNDLE);
+    package
+        .ancestors()
+        .map(|directory| directory.join(artifact))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            missing(format!(
+                "no {} in {} or any ancestor",
+                artifact.display(),
+                package.display()
+            ))
+        })
+}
+
+/// Install the exact server artifact that belongs to this cowshed build
+/// ([`packaged_nx_cache_server`]). Never resolve an ambient PATH server or a separate live
+/// workspace at daemon startup.
 fn install_nx_cache_server<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     home: &Path,
@@ -1572,17 +1645,8 @@ fn install_nx_cache_server<F, C>(
 where
     F: LaunchdFilesystem,
 {
-    let source = cowshed_source.with_file_name("nx-cache-server");
-    if !source.is_file() {
-        return Err(CowshedError::environment_missing(
-            format!(
-                "the cowshed distribution is missing its Nx cache server artifact {}",
-                source.display()
-            ),
-            "build or install the complete cowshed platform package, then run its cowshed setup",
-        ));
-    }
     let executable = HostStableExecutable::new(home, "nx-cache-server").map_err(launchd_error)?;
+    let source = packaged_nx_cache_server(&executable, cowshed_source)?;
     let retained = retain_previous_executable(executor, &executable)?;
     let digest = executable_digest(&source)?;
     install_stored_executable(executor, &executable, &digest, &source)?;
@@ -2173,36 +2237,53 @@ pub async fn refresh_gateway_binary(
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     refresh_gateway_from(
         home,
-        &candidate,
-        cfg!(debug_assertions),
-        basis,
+        IncomingBuild {
+            candidate: &candidate,
+            debug_build: cfg!(debug_assertions),
+            basis,
+        },
         daemon.as_ref(),
         gates,
         &mut executor,
+        invoking_bun,
     )
     .await
 }
 
-/// [`refresh_gateway_binary`] with its inputs given. `basis` is [`check_basis`]'s judgement of
-/// replacing the installed build with `candidate`, consulted only when the binary is replaced.
-/// `gates` is the control client of a daemon that answered: every refresh that gets past the
-/// no-op return activates the agent, which restarts that daemon, so it first waits for the gates
-/// in flight ([`wait_for_gates`]).
+/// The build a refresh would install, with the judgements about installing it.
+struct IncomingBuild<'a> {
+    candidate: &'a Candidate,
+    /// A debug build is refused as a supervised binary ([`refuse_unsupervisable_build`]).
+    debug_build: bool,
+    /// [`check_basis`]'s judgement of replacing the installed build with `candidate`, consulted
+    /// only when the binary is replaced.
+    basis: Result<()>,
+}
+
+/// [`refresh_gateway_binary`] with its inputs given. `gates` is the control client of a daemon
+/// that answered: every refresh that gets past the no-op return activates the agent, which
+/// restarts that daemon, so it first waits for the gates in flight ([`wait_for_gates`]). `bun` is
+/// asked only when a gateway agent is installed: a host without one needs no interpreter.
 async fn refresh_gateway_from<C: LaunchctlCommand>(
     home: &Path,
-    candidate: &Candidate,
-    debug_build: bool,
-    basis: Result<()>,
+    incoming: IncomingBuild<'_>,
     daemon: Option<&DaemonStatus>,
     gates: Option<(&InstallSlot, &GatewayControlClient)>,
     executor: &mut LaunchdExecutor<NativeFilesystem, C>,
+    bun: impl FnOnce() -> Result<BunDirectory>,
 ) -> Result<Option<ServiceBinaryRefresh>> {
+    let IncomingBuild {
+        candidate,
+        debug_build,
+        basis,
+    } = incoming;
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
-    let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
-    let observed = inspect_install_state(&spec)?;
+    let target = LaunchAgentTarget::new(home, GATEWAY_LABEL).map_err(launchd_error)?;
+    let observed = inspect_install_state(&target)?;
     if observed.plist.is_none() {
         return Ok(None);
     }
+    let spec = LaunchAgentSpec::gateway(&executable, &bun()?).map_err(launchd_error)?;
     let plan = plan_install(
         &spec,
         InstallState {
@@ -2537,14 +2618,14 @@ pub(crate) struct ObservedPlist {
     pub(crate) mode: u32,
 }
 
-pub(crate) fn inspect_install_state(spec: &LaunchAgentSpec) -> Result<ObservedInstallState> {
-    let directory_mode = private_directory_mode(spec.launch_agents_directory())?;
-    match inspect_existing(spec.plist_path())? {
+pub(crate) fn inspect_install_state(target: &LaunchAgentTarget) -> Result<ObservedInstallState> {
+    let directory_mode = private_directory_mode(target.launch_agents_directory())?;
+    match inspect_existing(target.plist_path())? {
         Some(metadata) if is_user_owned(&metadata, false) => {
-            let bytes = fs::read(spec.plist_path()).map_err(|error| {
+            let bytes = fs::read(target.plist_path()).map_err(|error| {
                 CowshedError::internal(format!(
                     "could not read {}: {error}",
-                    spec.plist_path().display()
+                    target.plist_path().display()
                 ))
             })?;
             Ok(ObservedInstallState {
@@ -2558,8 +2639,8 @@ pub(crate) fn inspect_install_state(spec: &LaunchAgentSpec) -> Result<ObservedIn
         Some(_) => Err(CowshedError::integrity(
             format!(
                 "{} LaunchAgent plist is not a user-owned regular file: {}",
-                spec.label(),
-                spec.plist_path().display()
+                target.label(),
+                target.plist_path().display()
             ),
             "remove the unsafe plist and rerun the service start command",
         )),
@@ -2643,31 +2724,46 @@ mod tests {
         )
     }
 
-    /// A build file under `home` recording exactly `record`.
+    /// A build file under `home` recording exactly `record`, laid out as a distribution:
+    /// `<home>/package/dist/bin/<platform>/<name>`, with the package's Nx cache server dependency
+    /// hoisted one level up ([`distribution_companion`]).
     fn build_recording(
         home: &Path,
         name: &str,
         bytes: &[u8],
         record: Option<BuildRecord>,
     ) -> Candidate {
-        let directory = home.join("builds");
+        let directory = home.join("package/dist/bin/platform");
         fs::create_dir_all(&directory).expect("builds directory");
         let path = directory.join(name);
         fs::write(&path, bytes).expect("build");
-        // The packaged Nx cache server beside every build, as a release distribution ships it.
-        fs::write(
-            directory.join("nx-cache-server"),
-            b"the packaged nx cache server",
-        )
-        .expect("companion");
+        let companion = distribution_companion(home);
+        fs::create_dir_all(companion.parent().unwrap()).expect("companion directory");
+        fs::write(&companion, b"the packaged nx cache server").expect("companion");
         Candidate::of(path, record).expect("candidate")
+    }
+
+    /// Where [`build_recording`]'s distributions find `@smoothbricks/nx-cache-server`'s bundle.
+    fn distribution_companion(home: &Path) -> PathBuf {
+        home.join(NX_CACHE_SERVER_BUNDLE)
+    }
+
+    /// The `bun` directory a test home's gateway agent names: an executable `bun` under `home`,
+    /// the same directory every call, so a refresh compares against the plist it was given.
+    fn test_bun(home: &Path) -> BunDirectory {
+        let directory = home.join("bun-bin");
+        fs::create_dir_all(&directory).unwrap();
+        let bun = directory.join("bun");
+        fs::write(&bun, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&bun, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        BunDirectory::on_path(directory.as_os_str()).unwrap()
     }
 
     /// A home whose gateway agent is installed with a current plist and no binary yet.
     fn host_with_agent(label: &str) -> (PathBuf, HostStableExecutable, LaunchAgentSpec) {
         let home = scratch_root(label);
         let executable = HostStableExecutable::new(&home, COWSHED_BINARY_NAME).unwrap();
-        let spec = LaunchAgentSpec::gateway(&executable).unwrap();
+        let spec = LaunchAgentSpec::gateway(&executable, &test_bun(&home)).unwrap();
         let mut filesystem = NativeFilesystem::new();
         for directory in [
             executable.support_directory(),
@@ -2830,10 +2926,20 @@ mod tests {
             executable.stored(&candidate.digest),
         ] {
             let candidate = Candidate::of(source, None).unwrap();
-            let refreshed =
-                refresh_gateway_from(&home, &candidate, false, Ok(()), None, None, &mut executor)
-                    .await
-                    .unwrap();
+            let refreshed = refresh_gateway_from(
+                &home,
+                IncomingBuild {
+                    candidate: &candidate,
+                    debug_build: false,
+                    basis: Ok(()),
+                },
+                None,
+                None,
+                &mut executor,
+                || Ok(test_bun(&home)),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 refreshed,
                 Some(ServiceBinaryRefresh::Refreshed {
@@ -2849,9 +2955,20 @@ mod tests {
                 "a stored copy is never rewritten"
             );
             assert_eq!(
-                refresh_gateway_from(&home, &candidate, false, Ok(()), None, None, &mut executor)
-                    .await
-                    .unwrap(),
+                refresh_gateway_from(
+                    &home,
+                    IncomingBuild {
+                        candidate: &candidate,
+                        debug_build: false,
+                        basis: Ok(())
+                    },
+                    None,
+                    None,
+                    &mut executor,
+                    || Ok(test_bun(&home))
+                )
+                .await
+                .unwrap(),
                 None
             );
             fs::write(spec.plist_path(), &legacy).unwrap();
@@ -2880,9 +2997,20 @@ mod tests {
         );
 
         for run in ["the setup that repairs it", "the setup after it"] {
-            refresh_gateway_from(&home, &candidate, false, Ok(()), None, None, &mut executor)
-                .await
-                .unwrap();
+            refresh_gateway_from(
+                &home,
+                IncomingBuild {
+                    candidate: &candidate,
+                    debug_build: false,
+                    basis: Ok(()),
+                },
+                None,
+                None,
+                &mut executor,
+                || Ok(test_bun(&home)),
+            )
+            .await
+            .unwrap();
             let installed = install_cli_from(
                 &home,
                 &candidate,
@@ -2924,9 +3052,20 @@ mod tests {
             RecordingGatewayLaunchctl::default(),
         );
         let refresh = async |executor: &mut RecordingExecutor, daemon: Option<&DaemonStatus>| {
-            refresh_gateway_from(&home, &candidate, false, Ok(()), daemon, None, executor)
-                .await
-                .unwrap()
+            refresh_gateway_from(
+                &home,
+                IncomingBuild {
+                    candidate: &candidate,
+                    debug_build: false,
+                    basis: Ok(()),
+                },
+                daemon,
+                None,
+                executor,
+                || Ok(test_bun(&home)),
+            )
+            .await
+            .unwrap()
         };
         // The first run installs the build.
         assert!(matches!(
@@ -3000,9 +3139,20 @@ mod tests {
                 async || Ok(mains.clone()),
             )
             .await;
-            refresh_gateway_from(&home, candidate, false, basis, None, None, &mut executor)
-                .await
-                .unwrap()
+            refresh_gateway_from(
+                &home,
+                IncomingBuild {
+                    candidate,
+                    debug_build: false,
+                    basis,
+                },
+                None,
+                None,
+                &mut executor,
+                || Ok(test_bun(&home)),
+            )
+            .await
+            .unwrap()
         };
         let link = || fs::read_link(executable.path()).unwrap();
 
@@ -3104,9 +3254,20 @@ mod tests {
             RecordingGatewayLaunchctl::default(),
         );
         assert!(matches!(
-            refresh_gateway_from(&home, &candidate, false, Ok(()), None, None, &mut executor)
-                .await
-                .unwrap(),
+            refresh_gateway_from(
+                &home,
+                IncomingBuild {
+                    candidate: &candidate,
+                    debug_build: false,
+                    basis: Ok(())
+                },
+                None,
+                None,
+                &mut executor,
+                || Ok(test_bun(&home))
+            )
+            .await
+            .unwrap(),
             Some(ServiceBinaryRefresh::Refreshed { .. })
         ));
         assert_eq!(
@@ -3249,26 +3410,36 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
-    /// A build with no packaged Nx cache server beside it cannot be installed: the refresh names the
-    /// missing companion and stops before any launchctl call or change to the stable name.
+    /// A build whose package has no Nx cache server dependency cannot be installed: the refresh
+    /// names the missing companion and stops before any launchctl call or change to the stable name.
     #[tokio::test]
     async fn a_refresh_without_the_packaged_companion_fails_before_activation() {
         let (home, executable, _) = host_with_agent("missing-companion");
         let candidate = build(
             &home,
             "no-companion",
-            b"a build with no server beside it",
+            b"a build with no server dependency",
             None,
         );
-        fs::remove_file(candidate.source.with_file_name("nx-cache-server")).unwrap();
+        fs::remove_file(distribution_companion(&home)).unwrap();
         let mut executor: RecordingExecutor = LaunchdExecutor::new(
             NativeFilesystem::new(),
             RecordingGatewayLaunchctl::default(),
         );
-        let error =
-            refresh_gateway_from(&home, &candidate, false, Ok(()), None, None, &mut executor)
-                .await
-                .expect_err("the companion is required");
+        let error = refresh_gateway_from(
+            &home,
+            IncomingBuild {
+                candidate: &candidate,
+                debug_build: false,
+                basis: Ok(()),
+            },
+            None,
+            None,
+            &mut executor,
+            || Ok(test_bun(&home)),
+        )
+        .await
+        .expect_err("the companion is required");
         assert!(
             error.message.contains("nx-cache-server"),
             "{}",
@@ -3277,6 +3448,59 @@ mod tests {
         let (_, command) = executor.into_parts();
         assert!(command.argv.is_empty(), "{:?}", command.argv);
         assert!(!executable.path().exists(), "the stable name is untouched");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A distribution's server is its package's `@smoothbricks/nx-cache-server` bundle, found as
+    /// Node finds the dependency: the isolated store's sibling `node_modules` beside the package
+    /// wins over a hoisted copy further up, and nothing beside the cowshed binary is consulted.
+    #[test]
+    fn a_distribution_resolves_its_server_from_the_nearest_dependency() {
+        let home = scratch_root("companion-resolution");
+        let installed = HostStableExecutable::new(&home, "nx-cache-server").unwrap();
+        let store = home.join("node_modules/.bun/@smoothbricks+cowshed@0.2.4/node_modules");
+        let binary = store.join("@smoothbricks/cowshed/dist/bin/darwin-arm64/cowshed");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"cowshed").unwrap();
+        fs::write(binary.with_file_name("nx-cache-server"), b"a stale copy").unwrap();
+        let artifact = Path::new(NX_CACHE_SERVER_BUNDLE)
+            .strip_prefix("node_modules")
+            .unwrap();
+        let hoisted = home.join("node_modules").join(artifact);
+        fs::create_dir_all(hoisted.parent().unwrap()).unwrap();
+        fs::write(&hoisted, b"hoisted").unwrap();
+        assert_eq!(
+            packaged_nx_cache_server(&installed, &binary).unwrap(),
+            hoisted
+        );
+        let isolated = store.join(artifact);
+        fs::create_dir_all(isolated.parent().unwrap()).unwrap();
+        fs::write(&isolated, b"isolated").unwrap();
+        assert_eq!(
+            packaged_nx_cache_server(&installed, &binary).unwrap(),
+            isolated
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// The install slot keeps the server its install put beside the stored copies, and a binary
+    /// outside both a slot and a `dist/bin/<platform>` layout is refused by name.
+    #[test]
+    fn the_install_slot_keeps_its_server_and_a_loose_binary_has_none() {
+        let home = scratch_root("companion-slot");
+        let installed = HostStableExecutable::new(&home, "nx-cache-server").unwrap();
+        let stored = installed.directory().join("cowshed-0123");
+        assert_eq!(
+            packaged_nx_cache_server(&installed, &stored).unwrap(),
+            installed.path()
+        );
+        let loose = home.join("tools/cowshed");
+        let error = packaged_nx_cache_server(&installed, &loose).expect_err("no layout");
+        assert!(
+            error.message.contains("dist/bin/<platform>"),
+            "{}",
+            error.message
+        );
         fs::remove_dir_all(home).unwrap();
     }
 

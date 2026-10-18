@@ -262,10 +262,12 @@ not a symlink. Workspace ownership is established by physical containment, so th
 unchanged. The fixture stops its daemon before unlinking its verified alias and removing its root. Bind and connect are
 proved under the real sandbox's long store `TMPDIR`, not only a host runner's short temporary directory.
 
-Nx backend host-controller fixtures bind their standalone server on an ephemeral loopback listener owned by the fixture.
-The core ignored protocol fixture, `host_controller_bridge_publishes_and_reads_through_the_production_server`, and the
-gateway's process case, `host_controller_nx_backend_process_serves_and_releases_its_store`, are separate; each names one
-controller-owned backend. Neither grants a broader host bypass.
+Nx backend host-controller fixtures run the package's server bundle, `dist/server/nx-cache-server.js` from
+`nx run nx-cache-server:bundle`, under the `bun` on the test's `PATH`, bound on an ephemeral loopback listener owned by
+the fixture. The core ignored protocol fixture,
+`host_controller_bridge_publishes_and_reads_through_the_production_server`, and the gateway's process case,
+`host_controller_nx_backend_process_serves_and_releases_its_store`, are separate; each names one controller-owned
+backend. Neither grants a broader host bypass.
 
 Git discovery fixtures exercise the restricted discovery profile, including denied includes, alternate object stores,
 and worktree metadata grants. The probe executes Git through the system-selected developer directory, not the

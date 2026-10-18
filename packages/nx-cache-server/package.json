@@ -27,7 +27,7 @@
   },
   "files": [
     "dist/ts",
-    "dist/bin",
+    "dist/server",
     "src",
     "!**/*.test.ts",
     "!**/__tests__/**",
@@ -76,26 +76,13 @@
           "killAfterMs": 10000
         }
       },
-      "bun-arm64-macos": {
-        "executor": "nx:run-commands",
-        "cache": true,
-        "inputs": [
-          "{projectRoot}/src/**/*.ts",
-          "!{projectRoot}/src/**/__tests__/**",
-          "{projectRoot}/package.json",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun -e 'console.log(Bun.version, Bun.revision)'"
-          }
-        ],
-        "outputs": [
-          "{projectRoot}/dist/bin/darwin-arm64/nx-cache-server"
-        ],
-        "options": {
-          "cwd": "{projectRoot}",
-          "command": "bun build --compile --target=bun-darwin-arm64 src/main.ts --outfile dist/bin/darwin-arm64/nx-cache-server"
-        }
+      "build": {
+        "dependsOn": [
+          "...",
+          "bundle"
+        ]
       },
-      "bun-x64-macos": {
+      "bundle": {
         "executor": "nx:run-commands",
         "cache": true,
         "inputs": [
@@ -107,49 +94,11 @@
           }
         ],
         "outputs": [
-          "{projectRoot}/dist/bin/darwin-x64/nx-cache-server"
+          "{projectRoot}/dist/server/nx-cache-server.js"
         ],
         "options": {
           "cwd": "{projectRoot}",
-          "command": "bun build --compile --target=bun-darwin-x64 src/main.ts --outfile dist/bin/darwin-x64/nx-cache-server"
-        }
-      },
-      "bun-arm64-linux": {
-        "executor": "nx:run-commands",
-        "cache": true,
-        "inputs": [
-          "{projectRoot}/src/**/*.ts",
-          "!{projectRoot}/src/**/__tests__/**",
-          "{projectRoot}/package.json",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun -e 'console.log(Bun.version, Bun.revision)'"
-          }
-        ],
-        "outputs": [
-          "{projectRoot}/dist/bin/linux-arm64/nx-cache-server"
-        ],
-        "options": {
-          "cwd": "{projectRoot}",
-          "command": "bun build --compile --target=bun-linux-arm64 src/main.ts --outfile dist/bin/linux-arm64/nx-cache-server"
-        }
-      },
-      "bun-x64-linux": {
-        "executor": "nx:run-commands",
-        "cache": true,
-        "inputs": [
-          "{projectRoot}/src/**/*.ts",
-          "!{projectRoot}/src/**/__tests__/**",
-          "{projectRoot}/package.json",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun -e 'console.log(Bun.version, Bun.revision)'"
-          }
-        ],
-        "outputs": [
-          "{projectRoot}/dist/bin/linux-x64/nx-cache-server"
-        ],
-        "options": {
-          "cwd": "{projectRoot}",
-          "command": "bun build --compile --target=bun-linux-x64 src/main.ts --outfile dist/bin/linux-x64/nx-cache-server"
+          "command": "bun build --target=bun src/main.ts --outfile dist/server/nx-cache-server.js"
         }
       }
     }

@@ -34,6 +34,43 @@ pub const STABLE_SUPPORT_DIRECTORY: &str = "dev.cowshed";
 pub const STABLE_BINARY_DIRECTORY: &str = "bin";
 pub const LAUNCH_AGENTS_DIRECTORY: &str = "LaunchAgents";
 
+/// The `PATH` launchd gives an agent that states none, kept behind [`BunDirectory`] in the
+/// gateway's so the daemon's other children resolve as they always did.
+pub const LAUNCHD_DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The directory of the `bun` the gateway runs its Nx cache server with: where the first `bun` on
+/// the invoking shell's `PATH` really lives, links resolved. A devenv shell's
+/// `.devenv/profile/bin/bun` becomes its `/nix/store/…-bun-…/bin`, which launchd can read at boot
+/// without the checkout; a store path nix later collects fails each backend start by name until
+/// setup runs again. cowshed carries no interpreter of its own (tg#7504, tg#6789).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BunDirectory(PathBuf);
+
+impl BunDirectory {
+    /// A directory said to hold `bun`, held to the shape a plist may name: canonical and absolute.
+    /// Like [`StoreBackedProgram::new`], this states a path rather than probing it; [`Self::on_path`]
+    /// is the constructor that looks.
+    pub fn new(directory: PathBuf) -> Result<Self, LaunchdError> {
+        validate_canonical_absolute_path("bun-directory", &directory)?;
+        Ok(Self(directory))
+    }
+
+    /// The canonical directory of the first `bun` on `path`, or why there is none to use.
+    pub fn on_path(path: &std::ffi::OsStr) -> Result<Self, String> {
+        let found = cowshed_gateway::bun_on_path(path)
+            .ok_or_else(|| format!("no bun on PATH {}", Path::new(path).display()))?;
+        let bun = found
+            .canonicalize()
+            .map_err(|error| format!("resolve bun {}: {error}", found.display()))?;
+        let directory = bun.parent().unwrap_or(Path::new("/")).to_path_buf();
+        Self::new(directory).map_err(|error| format!("bun {}: {error}", bun.display()))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// A binary path launchd can still reach after a reboot.
 ///
 /// `~/Library/Application Support/dev.cowshed/bin/<name>` is on the volume that also carries
@@ -377,12 +414,27 @@ impl LaunchAgentSpec {
         })
     }
 
-    pub fn gateway(executable: &HostStableExecutable) -> Result<Self, LaunchdError> {
-        let mut spec = Self::new_user(
-            executable,
-            GATEWAY_LABEL,
-            vec!["gateway".into(), "run".into()],
-            ServiceLifecycle::KeepAlive,
+    /// The gateway agent. Its `PATH` is the directory of the `bun` setup found ([`BunDirectory`])
+    /// ahead of launchd's own default, so the daemon runs its Nx cache server with that `bun`
+    /// and every other child it names resolves exactly as it did under launchd's default.
+    pub fn gateway(
+        executable: &HostStableExecutable,
+        bun: &BunDirectory,
+    ) -> Result<Self, LaunchdError> {
+        let path = format!(
+            "{}:{LAUNCHD_DEFAULT_PATH}",
+            bun.path().to_str().expect("validated paths are UTF-8")
+        );
+        let mut spec = Self::assemble(
+            executable.home(),
+            executable.path(),
+            AgentDefinition {
+                label: GATEWAY_LABEL.to_owned(),
+                arguments: vec!["gateway".into(), "run".into()],
+                environment: vec![("PATH".to_owned(), path)],
+                lifecycle: ServiceLifecycle::KeepAlive,
+                standard_error_file: "daemon-stderr.log",
+            },
         )?;
         // A finite kernel-sized soft limit keeps sysconf(_SC_OPEN_MAX) usable by fd-closing tools.
         // Hard authority remains Darwin's RLIM_INFINITY, owned by the service, not child spawns.

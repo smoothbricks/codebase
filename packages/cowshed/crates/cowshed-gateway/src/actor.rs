@@ -3853,7 +3853,8 @@ mod tests {
             },
         );
         fixture.actor.config.nx_cache = Some(crate::nx_cache::NxCacheServiceConfig {
-            executable: root.0.join("unavailable-server"),
+            script: root.0.join("unavailable-server"),
+            path: std::ffi::OsString::new(),
             directory: root.0.join("nx"),
             max_bytes: 1024,
             cap_bytes: 4096,

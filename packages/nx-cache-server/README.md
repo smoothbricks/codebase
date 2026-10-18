@@ -7,16 +7,16 @@ exact-head/task-hash landing eligibility belong to `05_gateway.md` and `16_build
 
 ## Start and supervise
 
-`nx-cache-server` runs the published `dist/ts/main.js` with Bun. Release platform targets also produce standalone
-executables in `dist/bin/{darwin,linux}-{arm64,x64}/nx-cache-server`, using the same platform artifact convention as
-cowshed. Supervision uses the installed artifact, not a workspace source path. One process owns one project store.
-JavaScript targets own only `dist/ts`; each native target owns its `dist/bin` platform directory. Their output trees are
-disjoint, so restoring a cached JavaScript target cannot replace a measured or installed native executable. Each project
-must have its own parent directory: `<project>/entries` holds archives and `<project>/sieve.hand` holds the SIEVE
-cursor. No other process may open that store or sweep it concurrently.
+`nx-cache-server` runs the published `dist/ts/main.js` with Bun. The package ships no standalone executables (tg#7504):
+its `bundle` target, part of the release `build`, writes one platform-independent file,
+`dist/server/nx-cache-server.js`, which runs as `bun dist/server/nx-cache-server.js` with the `bun` found on `PATH`.
+Cowshed's setup installs a content-addressed copy of that bundle, and its gateway runs the copy with the `bun` on the
+`PATH` that setup recorded, so supervision uses the installed artifact, not a workspace source path. One process owns
+one project store. Each project must have its own parent directory: `<project>/entries` holds archives and
+`<project>/sieve.hand` holds the SIEVE cursor. No other process may open that store or sweep it concurrently.
 
-Invocation is `nx-cache-server [--exit-on-stdin-eof]`; the optional flag enables the parent-held stdin pipe lease
-described below.
+Invocation is `nx-cache-server [--exit-on-stdin-eof]` (or `bun dist/server/nx-cache-server.js [--exit-on-stdin-eof]`);
+the optional flag enables the parent-held stdin pipe lease described below.
 
 | Environment                    | Meaning                                                                                                                                                                                |
 | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

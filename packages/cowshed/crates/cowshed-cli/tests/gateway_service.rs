@@ -6,9 +6,9 @@ use cowshed_cli::gateway_service::{
     remove_host_stable_executable, restore_previous_executable, retain_previous_executable,
 };
 use cowshed_cli::launchd::{
-    COWSHED_BINARY_NAME, CommandStatus, ExecutableDigest, HostStableExecutable, InstallOutcome,
-    LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput, LaunchdExecutor, NativeFilesystem,
-    NativeLaunchctlCommand, RemovalOutcome, STABLE_BINARY_MODE,
+    BunDirectory, COWSHED_BINARY_NAME, CommandStatus, ExecutableDigest, HostStableExecutable,
+    InstallOutcome, LaunchAgentSpec, LaunchctlCommand, LaunchctlOutput, LaunchdExecutor,
+    NativeFilesystem, NativeLaunchctlCommand, RemovalOutcome, STABLE_BINARY_MODE,
 };
 use cowshed_cli::output::Output;
 use cowshed_core::api::{
@@ -70,10 +70,17 @@ impl LaunchctlCommand for RecordingLaunchctl {
     }
 }
 
+/// The bun a devenv shell's `PATH` resolves to; the gateway agent's `PATH` leads with it.
+fn bun() -> BunDirectory {
+    BunDirectory::new("/nix/store/0000000000000000000000000000000b-bun-1.4.2/bin".into())
+        .expect("valid bun directory")
+}
+
 fn launch_spec() -> LaunchAgentSpec {
     LaunchAgentSpec::gateway(
         &HostStableExecutable::new(Path::new("/Users/test"), COWSHED_BINARY_NAME)
             .expect("valid host-stable binary"),
+        &bun(),
     )
     .expect("valid spec")
 }
@@ -695,7 +702,7 @@ fn installing_the_agent_binary_publishes_a_content_addressed_copy_and_reuses_it(
         "what the daemon and the PATH entry run is the stored copy"
     );
     // The plist launchd reads names the stable name, which never changes with the build.
-    let spec = LaunchAgentSpec::gateway(&executable).expect("valid spec");
+    let spec = LaunchAgentSpec::gateway(&executable, &bun()).expect("valid spec");
     assert_eq!(spec.program_arguments().next(), executable.path().to_str());
 
     // A current copy is left in place: same inode, no rewrite of a running binary.
@@ -776,7 +783,7 @@ fn installing_from_a_workspace_build_copies_onto_the_host_volume() {
         !stored.starts_with(home.join(".cowshed")),
         "nothing under the workspace is named"
     );
-    let spec = LaunchAgentSpec::gateway(&executable).expect("valid spec");
+    let spec = LaunchAgentSpec::gateway(&executable, &bun()).expect("valid spec");
     assert_eq!(spec.program_arguments().next(), executable.path().to_str());
 
     fs::remove_dir_all(&home).expect("remove scratch home");

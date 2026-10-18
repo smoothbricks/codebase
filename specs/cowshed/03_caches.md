@@ -453,21 +453,25 @@ host-owned store, not a shared `.nx` directory, blob CAS, or Cargo warm volume. 
 backend listener and one flat entries directory under cowshed's host cache directory; the gateway maps project identity
 to that backend. A hash in one project cannot name another project's archive.
 
-The gateway service owns the backend lifecycle, outside every workspace sandbox, using an installed foreground
-executable rather than a workspace's source files. One process exclusively owns each entries directory. Its
-configuration and labelled read/write bearer principals are host-owned; no repository, workspace child environment, or
-sandbox receives a backend secret or filesystem grant. The host-owned backend necessarily holds its own host
-credentials. Clients receive only their own gateway authority (05_gateway.md). Normal iteration always reads accepted
-project results with read-only authority. Only an accepted landing may publish its successful current task hashes,
-including existing local hits without rebuilding, under temporary gateway write authority; exact-head/task-hash
-eligibility belongs to 05_gateway.md and 16_build_volumes.md. There is no scratch store. Read-only authority denies
-publication, not necessarily archive creation or an attempted PUT by the stock client: measure that cost separately, and
-never describe a server-side 403 as zero upload overhead.
+The gateway service owns the backend lifecycle, outside every workspace sandbox, using an installed copy of the
+package's server bundle rather than a workspace's source files. The package ships that bundle as one
+platform-independent JavaScript file, `dist/server/nx-cache-server.js`, and no compiled executables; cowshed bundles no
+interpreter (tg#7504). Setup installs a content-addressed copy of the bundle and records its invoker's `PATH`, so the
+`bun` there — devenv provides it, a Nix-provided one included — is the one the gateway runs. One process exclusively
+owns each entries directory. Its configuration and labelled read/write bearer principals are host-owned; no repository,
+workspace child environment, or sandbox receives a backend secret or filesystem grant. The host-owned backend
+necessarily holds its own host credentials. Clients receive only their own gateway authority (05_gateway.md). Normal
+iteration always reads accepted project results with read-only authority. Only an accepted landing may publish its
+successful current task hashes, including existing local hits without rebuilding, under temporary gateway write
+authority; exact-head/task-hash eligibility belongs to 05_gateway.md and 16_build_volumes.md. There is no scratch store.
+Read-only authority denies publication, not necessarily archive creation or an attempted PUT by the stock client:
+measure that cost separately, and never describe a server-side 403 as zero upload overhead.
 
-The installed gateway starts the backend's foreground executable with `--exit-on-stdin-eof` and retains the write end of
-its stdin pipe for the child's lifetime. On hard parent death the kernel closes that pipe, and EOF drains and stops the
-backend. Normal standalone invocation without the flag keeps signal supervision. EOF changes lifecycle only; it is not
-the store-exclusion mechanism.
+The installed gateway starts the backend as `bun <installed bundle> --exit-on-stdin-eof`, `bun` resolved on that
+recorded `PATH` at each start (none found is a start failure said as one), and retains the write end of its stdin pipe
+for the child's lifetime. On hard parent death the kernel closes that pipe, and EOF drains and stops the backend. Normal
+standalone invocation without the flag keeps signal supervision. EOF changes lifecycle only; it is not the
+store-exclusion mechanism.
 
 The backend opens `<project>/entries/.owner.lock` and takes a nonblocking exclusive kernel `flock` (`LOCK_EX | LOCK_NB`)
 through a minimal Bun FFI binding to libc, before any staging reclamation. The lock file is persistent and is never

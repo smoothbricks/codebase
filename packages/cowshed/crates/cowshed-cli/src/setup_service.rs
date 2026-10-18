@@ -531,7 +531,7 @@ impl HostSetup for NativeHostSetup {
         let removals = vec![
             HostArtifactRemoval::new(
                 format!("{} agent", gateway_agent.label()),
-                remove_launch_agent(gateway_agent.target())?,
+                remove_launch_agent(&gateway_agent)?,
             ),
             HostArtifactRemoval::new(
                 format!("{} agent", sccache_agent.label()),
