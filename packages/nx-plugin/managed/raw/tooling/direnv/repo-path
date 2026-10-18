@@ -50,7 +50,10 @@ case "${1:-}" in
       source "$root/.cowshed/env"
     fi
     if [[ -z "${COWSHED_RUNTIME_LINK:-}" ]]; then
-      export PATH="$HOME/Library/Application Support/dev.cowshed/bin:$PATH"
+      # Bash expands `~` to HOME, or with HOME unset to the passwd home of the real uid: a caller that passes
+      # only PATH, such as a formatter or a hook under `env -i`, still reaches the installed cowshed.
+      home=~
+      export PATH="$home/Library/Application Support/dev.cowshed/bin:$PATH"
     fi
     printf '%s\n' "$PATH" ;;
 esac
