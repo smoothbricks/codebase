@@ -154,6 +154,19 @@ failed and whether the restore and the reload did. A first install has nothing t
 setup on a host with no gateway agent installs the same way without the activation. Setup installs only after its
 storage repair succeeded.
 
+**An install waits for the gates in flight.** Activating the agent restarts a gateway that runs, and so does the host
+move inside `setup`; a restart closes every lease connection ("Crash safety by connection"), a land's gate-job pool with
+them, and every task that gate admits afterwards is refused. Measured 2026-10-18: an install restarted the gateway at
+17:00 while a land's gate ran, its next tasks failed with
+`cpu-tokens parent pool refused: the gateway closed the lease connection`, and the land failed. So an install — holding
+the slot, after its refusals and before the activation or host move that would restart a gateway that answers `status` —
+first waits until that gateway's `cpu-budget` ledger shows no gate-class work holding or wanting tokens (`gateJobs` and
+`gateQueue` both empty, "Host CPU budget", Wire). It reads the ledger once a second, with no deadline, as no admission
+has one ("No admission deadline"): the gates end, and the install goes on. It says on stderr which gate jobs it waits
+for (`gate job <n> at <checkout>`), once and again whenever they change, and when none is left. A gateway that does not
+answer `cpu-budget` is not waited on, and the install says so. An install that restarts nothing (no daemon answers, or
+the refresh finds the agent current) does not wait. The restart and its refusals themselves are unchanged.
+
 **Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
 the new build's and the one it replaced is removed. The replaced build stays one install longer: a workspace supervisor
 of that build, still draining its jobs (11_shell.md "Draining a supervisor of another build"), starts the shells those

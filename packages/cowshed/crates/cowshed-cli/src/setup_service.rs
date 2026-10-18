@@ -608,7 +608,7 @@ impl HostSetup for NativeHostSetup {
                 .await
                 .is_ok_and(|status| status.running);
         if gateway {
-            crate::gateway_service::stop_for_host_move()?;
+            crate::gateway_service::stop_for_host_move().await?;
         }
         if sccache_running {
             crate::capabilities::sccache::service::stop_for_host_move()?;
