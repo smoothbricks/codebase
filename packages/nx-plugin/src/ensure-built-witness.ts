@@ -119,6 +119,24 @@ export function nodesUnchanged(nodes: readonly NodeWitness[]): boolean {
   return true;
 }
 
+/**
+ * The witnessed nodes whose stamp is no longer the one read, named for a refusal (the first eight in witness order, a
+ * gone one with its error code, and how many more), or null when none moved.
+ */
+export function movedNodes(nodes: readonly NodeWitness[]): string | null {
+  const moved: string[] = [];
+  for (const node of nodes) {
+    try {
+      if (nodeStamp(lstatSync(node.path, { bigint: true })) !== node.stamp) moved.push(node.path);
+    } catch (error) {
+      if (!systemError(error)) throw error;
+      moved.push(`${node.path} (${error.code})`);
+    }
+  }
+  if (moved.length === 0) return null;
+  return `${moved.slice(0, 8).join(', ')}${moved.length > 8 ? ` and ${moved.length - 8} more` : ''}`;
+}
+
 /** Membership and content are exact. Outputs do not exempt manifests or
  * newly created/deleted files; this graph witness has no output exclusions.
  */

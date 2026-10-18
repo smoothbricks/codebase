@@ -36,6 +36,7 @@ import {
 } from './ensure-built-receipt.js';
 import {
   graphInstallationIdentity,
+  movedNodes,
   type NodeWitness,
   nodesUnchanged,
   workspaceSnapshot,
@@ -263,8 +264,11 @@ function toolsFor(
         sha256: sha(entries),
       });
     }
-    if (!nodesUnchanged(observed) || !missing(module.missing))
-      return { ok: false, detail: 'Producer tool/module namespace moved during capture' };
+    const capture = movedNodes(observed);
+    if (capture !== null)
+      return { ok: false, detail: `Producer tool/module namespace moved during capture: ${capture}` };
+    if (!missing(module.missing))
+      return { ok: false, detail: 'Producer tool/module namespace moved during capture: a missing candidate appeared' };
     return { ok: true, value: { tools, nodes: observed } };
   } catch (error) {
     if (error instanceof Error) return { ok: false, detail: `Cannot prove producer tool closure: ${error.message}` };
@@ -416,8 +420,9 @@ export async function postTasksExecution(
     }
     const tasks = completed.value;
     let detail: string | undefined;
-    if (!nodesUnchanged(frame.value.toolNodes)) {
-      refuse('Producer tool/module nodes changed across actual execution');
+    const execution = movedNodes(frame.value.toolNodes);
+    if (execution !== null) {
+      refuse(`Producer tool/module nodes changed across actual execution: ${execution}`);
       continue;
     }
     const load = createWorkspaceNxRequire(context.workspaceRoot);
@@ -488,8 +493,9 @@ export async function postTasksExecution(
       refuse(result.reason.detail);
       continue;
     }
-    if (!nodesUnchanged(frame.value.toolNodes)) {
-      refuse('Producer tools changed during post-execution product census');
+    const census = movedNodes(frame.value.toolNodes);
+    if (census !== null) {
+      refuse(`Producer tools changed during post-execution product census: ${census}`);
       continue;
     }
     const publication = publish(context.workspaceRoot, target, {
