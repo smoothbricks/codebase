@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::dto::{CommandArg, ExitStatus, JobId, UtcTimestamp};
-use super::resources::{CpuMicros, ResidentBytes, StorageIoBytes};
+use super::resources::{CpuMicros, OneCoreCpuPermille, ResidentBytes, StorageIoBytes, WallMicros};
 
 /// Every process a job owned that its observer saw, the exited ones included, and whether the
 /// observer saw all of them.
@@ -208,13 +208,43 @@ pub struct ProcessUsage {
     pub cpu_user_us: CpuMicros,
     pub cpu_sys_us: CpuMicros,
     /// Whether its own CPU over the supervisor's last sample window was at least 1 % of one
-    /// core.
+    /// core: `cpu_window`'s share against [`BUSY_CPU_PERMILLE`], idle while no window closed.
     pub busy: bool,
+    /// The supervisor's last closed sample window of its own CPU, with the share `busy` judges;
+    /// absent until two reads a positive span apart closed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_window: Option<ProcessCpuWindow>,
     /// What it holds resident now; zero once it has exited.
     pub rss_bytes: ResidentBytes,
     /// The most it was read holding: never another process's, nor the group's sum.
     pub rss_peak_bytes: ResidentBytes,
     pub io: ProcessStorageIo,
+}
+
+/// One process's last closed CPU sample window: the span between the two reads of its own
+/// counters that bound it, and the share of one core its own CPU took over that span. A share is
+/// comparable only with its window, so the window is part of the value. Windows tile a life: each
+/// opens where the one before it closed, so a reader tells a window it already saw (the same
+/// `closed_us`) from the next one (`opened_us` at the last `closed_us`) and from one it missed
+/// (`opened_us` past it).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProcessCpuWindow {
+    /// Where the window opened, in whole microseconds after the process's first usage read, on
+    /// the supervisor's monotonic clock.
+    pub opened_us: WallMicros,
+    /// Where it closed, on the same clock; equal to `opened_us` for a window under a microsecond.
+    pub closed_us: WallMicros,
+    /// Its own user plus system CPU over the window, in thousandths of one core, from the
+    /// window's exact span and rounded down.
+    pub cpu_permille: OneCoreCpuPermille,
+}
+
+impl ProcessCpuWindow {
+    /// Whether its share reaches [`BUSY_CPU_PERMILLE`]: what `busy` says of it.
+    pub fn busy(&self) -> bool {
+        self.cpu_permille.get() >= u64::from(BUSY_CPU_PERMILLE)
+    }
 }
 
 /// What one process has moved to and from storage, as its kernel's per-process source counts

@@ -1063,6 +1063,7 @@ mod tests {
                 cpu_user_us: CpuMicros::new(1).expect("a CPU time"),
                 cpu_sys_us: CpuMicros::new(0).expect("a CPU time"),
                 busy: false,
+                cpu_window: None,
                 rss_bytes: ResidentBytes::new(0).expect("a resident size"),
                 rss_peak_bytes: ResidentBytes::new(0).expect("a resident size"),
                 io: ProcessStorageIo::Read {

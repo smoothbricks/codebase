@@ -29,14 +29,14 @@ use cowshed_core::{
         ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason, GcReport, GitOid,
         GrantSet, HostLoadSample, JobAccounting, JobId, JobInfo, JobLeafAttribution,
         JobProcessLeaf, JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage,
-        JobserverClass, LandReport, LandingCommits, OneCoreCpuPercent, OutputLimitInfo,
-        OutputStorage, OutputSummary, PortBlock, ProcessCoverage, ProcessCoverageGap,
-        ProtectedOutput, PushReport, RebaseBuildVolume, RebaseCarrySkip, RebaseReport,
-        RemoveReport, RepoRule, ResidentBytes, ResizeResult, ResizeVolume, Sha256Digest, SimVerb,
-        SpanId, StdinInfo, StdinKind, StreamBytes, StreamInfo, StreamLines, TraceContext, TraceId,
-        UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta,
-        WallMicros, WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName,
-        WorkspacePath, WorkspaceRole, WorkspaceState,
+        JobserverClass, LandReport, LandingCommits, OneCoreCpuPercent, OneCoreCpuPermille,
+        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProcessCoverage,
+        ProcessCoverageGap, ProtectedOutput, PushReport, RebaseBuildVolume, RebaseCarrySkip,
+        RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult, ResizeVolume,
+        Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamBytes, StreamInfo, StreamLines,
+        TraceContext, TraceId, UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage,
+        VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding,
+        WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -1125,8 +1125,8 @@ fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value
         StorageIoBytes,
         process::{
             BlockerChange, JobProcessDelta, JobProcessEvent, JobProcessSample, JobProcessTree,
-            LockHolder, ProcessBlockedOn, ProcessExit, ProcessIoUnavailable, ProcessStorageIo,
-            ProcessUsage,
+            LockHolder, ProcessBlockedOn, ProcessCpuWindow, ProcessExit, ProcessIoUnavailable,
+            ProcessStorageIo, ProcessUsage,
         },
     };
 
@@ -1145,6 +1145,11 @@ fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value
         cpu_user_us: CpuMicros::new(12_345).expect("fixture CPU"),
         cpu_sys_us: CpuMicros::new(678).expect("fixture CPU"),
         busy: true,
+        cpu_window: Some(ProcessCpuWindow {
+            opened_us: WallMicros::new(1_000_000).expect("fixture window"),
+            closed_us: WallMicros::new(2_000_000).expect("fixture window"),
+            cpu_permille: OneCoreCpuPermille::new(950).expect("fixture share"),
+        }),
         rss_bytes: ResidentBytes::new(4096).expect("fixture resident bytes"),
         rss_peak_bytes: ResidentBytes::new(8192).expect("fixture resident bytes"),
         io: ProcessStorageIo::Read {
@@ -1160,6 +1165,11 @@ fn process_observations() -> BTreeMap<&'static str, BTreeMap<&'static str, Value
     let ended = JobProcessSample {
         usage: Some(ProcessUsage {
             busy: false,
+            cpu_window: Some(ProcessCpuWindow {
+                opened_us: WallMicros::new(2_000_000).expect("fixture window"),
+                closed_us: WallMicros::new(2_500_000).expect("fixture window"),
+                cpu_permille: OneCoreCpuPermille::new(4).expect("fixture share"),
+            }),
             rss_bytes: ResidentBytes::new(0).expect("exited resident bytes"),
             ..usage
         }),

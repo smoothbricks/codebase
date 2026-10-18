@@ -1,6 +1,7 @@
 //! What each observed process of a job has cost itself (07_api.md, "Process-tree observations"):
-//! its own CPU, never that of the children it waited for, whether it was busy over the
-//! supervisor's last sample window, and the memory it holds resident now and at most.
+//! its own CPU, never that of the children it waited for, the share of one core it took over the
+//! supervisor's last sample window, which judges it busy, and the memory it holds resident now
+//! and at most.
 //!
 //! The fold is pure: the supervisor's sampler is its only writer, and it applies each reading of
 //! a life it read from the kernel. Reading the folded usage changes nothing, so a second reader
@@ -15,13 +16,15 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU128};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use crate::api::process::ProcessIoUnavailable;
-use crate::api::process::{BUSY_CPU_PERMILLE, ProcessCoverageGap, ProcessStorageIo, ProcessUsage};
-use crate::api::resources::{CpuMicros, ResidentBytes, ResourceUnitError, StorageIoBytes};
+use crate::api::process::{ProcessCoverageGap, ProcessCpuWindow, ProcessStorageIo, ProcessUsage};
+use crate::api::resources::{
+    CpuMicros, OneCoreCpuPermille, ResidentBytes, ResourceUnitError, StorageIoBytes, WallMicros,
+};
 use crate::runtime::process_tree::ProcessIdentity;
 
 /// When a process started, on the kernel clock the counters were read with: macOS
@@ -87,15 +90,30 @@ pub enum UsageFoldError {
     AfterExit { pid: u32 },
     #[error("process {pid} was read running after a read that found it exited")]
     Revived { pid: u32 },
+    #[error(
+        "process {pid}'s {cpu_us} us of own CPU over {span_ns} ns is a share no projection holds exactly"
+    )]
+    ShareInexact {
+        pid: u32,
+        cpu_us: u64,
+        span_ns: u128,
+    },
+    #[error(
+        "process {pid} was read {elapsed:?} after its first read, past what a microsecond count holds exactly"
+    )]
+    ClockInexact { pid: u32, elapsed: Duration },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Counted {
+    /// When the life was first read: the origin its windows are placed on.
+    first: Instant,
     latest: UsageReading,
     /// The reading the current window opened at: the last one a positive span after its
     /// predecessor.
     window: UsageReading,
-    busy: bool,
+    /// The last window closed; `None` until one has.
+    closed: Option<ProcessCpuWindow>,
     /// The most it was read holding.
     rss_peak: ResidentBytes,
 }
@@ -124,10 +142,11 @@ impl ProcessUsageFold {
                 // A refused reading leaves the life as it was.
                 let counted = match &life.counted {
                     None => Counted {
+                        first: reading.at,
                         latest: reading,
                         window: reading,
                         // No span has passed in which it could have been busy.
-                        busy: false,
+                        closed: None,
                         rss_peak: reading.resident,
                     },
                     Some(counted) => counted.read(process.pid, reading)?,
@@ -159,7 +178,8 @@ impl ProcessUsageFold {
         Some(ProcessUsage {
             cpu_user_us: counted.latest.cpu_user,
             cpu_sys_us: counted.latest.cpu_sys,
-            busy: counted.busy,
+            busy: counted.closed.is_some_and(|window| window.busy()),
+            cpu_window: counted.closed,
             rss_bytes: counted.latest.resident,
             rss_peak_bytes: counted.rss_peak,
             io: counted.latest.io,
@@ -239,29 +259,39 @@ impl Counted {
             }
         }
         let rss_peak = self.rss_peak.max(reading.resident);
-        let span = reading.at.duration_since(self.window.at);
-        if span.is_zero() {
+        let Some(span_ns) = NonZeroU128::new(reading.at.duration_since(self.window.at).as_nanos())
+        else {
             // No time passed in which to judge: the window stays open, the judgment stands.
             return Ok(Self {
                 latest: reading,
-                window: self.window,
-                busy: self.busy,
                 rss_peak,
+                ..*self
             });
-        }
+        };
+        let cpu_us = reading.cpu_total() - self.window.cpu_total();
+        let cpu_permille = OneCoreCpuPermille::of_window(cpu_us, span_ns).map_err(|_| {
+            UsageFoldError::ShareInexact {
+                pid,
+                cpu_us,
+                span_ns: span_ns.get(),
+            }
+        })?;
+        let since_first = |at: Instant| {
+            let elapsed = at.duration_since(self.first);
+            WallMicros::of(elapsed).map_err(|_| UsageFoldError::ClockInexact { pid, elapsed })
+        };
         Ok(Self {
+            first: self.first,
             latest: reading,
             window: reading,
-            busy: busy(reading.cpu_total() - self.window.cpu_total(), span),
+            closed: Some(ProcessCpuWindow {
+                opened_us: since_first(self.window.at)?,
+                closed_us: since_first(reading.at)?,
+                cpu_permille,
+            }),
             rss_peak,
         })
     }
-}
-
-/// Whether `cpu_us` of own CPU over `span` is at least [`BUSY_CPU_PERMILLE`] of one core,
-/// compared in exact nanoseconds: a span shorter than a microsecond is not rounded to none.
-fn busy(cpu_us: u64, span: Duration) -> bool {
-    u128::from(cpu_us) * 1_000_000 >= u128::from(BUSY_CPU_PERMILLE) * span.as_nanos()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -633,9 +663,11 @@ mod tests {
         UsageReading, own_counters, sample,
     };
     use crate::api::process::{
-        ProcessCoverageGap, ProcessIoUnavailable, ProcessStorageIo, ProcessUsage,
+        ProcessCoverageGap, ProcessCpuWindow, ProcessIoUnavailable, ProcessStorageIo, ProcessUsage,
     };
-    use crate::api::resources::{CpuMicros, ResidentBytes, StorageIoBytes};
+    use crate::api::resources::{
+        CpuMicros, OneCoreCpuPermille, ResidentBytes, StorageIoBytes, WallMicros,
+    };
     use crate::runtime::process_tree::{BirthToken, ProcessIdentity};
     use cowshed_os::fork_lock::Spawn as _;
 
@@ -694,6 +726,15 @@ mod tests {
         fold.usage(process).expect("a read life").busy
     }
 
+    /// The window from `opened_us` to `closed_us` after the life's first read, at `cpu_permille`.
+    fn cpu_window(opened_us: u64, closed_us: u64, cpu_permille: u64) -> ProcessCpuWindow {
+        ProcessCpuWindow {
+            opened_us: WallMicros::new(opened_us).expect("a position"),
+            closed_us: WallMicros::new(closed_us).expect("a position"),
+            cpu_permille: OneCoreCpuPermille::new(cpu_permille).expect("a share"),
+        }
+    }
+
     #[test]
     fn busy_is_the_share_of_one_window_and_flips_back_to_idle() {
         let process = identity(40);
@@ -725,11 +766,53 @@ mod tests {
                 cpu_user_us: cpu(519_000),
                 cpu_sys_us: cpu(100_000),
                 busy: true,
+                cpu_window: Some(cpu_window(2_000_000, 3_000_000, 10)),
                 rss_bytes: resident(1 << 20),
                 rss_peak_bytes: resident(1 << 20),
                 io: moved(0, 0),
             })
         );
+    }
+
+    /// The share `busy` judges is published with the window it was measured over: windows tile
+    /// the life from its first read, a zero-length reading keeps the last one, and the share is
+    /// rounded down from the exact span, so it says busy exactly when `busy` does.
+    #[test]
+    fn the_share_is_published_with_the_window_it_was_measured_over() {
+        let process = identity(44);
+        let start = Instant::now();
+        let mut fold = ProcessUsageFold::default();
+        let usage = |fold: &ProcessUsageFold| fold.usage(process).expect("a read life");
+        fold.apply(read(process, reading(start, 0, 0))).unwrap();
+        assert_eq!(
+            usage(&fold).cpu_window,
+            None,
+            "a first read closes no window"
+        );
+
+        // 950 ms of a 1 s window.
+        let second = start + Duration::from_secs(1);
+        fold.apply(read(process, reading(second, 900_000, 50_000)))
+            .unwrap();
+        assert_eq!(usage(&fold).cpu_window, Some(cpu_window(0, 1_000_000, 950)));
+        // 750 ms over the next 500 ms: one and a half cores, opening where the last one closed.
+        let half = second + Duration::from_millis(500);
+        fold.apply(read(process, reading(half, 1_500_000, 200_000)))
+            .unwrap();
+        let multicore = Some(cpu_window(1_000_000, 1_500_000, 1_500));
+        assert_eq!(usage(&fold).cpu_window, multicore);
+        // No time passed: the window and its share stand.
+        fold.apply(read(process, reading(half, 1_500_000, 200_000)))
+            .unwrap();
+        assert_eq!(usage(&fold).cpu_window, multicore);
+
+        // 29.999 ms over 3 s is 9.9997 thousandths: rounded down, under the busy share.
+        let idle = half + Duration::from_secs(3);
+        fold.apply(read(process, reading(idle, 1_529_999, 200_000)))
+            .unwrap();
+        let usage = usage(&fold);
+        assert_eq!(usage.cpu_window, Some(cpu_window(1_500_000, 4_500_000, 9)));
+        assert!(!usage.busy);
     }
 
     #[test]
@@ -840,6 +923,13 @@ mod tests {
             ))
             .unwrap();
             assert!(busy(&fold, process), "1 us over {nanos} ns is busy");
+            assert_eq!(
+                fold.usage(process)
+                    .and_then(|usage| usage.cpu_window)
+                    .map(|window| window.cpu_permille.get()),
+                Some(1_000_000 / nanos),
+                "its share is that of its exact span"
+            );
         }
     }
 

@@ -758,6 +758,13 @@ export const assertOneCoreCpuPercentList = typia.createAssertEquals<readonly Api
 export const parseOneCoreCpuPercentList = (json: string): readonly Api.OneCoreCpuPercent[] =>
   assertOneCoreCpuPercentList(JSON.parse(json));
 
+export const assertOneCoreCpuPermille = typia.createAssertEquals<Api.OneCoreCpuPermille>();
+export const parseOneCoreCpuPermille = (json: string): Api.OneCoreCpuPermille =>
+  assertOneCoreCpuPermille(JSON.parse(json));
+export const assertOneCoreCpuPermilleList = typia.createAssertEquals<readonly Api.OneCoreCpuPermille[]>();
+export const parseOneCoreCpuPermilleList = (json: string): readonly Api.OneCoreCpuPermille[] =>
+  assertOneCoreCpuPermilleList(JSON.parse(json));
+
 export const assertOtherBuild = typia.createAssertEquals<Api.OtherBuild>();
 export const parseOtherBuild = (json: string): Api.OtherBuild => assertOtherBuild(JSON.parse(json));
 export const assertOtherBuildList = typia.createAssertEquals<readonly Api.OtherBuild[]>();
@@ -823,6 +830,12 @@ export const parseProcessCoverageGap = (json: string): Api.ProcessCoverageGap =>
 export const assertProcessCoverageGapList = typia.createAssertEquals<readonly Api.ProcessCoverageGap[]>();
 export const parseProcessCoverageGapList = (json: string): readonly Api.ProcessCoverageGap[] =>
   assertProcessCoverageGapList(JSON.parse(json));
+
+export const assertProcessCpuWindow = typia.createAssertEquals<Api.ProcessCpuWindow>();
+export const parseProcessCpuWindow = (json: string): Api.ProcessCpuWindow => assertProcessCpuWindow(JSON.parse(json));
+export const assertProcessCpuWindowList = typia.createAssertEquals<readonly Api.ProcessCpuWindow[]>();
+export const parseProcessCpuWindowList = (json: string): readonly Api.ProcessCpuWindow[] =>
+  assertProcessCpuWindowList(JSON.parse(json));
 
 export const assertProcessExit = typia.createAssertEquals<Api.ProcessExit>();
 export const parseProcessExit = (json: string): Api.ProcessExit => assertProcessExit(JSON.parse(json));
