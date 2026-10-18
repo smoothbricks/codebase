@@ -5991,8 +5991,9 @@ async fn an_activation_and_its_command_each_count_once() {
 }
 
 /// A command line that reports `spinning <pid>` as it starts and holds until a line arrives on
-/// its stdin, then spins for `seconds` of its own CPU in the very process it runs in, reports
-/// `burned <us>` once done, and waits for another line.
+/// its stdin. Woken, it reports `woke <us>`, the CPU it had spent before its burn, then spins for
+/// `seconds` more of its own CPU in the very process it runs in, reports `burned <us>` once done,
+/// and waits for another line.
 #[cfg(target_os = "macos")]
 fn spinner(seconds: f64) -> String {
     format!(
@@ -6000,8 +6001,10 @@ fn spinner(seconds: f64) -> String {
          def used():\n    u = resource.getrusage(resource.RUSAGE_SELF)\n    return u.ru_utime + u.ru_stime\n\
          print(\"spinning\", os.getpid(), flush=True)\n\
          sys.stdin.readline()\n\
+         woke = used()\n\
+         print(\"woke\", int(woke * 1e6), flush=True)\n\
          x = 0\n\
-         while used() < {seconds}:\n    for _ in range(10000):\n        x += 1\n\
+         while used() < woke + {seconds}:\n    for _ in range(10000):\n        x += 1\n\
          print(\"burned\", int(used() * 1e6), flush=True)\n\
          sys.stdin.readline()\n'"
     )
@@ -6078,13 +6081,17 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
         0,
     )
     .await;
-    // No read has been taken: the latest sample is the boundary that opened the window.
+    // No read has been taken: the latest sample is the boundary that opened the window. The
+    // leader was blocked on its stdin from before that boundary until the line below wakes it,
+    // so the CPU it reports on waking bounds what the boundary can have accounted, whatever an
+    // interpreter's start cost on this host.
     let opened = latest(&handle, job_id).await;
-    assert!(
-        accounted_us(&opened) < SLACK_US,
-        "the window opened at the leader's start, before its burn: {opened:?}"
-    );
     leader.send("burn");
+    let woke = leader.reported("woke");
+    assert!(
+        accounted_us(&opened) <= woke,
+        "the window opened at the leader's start, before its burn from {woke} us: {opened:?}"
+    );
     let burned = leader.burned();
     let busy = handle.resources(job_id).await.unwrap();
     assert!(busy.consistent(), "{busy:?}");
