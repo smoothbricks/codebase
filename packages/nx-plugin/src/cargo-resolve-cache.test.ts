@@ -95,7 +95,7 @@ function alive(pid: number): boolean {
 /** How a subprocess ended, with everything it printed. */
 interface Ended {
   readonly exitCode: number | null;
-  readonly signalCode: NodeJS.Signals | null;
+  readonly signalCode: Bun.Subprocess['signalCode'];
   readonly stdout: string;
   readonly stderr: string;
 }
