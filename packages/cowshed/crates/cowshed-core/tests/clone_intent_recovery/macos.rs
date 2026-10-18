@@ -269,8 +269,9 @@ impl Fixture {
             .cloned()
     }
 
-    /// A stale `cowshed/<workspace>` branch in main: a fresh clone inherits it and its
-    /// initializer refuses, after the `PendingFence` image exists.
+    /// A stale `cowshed/<workspace>` branch in main. A git-worktree mint's initializer refuses
+    /// it after the `PendingFence` image exists, and keeps the clone pending: its initializer
+    /// registers in main's repository, so the clone stays for the retry to resume.
     fn plant_workspace_branch(&self, workspace: &str) {
         git(&self.checkout, &["branch", &format!("cowshed/{workspace}")]);
     }
@@ -308,6 +309,20 @@ impl Fixture {
             journal.mark_mutating(&name(workspace))
         })
         .expect("journal the unreplayable create");
+    }
+
+    /// Every build volume image the project holds, by file name.
+    fn build_images(&self) -> Vec<std::ffi::OsString> {
+        let directory = self.layout().project().project_root.join("build");
+        let mut images = match fs::read_dir(&directory) {
+            Ok(entries) => entries
+                .map(|entry| entry.expect("build image entry").file_name())
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("list {}: {error}", directory.display()),
+        };
+        images.sort();
+        images
     }
 
     /// Stands at `workspace`'s supervisor socket until a lifecycle verb asks who serves it, which
@@ -460,6 +475,15 @@ fn missing_revision() -> ForkOptions {
         ..ForkOptions::default()
     }
 }
+
+/// A git-worktree mint: the shape whose refused clone stays pending, because its initializer
+/// reaches main's repository. A standalone mint's refused clone is reclaimed instead.
+fn worktree() -> ForkOptions {
+    ForkOptions {
+        git_worktree: true,
+        ..ForkOptions::default()
+    }
+}
 #[tokio::test]
 async fn cold_named_open_reads_selected_authority_and_preserves_full_diagnostics() {
     use cowshed_core::metadata::sidecar_path;
@@ -587,9 +611,14 @@ async fn a_create_interrupted_after_its_pending_clone_exists_still_resumes() {
     for workspace in ["resumed", "legacy"] {
         fixture.plant_workspace_branch(workspace);
         fixture
-            .mint(&runtime, workspace, ForkOptions::default())
+            .mint(&runtime, workspace, worktree())
             .await
-            .expect_err("the clone's initializer refuses the inherited workspace branch");
+            .expect_err("the clone's initializer refuses main's stale workspace branch");
+        // The cause is main's, not the clone's: once it is gone, the resume can finish.
+        git(
+            &fixture.checkout,
+            &["branch", "-D", &format!("cowshed/{workspace}")],
+        );
     }
     let record = fixture
         .intent("resumed")
@@ -660,9 +689,9 @@ async fn a_slot_bound_create_that_fails_after_binding_is_kept_and_resumed() {
 }
 
 /// The residue an unchecked `--ref` left: a create past its mutation fence whose pending
-/// clone exists, and whose every replay fails. Here the clone stopped on a link it cannot
-/// restore, and its record carries the missing revision as the incident's did. `rm` retires
-/// the clone instead of replaying it, and the name is free again. The same unreplayable
+/// clone exists, and whose every replay fails. Here the git-worktree clone stopped on a link
+/// it cannot restore, and its record carries the missing revision as the incident's did. `rm`
+/// retires the clone instead of replaying it, and the name is free again. The same unreplayable
 /// create with no clone behind it — stopped after its mutation mark, before the clone's
 /// first write — is the second workspace here: `rm` has only the intent to retire, and
 /// retires it. One adopted project proves both (08_testing.md, "Host limit").
@@ -672,9 +701,18 @@ async fn rm_retires_a_pending_clone_whose_create_can_never_be_replayed() {
     let runtime = fixture.adopt().await;
     fixture.commit_escaping_link();
     fixture
-        .mint(&runtime, "wedged", ForkOptions::default())
+        .mint(&runtime, "wedged", worktree())
         .await
         .expect_err("the clone's initializer refuses the escaping link");
+    assert!(
+        fixture
+            .layout()
+            .session_image(&name("wedged"))
+            .expect("pending image path")
+            .image()
+            .exists(),
+        "the git-worktree clone stays pending"
+    );
     runtime
         .shutdown()
         .await
@@ -742,25 +780,99 @@ async fn rm_retires_a_clone_intent_that_left_no_clone_and_can_never_be_replayed(
     next.shutdown().await.expect("stop the creating runtime");
 }
 
+/// A fork whose initializer refuses leaves nothing behind, and the next attempt clones the
+/// source as it is then. The incident: a stale worktree registration in main refused a fork,
+/// and every retry resumed the refused clone's own copy of it, refusing again long after main
+/// had dropped it, until the clone was removed by hand. Here a committed link leaving the tree
+/// refuses the first attempt; once main drops it, the retry must succeed.
+#[tokio::test]
+async fn a_refused_fork_leaves_nothing_and_its_retry_clones_the_repaired_source() {
+    let fixture = Fixture::new("refused-fork");
+    let runtime = fixture.adopt().await;
+    let volumes = fixture.build_images();
+    fixture.commit_escaping_link();
+    fixture
+        .mint(&runtime, "retried", ForkOptions::default())
+        .await
+        .expect_err("the clone's initializer refuses the escaping link");
+    assert!(
+        !fixture
+            .layout()
+            .session_image(&name("retried"))
+            .expect("refused image path")
+            .image()
+            .exists(),
+        "the refused clone is reclaimed"
+    );
+    assert_eq!(
+        fixture.intent("retried"),
+        None,
+        "the refusal withdraws its intent"
+    );
+    assert_eq!(
+        fixture.build_images(),
+        volumes,
+        "the refusal collects the build volume it forked"
+    );
+    assert_eq!(fixture.listed(&runtime).await, ["main"]);
+
+    fixture.remove_escaping_link();
+    fixture
+        .mint(&runtime, "retried", ForkOptions::default())
+        .await
+        .expect("the retry clones main as it is now");
+    assert_eq!(fixture.listed(&runtime).await, ["main", "retried"]);
+    assert!(completed(fixture.intent("retried")));
+    runtime.shutdown().await.expect("stop the creating runtime");
+}
+
+/// The incident's trigger: main's repository still registered a worktree whose directory was
+/// gone, and that registration's hook links named files inside it. A standalone fork drops the
+/// registrations it inherits, so it never judges those links, and the fork succeeds.
+#[tokio::test]
+async fn a_stale_worktree_registration_in_main_does_not_refuse_a_standalone_fork() {
+    let fixture = Fixture::new("stale-registration");
+    let runtime = fixture.adopt().await;
+    let hooks = fixture.checkout.join(".git/worktrees/gone/hooks");
+    fs::create_dir_all(&hooks).expect("stale registration hooks");
+    fs::write(
+        hooks.parent().expect("registration").join("gitdir"),
+        b"/nowhere/gone/.git\n",
+    )
+    .expect("stale registration gitdir");
+    std::os::unix::fs::symlink(
+        "../../../../../gone/tooling/git-hooks/commit-msg.sh",
+        hooks.join("commit-msg"),
+    )
+    .expect("stale registration hook link");
+    fixture
+        .mint(&runtime, "forked", ForkOptions::default())
+        .await
+        .expect("main's stale registration is not the fork's");
+    assert_eq!(fixture.listed(&runtime).await, ["forked", "main"]);
+    runtime.shutdown().await.expect("stop the creating runtime");
+}
+
 /// Named removal inspects the pending fork itself, even after its clone source is gone.
 #[tokio::test]
 async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
     let fixture = Fixture::new("rm-gone-source");
     let runtime = fixture.adopt().await;
-    let source = fixture
+    fixture
         .mint(&runtime, "source", ForkOptions::default())
         .await
         .expect("mint source");
-    // In the source, not main: a fork keeps none of its source's branches but its own, so only
-    // a branch the source itself carries reaches the fork's clone.
-    git(
-        Path::new(source["info"]["mount"].as_str().expect("source mount")),
-        &["branch", "cowshed/wedged"],
-    );
+    // A git-worktree fork's branch lives in main, so a stale one there refuses the fork's
+    // initializer and keeps its clone pending for the retry.
+    fixture.plant_workspace_branch("wedged");
     fixture
-        .fork(&runtime, "source", "wedged")
+        .call(
+            &runtime,
+            "coordinator.fork",
+            json!({ "repoId": fixture.repo, "source": "source", "workspace": "wedged", "options": worktree() }),
+        )
         .await
-        .expect_err("the inherited destination branch interrupts the fork");
+        .expect_err("main's stale destination branch interrupts the fork");
     let image = fixture
         .layout()
         .session_image(&name("wedged"))

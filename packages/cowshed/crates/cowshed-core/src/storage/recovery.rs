@@ -1032,9 +1032,26 @@ impl LifecycleIntentJournal {
         workspace: &WorkspaceName,
         superseded: Option<LifecycleIntentRecord>,
     ) -> bool {
+        self.entries
+            .get(workspace)
+            .is_some_and(|record| record.phase == LifecycleIntentPhase::Prepared)
+            && self.discard_reclaimed_clone_intent(workspace, superseded)
+    }
+
+    /// Withdraws a create or fork intent whose own verb reclaimed its fresh clone after the
+    /// initializer refused, putting back `superseded` as
+    /// [`Self::discard_prepared_clone_intent`] does. The intent crossed its mutation fence, but
+    /// the verb has just proved that nothing it made survives, so it is no more an operation
+    /// anybody may finish than a refusal before that fence: replaying it would create a
+    /// workspace whose caller was told it failed. The caller must have released the slot
+    /// binding first.
+    pub fn discard_reclaimed_clone_intent(
+        &mut self,
+        workspace: &WorkspaceName,
+        superseded: Option<LifecycleIntentRecord>,
+    ) -> bool {
         let discard = self.entries.get(workspace).is_some_and(|record| {
             record.completion.is_none()
-                && record.phase == LifecycleIntentPhase::Prepared
                 && matches!(
                     record.operation,
                     LifecycleIntent::Create { .. } | LifecycleIntent::Fork { .. }

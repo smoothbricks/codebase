@@ -1898,12 +1898,13 @@ impl GitRepository {
                 timed_async("fork", "head", self.discard_uncommitted()).await?;
             }
         }
-        // Before any branch is checked out, so only what the clone inherited is judged. On resume
-        // every link still holds either the source's bytes or the absolute target an earlier pass
-        // derived from those same bytes, so the source remains the producer to resolve against.
-        timed_async("fork", "links", self.restore_inherited_links(origin.source)).await?;
+        // Links are judged before any branch is checked out, so only what the clone inherited is
+        // judged. On resume every link still holds either the source's bytes or the absolute
+        // target an earlier pass derived from those same bytes, so the source remains the
+        // producer to resolve against.
         match repository {
             WorkspaceRepository::LinkedWorktree => {
+                timed_async("fork", "links", self.restore_inherited_links(origin.source)).await?;
                 // Registration may have replaced the cloned `.git` directory with a pointer
                 // before a kill. Resume that state machine before preparing workspace Git.
                 let source_head = Self::from_root(&self.store_root, origin.source)
@@ -1976,12 +1977,15 @@ impl GitRepository {
             ));
         }
         // Before any branch is judged: an inherited registration may hold `cowshed/<name>`.
+        // Before any link is judged too: a registration is main's, never this clone's, and the
+        // hook links a stale one carries name a worktree that may be long gone.
         timed_async(
             "fork",
             "worktrees",
             self.strip_inherited_worktree_registrations(),
         )
         .await?;
+        timed_async("fork", "links", self.restore_inherited_links(source)).await?;
 
         let retry = format!("remove or rename cowshed/{name}, then retry: cowshed fork {name}");
         let (branch, branch_ready) = self
