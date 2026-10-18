@@ -889,6 +889,16 @@ loud miss/refusal without running a target or writing provider outputs. A manage
 to `ensureBuilt` or a producer writer. `ensureBuilt` remains the normal build/stream operation with its existing
 hit/built/failed results and Nx's current source/cache/artifact verdict.
 
+**A refusal never replaces a receipt.** A run whose products the hooks cannot prove publishes a refusal instead: its
+detail, in its own `producer-refusal-<sha>.json` beside `producer-receipt-<sha>.json`. A refusal says only that this run
+could not prove something; it is no evidence about the products an earlier run proved, and overwriting that run's
+receipt would destroy the evidence a consumer can still check. So a receipt stays until a later receipt replaces it, and
+the consumer validates it on its own evidence as above: one that still validates is the hit, whatever a later run
+refused. A miss names the latest refusal in its detail, and a published receipt removes the refusal it answers. The
+hooks read git under the repository's own configuration (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`): Nx
+runs them in the workspace's Nx daemon, which runs inside the cowshed sandbox under a host client's `HOME`, and the
+sandbox denies the operator's global git configuration (specs/cowshed/04_sandbox.md, the runtime-input contract).
+
 A FILE-only source plan does not perform a redundant installation census for absent runtime recipes; the complete
 producer tool/module and output SHA evidence is still captured and independently revalidated on every product probe.
 
