@@ -2,7 +2,6 @@ import { expect, it } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { chmod, mkdir, readFile, symlink, unlink, writeFile } from 'node:fs/promises';
 import { delimiter, join } from 'node:path';
-import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
@@ -32,10 +31,13 @@ async function run(
   child.stderr?.setEncoding('utf8').on('data', (text: string) => {
     output += text;
   });
-  const { promise: ended, resolve, reject } = Promise.withResolvers<number | null>();
-  child.once('error', reject);
-  child.once('close', resolve);
-  const code = await guardEvent(ended, `${command} ${args.join(' ')} to close`, () => output);
+  // The test waits for what it needs, the command's close, however long a loaded host makes the real Nx take: a
+  // deadline here measured the host, not the daemon's behaviour (a 15 s guard failed SB land gates at load 3 and 80
+  // with `oracle-control` still running). A command that never closes is the runner's idle-hang backstop's to report.
+  const code = await new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
   expect(code, output).toBe(expectedCode);
   return output;
 }
