@@ -34,13 +34,7 @@ import {
   type ReceiptEvidence,
   receiptNode,
 } from './ensure-built-receipt.js';
-import {
-  graphInstallationIdentity,
-  movedNodes,
-  type NodeWitness,
-  nodesUnchanged,
-  workspaceSnapshot,
-} from './ensure-built-witness.js';
+import { graphInstallationIdentity, movedNodes, type NodeWitness, workspaceSnapshot } from './ensure-built-witness.js';
 import { graphInputContractIdentity } from './graph-input-contract.js';
 
 export interface ProducerReceiptsOptions {
@@ -298,9 +292,10 @@ function verifyTools(tools: readonly EnsureBuiltProducerTool[]): ReceiptEvidence
       if (!same(nodes, tool.nodes) || sha(nodes) !== tool.sha256)
         return { ok: false, detail: `Producer tool/module bytes changed: ${tool.name}` };
     }
-    return nodesUnchanged(observed)
+    const moved = movedNodes(observed, recordedTool(tools));
+    return moved === null
       ? { ok: true, value: observed }
-      : { ok: false, detail: 'Producer tool nodes changed during readonly validation' };
+      : { ok: false, detail: `Producer tool nodes changed during readonly validation: ${moved}` };
   } catch (error) {
     if (error instanceof Error) return { ok: false, detail: `Cannot validate producer tools: ${error.message}` };
     throw error;
@@ -620,8 +615,9 @@ function validatedReceipt(root: string, target: string): ReceiptEvidence<EnsureB
             ? 'Public product bytes differ from actual producer receipt'
             : census.reason.detail,
       };
-    if (!nodesUnchanged(tools.value))
-      return { ok: false, detail: 'Producer tool namespace changed during independent product validation' };
+    const moved = movedNodes(tools.value, recordedTool(receipt.producer.tools));
+    if (moved !== null)
+      return { ok: false, detail: `Producer tool namespace changed during independent product validation: ${moved}` };
     return { ok: true, value: receipt };
   } catch (error) {
     if (error instanceof Error)

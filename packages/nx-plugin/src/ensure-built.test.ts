@@ -1007,12 +1007,25 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
             { encoding: 'utf8' },
           );
           expect(sourceCommit.status, sourceCommit.stdout + sourceCommit.stderr).toBe(0);
+          // The receipt binds the producer's executables. A `git` this fixture owns lets the consumer case below move
+          // one tool node's ctime alone, as a same-mode chmod by another checkout's install moves a shared store file.
+          const realGit = Bun.which('git');
+          if (realGit === null) throw new Error('git is not on PATH');
+          const fixtureBin = join(root, 'bin');
+          await mkdir(fixtureBin);
+          const fixtureGit = join(fixtureBin, 'git');
+          await writeExecutable(fixtureGit, `#!/bin/sh\nexec ${JSON.stringify(realGit)} "$@"\n`);
           const published = await run(
             'node',
             nxEntry(workspace),
             workspace,
             ['run', 'app:build', '--outputStyle=static-failures-only'],
-            { NX_DAEMON: 'true', NX_WORKSPACE_ROOT_PATH: workspace, ...ownEnv },
+            {
+              NX_DAEMON: 'true',
+              NX_WORKSPACE_ROOT_PATH: workspace,
+              ...ownEnv,
+              PATH: `${fixtureBin}:${process.env.PATH ?? ''}`,
+            },
           );
           expect(published.code, published.stdout + published.stderr).toBe(0);
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
@@ -1111,6 +1124,62 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
           expect(environmentResults.sameTree).toEqual(environmentResults.first);
           expect(environmentResults.moduleInspections).toBe(0);
           expect(await readFile(builds, 'utf-8')).toBe('lib\n');
+
+          // Between its readonly read of the receipt's tools and its last check of them, the consumer censuses the
+          // public outputs through Nx's expandOutputs. Moving the fixture `git` there is a tool node moving under the
+          // readonly validation: a same-mode chmod moves its ctime alone and keeps the hit, a byte change refuses and
+          // names the node.
+          const toolMoveEntry = join(root, 'tool-node-move.ts');
+          await writeFile(
+            toolMoveEntry,
+            `
+import { chmodSync, statSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const git = ${JSON.stringify(fixtureGit)};
+const native = createRequire(process.cwd() + '/package.json')('nx/src/native');
+const expand = native.expandOutputs;
+let move = () => {};
+let moves = 0;
+native.expandOutputs = (...args) => {
+  move();
+  moves += 1;
+  return expand(...args);
+};
+const before = statSync(git, { bigint: true });
+move = () => chmodSync(git, 0o755);
+const chmodded = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
+const after = statSync(git, { bigint: true });
+const ctimeAlone = before.ino === after.ino && before.mode === after.mode && before.size === after.size && before.mtimeNs === after.mtimeNs && before.ctimeNs !== after.ctimeNs;
+const chmodMoves = moves;
+move = () => writeFileSync(git, '#!/bin/sh\\nexit 1\\n');
+const rewritten = await probeBuilt({ target: 'app:build', cwd: process.cwd() });
+await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ chmodded, ctimeAlone, chmodMoves, rewritten }) + "\\n", error => error ? reject(error) : resolve()));
+`,
+          );
+          const toolMove = await run('bun', toolMoveEntry, workspace, [], {
+            NX_DAEMON: 'true',
+            NX_USE_LOCAL: 'true',
+            NX_WORKSPACE_ROOT_PATH: workspace,
+            ...ownEnv,
+          });
+          expect(toolMove.code, toolMove.stdout + toolMove.stderr).toBe(0);
+          const toolMoves = typia.json.assertParse<{
+            chmodded: EnsureBuiltProbeResult;
+            ctimeAlone: boolean;
+            chmodMoves: number;
+            rewritten: EnsureBuiltProbeResult;
+          }>(toolMove.stdout);
+          expect(toolMoves.chmodMoves).toBeGreaterThan(0);
+          expect(toolMoves.ctimeAlone).toBe(true);
+          expect(toolMoves.chmodded, toolMove.stderr).toEqual(environmentResults.first);
+          expect(toolMoves.rewritten).toMatchObject({
+            disposition: 'failed',
+            reason: {
+              kind: 'provider-proof',
+              detail: `Producer tool namespace changed during independent product validation: ${fixtureGit}`,
+            },
+          });
         },
         'workspace',
       );
