@@ -1216,13 +1216,16 @@ rename — but leaves the `cowshed` on your `PATH` alone. A build inside a works
 than refused — the copy is precisely what makes the agent independent of a path that only exists once cowshed has
 mounted it. A debug build is refused, and so is a build that does not contain the installed one (or one that records no
 commit), before anything is installed; `start` waits for the install slot like `setup` and has no `--downgrade`, which
-is `setup`'s. A failed activation puts the previous build back. `stop` boots out the agent and removes the plist,
-leaving the installed cowshed — host state rather than agent state, and keeping it makes the next `start` a plist write
-instead of a fresh multi-megabyte copy. `stop --purge` deletes it too — the stable name, every stored copy and its build
-record, and the `cowshed` links on your `PATH` that name the stable name — for a host that is done with the gateway
-rather than pausing it; `cowshed setup --uninstall` removes the system storage daemon, both user agents, the installed
-cowshed with its `PATH` links and sccache's nix GC root at once. All of these are idempotent, and a `--purge` with
-nothing installed says so rather than failing.
+is `setup`'s. Activating the agent restarts a running gateway, which cuts off every land's gate in flight, so `start`
+and `setup` first wait — no deadline — until the gateway's CPU ledger shows no gate job holding or wanting tokens,
+naming the gate jobs they wait for on stderr (05 Gateway, "An install waits for the gates in flight"); a gateway that
+does not answer `cpu-budget` is not waited on. A failed activation puts the previous build back. `stop` boots out the
+agent and removes the plist, leaving the installed cowshed — host state rather than agent state, and keeping it makes
+the next `start` a plist write instead of a fresh multi-megabyte copy. `stop --purge` deletes it too — the stable name,
+every stored copy and its build record, and the `cowshed` links on your `PATH` that name the stable name — for a host
+that is done with the gateway rather than pausing it; `cowshed setup --uninstall` removes the system storage daemon,
+both user agents, the installed cowshed with its `PATH` links and sccache's nix GC root at once. All of these are
+idempotent, and a `--purge` with nothing installed says so rather than failing.
 
 `status` and `doctor` call the gateway healthy only when the daemon runs the same bytes as the CLI asking; a daemon
 running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
