@@ -1,4 +1,4 @@
-import { expect, it } from 'bun:test';
+import { afterAll, expect, it } from 'bun:test';
 import { execFile, execFileSync } from 'node:child_process';
 import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -19,6 +19,7 @@ import {
   withEnvironment,
 } from './__tests__/counted-cargo.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
+import { testFileInstallation } from './__tests__/owned-installation.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
 import { CARGO_CLOSURE_INPUT, indexedCargoManifests } from './cargo-closure-input.js';
 import { hashCargoPathInputs } from './cargo-source-hash.js';
@@ -27,6 +28,10 @@ import { createNodesV2 } from './index.js';
 const repositoryRoot = join(import.meta.dir, '../../..');
 
 useFixtureCargoHome();
+
+/** The Nx installation this file's fixtures share; none may write into it. */
+const installation = testFileInstallation('cargo-closure-installation-');
+afterAll(() => installation.retire());
 
 /**
  * An Nx workspace that is also the Cargo workspace. `app` reaches `leaf`
@@ -85,7 +90,7 @@ async function closureFixture(
     await writeFile(join(root, path), text);
   }
   execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
-  await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+  await symlink(await installation.nodeModules(), join(workspace, 'node_modules'), 'dir');
   execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', join(workspace, 'Cargo.toml')], {
     stdio: 'pipe',
   });

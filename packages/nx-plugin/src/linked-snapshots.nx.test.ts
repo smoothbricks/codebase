@@ -3,19 +3,18 @@
 // against a provider workspace whose nx.json enables this plugin's producer receipts. No receipt is injected: the
 // production record, task hash, HEAD and every output byte come from the provider's own Nx run, and a provider no
 // production vouches for is refused unwritten.
-import { describe, expect, it } from 'bun:test';
+import { afterAll, describe, expect, it } from 'bun:test';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import typia from 'typia';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { testFileInstallation } from './__tests__/owned-installation.js';
 import { managedAssetsRoot } from './managed-assets.js';
 
-const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const repoRoot = dirname(dirname(packageRoot));
-const nxEntry = join(repoRoot, 'node_modules', '.bin', 'nx');
+/** The Nx and the plugin product the provider and the consumer link, one copy this file owns; none may write into it. */
+const installation = testFileInstallation('linked-snapshot-installation-');
 const SNAPSHOTS = join(managedAssetsRoot, 'raw/tooling/direnv/linked-snapshots.ts');
 const DECLARATION = { targets: ['linked-api:build'], artifactModules: [] };
 
@@ -79,8 +78,7 @@ async function git(workspace: string, ...args: string[]): Promise<string> {
 async function writeProvider(workspace: string): Promise<string> {
   await git(workspace, 'init', '--quiet');
   await writeFile(join(workspace, '.gitignore'), '.nx\nnode_modules\npackages/*/dist\n');
-  // The repository's own node_modules, so the fixture resolves the Nx this package is written against.
-  await symlink(join(repoRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+  await symlink(await installation.nodeModules(), join(workspace, 'node_modules'), 'dir');
   await writeFile(
     join(workspace, 'nx.json'),
     JSON.stringify({
@@ -149,6 +147,8 @@ async function writeProvider(workspace: string): Promise<string> {
 }
 
 describe('linked snapshots vouched for by the provider’s real Nx', () => {
+  afterAll(() => installation.retire());
+
   it('captures only what a real Nx production published, once per commit, and refuses stale output without writing it', async () => {
     const consumer = await mkdtemp(join(tmpdir(), 'linked-snapshot-consumer-'));
     try {
@@ -158,17 +158,22 @@ describe('linked snapshots vouched for by the provider’s real Nx', () => {
         const build = async () => {
           const built = await execute(
             'node',
-            [nxEntry, 'run', 'linked-api:build', '--outputStyle=static'],
+            [join(workspace, 'node_modules', '.bin', 'nx'), 'run', 'linked-api:build', '--outputStyle=static'],
             workspace,
             daemonless,
           );
           expect(built.status, built.stdout + built.stderr).toBe(0);
         };
 
-        // The consumer installs this package's built plugin product, as a workspace installs @smoothbricks/nx-plugin.
+        // The consumer installs this package's built plugin product, as a workspace installs @smoothbricks/nx-plugin:
+        // the copy in the file's installation, whose dependencies resolve inside that copy.
         await mkdir(join(consumer, 'node_modules/@smoothbricks'), { recursive: true });
         await writeFile(join(consumer, 'package.json'), JSON.stringify({ name: 'consumer', private: true }));
-        await symlink(packageRoot, join(consumer, 'node_modules/@smoothbricks/nx-plugin'), 'dir');
+        await symlink(
+          join(await installation.nodeModules(), '@smoothbricks/nx-plugin'),
+          join(consumer, 'node_modules/@smoothbricks/nx-plugin'),
+          'dir',
+        );
         const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
         const capture = async (): Promise<Captured> => {
           const run = await execute(

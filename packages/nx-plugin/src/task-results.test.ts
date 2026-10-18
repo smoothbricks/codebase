@@ -1,8 +1,8 @@
-import { expect, it } from 'bun:test';
+import { afterAll, expect, it } from 'bun:test';
 import { mkdir, readdir, readFile, realpath, stat, symlink, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
+import { testFileInstallation } from './__tests__/owned-installation.js';
 
 /**
  * The plugin's `preTasksExecution`/`postTasksExecution` hooks, run by a real Nx subprocess in a
@@ -15,18 +15,20 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 const RECEIPT_ENV = 'COWSHED_NX_TASK_RECEIPT_ID';
 const RECEIPT = '0123456789abcdef0123456789abcdef';
 const CHANGED_RECEIPT = 'fedcba9876543210fedcba9876543210';
-const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const repoRoot = dirname(dirname(packageRoot));
-const nxEntry = join(repoRoot, 'node_modules', '.bin', 'nx');
+/** The Nx CLI of a fixture workspace's own installation. */
+const nxEntry = (workspace: string) => join(workspace, 'node_modules', '.bin', 'nx');
 const HINTS = join('.nx', 'cache', '.cowshed-task-results');
+
+/** The Nx and the plugin under test, one copy this file's fixtures share; none may write into it. */
+const installation = testFileInstallation('task-results-installation-');
+afterAll(() => installation.retire());
 
 /** A fixture workspace: `app:build` caches its copy of `source.txt`; `app:fail` always exits 3. */
 async function writeWorkspace(workspace: string): Promise<void> {
   await mkdir(join(workspace, 'app'), { recursive: true });
   const git = Bun.spawnSync(['git', 'init', '--quiet', workspace]);
   expect(git.exitCode, git.stderr.toString()).toBe(0);
-  // The repository's own node_modules: the Nx and the plugin under test.
-  await symlink(join(repoRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+  await symlink(await installation.nodeModules(), join(workspace, 'node_modules'), 'dir');
   await writeFile(
     join(workspace, 'nx.json'),
     JSON.stringify({ cacheDirectory: '.nx/cache', plugins: ['@smoothbricks/nx-plugin'] }),
@@ -53,7 +55,7 @@ async function writeWorkspace(workspace: string): Promise<void> {
 
 /** Runs one target with `nx run` under `env`, returning its exit code, output and argv. */
 async function nx(workspace: string, env: Record<string, string>, target: string) {
-  const argv = [process.execPath, nxEntry, 'run', target, '--outputStyle=static'];
+  const argv = [process.execPath, nxEntry(workspace), 'run', target, '--outputStyle=static'];
   const child = Bun.spawn(argv, { cwd: workspace, env, stdout: 'pipe', stderr: 'pipe' });
   const [exitCode, stdout, stderr] = await Promise.all([
     child.exited,
@@ -112,7 +114,7 @@ it('records a task hint only under a controller receipt, and never on an ordinar
         version: 1,
         requestId: RECEIPT,
         workspaceRoot: workspace,
-        run: { argv: [process.execPath, await realpath(nxEntry), ...hit.argv.slice(2)] },
+        run: { argv: [process.execPath, await realpath(nxEntry(workspace)), ...hit.argv.slice(2)] },
         tasks: [{ task: { id: 'app:build', hash: expect.stringMatching(/^\d+$/) }, status: 'local-cache', code: 0 }],
       });
 
@@ -129,7 +131,7 @@ it('records a task hint only under a controller receipt, and never on an ordinar
       expect(await readHint(join(hints, CHANGED_RECEIPT))).toMatchObject({
         version: 1,
         requestId: CHANGED_RECEIPT,
-        run: { argv: [process.execPath, await realpath(nxEntry), ...changed.argv.slice(2)] },
+        run: { argv: [process.execPath, await realpath(nxEntry(workspace)), ...changed.argv.slice(2)] },
         tasks: [{ task: { id: 'app:build', hash: expect.stringMatching(/^\d+$/) }, status: 'success', code: 0 }],
       });
     },
@@ -179,7 +181,7 @@ it('records hints through a daemon-backed Nx only under a checked receipt', asyn
         version: 1,
         requestId: RECEIPT,
         workspaceRoot: workspace,
-        run: { argv: [checkedA.argv[0] ?? '', await realpath(nxEntry), ...checkedA.argv.slice(2)] },
+        run: { argv: [checkedA.argv[0] ?? '', await realpath(nxEntry(workspace)), ...checkedA.argv.slice(2)] },
         tasks: [
           {
             task: { id: 'app:build', hash: expect.stringMatching(/^\d+$/) },
@@ -211,7 +213,7 @@ it('records hints through a daemon-backed Nx only under a checked receipt', asyn
         version: 1,
         requestId: CHANGED_RECEIPT,
         workspaceRoot: workspace,
-        run: { argv: [checkedB.argv[0] ?? '', await realpath(nxEntry), ...checkedB.argv.slice(2)] },
+        run: { argv: [checkedB.argv[0] ?? '', await realpath(nxEntry(workspace)), ...checkedB.argv.slice(2)] },
         tasks: [
           {
             task: { id: 'app:build', hash: expect.stringMatching(/^\d+$/) },
