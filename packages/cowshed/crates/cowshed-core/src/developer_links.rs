@@ -182,6 +182,7 @@ impl DeveloperLinks {
 
     pub fn capture(root: &Path, mode: CaptureMode, stores: PackageStores) -> Result<Self> {
         let root = fs::canonicalize(root).map_err(|error| link_error(root, error))?;
+        let volume = build_volume(&root)?;
         let mut snapshot = Self {
             links: Vec::new(),
             stores,
@@ -204,10 +205,10 @@ impl DeveloperLinks {
                         fs::read_dir(&scope).map_err(|error| link_error(&scope, error))?
                     {
                         let package = package.map_err(|error| link_error(&scope, error))?;
-                        snapshot.capture_entry(&root, package, mode)?;
+                        snapshot.capture_entry(&root, volume.as_deref(), package, mode)?;
                     }
                 } else if kind.is_symlink() {
-                    snapshot.capture_entry(&root, entry, mode)?;
+                    snapshot.capture_entry(&root, volume.as_deref(), entry, mode)?;
                 }
             }
             snapshot.capture_executables(&root, tree, mode)?;
@@ -219,7 +220,16 @@ impl DeveloperLinks {
         Ok(snapshot)
     }
 
-    fn capture_entry(&mut self, root: &Path, entry: fs::DirEntry, mode: CaptureMode) -> Result<()> {
+    /// `volume` is the physical build volume `root` reaches through its build link: the checkout's
+    /// own build state, declared state included, lives there (16_build_volumes.md), so a product
+    /// a contained link reaches through it is owned like one beneath `root`.
+    fn capture_entry(
+        &mut self,
+        root: &Path,
+        volume: Option<&Path>,
+        entry: fs::DirEntry,
+        mode: CaptureMode,
+    ) -> Result<()> {
         let at = entry.path();
         if !entry
             .file_type()
@@ -258,7 +268,9 @@ impl DeveloperLinks {
         if !metadata.is_dir() {
             return Ok(());
         }
-        if resolved.starts_with(root) && !canonical.starts_with(root) {
+        let owned = canonical.starts_with(root)
+            || volume.is_some_and(|volume| canonical.starts_with(volume));
+        if resolved.starts_with(root) && !owned {
             return Err(CowshedError::integrity(
                 format!(
                     "owned developer link {} escapes its checkout to {}",
@@ -271,7 +283,7 @@ impl DeveloperLinks {
         self.links.push(DeveloperLink {
             at: relative.to_owned(),
             target,
-            binding: if canonical.starts_with(root) {
+            binding: if owned {
                 Binding::Owned(canonical)
             } else {
                 Binding::Sibling(canonical)
@@ -390,6 +402,18 @@ fn link_error(path: &Path, error: impl std::fmt::Display) -> CowshedError {
         format!("cannot keep developer link at {}: {error}", path.display()),
         "repair the checkout's package links and directory permissions",
     )
+}
+
+/// The physical directory `root`'s build link names, or `None` for a checkout never linked or
+/// whose volume is not mounted here. A link into an absent volume resolves nowhere, so capture
+/// skips it as it skips any link to nothing.
+fn build_volume(root: &Path) -> Result<Option<PathBuf>> {
+    let link = root.join(crate::build_volume::BUILD_LINK);
+    match fs::canonicalize(&link) {
+        Ok(volume) => Ok(Some(volume)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(link_error(&link, error)),
+    }
 }
 
 /// The installer's own entries: a link into the checkout's own `.bun`/`.pnpm`, or into a shared
@@ -803,6 +827,56 @@ mod tests {
         assert_eq!(
             fs::read_link(root.join("node_modules/.bin/dev")).unwrap(),
             Path::new("../@scope/dev/bin/dev")
+        );
+    }
+
+    /// A linked-package snapshot lives in declared build state: `.cache/linked-snapshots` is a link
+    /// through the build link into the checkout's own volume. A package alias bound to it is the
+    /// checkout's own product, and a contained link into any other physical tree still escapes.
+    #[test]
+    fn owned_links_into_the_checkouts_own_build_volume_are_owned() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-build-volume");
+        let root = scratch.join("checkout");
+        let volume = scratch.join("volume");
+        let snapshots = "declared/.cache/linked-snapshots";
+        fs::create_dir_all(volume.join(snapshots).join("id/packages/lmao")).unwrap();
+        fs::create_dir_all(root.join(".cowshed")).unwrap();
+        fs::create_dir_all(root.join(".cache")).unwrap();
+        fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        for args in [&["init", "--quiet"][..], &["add", "package.json"]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status_locked()
+                    .unwrap()
+                    .success()
+            );
+        }
+        symlink(&volume, root.join(crate::build_volume::BUILD_LINK)).unwrap();
+        symlink(
+            "../.cowshed/build/declared/.cache/linked-snapshots",
+            root.join(".cache/linked-snapshots"),
+        )
+        .unwrap();
+        let alias = root.join("node_modules/@scope/lmao");
+        symlink("../../.cache/linked-snapshots/id/packages/lmao", &alias).unwrap();
+        for mode in [CaptureMode::Mint, CaptureMode::Job] {
+            let links = DeveloperLinks::capture(&root, mode, fixture_stores(&root)).unwrap();
+            assert_eq!(links.links.len(), 1);
+            assert!(matches!(links.links[0].binding, Binding::Owned(_)));
+            assert_eq!(links.sibling_targets().count(), 0);
+        }
+
+        let elsewhere = scratch.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("id/packages/lmao")).unwrap();
+        fs::remove_file(root.join(".cache/linked-snapshots")).unwrap();
+        symlink(&elsewhere, root.join(".cache/linked-snapshots")).unwrap();
+        let error = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap_err();
+        assert!(
+            error.to_string().contains("escapes its checkout"),
+            "{error}"
         );
     }
 
