@@ -145,6 +145,12 @@ impl JobProcessFold {
         }
     }
 
+    /// The job's clock started at `origin`, the instant its first owned process spawned: usage
+    /// windows open on it from then on ([`ProcessUsageFold::clock`]).
+    pub fn clock(&mut self, origin: Instant) -> Result<(), JobProcessFoldError> {
+        Ok(self.readings.usage.clock(origin)?)
+    }
+
     /// Fold `observation` and append its process event and first coverage gap, if any. A tick
     /// appends a heartbeat for each live process due one. A refused observation appends nothing.
     pub fn apply(
@@ -412,8 +418,10 @@ mod tests {
     impl Run {
         fn new() -> Self {
             let start = Instant::now();
+            let mut fold = JobProcessFold::new(job(), start);
+            fold.clock(start).expect("the job's clock starts once");
             Self {
-                fold: JobProcessFold::new(job(), start),
+                fold,
                 start,
                 events: Vec::new(),
             }

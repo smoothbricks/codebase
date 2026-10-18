@@ -560,8 +560,7 @@ impl From<ChargedMemoryBytes> for u64 {
     }
 }
 
-/// Elapsed wall time in microseconds, on a monotonic clock whose origin each field names: a job
-/// sample's since its first owned process spawned, a process window's since its first usage read.
+/// Elapsed wall time since the job's first owned process spawned, in microseconds.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
 #[cfg_attr(

@@ -382,6 +382,12 @@ impl<P: ProcessReads> KqueueObserver<P> {
         self.observe(ProcessObservation::Lost(reason))
     }
 
+    /// The job's clock started at `origin`, the instant its first owned process spawned.
+    pub fn clock(&mut self, origin: Instant) -> Result<(), ObserveError> {
+        self.fold.clock(origin)?;
+        Ok(())
+    }
+
     pub fn watching(&self) -> bool {
         !self.registered.is_empty()
     }
