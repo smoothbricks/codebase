@@ -89,9 +89,31 @@ async function writeProvider(workspace: string): Promise<string> {
       plugins: [{ plugin: '@smoothbricks/nx-plugin', options: { producerReceipts: { targets: DECLARATION.targets } } }],
     }),
   );
+  // A lockfile package no task's project can resolve, as a Bun isolated install leaves most of them: the build names no
+  // externalDependencies, so Nx keys it on AllExternalDependencies, which this package is part of. The receipt binds
+  // that set by Nx's lockfile hash and must not try to resolve it from the task's project.
   await writeFile(
     join(workspace, 'package.json'),
-    JSON.stringify({ name: 'provider', private: true, workspaces: ['packages/*'] }),
+    JSON.stringify({
+      name: 'provider',
+      private: true,
+      workspaces: ['packages/*'],
+      devDependencies: { '@fixture/elsewhere': '1.0.0' },
+    }),
+  );
+  await writeFile(
+    join(workspace, 'bun.lock'),
+    JSON.stringify({
+      lockfileVersion: 1,
+      workspaces: {
+        '': { name: 'provider', devDependencies: { '@fixture/elsewhere': '1.0.0' } },
+        'packages/api': { name: 'linked-api', version: '1.0.0' },
+      },
+      packages: {
+        '@fixture/elsewhere': ['@fixture/elsewhere@1.0.0', '', {}, `sha512-${'A'.repeat(86)}==`],
+        'linked-api': ['linked-api@workspace:packages/api'],
+      },
+    }),
   );
   const api = join(workspace, 'packages/api');
   await mkdir(join(api, 'src'), { recursive: true });
