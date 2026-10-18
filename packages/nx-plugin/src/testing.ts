@@ -203,6 +203,65 @@ export async function pidsWorkingIn(root: string): Promise<number[]> {
 }
 
 /**
+ * Every process of this user started with `TMPDIR` set to `root` or beneath it. Such a process
+ * writes there whatever its working directory: a ttsc plugin build copies its Go sources into
+ * `$TMPDIR` from a process working in its project, and Node and Bun write their compile cache
+ * there on the way out. The environment is the one the process was started with, which is the
+ * one its children inherit unless it changed it for them.
+ */
+export async function pidsWithTempIn(root: string): Promise<number[]> {
+  // The value as it follows `TMPDIR=`: `root` itself, with or without its trailing slash, or below it.
+  const names = (value: string) => value.startsWith(root) && ['', '/', ' '].includes(value.charAt(root.length));
+  switch (process.platform) {
+    case 'linux': {
+      const found: number[] = [];
+      for (const pid of (await readdir('/proc')).filter((name) => /^\d+$/.test(name))) {
+        const environ = await readFile(`/proc/${pid}/environ`, 'utf8').catch((error: unknown) => {
+          // Another user's process, or one that exited since the listing.
+          if (errorCode(error) === 'EACCES' || errorCode(error) === 'ENOENT' || errorCode(error) === 'ESRCH') {
+            return null;
+          }
+          throw error;
+        });
+        const entry = environ?.split('\0').find((variable) => variable.startsWith('TMPDIR='));
+        if (entry !== undefined && names(entry.slice('TMPDIR='.length))) {
+          found.push(Number(pid));
+        }
+      }
+      return found;
+    }
+    case 'darwin': {
+      // `ps -E` follows each command line with the environment it was started with, as words
+      // separated by spaces, and only for this user's processes. A word `TMPDIR=<root>` is matched
+      // with what follows it in that word, so a root containing a space is still found whole. An
+      // argument spelled `TMPDIR=<root>` names the same directory and counts too: an `env` that
+      // sets it is about to run something there. `/bin/ps` by path: a procps `ps` has no `-E`.
+      const { stdout } = await run('/bin/ps', ['-E', '-ww', '-U', String(userInfo().uid), '-o', 'pid=,command='], {
+        maxBuffer: 256 * 1024 * 1024,
+      });
+      const token = ` TMPDIR=${root}`;
+      const found: number[] = [];
+      for (const line of stdout.split('\n')) {
+        const row = /^\s*(\d+) (.*)$/.exec(line);
+        if (row === null) {
+          continue;
+        }
+        const words = ` ${row[2]}`;
+        for (let at = words.indexOf(token); at !== -1; at = words.indexOf(token, at + 1)) {
+          if (names(words.slice(at + ' TMPDIR='.length))) {
+            found.push(Number(row[1]));
+            break;
+          }
+        }
+      }
+      return found;
+    }
+    default:
+      throw new Error(`No TMPDIR scan for ${process.platform}`);
+  }
+}
+
+/**
  * The Nx daemon `workspace` runs, the daemon first, then every process it
  * started. Empty when the workspace records no daemon or the recorded one is
  * gone. The record is `d/server-process.json` under the workspace's own

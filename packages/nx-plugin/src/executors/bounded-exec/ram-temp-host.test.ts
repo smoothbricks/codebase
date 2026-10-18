@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'bun:test';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import {
   chmodSync,
   existsSync,
@@ -14,10 +16,11 @@ import {
 } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import type { OpContextBinding } from '@smoothbricks/lmao';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
-import { pidsWorkingIn, processTable, terminate } from '../../testing.js';
+import { processTable, terminate } from '../../testing.js';
 import {
   type CommandOutput,
   createHostCommands,
@@ -25,6 +28,7 @@ import {
   leaseProcessesOn,
   mountsBelow,
   operationDisk,
+  pidsInLease,
   type RamDisk,
   type RamTempError,
   type RamTempPaths,
@@ -121,7 +125,7 @@ async function nativeRamVolume(): Promise<void> {
     async workingIn(directory) {
       const startedAt = Date.now();
       const starting = JSON.stringify({
-        phase: 'cwd-census-start',
+        phase: 'lease-census-start',
         directory,
         pid: process.pid,
         wallAtMs: startedAt,
@@ -130,10 +134,10 @@ async function nativeRamVolume(): Promise<void> {
       trace.log.info(starting);
       process.stderr.write(`${starting}\n`);
       try {
-        const pids = await pidsWorkingIn(directory);
+        const pids = await pidsInLease(directory);
         const endedAt = Date.now();
         const finished = JSON.stringify({
-          phase: 'cwd-census-end',
+          phase: 'lease-census-end',
           directory,
           pid: process.pid,
           wallAtMs: endedAt,
@@ -149,7 +153,7 @@ async function nativeRamVolume(): Promise<void> {
         const details = typeof error === 'object' && error !== null ? error : {};
         const failed = JSON.stringify(
           {
-            phase: 'cwd-census-error',
+            phase: 'lease-census-error',
             directory,
             pid: process.pid,
             wallAtMs: endedAt,
@@ -364,17 +368,45 @@ async function nativeRamVolume(): Promise<void> {
     expect(statSync(join(leaseB.directory, 'tree')).mode & 0o777).toBe(0o555);
 
     // Once its owner has detached the image, the next task reclaims the lease, and its release,
-    // the last, detaches the volume.
+    // the last, detaches the volume. The dead task left a writer behind, as a test's ttsc plugin
+    // build is left: working elsewhere, writing into the lease through its TMPDIR, with a child.
+    // The pid the lease is named after is dead; the writer is stopped before the lease goes, so
+    // its removal never meets a file made after the lease was judged dead. A second dead lease,
+    // that nothing works in, is reclaimed beside it.
     attachedBelow.image = null;
-    const fourth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
-    const d = await fourth.acquire();
-    if (!d.ok || d.value.kind !== 'leased') {
-      throw new Error(`fourth lease failed: ${JSON.stringify(d)}`);
+    const writer = spawn('sh', ['-c', 'sleep 600 & echo $!; i=0; while :; do i=$((i+1)); : > "$TMPDIR/w$i"; done'], {
+      cwd: parent,
+      env: { ...process.env, TMPDIR: leaseB.directory },
+      detached: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const writerExited = once(writer, 'close');
+    const writerChild = Number(String((await once(writer.stdout, 'data'))[0]).trim());
+    const quiet = join(paths.mountpoint, '303-quiet1');
+    mkdirSync(quiet);
+    writeFileSync(join(quiet, 'left'), 'by a task nothing of which still runs');
+    try {
+      while (!existsSync(join(leaseB.directory, 'w1'))) {
+        await sleep(5);
+      }
+      const fourth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
+      const d = await fourth.acquire();
+      if (!d.ok || d.value.kind !== 'leased') {
+        throw new Error(`fourth lease failed: ${JSON.stringify(d)}`);
+      }
+      expect(d.value.held).toEqual([]);
+      expect(d.value.reaped.map((entry) => Number(entry.split(' ')[0])).sort((a, b) => a - b)).toEqual(
+        [writer.pid ?? 0, writerChild].sort((a, b) => a - b),
+      );
+      expect(existsSync(leaseB.directory)).toBe(false);
+      expect(existsSync(quiet)).toBe(false);
+      expectUntouched(outside);
+      expect(await fourth.release(d.value.lease)).toEqual({ ok: true, value: undefined });
+    } finally {
+      terminate(writer.pid ?? 0, 'SIGKILL');
+      terminate(writerChild, 'SIGKILL');
+      await writerExited;
     }
-    expect(d.value.held).toEqual([]);
-    expect(existsSync(leaseB.directory)).toBe(false);
-    expectUntouched(outside);
-    expect(await fourth.release(d.value.lease)).toEqual({ ok: true, value: undefined });
     expect(existsSync(paths.mountpoint)).toBe(false);
     expect(await attachedDisks(paths, capacity)).toEqual([]);
   } finally {

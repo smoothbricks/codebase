@@ -1217,9 +1217,13 @@ detached when the last live lease ends, since its pages return only on detach. I
 spends none of the AppleDiskImages2 attach budget cowshed counts (`specs/cowshed/01a_apfs.md`, "How the APFS host
 degrades"). A lease whose task died is reclaimed by the next task, unless an image is still attached from a file below
 it or a mount sits below it: those belong to whoever attached them, so the lease and the volume are kept and every new
-task names them. A target's own `env.TMPDIR` wins over the lease. Inside a cowshed sandbox, which cannot write the lock
-in `/private/tmp`, the task keeps its inherited `TMPDIR` and says so once. A failed task that left the volume nearly
-full names the volume.
+task names them. The task's pid dying does not end what its command started, so before a lease is removed every process
+working in it is stopped, with everything it started: a process counts when its working directory or the `TMPDIR` it was
+started with lies in the lease. Most leftovers write there only through `TMPDIR` (a ttsc plugin build copying its Go
+sources, a Bun or Node compile cache written at exit), and a working-directory census alone let them write into a lease
+while it was removed, failing the next task's lease with `ENOTEMPTY`. A target's own `env.TMPDIR` wins over the lease.
+Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task keeps its inherited `TMPDIR` and says
+so once. A failed task that left the volume nearly full names the volume.
 
 Outside macOS, the executor never provisions an APFS RAM disk: it keeps the inherited `TMPDIR`, or uses the target's
 `env.TMPDIR` override, without reclaiming either directory. The host temp-directory proof runs the real default executor
@@ -1262,8 +1266,10 @@ instead of changing an attached volume. Held leases undergo no permission change
 
 The real RAM-volume regression walks one volume's lifecycle in a single test: unmarked debris and a live-lease refusal,
 recovery over the debris, concurrent leases, failed-acquire lease/claim rollback, read-only cleanup, a held dead lease,
-owner detach and reclaim, and the final detach. External symlink targets and held directory modes stay unchanged,
-without duplicate provision and teardown; its 60 s case bound is unchanged and its target has the progress bound.
+owner detach and reclaim of that lease while a writer the dead task left still writes into it through `TMPDIR` (stopped,
+then removed) beside a dead lease nothing works in, and the final detach. External symlink targets and held directory
+modes stay unchanged, without duplicate provision and teardown; its 60 s case bound is unchanged and its target has the
+progress bound.
 
 The host target names both owned files with `./` paths: Bun otherwise interprets a bare path as a filter over recursive
 test discovery. This changes no selected case or timeout. The failed-provisioning regression keeps its exact injected
