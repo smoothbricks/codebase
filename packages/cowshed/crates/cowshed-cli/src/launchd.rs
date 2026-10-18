@@ -38,32 +38,79 @@ pub const LAUNCH_AGENTS_DIRECTORY: &str = "LaunchAgents";
 /// gateway's so the daemon's other children resolve as they always did.
 pub const LAUNCHD_DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
-/// The directory of the `bun` the gateway runs its Nx cache server with: where the first `bun` on
-/// the invoking shell's `PATH` really lives, links resolved. A devenv shell's
-/// `.devenv/profile/bin/bun` becomes its `/nix/store/…-bun-…/bin`, which launchd can read at boot
-/// without the checkout; a store path nix later collects fails each backend start by name until
-/// setup runs again. cowshed carries no interpreter of its own (tg#7504, tg#6789).
+/// The directory of the `bun` the gateway runs its Nx cache server with, named as a place nix or
+/// devenv keeps alive and re-points, never as a `/nix/store` path. A plist outlives the shell that
+/// wrote it, and nothing roots a store path for it: after a devenv update and a nix GC that path is
+/// gone and every backend start fails. So this is the first `PATH` entry holding `bun`, spelt as
+/// `PATH` spells it — a devenv `.devenv/profile/bin`, a nix profile's `bin` such as
+/// `/etc/profiles/per-user/<user>/bin`, or any plain directory — with one translation: a devenv
+/// shell puts its own profile on `PATH` as the immutable store path it evaluated
+/// (`DEVENV_PROFILE`), and that entry becomes the profile link devenv re-points on activation and
+/// roots with the shell (`$DEVENV_DOTFILE/profile`, see [`DevenvProfile`]). Any other store entry
+/// is refused by name. cowshed carries no interpreter of its own (tg#7504, tg#6789).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BunDirectory(PathBuf);
 
+/// Where nix keeps immutable paths. A store path is never a [`BunDirectory`].
+const NIX_STORE: &str = "/nix/store";
+
+/// The invoking shell's devenv profile: `store`, the immutable profile the shell evaluated
+/// (`DEVENV_PROFILE`), and `link`, `$DEVENV_DOTFILE/profile`, which devenv points at the profile it
+/// last activated and which the `.devenv/gc` root it registers keeps alive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DevenvProfile {
+    pub store: PathBuf,
+    pub link: PathBuf,
+}
+
+impl DevenvProfile {
+    /// The profile devenv's own variables name, when this process runs in a devenv shell.
+    pub fn of_environment() -> Option<Self> {
+        let store = std::env::var_os("DEVENV_PROFILE")?;
+        let dotfile = std::env::var_os("DEVENV_DOTFILE")?;
+        Some(Self {
+            store: store.into(),
+            link: PathBuf::from(dotfile).join("profile"),
+        })
+    }
+}
+
 impl BunDirectory {
-    /// A directory said to hold `bun`, held to the shape a plist may name: canonical and absolute.
-    /// Like [`StoreBackedProgram::new`], this states a path rather than probing it; [`Self::on_path`]
-    /// is the constructor that looks.
+    /// A directory said to hold `bun`, held to the shape a plist may name: absolute, in its
+    /// canonical lexical spelling, and outside `/nix/store`. Like [`StoreBackedProgram::new`],
+    /// this states a path rather than probing it; [`Self::on_path`] is the constructor that looks.
     pub fn new(directory: PathBuf) -> Result<Self, LaunchdError> {
         validate_canonical_absolute_path("bun-directory", &directory)?;
+        if directory.starts_with(NIX_STORE) {
+            return Err(LaunchdError::InvalidPath {
+                field: "bun-directory",
+                reason: "must not be a /nix/store path, which nothing roots once a plist names it",
+            });
+        }
         Ok(Self(directory))
     }
 
-    /// The canonical directory of the first `bun` on `path`, or why there is none to use.
-    pub fn on_path(path: &std::ffi::OsStr) -> Result<Self, String> {
+    /// The directory of the first `bun` on `path`, as [`BunDirectory`] states, or why there is
+    /// none to use. `devenv` is the invoking shell's profile, when it is a devenv shell.
+    pub fn on_path(path: &std::ffi::OsStr, devenv: Option<&DevenvProfile>) -> Result<Self, String> {
         let found = cowshed_gateway::bun_on_path(path)
             .ok_or_else(|| format!("no bun on PATH {}", Path::new(path).display()))?;
-        let bun = found
-            .canonicalize()
-            .map_err(|error| format!("resolve bun {}: {error}", found.display()))?;
-        let directory = bun.parent().unwrap_or(Path::new("/")).to_path_buf();
-        Self::new(directory).map_err(|error| format!("bun {}: {error}", bun.display()))
+        let entry = found.parent().unwrap_or(Path::new("/"));
+        let directory = match devenv {
+            Some(profile) if entry == profile.store.join("bin") => {
+                let linked = profile.link.join("bin");
+                cowshed_gateway::bun_on_path(linked.as_os_str()).ok_or_else(|| {
+                    format!(
+                        "bun {} is devenv's profile, but its link {} holds no bun",
+                        found.display(),
+                        linked.display()
+                    )
+                })?;
+                linked
+            }
+            _ => entry.to_path_buf(),
+        };
+        Self::new(directory).map_err(|error| format!("bun {}: {error}", found.display()))
     }
 
     pub fn path(&self) -> &Path {

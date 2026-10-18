@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_cli::launchd::{
     BunDirectory, COWSHED_BINARY_NAME, CommandStatus, ControlAction, ControlExecutionError,
-    ControlPlan, ExecutableDigest, ExecutableInstallState, ExistingPlist, FilesystemOperation,
-    GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
-    JOBSERVER_LAUNCHER_NAME, LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand,
-    LaunchctlOutput, LaunchdError, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus,
-    Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME,
-    SCCACHE_LABEL, STABLE_BINARY_MODE, ServiceLifecycle, StableLink, StoreBackedProgram,
-    plan_executable_install, plan_executable_remove, plan_install, plan_launcher_link, plan_remove,
-    replace_symlink,
+    ControlPlan, DevenvProfile, ExecutableDigest, ExecutableInstallState, ExistingPlist,
+    FilesystemOperation, GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState,
+    InstalledExecutable, JOBSERVER_LAUNCHER_NAME, LAUNCHCTL_EXECUTABLE, LaunchAgentSpec,
+    LaunchctlCommand, LaunchctlOutput, LaunchdError, LaunchdExecutor, LaunchdFilesystem,
+    LaunchdServiceStatus, Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE,
+    SCCACHE_BINARY_NAME, SCCACHE_LABEL, STABLE_BINARY_MODE, ServiceLifecycle, StableLink,
+    StoreBackedProgram, plan_executable_install, plan_executable_remove, plan_install,
+    plan_launcher_link, plan_remove, replace_symlink,
 };
 
 #[cfg(target_os = "macos")]
@@ -42,8 +42,9 @@ const SCCACHE_STORE_PATH: &str =
     "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed";
 const SCCACHE_PROGRAM: &str =
     "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed/bin/sccache";
-/// The bun a devenv shell's `PATH` resolves to, as the gateway agent's `PATH` names it.
-const BUN_DIRECTORY: &str = "/nix/store/0000000000000000000000000000000b-bun-1.4.2/bin";
+/// The bun a devenv shell's `PATH` provides, as the gateway agent's `PATH` names it: the profile
+/// link devenv re-points and roots, never the store path behind it.
+const BUN_DIRECTORY: &str = "/Users/cowshed-test/Dev/project/tooling/direnv/.devenv/profile/bin";
 
 fn cowshed_binary() -> HostStableExecutable {
     HostStableExecutable::new(Path::new(HOME), COWSHED_BINARY_NAME).unwrap()
@@ -117,7 +118,7 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
         "  <key>EnvironmentVariables</key>\n",
         "  <dict>\n",
         "    <key>PATH</key>\n",
-        "    <string>/nix/store/0000000000000000000000000000000b-bun-1.4.2/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n",
+        "    <string>/Users/cowshed-test/Dev/project/tooling/direnv/.devenv/profile/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n",
         "  </dict>\n",
         "  <key>SoftResourceLimits</key>\n",
         "  <dict>\n",
@@ -133,6 +134,95 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
         "</plist>\n",
     );
     assert_eq!(spec.plist_bytes(), expected.as_bytes());
+}
+
+/// A plist outlives the shell that wrote it and nothing roots a store path for it, so no gateway
+/// agent can name one: after a devenv update and a nix GC it would be gone.
+#[test]
+fn bun_directory_refuses_a_store_path() {
+    assert_eq!(
+        BunDirectory::new(PathBuf::from(
+            "/nix/store/0000000000000000000000000000000b-bun-1.4.2/bin"
+        )),
+        Err(LaunchdError::InvalidPath {
+            field: "bun-directory",
+            reason: "must not be a /nix/store path, which nothing roots once a plist names it",
+        })
+    );
+}
+
+/// An executable `bun` in `directory`, created with it.
+fn bun_in(directory: &Path) {
+    fs::create_dir_all(directory).unwrap();
+    let bun = directory.join("bun");
+    fs::write(&bun, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&bun, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The `PATH` entry is kept as `PATH` spells it: a profile link stays the link, so the agent
+/// follows the profile when nix or devenv re-points it, rather than pinning what it pointed at.
+#[test]
+fn bun_on_path_keeps_the_entry_a_profile_link_names() {
+    let root = scratch("bun-profile-link");
+    bun_in(&root.join("generation-1/bin"));
+    std::os::unix::fs::symlink(root.join("generation-1"), root.join("profile")).unwrap();
+    let entry = root.join("profile/bin");
+    let path = std::env::join_paths([root.join("empty"), entry.clone()]).unwrap();
+
+    let found = BunDirectory::on_path(&path, None).unwrap();
+
+    assert_eq!(found.path(), entry);
+}
+
+/// A devenv shell puts its profile on `PATH` as the immutable path it evaluated; the agent names
+/// the profile link devenv re-points and roots instead.
+#[test]
+fn bun_on_path_names_a_devenv_shells_profile_by_its_link() {
+    let root = scratch("bun-devenv-profile");
+    let store = root.join("devenv-profile");
+    bun_in(&store.join("bin"));
+    fs::create_dir_all(root.join(".devenv")).unwrap();
+    let link = root.join(".devenv/profile");
+    std::os::unix::fs::symlink(&store, &link).unwrap();
+    let devenv = DevenvProfile {
+        store: store.clone(),
+        link: link.clone(),
+    };
+
+    let found = BunDirectory::on_path(store.join("bin").as_os_str(), Some(&devenv)).unwrap();
+
+    assert_eq!(found.path(), link.join("bin"));
+}
+
+/// A devenv profile whose link holds no `bun` has no place to name, which is said, not guessed.
+#[test]
+fn bun_on_path_refuses_a_devenv_profile_whose_link_holds_no_bun() {
+    let root = scratch("bun-devenv-stale-link");
+    let store = root.join("devenv-profile");
+    bun_in(&store.join("bin"));
+    fs::create_dir_all(root.join("other/bin")).unwrap();
+    fs::create_dir_all(root.join(".devenv")).unwrap();
+    let link = root.join(".devenv/profile");
+    std::os::unix::fs::symlink(root.join("other"), &link).unwrap();
+    let devenv = DevenvProfile {
+        store: store.clone(),
+        link,
+    };
+
+    let refusal = BunDirectory::on_path(store.join("bin").as_os_str(), Some(&devenv)).unwrap_err();
+
+    assert!(refusal.contains("holds no bun"), "{refusal}");
+}
+
+/// No `bun` on `PATH` is a refusal naming the `PATH` searched; nothing stands in for it.
+#[test]
+fn bun_on_path_refuses_a_path_without_bun() {
+    let root = scratch("bun-absent");
+    fs::create_dir_all(root.join("bin")).unwrap();
+
+    let refusal = BunDirectory::on_path(root.join("bin").as_os_str(), None).unwrap_err();
+
+    assert!(refusal.starts_with("no bun on PATH "), "{refusal}");
 }
 
 #[test]

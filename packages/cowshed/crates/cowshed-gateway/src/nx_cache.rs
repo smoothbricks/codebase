@@ -116,7 +116,8 @@ pub(crate) fn client_reads(method: &http::Method, status: http::StatusCode) -> b
 ///
 /// The server is JavaScript (`@smoothbricks/nx-cache-server`'s `dist/server` bundle) run by the
 /// `bun` on `path`: cowshed carries no interpreter of its own (tg#7504). `cowshed setup` puts the
-/// directory of the `bun` it found on the gateway agent's `PATH`, a nix store path included.
+/// directory of the `bun` it found on the gateway agent's `PATH`, named as a profile nix or devenv
+/// keeps and never as a `/nix/store` path (`cowshed_cli::launchd::BunDirectory`).
 #[derive(Clone, Debug)]
 pub struct NxCacheServiceConfig {
     pub script: std::path::PathBuf,

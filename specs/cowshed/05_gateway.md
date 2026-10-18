@@ -120,11 +120,18 @@ into `bin` the same content-addressed way: for a distribution (`<package>/dist/b
 from the package and then each ancestor (an isolated Bun store, a hoisted install and a checkout's workspace link
 alike); for a build the slot already holds it is the slot's own `nx-cache-server`. A build with neither is refused by
 name before anything changes. The gateway agent's plist sets `PATH` to the directory of the first `bun` on the
-installing shell's `PATH`, links resolved, ahead of launchd's default `/usr/bin:/bin:/usr/sbin:/sbin`: a devenv shell's
-`.devenv/profile/bin/bun` becomes its `/nix/store/…-bun-…/bin`, readable at boot without the checkout. An install, start
-or refresh from a shell with no `bun` is refused with the setup instruction; nothing beside cowshed stands in. The
-daemon starts each project's backend as `<bun on its PATH> <bin/nx-cache-server> --exit-on-stdin-eof`; a store path nix
-has since collected fails that start by name until setup runs again.
+installing shell's `PATH`, ahead of launchd's default `/usr/bin:/bin:/usr/sbin:/sbin`, **named as a profile nix or
+devenv keeps, never as a `/nix/store` path** (tg#7504, tg#7551). A plist outlives the shell that wrote it and nothing
+roots a store path for it, so after a devenv update and a nix GC a recorded store path is gone and every backend start
+fails. The entry is kept as `PATH` spells it, links unresolved — a nix profile's `bin` such as
+`/etc/profiles/per-user/<user>/bin`, or a devenv `.devenv/profile/bin` — so the agent follows the profile when it is
+re-pointed. A devenv shell puts its own profile on `PATH` as the immutable store path it evaluated (`DEVENV_PROFILE`);
+that entry is recorded as `$DEVENV_DOTFILE/profile/bin`, the link devenv re-points on each activation and keeps alive
+through the `.devenv/gc` root it registers. Any other `/nix/store` entry is refused, as is a shell with no `bun`; both
+refusals name the setup step, and nothing beside cowshed stands in. Setup runs from main's devenv shell: a shed's
+profile link disappears with the shed. The daemon starts each project's backend as
+`<bun on its PATH> <bin/nx-cache-server> --exit-on-stdin-eof`; a recorded profile that no longer holds `bun` (a removed
+checkout, a main not yet mounted) fails that start by name, an outage until the next start finds it.
 
 **Content-addressed copies, one moving name.** A copy is written once: the build's bytes go into an exclusive temporary
 file in `bin`, are synced, and are renamed to the copy's name. A copy whose bytes and mode already match is never
