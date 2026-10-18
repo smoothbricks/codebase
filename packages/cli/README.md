@@ -598,11 +598,14 @@ entry's install, a CI runner's frozen-lockfile install and `smoo monorepo update
 directly in the root's or a workspace member's `node_modules` (scoped names included) whose target lies outside the
 repository. The install records these links first, then puts back every one except Nx. A link whose target no longer
 exists is removed with a warning, and that install puts the lockfile's version in its place. To unlink, remove the link:
-the next install puts the lockfile's version there. A missing external target, or a live link to Nx, also makes the
-install stamp stale: the next managed install replaces the dangling or Nx link, while every other live external link is
-preserved. An ordinary local setup invocation runs `bun install` unless the install stamp matches, the TypeScript API
-package resolves and no developer link is stale; a successful install records the stamp, so a later ordinary local setup
-invocation with current bindings runs no `bun install`.
+the next install puts the lockfile's version there. A missing external target, a live link to Nx, or a link into Bun's
+install cache (`node_modules/.bun/<entry>` under `globalStore`) that the installed tree reaches and whose cache entry is
+gone also makes the install stamp stale: the next managed install replaces the dangling or Nx link and relinks the store
+entry, while every other live external link is preserved. A dangling store entry nothing installed reaches is a
+superseded variant no install changes, so it never makes the stamp stale. An ordinary local setup invocation runs
+`bun install` unless the install stamp matches, the TypeScript API package resolves and no developer or store link is
+stale; a successful install records the stamp, so a later ordinary local setup invocation with current bindings runs no
+`bun install`.
 
 Only an observed missing target makes a link dangling; an unreadable checkout is not a deleted checkout. A developer
 link whose target this process may not read (EPERM in a cowshed sandbox that grants no read of it, EACCES under a

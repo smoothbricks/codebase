@@ -3277,6 +3277,54 @@ describe('explicit missing-payload repair', () => {
   });
 });
 
+describe("what shell entry relinks in Bun's store", () => {
+  it('reinstalls when a store link the installed tree reaches dangles, and never for one nothing reaches', async () => {
+    const registry = await publishedRegistry();
+    try {
+      await withManagedRepository(
+        {
+          dependencies: { '@acme/payload': '1.0.0' },
+          files: {
+            '.npmrc': '@acme:registry=' + registry.origin + '\n',
+            // The repository's own install declaration: node_modules/.bun/<entry> links into the private install
+            // cache setupRun names.
+            'bunfig.toml': '[install]\nlinker = "isolated"\nglobalStore = true\n',
+          },
+        },
+        async ({ root, cargoHome }) => {
+          expect(await finished(setupRun(root, cargoHome, []))).toEqual(HEALTHY);
+          const check = async () => (await finished(setupRun(root, cargoHome, ['--links', '--check']))).exitCode;
+          const store = join(root, 'node_modules', '.bun');
+          const entry = join(store, '@acme+payload@1.0.0');
+          const cached = readlinkSync(entry);
+          expect(cached.startsWith(join(root, '.bun-install-cache') + '/')).toBe(true);
+          expect(await check()).toBe(0);
+
+          // A superseded variant of the same package and version, its cache entry gone: nothing installed reaches
+          // it and no install changes it, so it is not out of date.
+          symlinkSync(`${cached}-superseded`, join(store, '@acme+payload@1.0.0+superseded'));
+          expect(await check()).toBe(0);
+
+          // The cache entry the installed tree reaches is gone: the install is out of date.
+          await rm(cached, { recursive: true });
+          expect(await check()).toBe(1);
+          const repaired = await finished(setupRun(root, cargoHome, ['--links']));
+          expect(repaired.exitCode, repaired.stderr).toBe(0);
+          expect(repaired.stderr).toContain(
+            `! ${entry} -> ${cached}: that Bun install-cache entry no longer exists; reinstalling`,
+          );
+          expect(
+            JSON.parse(readFileSync(join(root, 'node_modules', '@acme', 'payload', 'package.json'), 'utf8')),
+          ).toEqual(JSON.parse(PUBLISHED_PACKAGE));
+          expect(await check()).toBe(0);
+        },
+      );
+    } finally {
+      registry.close();
+    }
+  });
+});
+
 describe('the project root a shell entry owns', () => {
   /**
    * A fresh git checkout holding the full managed direnv directory, so the real script and its
