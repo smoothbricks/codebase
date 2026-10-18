@@ -604,8 +604,11 @@ preserved. An ordinary local setup invocation runs `bun install` unless the inst
 package resolves and no developer link is stale; a successful install records the stamp, so a later ordinary local setup
 invocation with current bindings runs no `bun install`.
 
-Only an observed missing target makes a link dangling. Permission or other metadata errors abort the install without
-removing captured links; an unreadable checkout is not a deleted checkout.
+Only an observed missing target makes a link dangling; an unreadable checkout is not a deleted checkout. A developer
+link whose target this process may not read (EPERM in a cowshed sandbox that grants no read of it, EACCES under a
+directory's mode) is kept as made, named on its own line, and left out of the install's admission, which cannot read
+what it names; it is never taken for a dangling link and never fails the entry. Any other metadata error aborts the
+install without removing captured links.
 
 Declared `smoo.developerLinks` directories resolve against each checkout's own root, never a root borrowed from a
 cowshed marker. In-repository aliases are relative and travel with that checkout. An explicit declaration naming a

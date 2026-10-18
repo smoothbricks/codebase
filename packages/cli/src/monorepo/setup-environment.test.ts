@@ -1116,6 +1116,44 @@ describe('what shell entry keeps linked', () => {
     });
   });
 
+  it.skipIf(process.getuid?.() === 0)(
+    'keeps a developer link whose target it may not read, says so, and installs around it',
+    async () => {
+      await withManagedRepository(WORKSPACE, async ({ root, enterShell: enter, count }) => {
+        expect(await enter()).toEqual(HEALTHY);
+        // A local build behind a directory this process may not search: its stat fails EACCES, as a cowshed sandbox
+        // that grants no read of it fails EPERM. The link is not wrong, only unreadable here.
+        const fence = join(dirname(root), 'fenced');
+        const local = join(fence, 'local-lib');
+        await mkdir(local, { recursive: true });
+        await writeFile(join(local, 'package.json'), JSON.stringify({ name: '@fixture/lib', version: '9.9.9' }));
+        await rm(join(root, LINKED));
+        symlinkSync(local, join(root, LINKED));
+        await chmod(fence, 0);
+        try {
+          const said = `! developer link ${LINKED} -> ${local}: its target cannot be read here (EACCES); kept as it is\n`;
+          const entered = await enter();
+          expect(entered.exitCode, entered.stderr).toBe(0);
+          expect(entered.stderr).toContain(said);
+          expect(count('install')).toBe(1);
+          expect((await enter({ links: true, check: true })).exitCode).toBe(0);
+
+          await touchManifest(root);
+          const installed = await enter();
+          expect(installed.exitCode, installed.stderr).toBe(0);
+          expect(installed.stderr).toContain(said);
+          expect(count('install')).toBe(2);
+          expect(readlinkSync(join(root, LINKED))).toBe(local);
+          // The install recorded its stamp: the next entry installs nothing.
+          expect((await enter()).exitCode).toBe(0);
+          expect(count('install')).toBe(2);
+        } finally {
+          await chmod(fence, 0o755);
+        }
+      });
+    },
+  );
+
   describe('as smoo.developerLinks declares them', () => {
     /** A local checkout of a package: a directory holding its manifest. */
     async function checkout(at: string, name: string): Promise<string> {
@@ -1687,7 +1725,7 @@ describe('what shell entry keeps linked', () => {
     });
 
     it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
-      'retains developer links when their target metadata is denied',
+      'retains developer links when their target metadata is denied, and installs around them',
       async () => {
         await withDeveloperLinks(async ({ root, texts }) => {
           const blocked = join(dirname(root), 'blocked-provider');
@@ -1697,11 +1735,11 @@ describe('what shell entry keeps linked', () => {
           const before = texts();
           await chmod(blocked, 0);
           try {
-            await expect(
-              keepDeveloperLinks(root, async () => {
-                await Bun.$`bun install --no-summary`.cwd(root).quiet();
-              }),
-            ).rejects.toHaveProperty('code', 'EACCES');
+            // An unreadable checkout is not a deleted one, nor a reason to fail: the install runs and the link is put
+            // back as made.
+            await keepDeveloperLinks(root, async () => {
+              await Bun.$`bun install --no-summary`.cwd(root).quiet();
+            });
             expect(texts()).toEqual(before);
           } finally {
             await chmod(blocked, 0o700);

@@ -33,6 +33,7 @@ import {
   planDeclaredLinks,
   reportDeveloperLinks,
   reportUnavailableDeclaredLinks,
+  unreadableDeveloperLinks,
 } from './developer-links.ts';
 import {
   type DeferredSecret,
@@ -914,6 +915,9 @@ function verifyInstalledBunLinks(root: string): BunInstallIntegrityError | undef
     operation = 'resolve installed path';
     if (symbolicLink) {
       const target = readlinkSync(candidate);
+      // Developer links whose target this process may not read (developer-links.ts): the install
+      // did not make them and nothing here can read what they name, so they are not admitted here.
+      let unreadable: ReadonlySet<string> = new Set();
       expectedTarget = path.resolve(path.dirname(candidate), target);
       expectedTarget = path.resolve(realpathSync(path.dirname(candidate)), target);
     }
@@ -927,6 +931,7 @@ function verifyInstalledBunLinks(root: string): BunInstallIntegrityError | undef
   const aliases = (tree: string, symbolicLink = false): void => {
     select(tree, symbolicLink);
     operation = 'list installed package aliases';
+    if (unreadable.has(candidate)) return;
     for (const entry of readdirSync(tree, { withFileTypes: true })) {
       if (entry.name.startsWith('.')) continue;
       const candidate = path.join(tree, entry.name);
@@ -959,6 +964,7 @@ function verifyInstalledBunLinks(root: string): BunInstallIntegrityError | undef
     operation = 'inspect isolated store';
     const entries = readdirSync(store, { withFileTypes: true }).filter((entry) => !entry.name.startsWith('.'));
     const identityCounts = new Map<string, number>();
+    unreadable = new Set(unreadableDeveloperLinks(root));
     for (const entry of entries) {
       if (entry.name === 'node_modules' || !(entry.isDirectory() || entry.isSymbolicLink())) continue;
       const identity = identityOf(entry.name) ?? entry.name;
