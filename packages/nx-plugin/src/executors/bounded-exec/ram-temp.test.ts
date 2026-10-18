@@ -187,7 +187,7 @@ describe('RAM temp volume on this host', () => {
     const spawned = result.stdout.trim();
     expect(spawned).toMatch(/^\d+$/);
     // Gone, or a zombie its new parent has yet to reap: either way no longer running.
-    const state = await createHostCommands().run('/bin/ps', ['-o', 'stat=', '-p', spawned]);
+    const state = await createHostCommands().run('ps', ['-o', 'stat=', '-p', spawned]);
     expect(state.status === 1 || state.stdout.trim().startsWith('Z')).toBe(true);
   });
 

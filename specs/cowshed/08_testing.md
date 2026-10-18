@@ -524,6 +524,7 @@ with an explicitly limited ordinary-user fallback. A missing tool, denied privil
 changing process identity is incomplete evidence, never an empty holder set. Successful observations with resources,
 successful observations without matches and incomplete/raced captures remain distinct. An open file is not proof of a
 contested lock, and an admission token count or one CPU/state sample does not establish CPU starvation or its absence.
+The process census resolves `ps` through the runtime `PATH`, as fixture process tables do; NixOS has no `/bin/ps`.
 
 **Script-host fixture wedge (2026-10-16, resolved 2026-10-17).** The isolation case
 `nothing_one_script_does_to_its_process_reaches_the_next` once and `scripts_forked_at_once_each_run_whole` four times
