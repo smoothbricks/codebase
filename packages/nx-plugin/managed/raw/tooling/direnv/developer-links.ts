@@ -26,7 +26,10 @@
  *
  * Unlinking a package means removing its link, and the next install puts the
  * lockfile's version there. A dangling link is removed before the install,
- * with a warning. Links this owner creates for declarations also have a receipt
+ * with a warning. A link whose target this process may not read (EPERM in a
+ * cowshed sandbox that grants no read of it, EACCES under a directory's mode)
+ * is not wrong, only unreadable here: it is kept like a live link, never
+ * taken for a dangling one, and said. Links this owner creates for declarations also have a receipt
  * in node_modules/.smoo-declared-links: their alias, declaration and exact link
  * text. A changed declaration can replace that link only while its text still
  * matches the receipt. Unrecorded links and manual retargets stay the developer's.
@@ -121,9 +124,15 @@ interface DeveloperLink {
 }
 
 interface DeveloperLinks {
+  /** Links kept across an install: every link whose target is not known to be gone, unreadable ones included. */
   readonly live: readonly DeveloperLink[];
   /** Links whose target no longer exists. */
   readonly dangling: readonly DeveloperLink[];
+  /**
+   * The live links whose target this process may not read, with the error that said so: a sandbox's EPERM or a
+   * directory mode's EACCES. Such a link is not wrong, only unreadable here, so it is kept as made and said once.
+   */
+  readonly unreadable: readonly (DeveloperLink & { readonly code: string })[];
 }
 
 interface DeclaredLinkReceipt extends DeveloperLink {
@@ -143,7 +152,7 @@ export async function keepDeveloperLinks<T>(
   install: () => Promise<T>,
   options?: KeepDeveloperLinksOptions,
 ): Promise<T> {
-  const { live, dangling } = findDeveloperLinks(root);
+  const { live, dangling, unreadable } = findDeveloperLinks(root);
   const recorded = readDeclaredRecord(root);
   const undeclared = new Set<string>();
   if (recorded.size > 0) {
@@ -203,7 +212,7 @@ export async function keepDeveloperLinks<T>(
     if (options !== undefined || (succeeded && undeclared.size > 0)) {
       reportDeveloperLinks(root);
     } else {
-      describeDeveloperLinks(root, live);
+      describeDeveloperLinks(root, { live, unreadable });
     }
   }
 }
@@ -214,10 +223,11 @@ export async function keepDeveloperLinks<T>(
  * entry that installs nothing. The entry that installs gets the same line
  * from `keepDeveloperLinks`, but devenv's direnv integration runs that entry
  * where its output is not shown. A dangling link is left for the next
- * install to remove.
+ * install to remove. A link whose target this process may not read gets a
+ * line of its own.
  */
 export function reportDeveloperLinks(root: string): void {
-  describeDeveloperLinks(root, findDeveloperLinks(root).live);
+  describeDeveloperLinks(root, findDeveloperLinks(root));
 }
 
 /**
@@ -229,18 +239,31 @@ export function hasStaleDeveloperLinks(root: string, relink: readonly string[] =
   return dangling.length > 0 || live.some((link) => relink.includes(packageName(link)));
 }
 
+/**
+ * The developer links whose target this process may not read, as absolute paths: kept as made and said, but no
+ * process here can check what they point at, so an install's admission leaves them to the developer.
+ */
+export function unreadableDeveloperLinks(root: string): string[] {
+  return findDeveloperLinks(root).unreadable.map((link) => path.join(root, link.path));
+}
+
 /** The package a link stands for in its tree: `name` or `@scope/name`. */
 function packageName(link: DeveloperLink): string {
   return link.path.slice(link.path.lastIndexOf('node_modules/') + 'node_modules/'.length);
 }
 
-/** A package linked from many members is named once, with its count. */
-function describeDeveloperLinks(root: string, links: readonly DeveloperLink[]): void {
-  if (links.length === 0) {
+/** A package linked from many members is named once, with its count; each unreadable link is named on its own. */
+function describeDeveloperLinks(root: string, { live, unreadable }: Omit<DeveloperLinks, 'dangling'>): void {
+  for (const link of unreadable) {
+    console.error(
+      `! developer link ${link.path} -> ${resolvedTarget(root, link)}: its target cannot be read here (${link.code}); kept as it is`,
+    );
+  }
+  if (live.length === 0) {
     return;
   }
   const counts = new Map<string, number>();
-  for (const link of links) {
+  for (const link of live) {
     const named = `${packageName(link)} -> ${resolvedTarget(root, link)}`;
     counts.set(named, (counts.get(named) ?? 0) + 1);
   }
@@ -251,17 +274,25 @@ function describeDeveloperLinks(root: string, links: readonly DeveloperLink[]): 
 function findDeveloperLinks(root: string): DeveloperLinks {
   const live: DeveloperLink[] = [];
   const dangling: DeveloperLink[] = [];
+  const unreadable: (DeveloperLink & { readonly code: string })[] = [];
   for (const tree of nodeModulesTrees(root)) {
     for (const entry of packageLinks(root, tree)) {
       const link: DeveloperLink = { path: entry, target: readlinkSync(path.join(root, entry)) };
       const target = resolvedTarget(root, link);
       const relative = path.relative(root, target);
       if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-        (statSync(target, { throwIfNoEntry: false }) === undefined ? dangling : live).push(link);
+        try {
+          (statSync(target, { throwIfNoEntry: false }) === undefined ? dangling : live).push(link);
+        } catch (error) {
+          const code = error instanceof Error && 'code' in error ? error.code : undefined;
+          if (code !== 'EPERM' && code !== 'EACCES') throw error;
+          live.push(link);
+          unreadable.push({ ...link, code });
+        }
       }
     }
   }
-  return { live, dangling };
+  return { live, dangling, unreadable };
 }
 
 /**
