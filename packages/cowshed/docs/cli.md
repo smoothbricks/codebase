@@ -586,6 +586,10 @@ interactive command builds; forcing `CARGO_INCREMENTAL=0` there would compile ev
 
 Marks the workspace deleted and returns immediately; detach and image deletion happen in the background.
 
+cwd or `--project` selects the project as for any verb. Run from outside every project, `rm <name>` finds the workspace
+the way `detach <name>` does — from the store, by its session name — and refuses with the projects named when more than
+one holds it. The address is all that changes; the gate below is the same.
+
 Removing a workspace destroys its image, and the image is where its commits live — so `rm` refuses (exit 4) unless
 `main` already contains the workspace's `HEAD`. The refusal names main's tip and points at `cowshed land <ws>`.
 

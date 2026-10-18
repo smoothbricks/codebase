@@ -1213,6 +1213,20 @@ async fn resolve_project_context(cli: &Cli) -> Result<ResolvedProjectRoot> {
             resuming_re_adoption: false,
         }),
         (Command::Adopt(_), Err(error)) => Err(error),
+        // A named removal outside any project addresses its workspace the way `detach <ws>`
+        // does: from the store readdir, accepted only when exactly one project holds a session
+        // of that name. Only the address changes; the project then runs its own containment gate.
+        (Command::Remove(args), Err(error))
+            if cli.global.project.is_none() && WorkspaceName::session(&args.workspace).is_ok() =>
+        {
+            let storage = host_storage().await?;
+            named_removal_root(storage.store(), &args.workspace, error).map(|root| {
+                ResolvedProjectRoot {
+                    root,
+                    resuming_re_adoption: false,
+                }
+            })
+        }
         (_, Err(error)) => Err(project_context_error(error)),
     }
 }
@@ -1223,6 +1237,19 @@ fn project_context_error(error: CowshedError) -> CowshedError {
         error.message,
         "cowshed ls; cowshed --project <git-root> <command>",
     )
+}
+
+/// The project a named removal belongs to when cwd discovery found none: the store readdir's
+/// unique owner of `workspace`. A miss or an ambiguity says both what discovery saw and what the
+/// store holds, so the refusal names why neither address resolved.
+fn named_removal_root(store: &Path, workspace: &str, discovery: CowshedError) -> Result<PathBuf> {
+    resolve_session_project_root(store, workspace, "rm").map_err(|lookup| {
+        CowshedError::new(
+            lookup.code,
+            format!("{}; {}", discovery.message, lookup.message),
+            lookup.hint,
+        )
+    })
 }
 
 fn optional_project_unavailable(error: &CowshedError) -> bool {
@@ -3066,9 +3093,17 @@ fn detach_store_storage_error(error: impl std::fmt::Display) -> CowshedError {
 ///
 /// Identity is the image sidecar's `infoSnapshot.projectRoot` (the same project root the
 /// in-image marker records). Remotes and cwd git discovery are not consulted.
-pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Result<PathBuf> {
-    let wanted = WorkspaceName::session(workspace)
-        .map_err(|error| usage(error.to_string(), "cowshed detach <ws>; cowshed ls --all"))?;
+pub(crate) fn resolve_session_project_root(
+    store: &Path,
+    workspace: &str,
+    verb: &str,
+) -> Result<PathBuf> {
+    let wanted = WorkspaceName::session(workspace).map_err(|error| {
+        usage(
+            error.to_string(),
+            format!("cowshed {verb} <ws>; cowshed ls --all"),
+        )
+    })?;
     let mut found: Vec<(RepoId, PathBuf)> = Vec::new();
     let owners = fs::read_dir(store).map_err(|error| {
         CowshedError::environment_missing(
@@ -3131,7 +3166,7 @@ pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Res
     match found.as_slice() {
         [] => Err(CowshedError::not_found(
             format!("no session workspace {workspace} in the store"),
-            "cowshed ls --all; cowshed --project <git-root> detach <ws>",
+            format!("cowshed ls --all; cowshed --project <git-root> {verb} <ws>"),
         )),
         [(_, root)] => Ok(root.clone()),
         many => {
@@ -3142,7 +3177,7 @@ pub(crate) fn resolve_session_project_root(store: &Path, workspace: &str) -> Res
                 .join(", ");
             Err(CowshedError::conflict(
                 format!("workspace {workspace} exists in more than one project ({projects})"),
-                "cowshed --project <git-root> detach <ws>",
+                format!("cowshed --project <git-root> {verb} <ws>"),
             ))
         }
     }
@@ -3183,7 +3218,7 @@ async fn resolve_detach_root(cli: &Cli) -> Result<PathBuf> {
         )
     })?;
     let storage = host_storage().await?;
-    resolve_session_project_root(storage.store(), workspace)
+    resolve_session_project_root(storage.store(), workspace, "detach")
 }
 
 fn emit_reseed_result<W: Write, E: Write>(
@@ -6979,17 +7014,62 @@ mod tests {
         write_session_image(&store, "acme", "widget", "fox", Path::new("/cwd/project"));
         write_session_image(&store, "zeta", "tool", "raven", &other_checkout);
 
-        let resolved = resolve_session_project_root(&store, "raven").expect("found raven");
+        let resolved =
+            resolve_session_project_root(&store, "raven", "detach").expect("found raven");
         assert_eq!(resolved, other_checkout);
 
-        let missing = resolve_session_project_root(&store, "absent").unwrap_err();
+        let missing = resolve_session_project_root(&store, "absent", "detach").unwrap_err();
         assert_eq!(missing.code, ErrorCode::NotFound);
 
         write_session_image(&store, "acme", "widget", "raven", Path::new("/cwd/project"));
-        let conflict = resolve_session_project_root(&store, "raven").unwrap_err();
+        let conflict = resolve_session_project_root(&store, "raven", "detach").unwrap_err();
         assert_eq!(conflict.code, ErrorCode::Conflict);
         assert!(conflict.message.contains("zeta/tool"));
         assert!(conflict.message.contains("acme/widget"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rm_outside_any_project_addresses_a_session_by_its_unique_name_in_the_store() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-rm-store-readdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = root.join("store");
+        let checkout = PathBuf::from("/fixtures/snapshots/project");
+        write_session_image(&store, "fixtures", "snapshots", "fixture", &checkout);
+        let discovery = || {
+            CowshedError::environment_missing(
+                "/Users/dev is not inside a standalone git repository",
+                "cowshed adopt <git-root>",
+            )
+        };
+
+        let resolved = named_removal_root(&store, "fixture", discovery()).expect("found fixture");
+        assert_eq!(resolved, checkout);
+
+        let missing = named_removal_root(&store, "absent", discovery()).unwrap_err();
+        assert_eq!(missing.code, ErrorCode::NotFound);
+        assert_eq!(
+            missing.message,
+            "/Users/dev is not inside a standalone git repository; no session workspace absent in the store"
+        );
+        assert_eq!(
+            missing.hint,
+            "cowshed ls --all; cowshed --project <git-root> rm <ws>"
+        );
+
+        write_session_image(&store, "fixtures", "retirement", "fixture", &checkout);
+        let conflict = named_removal_root(&store, "fixture", discovery()).unwrap_err();
+        assert_eq!(conflict.code, ErrorCode::Conflict);
+        assert!(conflict.message.contains("fixtures/snapshots"));
+        assert!(conflict.message.contains("fixtures/retirement"));
+        assert_eq!(conflict.hint, "cowshed --project <git-root> rm <ws>");
 
         std::fs::remove_dir_all(root).unwrap();
     }

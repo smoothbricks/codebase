@@ -11,8 +11,10 @@ working tree.
 
 Every use of `main` in this specification is project-scoped. A host may adopt any number of repositories, each with its
 own warm `main`, sessions, checkpoints, grants, gateway identity, and standalone Git object store under its primary
-`repo_id`. Commands select the project explicitly with global `--project <git-root>` or derive it from cwd; `fork`,
-`checkpoint`, `restore`, `push`, and `land` never select a machine-global main or cross repository boundaries.
+`repo_id`. Commands select the project explicitly with global `--project <git-root>` or derive it from cwd;
+`detach <ws>` and, outside any project, `rm <ws>` derive it instead from the one project whose store holds a session of
+that name. `fork`, `checkpoint`, `restore`, `push`, and `land` never select a machine-global main or cross repository
+boundaries.
 
 ## The safe-to-clone-main invariant
 
