@@ -369,3 +369,26 @@ describe('owning-reader external input byproducts', () => {
     expect(identity('reference-scan')).toBeNull();
   });
 });
+
+describe('DIAG linux graph-input', () => {
+  it('reports why the collector refuses', async () => {
+    const { lstatSync, realpathSync, readdirSync } = await import('node:fs');
+    const probe = reader();
+    const result = probe.finish();
+    const path = (process.env.PATH ?? '').split(':').map((directory) => {
+      try {
+        const stats = lstatSync(join(directory || '.', 'bun'));
+        return {
+          directory,
+          kind: stats.isSymbolicLink() ? 'link' : stats.isFile() ? 'file' : 'other',
+          real: realpathSync(join(directory || '.', 'bun')),
+        };
+      } catch (error) {
+        return { directory, error: error instanceof Error && 'code' in error ? String(error.code) : String(error) };
+      }
+    });
+    throw new Error(
+      `DIAG ${JSON.stringify({ result, execPath: process.execPath, realExec: realpathSync(process.execPath), path, loader: ['NODE_OPTIONS', 'BUN_OPTIONS', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES'].map((name) => [name, process.env[name] ?? null]), tmp: tmpdir(), root, data: data(), inheritedData, dataFiles: readdirSync(data()) }, null, 1)}`,
+    );
+  });
+});
