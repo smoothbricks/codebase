@@ -1065,6 +1065,12 @@ mod tests {
             cpu_user_us: CpuMicros::new(user).unwrap(),
             cpu_sys_us: CpuMicros::new(0).unwrap(),
             busy,
+            // A busy usage was judged so over a window that closed: a whole core for a second.
+            cpu_window: busy.then(|| crate::api::process::ProcessCpuWindow {
+                opened_us: crate::api::resources::WallMicros::new(0).unwrap(),
+                closed_us: crate::api::resources::WallMicros::new(1_000_000).unwrap(),
+                cpu_permille: crate::api::resources::OneCoreCpuPermille::new(1_000).unwrap(),
+            }),
             rss_bytes: ResidentBytes::new(rss).unwrap(),
             rss_peak_bytes: ResidentBytes::new(rss).unwrap(),
             io: ProcessStorageIo::Read {

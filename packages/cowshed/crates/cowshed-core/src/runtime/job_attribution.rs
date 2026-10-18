@@ -694,6 +694,7 @@ mod tests {
             cpu_user_us: CpuMicros::new(user).expect("exact"),
             cpu_sys_us: CpuMicros::new(sys).expect("exact"),
             busy: false,
+            cpu_window: None,
             rss_bytes: ResidentBytes::ZERO,
             rss_peak_bytes: ResidentBytes::ZERO,
             io: ProcessStorageIo::Unavailable {

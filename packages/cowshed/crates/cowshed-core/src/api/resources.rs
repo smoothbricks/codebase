@@ -4,7 +4,7 @@
 //! number. Its scalar declaration gives generated validators the same safe-integer boundary
 //! as its Rust constructor, so no projection admits a value another projection refuses.
 
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU128};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -256,6 +256,52 @@ impl TryFrom<f64> for OneCoreCpuPercent {
 impl From<OneCoreCpuPercent> for f64 {
     fn from(value: OneCoreCpuPercent) -> Self {
         value.get()
+    }
+}
+
+/// A share of one CPU core over a window, in thousandths: 1000 is one core kept busy for the
+/// whole window, so a process running on several cores exceeds it. The unit of
+/// [`BUSY_CPU_PERMILLE`](super::process::BUSY_CPU_PERMILLE).
+#[cfg_attr(
+    any(),
+    cowshed_api(
+        accessor = "get",
+        scalar = "number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>"
+    )
+)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct OneCoreCpuPermille(u64);
+
+impl OneCoreCpuPermille {
+    pub fn new(value: u64) -> Result<Self, ResourceUnitError> {
+        exact("cpuPermille", u128::from(value)).map(Self)
+    }
+
+    /// `cpu_us` of CPU over a window of `span_ns`, rounded down from the exact ratio: the share
+    /// reaches a whole number of thousandths exactly when the CPU does, and a window shorter than
+    /// a microsecond is not rounded to none.
+    pub fn of_window(cpu_us: u64, span_ns: NonZeroU128) -> Result<Self, ResourceUnitError> {
+        // A microsecond is 1000 ns, and one core is 1000 thousandths.
+        exact("cpuPermille", u128::from(cpu_us) * 1_000_000 / span_ns).map(Self)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for OneCoreCpuPermille {
+    type Error = ResourceUnitError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<OneCoreCpuPermille> for u64 {
+    fn from(value: OneCoreCpuPermille) -> Self {
+        value.0
     }
 }
 
@@ -514,7 +560,8 @@ impl From<ChargedMemoryBytes> for u64 {
     }
 }
 
-/// Elapsed wall time since the job's first owned process spawned, in microseconds.
+/// Elapsed wall time in microseconds, on a monotonic clock whose origin each field names: a job
+/// sample's since its first owned process spawned, a process window's since its first usage read.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
 #[cfg_attr(

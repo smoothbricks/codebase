@@ -484,10 +484,10 @@ fork-heavy workload. Polling alone cannot claim complete short-lived descendants
 gaps, never a shortened tree presented as complete.
 
 `JobHandle.processes` and `process_events` expose the canonical records in 07_api.md through both controller and N-API,
-generated from the same declaration. The records carry per-process CPU user/sys microseconds, current/peak RSS,
-read/write I/O, busy/idle state, observed blocker kind and evidence, and exact exit state. A lock can name its holder
-PID and job; absence of blocker evidence never means `none`. No shell flavor or argv classification sets an expectation
-for these observations.
+generated from the same declaration. The records carry per-process CPU user/sys microseconds, the share of one core over
+the last sample window with that window, current/peak RSS, read/write I/O, busy/idle state, observed blocker kind and
+evidence, and exact exit state. A lock can name its holder PID and job; absence of blocker evidence never means `none`.
+No shell flavor or argv classification sets an expectation for these observations.
 
 The supervisor emits one `process.run` span per process under the job's trace, with parentage following the process tree
 and birth/exit as its boundaries. Each unchanged live process has one heartbeat a minute, independent of any API

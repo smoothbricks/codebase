@@ -830,6 +830,7 @@ pub struct StorageIoBytesDelta(i64);
 pub struct VolumeUsedBytesDelta(i64);
 pub struct HostLoad1(f64);
 pub struct OneCoreCpuPercent(f64);
+pub struct OneCoreCpuPermille(u64);  // a process's share of one core over a window, in thousandths
 pub struct HostCores(u16);
 pub struct HostLoadSample { pub load1: HostLoad1, pub cores: HostCores }
 pub enum VolumeUnavailable {
@@ -1025,10 +1026,16 @@ pub const BUSY_CPU_PERMILLE: u32 = 10;     // busy: own CPU over the last sample
 pub struct ProcessUsage {                  // the process's own counters, as last read
     pub cpu_user_us: CpuMicros,
     pub cpu_sys_us: CpuMicros,
-    pub busy: bool,
+    pub busy: bool,                        // cpu_window's share ≥ BUSY_CPU_PERMILLE; idle while it is absent
+    pub cpu_window: Option<ProcessCpuWindow>, // absent until two reads a positive span apart closed one
     pub rss_bytes: ResidentBytes,          // zero once it has exited
     pub rss_peak_bytes: ResidentBytes,
     pub io: ProcessStorageIo,
+}
+pub struct ProcessCpuWindow {             // the last closed sample window of the process's own CPU
+    pub opened_us: WallMicros,             // after the process's first usage read, on the supervisor's monotonic clock
+    pub closed_us: WallMicros,             // equal to opened_us for a window under a microsecond
+    pub cpu_permille: OneCoreCpuPermille,  // own user+sys CPU over the exact span in thousandths of a core, rounded down
 }
 pub enum ProcessStorageIo {
     Read { read_bytes: StorageIoBytes, write_bytes: StorageIoBytes },
@@ -1104,11 +1111,17 @@ read: one reaped before the sampler reached it, or on macOS one that exited befo
 own. Usage is final only when it was read after the process exited. An exit with no such read is the coverage gap
 `UnreadFinalUsage`, and the usage stays the last one observed, never zeroed or reset. Each read is fenced to the
 retained life. On macOS the first read is proven by the process's unique id read after it, and every later one by the
-start time the read itself carries. On Linux the held pidfd must still name an unreaped process after each read. `busy`
-holds when the process's own CPU over the supervisor's last sample window is at least `BUSY_CPU_PERMILLE` thousandths of
-one core; that constant is the one declaration consumers read through the generated surface. A first read and a
-zero-length window divide nothing and keep the prior judgment, initially idle. Reading usage or subscribing never moves
-the window. Storage I/O follows each platform's per-process source: macOS
+start time the read itself carries. On Linux the held pidfd must still name an unreaped process after each read.
+`cpuWindow` is the supervisor's last closed sample window of the process's own CPU: where it opened and closed, in whole
+microseconds after the process's first usage read on the supervisor's monotonic clock, and `cpuPermille`, its own user
+plus system CPU over the window's exact span in thousandths of one core, rounded down; a process on several cores
+exceeds 1000. A share is comparable only with its window, so the window is part of the value. Windows tile a life, each
+opening where the one before it closed, so a reader polling the tree tells a window it already saw (the same `closedUs`)
+from the next one and from one it missed (`openedUs` past the last `closedUs`). The share does not depend on `sampledAt`
+or any other second-resolution timestamp. `busy` holds when that share is at least `BUSY_CPU_PERMILLE`; that constant is
+the one declaration consumers read through the generated surface. A first read and a zero-length window divide nothing
+and keep the prior window and judgment, initially none and idle. Reading usage or subscribing never moves the window; a
+new window alone is not a change record. Storage I/O follows each platform's per-process source: macOS
 `ri_diskio_bytesread`/`ri_diskio_byteswritten`, the I/O the process issued to disk; Linux `/proc/<pid>/io`
 `read_bytes`/`write_bytes`, reads it caused to be fetched from storage and pages it dirtied for storage, counted when
 dirtied rather than at writeback. Reads served from the cache count on neither. `NotPermitted` is a kernel refusal

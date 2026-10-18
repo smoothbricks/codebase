@@ -1587,6 +1587,13 @@ export type NxCarry = {
 export type OneCoreCpuPercent = number & tags.Minimum<0> & tags.Maximum<1.7976931348623157e308>;
 
 /**
+ * A share of one CPU core over a window, in thousandths: 1000 is one core kept busy for the
+ * whole window, so a process running on several cores exceeds it. The unit of
+ * [`BUSY_CPU_PERMILLE`](super::process::BUSY_CPU_PERMILLE).
+ */
+export type OneCoreCpuPermille = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
  * The daemon serves only its own build, and refused a request from another (11_shell.md
  * "hello"). A controller of the refused build can start nothing in a workspace from then on; a
  * controller of the daemon's build — the host's current `cowshed` once an install has started
@@ -1705,6 +1712,31 @@ export type ProcessCoverageGap =
     });
 
 /**
+ * One process's last closed CPU sample window: the span between the two reads of its own
+ * counters that bound it, and the share of one core its own CPU took over that span. A share is
+ * comparable only with its window, so the window is part of the value. Windows tile a life: each
+ * opens where the one before it closed, so a reader tells a window it already saw (the same
+ * `closed_us`) from the next one (`opened_us` at the last `closed_us`) and from one it missed
+ * (`opened_us` past it).
+ */
+export type ProcessCpuWindow = {
+  /**
+   * Where the window opened, in whole microseconds after the process's first usage read, on
+   * the supervisor's monotonic clock.
+   */
+  readonly openedUs: WallMicros;
+  /**
+   * Where it closed, on the same clock; equal to `opened_us` for a window under a microsecond.
+   */
+  readonly closedUs: WallMicros;
+  /**
+   * Its own user plus system CPU over the window, in thousandths of one core, from the
+   * window's exact span and rounded down.
+   */
+  readonly cpuPermille: OneCoreCpuPermille;
+};
+
+/**
  * How and when a process ended: the two are observed together, so neither exists alone.
  */
 export type ProcessExit = {
@@ -1743,9 +1775,14 @@ export type ProcessUsage = {
   readonly cpuSysUs: CpuMicros;
   /**
    * Whether its own CPU over the supervisor's last sample window was at least 1 % of one
-   * core.
+   * core: `cpu_window`'s share against [`BUSY_CPU_PERMILLE`], idle while no window closed.
    */
   readonly busy: boolean;
+  /**
+   * The supervisor's last closed sample window of its own CPU, with the share `busy` judges;
+   * absent until two reads a positive span apart closed one.
+   */
+  readonly cpuWindow?: ProcessCpuWindow;
   /**
    * What it holds resident now; zero once it has exited.
    */
@@ -2558,7 +2595,8 @@ export type VolumeUsedBytesDelta = number &
   tags.Maximum<9007199254740991>;
 
 /**
- * Elapsed wall time since the job's first owned process spawned, in microseconds.
+ * Elapsed wall time in microseconds, on a monotonic clock whose origin each field names: a job
+ * sample's since its first owned process spawned, a process window's since its first usage read.
  */
 export type WallMicros = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
 
