@@ -59,6 +59,42 @@ export async function runInteractiveStatus(
   });
 }
 
+/**
+ * `runInteractiveStatus` that also keeps what the command wrote to stderr, for
+ * diagnosing its failure from its own words. stdin and stdout stay the
+ * terminal's, so a command that prompts only on a TTY (npm's OTP and web-auth
+ * challenges check stdin and stdout) still prompts; stderr is forwarded live.
+ */
+export async function runInteractiveCapturingStderr(
+  command: string,
+  args: string[],
+  cwd: string,
+  env?: Record<string, string>,
+  unsetEnv?: readonly string[],
+): Promise<{ exitCode: number; stderr: string }> {
+  const invocation = resolveCommandInvocation(cwd, command, args);
+  const { promise, resolve, reject } = Promise.withResolvers<{ exitCode: number; stderr: string }>();
+  const child = spawn(invocation.command, invocation.args, {
+    cwd,
+    env: mergeEnv(env, unsetEnv),
+    stdio: ['inherit', 'inherit', 'pipe'],
+  });
+  const stderr: Buffer[] = [];
+  child.stderr.on('data', (chunk: Buffer) => {
+    stderr.push(chunk);
+    process.stderr.write(chunk);
+  });
+  child.on('error', reject);
+  child.on('close', (code, signal) => {
+    if (signal) {
+      reject(new Error(`${command} ${args.join(' ')} terminated by signal ${signal}`));
+      return;
+    }
+    resolve({ exitCode: code ?? 1, stderr: Buffer.concat(stderr).toString('utf8') });
+  });
+  return promise;
+}
+
 export async function runResult(
   command: string,
   args: string[],

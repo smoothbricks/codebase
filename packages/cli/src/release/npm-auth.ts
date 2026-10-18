@@ -49,13 +49,161 @@ export async function publishWithAuthDiagnostics(
       shell.log(`${packageVersion}: publish result already visible on npm; continuing.`);
       return;
     }
-    shell.error(npmPublishAuthFailureMessage(pkg, options));
-    await shell.appendSummary(npmPublishAuthFailureMarkdown(pkg, options));
-    throw new Error(
-      `${packageVersion}: npm publish authentication failed. Run smoo release trust-publisher; see the warning banner above for details.`,
-      { cause: error },
-    );
+    // Packing and spawning fail before npm says anything; that error is the report.
+    if (!(error instanceof NpmPublishCommandError)) {
+      throw error;
+    }
+    const failure = classifyNpmPublishFailure(error.stderr);
+    switch (failure.kind) {
+      case 'auth':
+        shell.error(npmPublishAuthFailureMessage(pkg, options));
+        await shell.appendSummary(npmPublishAuthFailureMarkdown(pkg, options));
+        throw new Error(
+          `${packageVersion}: npm publish authentication failed (${failure.code}). Run smoo release trust-publisher; see the warning banner above for details.`,
+          { cause: error },
+        );
+      case 'too-large':
+        shell.error(npmPublishTooLargeMessage(pkg, failure.packageSize));
+        await shell.appendSummary(npmPublishTooLargeMarkdown(pkg, failure.packageSize));
+        throw new Error(
+          `${packageVersion}: npm rejected the tarball as too large (E413 Payload Too Large, package size ${failure.packageSize ?? 'not reported'}; npm's ceiling is ~200 MB).`,
+          { cause: error },
+        );
+      case 'npm':
+        shell.error(npmPublishFailureMessage(pkg, failure));
+        await shell.appendSummary(npmPublishFailureMarkdown(pkg, failure));
+        throw new Error(
+          `${packageVersion}: npm publish failed (${failure.code ?? `exit code ${error.exitCode}`}):\n${failure.detail}`,
+          { cause: error },
+        );
+    }
   }
+}
+
+/**
+ * `npm publish` exited non-zero. Carries npm's stderr -- where npm writes its
+ * `npm error code ...` lines and its `npm notice package size:` line -- so the
+ * failure is classified from what npm said rather than assumed.
+ */
+export class NpmPublishCommandError extends Error {
+  constructor(
+    readonly npmArgs: readonly string[],
+    readonly exitCode: number,
+    readonly stderr: string,
+  ) {
+    super(`npm ${npmArgs.join(' ')} failed with exit code ${exitCode}`);
+    this.name = 'NpmPublishCommandError';
+  }
+}
+
+/**
+ * npm codes meaning the registry did not authenticate the publish. A failed
+ * trusted-publishing OIDC exchange surfaces as ENEEDAUTH or as a 404 on the PUT
+ * of a package that exists (npm/cli#9088); publish checks existence first.
+ */
+const NPM_AUTH_ERROR_CODES: Record<NpmAuthErrorCode, true> = { E401: true, E403: true, E404: true, ENEEDAUTH: true };
+
+export type NpmAuthErrorCode = 'E401' | 'E403' | 'E404' | 'ENEEDAUTH';
+
+export type NpmPublishFailure =
+  | { kind: 'auth'; code: NpmAuthErrorCode }
+  | { kind: 'too-large'; packageSize: string | undefined }
+  | { kind: 'npm'; code: string | undefined; detail: string };
+
+/** Classifies a failed `npm publish` from npm's own stderr. */
+export function classifyNpmPublishFailure(stderr: string): NpmPublishFailure {
+  const code = /^npm (?:error|ERR!) code (\S+)/m.exec(stderr)?.[1];
+  if (code === 'E413') {
+    return { kind: 'too-large', packageSize: /^npm notice package size:\s*(.+?)\s*$/m.exec(stderr)?.[1] };
+  }
+  if (code !== undefined && isNpmAuthErrorCode(code)) {
+    return { kind: 'auth', code };
+  }
+  return { kind: 'npm', code, detail: npmErrorDetail(stderr) };
+}
+
+function isNpmAuthErrorCode(code: string): code is NpmAuthErrorCode {
+  return Object.hasOwn(NPM_AUTH_ERROR_CODES, code);
+}
+
+/** npm's own error lines, verbatim; the stderr tail when npm printed none. */
+function npmErrorDetail(stderr: string): string {
+  const lines = stderr.split('\n').map((line) => line.trimEnd());
+  const errorLines = lines.filter((line) => /^npm (?:error|ERR!)/.test(line));
+  if (errorLines.length > 0) {
+    return errorLines.join('\n');
+  }
+  const tail = lines.filter((line) => line.length > 0).slice(-12);
+  return tail.length > 0 ? tail.join('\n') : 'npm printed nothing to stderr.';
+}
+
+const NPM_TARBALL_CEILING =
+  "npm's registry rejects tarballs above roughly 200 MB (https://github.com/npm/documentation/issues/1691).";
+
+export function npmPublishTooLargeMessage(
+  pkg: Pick<ReleasePackageInfo, 'name' | 'version'>,
+  packageSize: string | undefined,
+): string {
+  const packageVersion = `${pkg.name}@${pkg.version}`;
+  const size = packageSize ?? 'not reported by npm';
+  return [
+    `::error title=npm rejected the package as too large::${packageVersion} could not be published: the registry answered E413 Payload Too Large (package size ${size}).`,
+    '',
+    `npm publish rejected ${packageVersion}: tarball too large (E413)`,
+    '',
+    `Package size: ${size}`,
+    NPM_TARBALL_CEILING,
+    'This is not an authentication failure; do not run smoo release trust-publisher.',
+    '',
+    'Fix: shrink the packed package below the ceiling (see `npm pack --dry-run` for what it ships), then rerun the Publish workflow.',
+  ].join('\n');
+}
+
+export function npmPublishTooLargeMarkdown(
+  pkg: Pick<ReleasePackageInfo, 'name' | 'version'>,
+  packageSize: string | undefined,
+): string {
+  return [
+    '## npm rejected the package as too large',
+    '',
+    `Package: \`${pkg.name}@${pkg.version}\``,
+    '',
+    `The registry answered \`E413 Payload Too Large\`. Package size: ${packageSize ?? 'not reported by npm'}.`,
+    '',
+    NPM_TARBALL_CEILING,
+    '',
+    'This is not an authentication failure; do not run `smoo release trust-publisher`. Shrink the packed package below the ceiling, then rerun the Publish workflow.',
+  ].join('\n');
+}
+
+export function npmPublishFailureMessage(
+  pkg: Pick<ReleasePackageInfo, 'name' | 'version'>,
+  failure: { code: string | undefined; detail: string },
+): string {
+  const packageVersion = `${pkg.name}@${pkg.version}`;
+  return [
+    `::error title=npm publish failed::${packageVersion} could not be published: npm error code ${failure.code ?? '(none)'}.`,
+    '',
+    `npm publish failed for ${packageVersion}. npm said:`,
+    failure.detail,
+  ].join('\n');
+}
+
+export function npmPublishFailureMarkdown(
+  pkg: Pick<ReleasePackageInfo, 'name' | 'version'>,
+  failure: { code: string | undefined; detail: string },
+): string {
+  return [
+    '## npm publish failed',
+    '',
+    `Package: \`${pkg.name}@${pkg.version}\``,
+    '',
+    'npm said:',
+    '',
+    '```text',
+    failure.detail,
+    '```',
+  ].join('\n');
 }
 
 export function npmProvenanceRunnerRefusalMessage(pkg: Pick<ReleasePackageInfo, 'name' | 'version'>): string {
