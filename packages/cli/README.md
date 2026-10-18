@@ -115,7 +115,10 @@ packages should get `^build` ordering for ordinary development commands, while p
 
 `smoo monorepo init --runtime-only` only synchronizes root runtime versions. It is used from direnv setup so
 `packageManager`, `engines.node`, and `@types/node` stay aligned with the active devenv shell without duplicating that
-policy in the direnv script.
+policy in the direnv script. The versions are those of the `bun` running `smoo` and the `node` on the shell's `PATH`,
+the same binaries shell entry probes for drift; no checkout path is consulted, because the checkout's
+`tooling/direnv/.devenv/profile` link is re-pointed by every activation of that checkout and once wrote another
+evaluation's Bun over the shell's.
 
 Bun types are also a root runtime policy. The root `@types/bun` version follows the exact `packageManager` Bun version,
 while package manifests are not forced to depend on Bun just because a test tsconfig opts into Bun globals. If a package
