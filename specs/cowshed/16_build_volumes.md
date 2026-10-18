@@ -1170,7 +1170,11 @@ resolve beside the current checkout; inherited absolute sibling bindings retain 
 containment nor the sibling rule grants the main checkout or an ancestor dependency store to a cowshed sandbox.
 
 A project-contained developer alias is a relative link within its checkout. A source-image fork therefore selects its
-own copy without borrowing its donor's tree. Genuine sibling links retain their distinct host-local authority.
+own copy without borrowing its donor's tree. Genuine sibling links retain their distinct host-local authority. The
+checkout's own build volume is within the checkout: an alias that reaches build state through the build link, such as a
+linked-package snapshot in declared `.cache/linked-snapshots`, is owned, and a fork's volume clone carries it. Only a
+contained alias whose physical target lies outside both the checkout and the volume its build link names escapes: mint
+and job admission refuse it.
 
 ### The adoption needs the target's Nx database closed
 
