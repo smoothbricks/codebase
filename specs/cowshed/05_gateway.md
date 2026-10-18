@@ -793,12 +793,16 @@ core count.
   `{"ok":true,"lease":"granted","id":"<lease id>","tokens":<g>}` when the runner may start. The same lease id identifies
   that admission until its connection closes. `want` 0, a missing or empty checkout, or one over 4096 bytes is refused
   as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as `cpuBudget`: `total`, `held`, per
-  checkout `held`, `running` and `waiting`, and `gateQueue`: the waiting gate-class requests in the order returned
-  tokens go to them, each with its `checkout`, its gate `job` (the job's admission number; the smaller is the older job)
-  and its `want`. `cowshed gateway status` shows this ledger and gate queue to the operator, in its human lines and as
-  `cpuBudget` in `--json` (06_cli.md; 07_api.md `GatewayStatus`), so whether queued lands wait behind the head of the
-  queue without loading it is visible rather than inferred; a daemon that does not answer `cpu-budget` is reported as
-  such, never as an empty ledger.
+  checkout `held`, `running` and `waiting` (every class together); `gateJobs`: the gate jobs whose runners hold tokens,
+  oldest job first — the first is the head of the gate queue — each with its `checkout`, its gate `job` (the job's
+  admission number; the smaller is the older job), the tokens it `held` and its `running` runners; `gateQueue`: the
+  waiting gate-class requests in the order returned tokens go to them, each with its `checkout`, gate `job` and `want`;
+  and `background`: each checkout's background-class stake alone (`held`, `running`, `waiting`), for the checkouts that
+  have one. `cowshed gateway status` shows this ledger to the operator in the order it serves — the head gate job, the
+  gate jobs behind it, the gate queue, then background — in its human lines, and verbatim as `cpuBudget` in `--json`
+  (06_cli.md; 07_api.md `GatewayStatus`), so whether queued lands wait behind the head of the queue without loading it
+  is visible rather than inferred; a daemon that does not answer `cpu-budget` is reported as such, never as an empty
+  ledger.
 - **Priority updates.** `{"op":"job-qos","job":{…}|"lease":"<lease id>","priority":<u32>}` is one-shot and answers
   `{"ok":true}`, or `not-found` for an admission that is not live. It re-keys the selected admission only while queued;
   a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions. This

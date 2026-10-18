@@ -1334,9 +1334,10 @@ pub fn emit_gateway_status<W: Write, E: Write>(
     Ok(())
 }
 
-/// The host CPU ledger in the operator's words (05_gateway.md "Host CPU budget"): tokens held of
-/// the total, each checkout's holders and waiters, then the gate queue in the order returned
-/// tokens go to it — or why the daemon gave no ledger.
+/// The host CPU ledger in the operator's words (05_gateway.md "Host CPU budget"), in the order the
+/// ledger serves it: tokens held of the total; the running gate jobs, the head — the oldest — first;
+/// the waiting gate-class requests in the order returned tokens go to them; then each checkout's
+/// background stake, served behind them. Or why the daemon gave no ledger.
 fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
     let ledger = match budget {
         GatewayCpuBudget::Ledger(ledger) => ledger,
@@ -1346,17 +1347,28 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
             )];
         }
     };
-    let mut lines = Vec::with_capacity(2 + ledger.checkouts.len() + ledger.gate_queue.len());
+    let mut lines = Vec::with_capacity(
+        4 + ledger.gate_jobs.len() + ledger.gate_queue.len() + ledger.background.len(),
+    );
     lines.push(format!(
         "gateway cpu budget: held {}/{} tokens",
         ledger.held, ledger.total
     ));
-    lines.extend(ledger.checkouts.iter().map(|checkout| {
-        format!(
-            "gateway cpu budget: {}: held {}, running {}, waiting {}",
-            checkout.checkout, checkout.held, checkout.running, checkout.waiting
-        )
-    }));
+    match ledger.gate_jobs.split_first() {
+        None => lines.push("gateway gate head: no gate job is running".to_owned()),
+        Some((head, behind)) => {
+            lines.push(format!(
+                "gateway gate head: {} gate job {}: held {}, running {}",
+                head.checkout, head.job, head.held, head.running
+            ));
+            lines.extend(behind.iter().map(|job| {
+                format!(
+                    "gateway gate job behind the head: {} gate job {}: held {}, running {}",
+                    job.checkout, job.job, job.held, job.running
+                )
+            }));
+        }
+    }
     if ledger.gate_queue.is_empty() {
         lines.push("gateway gate queue: empty".to_owned());
     } else {
@@ -1374,6 +1386,15 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
             )
         }));
     }
+    if ledger.background.is_empty() {
+        lines.push("gateway background: none".to_owned());
+    }
+    lines.extend(ledger.background.iter().map(|stake| {
+        format!(
+            "gateway background: {}: held {}, running {}, waiting {}",
+            stake.checkout, stake.held, stake.running, stake.waiting
+        )
+    }));
     lines
 }
 

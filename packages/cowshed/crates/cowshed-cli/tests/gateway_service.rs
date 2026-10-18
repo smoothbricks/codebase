@@ -13,7 +13,7 @@ use cowshed_cli::launchd::{
 use cowshed_cli::output::Output;
 use cowshed_core::api::{GatewayCpuBudget, GatewayStatus as CliGatewayStatus};
 use cowshed_core::{CowshedError, Result};
-use cowshed_gateway_types::{CpuBudgetStatus, CpuCheckoutStatus, CpuGateWaiter};
+use cowshed_gateway_types::{CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter};
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -355,9 +355,10 @@ fn answering_status(cpu_budget: GatewayCpuBudget) -> CliGatewayStatus {
     }
 }
 
-/// `gateway status` shows who holds the host's CPU tokens and the gate queue in serving order,
-/// as the daemon's `cpu-budget` ledger says (05_gateway.md "Host CPU budget", Wire), in both
-/// the human lines and the JSON result.
+/// `gateway status` shows who holds the host's CPU tokens in the order the ledger serves them —
+/// the head gate job, the gate jobs behind it, the gate queue, then background — as the daemon's
+/// `cpu-budget` ledger says (05_gateway.md "Host CPU budget", Wire), in both the human lines and
+/// the JSON result.
 #[test]
 fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
     let ledger = CpuBudgetStatus {
@@ -373,8 +374,22 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
             CpuCheckoutStatus {
                 checkout: "/w/younger-land".into(),
                 held: 4,
-                running: 1,
+                running: 2,
                 waiting: 1,
+            },
+        ],
+        gate_jobs: vec![
+            CpuGateJob {
+                checkout: "/w/older-land".into(),
+                job: 3,
+                held: 12,
+                running: 2,
+            },
+            CpuGateJob {
+                checkout: "/w/younger-land".into(),
+                job: 5,
+                held: 1,
+                running: 1,
             },
         ],
         gate_queue: vec![
@@ -394,6 +409,20 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
                 want: 18,
             },
         ],
+        background: vec![
+            CpuCheckoutStatus {
+                checkout: "/w/older-land".into(),
+                held: 1,
+                running: 1,
+                waiting: 0,
+            },
+            CpuCheckoutStatus {
+                checkout: "/w/younger-land".into(),
+                held: 3,
+                running: 1,
+                waiting: 0,
+            },
+        ],
     };
 
     let mut output = Output::new(Vec::new(), Vec::new(), false);
@@ -408,20 +437,23 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
     let stderr = String::from_utf8(stderr).expect("utf8 status");
     let ledger_lines: Vec<&str> = stderr
         .lines()
-        .filter(|line| line.contains("cpu budget") || line.contains("gate queue"))
+        .skip_while(|line| !line.contains("cpu budget"))
         .collect();
-    assert_eq!(ledger_lines.len(), 7, "{stderr}");
-    for (line, expected) in ledger_lines.iter().zip([
-        "cowshed: gateway cpu budget: held 17/18 tokens",
-        "cowshed: gateway cpu budget: /w/older-land: held 13, running 3, waiting 2",
-        "cowshed: gateway cpu budget: /w/younger-land: held 4, running 1, waiting 1",
-        "cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them",
-        "cowshed: gateway gate queue 1: /w/older-land gate job 3 want 6",
-        "cowshed: gateway gate queue 2: /w/older-land gate job 3 want 2",
-        "cowshed: gateway gate queue 3: /w/younger-land gate job 5 want 18",
-    ]) {
-        assert_eq!(*line, expected, "{stderr}");
-    }
+    assert_eq!(
+        ledger_lines,
+        [
+            "cowshed: gateway cpu budget: held 17/18 tokens",
+            "cowshed: gateway gate head: /w/older-land gate job 3: held 12, running 2",
+            "cowshed: gateway gate job behind the head: /w/younger-land gate job 5: held 1, running 1",
+            "cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them",
+            "cowshed: gateway gate queue 1: /w/older-land gate job 3 want 6",
+            "cowshed: gateway gate queue 2: /w/older-land gate job 3 want 2",
+            "cowshed: gateway gate queue 3: /w/younger-land gate job 5 want 18",
+            "cowshed: gateway background: /w/older-land: held 1, running 1, waiting 0",
+            "cowshed: gateway background: /w/younger-land: held 3, running 1, waiting 0",
+        ],
+        "{stderr}"
+    );
 
     let mut output = Output::new(Vec::new(), Vec::new(), false);
     emit_gateway_status(
@@ -440,12 +472,20 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
             "held": 17,
             "checkouts": [
                 {"checkout": "/w/older-land", "held": 13, "running": 3, "waiting": 2},
-                {"checkout": "/w/younger-land", "held": 4, "running": 1, "waiting": 1}
+                {"checkout": "/w/younger-land", "held": 4, "running": 2, "waiting": 1}
+            ],
+            "gateJobs": [
+                {"checkout": "/w/older-land", "job": 3, "held": 12, "running": 2},
+                {"checkout": "/w/younger-land", "job": 5, "held": 1, "running": 1}
             ],
             "gateQueue": [
                 {"checkout": "/w/older-land", "job": 3, "want": 6},
                 {"checkout": "/w/older-land", "job": 3, "want": 2},
                 {"checkout": "/w/younger-land", "job": 5, "want": 18}
+            ],
+            "background": [
+                {"checkout": "/w/older-land", "held": 1, "running": 1, "waiting": 0},
+                {"checkout": "/w/younger-land", "held": 3, "running": 1, "waiting": 0}
             ]
         }})
     );
@@ -463,6 +503,8 @@ fn gateway_status_says_an_empty_gate_queue_is_empty() {
             held: 0,
             checkouts: Vec::new(),
             gate_queue: Vec::new(),
+            gate_jobs: Vec::new(),
+            background: Vec::new(),
         })),
     )
     .expect("status emits");
@@ -471,7 +513,12 @@ fn gateway_status_says_an_empty_gate_queue_is_empty() {
         stderr.contains("gateway cpu budget: held 0/18 tokens"),
         "{stderr}"
     );
+    assert!(
+        stderr.contains("gateway gate head: no gate job is running"),
+        "{stderr}"
+    );
     assert!(stderr.contains("gateway gate queue: empty"), "{stderr}");
+    assert!(stderr.contains("gateway background: none"), "{stderr}");
 }
 
 /// A daemon that answers `status` but refuses `cpu-budget` — one from before the request — is
