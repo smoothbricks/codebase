@@ -1096,12 +1096,11 @@ fn current_install() -> ExecutableInstallState {
 /// switches the launcher and daemon to the same stored build.
 #[test]
 fn launcher_link_plan_follows_the_stable_name_beside_it() {
-    let executable = cowshed_binary();
     let binary_directory = PathBuf::from(BINARY_DIRECTORY);
     let stable_name = PathBuf::from(COWSHED_BINARY_NAME);
 
     assert_eq!(
-        plan_launcher_link(&executable, &StableLink::Absent).operations(),
+        plan_launcher_link(&binary_directory, &StableLink::Absent).operations(),
         [
             Mutation::CreateTemporarySymlink {
                 directory: binary_directory.clone(),
@@ -1112,12 +1111,21 @@ fn launcher_link_plan_follows_the_stable_name_beside_it() {
                 destination: binary_directory.join(JOBSERVER_LAUNCHER_NAME),
             },
             Mutation::SyncDirectory {
-                path: binary_directory
+                path: binary_directory.clone()
             },
         ]
     );
-    assert!(plan_launcher_link(&executable, &StableLink::To(stable_name)).is_noop());
-    assert!(!plan_launcher_link(&executable, &StableLink::To(stored_name())).is_noop());
+    assert!(plan_launcher_link(&binary_directory, &StableLink::To(stable_name)).is_noop());
+    assert!(!plan_launcher_link(&binary_directory, &StableLink::To(stored_name())).is_noop());
+    // A link saying any other installed executable — the Nx cache server's, as its install once
+    // left it — is repaired to `cowshed`, the only binary that answers to `cargo`.
+    assert!(
+        !plan_launcher_link(
+            &binary_directory,
+            &StableLink::To(PathBuf::from("nx-cache-server"))
+        )
+        .is_noop()
+    );
 }
 
 /// A copy of the build is stored once under the name its bytes give it, and the stable name moves

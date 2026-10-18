@@ -813,12 +813,17 @@ pub fn plan_executable_install(
     InstallPlan { operations }
 }
 
-/// Plan the `cargo` link to the relative stable cowshed name: one rename of
-/// that stable name publishes the same stored build for the launcher and
-/// daemon, including when a failed activation restores the previous build.
-/// A link that already names the stable name plans nothing.
-pub fn plan_launcher_link(executable: &HostStableExecutable, current: &StableLink) -> InstallPlan {
-    let target = PathBuf::from(executable.name());
+/// Plan the `cargo` link in the host-stable `directory` to the relative stable cowshed name: one
+/// rename of that stable name publishes the same stored build for the launcher and daemon,
+/// including when a failed activation restores the previous build. A link that already names the
+/// stable name plans nothing.
+///
+/// The target is [`COWSHED_BINARY_NAME`] and nothing else, whichever executable was installed
+/// last: only cowshed answers to `cargo` (05_gateway.md, "Name in `bin`"). Deriving it from the
+/// executable an install had just written pointed `cargo` at `nx-cache-server`, which refuses
+/// every cargo argument.
+pub fn plan_launcher_link(directory: &Path, current: &StableLink) -> InstallPlan {
+    let target = PathBuf::from(COWSHED_BINARY_NAME);
     if *current == StableLink::To(target.clone()) {
         return InstallPlan {
             operations: Vec::new(),
@@ -827,15 +832,15 @@ pub fn plan_launcher_link(executable: &HostStableExecutable, current: &StableLin
     InstallPlan {
         operations: vec![
             Mutation::CreateTemporarySymlink {
-                directory: executable.directory().to_path_buf(),
+                directory: directory.to_path_buf(),
                 name_prefix: format!(".{JOBSERVER_LAUNCHER_NAME}.link."),
                 target,
             },
             Mutation::RenameTemporaryFile {
-                destination: executable.directory().join(JOBSERVER_LAUNCHER_NAME),
+                destination: directory.join(JOBSERVER_LAUNCHER_NAME),
             },
             Mutation::SyncDirectory {
-                path: executable.directory().to_path_buf(),
+                path: directory.to_path_buf(),
             },
         ],
     }

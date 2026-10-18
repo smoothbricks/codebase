@@ -1379,14 +1379,14 @@ where
 pub fn install_host_stable_executable<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
     home: &Path,
-    name: &str,
     source: &Path,
 ) -> Result<HostStableExecutable>
 where
     F: LaunchdFilesystem,
 {
-    let executable = HostStableExecutable::new(home, name).map_err(launchd_error)?;
+    let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     install_stored_executable(executor, &executable, &executable_digest(source)?, source)?;
+    link_jobserver_launcher(executor, executable.directory())?;
     Ok(executable)
 }
 
@@ -1403,17 +1403,31 @@ where
     executor
         .execute_install(&plan_executable_install(executable, digest, source, &state))
         .map_err(launchd_error)?;
-    // The same build under the launcher's name, beside the stable name.
-    let launcher = observe_launcher_link(executable)?;
+    Ok(())
+}
+
+/// Point `cargo` in the host-stable `directory` at the stable `cowshed` name beside it.
+///
+/// Called by the cowshed installs alone, after the stable name runs the build they installed,
+/// never by the generic stored-executable install: the Nx cache server is installed through that
+/// too, and a launcher link planted there followed whichever executable went in last.
+fn link_jobserver_launcher<F, C>(
+    executor: &mut LaunchdExecutor<F, C>,
+    directory: &Path,
+) -> Result<()>
+where
+    F: LaunchdFilesystem,
+{
+    let launcher = observe_launcher_link(directory)?;
     executor
-        .execute_install(&plan_launcher_link(executable, &launcher))
+        .execute_install(&plan_launcher_link(directory, &launcher))
         .map_err(launchd_error)?;
     Ok(())
 }
 
 /// What the `cargo` link beside the stable name currently is.
-fn observe_launcher_link(executable: &HostStableExecutable) -> Result<StableLink> {
-    let path = executable.directory().join(JOBSERVER_LAUNCHER_NAME);
+fn observe_launcher_link(directory: &Path) -> Result<StableLink> {
+    let path = directory.join(JOBSERVER_LAUNCHER_NAME);
     match inspect_existing(&path)? {
         None => Ok(StableLink::Absent),
         Some(metadata) if metadata.uid() != effective_uid() => Err(CowshedError::integrity(
@@ -1813,6 +1827,7 @@ where
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
     let retained = retain_previous_executable(executor, &executable)?;
     install_stored_executable(executor, &executable, &candidate.digest, &candidate.source)?;
+    link_jobserver_launcher(executor, executable.directory())?;
     record_installed_source(&executable, &candidate.source);
     record_installed_build(&executable, candidate);
     match activate_launch_agent(executor, effective_uid(), spec.target(), plist) {
@@ -2101,6 +2116,9 @@ where
             retained.as_deref(),
         );
     }
+    // Also when the stable name already ran this build: a setup is what repairs a `cargo` link
+    // that says anything but `cowshed`, as the Nx cache server's install once left it.
+    link_jobserver_launcher(executor, executable.directory())?;
     let from_installed_copy = candidate
         .source
         .parent()
@@ -2490,13 +2508,8 @@ mod tests {
         fs::write(executable.path(), b"the build running setup").expect("refresh");
         assert!(stale(&candidate));
 
-        install_host_stable_executable(
-            &mut LaunchdExecutor::native(),
-            &home,
-            COWSHED_BINARY_NAME,
-            &candidate.source,
-        )
-        .expect("install");
+        install_host_stable_executable(&mut LaunchdExecutor::native(), &home, &candidate.source)
+            .expect("install");
         assert!(!stale(&candidate), "the installed build is current");
         assert_eq!(
             fs::read_link(executable.path()).expect("the stable name is a link"),
@@ -2553,13 +2566,8 @@ mod tests {
             b"the already installed release",
             None,
         );
-        install_host_stable_executable(
-            &mut LaunchdExecutor::native(),
-            &home,
-            COWSHED_BINARY_NAME,
-            &candidate.source,
-        )
-        .unwrap();
+        install_host_stable_executable(&mut LaunchdExecutor::native(), &home, &candidate.source)
+            .unwrap();
         let desired = spec.plist_bytes();
         let desired_text = std::str::from_utf8(&desired).unwrap();
         let limits_start = desired_text
@@ -2612,6 +2620,52 @@ mod tests {
         assert_eq!(command.argv.len(), 6);
         assert_eq!(command.argv[2][0], "bootstrap");
         assert_eq!(command.argv[5][0], "bootstrap");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// `cargo` says `cowshed` after every setup, including one whose cowshed is already current:
+    /// the Nx cache server's install once re-pointed it at `nx-cache-server`, which refuses every
+    /// cargo argument, and a setup with nothing else to change returned with it so.
+    #[test]
+    fn every_setup_leaves_cargo_saying_cowshed() {
+        let (home, executable, _) = host_with_agent("cargo-launcher");
+        let candidate = build(&home, "release", b"the installed release", None);
+        install_host_stable_executable(&mut LaunchdExecutor::native(), &home, &candidate.source)
+            .unwrap();
+        let launcher = executable.directory().join(JOBSERVER_LAUNCHER_NAME);
+        replace_symlink(Path::new("nx-cache-server"), &launcher).unwrap();
+        let mut executor: RecordingExecutor = LaunchdExecutor::new(
+            NativeFilesystem::new(),
+            RecordingGatewayLaunchctl::default(),
+        );
+
+        for run in ["the setup that repairs it", "the setup after it"] {
+            refresh_gateway_from(&home, &candidate, false, Ok(()), None, &mut executor).unwrap();
+            let installed = install_cli_from(
+                &home,
+                &candidate,
+                false,
+                Ok(()),
+                std::ffi::OsStr::new(""),
+                &mut executor,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    installed,
+                    CliInstall::Installed {
+                        replaced: false,
+                        ..
+                    }
+                ),
+                "{run}: {installed:?}"
+            );
+            assert_eq!(
+                fs::read_link(&launcher).unwrap(),
+                Path::new(COWSHED_BINARY_NAME),
+                "{run}"
+            );
+        }
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2905,13 +2959,8 @@ mod tests {
             b"a build whose agent will not load",
             Some(200),
         );
-        install_host_stable_executable(
-            &mut LaunchdExecutor::native(),
-            &home,
-            COWSHED_BINARY_NAME,
-            &first.source,
-        )
-        .unwrap();
+        install_host_stable_executable(&mut LaunchdExecutor::native(), &home, &first.source)
+            .unwrap();
         let launcher = executable.directory().join(JOBSERVER_LAUNCHER_NAME);
         assert_eq!(executable_digest(executable.path()).unwrap(), first.digest);
         assert_eq!(executable_digest(&launcher).unwrap(), first.digest);
