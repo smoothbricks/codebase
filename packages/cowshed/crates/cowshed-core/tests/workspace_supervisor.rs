@@ -4577,6 +4577,113 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     remote.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
+/// The served supervisor for a running job, as `cowshed exec --class gate` reaches it: the job,
+/// its spawn, and the socket a hold names.
+async fn held_job_fixture(h: &mut Harness) -> (JobId, Spawned, PathBuf) {
+    use cowshed_core::runtime::supervisor_socket;
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::StdinClosed(job)
+    );
+    let path = supervisor_socket::socket_path(
+        &manager_store(),
+        &authority().repo_id,
+        &authority().workspace,
+    );
+    let listener = supervisor_socket::bind(&path).await.unwrap();
+    tokio::spawn(supervisor_socket::serve(
+        listener,
+        h.handle.clone(),
+        None,
+        None,
+    ));
+    (job, spawned, path)
+}
+
+/// A gate whose operator is gone is killed (05_gateway.md, "A gate lives with its operator"):
+/// the holder's connection closing while the job runs — its process ending, `SIGKILL` included —
+/// signals the job's group, and the job ends Killed.
+#[tokio::test]
+async fn a_held_job_is_killed_when_its_holder_goes_away() {
+    use cowshed_core::runtime::supervisor_socket;
+    let (mut h, _root) = harness(1, 1024, false, false);
+    let (job, spawned, path) = held_job_fixture(&mut h).await;
+    let hold = supervisor_socket::hold(&path, &authority().workspace_incarnation, job)
+        .await
+        .unwrap();
+    drop(hold);
+    assert_eq!(
+        h.process.recv().await.unwrap(),
+        ProcessObservation::Signal(job, ProcessSignal::Term)
+    );
+    complete(
+        &spawned,
+        b"",
+        b"",
+        ExitStatus::Signaled {
+            signal: 15,
+            core_dumped: false,
+        },
+    )
+    .await;
+    assert_eq!(h.handle.wait(job).await.unwrap().state, JobState::Killed);
+}
+
+/// A released hold leaves the job running, as `--timeout` leaves a gate it stopped waiting for;
+/// a job that ended answers its hold, and closing that hold afterwards kills nothing.
+#[tokio::test]
+async fn a_released_or_answered_hold_kills_nothing() {
+    use cowshed_core::runtime::supervisor_socket;
+    let (mut h, _root) = harness(1, 1024, false, false);
+    let (job, spawned, path) = held_job_fixture(&mut h).await;
+    let incarnation = authority().workspace_incarnation;
+    supervisor_socket::hold(&path, &incarnation, job)
+        .await
+        .unwrap()
+        .release()
+        .await
+        .unwrap();
+    let answered = supervisor_socket::hold(&path, &incarnation, job)
+        .await
+        .unwrap();
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    assert_eq!(h.handle.wait(job).await.unwrap().state, JobState::Exited);
+    drop(answered);
+    assert!(
+        h.process.try_recv().is_err(),
+        "neither the released hold nor the answered one signalled the job"
+    );
+    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Exited);
+}
+
+/// A hold names the incarnation its job belongs to; a supervisor serving another one refuses it
+/// before anything is held.
+#[tokio::test]
+async fn a_hold_refuses_another_incarnation() {
+    use cowshed_core::runtime::supervisor_socket;
+    let (mut h, _root) = harness(1, 1024, false, false);
+    let (job, _spawned, path) = held_job_fixture(&mut h).await;
+    let other = WorkspaceIncarnation::new("0198f2c0b7e34dc795f17b238b331c81").unwrap();
+    assert_eq!(
+        supervisor_socket::hold(&path, &other, job)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+}
+
 /// A grant change can land between a controller's read of the grants and its ensure — another
 /// process's gateway reconcile moving the workspace's port block, a `grant`, a project-wide
 /// grant — and the supervisor started or advanced since serves the newer revision. The

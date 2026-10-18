@@ -30,7 +30,8 @@ use crate::gateway_service::{
 use crate::output::Output;
 use crate::runtime::{
     DispatchExit, ExecEnd, ExecPresentation, ExecResult, ForegroundJob, emit_mount_path,
-    exec_command, exec_presentation, output_error, relay_foreground, report_exec, success,
+    exec_command, exec_presentation, hold_gate, output_error, relay_foreground, report_exec,
+    success,
 };
 
 /// Whether the resident path answered, and if not, what the controller path still needs.
@@ -186,9 +187,11 @@ async fn run(
     stderr: &mut (dyn Write + Send),
 ) -> Result<ExecResult> {
     let build_volume = resident.build_volume.clone();
+    let incarnation = resident.authority().workspace_incarnation.clone();
     let link = JobLink::new(resident);
     // The operator's gate is the coordinator's route, as it is through the controller.
-    let source = if request.class == cowshed_core::api::JobserverClass::Gate {
+    let gate = request.class == cowshed_core::api::JobserverClass::Gate;
+    let source = if gate {
         cowshed_core::runtime::supervisor_socket::AdmissionSource::Coordinator
     } else {
         cowshed_core::runtime::supervisor_socket::AdmissionSource::Worker
@@ -209,15 +212,14 @@ async fn run(
             end: ExecEnd::Backgrounded,
         });
     }
+    let job = ResidentJob { link, job };
+    let hold = if gate {
+        Some(hold_gate(&job, &job.link.socket, &incarnation, job.job).await?)
+    } else {
+        None
+    };
     let _relay = span("resident", "relay");
-    relay_foreground(
-        &ResidentJob { link, job },
-        timeout,
-        presentation,
-        stdout,
-        stderr,
-    )
-    .await
+    relay_foreground(&job, hold, timeout, presentation, stdout, stderr).await
 }
 
 /// A job of the resident workspace, reached through its supervisor's socket.
@@ -240,6 +242,10 @@ impl ForegroundJob for ResidentJob {
     /// nothing to tell it.
     async fn detach(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn kill(&self) -> Result<()> {
+        self.link.clone().kill(self.job).await
     }
 
     async fn relay(&self, stream: JobStream, writer: &mut (dyn Write + Send)) -> Result<()> {
@@ -298,6 +304,16 @@ impl JobLink {
             Err(error) => {
                 self.followed(error).await?;
                 self.handle.wait(job).await
+            }
+            done => done,
+        }
+    }
+
+    async fn kill(mut self, job: JobId) -> Result<()> {
+        match self.handle.kill(job).await {
+            Err(error) => {
+                self.followed(error).await?;
+                self.handle.kill(job).await
             }
             done => done,
         }

@@ -328,6 +328,12 @@ enum Call {
     Wait {
         job_id: JobId,
     },
+    /// Hold the job for as long as this connection stays open (`hold`). The job's end answers
+    /// it; a [`HoldDemand::Release`] lets the job outlive it; a close before either kills it.
+    #[serde(rename_all = "camelCase")]
+    Hold {
+        job_id: JobId,
+    },
     #[serde(rename_all = "camelCase")]
     LogRead {
         job_id: JobId,
@@ -1030,6 +1036,10 @@ async fn serve_call(
         serve_process_events(stream, &caller, job_id, every).await?;
         return Ok(Retirement::Serving);
     }
+    if let Call::Hold { job_id } = *call {
+        serve_hold(stream, supervisor, &caller, job_id).await?;
+        return Ok(Retirement::Serving);
+    }
     let retiring = matches!(*call, Call::Retire { .. });
     let (value, bytes) = match answer(&caller, streams, *call, payload).await {
         Ok(answer) => answer,
@@ -1083,6 +1093,65 @@ async fn serve_process_events(
     )
     .await?;
     relay_process_events(stream, events).await
+}
+
+/// Hold `job_id` for its holder: answer `null` once the hold is in place, then the job's
+/// terminal `JobInfo` when it ends, or `null` again when the holder releases it. A holder that
+/// closes the connection first — it exited, or was killed, `SIGKILL` included, since the kernel
+/// closes its socket — has left a job nobody waits for, and the job is killed
+/// (05_gateway.md, "A gate lives with its operator").
+async fn serve_hold(
+    mut stream: UnixStream,
+    supervisor: &WorkspaceSupervisorHandle,
+    caller: &WorkspaceSupervisorHandle,
+    job_id: JobId,
+) -> Result<()> {
+    if let Err(error) = caller.info(job_id).await {
+        return write_json(&mut stream, &Response::Err(error)).await;
+    }
+    write_json(
+        &mut stream,
+        &Response::Ok {
+            value: serde_json::Value::Null,
+            bytes: 0,
+        },
+    )
+    .await?;
+    let (mut reader, mut writer) = stream.into_split();
+    tokio::select! {
+        biased;
+        ended = caller.wait(job_id) => {
+            let response = match ended {
+                Ok(info) => Response::Ok { value: to_value(&info)?, bytes: 0 },
+                Err(error) => Response::Err(error),
+            };
+            write_json(&mut writer, &response).await
+        }
+        demand = read_json::<HoldDemand>(&mut reader) => match demand {
+            Ok(HoldDemand::Release) => {
+                write_json(
+                    &mut writer,
+                    &Response::Ok { value: serde_json::Value::Null, bytes: 0 },
+                )
+                .await
+            }
+            Err(_) => kill_unheld(supervisor, job_id).await,
+        },
+    }
+}
+
+/// Kill `job_id` because its holder went away while it ran. The job may have been advanced onto
+/// a newer grant revision meanwhile, so it is reached under the authority served now.
+async fn kill_unheld(supervisor: &WorkspaceSupervisorHandle, job_id: JobId) -> Result<()> {
+    let current = supervisor.with_authority(supervisor.current_authority().await?);
+    if current.info(job_id).await?.state.is_terminal() {
+        return Ok(());
+    }
+    eprintln!(
+        "cowshed: job {} lost its holder before it ended; killing it, since nothing waits for it",
+        job_id.get()
+    );
+    current.kill(job_id).await
 }
 
 async fn relay_process_events(stream: UnixStream, mut events: JobProcessStream) -> Result<()> {
@@ -1304,6 +1373,9 @@ async fn answer(
         ),
         Call::ProcessEvents { .. } => {
             return Err(protocol_error("process events require their demand stream"));
+        }
+        Call::Hold { .. } => {
+            return Err(protocol_error("a hold requires its connection"));
         }
         Call::TraceHealth => (to_value(&supervisor.trace_health().await?)?, Bytes::new()),
         Call::ListeningPorts { job_id } => (
@@ -1732,6 +1804,73 @@ async fn open_process_events(
         }
     });
     Ok(JobProcessStream::new(receive))
+}
+
+/// What a holder asks of its hold: to let the job outlive it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum HoldDemand {
+    Release,
+}
+
+/// A job this process holds (`hold`). Dropping it while the job runs — this process ending
+/// included, however it ends — kills the job; [`JobHold::release`] lets the job run on.
+#[derive(Debug)]
+pub struct JobHold {
+    stream: UnixStream,
+}
+
+impl JobHold {
+    /// Let the held job outlive this hold. A job that ended meanwhile has already answered the
+    /// hold with its terminal record, which releases it as well.
+    pub async fn release(mut self) -> Result<()> {
+        let sent = write_json(&mut self.stream, &HoldDemand::Release).await;
+        match (read_json::<Response>(&mut self.stream).await, sent) {
+            (Ok(Response::Ok { .. }), _) => Ok(()),
+            (Ok(Response::Err(error)), _) | (Err(_), Err(error)) | (Err(error), Ok(())) => {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Hold job `job_id` of the supervisor serving `path`, which must serve `incarnation`: the job
+/// lives no longer than the returned [`JobHold`] unless it is released (05_gateway.md, "A gate
+/// lives with its operator"). The hold names the authority served now, so a grant change
+/// between the job's admission and its hold changes nothing.
+pub async fn hold(
+    path: &Path,
+    incarnation: &crate::metadata::WorkspaceIncarnation,
+    job_id: JobId,
+) -> Result<JobHold> {
+    let serving = hello(path).await?;
+    if serving.authority.workspace_incarnation != *incarnation {
+        return Err(CowshedError::conflict(
+            format!(
+                "the supervisor at {} serves another incarnation of the workspace than job {}'s",
+                path.display(),
+                job_id.get()
+            ),
+            "run the command again against the current workspace",
+        ));
+    }
+    let mut stream = UnixStream::connect(path)
+        .await
+        .map_err(|error| unavailable(path, &error))?;
+    write_json(
+        &mut stream,
+        &Request::Call {
+            authority: (&serving.authority).into(),
+            call: Box::new(Call::Hold { job_id }),
+            bytes: 0,
+        },
+    )
+    .await?;
+    match read_json::<Response>(&mut stream).await? {
+        Response::Err(error) => Err(error),
+        Response::Ok { value, bytes: 0 } if value.is_null() => Ok(JobHold { stream }),
+        Response::Ok { .. } => Err(protocol_error("malformed hold answer")),
+    }
 }
 
 async fn forward(path: Arc<PathBuf>, command: Command) {
