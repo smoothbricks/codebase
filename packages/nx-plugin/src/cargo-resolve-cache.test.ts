@@ -1,4 +1,4 @@
-import { expect, it } from 'bun:test';
+import { afterAll, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import {
   appendFile,
@@ -34,6 +34,7 @@ import {
   withEnvironment,
 } from './__tests__/counted-cargo.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
+import { testFileInstallation } from './__tests__/owned-installation.js';
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
 import {
   acquireCargoResolveLock,
@@ -44,6 +45,10 @@ import {
 import { createNodesV2 } from './index.js';
 
 useFixtureCargoHome();
+
+/** The Nx installation this file's graph fixtures share; none may write into it. */
+const installation = testFileInstallation('cargo-resolve-installation-');
+afterAll(() => installation.retire());
 
 /*
  * What Cargo resolution costs, measured by the one number that matters: how many `cargo metadata`
@@ -63,7 +68,6 @@ useFixtureCargoHome();
 
 const sourceModule = join(import.meta.dir, 'cargo-source-hash.ts');
 const cliModule = join(import.meta.dir, 'bin', 'smoo-nx-cargo-hash.ts');
-const repositoryRoot = join(import.meta.dir, '../../..');
 
 const spawned = async (cargo: CountedCargo): Promise<number> => (await cargo.runs()).spawned;
 
@@ -870,7 +874,7 @@ async function graphFixture(root: string): Promise<string> {
   };
   for (const [path, text] of Object.entries(files)) await put(root, path, text);
   execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
-  await symlink(join(repositoryRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+  await symlink(await installation.nodeModules(), join(workspace, 'node_modules'), 'dir');
   relock(workspace);
   return workspace;
 }

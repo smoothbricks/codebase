@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { TargetConfiguration } from 'nx/src/devkit-exports.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
+import { testFileInstallation } from './__tests__/owned-installation.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import type { NxTaskContext } from './executors/bounded-exec/executor.js';
 import { hostLeaseProcesses } from './executors/bounded-exec/ram-temp.js';
@@ -64,6 +65,8 @@ let ending = false;
 let bodyDone: Promise<void> = Promise.resolve();
 /** A failed barrier keeps the fixture, even if a later cleanup attempt succeeds. */
 let barrierFailure: string | undefined;
+/** The Nx installation the fixture links; it must leave it as it was made. */
+const installation = testFileInstallation('smoo-nextest-partitions-installation-');
 
 beforeAll(
   caseBody(async () => {
@@ -108,7 +111,7 @@ ${expected.map((name) => `    #[test] fn ${name}() { record("${name}");${serial.
 }
 `,
     );
-    await symlink(join(import.meta.dir, '../../../node_modules'), join(root, 'node_modules'), 'dir');
+    await symlink(await installation.nodeModules(), join(root, 'node_modules'), 'dir');
     await run(root, ['git', 'init', '--quiet']);
     await run(root, ['cargo', 'generate-lockfile', '--offline']);
     const [, infer] = createNodesV2ForPlatform('darwin', 'arm64');
@@ -205,6 +208,9 @@ afterAll(async () => {
   shared = undefined;
   await rm(root, { recursive: true, force: true });
 });
+
+// After the fixture's own teardown, so every process that could read the installation has ended.
+afterAll(() => installation.retire());
 
 function fixture(): SharedFixture {
   if (shared === undefined) {
