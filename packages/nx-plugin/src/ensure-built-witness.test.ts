@@ -478,12 +478,19 @@ describe('installed graph input identity', () => {
   it('names every moved node, and re-reads only one whose ctime alone moved', async () => {
     const file = join(root, 'stamped');
     await writeFile(file, 'before');
-    const witness = (): NodeWitness[] => [{ path: file, stamp: nodeStamp(lstatSync(file, { bigint: true })) }];
-    const chmodded = witness();
+    // A filesystem that stamps from the kernel's coarse tick (ZFS on Linux: 1 ms) keeps the stamp of a chmod or a
+    // same-size rewrite that lands in the tick of the last change. No call sets a ctime, so the file is dated a second
+    // back and recorded as it was then, when its ctime was its mtime: each change below moves it on every filesystem.
+    const past = new Date(Date.now() - 1000);
+    await utimes(file, past, past);
+    const recorded = lstatSync(file, { bigint: true });
+    const chmodded: NodeWitness[] = [
+      { path: file, stamp: nodeStamp(Object.assign(recorded, { ctimeNs: recorded.mtimeNs })) },
+    ];
     chmodSync(file, (await stat(file)).mode & 0o7777);
     expect(movedNodes(chmodded)).toBe(file);
     expect(movedNodes(chmodded, () => true)).toBeNull();
-    const written = witness();
+    const written: NodeWitness[] = [{ path: file, stamp: nodeStamp(lstatSync(file, { bigint: true })) }];
     await writeFile(file, 'after!');
     expect(movedNodes(written, () => true)).toBe(file);
     await rm(file);
