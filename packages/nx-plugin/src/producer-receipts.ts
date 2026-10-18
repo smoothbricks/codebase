@@ -124,6 +124,19 @@ function publish(root: string, target: string, record: ProducerRecord): ReceiptE
 function same(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
+/**
+ * Whether a tool node whose ctime alone moved still reads as `tools` recorded it: the same bytes, link text,
+ * membership and mode. Bun's global store is shared by every checkout, and linking a package's bin on any of their
+ * installs re-chmods the store file to the mode it already has; that moves the ctime of a node these tools witness
+ * without changing it, and is no reason to refuse the run.
+ */
+function recordedTool(tools: readonly EnsureBuiltProducerTool[]): (path: string) => boolean {
+  const recorded = new Map(tools.flatMap((tool) => tool.nodes.map((node) => [node.path, node] as const)));
+  return (path) => {
+    const node = recorded.get(path);
+    return node !== undefined && same(receiptNode(path, path, []), node);
+  };
+}
 function missing(paths: readonly string[]): boolean {
   return paths.every((path) => {
     try {
@@ -264,7 +277,7 @@ function toolsFor(
         sha256: sha(entries),
       });
     }
-    const capture = movedNodes(observed);
+    const capture = movedNodes(observed, recordedTool(tools));
     if (capture !== null)
       return { ok: false, detail: `Producer tool/module namespace moved during capture: ${capture}` };
     if (!missing(module.missing))
@@ -420,7 +433,7 @@ export async function postTasksExecution(
     }
     const tasks = completed.value;
     let detail: string | undefined;
-    const execution = movedNodes(frame.value.toolNodes);
+    const execution = movedNodes(frame.value.toolNodes, recordedTool(frame.value.tools));
     if (execution !== null) {
       refuse(`Producer tool/module nodes changed across actual execution: ${execution}`);
       continue;
@@ -493,7 +506,7 @@ export async function postTasksExecution(
       refuse(result.reason.detail);
       continue;
     }
-    const census = movedNodes(frame.value.toolNodes);
+    const census = movedNodes(frame.value.toolNodes, recordedTool(frame.value.tools));
     if (census !== null) {
       refuse(`Producer tools changed during post-execution product census: ${census}`);
       continue;
