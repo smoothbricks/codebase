@@ -179,12 +179,17 @@ describe('bounded-exec verdicts', () => {
   });
 
   it('records a failing command with no report as a failure, and a passing one as passed', async () => {
-    expect(await verdictOf('node -e "process.exit(3)"', { timeoutMs: 5_000 })).toEqual({
-      outcome: 'failed',
-      exitCode: 3,
-      tests: [],
-    });
-    expect(await verdictOf('node -e ""', { timeoutMs: 5_000 })).toEqual({ outcome: 'passed' });
+    // How an exit is classified, not how soon it comes: the clock is faked and nothing moves it, so the total bound
+    // cannot end a `node` still starting on a loaded host (a land gate measured 5243 ms for `node -e ""`). The run
+    // ends only by exiting.
+    const exiting = (command: string) =>
+      onProgressClock(
+        () => false,
+        0,
+        () => verdictOf(command, { timeoutMs: 5_000 }),
+      );
+    expect((await exiting('node -e "process.exit(3)"')).result).toEqual({ outcome: 'failed', exitCode: 3, tests: [] });
+    expect((await exiting('node -e ""')).result).toEqual({ outcome: 'passed' });
   });
 
   it("reads nextest's typed timeout from its JUnit report", () => {
