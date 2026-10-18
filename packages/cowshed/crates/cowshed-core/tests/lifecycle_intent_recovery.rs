@@ -7,8 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cowshed_core::api::{AdoptOptions, RemoveOptions, RemoveReport};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
-    IntentLease, LIFECYCLE_INTENTS_FILE, LifecycleIntent, LifecycleIntentCompletion,
-    LifecycleIntentJournal, LifecycleIntentPhase, MintOptions,
+    IntentLease, KeptAbandonBundles, LIFECYCLE_INTENTS_FILE, LifecycleIntent,
+    LifecycleIntentCompletion, LifecycleIntentJournal, LifecycleIntentPhase, MintOptions,
 };
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
 
@@ -41,6 +41,52 @@ impl Drop for TestRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+/// What the trash keeps of `rm --abandon` is counted by the rule a sweep uses: only regular
+/// `*.bundle` files directly in it, never a staged `.partial`, a directory or a symlink.
+#[test]
+fn kept_abandon_bundles_count_only_regular_bundles_in_the_trash() {
+    let root = TestRoot::new("kept-bundles");
+    let trash = root.path().join("sessions/.trash");
+    assert_eq!(
+        KeptAbandonBundles::in_trash(&trash).expect("absent trash reads"),
+        None,
+        "a project that never abandoned anything keeps nothing"
+    );
+    fs::create_dir_all(&trash).expect("trash");
+    fs::write(trash.join("raven-1111.bundle"), vec![7_u8; 9000]).expect("first bundle");
+    fs::write(trash.join("crow-2222.bundle"), b"bundle").expect("second bundle");
+    fs::write(trash.join(".crow-2222.bundle.0abc.partial"), b"staged").expect("partial");
+    fs::create_dir(trash.join("not-a-file.bundle")).expect("directory");
+    std::os::unix::fs::symlink(trash.join("crow-2222.bundle"), trash.join("link.bundle"))
+        .expect("symlink");
+    fs::write(
+        trash.join("raven-0198f2c0b7e34dc795f17b238b331c80.dmg"),
+        b"image",
+    )
+    .expect("image");
+
+    let kept = KeptAbandonBundles::in_trash(&trash)
+        .expect("trash reads")
+        .expect("two bundles");
+    assert_eq!(kept.trash, trash);
+    assert_eq!(kept.count, 2);
+    let allocated = |name: &str| {
+        use std::os::unix::fs::MetadataExt as _;
+        fs::metadata(trash.join(name))
+            .expect("bundle metadata")
+            .blocks()
+            * 512
+    };
+    assert_eq!(
+        kept.bytes,
+        allocated("raven-1111.bundle") + allocated("crow-2222.bundle")
+    );
+    assert!(
+        kept.to_string().contains("keeps 2 abandon bundles"),
+        "{kept}"
+    );
 }
 
 fn workspace(value: &str) -> WorkspaceName {

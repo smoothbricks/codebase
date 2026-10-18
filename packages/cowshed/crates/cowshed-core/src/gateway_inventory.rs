@@ -970,6 +970,45 @@ impl NativeGatewayInventory {
         Ok(projects)
     }
 
+    /// What each adopted project's trash keeps of `rm --abandon`, for `ls --all` to name: no
+    /// listing shows `sessions/.trash`, and no plain gc deletes those bundles.
+    pub async fn kept_abandon_bundles(
+        &self,
+    ) -> Result<Vec<(RepoId, crate::storage::recovery::KeptAbandonBundles)>, GatewayInventoryError>
+    {
+        let inventory = self.clone();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            let store = inventory.storage.store();
+            let mut kept = Vec::new();
+            for repo_id in discover_repositories(store)? {
+                let layout = StorageLayout::new(store, &repo_id).map_err(|error| {
+                    GatewayInventoryError::InvalidMetadata {
+                        path: store.to_owned(),
+                        message: error.to_string(),
+                    }
+                })?;
+                let trash = layout
+                    .project()
+                    .sessions
+                    .join(crate::storage::recovery::TRASH_NAMESPACE);
+                match crate::storage::recovery::KeptAbandonBundles::in_trash(&trash) {
+                    Ok(Some(bundles)) => kept.push((repo_id, bundles)),
+                    Ok(None) => {}
+                    Err(source) => {
+                        return Err(GatewayInventoryError::Io {
+                            operation: "reading abandon bundles",
+                            path: trash,
+                            source,
+                        });
+                    }
+                }
+            }
+            Ok(kept)
+        })
+        .await
+        .map_err(|error| GatewayInventoryError::Blocking(error.to_string()))?
+    }
+
     fn adopted_projects_blocking(&self) -> Result<Vec<AdoptedProject>, GatewayInventoryError> {
         let scan = self.adopted_and_checkoutless_blocking()?;
         for (repo_id, error) in scan.issues {
