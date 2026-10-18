@@ -22,6 +22,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import {
   awaitExit,
   type ProcessEntry,
+  pidsWithTempIn,
   pidsWorkingIn,
   processTable,
   terminate,
@@ -80,7 +81,11 @@ import {
  * checks that the volume, the lease directory and its own claim are still as
  * it claimed them. A lease is a directory named after the task process's pid;
  * a lease whose pid is gone is reclaimed by the next task, and the volume is
- * detached when the last lease ends.
+ * detached when the last lease ends. The pid's death proves only that the task
+ * process is gone, not what it started: its command runs in a process group of
+ * its own, and every process started with the lease as its `TMPDIR` writes
+ * there wherever it works. So a dead lease is removed only once every process
+ * working in it, by working directory or by `TMPDIR`, has been stopped.
  *
  * The volume is created under its final name and never renamed. It is mounted by `mount_apfs` at a
  * private staging directory and marked there; the kernel then unmounts it (`umount`) and `diskutil mount`, the
@@ -180,16 +185,16 @@ const LEFTOVER_GRACE_MS = 5_000;
  */
 export interface LeaseProcesses {
   /**
-   * End every process whose working directory is in `directory`, and everything those started,
-   * and answer each as `<pid> (<command>)`. Every one has exited when this settles; one that
-   * would not rejects with its name.
+   * End every process that works in `directory` — its working directory or the `TMPDIR` it was
+   * started with is there — and everything those started, and answer each as `<pid> (<command>)`.
+   * Every one has exited when this settles; one that would not rejects with its name.
    */
   stopWorkingIn(directory: string): Promise<string[]>;
 }
 
 /** The host reads and signals cleanup uses; a seam for process ordering and signal failures. */
 export interface ProcessHost {
-  /** The processes whose working directory is `directory` or lies beneath it. */
+  /** The processes whose working directory, or the `TMPDIR` they were started with, is `directory` or lies beneath it. */
   workingIn(directory: string): Promise<number[]>;
   /** Every process on the host. */
   table(): Promise<ProcessEntry[]>;
@@ -201,13 +206,17 @@ const STARTS_NOTHING = /^[TtZ]/;
 
 /**
  * The processes `host` reads. A lease belongs to one task and its command is gone by the time the
- * lease ends, so what still works in it is what the command left behind. A fixture's Nx daemon is
- * the usual one: Nx detaches it into a session of its own, so the process-group kill that ends a
- * timed-out command never reaches it, and a test process that is killed runs no teardown of its
- * own. Deleting the lease asks such a daemon to leave only by deleting its record, which it
- * notices within a second when it is idle and not at all while it is wedged; a signal does not
- * depend on the daemon noticing, and a process left on the volume is what keeps it from
- * detaching.
+ * lease ends, so what still works in it is what the command left behind. Most of that works in the
+ * lease only through `TMPDIR`, never by working directory: a test's ttsc plugin build copies the
+ * typescript-go sources into `$TMPDIR` from a process working in its project, and a Bun or Node
+ * process writes its compile cache there as it exits. Neither is known to the task's pid, and
+ * whichever outlived that pid would write into a lease being removed (measured 2026-10-18: `rm`
+ * failing ENOTEMPTY under a ttsc copy whose task had died). A fixture's Nx daemon is another: Nx
+ * detaches it into a session of its own, so the process-group kill that ends a timed-out command
+ * never reaches it, and a test process that is killed runs no teardown of its own. Deleting the
+ * lease asks such a daemon to leave only by deleting its record, which it notices within a second
+ * when it is idle and not at all while it is wedged; a signal does not depend on the daemon
+ * noticing, and a process left on the volume is what keeps it from detaching.
  *
  * A leftover keeps running while it is looked for, and a child it starts after the process table
  * was read is in no table that was. So each one found is held with SIGSTOP and the table is read
@@ -290,8 +299,14 @@ export function leaseProcessesOn(host: ProcessHost): LeaseProcesses {
   };
 }
 
+/** What works in `directory` on this host: by working directory, and by the `TMPDIR` it was started with. */
+export async function pidsInLease(directory: string): Promise<number[]> {
+  const [working, temp] = await Promise.all([pidsWorkingIn(directory), pidsWithTempIn(directory)]);
+  return [...new Set([...working, ...temp])];
+}
+
 export const hostLeaseProcesses: LeaseProcesses = leaseProcessesOn({
-  workingIn: pidsWorkingIn,
+  workingIn: pidsInLease,
   table: processTable,
   signal: terminate,
 });
@@ -1054,9 +1069,10 @@ export class RamTempVolume {
     }
     const reaped: string[] = [];
     for (const candidate of candidates) {
-      // Its task is gone, so what works in it is what that task left: stopped before the lease
-      // is removed, even where the removal is refused below. A task reaps its own (`reap`).
-      if (!candidate.own && (await readdir(candidate.directory)).length > 0) {
+      // Its task is gone, so what works in it is what that task left: stopped before the lease is
+      // removed, even where the removal is refused below. An empty lease is asked too: a leftover
+      // that has not written yet writes once it runs again. A task reaps its own (`reap`).
+      if (!candidate.own) {
         reaped.push(...(await this.processes.stopWorkingIn(candidate.directory)));
       }
     }

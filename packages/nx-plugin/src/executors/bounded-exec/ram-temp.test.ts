@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { awaitExit, ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -658,15 +659,76 @@ describe('processes a task left working in its RAM lease', () => {
     }
   });
 
+  it('stops what writes into the lease through its TMPDIR from elsewhere, so the lease can be removed', async () => {
+    const lease = scratch();
+    const elsewhere = scratch();
+    // As a dead task's ttsc plugin build leaves it: working in its project, writing into `$TMPDIR`
+    // as fast as it can (shell builtins only, so it forks nothing), with a child of its own. macOS
+    // spells TMPDIR with a trailing slash.
+    const writer = spawn('sh', ['-c', 'sleep 600 & echo $!; i=0; while :; do i=$((i+1)); : > "$TMPDIR/w$i"; done'], {
+      cwd: elsewhere,
+      env: { ...process.env, TMPDIR: `${lease}/` },
+      detached: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    // Another, started on its own with a TMPDIR beneath the lease.
+    mkdirSync(join(lease, 'nested'));
+    const nested = spawn('sleep', ['600'], {
+      cwd: elsewhere,
+      env: { ...process.env, TMPDIR: join(lease, 'nested') },
+      detached: true,
+      stdio: 'ignore',
+    });
+    const exited = [once(writer, 'close'), once(nested, 'close')];
+    const pids = [writer.pid ?? 0, nested.pid ?? 0];
+    let child = 0;
+    try {
+      child = Number(String((await once(writer.stdout, 'data'))[0]).trim());
+      while (readdirSync(lease).length < 2) {
+        await sleep(5);
+      }
+      // None of them works in the lease by its working directory.
+      expect(await pidsWorkingIn(lease)).toEqual([]);
+
+      const stopped = await hostLeaseProcesses.stopWorkingIn(lease);
+
+      expect(stopped.map((entry) => Number(entry.split(' ')[0])).sort((a, b) => a - b)).toEqual(
+        [...pids, child].sort((a, b) => a - b),
+      );
+      expect(await liveAmong([...pids, child])).toEqual([]);
+      // Nothing writes there any more: the lease goes whole, with no ENOTEMPTY.
+      await rm(lease, { recursive: true });
+    } finally {
+      for (const pid of [...pids, child]) {
+        if (pid !== 0) {
+          terminate(pid, 'SIGKILL');
+        }
+      }
+      await Promise.all(exited);
+      rmSync(lease, { recursive: true, force: true });
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
   it('stops nothing in a lease no process works in, and nothing that works elsewhere', async () => {
     const lease = scratch();
     const elsewhere = scratch();
     const bystander = spawn('sleep', ['600'], { cwd: elsewhere, detached: true, stdio: 'ignore' });
+    // A TMPDIR that only starts with the lease's name is another directory.
+    const sibling = spawn('sleep', ['600'], {
+      cwd: elsewhere,
+      env: { ...process.env, TMPDIR: `${lease}x` },
+      detached: true,
+      stdio: 'ignore',
+    });
     try {
       expect(await hostLeaseProcesses.stopWorkingIn(lease)).toEqual([]);
-      expect(bystander.exitCode === null && bystander.signalCode === null).toBe(true);
+      for (const left of [bystander, sibling]) {
+        expect(left.exitCode === null && left.signalCode === null).toBe(true);
+      }
     } finally {
       bystander.kill('SIGKILL');
+      sibling.kill('SIGKILL');
       rmSync(lease, { recursive: true, force: true });
       rmSync(elsewhere, { recursive: true, force: true });
     }
