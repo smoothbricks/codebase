@@ -1,4 +1,9 @@
 import { describe, expect, it } from 'bun:test';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Task, TaskGraph } from 'nx/src/config/task-graph';
 import type { TaskResults } from 'nx/src/tasks-runner/life-cycle';
 import type { EnsureBuiltProducerReceipt } from './ensure-built.js';
@@ -7,7 +12,10 @@ import {
   postTasksExecution,
   preTasksExecution,
   producerEnvironmentIdentity,
+  readProducerReceipt,
 } from './producer-receipts.js';
+
+const repoRoot = dirname(dirname(dirname(dirname(fileURLToPath(import.meta.url)))));
 
 const task: Task = {
   id: 'app:build',
@@ -105,5 +113,52 @@ describe('actual producer completion evidence', () => {
     const context = { id: 'disabled-hook', workspaceRoot: '/not-a-workspace', nxJsonConfiguration: {}, argv: [] };
     await preTasksExecution(undefined, context);
     await postTasksExecution(undefined, { ...context, taskResults: {}, startTime: 10, endTime: 20 });
+  });
+  it('publishes a refusal beside a published receipt, never over it, and names it in the miss', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'producer-refusal-')));
+    const inherited = process.env.NX_WORKSPACE_DATA_DIRECTORY;
+    delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
+    try {
+      await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'refusal-fixture' }));
+      await writeFile(join(root, 'nx.json'), '{}');
+      await symlink(join(repoRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
+      const data = join(root, '.nx', 'workspace-data');
+      await mkdir(data, { recursive: true });
+      const name = createHash('sha256').update(JSON.stringify(task.id)).digest('hex');
+      const receiptPath = join(data, `producer-receipt-${name}.json`);
+      // What an earlier run published; this run's refusal is no evidence about it.
+      const published = JSON.stringify({ version: 1, disposition: 'published', receipt: 'an earlier run' });
+      await writeFile(receiptPath, published);
+      // A run whose pre-execution frame never bound (the sandboxed git failure's shape) refuses its target.
+      await postTasksExecution(
+        { producerReceipts: { targets: [task.id] } },
+        {
+          id: 'unbound-frame',
+          workspaceRoot: root,
+          nxJsonConfiguration: {},
+          argv: [],
+          taskResults: { [task.id]: { task, status: 'success', code: 0 } },
+          startTime: 10,
+          endTime: 20,
+        },
+      );
+      expect(await readFile(receiptPath, 'utf8')).toBe(published);
+      expect((await readdir(data)).sort()).toEqual([`producer-receipt-${name}.json`, `producer-refusal-${name}.json`]);
+      expect(readProducerReceipt(root, task.id)).toEqual({
+        ok: false,
+        detail:
+          "Missing/corrupt producer completion contract; the producer's latest run refused: No bound producer pre-execution frame",
+      });
+      // With no receipt at all, the miss still says why the latest run published none.
+      await rm(receiptPath);
+      const missing = readProducerReceipt(root, task.id);
+      expect(missing.ok ? 'hit' : missing.detail).toEndWith(
+        "; the producer's latest run refused: No bound producer pre-execution frame",
+      );
+    } finally {
+      if (inherited === undefined) delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
+      else process.env.NX_WORKSPACE_DATA_DIRECTORY = inherited;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

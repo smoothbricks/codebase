@@ -89,16 +89,20 @@ function sha(value: unknown): string {
 function configured(options: ProducerReceiptsOptions | undefined): readonly string[] {
   return options?.producerReceipts?.targets ?? [];
 }
-function recordPath(root: string, target: string): string {
+/**
+ * Where a record of `disposition` lives. A refusal has its own file beside the receipt, so a run that could not prove
+ * its products never replaces the receipt an earlier run published: readers validate that receipt on its own evidence.
+ */
+function recordPath(root: string, target: string, disposition: ProducerRecord['disposition']): string {
   const load = createWorkspaceNxRequire(root);
   return join(
     load('nx/src/utils/cache-directory').workspaceDataDirectoryForWorkspace(root),
-    `producer-receipt-${sha(target)}.json`,
+    `producer-${disposition === 'published' ? 'receipt' : 'refusal'}-${sha(target)}.json`,
   );
 }
 function publish(root: string, target: string, record: ProducerRecord): ReceiptEvidence<true> {
   try {
-    const path = recordPath(root, target);
+    const path = recordPath(root, target, record.disposition);
     mkdirSync(dirname(path), { recursive: true });
     const temporary = `${path}.${randomUUID()}`;
     try {
@@ -107,9 +111,12 @@ function publish(root: string, target: string, record: ProducerRecord): ReceiptE
     } finally {
       rmSync(temporary, { force: true });
     }
+    // A receipt answers the refusal of any run before it.
+    if (record.disposition === 'published') rmSync(recordPath(root, target, 'refused'), { force: true });
     return { ok: true, value: true };
   } catch (error) {
-    if (error instanceof Error) return { ok: false, detail: `Cannot publish producer receipt: ${error.message}` };
+    if (error instanceof Error)
+      return { ok: false, detail: `Cannot publish producer ${record.disposition} record: ${error.message}` };
     throw error;
   }
 }
@@ -496,13 +503,34 @@ export async function postTasksExecution(
     if (!publication.ok) process.stderr.write(`producerReceipts: ${target}: ${publication.detail}\n`);
   }
 }
-/** Readonly consumers accept actual producer completion evidence, never their own environment/cache rows. */
+/**
+ * Readonly consumers accept actual producer completion evidence, never their own environment/cache rows. A receipt
+ * that does not validate is a miss whose detail also carries the refusal of the producer's latest run, when it left one.
+ */
 export function readProducerReceipt(root: string, target: string): ReceiptEvidence<EnsureBuiltReceipt> {
+  const published = validatedReceipt(root, target);
+  if (published.ok) return published;
+  const refusal = latestRefusal(root, target);
+  return refusal === null
+    ? published
+    : { ok: false, detail: `${published.detail}; the producer's latest run refused: ${refusal}` };
+}
+/** The detail of the refusal a producer run left after the last receipt, or null when none did. */
+function latestRefusal(root: string, target: string): string | null {
   try {
-    const record = typia.json.isParse<ProducerRecord>(readFileSync(recordPath(root, target), 'utf8'));
+    const record = typia.json.isParse<RefusedReceipt>(readFileSync(recordPath(root, target, 'refused'), 'utf8'));
+    return record === null || record.version !== 1 ? 'corrupt producer refusal record' : record.detail;
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    if (error instanceof Error) return `unreadable producer refusal record: ${error.message}`;
+    throw error;
+  }
+}
+function validatedReceipt(root: string, target: string): ReceiptEvidence<EnsureBuiltReceipt> {
+  try {
+    const record = typia.json.isParse<PublishedReceipt>(readFileSync(recordPath(root, target, 'published'), 'utf8'));
     if (record === null || record.version !== 1)
       return { ok: false, detail: 'Missing/corrupt producer completion contract' };
-    if (record.disposition === 'refused') return { ok: false, detail: record.detail };
     const receipt = record.receipt;
     if (
       receipt.workspaceRoot !== realpathSync(root) ||
