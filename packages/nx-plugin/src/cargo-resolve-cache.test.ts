@@ -495,7 +495,10 @@ for (const file of KEYED_FILES) {
       expect(await resolvesAs('same bytes')).toEqual(['one']);
       expect(await spawned(cargo)).toBe(2);
 
+      // Identical size and mtime cannot stand in for the current bytes.
+      const before = await stat(join(root, file.path));
       await put(root, file.path, `${original}# two\n`);
+      await utimes(join(root, file.path), before.atime, before.mtime);
       expect(await resolvesAs('two')).toEqual(['two']);
       expect(await spawned(cargo)).toBe(3);
 
@@ -509,6 +512,51 @@ for (const file of KEYED_FILES) {
     });
   });
 }
+
+it('retargeting a configuration symlink with identical bytes still resolves the new canonical input', async () => {
+  await withCannedWorkspace(async ({ root, workspace, cargo, answer, members }) => {
+    const config = join(workspace, '.cargo/config.toml');
+    await put(root, 'config-a.toml', '[net]\noffline=true\n');
+    await put(root, 'config-b.toml', '[net]\noffline=true\n');
+    await mkdir(dirname(config), { recursive: true });
+    await symlink(join(root, 'config-a.toml'), config);
+    await answer('first target');
+    expect(await members()).toEqual(['first target']);
+    expect(await spawned(cargo)).toBe(1);
+
+    await rm(config);
+    await symlink(join(root, 'config-b.toml'), config);
+    await answer('second target');
+    expect(await members()).toEqual(['second target']);
+    expect(await spawned(cargo)).toBe(2);
+    await answer('unchanged');
+    expect(await members()).toEqual(['second target']);
+    expect(await spawned(cargo)).toBe(2);
+  });
+});
+
+it('a resolution input read failure is not a missing file or a reusable answer', async () => {
+  await withCannedWorkspace(async ({ workspace, manifest, cargo, answer }) => {
+    // Use the graph caller's inventory so this tests the resolution reader,
+    // independently of how the native workspace census treats a symlink loop.
+    const indexed = new Set(['Cargo.toml', 'crates/leaf/Cargo.toml']);
+    const members = async () => [...(await readCargoResolve(manifest, workspace, indexed)).members];
+    await answer('cold');
+    expect(await members()).toEqual(['cold']);
+    const config = join(workspace, '.cargo/config.toml');
+    await mkdir(dirname(config), { recursive: true });
+    await symlink('config.toml', config);
+    const failure = expectCargoMetadataError(await rejectionOf(members()), manifest);
+    expect(failure.message).toContain('ELOOP');
+    expect(failure.message).toContain(config);
+    expect(await spawned(cargo)).toBe(1);
+
+    await rm(config);
+    await answer('trap');
+    expect(await members()).toEqual(['cold']);
+    expect(await spawned(cargo)).toBe(1);
+  });
+});
 
 it('resolves again exactly once when the cargo on PATH or the rustup selection changes', async () => {
   await withCannedWorkspace(async ({ root, cargo, answer, members, environment }) => {
