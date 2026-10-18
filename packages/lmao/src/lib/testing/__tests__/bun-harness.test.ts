@@ -115,13 +115,6 @@ describe('bun harness test log schema extension', () => {
     });
   });
 
-  it('defaults to an in-memory TestTracer when sqlite and verbose are off', () => {
-    const tracer = makeTestTracer(baseBinding);
-    tracer.setup();
-
-    expect(tracer.getTracer()).toBeInstanceOf(TestTracer);
-  });
-
   it('rejects duplicate extra test columns instead of silently erasing them', () => {
     const tracer = makeTestTracer(baseBinding, {
       extraTestColumns: {
@@ -139,9 +132,11 @@ describe('bun harness test log schema extension', () => {
 // test slower than the ambient `--timeout`. The seam asserted here is the exact call the harness
 // makes into bun's runner, which is where a dropped timeout becomes an ignored timeout.
 describe('bun harness per-test options forwarding', () => {
-  it('hands bun the timeout slot it was given', async () => {
+  it('defaults to an in-memory TestTracer, then hands bun the timeout slot it was given', async () => {
     const tracer = makeTestTracer(baseBinding);
     tracer.setup();
+    // sqlite and verbose are off.
+    expect(tracer.getTracer()).toBeInstanceOf(TestTracer);
 
     const registrations: Registration[] = [];
     const wrapped = tracer.createBunTestMock(createImmediateBunTestModule(registrations));
