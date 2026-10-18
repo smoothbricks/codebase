@@ -157,26 +157,16 @@ function toolsFor(
     const data = load('nx/src/utils/cache-directory').workspaceDataDirectoryForWorkspace(root);
     const snapshot = workspaceSnapshot(root, new (load('nx/src/native').WorkspaceContext)(root, data), undefined);
     const local = graphInputContractIdentity(root, nxJson, snapshot);
-    const packages: { name: string; from: string }[] = [];
+    // A task's npm external inputs (AllExternalDependencies, and the `npm:` nodes of its project's dependency closure)
+    // are Nx's lockfile identities, bound by the receipt's hashDetails and the committed tree's bun.lock. They add no
+    // installed closure: resolved from the task's project, a transitive or uninstalled-optional node is unresolvable
+    // under Bun's isolated linker, and the installed closure of every lockfile package measured 46 MB of evidence and
+    // 10 s of census. The tools that compute the graph and hashes are still bound below.
     let needsCargo = false;
     for (const basis of bases) {
       const proof = providerInputProof(root, nxJson, projectGraph, basis.graph, load);
       if (proof.runtimeSource.kind === 'opaque') return { ok: false, detail: proof.runtimeSource.detail };
-      for (const [id, input] of Object.entries(proof.inputs)) {
-        needsCargo ||= input.runtime.length > 0;
-        const task = basis.graph.tasks[id];
-        if (task === undefined) return { ok: false, detail: `Lost producer task ${id}` };
-        for (const external of input.external) {
-          if (external === 'AllExternalDependencies') {
-            for (const node of Object.values(projectGraph.externalNodes ?? {}))
-              packages.push({ name: node.data.packageName, from: join(root, task.projectRoot ?? '.') });
-            continue;
-          }
-          const node = projectGraph.externalNodes?.[external] ?? projectGraph.externalNodes?.[`npm:${external}`];
-          if (node === undefined) return { ok: false, detail: `Unbound external input ${external} for ${id}` };
-          packages.push({ name: node.data.packageName, from: join(root, task.projectRoot ?? '.') });
-        }
-      }
+      needsCargo ||= Object.values(proof.inputs).some((input) => input.runtime.length > 0);
     }
     let installationMiss = 'unproved installed module/resolution closure';
     const identity = graphInstallationIdentity(
@@ -184,9 +174,7 @@ function toolsFor(
       nxJson,
       load('nx/src/utils/package-json').readModulePackageJson,
       load('nx/src/native').expandOutputs,
-      local === null
-        ? { plugins: [], packages, identity: '[]' }
-        : { ...local, packages: [...local.packages, ...packages] },
+      local ?? { plugins: [], packages: [], identity: '[]' },
       (detail) => {
         installationMiss = detail;
       },

@@ -871,7 +871,11 @@ environment identity and bound tool/module inputs, independent product output SH
 explicit clean tracked-tree assertion. It includes every completed required task's Nx identity and every Nx-expanded
 public output. Files carry SHA-256; symlinks carry text and mode without following them; directories carry mode, ordered
 membership and child-census digest, including empty directories. The producer source/tool/output witnesses must stay
-stable through publication. The command's stdout/stderr digest is not a product digest.
+stable through publication. The command's stdout/stderr digest is not a product digest. The bound tool/module inputs are
+the installed closures of Nx, this plugin, TypeScript and local graph plugins, and the producer executables. A task's
+npm external inputs (`AllExternalDependencies` and the npm nodes of its project's dependency closure) are Nx's lockfile
+identities: the task's hash details and the committed `bun.lock` bind them, and no installed closure is resolved for
+them, since under Bun's isolated linker most of them do not resolve from the task's project.
 
 Validity compares the committed tree, not the current HEAD spelling. An empty commit with an identical tree keeps the
 receipt valid and its original basis SHA unchanged; the consumer never rewrites that provenance. A genuinely changed
