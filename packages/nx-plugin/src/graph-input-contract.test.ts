@@ -31,6 +31,9 @@ const pure = 'export const createNodesV2 = ["**/project.json", (files) => files.
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 let root = '';
 let external = '';
+// One Nx state per checkout (specs/cowshed/04_sandbox.md): the fixture is its own checkout, so the runner's
+// NX_WORKSPACE_DATA_DIRECTORY (CI's shared host directory, a job's checkout `.nx`) must not name its witnesses.
+const inheritedData = process.env.NX_WORKSPACE_DATA_DIRECTORY;
 const data = () => join(root, '.nx', 'workspace-data');
 const snapshot = () => workspaceSnapshot(root, new WorkspaceContext(root, data()), undefined);
 const options = (kind: GraphInputContract['kind'] = 'native-only') => ({
@@ -53,6 +56,7 @@ beforeEach(async () => {
   root = await realpath(await mkdtemp(join(tmpdir(), 'graph-input-contract-')));
   external = await realpath(await mkdtemp(join(tmpdir(), 'graph-input-outside-')));
   await mkdir(data(), { recursive: true });
+  process.env.NX_WORKSPACE_DATA_DIRECTORY = data();
   await mkdir(join(root, 'node_modules'), { recursive: true });
   for (const name of ['nx', 'typescript']) {
     await symlink(dirname(require.resolve(`${name}/package.json`)), join(root, 'node_modules', name), 'dir');
@@ -64,6 +68,8 @@ beforeEach(async () => {
   await writeFile(join(external, 'base.json'), '{"include":["src"]}');
 });
 afterEach(async () => {
+  if (inheritedData === undefined) delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
+  else process.env.NX_WORKSPACE_DATA_DIRECTORY = inheritedData;
   await rm(root, { recursive: true, force: true });
   await rm(external, { recursive: true, force: true });
 });
