@@ -15,7 +15,13 @@
 //! - `<repo>.lease` is the project lease. Every project actor holds it shared for its lifetime
 //!   ([`acquire_project_reader`]); the collector takes it exclusive without waiting
 //!   ([`acquire_collector`]), which succeeds only once every actor that opened before the fence has
-//!   released it. No PID is inferred: the kernel lease is the whole proof;
+//!   released it. No PID is inferred: the kernel lease is the whole proof. The lease is the
+//!   inode the path names: whoever locks it checks afterwards, by device and inode and without
+//!   following a link, that the path still names what it locked, and reopens it when not. That is
+//!   what lets an unbinding remove the lease ([`ProjectReadLease::remove_unbound`]): only once its
+//!   own shared hold upgrades to exclusive without waiting, so no one else holds it, and only
+//!   while no record stands beside it. An opener that reached the removed inode finds its path
+//!   gone or naming a new one and takes that instead, so every holder still meets on one inode;
 //! - `<repo>.run` admits one execution of the retirement at a time, from before the drain
 //!   through the archive commit, and only for the exact record it was given
 //!   ([`acquire_retirement_run`]).
@@ -59,6 +65,10 @@ const RECORD_SUFFIX: &str = ".json";
 const SERIALIZATION_SUFFIX: &str = ".lock";
 const LEASE_SUFFIX: &str = ".lease";
 const RUN_SUFFIX: &str = ".run";
+/// How many times one taking of the project lease reopens it after finding it removed under
+/// the open. Each reopen means an unbinding removed the inode this open reached, which happens
+/// at most once per unbinding, so a run of them is the store being tampered with, not a race.
+const LEASE_REOPENS: usize = 16;
 /// Records and registrations are a few hundred bytes; a file this large is neither.
 const MAX_CONTROLLER_FILE: u64 = 1 << 20;
 const LOCK_FILE_MODE: libc::c_uint = 0o600;
@@ -142,12 +152,109 @@ pub struct RetirementIntent {
 #[derive(Debug)]
 pub struct ProjectReadLease {
     repo_id: RepoId,
-    _lease: Fenced<File>,
+    lease: Fenced<File>,
+}
+
+/// What an unbinding's [`ProjectReadLease::remove_unbound`] did with the project lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnboundLease {
+    /// It is gone, and with it the owner directory it left empty.
+    Removed,
+    /// Another holder shares it, so it stays; the caller keeps its shared hold.
+    Held { lease: PathBuf },
+    /// A retirement record stands beside it, which it fences, so it stays; the caller keeps its
+    /// shared hold.
+    Recorded { lease: PathBuf },
 }
 
 impl ProjectReadLease {
     pub fn repo_id(&self) -> &RepoId {
         &self.repo_id
+    }
+
+    /// Remove the project lease once the project's unbinding removed its binding, so an unbound
+    /// identity leaves nothing under `.retirements`. Only this holder may: its shared hold
+    /// upgrades to exclusive without waiting, or another holder shares it and it stays
+    /// ([`UnboundLease::Held`]). With the lease exclusive, a record beside it keeps it too
+    /// ([`UnboundLease::Recorded`]); otherwise the lease and an owner directory it leaves empty
+    /// are removed. Whenever it stays, the hold goes back to shared. Once removed, this hold is on
+    /// an unlinked inode and fences nothing: an opener that reached that inode sees its path no
+    /// longer names it and opens the one there now. A record published after the check is fenced
+    /// all the same: the collector takes the new inode, which no one holding the old one ever
+    /// kept, because this hold excluded them all.
+    pub fn remove_unbound(&self, store: &Path) -> Result<UnboundLease> {
+        let store = Store::open(store)?;
+        let names = Names::of(&self.repo_id);
+        let lease = store.retirement_path(&names, &names.lease);
+        match self.lease.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                self.keep_shared(&lease)?;
+                return Ok(UnboundLease::Held { lease });
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(io_failure("upgrade project lease", &lease, error));
+            }
+        }
+        let removed = (|| {
+            let owner = store
+                .existing_retirement_owner(&names)?
+                .ok_or_else(|| replaced(&lease))?;
+            if !names_file(&owner, &names.lease, &self.lease)
+                .map_err(|error| io_failure("inspect project lease", &lease, error))?
+            {
+                return Err(replaced(&lease));
+            }
+            if store.load_at(&owner, &names, &self.repo_id)?.is_some() {
+                return Ok(UnboundLease::Recorded {
+                    lease: lease.clone(),
+                });
+            }
+            unlink_at(&owner, &names.lease, 0)
+                .map_err(|error| io_failure("remove project lease", &lease, error))?;
+            let Some(retirements) = store.retirements()? else {
+                return Ok(UnboundLease::Removed);
+            };
+            let owner_path = store
+                .path
+                .join(RETIREMENTS_NAMESPACE)
+                .join(component(&names.owner));
+            match unlink_at(&retirements, &names.owner, libc::AT_REMOVEDIR) {
+                Ok(()) => Ok(UnboundLease::Removed),
+                // Another identity of the owner keeps it, or a run removed it already.
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENOTEMPTY)
+                        || error.raw_os_error() == Some(libc::EEXIST)
+                        || error.kind() == io::ErrorKind::NotFound =>
+                {
+                    Ok(UnboundLease::Removed)
+                }
+                Err(error) => Err(io_failure("remove", &owner_path, error)),
+            }
+        })();
+        if !matches!(removed, Ok(UnboundLease::Removed)) {
+            self.keep_shared(&lease)?;
+        }
+        removed
+    }
+
+    /// Hold the lease shared again after an upgrade that did not remove it. A refused
+    /// non-blocking upgrade keeps the shared hold on Darwin; Linux drops it first, so it is
+    /// taken again rather than assumed.
+    fn keep_shared(&self, lease: &Path) -> Result<()> {
+        match self.lease.try_lock_shared() {
+            Ok(()) => Ok(()),
+            Err(TryLockError::WouldBlock) => Err(CowshedError::integrity(
+                format!(
+                    "this process lost its shared hold on project lease {} to an exclusive holder",
+                    lease.display()
+                ),
+                forget_hint(&self.repo_id),
+            )),
+            Err(TryLockError::Error(error)) => {
+                Err(io_failure("take project lease shared", lease, error))
+            }
+        }
     }
 }
 
@@ -495,28 +602,26 @@ impl RetirementIntent {
 
 /// Take `repo`'s project lease shared, then refuse when an unarchived retirement fences it.
 ///
-/// Never waits: a collector holding the lease means the project is being retired.
+/// Never waits: an exclusive holder is a collector retiring the project, or an unbinding for
+/// the instant it removes the lease.
 pub fn acquire_project_reader(store: &Path, repo: &RepoId) -> Result<ProjectReadLease> {
     let store = Store::open(store)?;
     let names = Names::of(repo);
-    let owner = store.retirement_owner(&names)?;
-    let lease = store.lease(&owner, &names)?;
-    match lease.try_lock_shared() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            return Err(CowshedError::conflict(
-                format!("project {repo} is being collected by its explicit retirement"),
-                forget_hint(repo),
-            ));
-        }
-        Err(TryLockError::Error(error)) => {
-            return Err(io_failure(
-                "take project lease",
-                &store.retirement_path(&names, &names.lease),
-                error,
-            ));
-        }
-    }
+    let Some((owner, lease)) = store.lock_lease(
+        &names,
+        LeaseMode::Shared,
+        || store.retirement_owner(&names),
+        open_lock,
+    )?
+    else {
+        return Err(CowshedError::conflict(
+            format!(
+                "project {repo} is being collected by its explicit retirement, or its unbinding \
+                 is removing its lease"
+            ),
+            forget_hint(repo),
+        ));
+    };
     if let Some(intent) = store.load_at(&owner, &names, repo)?
         && intent.phase.blocks_open()
     {
@@ -524,7 +629,7 @@ pub fn acquire_project_reader(store: &Path, repo: &RepoId) -> Result<ProjectRead
     }
     Ok(ProjectReadLease {
         repo_id: repo.clone(),
-        _lease: lease,
+        lease,
     })
 }
 
@@ -550,27 +655,30 @@ pub fn acquire_collector(store: &Path, repo: &RepoId) -> Result<CollectorLease> 
     if !intent.phase.blocks_open() {
         return Err(unauthorized());
     }
-    let lease = store.lease(&owner, &names)?;
-    match lease.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            return Err(CowshedError::conflict(
-                format!(
-                    "project {repo} still has active controllers holding its lease; retirement {} \
-                     fences new opens and waits for them to drain",
-                    intent.operation_id
-                ),
-                forget_hint(repo),
-            ));
-        }
-        Err(TryLockError::Error(error)) => {
-            return Err(io_failure(
-                "take project lease",
-                &store.retirement_path(&names, &names.lease),
-                error,
-            ));
-        }
-    }
+    let owner_path = store
+        .path
+        .join(RETIREMENTS_NAMESPACE)
+        .join(component(&names.owner));
+    let Some((owner, lease)) = store.lock_lease(
+        &names,
+        LeaseMode::Exclusive,
+        || {
+            owner
+                .try_clone()
+                .map_err(|error| io_failure("open", &owner_path, error))
+        },
+        open_lock,
+    )?
+    else {
+        return Err(CowshedError::conflict(
+            format!(
+                "project {repo} still has active controllers holding its lease; retirement {} \
+                 fences new opens and waits for them to drain",
+                intent.operation_id
+            ),
+            forget_hint(repo),
+        ));
+    };
     // The record may have moved on between the read above and the lease.
     let current = store.recorded(&owner, &names, repo)?;
     if current.operation_id != intent.operation_id || !current.phase.blocks_open() {
@@ -701,6 +809,18 @@ pub fn outstanding_retirements(store: &Path) -> Result<Vec<RetirementIntent>> {
 
 fn forget_hint(repo: &RepoId) -> String {
     format!("cowshed forget {repo} --abandon")
+}
+
+/// The project lease this holder locked is no longer the one at its path, which only a removal
+/// it did not make could do.
+fn replaced(lease: &Path) -> CowshedError {
+    CowshedError::integrity(
+        format!(
+            "project lease {} no longer names the inode this process holds",
+            lease.display()
+        ),
+        "reopen the project so its actors hold the lease at that path",
+    )
 }
 
 fn pending_retirement(intent: &RetirementIntent) -> CowshedError {
@@ -986,14 +1106,52 @@ impl<'a> Store<'a> {
         }
     }
 
-    fn lease(&self, owner: &File, names: &Names) -> Result<Fenced<File>> {
-        open_lock(owner, &names.lease).map_err(|error| {
-            io_failure(
-                "open project lease",
-                &self.retirement_path(names, &names.lease),
-                error,
-            )
-        })
+    /// Lock `names`' project lease in `mode` without waiting; `None` while another holder
+    /// excludes it. The lease is the inode its path names, and an unbinding may remove it after
+    /// this opened it ([`ProjectReadLease::remove_unbound`]): after the attempt, locked or
+    /// refused, the path must still name the inode it was made on, compared by device and inode
+    /// without following a link, or the lease is reopened from `owner` (which reopens an owner
+    /// directory the unbinding removed). `open` is [`open_lock`] outside tests.
+    fn lock_lease(
+        &self,
+        names: &Names,
+        mode: LeaseMode,
+        mut owner: impl FnMut() -> Result<File>,
+        mut open: impl FnMut(&File, &CStr) -> io::Result<Fenced<File>>,
+    ) -> Result<Option<(File, Fenced<File>)>> {
+        let path = self.retirement_path(names, &names.lease);
+        for _ in 0..LEASE_REOPENS {
+            let directory = owner()?;
+            let lease = match open(&directory, &names.lease) {
+                Ok(lease) => lease,
+                // An unbinding removed the owner directory after `owner` opened it.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_failure("open project lease", &path, error)),
+            };
+            let locked = match mode {
+                LeaseMode::Shared => lease.try_lock_shared(),
+                LeaseMode::Exclusive => lease.try_lock(),
+            };
+            let busy = match locked {
+                Ok(()) => false,
+                Err(TryLockError::WouldBlock) => true,
+                Err(TryLockError::Error(error)) => {
+                    return Err(io_failure("take project lease", &path, error));
+                }
+            };
+            if names_file(&directory, &names.lease, &lease)
+                .map_err(|error| io_failure("inspect project lease", &path, error))?
+            {
+                return Ok(if busy { None } else { Some((directory, lease)) });
+            }
+        }
+        Err(CowshedError::conflict(
+            format!(
+                "project lease {} was removed under this open {LEASE_REOPENS} times in a row",
+                path.display()
+            ),
+            "retry once the project's unbindings have finished",
+        ))
     }
 
     fn load_at(
@@ -1139,6 +1297,56 @@ fn publish_at(directory: &File, name: &CStr, bytes: &[u8]) -> io::Result<()> {
     }
     cleanup.disarm();
     Durability::PowerLoss.sync_new_entry_at(directory)
+}
+
+/// How a project lease is taken.
+#[derive(Clone, Copy, Debug)]
+enum LeaseMode {
+    Shared,
+    Exclusive,
+}
+
+/// Whether `name` beneath `directory` is `file` itself: the same device and inode, the leaf
+/// not followed. An absent `name` is not.
+fn names_file(directory: &File, name: &CStr, file: &File) -> io::Result<bool> {
+    let mut at = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the held directory fd and NUL-terminated leaf outlive the call, which fills `at`
+    // on success. NOFOLLOW stats a link at the leaf itself.
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            at.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let mut held = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the held fd outlives the call, which fills `held` on success.
+    if unsafe { libc::fstat(file.as_raw_fd(), held.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both calls succeeded, so both buffers are initialized.
+    let (at, held) = unsafe { (at.assume_init(), held.assume_init()) };
+    Ok(at.st_dev == held.st_dev && at.st_ino == held.st_ino)
+}
+
+/// Remove the leaf `name` beneath `directory` (`AT_REMOVEDIR` for an empty directory), never
+/// following it.
+fn unlink_at(directory: &File, name: &CStr, flags: libc::c_int) -> io::Result<()> {
+    // SAFETY: the held directory fd and NUL-terminated leaf outlive the call.
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Open the lock file `name` beneath `directory`, creating it 0600 when absent, fenced from the
@@ -1523,6 +1731,176 @@ mod tests {
         assert_eq!(collector.operation_id(), intent.operation_id);
         let refusal = acquire_project_reader(&store, &widget).expect_err("collecting");
         assert_eq!(refusal.code, ErrorCode::Conflict);
+    }
+
+    fn lease_path(store: &Path, id: &str) -> PathBuf {
+        store
+            .join(RETIREMENTS_NAMESPACE)
+            .join(format!("{id}{LEASE_SUFFIX}"))
+    }
+
+    /// Whether some holder other than the probe keeps `lease` from being taken exclusive.
+    fn held(lease: &Path) -> bool {
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lease)
+            .expect("probe the lease");
+        match probe.try_lock() {
+            Ok(()) => false,
+            Err(TryLockError::WouldBlock) => true,
+            Err(TryLockError::Error(error)) => panic!("probe the lease: {error}"),
+        }
+    }
+
+    #[test]
+    fn an_unbinding_alone_on_its_lease_removes_it_and_its_emptied_owner_directory() {
+        let root = TempRoot::new("unbound-lease");
+        let store = store(&root);
+        let widget = repo("acme/widget");
+        let owner = store.join(RETIREMENTS_NAMESPACE).join("acme");
+        let lease = lease_path(&store, "acme/widget");
+        let unbinding = acquire_project_reader(&store, &widget).expect("actor opens");
+        assert!(lease.is_file());
+
+        assert_eq!(
+            unbinding.remove_unbound(&store).expect("remove"),
+            UnboundLease::Removed
+        );
+        assert!(!lease.exists(), "the lease outlives the unbinding");
+        assert!(!owner.exists(), "an emptied owner directory remains");
+
+        // A later actor of the identity makes the lease afresh; another identity of the owner
+        // keeps the owner directory.
+        let sibling = acquire_project_reader(&store, &repo("acme/gadget")).expect("sibling");
+        let again = acquire_project_reader(&store, &widget).expect("readopted actor opens");
+        assert!(lease.is_file());
+        assert_eq!(
+            again.remove_unbound(&store).expect("remove"),
+            UnboundLease::Removed
+        );
+        assert!(!lease.exists());
+        assert!(owner.is_dir(), "another identity's owner directory went");
+        assert!(held(&lease_path(&store, "acme/gadget")));
+        drop(sibling);
+    }
+
+    #[test]
+    fn an_unbinding_refused_its_upgrade_leaves_the_lease_and_keeps_its_hold() {
+        let root = TempRoot::new("unbound-lease-held");
+        let store = store(&root);
+        let widget = repo("acme/widget");
+        plant_project(&store, "acme/widget", &registration("acme/widget"));
+        let lease = lease_path(&store, "acme/widget");
+        let unbinding = acquire_project_reader(&store, &widget).expect("actor opens");
+        let other = acquire_project_reader(&store, &widget).expect("another actor opens");
+
+        assert_eq!(
+            unbinding.remove_unbound(&store).expect("remove"),
+            UnboundLease::Held {
+                lease: lease.clone()
+            }
+        );
+        assert!(lease.is_file(), "a lease another actor holds was removed");
+
+        // The unbinding still holds it shared: a collector waits for it too.
+        drop(other);
+        RetirementIntent::authorize(&store, &widget).expect("authorize");
+        let refusal =
+            acquire_collector(&store, &widget).expect_err("the unbinding still holds the lease");
+        assert_eq!(refusal.code, ErrorCode::Conflict);
+        drop(unbinding);
+        acquire_collector(&store, &widget).expect("drained");
+    }
+
+    #[test]
+    fn an_unbinding_keeps_the_lease_a_retirement_record_fences() {
+        let root = TempRoot::new("unbound-lease-recorded");
+        let store = store(&root);
+        let widget = repo("acme/widget");
+        plant_project(&store, "acme/widget", &registration("acme/widget"));
+        retire(&store, &widget);
+        let lease = lease_path(&store, "acme/widget");
+        let unbinding =
+            acquire_project_reader(&store, &widget).expect("an archived record blocks no open");
+
+        assert_eq!(
+            unbinding.remove_unbound(&store).expect("remove"),
+            UnboundLease::Recorded {
+                lease: lease.clone()
+            }
+        );
+        assert!(lease.is_file(), "the lease beside a record was removed");
+        assert!(record_path(&store, "acme/widget").is_file());
+        assert!(held(&lease), "the unbinding gave up its shared hold");
+        drop(unbinding);
+        assert!(!held(&lease));
+    }
+
+    /// The unbinding holds the lease exclusive, a reader has already opened that inode, and the
+    /// unbinding removes it before the reader locks: the reader must hold the lease at the path,
+    /// which is the one a collector meets, never the removed inode. Whether the unbinding still
+    /// holds the removed inode when the reader locks it (refused) or has let go (locked), and
+    /// whether another reader has made the lease anew at the path by then.
+    #[test]
+    fn an_opener_that_reached_a_removed_lease_takes_the_one_at_its_path() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        for (still_held, recreated) in [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let root = TempRoot::new("removed-lease-race");
+            let store_path = store(&root);
+            let widget = repo("acme/widget");
+            let lease_at = lease_path(&store_path, "acme/widget");
+            let store = Store::open(&store_path).expect("store");
+            let names = Names::of(&widget);
+            let owner = store.retirement_owner(&names).expect("owner");
+            let removing = open_lock(&owner, &names.lease).expect("unbinding's lease");
+            removing.try_lock().expect("unbinding upgrades");
+            let mut reached = Some(open_lock(&owner, &names.lease).expect("reader opens"));
+            let removed = reached
+                .as_ref()
+                .expect("reached")
+                .metadata()
+                .expect("inode");
+            fs::remove_file(&lease_at).expect("the unbinding removes the lease");
+            let first = recreated
+                .then(|| acquire_project_reader(&store_path, &widget).expect("a new reader"));
+            if !still_held {
+                drop(removing);
+            }
+
+            let mut opens = 0;
+            let (_, lease) = store
+                .lock_lease(
+                    &names,
+                    LeaseMode::Shared,
+                    || store.retirement_owner(&names),
+                    |directory, name| {
+                        opens += 1;
+                        reached
+                            .take()
+                            .map_or_else(|| open_lock(directory, name), Ok)
+                    },
+                )
+                .expect("lock")
+                .expect("the lease at the path is free");
+            let case = format!("still held {still_held}, recreated {recreated}");
+            assert_eq!(opens, 2, "{case}: the removed inode was not reopened");
+            let at_path = fs::symlink_metadata(&lease_at).expect("lease at its path");
+            let locked = lease.metadata().expect("locked inode");
+            assert_eq!(
+                (locked.dev(), locked.ino()),
+                (at_path.dev(), at_path.ino()),
+                "{case}"
+            );
+            assert_ne!(locked.ino(), removed.ino(), "{case}");
+            assert!(
+                held(&lease_at),
+                "{case}: a collector would not meet this reader"
+            );
+            drop(first);
+        }
     }
 
     #[test]

@@ -2342,7 +2342,8 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     /// what `settle_reclaims` waits for. Finished ones are dropped as new ones start.
     reclaims: Vec<JoinHandle<()>>,
     /// Retirement may archive this project's storage only after every actor and healer releases it.
-    _retirement_lease: crate::project_retirement::ProjectReadLease,
+    /// The unbinding that ends a main restore removes it ([`Self::remove_unbound_lease`]).
+    retirement_lease: crate::project_retirement::ProjectReadLease,
 }
 
 /// Who runs a workspace's supervisor.
@@ -2977,8 +2978,9 @@ fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result
 /// tree, its build volumes' mount tree (`<host mount root>/.build/<owner>/<repo>`) and each owner
 /// directory they leave empty; the store directory goes once the binding and the checkout root
 /// record after it do. What the user put in the store — `policy.json`, `waivers.json`,
-/// `quarantine/` — stays, and keeps the store directory with it. So does the project lease
-/// under `.retirements/`, which every actor of the identity holds by its inode.
+/// `quarantine/` — stays, and keeps the store directory with it. The project lease under
+/// `.retirements/` is not here: it goes only once the binding has, under the lease itself
+/// (`StorageProjectRuntimeHost::remove_unbound_lease`).
 #[cfg(target_os = "macos")]
 fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Result<()> {
     let build =
@@ -3638,7 +3640,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             binding_remote_validation: validation,
             recovery_scope,
             reclaims: Vec::new(),
-            _retirement_lease: retirement_lease,
+            retirement_lease,
         })
     }
     /// Apply `change` to the journal on disk under its lock and adopt the result, which also
@@ -5420,7 +5422,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         self.layout = layout;
         self.descriptor.repo_id = repo_id;
         self.descriptor.binding = std::sync::Arc::new(binding);
-        self._retirement_lease = retirement_lease;
+        self.retirement_lease = retirement_lease;
         self.lifecycle_intents_path = self
             .layout
             .project()
@@ -6640,8 +6642,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 // The binding's absence is the restore's completion. Recovery at open replays a
                 // pending restore, so this very process may already have finished it and removed
                 // the project directory with the binding; there is nothing left to record or
-                // journal, and writing either would recreate that directory.
+                // journal, and writing either would recreate that directory. Only the project
+                // lease may remain, from a run that died after the binding went.
                 if !self.project_is_bound().await? {
+                    self.remove_unbound_lease()?;
                     return Ok(RemoveReport::default());
                 }
                 let pre_cowshed = pre_cowshed_path(&self.descriptor.git_root)?;
@@ -7101,8 +7105,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// leaves a project still bound and a retry that finishes the job. The binding's absence is
     /// the removal's completion. The checkout root record goes right after it — it is what
     /// reopens a still-bound project whose main image is gone — and the store directory and
-    /// emptied owner directories after that. What the user wrote (`policy.json`, `waivers.json`,
-    /// `quarantine/`) stays, and with it the store directory.
+    /// emptied owner directories after that, and once the project is unbound the identity's
+    /// project lease. What the user wrote (`policy.json`, `waivers.json`, `quarantine/`) stays,
+    /// and with it the store directory.
     async fn unbind_restored_project(&self) -> Result<()> {
         if self.project_is_bound().await? {
             self.release_build_volumes_for_unbinding().await?;
@@ -7173,7 +7178,36 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
         })
         .await
-        .map_err(|error| CowshedError::internal(format!("binding cleanup task failed: {error}")))?
+        .map_err(|error| {
+            CowshedError::internal(format!("binding cleanup task failed: {error}"))
+        })??;
+        self.remove_unbound_lease()
+    }
+
+    /// The last of an unbinding (02_workspaces.md): the identity's
+    /// `.retirements/<owner>/<repo>.lease` goes too, unless another process shares it or a
+    /// retirement record stands beside it; either is said on stderr, never skipped silently. A
+    /// project already unbound by an earlier run gets here as well, so its retry removes it.
+    fn remove_unbound_lease(&self) -> Result<()> {
+        use crate::project_retirement::UnboundLease;
+        match self
+            .retirement_lease
+            .remove_unbound(self.descriptor.storage.store())?
+        {
+            UnboundLease::Removed => {}
+            UnboundLease::Held { lease } => eprintln!(
+                "cowshed: project lease {} stays: another cowshed process (the gateway, or a \
+                 command still open on {}) holds it, and removing a held lease would let a later \
+                 `cowshed forget` fence past that process",
+                lease.display(),
+                self.descriptor.repo_id
+            ),
+            UnboundLease::Recorded { lease } => eprintln!(
+                "cowshed: project lease {} stays beside the retirement record it fences",
+                lease.display()
+            ),
+        }
+        Ok(())
     }
 
     /// Main's images are the record of where the checkout is, and removing main takes them away.
