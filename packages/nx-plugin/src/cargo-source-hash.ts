@@ -572,6 +572,24 @@ export async function readCargoResolve(
   }
 }
 
+type CacheParentObservation =
+  | { readonly state: 'present'; readonly dev: string; readonly ino: string }
+  | { readonly state: 'unavailable'; readonly code: string; readonly detail: string };
+
+async function observeCacheParent(directory: string): Promise<CacheParentObservation> {
+  try {
+    const parent = await stat(directory, { bigint: true });
+    return { state: 'present', dev: parent.dev.toString(), ino: parent.ino.toString() };
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    return {
+      state: 'unavailable',
+      code: 'code' in error && typeof error.code === 'string' ? error.code : error.name,
+      detail: error.message,
+    };
+  }
+}
+
 async function resolveAndCache(
   root: string,
   manifest: string,
@@ -592,6 +610,7 @@ async function resolveAndCache(
     if (state.cached?.key === key) return state.cached.cargo;
   }
   const lockFile = join(directory, 'resolve.lock');
+  const parentBeforeLock = await observeCacheParent(directory);
   const lock = await acquireCargoResolveLock(lockFile, boundMs);
   try {
     // Another worker may have populated it while this worker waited.
@@ -624,9 +643,17 @@ async function resolveAndCache(
         continue;
       }
       const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+      const parentAtTmpOpen = await observeCacheParent(directory);
       try {
         await writeFile(temporary, `${key}\n${JSON.stringify(metadata)}\n`);
         await rename(temporary, file);
+      } catch (error) {
+        const parentAfterFailure = await observeCacheParent(directory);
+        const cause = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Cargo resolution cache publication failed: ${JSON.stringify({ directory, lockFile, temporary, parentBeforeLock, parentAtTmpOpen, parentAfterFailure })}; ${cause}`,
+          { cause: error },
+        );
       } finally {
         await rm(temporary, { force: true });
       }

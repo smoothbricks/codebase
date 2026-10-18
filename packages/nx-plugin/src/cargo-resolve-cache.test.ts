@@ -1,11 +1,25 @@
 import { expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
 import { FileLock } from 'nx/src/native/index.js';
+import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import { resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
 import {
   type CannedCargo,
@@ -938,6 +952,55 @@ it('a Cargo workspace Cargo refuses fails the project graph with a CargoMetadata
     expect(await spawned(cargo)).toBe(4);
   });
 });
+
+for (const replaced of [false, true]) {
+  it(`cache publication records a ${replaced ? 'rebound' : 'missing'} parent with the original filesystem cause`, async () => {
+    await withGraphWorkspace(async ({ workspace, cargo }) => {
+      const manifest = join(workspace, 'Cargo.toml');
+      await cargo.beforeAnswer.close();
+      const refused = rejectionOf(readCargoResolve(manifest, workspace));
+      await cargo.waitForRuns((runs) => runs.read === 1, 'real locked/offline Cargo to read before cache publication');
+      const namespace = join(workspaceDataDirectoryForWorkspace(workspace), 'cargo-resolve');
+      const entries = await readdir(namespace);
+      expect(entries).toHaveLength(1);
+      const [entry] = entries;
+      if (entry === undefined) throw new Error('the real resolver created no owned cache namespace');
+      const directory = join(namespace, entry);
+      const before = await stat(directory, { bigint: true });
+      let atOpen = before;
+      if (replaced) {
+        await rename(directory, `${directory}.retired`);
+        await mkdir(directory);
+        atOpen = await stat(directory, { bigint: true });
+        expect(atOpen.ino).not.toBe(before.ino);
+        // Force publication to report the replacement rather than silently sign under a new namespace.
+        await mkdir(join(directory, 'entry.cache'));
+      } else {
+        await rm(directory, { recursive: true });
+      }
+      await cargo.beforeAnswer.open();
+      const failure = expectCargoMetadataError(await refused, manifest);
+      expect(failure.message).toContain(directory);
+      expect(failure.message).toContain('entry.cache.');
+      expect(failure.message).toContain(
+        `"parentBeforeLock":${JSON.stringify({ state: 'present', dev: before.dev.toString(), ino: before.ino.toString() })}`,
+      );
+      if (replaced) {
+        const expected = JSON.stringify({ state: 'present', dev: atOpen.dev.toString(), ino: atOpen.ino.toString() });
+        expect(failure.message).toContain(`"parentAtTmpOpen":${expected}`);
+        expect(failure.message).toContain(`"parentAfterFailure":${expected}`);
+      } else {
+        expect(failure.message).toContain('"parentAtTmpOpen":{"state":"unavailable","code":"ENOENT"');
+        expect(failure.message).toContain('"parentAfterFailure":{"state":"unavailable","code":"ENOENT"');
+      }
+      const publication = failure.cause;
+      expect(publication).toBeInstanceOf(Error);
+      if (!(publication instanceof Error)) throw new Error('cache publication lost its structured cause');
+      expect(publication.cause).toHaveProperty('code', replaced ? 'EISDIR' : 'ENOENT');
+      expect(await spawned(cargo)).toBe(1);
+    });
+  });
+}
 
 it('fresh smoo-nx-cargo-hash processes over an unchanged Cargo workspace run Cargo once between them', async () => {
   await withGraphWorkspace(async ({ root, workspace, cargo }) => {
