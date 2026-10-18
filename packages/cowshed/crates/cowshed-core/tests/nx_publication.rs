@@ -7,20 +7,12 @@
 //! land, a publication, nor a cutover claim.
 
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
-use std::io::Write;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::io::{BufRead, BufReader, Read};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::process::Child;
-use std::process::{Command, Output, Stdio};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cowshed_core::build_volume::cache_adapter;
 use serde_json::{Value, json};
@@ -34,25 +26,16 @@ const CHECK: &str = "00000000000000000000000000000001";
 const REFUSED: &str = "00000000000000000000000000000002";
 const MISSING: &str = "00000000000000000000000000000003";
 const FAILED: &str = "00000000000000000000000000000004";
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const SOURCE_CHECK: &str = "00000000000000000000000000000005";
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const READER_CHECK: &str = "00000000000000000000000000000006";
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const READER_WIP: &str = "00000000000000000000000000000007";
 const CHECKED_COMMAND: &str = "nx run app:build --outputStyle=static";
 const ANSWER_LIMIT: usize = 1024 * 1024;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const READY_FRAME_LIMIT: u64 = 4096;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MAX_UPLOAD_BYTES: &str = "1048576";
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CAP_BYTES: &str = "16777216";
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const WRITER_TOKEN: &str = "writer-token-for-the-host-lane-proof";
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const READER_TOKEN: &str = "reader-token-for-the-host-lane-proof";
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const UNKNOWN_HASH: &str = "18446744073709551615";
 
 /// A fixture workspace under `COWSHED_RUNTIME_LINK` when one is set, else the system temporary
@@ -71,24 +54,24 @@ struct Remote {
     token: String,
 }
 
-/// The production `nx-cache-server` this repository builds, supervised by the test: its stdin is
-/// the lease, and a panic kills and reaps it rather than leaving an orphan.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// The production `nx-cache-server` bundle this repository builds, run by the `bun` on `PATH` and
+/// supervised by the test: its stdin is the lease, and a panic kills and reaps it rather than
+/// leaving an orphan.
 struct Server {
     child: Option<Child>,
     origin: String,
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Server {
     /// Starts the server on an ephemeral loopback port, named by its one-line readiness frame.
     fn start(root: &Path, writer: &str, reader: &str) -> Self {
-        let binary = repository_root()
-            .join("packages/nx-cache-server/dist/bin/darwin-arm64/nx-cache-server");
+        let script =
+            repository_root().join("packages/nx-cache-server/dist/server/nx-cache-server.js");
         let entries = root.join("entries");
         std::fs::create_dir(&entries)
             .unwrap_or_else(|error| panic!("create {}: {error}", entries.display()));
-        let mut child = Command::new(&binary)
+        let mut child = Command::new("bun")
+            .arg(&script)
             .arg("--exit-on-stdin-eof")
             .env_clear()
             .env(
@@ -106,7 +89,7 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn_locked()
-            .unwrap_or_else(|error| panic!("start {}: {error}", binary.display()));
+            .unwrap_or_else(|error| panic!("start bun {}: {error}", script.display()));
         let stdout = child.stdout.take().expect("server stdout");
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
@@ -153,7 +136,6 @@ impl Server {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for Server {
     fn drop(&mut self) {
         // Reached with the child still held only on a panic before a confirmed close: kill, then reap.
@@ -334,7 +316,6 @@ fn answer(output: &Output) -> Value {
 }
 
 /// The status a direct GET of one hash returns from the server, with the read token.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn direct_status(origin: &str, token: &str, hash: &str) -> u16 {
     let address = origin
         .strip_prefix("http://")
@@ -500,7 +481,6 @@ fn stock_nx_bridge_qualifies_only_the_checked_successful_task() {
 /// uploads the checked hash once and then sees it existing; a reader's ordinary run restores it
 /// remotely without executing; a changed read is local work whose hash the server never stores.
 #[test]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 fn host_controller_bridge_publishes_and_reads_through_the_production_server() {
     let source = fixture();
@@ -696,42 +676,36 @@ fn read_manifest(path: &Path) -> Value {
         .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
-/// Each cowshed CLI build depends on the packaged server producer for its platform, and hashes that
-/// producer's output file as an input, so a server change rebuilds the CLI that ships it. All four
-/// platforms are checked; a single target is not enough.
+/// The server ships as one platform-independent bundle that Bun runs from `PATH` (tg#7504): the
+/// nx-cache-server package publishes `dist/server` and no `dist/bin`, and no cowshed CLI build
+/// depends on, hashes, or copies an nx-cache-server artifact. All four platforms are checked; a
+/// single target is not enough.
 #[test]
-fn every_cli_target_depends_on_and_inputs_its_platforms_nx_cache_server() {
+fn cli_targets_carry_no_nx_cache_server_and_the_server_ships_its_bundle() {
     let root = repository_root();
     let cowshed = read_manifest(&root.join("packages/cowshed/package.json"));
     let server = read_manifest(&root.join("packages/nx-cache-server/package.json"));
-    let cli_targets = [
-        ("cli-arm64-macos", "bun-arm64-macos"),
-        ("cli-x64-macos", "bun-x64-macos"),
-        ("cli-arm64-linux", "bun-arm64-linux"),
-        ("cli-x64-linux", "bun-x64-linux"),
-    ];
-    for (cli, producer) in cli_targets {
+    let files = server["files"]
+        .as_array()
+        .expect("nx-cache-server declares its published files");
+    assert!(files.contains(&json!("dist/server")), "{files:?}");
+    assert!(!files.contains(&json!("dist/bin")), "{files:?}");
+    assert_eq!(
+        server["nx"]["targets"]["bundle"]["outputs"],
+        json!(["{projectRoot}/dist/server/nx-cache-server.js"])
+    );
+    for cli in [
+        "cli-arm64-macos",
+        "cli-x64-macos",
+        "cli-arm64-linux",
+        "cli-x64-linux",
+    ] {
         let target = &cowshed["nx"]["targets"][cli];
         assert!(target.is_object(), "{cli} is a cowshed target");
+        let declared = serde_json::to_string(target).expect("serialize the target");
         assert!(
-            server["nx"]["targets"][producer].is_object(),
-            "{producer} is a nx-cache-server target"
-        );
-        let depends = target["dependsOn"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{cli} declares dependsOn"));
-        assert!(
-            depends.contains(&json!({"projects": ["nx-cache-server"], "target": producer})),
-            "{cli} must depend on {producer}: {depends:?}"
-        );
-        let inputs = target["inputs"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{cli} declares inputs"));
-        assert!(
-            inputs.contains(
-                &json!({"dependentTasksOutputFiles": "**/nx-cache-server", "transitive": false})
-            ),
-            "{cli} must hash the packaged nx-cache-server output: {inputs:?}"
+            !declared.contains("nx-cache-server"),
+            "{cli} must not depend on, hash, or copy an nx-cache-server artifact: {declared}"
         );
     }
 }

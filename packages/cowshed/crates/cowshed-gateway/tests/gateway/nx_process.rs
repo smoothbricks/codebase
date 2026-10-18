@@ -1,10 +1,11 @@
-//! The gateway's lazily started standalone Nx cache server, as a real process: its lock, its
-//! refusal frame, its death with the gateway, and its stdin-EOF drain. Raw bytes service and
-//! process integration only; no archive restore, cutover, or publication claim.
+//! The gateway's lazily started Nx cache server, `bun <bundle> --exit-on-stdin-eof`, as a real
+//! process: its lock, its refusal frame, its death with the gateway, and its stdin-EOF drain. Raw
+//! bytes service and process integration only; no archive restore, cutover, or publication claim.
 use super::*;
 
 use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
 
+use std::ffi::OsString;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
@@ -26,27 +27,36 @@ const LINE_LIMIT: u64 = 16 * 1024;
 /// The whole startup stream of a child or server is capped too, so no read is unbounded.
 const STREAM_LIMIT: u64 = 64 * 1024;
 
-/// The packaged standalone server for this host. Built by its own package step; the test asserts
-/// it exists rather than falling back to any other server.
-pub(super) fn server_executable() -> PathBuf {
-    let arch = if cfg!(target_arch = "aarch64") {
-        "darwin-arm64"
-    } else {
-        "darwin-x64"
-    };
+/// The server bundle this repository builds (`nx run nx-cache-server:bundle`). The test asserts it
+/// exists rather than falling back to any other server.
+pub(super) fn server_script() -> PathBuf {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
         .expect("cargo and nextest export CARGO_MANIFEST_DIR to the test process");
     let path = Path::new(&manifest)
-        .join("../../../../packages/nx-cache-server/dist/bin")
-        .join(arch)
-        .join("nx-cache-server");
+        .join("../../../../packages/nx-cache-server/dist/server/nx-cache-server.js");
     assert!(
         path.is_file(),
-        "packaged standalone server is missing at {}: build packages/nx-cache-server first",
+        "server bundle is missing at {}: run nx run nx-cache-server:bundle first",
         path.display()
     );
-    path.canonicalize()
-        .expect("canonical standalone server path")
+    path.canonicalize().expect("canonical server bundle path")
+}
+
+/// The `PATH` the gateway searches for `bun`: this test's own, as setup records its invoker's.
+pub(super) fn server_path() -> OsString {
+    std::env::var_os("PATH").expect("PATH names the bun the server runs on")
+}
+
+/// Whether a `ps` args line is the gateway's server: `<bun> <script> --exit-on-stdin-eof`.
+pub(super) fn is_server_args(args: &str, script: &Path) -> bool {
+    args.ends_with(&format!("{} --exit-on-stdin-eof", script.display()))
+}
+
+/// A direct run of the server bundle under bun, outside any gateway.
+fn server_command(script: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("bun");
+    command.arg(script);
+    command
 }
 
 fn nx_put(endpoint: SocketAddr, token: &str, hash: &str, body: &str) -> String {
@@ -63,6 +73,7 @@ fn server_env(command: &mut tokio::process::Command, entries: &Path) {
     let write = WorkspaceToken::from_bytes([62; 32]).encode();
     command
         .env_clear()
+        .env("PATH", server_path())
         .env("NX_CACHE_SERVER_DIR", entries)
         .env("NX_CACHE_SERVER_HOST", "127.0.0.1")
         .env("NX_CACHE_SERVER_PORT", "0")
@@ -115,7 +126,8 @@ async fn nx_backend_gateway_child() {
     let config = GatewayConfig {
         mirror_cache: MirrorCacheConfig::new(mirror),
         nx_cache: Some(NxCacheServiceConfig {
-            executable: server_executable(),
+            script: server_script(),
+            path: server_path(),
             directory: directory.clone(),
             max_bytes: 1024 * 1024,
             cap_bytes: 64 * 1024 * 1024,
@@ -318,7 +330,7 @@ async fn await_exit(kq: OwnedFd) -> bool {
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
-    let server = server_executable();
+    let server = server_script();
     let root = secure_fixture_dir(&format!("cowshed-nx-process-{}", std::process::id()));
     let mut child =
         tokio::process::Command::new(std::env::current_exe().expect("test binary path"))
@@ -353,7 +365,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
 
     // One snapshot of the process table: exactly one server, owned by this gateway.
     let listing = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,comm="])
+        .args(["-axo", "pid=,ppid=,args="])
         .output_locked()
         .expect("ps snapshot");
     assert!(
@@ -370,8 +382,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
             }
             let pid: u32 = fields[0].parse().ok()?;
             let ppid: u32 = fields[1].parse().ok()?;
-            (ppid == gateway_pid && fields[2..].join(" ").ends_with("nx-cache-server"))
-                .then_some(pid)
+            (ppid == gateway_pid && is_server_args(&fields[2..].join(" "), &server)).then_some(pid)
         })
         .collect();
     assert_eq!(
@@ -418,7 +429,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
     let inode_before = std::fs::metadata(&lock)
         .expect("persistent lock file")
         .ino();
-    let mut second = tokio::process::Command::new(&server);
+    let mut second = server_command(&server);
     server_env(&mut second, &entries);
     second
         .stdin(Stdio::null())
@@ -469,7 +480,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
     );
 
     // A fresh server on the same directory, with stdin held open, proves the lock was released.
-    let mut fresh_command = tokio::process::Command::new(&server);
+    let mut fresh_command = server_command(&server);
     fresh_command.arg("--exit-on-stdin-eof");
     server_env(&mut fresh_command, &entries);
     fresh_command

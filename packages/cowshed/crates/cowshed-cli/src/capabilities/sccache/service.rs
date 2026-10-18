@@ -141,7 +141,7 @@ pub async fn start_service(capacity: Option<ImageCapacity>) -> Result<SccacheSta
             CowshedError::internal(format!("could not create {}: {error}", parent.display()))
         })?;
     }
-    let observed = inspect_install_state(&spec)?;
+    let observed = inspect_install_state(spec.target())?;
     // `plan_install` compares the desired plist bytes against the installed ones, and the program
     // path is in those bytes. Because the plist names the resolved store path, a rebuild that moved
     // sccache is a changed plist, which forces the bootout-then-bootstrap below: the running server

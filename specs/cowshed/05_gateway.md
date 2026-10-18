@@ -108,9 +108,23 @@ reaches it after a reboot whatever volume the build came from (a workspace image
 | `cargo`                  | The jobserver launcher: a relative link saying `cowshed`, so install and rollback switch both. |
 | `cowshed-<sha256>`       | A stored copy, named for the SHA-256 of its bytes (64 lowercase hex digits), mode 0755.        |
 | `cowshed-<sha256>.build` | That copy's build record, JSON `{"commit","commitTime"}`, written by a build that records one. |
+| `nx-cache-server`        | The Nx cache server's stable name, a link to its own stored copy `nx-cache-server-<sha256>`.   |
 
 `cowshed-source`, one level up beside `bin`, records the path the current install came from and its package version.
 `install.lock`, beside it, is the install slot's lock (below); it is never removed.
+
+**The Nx cache server is JavaScript run by the shell's `bun`** (tg#7504, tg#6789). Neither `@smoothbricks/cowshed` nor
+`@smoothbricks/nx-cache-server` ships a compiled server or an interpreter. An install copies the build's server bundle
+into `bin` the same content-addressed way: for a distribution (`<package>/dist/bin/<platform>/cowshed`) it is
+`node_modules/@smoothbricks/nx-cache-server/dist/server/nx-cache-server.js`, resolved as Node resolves the dependency
+from the package and then each ancestor (an isolated Bun store, a hoisted install and a checkout's workspace link
+alike); for a build the slot already holds it is the slot's own `nx-cache-server`. A build with neither is refused by
+name before anything changes. The gateway agent's plist sets `PATH` to the directory of the first `bun` on the
+installing shell's `PATH`, links resolved, ahead of launchd's default `/usr/bin:/bin:/usr/sbin:/sbin`: a devenv shell's
+`.devenv/profile/bin/bun` becomes its `/nix/store/…-bun-…/bin`, readable at boot without the checkout. An install, start
+or refresh from a shell with no `bun` is refused with the setup instruction; nothing beside cowshed stands in. The
+daemon starts each project's backend as `<bun on its PATH> <bin/nx-cache-server> --exit-on-stdin-eof`; a store path nix
+has since collected fails that start by name until setup runs again.
 
 **Content-addressed copies, one moving name.** A copy is written once: the build's bytes go into an exclusive temporary
 file in `bin`, are synced, and are renamed to the copy's name. A copy whose bytes and mode already match is never

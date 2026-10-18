@@ -208,14 +208,6 @@
       "cli-arm64-macos": {
         "executor": "nx:run-commands",
         "cache": true,
-        "dependsOn": [
-          {
-            "projects": [
-              "nx-cache-server"
-            ],
-            "target": "bun-arm64-macos"
-          }
-        ],
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/skills/cowshed/SKILL.md",
@@ -229,36 +221,24 @@
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock",
-          "cargoToolchain",
-          {
-            "dependentTasksOutputFiles": "**/nx-cache-server",
-            "transitive": false
-          }
+          "cargoToolchain"
         ],
         "outputs": [
           "{projectRoot}/dist/bin/darwin-arm64"
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && cp ../nx-cache-server/dist/bin/darwin-arm64/nx-cache-server dist/bin/darwin-arm64/nx-cache-server"
+          "command": "napi build --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64"
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && cp ../nx-cache-server/dist/bin/darwin-arm64/nx-cache-server dist/bin/darwin-arm64/nx-cache-server"
+            "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64"
           }
         }
       },
       "cli-x64-macos": {
         "executor": "nx:run-commands",
         "cache": true,
-        "dependsOn": [
-          {
-            "projects": [
-              "nx-cache-server"
-            ],
-            "target": "bun-x64-macos"
-          }
-        ],
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/skills/cowshed/SKILL.md",
@@ -272,22 +252,18 @@
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock",
-          "cargoToolchain",
-          {
-            "dependentTasksOutputFiles": "**/nx-cache-server",
-            "transitive": false
-          }
+          "cargoToolchain"
         ],
         "outputs": [
           "{projectRoot}/dist/bin/darwin-x64"
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && cp ../nx-cache-server/dist/bin/darwin-x64/nx-cache-server dist/bin/darwin-x64/nx-cache-server"
+          "command": "napi build --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64"
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && cp ../nx-cache-server/dist/bin/darwin-x64/nx-cache-server dist/bin/darwin-x64/nx-cache-server"
+            "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64"
           }
         }
       },
@@ -295,13 +271,7 @@
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
-          "napi-toolchain-arm64-linux",
-          {
-            "projects": [
-              "nx-cache-server"
-            ],
-            "target": "bun-arm64-linux"
-          }
+          "napi-toolchain-arm64-linux"
         ],
         "inputs": [
           "{projectRoot}/**/*.rs",
@@ -315,25 +285,21 @@
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock",
-          "cargoToolchain",
-          {
-            "dependentTasksOutputFiles": "**/nx-cache-server",
-            "transitive": false
-          }
+          "cargoToolchain"
         ],
         "outputs": [
           "{projectRoot}/dist/bin/linux-arm64-gnu"
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu && cp ../nx-cache-server/dist/bin/linux-arm64/nx-cache-server dist/bin/linux-arm64-gnu/nx-cache-server",
+          "command": "napi build --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu",
           "env": {
             "CFLAGS_aarch64_unknown_linux_gnu": "-D__ARM_ARCH=8"
           }
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu && cp ../nx-cache-server/dist/bin/linux-arm64/nx-cache-server dist/bin/linux-arm64-gnu/nx-cache-server"
+            "command": "napi build --release --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu"
           }
         }
       },
@@ -341,13 +307,7 @@
         "executor": "nx:run-commands",
         "cache": true,
         "dependsOn": [
-          "napi-toolchain-x64-linux",
-          {
-            "projects": [
-              "nx-cache-server"
-            ],
-            "target": "bun-x64-linux"
-          }
+          "napi-toolchain-x64-linux"
         ],
         "inputs": [
           "{projectRoot}/**/*.rs",
@@ -361,18 +321,14 @@
           "!{projectRoot}/**/target/**",
           "{projectRoot}/package.json",
           "{workspaceRoot}/bun.lock",
-          "cargoToolchain",
-          {
-            "dependentTasksOutputFiles": "**/nx-cache-server",
-            "transitive": false
-          }
+          "cargoToolchain"
         ],
         "outputs": [
           "{projectRoot}/dist/bin/linux-x64-gnu"
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu && cp ../nx-cache-server/dist/bin/linux-x64/nx-cache-server dist/bin/linux-x64-gnu/nx-cache-server",
+          "command": "napi build --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu",
           "env": {
             "AR_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-ar",
             "CC_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-gcc",
@@ -382,7 +338,7 @@
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu && cp ../nx-cache-server/dist/bin/linux-x64/nx-cache-server dist/bin/linux-x64-gnu/nx-cache-server"
+            "command": "napi build --release --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu"
           }
         }
       },
@@ -622,7 +578,7 @@
             "projects": [
               "nx-cache-server"
             ],
-            "target": "bun-arm64-macos"
+            "target": "bundle"
           }
         ],
         "inputs": [

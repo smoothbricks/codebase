@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_cli::launchd::{
-    COWSHED_BINARY_NAME, CommandStatus, ControlAction, ControlExecutionError, ControlPlan,
-    ExecutableDigest, ExecutableInstallState, ExistingPlist, FilesystemOperation, GATEWAY_LABEL,
-    HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
+    BunDirectory, COWSHED_BINARY_NAME, CommandStatus, ControlAction, ControlExecutionError,
+    ControlPlan, ExecutableDigest, ExecutableInstallState, ExistingPlist, FilesystemOperation,
+    GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
     JOBSERVER_LAUNCHER_NAME, LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand,
     LaunchctlOutput, LaunchdError, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus,
     Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME,
@@ -42,13 +42,19 @@ const SCCACHE_STORE_PATH: &str =
     "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed";
 const SCCACHE_PROGRAM: &str =
     "/nix/store/0000000000000000000000000000000a-sccache-0.17.0-cowshed/bin/sccache";
+/// The bun a devenv shell's `PATH` resolves to, as the gateway agent's `PATH` names it.
+const BUN_DIRECTORY: &str = "/nix/store/0000000000000000000000000000000b-bun-1.4.2/bin";
 
 fn cowshed_binary() -> HostStableExecutable {
     HostStableExecutable::new(Path::new(HOME), COWSHED_BINARY_NAME).unwrap()
 }
 
+fn bun() -> BunDirectory {
+    BunDirectory::new(PathBuf::from(BUN_DIRECTORY)).unwrap()
+}
+
 fn gateway() -> LaunchAgentSpec {
-    LaunchAgentSpec::gateway(&cowshed_binary()).unwrap()
+    LaunchAgentSpec::gateway(&cowshed_binary(), &bun()).unwrap()
 }
 
 fn sccache_program() -> StoreBackedProgram {
@@ -108,6 +114,11 @@ fn gateway_definition_has_exact_paths_argv_lifecycle_and_plist_bytes() {
         "  <string>Interactive</string>\n",
         "  <key>StandardErrorPath</key>\n",
         "  <string>/Users/cowshed-test/Library/Logs/cowshed/daemon-stderr.log</string>\n",
+        "  <key>EnvironmentVariables</key>\n",
+        "  <dict>\n",
+        "    <key>PATH</key>\n",
+        "    <string>/nix/store/0000000000000000000000000000000b-bun-1.4.2/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n",
+        "  </dict>\n",
         "  <key>SoftResourceLimits</key>\n",
         "  <dict>\n",
         "    <key>NumberOfFiles</key>\n",
@@ -1041,7 +1052,7 @@ fn each_agent_plist_names_only_the_program_its_type_can_prove() {
     );
 
     let specs = [
-        LaunchAgentSpec::gateway(&cowshed).unwrap(),
+        LaunchAgentSpec::gateway(&cowshed, &bun()).unwrap(),
         LaunchAgentSpec::sccache(
             &sccache,
             Path::new("/Users/cowshed-test/.cowshed/sccache.sock"),
@@ -1630,7 +1641,8 @@ mod descriptor_inheritance {
         let root = agent._scratch.path();
         let executable =
             HostStableExecutable::new(root, COWSHED_BINARY_NAME).expect("probe program");
-        let spec = LaunchAgentSpec::gateway(&executable).expect("generated gateway definition");
+        let spec =
+            LaunchAgentSpec::gateway(&executable, &bun()).expect("generated gateway definition");
         fs::create_dir_all(executable.path().parent().expect("binary directory"))
             .expect("binary directory");
         fs::create_dir_all(spec.standard_error_path().parent().expect("log directory"))

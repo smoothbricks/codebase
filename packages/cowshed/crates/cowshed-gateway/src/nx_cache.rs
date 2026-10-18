@@ -110,14 +110,34 @@ pub(crate) fn client_reads(method: &http::Method, status: http::StatusCode) -> b
     }
 }
 
-/// Installed standalone server bytes and a host-private artifact root. A backend is started only
-/// when an Nx client first asks for its project, not for every non-Nx workspace in inventory.
+/// The installed server bundle, the `PATH` its `bun` comes from, and a host-private artifact root.
+/// A backend is started only when an Nx client first asks for its project, not for every non-Nx
+/// workspace in inventory.
+///
+/// The server is JavaScript (`@smoothbricks/nx-cache-server`'s `dist/server` bundle) run by the
+/// `bun` on `path`: cowshed carries no interpreter of its own (tg#7504). `cowshed setup` puts the
+/// directory of the `bun` it found on the gateway agent's `PATH`, a nix store path included.
 #[derive(Clone, Debug)]
 pub struct NxCacheServiceConfig {
-    pub executable: std::path::PathBuf,
+    pub script: std::path::PathBuf,
+    pub path: std::ffi::OsString,
     pub directory: std::path::PathBuf,
     pub max_bytes: u64,
     pub cap_bytes: u64,
+}
+
+/// The first `bun` on `path`: an executable regular file (through links) in an absolute
+/// directory. Relative entries are skipped, as a service's working directory names nothing.
+pub fn bun_on_path(path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::env::split_paths(path)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join("bun"))
+        .find(|candidate| {
+            candidate.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
 }
 
 #[derive(serde::Deserialize)]
@@ -270,7 +290,7 @@ pub(crate) async fn start_backend(
 
     cowshed_gateway_types::validate_repo_id(repo_id)
         .map_err(|error| format!("Nx cache project {repo_id}: {error}"))?;
-    if !config.executable.is_absolute()
+    if !config.script.is_absolute()
         || !config.directory.is_absolute()
         || config.max_bytes == 0
         || config.max_bytes > config.cap_bytes
@@ -280,6 +300,13 @@ pub(crate) async fn start_backend(
                 .to_owned(),
         );
     }
+    // A missing interpreter is a setup fault, said as one: nothing beside cowshed stands in.
+    let bun = bun_on_path(&config.path).ok_or_else(|| {
+        format!(
+            "Nx cache backend {repo_id}: no bun on the gateway's PATH {}; run `cowshed setup` from a shell whose PATH has bun (devenv provides it)",
+            std::path::Path::new(&config.path).display()
+        )
+    })?;
     let project = config
         .directory
         .join(format!("{:x}", Sha256::digest(repo_id.as_bytes())));
@@ -305,7 +332,8 @@ pub(crate) async fn start_backend(
     }
     let read_token = mint_token()?;
     let write_token = mint_token()?;
-    let mut child = tokio::process::Command::new(&config.executable)
+    let mut child = tokio::process::Command::new(&bun)
+        .arg(&config.script)
         .arg("--exit-on-stdin-eof")
         .env_clear()
         .env("NX_CACHE_SERVER_DIR", project.join("entries"))
@@ -326,7 +354,13 @@ pub(crate) async fn start_backend(
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn_locked()
-        .map_err(|error| format!("start Nx cache {}: {error}", config.executable.display()))?;
+        .map_err(|error| {
+            format!(
+                "start Nx cache {} {}: {error}",
+                bun.display(),
+                config.script.display()
+            )
+        })?;
     let stdout = child
         .stdout
         .take()

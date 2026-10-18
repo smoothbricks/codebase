@@ -1,11 +1,11 @@
 //! A Nx read whose backend dies mid-body. The response head already said `200`, so the gateway
 //! cannot change it; the audit must name the cut as a failed transfer and never as a completed hit.
-//! One real `Gateway` and one real standalone server from the normal package build, which this
-//! test kills with SIGKILL. It proves that stream cut and nothing else: no restore, publication,
-//! or cutover claim.
+//! One real `Gateway` and one real server, the package's bundle run by `bun` from `PATH`, which
+//! this test kills with SIGKILL. It proves that stream cut and nothing else: no restore,
+//! publication, or cutover claim.
 use super::*;
 
-use super::nx_process::server_executable;
+use super::nx_process::{is_server_args, server_path, server_script};
 use cowshed_gateway::{
     AuditEvent, AuditStatus, GatewayTimeouts, NxCacheServiceConfig, NxPublication,
 };
@@ -80,10 +80,10 @@ async fn read_some(stream: &mut TcpStream, buffer: &mut [u8]) -> usize {
     read
 }
 
-/// The one standalone server this process's gateway started, read from a single `ps` snapshot.
-fn own_server_child(gateway_pid: u32) -> libc::pid_t {
+/// The one server this process's gateway started, read from a single `ps` snapshot.
+fn own_server_child(gateway_pid: u32, script: &std::path::Path) -> libc::pid_t {
     let listing = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,comm="])
+        .args(["-axo", "pid=,ppid=,args="])
         .output_locked()
         .expect("ps snapshot");
     assert!(
@@ -100,8 +100,7 @@ fn own_server_child(gateway_pid: u32) -> libc::pid_t {
             }
             let pid: libc::pid_t = fields[0].parse().ok()?;
             let ppid: u32 = fields[1].parse().ok()?;
-            (ppid == gateway_pid && fields[2..].join(" ").ends_with("nx-cache-server"))
-                .then_some(pid)
+            (ppid == gateway_pid && is_server_args(&fields[2..].join(" "), script)).then_some(pid)
         })
         .collect();
     assert_eq!(
@@ -129,8 +128,10 @@ async fn host_controller_nx_backend_killed_mid_body_is_a_failed_transfer() {
         tunnel_total: STEP_LIMIT,
         ..config.timeouts
     };
+    let script = server_script();
     config.nx_cache = Some(NxCacheServiceConfig {
-        executable: server_executable(),
+        script: script.clone(),
+        path: server_path(),
         directory,
         max_bytes: 64 * 1024 * 1024,
         cap_bytes: 96 * 1024 * 1024,
@@ -229,8 +230,8 @@ async fn host_controller_nx_backend_killed_mid_body_is_a_failed_transfer() {
         "the preview must be a fraction of the artifact"
     );
 
-    // Kill the backend, not the gateway: the server is the one standalone child this gateway started.
-    let server = own_server_child(std::process::id());
+    // Kill the backend, not the gateway: the server is the one child this gateway started.
+    let server = own_server_child(std::process::id(), &script);
     // SAFETY: kill signals one pid, the server child this test has just identified; no other pid
     // is named.
     let killed = unsafe { libc::kill(server, libc::SIGKILL) };

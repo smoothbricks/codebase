@@ -349,10 +349,11 @@ async fn real_nx_client_with_no_service_config_executes_locally() {
     gateway.drain().await.expect("drain gateway");
 }
 
-/// A configured service whose executable does not exist: the start fails, its failure becomes a
-/// cooldown, and the client's GET is refused as an outage without starting a server.
+/// A configured service whose `PATH` has no `bun`: the start fails before any process is spawned,
+/// its failure becomes a cooldown, and the client's GET is refused as an outage. The script exists,
+/// so the missing interpreter is the only fault.
 #[tokio::test]
-async fn real_nx_client_with_missing_executable_executes_locally() {
+async fn real_nx_client_with_no_bun_on_path_executes_locally() {
     let root = super::fixture_dir::secure_fixture_dir(&format!(
         "cowshed-nx-outage-missing-{}",
         std::process::id()
@@ -364,8 +365,16 @@ async fn real_nx_client_with_missing_executable_executes_locally() {
         .mode(0o700)
         .create(&store)
         .expect("create the private Nx store under the fixture root");
+    let script = root.path().join("nx-cache-server.js");
+    std::fs::write(&script, b"").expect("write the fixture server script");
+    let empty = root.path().join("empty-bin");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&empty)
+        .expect("create a PATH directory without bun");
     config.nx_cache = Some(NxCacheServiceConfig {
-        executable: root.path().join("no-such-nx-cache-server"),
+        script,
+        path: empty.into_os_string(),
         directory: store,
         max_bytes: 1024 * 1024,
         cap_bytes: 64 * 1024 * 1024,
