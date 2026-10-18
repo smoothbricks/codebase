@@ -146,6 +146,15 @@ export function reusableGraph(
     : null;
 }
 
+/** What {@link graphInstallationIdentity} binds: resolution edges `[from, name, physical manifest]`, node stamps and
+ * file hashes, read once.
+ */
+export interface GraphInstallationCensus {
+  readonly resolutions: readonly (readonly [string, string, string | null])[];
+  readonly nodes: readonly NodeWitness[];
+  readonly files: readonly { readonly path: string; readonly sha256: string }[];
+}
+
 /** Plugins with opaque external graph inputs cannot borrow this proof.
  * For the repository plugin and Nx, bind the entire owned module/file tree
  * and its dependency/optional/peer resolution closure, including each alias,
@@ -161,6 +170,38 @@ export function graphInstallationIdentity(
   localInputs: GraphInputContractProof | null,
   onUnproved?: (detail: string) => void,
 ): string | null {
+  const census = graphInstallationCensus(workspaceRoot, nxJson, resolvePackage, expand, localInputs, onUnproved);
+  if (census === null) return null;
+  try {
+    for (const node of census.nodes) {
+      if (nodeStamp(lstatSync(node.path, { bigint: true })) !== node.stamp) {
+        onUnproved?.(`Installed module node changed during inspection: ${node.path}`);
+        return null;
+      }
+    }
+  } catch (error) {
+    if (systemError(error) && ['EACCES', 'EPERM', 'EIO'].includes(error.code)) throw error;
+    if (error instanceof Error) {
+      onUnproved?.(error.message);
+      return null;
+    }
+    throw error;
+  }
+  return JSON.stringify({ ...census, localInputs: localInputs?.identity ?? null });
+}
+
+/** One read of the installation closure {@link graphInstallationIdentity} binds, without its final check that no node
+ * moved while it was read: what a caller that needs the closure, not a proof of it, reads. `null`, with `onUnproved`
+ * told why, for a closure that cannot be read.
+ */
+export function graphInstallationCensus(
+  workspaceRoot: string,
+  nxJson: NxJsonConfiguration,
+  resolvePackage: typeof readModulePackageJsonWithoutFallbacks,
+  expand: typeof expandOutputs,
+  localInputs: GraphInputContractProof | null,
+  onUnproved?: (detail: string) => void,
+): GraphInstallationCensus | null {
   const plugins = (nxJson.plugins ?? []).map((plugin) => (typeof plugin === 'string' ? plugin : plugin.plugin));
   const unproved = plugins.filter(
     (plugin) => plugin !== '@smoothbricks/nx-plugin' && !localInputs?.plugins.includes(plugin),
@@ -316,13 +357,7 @@ export function graphInstallationIdentity(
       visit(name, workspaceRoot, false);
     for (const input of localInputs?.packages ?? []) visit(input.name, input.from, false);
     visit('typescript', workspaceRoot, true);
-    for (const node of nodes) {
-      if (nodeStamp(lstatSync(node.path, { bigint: true })) !== node.stamp) {
-        onUnproved?.(`Installed module node changed during inspection: ${node.path}`);
-        return null;
-      }
-    }
-    return JSON.stringify({ resolutions, nodes, files, localInputs: localInputs?.identity ?? null });
+    return { resolutions, nodes, files };
   } catch (error) {
     if (systemError(error) && ['EACCES', 'EPERM', 'EIO'].includes(error.code)) throw error;
     // Installation uncertainty disables only graph reuse. Nx's authoritative

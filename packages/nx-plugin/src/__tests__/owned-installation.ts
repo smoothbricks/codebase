@@ -21,20 +21,17 @@ import { basename, dirname, join, relative } from 'node:path';
 import { expandOutputs } from 'nx/src/native';
 import { readModulePackageJson } from 'nx/src/utils/package-json';
 import typia from 'typia';
-import { graphInstallationIdentity } from '../ensure-built-witness.js';
+import {
+  type GraphInstallationCensus,
+  graphInstallationCensus,
+  graphInstallationIdentity,
+} from '../ensure-built-witness.js';
 import { nxFixtureRoot } from './fixture-nx-env.js';
 
 const repositoryRoot = join(import.meta.dir, '../../../..');
 
 /** The configuration the census resolves: Nx, this plugin and TypeScript. */
 const CENSUS_NX_JSON = { plugins: ['@smoothbricks/nx-plugin'] };
-
-/** What {@link graphInstallationIdentity} binds: resolution edges `[from, name, physical manifest]`, node stamps, file hashes. */
-interface InstallationCensus {
-  readonly resolutions: readonly (readonly [string, string, string | null])[];
-  readonly nodes: readonly { readonly path: string; readonly stamp: string }[];
-  readonly files: readonly { readonly path: string; readonly sha256: string }[];
-}
 
 /** An installation made under `root`, and its identity when the copy was made. */
 interface OwnedInstallation {
@@ -59,9 +56,26 @@ function installationIdentity(root: string): string {
   return identity;
 }
 
-/** Copy the repository's installation closure into `root/node_modules`; `root` is an empty directory the caller owns. */
+/** Copy the repository's installation closure into `root/node_modules`; `root` is an empty directory the caller owns.
+ *
+ * Only the closure is read from the repository, never its proof: the repository's installation is the host's, whose
+ * shared store other tasks relink while the census reads it, which changes node stamps and would make every test that
+ * copies it fail for the host's work rather than its own. The copy, which the fixture owns, is what gets proved.
+ */
 async function makeOwnedInstallation(root: string): Promise<OwnedInstallation> {
-  const { resolutions } = typia.json.assertParse<InstallationCensus>(installationIdentity(repositoryRoot));
+  let unread = 'no detail';
+  const census = graphInstallationCensus(
+    repositoryRoot,
+    CENSUS_NX_JSON,
+    readModulePackageJson,
+    expandOutputs,
+    null,
+    (detail) => {
+      unread = detail;
+    },
+  );
+  if (census === null) throw new Error(`the Nx installation closure of ${repositoryRoot} cannot be read: ${unread}`);
+  const { resolutions } = census;
   const modules = join(root, 'node_modules');
   // Each source package root's copy, inside a store directory whose node_modules also holds its dependency links.
   const copies = new Map<
@@ -116,7 +130,7 @@ async function retireOwnedInstallation({ root, identity }: OwnedInstallation): P
     const retired = installationIdentity(root);
     if (retired === identity) return;
     const entries = (census: string) => {
-      const { nodes, files } = typia.json.assertParse<InstallationCensus>(census);
+      const { nodes, files } = typia.json.assertParse<GraphInstallationCensus>(census);
       return new Set([
         ...nodes.map(({ path, stamp }) => `${path} ${stamp}`),
         ...files.map(({ path, sha256 }) => `${path} ${sha256}`),
