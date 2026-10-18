@@ -202,7 +202,9 @@ outside it — enough to make a pre-push cross-compile probe unsatisfiable. Keep
 build-script reads or custom environment variables that Cargo metadata cannot name.
 
 A target whose inputs a repository DECLARES replaces the inferred list, pin included. Name the two `devenv.lock` entries
-in that declaration, or in the named input it uses, or a toolchain bump will not invalidate it.
+in that declaration, or in the named input it uses, or a toolchain bump will not invalidate it. The replaced list also
+held the target's `externalDependencies` entry described below; restate it (`[]` for a target that runs only cargo), or
+every lockfile change re-keys the target.
 
 Every cached cargo target names the npm packages its command runs as `externalDependencies`: none for cargo itself, and
 `@smoothbricks/nx-plugin` for a target that runs its executor or reads its installed files (the nextest tool config, the

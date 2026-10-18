@@ -48,7 +48,7 @@
       "inputs": ["default", "^default"]
     },
     "cargo-lint": {
-      "inputs": ["default", "^default"]
+      "inputs": [{ "externalDependencies": [] }]
     },
     "lint": {
       "cache": true
