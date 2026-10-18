@@ -14,7 +14,8 @@ use crate::path_entry::PathEntryOutcome;
 use async_trait::async_trait;
 use cowshed_core::api::Coordinator;
 use cowshed_core::api::{
-    EmptyResult, GatewayCpuBudget, GatewayStatus as CliGatewayStatus, StaleDaemonBinary,
+    EmptyResult, GateJobRef, GatewayCpuBudget, GatewayStatus as CliGatewayStatus, PendingInstall,
+    StaleDaemonBinary,
 };
 use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::project_retirement::ProjectRetirementReport;
@@ -521,8 +522,8 @@ where
 {
     match action {
         GatewayCommand::Start => {
-            let _slot = take_install_slot(&canonical_home()?).await?;
-            let status = start_service(output, Downgrade::Refuse).await?;
+            let slot = take_install_slot(&canonical_home()?).await?;
+            let status = start_service(output, &slot, Downgrade::Refuse).await?;
             emit_gateway_status(output, json, status)?;
         }
         GatewayCommand::Stop { purge } => {
@@ -561,8 +562,11 @@ where
     Ok(0)
 }
 
+/// Install the running build and start the gateway onto it. `slot` is the install slot this
+/// install holds ([`take_install_slot`]).
 async fn start_service<W, E>(
     output: &mut Output<W, E>,
+    slot: &InstallSlot,
     downgrade: Downgrade,
 ) -> Result<CliGatewayStatus>
 where
@@ -600,7 +604,7 @@ where
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
     // Activation restarts a gateway that runs; one that answers first sees its gates through.
     if client.status().await.is_ok() {
-        wait_for_gates(&client, &mut io::stderr()).await?;
+        wait_for_gates(slot, &client, &mut io::stderr()).await?;
     }
     let written = executor.execute_install(&plan).map_err(launchd_error)?;
     install_and_activate_gateway(&mut executor, &home, &candidate, &spec, written)?;
@@ -637,7 +641,7 @@ where
                     // activation did not restart it onto the bytes just installed. Restart it
                     // once.
                     (None, Some(_), _) if !restarted => {
-                        wait_for_gates(&client, &mut io::stderr()).await?;
+                        wait_for_gates(slot, &client, &mut io::stderr()).await?;
                         // The start deadline is the daemon's to meet, not the gates'.
                         started = tokio::time::Instant::now();
                         activate_launch_agent(
@@ -900,19 +904,19 @@ pub(crate) fn remove_path_entries(stable: &Path) -> Result<RemovalOutcome> {
 /// Stop the gateway while setup moves its mirrors; the installed binary stays. A gateway that
 /// answers first sees its gates through ([`wait_for_gates`]): stopping it cuts them off as a
 /// restart does.
-pub(crate) async fn stop_for_host_move() -> Result<()> {
+pub(crate) async fn stop_for_host_move(slot: &InstallSlot) -> Result<()> {
     let client = GatewayControlClient::new(control_socket_path()).map_err(control_error)?;
     if client.status().await.is_ok() {
-        wait_for_gates(&client, &mut io::stderr()).await?;
+        wait_for_gates(slot, &client, &mut io::stderr()).await?;
     }
     stop_service(false).map(|_| ())
 }
 
 /// Start the gateway again after setup moved its mirrors, saying nothing: setup reports the
 /// move itself, and the gateway's own start output belongs to `cowshed gateway start`.
-pub(crate) async fn start_after_host_move(downgrade: Downgrade) -> Result<()> {
+pub(crate) async fn start_after_host_move(slot: &InstallSlot, downgrade: Downgrade) -> Result<()> {
     let mut quiet = Output::new(io::sink(), io::sink(), true);
-    start_service(&mut quiet, downgrade).await.map(|_| ())
+    start_service(&mut quiet, slot, downgrade).await.map(|_| ())
 }
 
 pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
@@ -920,6 +924,7 @@ pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
     let socket = control_socket_path();
     let executable =
         HostStableExecutable::new(&home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    let pending_install = InstallSlot::observe(executable.support_directory())?;
     let spec = LaunchAgentSpec::gateway(&executable).map_err(launchd_error)?;
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let installed = matches!(
@@ -944,6 +949,7 @@ pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
     let cli_sha256 = executable_digest(&running_executable()?)?;
     Ok(CliGatewayStatus {
         cpu_budget,
+        pending_install,
         ..cli_status(installed, socket, status.as_ref(), cli_sha256.as_str())
     })
 }
@@ -962,32 +968,48 @@ const GATE_POLL: Duration = Duration::from_secs(1);
 
 /// The gate jobs a gateway restart now would cut off, oldest first: every gate job whose runners
 /// hold tokens, and every gate job a waiting request serves.
-fn gates_in_flight(ledger: &cowshed_gateway_types::CpuBudgetStatus) -> BTreeSet<(u64, String)> {
+fn gates_in_flight(ledger: &cowshed_gateway_types::CpuBudgetStatus) -> BTreeSet<GateJobRef> {
     ledger
         .gate_jobs
         .iter()
-        .map(|job| (job.job, job.checkout.clone()))
-        .chain(
-            ledger
-                .gate_queue
-                .iter()
-                .map(|waiter| (waiter.job, waiter.checkout.clone())),
-        )
+        .map(|job| GateJobRef {
+            job: job.job,
+            checkout: job.checkout.clone(),
+        })
+        .chain(ledger.gate_queue.iter().map(|waiter| GateJobRef {
+            job: waiter.job,
+            checkout: waiter.checkout.clone(),
+        }))
         .collect()
 }
 
 /// Hold an install that is about to restart the running gateway until no gate-class work holds
-/// or wants CPU tokens (05_gateway.md "Install order and rollback").
+/// or wants CPU tokens (05_gateway.md "An install waits for the gates in flight").
 ///
 /// A restart closes every lease connection, and a gate's pool goes with it: every task that gate
 /// admits afterwards is refused ("cpu-tokens parent pool refused: the gateway closed the lease
 /// connection"), which killed a land mid-gate. The restart itself is unchanged ("Crash safety by
 /// connection"); the installer only picks a moment with no gate in flight. There is no deadline,
 /// as no admission has one (05 "No admission deadline"): the gates end, and the install goes on.
-/// The gate jobs waited for are said once, and again whenever they change. A gateway that does
-/// not answer `cpu-budget` is not waited on, and that is said too.
-async fn wait_for_gates(client: &GatewayControlClient, stderr: &mut impl Write) -> Result<()> {
-    let mut named: Option<BTreeSet<(u64, String)>> = None;
+/// The gate jobs waited for are said once, and again whenever they change, and recorded in the
+/// slot for `gateway status` until the wait ends. A gateway that does not answer `cpu-budget` is
+/// not waited on, and that is said too.
+async fn wait_for_gates(
+    slot: &InstallSlot,
+    client: &GatewayControlClient,
+    stderr: &mut impl Write,
+) -> Result<()> {
+    let waited = watch_gates(slot, client, stderr).await;
+    let cleared = slot.clear_wait();
+    waited.and(cleared)
+}
+
+async fn watch_gates(
+    slot: &InstallSlot,
+    client: &GatewayControlClient,
+    stderr: &mut impl Write,
+) -> Result<()> {
+    let mut named: Option<BTreeSet<GateJobRef>> = None;
     loop {
         let gates = match client.cpu_budget().await {
             Ok(ledger) => gates_in_flight(&ledger),
@@ -1010,20 +1032,29 @@ async fn wait_for_gates(client: &GatewayControlClient, stderr: &mut impl Write) 
             return Ok(());
         }
         if named.as_ref() != Some(&gates) {
-            let jobs: Vec<String> = gates
-                .iter()
-                .map(|(job, checkout)| format!("gate job {job} at {checkout}"))
-                .collect();
             writeln!(
                 stderr,
                 "cowshed: waiting to restart the gateway until no gate job holds or wants CPU tokens: {}",
-                jobs.join(", ")
+                gate_jobs_named(&gates)
             )
             .map_err(output_error)?;
+            slot.record_wait(&PendingInstall {
+                waiting_for: gates.iter().cloned().collect(),
+            })?;
             named = Some(gates);
         }
         tokio::time::sleep(GATE_POLL).await;
     }
+}
+
+/// `gate job <n> at <checkout>, …`: how the installer and `gateway status` name the gate jobs an
+/// install waits for.
+fn gate_jobs_named<'a>(gates: impl IntoIterator<Item = &'a GateJobRef>) -> String {
+    gates
+        .into_iter()
+        .map(|gate| format!("gate job {} at {}", gate.job, gate.checkout))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn run_daemon() -> Result<()> {
@@ -1334,6 +1365,8 @@ fn cli_status(
         }),
         // The ledger is a second request, asked only of a daemon that answered this one.
         cpu_budget: None,
+        // The slot is observed beside the daemon, not asked of it.
+        pending_install: None,
     }
 }
 
@@ -1410,10 +1443,30 @@ pub fn emit_gateway_status<W: Write, E: Write>(
             status.daemon_version.as_deref().unwrap_or("unavailable")
         ))
         .map_err(output_error)?;
+    if let Some(pending) = &status.pending_install {
+        output
+            .guidance(&pending_install_line(pending))
+            .map_err(output_error)?;
+    }
     for line in status.cpu_budget.iter().flat_map(cpu_budget_lines) {
         output.guidance(&line).map_err(output_error)?;
     }
     Ok(())
+}
+
+/// An install that holds the slot, in the operator's words: the restart it is about to make, and
+/// the gate jobs it waits for before making it.
+fn pending_install_line(pending: &PendingInstall) -> String {
+    match pending.waiting_for.as_slice() {
+        [] => {
+            "gateway install pending: an install holds the install slot (dev.cowshed/install.lock)"
+                .to_owned()
+        }
+        gates => format!(
+            "gateway install pending: an install holds the install slot (dev.cowshed/install.lock) and waits to restart the gateway until no gate job holds or wants CPU tokens: {}",
+            gate_jobs_named(gates)
+        ),
+    }
 }
 
 /// The host CPU ledger in the operator's words (05_gateway.md "Host CPU budget"), in the order the
@@ -2095,8 +2148,9 @@ pub fn installed_binary_is_stale(
 /// The build has to be fit to supervise, and contain the installed one, *before* anything is
 /// copied, and a failed activation puts the old binary back: this is the function that,
 /// unguarded, replaced a host's supervised gateway with a debug build and then stranded it with
-/// no loaded agent. The caller holds the install slot ([`take_install_slot`]).
+/// no loaded agent. The caller holds the install slot: `slot` ([`take_install_slot`]).
 pub async fn refresh_gateway_binary(
+    slot: &InstallSlot,
     home: &Path,
     downgrade: Downgrade,
 ) -> Result<Option<ServiceBinaryRefresh>> {
@@ -2112,7 +2166,10 @@ pub async fn refresh_gateway_binary(
         None => None,
     };
     // Only a daemon that answers is one a restart would cut its gates off from.
-    let gates = client.as_ref().filter(|_| daemon.is_some());
+    let gates = client
+        .as_ref()
+        .filter(|_| daemon.is_some())
+        .map(|client| (slot, client));
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     refresh_gateway_from(
         home,
@@ -2137,7 +2194,7 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     debug_build: bool,
     basis: Result<()>,
     daemon: Option<&DaemonStatus>,
-    gates: Option<&GatewayControlClient>,
+    gates: Option<(&InstallSlot, &GatewayControlClient)>,
     executor: &mut LaunchdExecutor<NativeFilesystem, C>,
 ) -> Result<Option<ServiceBinaryRefresh>> {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
@@ -2187,8 +2244,8 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
     if !binary_is_stale && !daemon_is_stale && plan.is_noop() {
         return Ok(None);
     }
-    if let Some(client) = gates {
-        wait_for_gates(client, &mut io::stderr()).await?;
+    if let Some((slot, client)) = gates {
+        wait_for_gates(slot, client, &mut io::stderr()).await?;
     }
     let plist = executor.execute_install(&plan).map_err(launchd_error)?;
     if binary_is_stale {
@@ -3706,35 +3763,61 @@ mod tests {
         /// land admitted afterwards was refused. An install now waits until no gate job holds
         /// or wants a token, names the gate jobs it waits for once and again when they change,
         /// and goes on once none is left; with none in flight it goes on at once, silently.
+        /// Meanwhile `gateway status` sees the install hold the slot, and the gates it waits for.
         #[tokio::test]
         async fn an_install_waits_until_no_gate_job_holds_or_wants_cpu_tokens() {
             let heal = Arc::new(StartupHealState::mounting(0));
             heal.restored();
             let daemon = daemon("csgatewait", &[], heal).await;
             let client = GatewayControlClient::new(daemon.socket.clone()).expect("client");
+            let support = daemon.root.join("dev.cowshed");
+            fs::create_dir(&support).expect("support directory");
+            assert_eq!(InstallSlot::observe(&support).expect("observe"), None);
+            let slot = Arc::new(InstallSlot::take(&support).await.expect("the slot"));
+            let observed = || InstallSlot::observe(&support).expect("observe");
+            let pending = |gates: &[(u64, &str)]| {
+                Some(PendingInstall {
+                    waiting_for: gates
+                        .iter()
+                        .map(|(job, checkout)| GateJobRef {
+                            job: *job,
+                            checkout: (*checkout).to_owned(),
+                        })
+                        .collect(),
+                })
+            };
+            assert_eq!(observed(), pending(&[]), "held, and waiting for nothing");
 
             let mut said = Vec::new();
-            wait_for_gates(&client, &mut said)
+            wait_for_gates(&slot, &client, &mut said)
                 .await
                 .expect("no gate in flight");
             assert!(said.is_empty(), "{}", String::from_utf8_lossy(&said));
 
             let older = hold_gate(&daemon.socket, "/w/older-land").await;
             let waiting = tokio::spawn({
-                let client = client.clone();
+                let (slot, client) = (Arc::clone(&slot), client.clone());
                 async move {
                     let mut said = Vec::new();
-                    wait_for_gates(&client, &mut said).await.map(|()| said)
+                    wait_for_gates(&slot, &client, &mut said)
+                        .await
+                        .map(|()| said)
                 }
             });
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(!waiting.is_finished(), "the install waits for the gate");
+            let older_job = observed().expect("held").waiting_for[0].job;
+            assert_eq!(observed(), pending(&[(older_job, "/w/older-land")]));
             let younger = hold_gate(&daemon.socket, "/w/younger-land").await;
             tokio::time::sleep(GATE_POLL * 2).await;
             assert!(!waiting.is_finished(), "the install waits for both gates");
+            let both = observed().expect("held").waiting_for;
+            assert_eq!(both.len(), 2, "{both:?}");
+            assert_eq!(both[1].checkout, "/w/younger-land");
             drop(older);
             tokio::time::sleep(GATE_POLL * 2).await;
             assert!(!waiting.is_finished(), "the younger gate still runs");
+            assert_eq!(observed(), pending(&[(both[1].job, "/w/younger-land")]));
             drop(younger);
             let said = tokio::time::timeout(Duration::from_secs(10), waiting)
                 .await
@@ -3762,6 +3845,13 @@ mod tests {
                 lines[3],
                 "cowshed: no gate job holds or wants CPU tokens any more; restarting the gateway"
             );
+            assert_eq!(
+                observed(),
+                pending(&[]),
+                "the wait is over; the install still holds the slot"
+            );
+            drop(slot);
+            assert_eq!(observed(), None, "the slot is free");
 
             daemon.gateway.drain().await.expect("drain the gateway");
             fs::remove_dir_all(&daemon.root).expect("cleanup");

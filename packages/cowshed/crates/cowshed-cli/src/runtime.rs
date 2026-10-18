@@ -6692,6 +6692,7 @@ mod tests {
                 cli_sha256: "b4223cd0".into(),
             }),
             cpu_budget: None,
+            pending_install: None,
         };
 
         let findings = gateway_findings(&status);
@@ -6720,6 +6721,7 @@ mod tests {
             recovering: None,
             stale_daemon: None,
             cpu_budget: None,
+            pending_install: None,
         });
         let draining = findings
             .iter()
@@ -6743,6 +6745,7 @@ mod tests {
             recovering: None,
             stale_daemon: None,
             cpu_budget: None,
+            pending_install: None,
         });
         assert_eq!(gateway[0].code, "gateway-down");
         assert_eq!(gateway[0].severity, FindingSeverity::Error);

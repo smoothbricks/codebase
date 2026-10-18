@@ -11,7 +11,9 @@ use cowshed_cli::launchd::{
     NativeLaunchctlCommand, RemovalOutcome, STABLE_BINARY_MODE,
 };
 use cowshed_cli::output::Output;
-use cowshed_core::api::{GatewayCpuBudget, GatewayStatus as CliGatewayStatus};
+use cowshed_core::api::{
+    GateJobRef, GatewayCpuBudget, GatewayStatus as CliGatewayStatus, PendingInstall,
+};
 use cowshed_core::{CowshedError, Result};
 use cowshed_gateway_types::{CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter};
 
@@ -267,6 +269,7 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
             recovering: None,
             stale_daemon: None,
             cpu_budget: None,
+            pending_install: None,
         },
     )
     .expect("status emits");
@@ -317,6 +320,7 @@ fn gateway_status_names_launchd_socket_and_both_versions() {
                 recovering: None,
                 stale_daemon: None,
                 cpu_budget: None,
+                pending_install: None,
             },
         )
         .expect("status emits");
@@ -352,7 +356,85 @@ fn answering_status(cpu_budget: GatewayCpuBudget) -> CliGatewayStatus {
         recovering: None,
         stale_daemon: None,
         cpu_budget: Some(cpu_budget),
+        pending_install: None,
     }
+}
+
+/// An install that holds the slot is said, and so are the gate jobs it waits for before it
+/// restarts the gateway; the JSON carries the same as `pendingInstall` (05_gateway.md "The install
+/// slot").
+#[test]
+fn gateway_status_says_an_install_is_pending_and_which_gates_it_waits_for() {
+    let idle = || {
+        GatewayCpuBudget::Ledger(CpuBudgetStatus {
+            total: 18,
+            held: 0,
+            checkouts: Vec::new(),
+            gate_jobs: Vec::new(),
+            gate_queue: Vec::new(),
+            background: Vec::new(),
+        })
+    };
+    let rendered = |pending: Option<PendingInstall>, json: bool| {
+        let mut output = Output::new(Vec::new(), Vec::new(), false);
+        emit_gateway_status(
+            &mut output,
+            json,
+            CliGatewayStatus {
+                pending_install: pending,
+                ..answering_status(idle())
+            },
+        )
+        .expect("status emits");
+        let (stdout, stderr) = output.into_inner();
+        (
+            String::from_utf8(stdout).expect("utf8"),
+            String::from_utf8(stderr).expect("utf8"),
+        )
+    };
+
+    let (_, free) = rendered(None, false);
+    assert!(!free.contains("install pending"), "{free}");
+
+    let (_, held) = rendered(
+        Some(PendingInstall {
+            waiting_for: Vec::new(),
+        }),
+        false,
+    );
+    assert!(
+        held.lines().any(|line| line
+            == "cowshed: gateway install pending: an install holds the install slot (dev.cowshed/install.lock)"),
+        "{held}"
+    );
+
+    let waiting = PendingInstall {
+        waiting_for: vec![
+            GateJobRef {
+                job: 3,
+                checkout: "/w/older-land".into(),
+            },
+            GateJobRef {
+                job: 5,
+                checkout: "/w/younger-land".into(),
+            },
+        ],
+    };
+    let (_, said) = rendered(Some(waiting.clone()), false);
+    assert!(
+        said.lines().any(|line| line
+            == "cowshed: gateway install pending: an install holds the install slot (dev.cowshed/install.lock) and waits to restart the gateway until no gate job holds or wants CPU tokens: gate job 3 at /w/older-land, gate job 5 at /w/younger-land"),
+        "{said}"
+    );
+    let (stdout, _) = rendered(Some(waiting), true);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON line");
+    assert_eq!(
+        json["result"]["pendingInstall"],
+        serde_json::json!({"waitingFor": [
+            {"job": 3, "checkout": "/w/older-land"},
+            {"job": 5, "checkout": "/w/younger-land"}
+        ]})
+    );
 }
 
 /// `gateway status` shows who holds the host's CPU tokens in the order the ledger serves them —

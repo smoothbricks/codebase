@@ -1142,6 +1142,7 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         recovering: None,
         stale_daemon: None,
         cpu_budget: None,
+        pending_install: None,
     };
     assert_eq!(
         serde_json::to_value(&status).unwrap(),
@@ -1202,6 +1203,24 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
     assert_eq!(
         serde_json::to_value(unanswered).unwrap()["cpuBudget"],
         json!({"unanswered":"gateway control rejected operation (InvalidRequest): unknown op"})
+    );
+    // An install that holds the slot names the gate jobs it waits for; one not waiting names none.
+    let pending = GatewayStatus {
+        pending_install: Some(PendingInstall {
+            waiting_for: vec![GateJobRef {
+                job: 3,
+                checkout: "/w/land".into(),
+            }],
+        }),
+        ..status.clone()
+    };
+    assert_eq!(
+        serde_json::to_value(&pending).unwrap()["pendingInstall"],
+        json!({"waitingFor":[{"job":3,"checkout":"/w/land"}]})
+    );
+    assert_eq!(
+        serde_json::from_value::<GatewayStatus>(serde_json::to_value(&pending).unwrap()).unwrap(),
+        pending
     );
     // A daemon still recovering the supervisors from before it started says how many, never 0.
     let recovering = GatewayStatus {
