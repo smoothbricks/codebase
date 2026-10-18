@@ -2068,8 +2068,9 @@ impl ProjectActor {
 /// Remove an adopted project end to end: retire every session workspace, listed or never
 /// published; wait for their images' reclamation; collect; delete the abandon bundles the
 /// removals left (only under `abandon`, which is what authorized them); then restore main, which
-/// unbinds the project. Every step is idempotent, so a refusal at any step leaves the rest for
-/// the same call to finish — and a stale collection says so as [`crate::error::Retry`].
+/// unbinds the project and, with main retired, releases the build volumes main's link and seed
+/// kept from that collection. Every step is idempotent, so a refusal at any step leaves the rest
+/// for the same call to finish — and a stale collection says so as [`crate::error::Retry`].
 async fn remove_project(
     host: &mut dyn ProjectRuntimeHost,
     options: RemoveProjectOptions,
@@ -2735,8 +2736,8 @@ enum TerminalEntry {
 }
 
 /// Plans the removal of a terminal storage tree, children before their directory: only empty
-/// directories and the zero-length locks retired workspaces leave behind qualify. Anything else is
-/// refused before a single entry is removed.
+/// directories and the zero-length locks retired workspaces and released build volumes leave
+/// behind (`.lock`, `.hold`) qualify. Anything else is refused before a single entry is removed.
 #[cfg(target_os = "macos")]
 fn plan_terminal_storage_tree(path: &Path, plan: &mut Vec<TerminalEntry>) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
@@ -2781,7 +2782,9 @@ fn plan_terminal_storage_tree(path: &Path, plan: &mut Vec<TerminalEntry>) -> Res
         && path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".lock"))
+            .is_some_and(|name| {
+                name.ends_with(".lock") || name.ends_with(crate::build_volume::HOLD_SUFFIX)
+            })
     {
         plan.push(TerminalEntry::Lock(path.to_owned()));
         Ok(())
@@ -2796,10 +2799,9 @@ fn plan_terminal_storage_tree(path: &Path, plan: &mut Vec<TerminalEntry>) -> Res
     }
 }
 
+/// Removes what [`plan_terminal_storage_tree`] planned, in its order.
 #[cfg(target_os = "macos")]
-fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
-    let mut plan = Vec::new();
-    plan_terminal_storage_tree(path, &mut plan)?;
+fn remove_planned_terminal_storage(plan: Vec<TerminalEntry>) -> Result<()> {
     for entry in plan {
         let (removed, path) = match &entry {
             TerminalEntry::Lock(path) => (std::fs::remove_file(path), path),
@@ -2818,61 +2820,104 @@ fn remove_terminal_storage_tree(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The project store trees an unbinding deletes once main is retired; they may hold nothing but
-/// empty directories and zero-length locks by then.
+/// What is gone from a terminal storage tree before the unbinding deletes it, so the restore's
+/// check before main retires lets it stand.
 #[cfg(target_os = "macos")]
-const TERMINAL_STORAGE_TREES: [&str; 4] = [
-    crate::storage::recovery::STAGING_NAMESPACE,
-    crate::repository::CHECKPOINTS_DIRECTORY,
-    crate::repository::EXEC_TEMP_DIRECTORY,
-    crate::repository::SESSIONS_DIRECTORY,
+#[derive(Clone, Copy)]
+enum ReleasedFirst {
+    /// Nothing: the tree may hold only empty directories and locks already.
+    Nothing,
+    /// Main's own entry, which main's retirement reclaims with its image.
+    MainsOwn,
+    /// Every build volume's image and record, which the unbinding releases once main is retired,
+    /// main's linked volume and seed included.
+    BuildVolumes,
+}
+
+#[cfg(target_os = "macos")]
+impl ReleasedFirst {
+    fn exempts(self, entry: &std::ffi::OsStr) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::MainsOwn => entry == main_name().as_str(),
+            Self::BuildVolumes => crate::build_volume::VolumeFile::of(entry).is_some(),
+        }
+    }
+}
+
+/// The project store trees an unbinding deletes once main is retired and its build volumes are
+/// released; they may hold nothing but empty directories and zero-length locks by then.
+#[cfg(target_os = "macos")]
+const TERMINAL_STORAGE_TREES: [(&str, ReleasedFirst); 5] = [
+    (
+        crate::storage::recovery::STAGING_NAMESPACE,
+        ReleasedFirst::Nothing,
+    ),
+    (
+        crate::repository::CHECKPOINTS_DIRECTORY,
+        ReleasedFirst::MainsOwn,
+    ),
+    (
+        crate::repository::EXEC_TEMP_DIRECTORY,
+        ReleasedFirst::MainsOwn,
+    ),
+    (
+        crate::repository::SESSIONS_DIRECTORY,
+        ReleasedFirst::Nothing,
+    ),
+    (
+        crate::build_volume::IMAGES_DIRECTORY,
+        ReleasedFirst::BuildVolumes,
+    ),
 ];
 
 /// Refuses a main restore whose terminal storage the unbinding could not delete: a live
 /// workspace's image, grants or temp dir, an unreclaimed retired image, a staged image, another
-/// workspace's checkpoint, or an `rm --abandon` bundle kept for its owner. Main's own checkpoints
-/// and temp dir are exempt: main's retirement reclaims them with its image. The restore checks
-/// this before it retires main, because the same refusal after it leaves a binding no command can
-/// remove.
+/// workspace's checkpoint, an `rm --abandon` bundle kept for its owner, or anything in `build/`
+/// that is not a build volume's image, record or hold (a legacy payload, a stray file). Main's own
+/// checkpoints and temp dir are exempt: main's retirement reclaims them with its image. So are
+/// build volumes: the unbinding releases them all before it deletes `build/`, and refuses while
+/// the project is still bound if one stays. The restore checks this before it retires main,
+/// because the same refusal after it leaves a binding only a retry of the restore removes.
 #[cfg(target_os = "macos")]
 fn require_terminal_storage(project_root: &Path) -> Result<()> {
     let mut plan = Vec::new();
-    let planned = TERMINAL_STORAGE_TREES.into_iter().try_for_each(|name| {
-        let tree = project_root.join(name);
-        if name != crate::repository::CHECKPOINTS_DIRECTORY
-            && name != crate::repository::EXEC_TEMP_DIRECTORY
-        {
-            return plan_terminal_storage_tree(&tree, &mut plan);
-        }
-        let entries = match std::fs::read_dir(&tree) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(CowshedError::environment_missing(
-                    format!(
-                        "cannot enumerate terminal project storage {}: {error}",
-                        tree.display()
-                    ),
-                    "check controller storage permissions and retry",
-                ));
+    let planned = TERMINAL_STORAGE_TREES
+        .into_iter()
+        .try_for_each(|(name, released)| {
+            let tree = project_root.join(name);
+            if matches!(released, ReleasedFirst::Nothing) {
+                return plan_terminal_storage_tree(&tree, &mut plan);
             }
-        };
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot read terminal project storage {}: {error}",
-                        tree.display()
-                    ),
-                    "check controller storage permissions and retry",
-                )
-            })?;
-            if entry.file_name() != main_name().as_str() {
-                plan_terminal_storage_tree(&entry.path(), &mut plan)?;
+            let entries = match std::fs::read_dir(&tree) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(CowshedError::environment_missing(
+                        format!(
+                            "cannot enumerate terminal project storage {}: {error}",
+                            tree.display()
+                        ),
+                        "check controller storage permissions and retry",
+                    ));
+                }
+            };
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot read terminal project storage {}: {error}",
+                            tree.display()
+                        ),
+                        "check controller storage permissions and retry",
+                    )
+                })?;
+                if !released.exempts(&entry.file_name()) {
+                    plan_terminal_storage_tree(&entry.path(), &mut plan)?;
+                }
             }
-        }
-        Ok(())
-    });
+            Ok(())
+        });
     planned.map_err(|error| match error.code {
         ErrorCode::Integrity => CowshedError::conflict(
             format!(
@@ -2886,10 +2931,14 @@ fn require_terminal_storage(project_root: &Path) -> Result<()> {
     })
 }
 
+/// Deletes every terminal storage tree and the project root's own locks. The whole of it is
+/// planned before one entry is removed, so a refusal names what blocks it and leaves the rest as
+/// it found it.
 #[cfg(target_os = "macos")]
 fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result<()> {
-    for name in TERMINAL_STORAGE_TREES {
-        remove_terminal_storage_tree(&project_root.join(name))?;
+    let mut plan = Vec::new();
+    for (name, _) in TERMINAL_STORAGE_TREES {
+        plan_terminal_storage_tree(&project_root.join(name), &mut plan)?;
     }
     for entry in std::fs::read_dir(project_root).map_err(|error| {
         CowshedError::environment_missing(
@@ -2917,19 +2966,23 @@ fn clean_terminal_project_storage(project_root: &Path, binding: &Path) -> Result
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.ends_with(".lock"))
         {
-            remove_terminal_storage_tree(&path)?;
+            plan_terminal_storage_tree(&path, &mut plan)?;
         }
     }
-    Ok(())
+    remove_planned_terminal_storage(plan)
 }
 
 /// Everything the controller keeps for a project it is unbinding. Nothing reopens an unbound
 /// project, so its lifecycle journal, deletion log and slot bindings go, and with them its mount
-/// tree and each owner directory they leave empty; the store directory goes once
-/// the binding and the checkout root record after it do. What the user put in the store —
-/// `policy.json`, `waivers.json`, `quarantine/` — stays, and keeps the store directory with it.
+/// tree, its build volumes' mount tree (`<host mount root>/.build/<owner>/<repo>`) and each owner
+/// directory they leave empty; the store directory goes once the binding and the checkout root
+/// record after it do. What the user put in the store — `policy.json`, `waivers.json`,
+/// `quarantine/` — stays, and keeps the store directory with it. So does the project lease
+/// under `.retirements/`, which every actor of the identity holds by its inode.
 #[cfg(target_os = "macos")]
 fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Result<()> {
+    let build =
+        crate::build_volume::BuildVolumeLayout::new(paths).map_err(native_integrity_error)?;
     for file in [
         paths
             .project_root
@@ -2945,9 +2998,11 @@ fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Resu
     if let Some(owner) = paths.project_root.parent() {
         remove_directory_if_empty(owner)?;
     }
-    remove_empty_mount_tree(&paths.mount_root)?;
-    if let Some(owner) = paths.mount_root.parent() {
-        remove_directory_if_empty(owner)?;
+    for tree in [paths.mount_root.as_path(), build.mounts()] {
+        remove_empty_mount_tree(tree)?;
+        if let Some(owner) = tree.parent() {
+            remove_directory_if_empty(owner)?;
+        }
     }
     Ok(())
 }
@@ -6291,7 +6346,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// with it, unless a target adopted the volume (16_build_volumes.md, "Garbage collection"),
     /// and with them whatever else no checkout links. That holds for an unfinished clone, whose
     /// volumes no `gc` could collect while its create or fork was journaled, as for a published
-    /// workspace, and for a retried removal whose first attempt retired the image.
+    /// workspace, and for a retried removal whose first attempt retired the image. A main restore
+    /// collects in its unbinding instead, once main is retired and nothing links any volume, and
+    /// refuses there while the project is still bound when one stays.
     async fn remove_contained_in(
         &mut self,
         workspace: WorkspaceName,
@@ -7014,13 +7071,42 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(())
     }
 
-    /// Unbinds a project whose main was restored: the terminal storage, the controller's own
-    /// state (lifecycle journal included) and the mount tree go first, and the binding last, so a
-    /// process that dies part way leaves a project still bound and a retry that finishes the
-    /// job. The binding's absence is the removal's completion. The checkout root record goes right
-    /// after it — it is what reopens a still-bound project whose main image is gone — and the store
-    /// directory and emptied owner directories after that.
+    /// Releases every build volume the project still has, for an unbinding once main is retired:
+    /// nothing links one any more, so collection releases main's linked volume and seed with
+    /// whatever else no earlier collection could (16_build_volumes.md, "Garbage collection": a
+    /// target's seed is released when the target retires). One that stays — a job still holds it,
+    /// its release failed, its record is unreadable — refuses the unbinding while the binding
+    /// stands, naming each and why, so the same removal retries it.
+    async fn release_build_volumes_for_unbinding(&self) -> Result<()> {
+        let (images, links) = self.build_volume_links().await?;
+        let collection = self.build_volumes()?.collect(images, links, false).await?;
+        if collection.deferred.is_empty() {
+            return Ok(());
+        }
+        let stays = collection
+            .deferred
+            .iter()
+            .map(|deferred| format!("{} ({})", deferred.path.display(), deferred.deferral))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(CowshedError::conflict(
+            format!("the project cannot be unbound while its build volumes stay: {stays}"),
+            "the project stays bound; run the same removal again once they are released",
+        ))
+    }
+
+    /// Unbinds a project whose main was restored: its build volumes are released, then the
+    /// terminal storage (`build/` included), the controller's own state (lifecycle journal
+    /// included) and both mount trees go, and the binding last, so a process that dies part way
+    /// leaves a project still bound and a retry that finishes the job. The binding's absence is
+    /// the removal's completion. The checkout root record goes right after it — it is what
+    /// reopens a still-bound project whose main image is gone — and the store directory and
+    /// emptied owner directories after that. What the user wrote (`policy.json`, `waivers.json`,
+    /// `quarantine/`) stays, and with it the store directory.
     async fn unbind_restored_project(&self) -> Result<()> {
+        if self.project_is_bound().await? {
+            self.release_build_volumes_for_unbinding().await?;
+        }
         let paths = self.layout.project().clone();
         let expected = self.descriptor.binding.clone();
         crate::storage::lifecycle::dispatch_blocking(move || {
@@ -22504,6 +22590,120 @@ mod terminal_project_cleanup_tests {
             assert_eq!(std::fs::read(owned).expect("kept"), b"main's own");
         }
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    const VOLUME: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Released build volumes leave `build/` with their zero-length holds (legacy `.asif` ones
+    /// too, which no collection lists) and an empty `.staging`; none of it outlives the binding.
+    #[test]
+    fn cleanup_removes_a_build_directory_its_released_volumes_emptied() {
+        let root = root("build-emptied");
+        let binding = root.join("repository.json");
+        let build = root.join("build");
+        std::fs::create_dir_all(build.join(".staging")).expect("build staging");
+        std::fs::write(build.join(format!("{VOLUME}.dmg.hold")), b"").expect("hold");
+        std::fs::write(
+            build.join("fedcba9876543210fedcba9876543210.asif.hold"),
+            b"",
+        )
+        .expect("legacy hold");
+        std::fs::write(&binding, b"binding").expect("binding");
+
+        clean_terminal_project_storage(&root, &binding).expect("terminal cleanup");
+        assert!(!build.exists(), "build/ outlives the unbinding");
+        assert!(binding.is_file());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_build_volume_still_in_build_refuses_before_anything_is_removed() {
+        let root = root("build-held");
+        let binding = root.join("repository.json");
+        let image = root.join(format!("build/{VOLUME}.dmg"));
+        let lock = root.join("sessions/raven.asif.lock");
+        std::fs::create_dir_all(root.join(".staging")).expect("staging");
+        std::fs::create_dir_all(image.parent().expect("build")).expect("build");
+        std::fs::create_dir_all(lock.parent().expect("sessions")).expect("sessions");
+        std::fs::write(&image, b"volume").expect("image");
+        std::fs::write(&lock, b"").expect("lock");
+        std::fs::write(&binding, b"binding").expect("binding");
+
+        let error = clean_terminal_project_storage(&root, &binding)
+            .expect_err("a build volume left in build/ must block the unbinding");
+        assert_eq!(error.code.as_str(), "integrity");
+        assert!(error.message.contains(VOLUME), "{}", error.message);
+        assert_eq!(std::fs::read(&image).expect("image preserved"), b"volume");
+        assert!(lock.is_file(), "a lock went before the refusal");
+        assert!(
+            root.join(".staging").is_dir(),
+            "staging went before the refusal"
+        );
+        assert!(binding.is_file());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_unbound_project_leaves_no_build_mount_tree() {
+        let (root, paths) = project("build-mounts");
+        let mounts = root.join("mnt/.build/example-org/example-app");
+        std::fs::create_dir_all(mounts.join(VOLUME)).expect("released volume's mountpoint");
+
+        remove_unbound_project_state(&paths).expect("unbound state removal");
+        assert!(!mounts.exists(), "build mount tree remains");
+        assert!(
+            !mounts.parent().expect("owner").exists(),
+            "empty owner directory remains under .build"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn build_volumes_do_not_refuse_mains_restore() {
+        let (root, paths) = project("main-volume");
+        let build = paths.project_root.join("build");
+        std::fs::create_dir_all(build.join(".staging")).expect("build staging");
+        let volume = [
+            (build.join(format!("{VOLUME}.dmg")), &b"volume"[..]),
+            (build.join(format!("{VOLUME}.dmg.json")), &b"{}"[..]),
+            (build.join(format!("{VOLUME}.dmg.hold")), &b""[..]),
+        ];
+        for (path, bytes) in &volume {
+            std::fs::write(path, bytes).expect("volume file");
+        }
+
+        require_terminal_storage(&paths.project_root)
+            .expect("the unbinding releases main's build volumes after main retires");
+        for (path, bytes) in &volume {
+            assert_eq!(&std::fs::read(path).expect("kept"), bytes);
+        }
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn anything_in_build_that_is_no_volume_refuses_the_restore() {
+        for artifact in ["fedcba9876543210fedcba9876543210.asif", "notes.txt"] {
+            let (root, paths) = project("build-artifact");
+            let artifact = paths.project_root.join("build").join(artifact);
+            std::fs::create_dir_all(artifact.parent().expect("build")).expect("build");
+            std::fs::write(&artifact, b"retained").expect("artifact");
+
+            let error = require_terminal_storage(&paths.project_root)
+                .expect_err("collection never releases it, so the unbinding could not delete it");
+            assert_eq!(error.code.as_str(), "conflict");
+            assert!(
+                error
+                    .message
+                    .contains(artifact.file_name().expect("name").to_str().expect("utf-8")),
+                "{}",
+                error.message
+            );
+            assert_eq!(
+                std::fs::read(&artifact).expect("artifact kept"),
+                b"retained"
+            );
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
     }
 }
 

@@ -856,7 +856,12 @@ again at any level above it.
   volume is not released and leaves no line; a release that finds the image already gone deletes none and leaves none.
   Without this journal, an `rm` that releases the volume a land has just moved main onto leaves no trace of it.
 - Each target keeps only its latest seed; a superseded seed is released when replaced, and a target's seed is released
-  when the target retires. Detached seeds do not need an attach or a rename to be deleted.
+  when the target retires. Detached seeds do not need an attach or a rename to be deleted. Main retires last, in
+  `rm main --restore` (and `--restore --purge`): its unbinding collects once main's image is retired, so main's linked
+  volume and seed are released with every volume an earlier collection left, and a volume that stays refuses the
+  unbinding while the project is still bound (02_workspaces.md, "Checkout layouts"). With no volume left, the unbinding
+  deletes `build/` (then only empty directories and zero-length holds) and the project's `.build/<owner>/<repo>` mount
+  tree.
 - GC also enumerates seed sidecars whose images are already gone. Under the ordinary exclusive release claim it rechecks
   image absence, the sidecar and live links, then deletes the orphan sidecar with zero image bytes reclaimed. An image
   appearing or a record/link changing defers it; linked records and retained existing seed images are not relabeled or

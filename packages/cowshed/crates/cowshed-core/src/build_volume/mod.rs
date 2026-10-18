@@ -49,7 +49,7 @@ const MOUNTS_DIRECTORY: &str = ".build";
 pub(crate) const RECORD_SUFFIX: &str = ".json";
 /// The lock beside each image that every job admitted on the volume holds shared for its whole
 /// run, and that a release takes exclusively: `<id>.dmg.hold` ([`BuildVolumeHold`]).
-const HOLD_SUFFIX: &str = ".hold";
+pub(crate) const HOLD_SUFFIX: &str = ".hold";
 /// The volume's own statement of the build-state paths it holds, at its root. It travels with
 /// every clone, so a fork knows what its source linked without rediscovering it.
 pub const STATE_FILE: &str = "cowshed-build-state.json";
@@ -495,6 +495,32 @@ pub enum LinkResolution {
     Vanished,
 }
 
+/// A name in the images directory that belongs to one build volume: its image or its record.
+/// The hold beside them is a zero-length lock, not part of what a volume is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum VolumeFile {
+    /// `<id>.dmg`.
+    Image(BuildVolumeId),
+    /// `<id>.dmg.json`.
+    Record(BuildVolumeId),
+}
+
+impl VolumeFile {
+    pub(crate) fn of(name: &std::ffi::OsStr) -> Option<Self> {
+        let name = name.to_str()?;
+        let (image, file): (&str, fn(BuildVolumeId) -> Self) =
+            match name.strip_suffix(RECORD_SUFFIX) {
+                Some(image) => (image, Self::Record),
+                None => (name, Self::Image),
+            };
+        image
+            .strip_suffix(IMAGE_EXTENSION)?
+            .strip_suffix('.')
+            .and_then(BuildVolumeId::parse)
+            .map(file)
+    }
+}
+
 /// Where one project's build volumes live.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildVolumeLayout {
@@ -774,24 +800,14 @@ impl BuildVolumeLayout {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(io_error("list build volumes", &self.images, &error)),
         };
-        let image_name = format!(".{IMAGE_EXTENSION}");
-        let record_name = format!(".{IMAGE_EXTENSION}{RECORD_SUFFIX}");
         let mut ids = Vec::new();
         for entry in entries {
             let entry =
                 entry.map_err(|error| io_error("list build volumes", &self.images, &error))?;
-            let name = entry.file_name();
-            let Some(stem) = name.to_str().and_then(|name| {
-                name.strip_suffix(&image_name).or_else(|| {
-                    include_records
-                        .then(|| name.strip_suffix(&record_name))
-                        .flatten()
-                })
-            }) else {
-                continue;
-            };
-            if let Some(id) = BuildVolumeId::parse(stem) {
-                ids.push(id);
+            match VolumeFile::of(&entry.file_name()) {
+                Some(VolumeFile::Image(id)) => ids.push(id),
+                Some(VolumeFile::Record(id)) if include_records => ids.push(id),
+                Some(VolumeFile::Record(_)) | None => {}
             }
         }
         ids.sort();

@@ -312,12 +312,22 @@ Unbinding is last. Removing main first records the checkout path in the project 
 main's images — the only other record naming it — are retired and then reclaimed. A restore interrupted after retiring
 main is finished by the same command from the checkout: the project root lookup matches that record when no main image
 exists, which is what reaches a checkout with no remote. The finishing run reports no abandoned work; the bundle the
-interrupted run wrote stays where it was reported. Unbinding removes terminal storage, the controller's own state and
-the mount tree, then the binding, then the checkout record, so a process that dies at any point leaves either a bound
-project that command reopens or none. The binding's absence is the completion: a run that finds the project already
-unbound — its own open-time recovery may have finished the pending restore — succeeds without writing anything. A death
-between the last two removals leaves an unbound store directory holding only `checkout-root.json`; nothing bound reads
-it, and a later adoption's main image outranks it.
+interrupted run wrote stays where it was reported. Unbinding first releases every build volume the project still has:
+with main retired nothing links one, so main's linked volume and its seed go with whatever an earlier collection left
+(16_build_volumes.md, "Garbage collection"), and a volume that stays (a job holds it, its release failed) refuses the
+unbinding while the project is still bound, naming it and why, for the same command to retry. Unbinding then removes
+terminal storage (`.staging/`, `sessions/`, `checkpoints/`, `tmp/` and `build/`, which by then may hold only empty
+directories and zero-length locks and holds; anything else refuses, named, before one entry is removed), the
+controller's own state (lifecycle journal, deletion log, slot bindings) and the mount trees (`<owner>/<repo>` and
+`.build/<owner>/<repo>` under the host mount root, and each owner directory they leave empty), then the binding, then
+the checkout record, so a process that dies at any point leaves either a bound project that command reopens or none.
+What the user wrote stays: `policy.json`, `waivers.json` and `quarantine/` keep the store directory. So does the
+identity's project lease `.retirements/<owner>/<repo>.lease`, which `forget` fences by its inode (below). The restore
+checks terminal storage before it retires main, exempting what main's retirement and this release remove (main's own
+checkpoints and temp dir, every build volume's image and record), so its refusal leaves main in place. The binding's
+absence is the completion: a run that finds the project already unbound — its own open-time recovery may have finished
+the pending restore — succeeds without writing anything. A death between the last two removals leaves an unbound store
+directory holding only `checkout-root.json`; nothing bound reads it, and a later adoption's main image outranks it.
 
 ## `cowshed forget <owner/repo> --abandon` — retire from store authority
 
