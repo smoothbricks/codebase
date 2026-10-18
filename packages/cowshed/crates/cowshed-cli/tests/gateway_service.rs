@@ -366,8 +366,7 @@ fn installing_the_agent_binary_publishes_a_content_addressed_copy_and_reuses_it(
 
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
     let executable =
-        install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
-            .expect("install succeeds");
+        install_host_stable_executable(&mut executor, &home, &source).expect("install succeeds");
 
     assert_eq!(
         executable.path(),
@@ -396,9 +395,8 @@ fn installing_the_agent_binary_publishes_a_content_addressed_copy_and_reuses_it(
     assert_eq!(spec.program_arguments().next(), executable.path().to_str());
 
     // A current copy is left in place: same inode, no rewrite of a running binary.
-    let reinstalled =
-        install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
-            .expect("second install succeeds");
+    let reinstalled = install_host_stable_executable(&mut executor, &home, &source)
+        .expect("second install succeeds");
     assert_eq!(reinstalled.path(), executable.path());
     assert_eq!(
         fs::symlink_metadata(&first).expect("stored copy").ino(),
@@ -409,8 +407,7 @@ fn installing_the_agent_binary_publishes_a_content_addressed_copy_and_reuses_it(
     // in one rename: launchd never sees a partially written binary or a missing name, and the
     // build that is replaced is not rewritten under a process still running it.
     fs::write(&source, b"#!/bin/sh\nexit 1\n").expect("newer source binary");
-    install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
-        .expect("upgrade succeeds");
+    install_host_stable_executable(&mut executor, &home, &source).expect("upgrade succeeds");
     let second = executable.stored(&digest_of(b"#!/bin/sh\nexit 1\n"));
     assert_ne!(first, second);
     assert_eq!(
@@ -429,13 +426,8 @@ fn installing_the_agent_binary_publishes_a_content_addressed_copy_and_reuses_it(
 
     // Installing the stable name from itself is the steady state and touches nothing.
     let before = fs::symlink_metadata(&second).expect("stored copy").ino();
-    let same = install_host_stable_executable(
-        &mut executor,
-        &home,
-        COWSHED_BINARY_NAME,
-        executable.path(),
-    )
-    .expect("self install succeeds");
+    let same = install_host_stable_executable(&mut executor, &home, executable.path())
+        .expect("self install succeeds");
     assert_eq!(same.path(), executable.path());
     assert_eq!(
         fs::symlink_metadata(&second).expect("stored copy").ino(),
@@ -456,9 +448,8 @@ fn installing_from_a_workspace_build_copies_onto_the_host_volume() {
     fs::write(&source, b"#!/bin/sh\nexit 0\n").expect("workspace binary");
 
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    let executable =
-        install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
-            .expect("copy from a workspace build succeeds");
+    let executable = install_host_stable_executable(&mut executor, &home, &source)
+        .expect("copy from a workspace build succeeds");
 
     assert_eq!(
         executable.path(),
@@ -600,8 +591,7 @@ fn a_failed_activation_restores_the_binary_it_replaced() {
     // The install moves the stable name to another build; the restore moves it back.
     let other = home.join("other-build");
     fs::write(&other, b"a build whose agent will not load\n").expect("replacement");
-    install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &other)
-        .expect("install");
+    install_host_stable_executable(&mut executor, &home, &other).expect("install");
     assert_eq!(
         fs::read(executable.path()).expect("replaced bytes"),
         b"a build whose agent will not load\n"
@@ -660,10 +650,8 @@ fn removing_the_installed_cowshed_takes_the_stable_name_every_copy_and_every_rec
     for build in [&b"first build\n"[..], b"second build\n"] {
         let source = home.join("build");
         fs::write(&source, build).expect("build");
-        executable = Some(
-            install_host_stable_executable(&mut executor, &home, COWSHED_BINARY_NAME, &source)
-                .expect("install"),
-        );
+        executable =
+            Some(install_host_stable_executable(&mut executor, &home, &source).expect("install"));
     }
     let executable = executable.expect("installed");
     let first = executable.stored(&digest_of(b"first build\n"));
