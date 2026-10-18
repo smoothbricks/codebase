@@ -555,24 +555,26 @@ image remains live and mounted throughout capture.
    exclusively, writes into it, and renames it over the file, so a clone taken while a writer in main held one carries a
    lock nobody in the workspace holds — the writer's rename lands in main — and every write to that file in the
    workspace would fail. A `.git` that is a file or a symlink names a Git directory in another tree, whose locks may be
-   live, and is not walked. Then re-resolve inherited escaping symlinks. A relative symlink whose target climbs above
-   the tree root (the entry `bun install` writes for a `link:` dependency, say) was computed against main's depth and
-   lands somewhere else at the workspace's mount depth, so it is rewritten to the absolute path it named in main; one
-   whose target does not exist in main either is refused by name rather than repointed at a guess. An absolute symlink
-   whose target lies under the source checkout's root (a hook installer's `.git/hooks` entry, a package linker's link to
-   a directory the checkout owns) names the source checkout's own files, which the workspace's sandbox cannot read and
-   whose edits belong to another checkout; it is rewritten to the same path under the clone's root, spelled relative to
-   the link, so it names the clone's own copy at every later depth. In-tree links and absolute links outside the source
-   root are left alone. Before any private job runs, the mint's identity adds exactly the canonical sibling targets of
-   the source's developer package links to its read grants (16_build_volumes.md, "Hash inputs"); it never adds an
-   ancestor dependency store or the source's main root, and the source's owned-link marker is migrated first. Finding
-   them reads every directory of the fresh volume, concurrently, and is the largest setup cost after the clone's first
-   write. Then, inside the mount, under the workspace's closed sandbox: configure the `main` remote (see "The `main`
-   remote") and `git switch -c cowshed/<name>` from the checked-out state, then delete every other local branch whose
-   tip equals the source repository's branch of the same name. One branch per workspace: the clone carried every branch
-   its source had, the source still holds each one, and a copy left in the workspace is a branch work can land on
-   unseen. A carried branch whose tip no longer matches the source's stays, and `rm` judges it like any other. A fork
-   from a session keeps none of the source's branches, its `cowshed/<src>` included. The `.git` directory arrived
+   live, and is not walked. A standalone clone then drops the linked-worktree registrations it inherited from main
+   (`.git/worktrees`) before any link is judged: they are main's, never the clone's, and the hook links a stale one
+   carries name a worktree that may be long gone. Then re-resolve inherited escaping symlinks. A relative symlink whose
+   target climbs above the tree root (the entry `bun install` writes for a `link:` dependency, say) was computed against
+   main's depth and lands somewhere else at the workspace's mount depth, so it is rewritten to the absolute path it
+   named in main; one whose target does not exist in main either is refused by name rather than repointed at a guess. An
+   absolute symlink whose target lies under the source checkout's root (a hook installer's `.git/hooks` entry, a package
+   linker's link to a directory the checkout owns) names the source checkout's own files, which the workspace's sandbox
+   cannot read and whose edits belong to another checkout; it is rewritten to the same path under the clone's root,
+   spelled relative to the link, so it names the clone's own copy at every later depth. In-tree links and absolute links
+   outside the source root are left alone. Before any private job runs, the mint's identity adds exactly the canonical
+   sibling targets of the source's developer package links to its read grants (16_build_volumes.md, "Hash inputs"); it
+   never adds an ancestor dependency store or the source's main root, and the source's owned-link marker is migrated
+   first. Finding them reads every directory of the fresh volume, concurrently, and is the largest setup cost after the
+   clone's first write. Then, inside the mount, under the workspace's closed sandbox: configure the `main` remote (see
+   "The `main` remote") and `git switch -c cowshed/<name>` from the checked-out state, then delete every other local
+   branch whose tip equals the source repository's branch of the same name. One branch per workspace: the clone carried
+   every branch its source had, the source still holds each one, and a copy left in the workspace is a branch work can
+   land on unseen. A carried branch whose tip no longer matches the source's stays, and `rm` judges it like any other. A
+   fork from a session keeps none of the source's branches, its `cowshed/<src>` included. The `.git` directory arrived
    complete via CoW — the workspace is a standalone repository with **no linked-worktree registration and no
    back-references** into the host checkout, unless it was created with `--git-worktree` (see "Git-worktree
    workspaces").
@@ -588,12 +590,13 @@ lifecycle-intent journal. The intent stays `Prepared` until the verb has somethi
 port-block claim is not durable: it belongs to the claiming process and lapses with it. A verb that fails while its
 intent is still `Prepared` was refused (no free port block, an occupied slot) and puts back the journal record its
 intent superseded before returning its error, so no later recovery can create a workspace whose caller was told it
-failed. Startup first reconciles a pending destination against canonical inventory: an already-published incarnation
-becomes the recorded result; an absent destination reruns the operation if its intent is `Mutating`, or if a
-`PendingFence` image or a slot binding carries its name. Binaries before the `Mutating` mark journaled every create and
-fork `Prepared`, so those durable facts, not the phase, decide a `Prepared` intent. One with neither mutated nothing;
-startup discards it and names it on stderr instead of rerunning it. Reissuing the same call returns the recorded
-incarnation instead of creating a second workspace or reporting a false conflict.
+failed. A verb whose fresh standalone clone's initializer refused does the same once it has reclaimed that clone (see
+"Publication and crash recovery"). Startup first reconciles a pending destination against canonical inventory: an
+already-published incarnation becomes the recorded result; an absent destination reruns the operation if its intent is
+`Mutating`, or if a `PendingFence` image or a slot binding carries its name. Binaries before the `Mutating` mark
+journaled every create and fork `Prepared`, so those durable facts, not the phase, decide a `Prepared` intent. One with
+neither mutated nothing; startup discards it and names it on stderr instead of rerunning it. Reissuing the same call
+returns the recorded incarnation instead of creating a second workspace or reporting a false conflict.
 
 Flags: `--clean` resets tracked changes from `HEAD` and removes nonignored untracked files in the clone, with the
 clone-owned registration ordering above for linked sources. Ignored paths stay warm. `--ref <rev>` implies `--clean` and
@@ -633,19 +636,19 @@ ever ran in it. `gc` and `doctor --repair` retire it as the create or fork its o
 pending-clone retirement checks, and `rm <name>` accepts it the same way. A retirement those checks refuse leaves the
 clone in place and names the refusal. `gc` never deletes a `PendingFence` image directly.
 
-| Kill window                                                      | Durable state                                                  | Recovery action and guard                                                                                                                                                                                   |
-| ---------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Before the `Mutating` mark                                       | `Prepared` intent only                                         | Nothing durable exists. A failing verb puts back the record its intent superseded; startup discards a leftover one and names it on stderr.                                                                  |
-| After the mark, before pending metadata                          | `Mutating` intent, plus the slot binding with `--slot`         | Re-run create/fork normally. A `Prepared` intent whose slot is bound (an older binary, or a kill between binding and marking) is re-run the same way.                                                       |
-| After sidecar, before complete clone                             | Sidecar only, or a failed clone                                | A clone failure reclaims both artifacts; startup recovery removes a sidecar-only record. No partial payload is admitted as resumable.                                                                       |
-| After clone, before attach                                       | C + `PendingFence`                                             | Reuse the metadata incarnation and original operation identity; never clone over C.                                                                                                                         |
-| After attach, before mount                                       | C + `PendingFence` + unmounted attachment                      | An exact inventory match is detached and settled, then the ordinary verified attach/fsck path repeats before mounting.                                                                                      |
-| After mount, during image-local preparation                      | C + `PendingFence` + canonical kernel mount                    | Exact source-device and canonical mount flags reuse the existing attachment; ambiguous or foreign mounts fail closed. Rename and credential publication are idempotent.                                     |
-| During the initializer                                           | The same pending mounted C, possibly with external Git effects | Cancellation and initializer errors preserve C and the mount. The retry receives explicit `stage.resuming` authority; the branch and worktree state machines continue only their exact cowshed-owned state. |
-| After the marker write                                           | The same pending mounted C                                     | An already-current marker is validated rather than rewritten, so lineage never duplicates itself.                                                                                                           |
-| After the callback, before or during activation                  | Pending or `Active` sidecar (atomic rewrite)                   | Pending reruns the callback and validation; `Active` is listed as current. No intermediate publication state exists.                                                                                        |
-| After activation, before downstream effects or intent completion | `Active` C + pending lifecycle intent                          | Startup recovery reruns optional main registration and append-safe commitments, then records exact completion. Slot binding is retained across errors, and rebinding the exact owner is a no-op.            |
-| After completion                                                 | `Active` C + completed intent                                  | Reissuing returns the recorded incarnation; supervisor startup is start-or-reuse.                                                                                                                           |
+| Kill window                                                      | Durable state                                                  | Recovery action and guard                                                                                                                                                                                                                                                                                                     |
+| ---------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Before the `Mutating` mark                                       | `Prepared` intent only                                         | Nothing durable exists. A failing verb puts back the record its intent superseded; startup discards a leftover one and names it on stderr.                                                                                                                                                                                    |
+| After the mark, before pending metadata                          | `Mutating` intent, plus the slot binding with `--slot`         | Re-run create/fork normally. A `Prepared` intent whose slot is bound (an older binary, or a kill between binding and marking) is re-run the same way.                                                                                                                                                                         |
+| After sidecar, before complete clone                             | Sidecar only, or a failed clone                                | A clone failure reclaims both artifacts; startup recovery removes a sidecar-only record. No partial payload is admitted as resumable.                                                                                                                                                                                         |
+| After clone, before attach                                       | C + `PendingFence`                                             | Reuse the metadata incarnation and original operation identity; never clone over C.                                                                                                                                                                                                                                           |
+| After attach, before mount                                       | C + `PendingFence` + unmounted attachment                      | An exact inventory match is detached and settled, then the ordinary verified attach/fsck path repeats before mounting.                                                                                                                                                                                                        |
+| After mount, during image-local preparation                      | C + `PendingFence` + canonical kernel mount                    | Exact source-device and canonical mount flags reuse the existing attachment; ambiguous or foreign mounts fail closed. Rename and credential publication are idempotent.                                                                                                                                                       |
+| During the initializer                                           | The same pending mounted C, possibly with external Git effects | Cancellation preserves C and the mount, and so does an initializer error on a resume or a git-worktree clone. The retry receives explicit `stage.resuming` authority; the branch and worktree state machines continue only their exact cowshed-owned state. An initializer error on any other fresh clone reclaims C (below). |
+| After the marker write                                           | The same pending mounted C                                     | An already-current marker is validated rather than rewritten, so lineage never duplicates itself.                                                                                                                                                                                                                             |
+| After the callback, before or during activation                  | Pending or `Active` sidecar (atomic rewrite)                   | Pending reruns the callback and validation; `Active` is listed as current. No intermediate publication state exists.                                                                                                                                                                                                          |
+| After activation, before downstream effects or intent completion | `Active` C + pending lifecycle intent                          | Startup recovery reruns optional main registration and append-safe commitments, then records exact completion. Slot binding is retained across errors, and rebinding the exact owner is a no-op.                                                                                                                              |
+| After completion                                                 | `Active` C + completed intent                                  | Reissuing returns the recorded incarnation; supervisor startup is start-or-reuse.                                                                                                                                                                                                                                             |
 
 Every initializer step can run again:
 
@@ -666,6 +669,17 @@ git-worktree workspace, its registration live in main's repository. Deleting the
 compensating is itself crashable, and deleting a branch that acquired commits between the crash and the reclaim loses
 work. Rolling back would also need a fence for the corpse and a reclaim rule anyway, and it has a window in which a
 crash after a successful initialization deletes complete work. Resume never deletes state a user can reach.
+
+**A refused fresh clone is reclaimed.** Rollback's hazards are a crash's and an external effect's. A fresh clone whose
+initializer returns an error has neither when nothing the initializer does reaches past the clone: a standalone clone's
+branch, remotes and links live in its own repository, and the build volume and seed it forks belong to its incarnation.
+Its verb is still running, nothing was published, and the source still holds every byte the clone copied. So the verb
+detaches and reclaims C, releases the slot it bound, withdraws its intent (putting back the record it superseded), and
+collects the build volumes the withdrawn intent kept from collection. A refusal leaves the store as the verb found it,
+and the next attempt clones the source as it is then. Kept, every retry resumed C, the copy of the state that refused —
+a stale worktree registration main had since dropped refused one fork until the clone was removed by hand. A
+git-worktree clone's initializer registers it in main's repository, and a resume may carry an earlier attempt's effects,
+so both keep C as the table says.
 
 **Mounting the staging image and renaming it under the live mount was rejected.** It renames an attached image's backing
 file, after which the attachment inventory, keyed by the path the image was opened with, reads a mounted image as

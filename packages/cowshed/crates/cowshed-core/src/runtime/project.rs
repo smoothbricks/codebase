@@ -3787,6 +3787,43 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         }
     }
 
+    /// The failure path of `fork` and `rename` whose fresh clone the storage reclaimed after its
+    /// initializer refused (02_workspaces.md, "Publication and crash recovery"): the refusal
+    /// leaves the store as the verb found it, so the next attempt clones its source as it is
+    /// then instead of resuming a copy of the state that refused. The slot the verb bound is
+    /// released, its intent withdrawn, and the build volume and seed its initializer forked are
+    /// collected, which only the withdrawn intent kept from collection. Best-effort, and said
+    /// when it fails: the error the caller sees stays the refusal.
+    async fn withdraw_reclaimed_clone(
+        &mut self,
+        workspace: &WorkspaceName,
+        superseded: Option<crate::storage::recovery::LifecycleIntentRecord>,
+    ) {
+        let withdrawn = async {
+            self.release_slot(workspace).await?;
+            let target = workspace.clone();
+            if !self
+                .update_lifecycle_intents(move |journal| {
+                    Ok(journal.discard_reclaimed_clone_intent(&target, superseded))
+                })
+                .await?
+            {
+                return Err(CowshedError::internal(format!(
+                    "the lifecycle intent for {workspace} changed under its lease"
+                )));
+            }
+            self.collect_build_volumes().await
+        }
+        .await;
+        if let Err(error) = withdrawn {
+            eprintln!(
+                "cowshed: the refused clone of {workspace} was reclaimed, but withdrawing what it left stopped ({}: {}); cowshed doctor lists what stays",
+                error.code.as_str(),
+                error.message
+            );
+        }
+    }
+
     async fn complete_lifecycle_intent(
         &mut self,
         workspace: &WorkspaceName,
@@ -9971,6 +10008,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // staged clone writes its `PendingFence` sidecar. A failure while still `Prepared` was a
         // refusal and withdraws the intent; a `Mutating` one stays for recovery to finish.
         let superseded = self.begin_lifecycle_intent(intent).await?;
+        let mut reclaimed = false;
         let outcome = async {
             if let Some(slot) = slot {
                 self.bind_slot(&workspace, slot).await?;
@@ -10122,7 +10160,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     },
                 )
                 .await
-                .map_err(native_staged_error)?;
+                .map_err(|error| native_clone_error(error, &mut reclaimed))?;
             // Published, the image owns its block: the kernel claim ends with publication, or a
             // gateway reconcile in another process installing the workspace's session finds the
             // block's base port taken and moves the workspace to another block (05_gateway.md).
@@ -10165,8 +10203,12 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         }
         .await;
         if outcome.is_err() {
-            self.withdraw_refused_clone_intent(&workspace, superseded)
-                .await;
+            if reclaimed {
+                self.withdraw_reclaimed_clone(&workspace, superseded).await;
+            } else {
+                self.withdraw_refused_clone_intent(&workspace, superseded)
+                    .await;
+            }
         }
         outcome
     }
@@ -10350,6 +10392,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             // A published destination is past its clone: its record must replay as `Mutating`.
             self.mark_lifecycle_intent_mutating(&destination).await?;
         }
+        let mut reclaimed = false;
         let outcome = async {
                     self.migrate_owned_links_for(&source_fact, &self.workspace_mount_path(&source)?)
                 .await?;
@@ -10509,7 +10552,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         },
                     )
                     .await
-                    .map_err(native_staged_error)?;
+                    .map_err(|error| native_clone_error(error, &mut reclaimed))?;
                 // Published, the image owns its block; see `resume_fork`.
                 drop(reservation);
                 self.mark_lifecycle_fence_complete(&destination).await;
@@ -10598,8 +10641,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         }
         .await;
         if outcome.is_err() {
-            self.withdraw_refused_clone_intent(&destination, superseded)
-                .await;
+            if reclaimed {
+                self.withdraw_reclaimed_clone(&destination, superseded)
+                    .await;
+            } else {
+                self.withdraw_refused_clone_intent(&destination, superseded)
+                    .await;
+            }
         }
         outcome
     }
@@ -17758,7 +17806,8 @@ fn native_staged_error(
 ) -> CowshedError {
     match error {
         crate::storage::apfs::StagedExecutionError::Storage(error) => native_storage_error(error),
-        crate::storage::apfs::StagedExecutionError::Initializer(error) => error,
+        crate::storage::apfs::StagedExecutionError::Initializer(error)
+        | crate::storage::apfs::StagedExecutionError::InitializerReclaimed(error) => error,
         crate::storage::apfs::StagedExecutionError::InitializerCleanup {
             initializer,
             cleanup,
@@ -17767,6 +17816,20 @@ fn native_staged_error(
             "cowshed doctor --json",
         ),
     }
+}
+
+/// A fork's or rename's staged clone error, noting in `reclaimed` whether the storage reclaimed
+/// the fresh clone the refusing initializer ran on, which decides what the verb withdraws.
+#[cfg(target_os = "macos")]
+fn native_clone_error(
+    error: crate::storage::apfs::StagedExecutionError<CowshedError>,
+    reclaimed: &mut bool,
+) -> CowshedError {
+    *reclaimed = matches!(
+        error,
+        crate::storage::apfs::StagedExecutionError::InitializerReclaimed(_)
+    );
+    native_staged_error(error)
 }
 
 #[cfg(target_os = "macos")]

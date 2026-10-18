@@ -283,6 +283,11 @@ pub enum StagedExecutionError<E> {
     Storage(#[source] ApfsStorageError),
     #[error("staged lifecycle initializer failed: {0}")]
     Initializer(E),
+    /// The initializer of a fresh clone whose effects stay inside it failed, and the clone was
+    /// reclaimed: nothing of it remains for a retry to resume (02_workspaces.md, "Publication
+    /// and crash recovery").
+    #[error("staged lifecycle initializer failed and its fresh clone was reclaimed: {0}")]
+    InitializerReclaimed(E),
     #[error(
         "staged lifecycle initializer failed and cleanup also failed: initializer={initializer}; cleanup={cleanup}"
     )]
@@ -1291,6 +1296,13 @@ where
         let incarnations = Arc::clone(&self.incarnations);
         let expected = plan.expected().to_vec();
         let operation = plan.operation().clone();
+        // A git-worktree clone's initializer registers it in main's repository; every other
+        // clone's initializer changes only the clone and what its incarnation owns.
+        let reaches_main = matches!(
+            &operation,
+            Operation::Create { identity, .. } | Operation::Fork { identity, .. }
+                if identity.git_worktree
+        );
         let staging = self.lane.dispatch(move || {
             let (source, destination, identity, operation_kind) = match &operation {
                 Operation::Create {
@@ -1349,12 +1361,37 @@ where
         )
         .await;
         if let Err(initializer) = initialized {
-            // The callback can already have changed state outside the image (Git branches,
-            // worktree registrations, remotes). The PendingFence is the rollback boundary: keep
-            // the exact mounted clone so the durable lifecycle intent can re-enter the
-            // initializer with resume authority rather than orphaning those external effects.
-            let _prepared = prepared.into_prepared();
-            return Err(StagedExecutionError::Initializer(initializer));
+            let prepared = prepared.into_prepared();
+            if prepared.stage.resuming || reaches_main {
+                // The callback can already have changed state outside the image (a worktree
+                // registration in main), or an earlier attempt did. The PendingFence is the
+                // rollback boundary: keep the exact mounted clone so the durable lifecycle intent
+                // can re-enter the initializer with resume authority rather than orphaning
+                // those effects.
+                drop(prepared);
+                return Err(StagedExecutionError::Initializer(initializer));
+            }
+            // A fresh clone whose initializer reaches nothing outside it holds nothing a retry
+            // needs: it was never published, and its source still holds every byte it copied.
+            // Kept, every retry would resume this copy of the state that refused it; reclaimed,
+            // the retry clones the source as it is then.
+            let host = Arc::clone(&self.host);
+            let reclaimed = self
+                .lane
+                .dispatch(move || {
+                    let PreparedClone {
+                        attachment, image, ..
+                    } = prepared;
+                    detach_and_reclaim(host.as_ref(), attachment, &image, "refused clone detach")
+                })
+                .await;
+            return Err(match reclaimed {
+                Ok(()) => StagedExecutionError::InitializerReclaimed(initializer),
+                Err(cleanup) => StagedExecutionError::InitializerCleanup {
+                    initializer,
+                    cleanup,
+                },
+            });
         }
         let prepared = prepared.into_prepared();
         let host = Arc::clone(&self.host);

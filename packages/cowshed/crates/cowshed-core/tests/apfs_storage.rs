@@ -2674,6 +2674,88 @@ async fn aborting_create_and_fork_callbacks_preserves_each_pending_clone_for_res
     }
 }
 
+/// A fresh clone whose initializer refuses is reclaimed when nothing the initializer does
+/// reaches past the clone, so the retry clones the source again rather than resuming a copy of
+/// the state that refused. A git-worktree clone's initializer registers it in main's
+/// repository, so its refused clone stays pending for the retry to resume and finish.
+#[tokio::test]
+async fn a_refused_initializer_reclaims_a_fresh_clone_unless_it_reaches_main() {
+    for git_worktree in [false, true] {
+        let host = FakeHost::default();
+        let source = workspace("main", 5);
+        host.seed(&source);
+        let substrate = substrate(host.clone(), CountingLane::default());
+        let destination_name = WorkspaceName::session("refused").expect("destination");
+        let operation_identity = OperationIdentity {
+            git_worktree,
+            ..identity()
+        };
+        let destination = || Destination {
+            repo: repo(),
+            name: destination_name.clone(),
+            topology_revision: Revision::new(8),
+            identity: operation_identity.clone(),
+        };
+        let refusal = substrate
+            .execute_fork_staged(
+                substrate
+                    .plan_fork(&source, destination())
+                    .expect("fork plan"),
+                Alongside::none(),
+                |stage, ()| async move {
+                    assert!(!stage.resuming);
+                    Err::<(), _>("escaping link")
+                },
+            )
+            .await;
+        let pending = host.pending_publications(&repo()).expect("pending clones");
+        let events = host.events();
+        if git_worktree {
+            assert!(matches!(
+                refusal,
+                Err(StagedExecutionError::Initializer("escaping link"))
+            ));
+            assert_eq!(pending.len(), 1, "the registration's clone stays to resume");
+            assert_eq!(host.mounted_paths_now().len(), 1);
+            assert!(!events.contains(&"idempotent-reclaim".to_owned()));
+        } else {
+            assert!(matches!(
+                refusal,
+                Err(StagedExecutionError::InitializerReclaimed("escaping link"))
+            ));
+            assert!(pending.is_empty(), "the refused clone is reclaimed");
+            assert!(host.mounted_paths_now().is_empty());
+            assert!(events.contains(&"detach:Release".to_owned()));
+            assert!(events.contains(&"idempotent-reclaim".to_owned()));
+        }
+
+        host.clear_events();
+        substrate
+            .execute_fork_staged(
+                substrate
+                    .plan_fork(&source, destination())
+                    .expect("retry plan"),
+                Alongside::none(),
+                move |stage, ()| async move {
+                    assert_eq!(stage.resuming, git_worktree);
+                    Ok::<(), &'static str>(())
+                },
+            )
+            .await
+            .expect("retry");
+        assert_eq!(
+            host.events().iter().any(|event| event.as_str() == "clone"),
+            !git_worktree,
+            "only a reclaimed clone is cloned again"
+        );
+        assert!(
+            host.pending_publications(&repo())
+                .expect("pending clones after retry")
+                .is_empty()
+        );
+    }
+}
+
 #[tokio::test]
 async fn checkpoint_barrier_runs_under_lock_before_snapshot_clone() {
     let host = FakeHost::default();
