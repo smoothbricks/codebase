@@ -904,7 +904,10 @@ Managed CI setup is split across local composite actions:
 - `cache-nix-devenv` is the shared restore/save primitive for the `.devenv`/`.direnv` segment.
 - `cache-node-modules` restores `node_modules` together with `~/.bun/install/cache/links`. Bun's isolated-store aliases
   name those global targets by absolute path, so archiving the aliases alone is incomplete. Both paths share one cache
-  artifact and its path-versioned identity; ttsc plugins remain in their separate cache.
+  artifact and its path-versioned identity; ttsc plugins remain in their separate cache. The archive excludes
+  `node_modules/.smoo-install`: workspace members' own `node_modules` links are not in it, and the stamp is the input
+  devenv's `smoo:install` watches, so a restored stamp beside a restored `.devenv` task state would skip the install
+  that recreates those links.
 
 The cache split is intentional. The store segment is large. Its key hashes the pins (`devenv.lock`, `devenv.yaml`), then
 the files that choose and override packages on top of them (`devenv.nix`, `devenv.smoo.nix`, `nixpkgs-overlay/`), and a

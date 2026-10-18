@@ -493,9 +493,13 @@ describe('managed cache actions', () => {
     const action = typia.assert<{ runs: { steps: [{ with: { path: string } }] } }>(
       Bun.YAML.parse(await readFile(join(REPO_ROOT, '.github/actions/cache-node-modules/action.yml'), 'utf8')),
     );
-    const paths = typia.assert<Array<'node_modules' | '~/.bun/install/cache/links'>>(
+    const listed = typia.assert<Array<'node_modules' | '~/.bun/install/cache/links' | '!node_modules/.smoo-install'>>(
       action.runs.steps[0].with.path.trim().split('\n'),
     );
+    // The install stamp is excluded: workspace members' node_modules links are not archived, so a restored stamp
+    // would let devenv's smoo:install skip the install that recreates them (Publish run 39132666631).
+    expect(listed).toEqual(['node_modules', '~/.bun/install/cache/links', '!node_modules/.smoo-install']);
+    const paths = listed.filter((path) => path !== '!node_modules/.smoo-install');
     const temp = await mkdtemp(join(tmpdir(), 'smoo-bun-cache-'));
     const modules = join(temp, 'checkout', 'node_modules');
     const links = join(temp, 'home', '.bun', 'install', 'cache', 'links');
