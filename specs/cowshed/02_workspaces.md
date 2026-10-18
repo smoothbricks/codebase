@@ -321,13 +321,18 @@ directories and zero-length locks and holds; anything else refuses, named, befor
 controller's own state (lifecycle journal, deletion log, slot bindings) and the mount trees (`<owner>/<repo>` and
 `.build/<owner>/<repo>` under the host mount root, and each owner directory they leave empty), then the binding, then
 the checkout record, so a process that dies at any point leaves either a bound project that command reopens or none.
-What the user wrote stays: `policy.json`, `waivers.json` and `quarantine/` keep the store directory. So does the
-identity's project lease `.retirements/<owner>/<repo>.lease`, which `forget` fences by its inode (below). The restore
-checks terminal storage before it retires main, exempting what main's retirement and this release remove (main's own
-checkpoints and temp dir, every build volume's image and record), so its refusal leaves main in place. The binding's
-absence is the completion: a run that finds the project already unbound — its own open-time recovery may have finished
-the pending restore — succeeds without writing anything. A death between the last two removals leaves an unbound store
-directory holding only `checkout-root.json`; nothing bound reads it, and a later adoption's main image outranks it.
+What the user wrote stays: `policy.json`, `waivers.json` and `quarantine/` keep the store directory. Once the project is
+unbound, the identity's project lease `.retirements/<owner>/<repo>.lease` goes too, and with it an owner directory it
+leaves empty, but only under the lease itself: the unbinding's own shared hold must upgrade to exclusive without
+waiting, and no `<repo>.json` retirement record may stand beside it. Another holder (the gateway, a command still open
+on the project) or a record keeps it, said on stderr, and the unbinding keeps its shared hold. Because every holder
+rechecks the lease's inode after locking (`forget`, below), removing it cannot split them. The restore checks terminal
+storage before it retires main, exempting what main's retirement and this release remove (main's own checkpoints and
+temp dir, every build volume's image and record), so its refusal leaves main in place. The binding's absence is the
+completion: a run that finds the project already unbound — its own open-time recovery may have finished the pending
+restore — writes nothing and removes only a lease an earlier run left. A death between the binding's removal and the
+checkout record's leaves an unbound store directory holding only `checkout-root.json`; nothing bound reads it, and a
+later adoption's main image outranks it.
 
 ## `cowshed forget <owner/repo> --abandon` — retire from store authority
 
@@ -347,8 +352,11 @@ The monotonic phases are:
 1. **`fenced`**: publish authorization before effects. Project actors and startup healers take shared kernel leases
    before binding writes or mounting, and refuse a pending retirement. Existing actors keep their leases; admitted
    blocking build/seed work, cancelled mint cleanup and background reclamation retain their own holds until they finish,
-   even if their caller is gone. A separate run lease excludes concurrent execution and rejects a stale operation
-   generation.
+   even if their caller is gone. The project lease is the inode `.retirements/<owner>/<repo>.lease` names: every holder,
+   shared or the collector's exclusive, checks after locking (and after a refused attempt) that the path still names the
+   inode it locked, by device and inode without following a link, and reopens it when not. So the one removal of it, an
+   unbinding's under its exclusive upgrade (above), leaves every holder meeting on the inode at the path. A separate run
+   lease excludes concurrent execution and rejects a stale operation generation.
 2. **`drained`**: the exact workspace supervisors answer the existing drain protocol, and kernel socket-peer exit
    watches prove they ended. Their socket leases and the existing lost-job-group reconciliation remain held. An unknown
    response, unresolved group, active controller, or held lifecycle intent refuses; a PID lookup cannot substitute for

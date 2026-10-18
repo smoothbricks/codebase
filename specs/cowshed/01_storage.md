@@ -54,7 +54,8 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
   .retirements/<owner>/               # explicit whole-project retirement authority, outside the tree it moves
     <repo>.json                      # version, operationId, repoId, authorization, phase, registrationSha256
     <repo>.lock                      # serializes record publication and phase transitions
-    <repo>.lease                     # shared by project actors/healers; exclusive for archival
+    <repo>.lease                     # shared by project actors/healers; exclusive for archival; removed by an unbinding
+                                     #   that upgrades to exclusive with no record beside it (02_workspaces.md)
     <repo>.run                       # one retirement execution, fenced to the exact recorded generation
   .retired-projects/                  # preserved, detached evidence; never discovered as live projects
     <operation-id>/                  # the complete former project store tree, renamed without copying or deleting
