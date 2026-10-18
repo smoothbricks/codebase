@@ -4556,7 +4556,7 @@ where
         // an APFS volume from the moment it exists. A legacy unformatted payload is replaced;
         // Filesystem verification and command mount failures remain authoritative.
         match self.attach_and_mount_resumable(image, mount_point, workspace) {
-            Ok(attachment) => Ok(Some(attachment)),
+            Ok(resumed) => Ok(Some(resumed.attachment)),
             Err(ApfsStorageError::Apfs(ApfsError::NoApfsVolume)) => Ok(None),
             Err(error) => Err(error),
         }
@@ -4616,7 +4616,7 @@ where
         image: &Path,
         mount_point: &Path,
         _workspace: &LifecycleWorkspace,
-    ) -> Result<Self::Attachment, ApfsStorageError> {
+    ) -> Result<super::ResumedMount<Self::Attachment>, ApfsStorageError> {
         self.verify_controller_path(image)?;
         self.verify_controller_path(mount_point)?;
         let mounted = self
@@ -4645,18 +4645,28 @@ where
                     attachment.volume_device()
                 )));
             }
-            return Ok(attachment);
+            return Ok(super::ResumedMount {
+                attachment,
+                found: super::FoundMount::Mounted,
+            });
         }
 
         let Some(attachment) = existing else {
             return self
                 .backend
                 .attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
+                .map(|attachment| super::ResumedMount {
+                    attachment,
+                    found: super::FoundMount::Detached,
+                })
                 .map_err(Into::into);
         };
         // Mount the freshly probed and pinned crash-left volume without another attachment.
         match self.mount(&attachment, mount_point, MountAccess::ReadWrite, false) {
-            Ok(()) => Ok(attachment),
+            Ok(()) => Ok(super::ResumedMount {
+                attachment,
+                found: super::FoundMount::Attached,
+            }),
             Err(primary) => match self.detach(attachment, DetachIntent::Release) {
                 Ok(()) => Err(primary),
                 Err(cleanup) => Err(ApfsStorageError::Cleanup {

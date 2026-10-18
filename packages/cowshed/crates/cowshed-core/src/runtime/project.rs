@@ -6249,8 +6249,38 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     }
 
     /// Remove `workspace`, gating a session's destruction on `containment` holding its commits:
-    /// main for `rm`, the branch a unit just landed on for `land`'s retire.
+    /// main for `rm`, the branch a unit just landed on for `land`'s retire. Every removal that
+    /// retires an image collects before it answers: the workspace's build volume and seed retire
+    /// with it, unless a target adopted the volume (16_build_volumes.md, "Garbage collection"),
+    /// and with them whatever else no checkout links. That holds for an unfinished clone, whose
+    /// volumes no `gc` could collect while its create or fork was journaled, as for a published
+    /// workspace, and for a retried removal whose first attempt retired the image.
     async fn remove_contained_in(
+        &mut self,
+        workspace: WorkspaceName,
+        options: RemoveOptions,
+        containment: &NativeContainment,
+        nx_check: CheckoutNxCheck,
+    ) -> Result<RemoveReport> {
+        let report = self
+            .retire_contained_in(workspace.clone(), options, containment, nx_check)
+            .await?;
+        if !options.restore {
+            self.collect_build_volumes().await.map_err(|failed| {
+                CowshedError::new(
+                    failed.code,
+                    format!(
+                        "retired {workspace}, but its build volumes were not collected: {}",
+                        failed.message
+                    ),
+                    failed.hint,
+                )
+            })?;
+        }
+        Ok(report)
+    }
+
+    async fn retire_contained_in(
         &mut self,
         workspace: WorkspaceName,
         options: RemoveOptions,
@@ -6710,10 +6740,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 None => None,
             };
             self.finish_retirement(current, nx_check).await?;
-            // The workspace's build volume and seed retire with it, unless a target adopted the
-            // volume (16_build_volumes.md, "Garbage collection"), and with them whatever else no
-            // checkout links.
-            self.collect_build_volumes().await?;
             Ok(RemoveReport { abandoned })
         }
         .await;
@@ -9607,6 +9633,16 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         }
         self.supervisors.clear();
         self.sessions.clear();
+        // A retirement answers before its image is reclaimed, but the runtime that spawned the
+        // reclamation does not end before it: a process that exits under it would leave trash
+        // only a later gc collects.
+        for reclaim in std::mem::take(&mut self.reclaims) {
+            if let Err(error) = reclaim.await {
+                eprintln!(
+                    "cowshed: image reclamation task failed as its runtime shut down: {error}"
+                );
+            }
+        }
     }
 
     async fn recover(&mut self) -> Result<()> {

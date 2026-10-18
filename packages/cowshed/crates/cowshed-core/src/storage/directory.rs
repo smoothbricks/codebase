@@ -60,9 +60,9 @@ use super::apfs::native::{
     warn_missing_session_sidecar, warn_session_image_issue, workspace_checkpoint_facts,
 };
 use super::apfs::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, MarkerExpectation, MetadataPolicy,
-    PendingAdoption, PendingPublicationFact, PublicationError, ResumableClone, combine_cleanup,
-    companion_path, layout, main_aware_mount_point, volume_key,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, FoundMount, MarkerExpectation,
+    MetadataPolicy, PendingAdoption, PendingPublicationFact, PublicationError, ResumableClone,
+    ResumedMount, combine_cleanup, companion_path, layout, main_aware_mount_point, volume_key,
 };
 use super::lifecycle::{
     CheckpointFact, DefragmentOutcome, DerivedWorkspace, KernelMountFact, LifecycleFact,
@@ -1459,14 +1459,18 @@ impl ApfsExecutionHost for DirectoryExecutionHost {
         image: &Path,
         mount_point: &Path,
         _workspace: &LifecycleWorkspace,
-    ) -> Result<Self::Attachment, ApfsStorageError> {
+    ) -> Result<ResumedMount<Self::Attachment>, ApfsStorageError> {
         self.require_store_image(image)?;
         self.verify_controller_path(mount_point)?;
-        payload_root(image)?;
+        // A directory payload is either home or bound: there is no attached-but-unmounted state.
+        let found = match settle(image)? {
+            Payload::Mounted(current) if current == mount_point => FoundMount::Mounted,
+            Payload::Mounted(_) | Payload::Home => FoundMount::Detached,
+        };
         bind(image, mount_point)?;
         let attachment = DirectoryAttachment::new(image.to_owned());
         attachment.set_bound(Some(mount_point.to_owned()));
-        Ok(attachment)
+        Ok(ResumedMount { attachment, found })
     }
 
     fn rename_volume(

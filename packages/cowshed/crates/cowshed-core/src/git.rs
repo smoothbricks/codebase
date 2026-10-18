@@ -260,6 +260,28 @@ impl Drop for BundleVerificationScratch {
     }
 }
 
+/// A bundle staged beside its final name belongs to the write that staged it, including when its
+/// caller drops that future: it is renamed into place or removed, never left as a `.partial`
+/// that no sweep owns.
+struct StagedBundle {
+    path: PathBuf,
+    settled: bool,
+}
+
+impl Drop for StagedBundle {
+    fn drop(&mut self) {
+        if !self.settled
+            && let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "cowshed: could not remove interrupted partial bundle {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 impl GitRepository {
     /// Resolve the standalone repository containing `path`, for a controller serving `store_root`.
     pub async fn discover(store_root: &Arc<Path>, path: impl AsRef<Path>) -> Result<Self> {
@@ -1230,11 +1252,14 @@ impl GitRepository {
         let mut staged_name = OsString::from(".");
         staged_name.push(file_name);
         staged_name.push(format!(".{}.partial", uuid::Uuid::new_v4().simple()));
-        let staged = destination.with_file_name(staged_name);
+        let mut staged = StagedBundle {
+            path: destination.with_file_name(staged_name),
+            settled: false,
+        };
         let mut args = vec![
             OsString::from("bundle"),
             OsString::from("create"),
-            staged.as_os_str().to_owned(),
+            staged.path.as_os_str().to_owned(),
         ];
         args.extend(heads.iter().map(OsString::from));
         if let Some(target) = target {
@@ -1244,9 +1269,9 @@ impl GitRepository {
             let output =
                 run_git_bundle_at(&self.root, self.alternate_objects.as_deref(), args).await?;
             ensure_git_success("write commit bundle", output)?;
-            self.verify_bundle(&staged, heads, &expected_heads, target, commit_count)
+            self.verify_bundle(&staged.path, heads, &expected_heads, target, commit_count)
                 .await?;
-            tokio::fs::rename(&staged, destination)
+            tokio::fs::rename(&staged.path, destination)
                 .await
                 .map_err(|error| {
                     CowshedError::environment_missing(
@@ -1259,8 +1284,9 @@ impl GitRepository {
                 })
         }
         .await;
-        if let Err(error) = written {
-            return Err(match tokio::fs::remove_file(&staged).await {
+        let result = match written {
+            Ok(()) => Ok(commit_count),
+            Err(error) => Err(match tokio::fs::remove_file(&staged.path).await {
                 Ok(()) => error,
                 Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
                 Err(cleanup) => CowshedError::new(
@@ -1268,13 +1294,14 @@ impl GitRepository {
                     format!(
                         "{}; the partial bundle {} could not be removed either: {cleanup}",
                         error.message,
-                        staged.display()
+                        staged.path.display()
                     ),
                     error.hint,
                 ),
-            });
-        }
-        Ok(commit_count)
+            }),
+        };
+        staged.settled = true;
+        result
     }
 
     /// Prove the artifact works in the environment its promise names: a repository with no

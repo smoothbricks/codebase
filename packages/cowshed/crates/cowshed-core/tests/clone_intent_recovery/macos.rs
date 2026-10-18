@@ -808,6 +808,18 @@ async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
         "the fork is never activated"
     );
     rm.shutdown().await.expect("stop the removing runtime");
+    // The retirement answered before its image was reclaimed, but the runtime that started the
+    // reclamation finishes it before it ends: nothing is left in the trash for a later gc.
+    let trash = fixture.layout().project().sessions.join(".trash");
+    let left = fs::read_dir(&trash)
+        .expect("trash")
+        .map(|entry| entry.expect("trash entry").file_name())
+        .filter(|entry| entry.to_string_lossy().starts_with("wedged-"))
+        .collect::<Vec<_>>();
+    assert!(
+        left.is_empty(),
+        "retired wedged left trash behind: {left:?}"
+    );
 
     LifecycleIntentJournal::update(&fixture.journal_path(), |journal| {
         journal.begin(LifecycleIntent::Fork {
