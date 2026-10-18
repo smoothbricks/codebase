@@ -1141,10 +1141,53 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         healing: None,
         recovering: None,
         stale_daemon: None,
+        cpu_budget: None,
     };
     assert_eq!(
         serde_json::to_value(&status).unwrap(),
         json!({"installed":true,"running":true,"socket":"/store/gateway.sock","cliVersion":"1.4.0","daemonVersion":"1.3.0","activeWorkspaces":2})
+    );
+    // The CPU ledger is the daemon's own `cpu-budget` answer, verbatim; a daemon that answered
+    // `status` but not `cpu-budget` says why, and is never an empty ledger.
+    let ledger = GatewayStatus {
+        cpu_budget: Some(GatewayCpuBudget::Ledger(
+            cowshed_gateway_types::CpuBudgetStatus {
+                total: 18,
+                held: 13,
+                checkouts: vec![cowshed_gateway_types::CpuCheckoutStatus {
+                    checkout: "/w/land".into(),
+                    held: 13,
+                    running: 4,
+                    waiting: 1,
+                }],
+                gate_queue: vec![cowshed_gateway_types::CpuGateWaiter {
+                    checkout: "/w/land".into(),
+                    job: 7,
+                    want: 6,
+                }],
+            },
+        )),
+        ..status.clone()
+    };
+    assert_eq!(
+        serde_json::to_value(&ledger).unwrap()["cpuBudget"],
+        json!({"ledger":{"total":18,"held":13,
+            "checkouts":[{"checkout":"/w/land","held":13,"running":4,"waiting":1}],
+            "gateQueue":[{"checkout":"/w/land","job":7,"want":6}]}})
+    );
+    assert_eq!(
+        serde_json::from_value::<GatewayStatus>(serde_json::to_value(&ledger).unwrap()).unwrap(),
+        ledger
+    );
+    let unanswered = GatewayStatus {
+        cpu_budget: Some(GatewayCpuBudget::Unanswered(
+            "gateway control rejected operation (InvalidRequest): unknown op".into(),
+        )),
+        ..status.clone()
+    };
+    assert_eq!(
+        serde_json::to_value(unanswered).unwrap()["cpuBudget"],
+        json!({"unanswered":"gateway control rejected operation (InvalidRequest): unknown op"})
     );
     // A daemon still recovering the supervisors from before it started says how many, never 0.
     let recovering = GatewayStatus {

@@ -1393,12 +1393,17 @@ supervisor that ran the job retires.
   `LandedReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, buildVolume }`;
   preservation-only delivery has no landed, build-volume or retirement fields; `MirrorInfo = { url, mirror }`;
   `CheckpointQuota = { maxCount, maxBytes }`.
-- `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon? }`;
+- `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon?, cpuBudget? }`;
   `healing = { mounting: { projects } } | "restoringSessions"` says how far the daemon's startup pass has got — the
   projects it still mounts, never 0, then the sessions it restores from them — and is absent once that pass is over
   (05_gateway.md "Startup contract"); `recovering = { supervisors }` counts the workspace supervisors from before the
   daemon started that it is still recovering, never 0 (11_shell.md "Supervisor recovery").
-  `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
+  `cpuBudget = { ledger: CpuBudgetStatus } | { unanswered: <reason> }` is the daemon's own `cpu-budget` answer verbatim,
+  or the control client's reason a daemon that answered `status` did not answer it (one from before the request refuses
+  it); never an empty ledger in its place, and absent when no daemon answered `status`.
+  `CpuBudgetStatus = { total, held, checkouts, gateQueue }` with `checkouts = [{ checkout, held, running, waiting }]`
+  and `gateQueue = [{ checkout, job, want }]` in the order returned tokens go to it (05_gateway.md "Host CPU budget",
+  Wire). `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
 
 `JsonEnvelope<T>` has only the private-body constructors `success(T)` → `{"ok":true,"result":T}` and
 `failure(CowshedError)` → `{"ok":false,"error":{"code","message","hint"}}`. `T` must implement the sealed core-only

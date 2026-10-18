@@ -1227,17 +1227,52 @@ nothing installed says so rather than failing.
 `status` and `doctor` call the gateway healthy only when the daemon runs the same bytes as the CLI asking; a daemon
 running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
 
-`status` reports health without starting the service. Its JSON result is the standard frozen envelope:
+`status` reports health without starting the service, then the host CPU ledger the daemon serves (05 Gateway, "Host CPU
+budget"): tokens held of the total, each checkout's held tokens, running and waiting runners, and the gate queue in the
+order returned tokens go to it — the gate job (its admission number; the smaller is the older land) and its want:
+
+```
+$ cowshed gateway status
+cowshed: gateway is healthy: launchd loaded; control socket answers at /private/cowshed/store/gateway.sock
+cowshed: gateway versions: cli 0.1.0; daemon 0.1.0
+cowshed: gateway cpu budget: held 18/18 tokens
+cowshed: gateway cpu budget: /Users/me/Dev/app: held 17, running 5, waiting 2
+cowshed: gateway cpu budget: /Users/me/Dev/lib: held 1, running 1, waiting 1
+cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them
+cowshed: gateway gate queue 1: /Users/me/Dev/app gate job 4 want 6
+cowshed: gateway gate queue 2: /Users/me/Dev/app gate job 4 want 2
+cowshed: gateway gate queue 3: /Users/me/Dev/lib gate job 9 want 18
+```
+
+A daemon that answers but does not know `cpu-budget` (one from before it) is reported as not answering it, never as an
+idle host. Its JSON result is the standard frozen envelope, with the ledger verbatim under `cpuBudget.ledger`, or the
+reason under `cpuBudget.unanswered`; `cpuBudget` is absent when no daemon answers:
 
 ```json
 {
   "ok": true,
   "result": {
+    "installed": true,
     "running": true,
     "socket": "/private/cowshed/store/gateway.sock",
-    "cacheEntries": 0,
-    "cacheBytes": 0,
-    "activeWorkspaces": 3
+    "cliVersion": "0.1.0",
+    "daemonVersion": "0.1.0",
+    "activeWorkspaces": 3,
+    "cpuBudget": {
+      "ledger": {
+        "total": 18,
+        "held": 18,
+        "checkouts": [
+          { "checkout": "/Users/me/Dev/app", "held": 17, "running": 5, "waiting": 2 },
+          { "checkout": "/Users/me/Dev/lib", "held": 1, "running": 1, "waiting": 1 }
+        ],
+        "gateQueue": [
+          { "checkout": "/Users/me/Dev/app", "job": 4, "want": 6 },
+          { "checkout": "/Users/me/Dev/app", "job": 4, "want": 2 },
+          { "checkout": "/Users/me/Dev/lib", "job": 9, "want": 18 }
+        ]
+      }
+    }
   }
 }
 ```

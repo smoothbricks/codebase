@@ -13,7 +13,9 @@ use crate::output::Output;
 use crate::path_entry::PathEntryOutcome;
 use async_trait::async_trait;
 use cowshed_core::api::Coordinator;
-use cowshed_core::api::{EmptyResult, GatewayStatus as CliGatewayStatus, StaleDaemonBinary};
+use cowshed_core::api::{
+    EmptyResult, GatewayCpuBudget, GatewayStatus as CliGatewayStatus, StaleDaemonBinary,
+};
 use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::project_retirement::ProjectRetirementReport;
 use cowshed_core::repository::RepoId;
@@ -618,7 +620,12 @@ where
                     &reported.stale_daemon,
                     reported.healing,
                 ) {
-                    (None, None, None) => return Ok(reported),
+                    (None, None, None) => {
+                        return Ok(CliGatewayStatus {
+                            cpu_budget: Some(read_cpu_budget(&client).await),
+                            ..reported
+                        });
+                    }
                     // It answers, and tells how far its startup pass has got; nothing that
                     // needs a workspace is served until that pass is over.
                     (None, None, Some(heal)) => StartWait::Startup(heal),
@@ -911,19 +918,30 @@ pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
             .map_err(launchd_error)?,
         LaunchdServiceStatus::Loaded { .. }
     );
-    let status = if installed {
+    let answered = if installed {
         let client = GatewayControlClient::new(socket.clone()).map_err(control_error)?;
-        client.status().await.ok()
+        match client.status().await {
+            Ok(status) => Some((status, read_cpu_budget(&client).await)),
+            Err(_) => None,
+        }
     } else {
         None
     };
+    let (status, cpu_budget) = answered.unzip();
     let cli_sha256 = executable_digest(&running_executable()?)?;
-    Ok(cli_status(
-        installed,
-        socket,
-        status.as_ref(),
-        cli_sha256.as_str(),
-    ))
+    Ok(CliGatewayStatus {
+        cpu_budget,
+        ..cli_status(installed, socket, status.as_ref(), cli_sha256.as_str())
+    })
+}
+
+/// The host CPU ledger of a daemon that answered `status`, or why it did not answer
+/// `cpu-budget`: a daemon from before that request refuses it, which is not an empty ledger.
+async fn read_cpu_budget(client: &GatewayControlClient) -> GatewayCpuBudget {
+    match client.cpu_budget().await {
+        Ok(ledger) => GatewayCpuBudget::Ledger(ledger),
+        Err(error) => GatewayCpuBudget::Unanswered(error.to_string()),
+    }
 }
 
 async fn run_daemon() -> Result<()> {
@@ -1232,6 +1250,8 @@ fn cli_status(
                 cli_sha256: cli_sha256.to_owned(),
             })
         }),
+        // The ledger is a second request, asked only of a daemon that answered this one.
+        cpu_budget: None,
     }
 }
 
@@ -1308,7 +1328,53 @@ pub fn emit_gateway_status<W: Write, E: Write>(
             status.daemon_version.as_deref().unwrap_or("unavailable")
         ))
         .map_err(output_error)?;
+    for line in status.cpu_budget.iter().flat_map(cpu_budget_lines) {
+        output.guidance(&line).map_err(output_error)?;
+    }
     Ok(())
+}
+
+/// The host CPU ledger in the operator's words (05_gateway.md "Host CPU budget"): tokens held of
+/// the total, each checkout's holders and waiters, then the gate queue in the order returned
+/// tokens go to it — or why the daemon gave no ledger.
+fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
+    let ledger = match budget {
+        GatewayCpuBudget::Ledger(ledger) => ledger,
+        GatewayCpuBudget::Unanswered(reason) => {
+            return vec![format!(
+                "gateway cpu budget unavailable: the daemon did not answer cpu-budget: {reason}"
+            )];
+        }
+    };
+    let mut lines = Vec::with_capacity(2 + ledger.checkouts.len() + ledger.gate_queue.len());
+    lines.push(format!(
+        "gateway cpu budget: held {}/{} tokens",
+        ledger.held, ledger.total
+    ));
+    lines.extend(ledger.checkouts.iter().map(|checkout| {
+        format!(
+            "gateway cpu budget: {}: held {}, running {}, waiting {}",
+            checkout.checkout, checkout.held, checkout.running, checkout.waiting
+        )
+    }));
+    if ledger.gate_queue.is_empty() {
+        lines.push("gateway gate queue: empty".to_owned());
+    } else {
+        lines.push(format!(
+            "gateway gate queue: {} waiting, in the order returned tokens go to them",
+            ledger.gate_queue.len()
+        ));
+        lines.extend(ledger.gate_queue.iter().enumerate().map(|(place, waiter)| {
+            format!(
+                "gateway gate queue {}: {} gate job {} want {}",
+                place + 1,
+                waiter.checkout,
+                waiter.job,
+                waiter.want
+            )
+        }));
+    }
+    lines
 }
 
 /// The build an install would put in place: its bytes, what they hash to, and what the build
@@ -3151,6 +3217,44 @@ mod tests {
         let silent = cli_status(true, socket.clone(), None, "aa");
         assert!(!silent.running);
         assert_eq!((silent.drain_cause, silent.stale_daemon), (None, None));
+    }
+
+    /// A daemon from before `cpu-budget` refuses it as an unknown operation, exactly as a live
+    /// daemon refuses any operation it does not know: `status` reports that refusal as the
+    /// ledger it could not read, never as an idle host with an empty one.
+    #[tokio::test]
+    async fn a_daemon_that_refuses_cpu_budget_is_unanswered_not_an_empty_ledger() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = std::env::temp_dir().join(format!("cscpuview-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+        let socket = dir.join("gateway.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let older_daemon = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).await.expect("request");
+            stream
+                .write_all(b"{\"ok\":false,\"code\":\"invalid-request\",\"error\":\"gateway control encoding failed: unknown gateway control operation\"}\n")
+                .await
+                .expect("refuse");
+            request
+        });
+        let client = GatewayControlClient::new(socket).expect("absolute socket");
+        let budget = read_cpu_budget(&client).await;
+        assert_eq!(
+            older_daemon.await.expect("daemon"),
+            "{\"op\":\"cpu-budget\"}\n"
+        );
+        assert_eq!(
+            budget,
+            GatewayCpuBudget::Unanswered(
+                "gateway control rejected operation (InvalidRequest): gateway control encoding failed: unknown gateway control operation"
+                    .into()
+            )
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// The daemon's control socket and the startup pass it reports — mounts still healing,

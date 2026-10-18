@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use cowshed_gateway::{
     AuditError, AuditEvent, AuditSink, AuthorizedTarget, ConnectError, CpuBudgetLimits,
     CredentialError, CredentialProvider, CredentialQuery, CredentialRecord, Gateway, GatewayConfig,
-    MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
+    GatewayControlClient, MirrorCacheConfig, UpstreamConnection, UpstreamConnector, UpstreamHealth,
 };
 use cowshed_gateway_types::{CpuBudgetStatus, CpuTokensRequest};
 use serde_json::Value;
@@ -220,9 +220,13 @@ async fn one_shot(socket: &Path, line: &str) -> Value {
     serde_json::from_str(answer.trim_end()).expect("an answer is JSON")
 }
 
+/// The ledger as `cowshed gateway status` reads it: the control client's `cpu-budget` request.
 async fn ledger(socket: &Path) -> CpuBudgetStatus {
-    let answer = one_shot(socket, "{\"op\":\"cpu-budget\"}\n").await;
-    serde_json::from_value(answer["cpuBudget"].clone()).expect("a ledger")
+    GatewayControlClient::new(socket.to_path_buf())
+        .expect("absolute socket")
+        .cpu_budget()
+        .await
+        .expect("a ledger")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

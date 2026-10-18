@@ -233,6 +233,25 @@ export const assertCpuAdmissionRefusalList = typia.createAssertEquals<readonly A
 export const parseCpuAdmissionRefusalList = (json: string): readonly Api.CpuAdmissionRefusal[] =>
   assertCpuAdmissionRefusalList(JSON.parse(json));
 
+export const assertCpuBudgetStatus = typia.createAssertEquals<Api.CpuBudgetStatus>();
+export const parseCpuBudgetStatus = (json: string): Api.CpuBudgetStatus => assertCpuBudgetStatus(JSON.parse(json));
+export const assertCpuBudgetStatusList = typia.createAssertEquals<readonly Api.CpuBudgetStatus[]>();
+export const parseCpuBudgetStatusList = (json: string): readonly Api.CpuBudgetStatus[] =>
+  assertCpuBudgetStatusList(JSON.parse(json));
+
+export const assertCpuCheckoutStatus = typia.createAssertEquals<Api.CpuCheckoutStatus>();
+export const parseCpuCheckoutStatus = (json: string): Api.CpuCheckoutStatus =>
+  assertCpuCheckoutStatus(JSON.parse(json));
+export const assertCpuCheckoutStatusList = typia.createAssertEquals<readonly Api.CpuCheckoutStatus[]>();
+export const parseCpuCheckoutStatusList = (json: string): readonly Api.CpuCheckoutStatus[] =>
+  assertCpuCheckoutStatusList(JSON.parse(json));
+
+export const assertCpuGateWaiter = typia.createAssertEquals<Api.CpuGateWaiter>();
+export const parseCpuGateWaiter = (json: string): Api.CpuGateWaiter => assertCpuGateWaiter(JSON.parse(json));
+export const assertCpuGateWaiterList = typia.createAssertEquals<readonly Api.CpuGateWaiter[]>();
+export const parseCpuGateWaiterList = (json: string): readonly Api.CpuGateWaiter[] =>
+  assertCpuGateWaiterList(JSON.parse(json));
+
 export const assertCpuMicros = typia.createAssertEquals<Api.CpuMicros>();
 export const parseCpuMicros = (json: string): Api.CpuMicros => assertCpuMicros(JSON.parse(json));
 export const assertCpuMicrosList = typia.createAssertEquals<readonly Api.CpuMicros[]>();
@@ -394,6 +413,12 @@ export const parseForkRequest = (json: string): Api.ForkRequest => assertForkReq
 export const assertForkRequestList = typia.createAssertEquals<readonly Api.ForkRequest[]>();
 export const parseForkRequestList = (json: string): readonly Api.ForkRequest[] =>
   assertForkRequestList(JSON.parse(json));
+
+export const assertGatewayCpuBudget = typia.createAssertEquals<Api.GatewayCpuBudget>();
+export const parseGatewayCpuBudget = (json: string): Api.GatewayCpuBudget => assertGatewayCpuBudget(JSON.parse(json));
+export const assertGatewayCpuBudgetList = typia.createAssertEquals<readonly Api.GatewayCpuBudget[]>();
+export const parseGatewayCpuBudgetList = (json: string): readonly Api.GatewayCpuBudget[] =>
+  assertGatewayCpuBudgetList(JSON.parse(json));
 
 export const assertGatewayStatus = typia.createAssertEquals<Api.GatewayStatus>();
 export const parseGatewayStatus = (json: string): Api.GatewayStatus => assertGatewayStatus(JSON.parse(json));

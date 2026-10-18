@@ -450,6 +450,55 @@ export type CpuAdmissionRefusal =
     });
 
 /**
+ * The budget as the gateway reports it in its status: the host total, how many tokens are held,
+ * and by whom. `held` plus the free tokens is always `total`.
+ */
+export type CpuBudgetStatus = {
+  readonly total: number & tags.Type<'uint64'>;
+  readonly held: number & tags.Type<'uint64'>;
+  /**
+   * One entry per checkout holding or waiting for tokens.
+   */
+  readonly checkouts: ReadonlyArray<CpuCheckoutStatus>;
+  /**
+   * The gate-class requests waiting, in the order returned tokens go to them: the oldest gate
+   * job's first, and within one job in the order its tasks asked.
+   */
+  readonly gateQueue: ReadonlyArray<CpuGateWaiter>;
+};
+
+export type CpuCheckoutStatus = {
+  readonly checkout: string;
+  /**
+   * Tokens its granted runners hold.
+   */
+  readonly held: number & tags.Type<'uint64'>;
+  /**
+   * Runners holding tokens.
+   */
+  readonly running: number & tags.Type<'uint64'>;
+  /**
+   * Runners waiting for a grant.
+   */
+  readonly waiting: number & tags.Type<'uint64'>;
+};
+
+/**
+ * One waiting gate-class request.
+ */
+export type CpuGateWaiter = {
+  readonly checkout: string;
+  /**
+   * The gate job it serves, as that job's admission number: the smaller is the older job.
+   */
+  readonly job: number & tags.Type<'uint64'>;
+  /**
+   * The tokens it asked for.
+   */
+  readonly want: number & tags.Type<'uint64'>;
+};
+
+/**
  * CPU time in microseconds, cumulative from the start of whatever it counts: one process's own
  * user or system time, or a job's total from its accounting source.
  */
@@ -732,6 +781,13 @@ export type ForkRequest = {
   readonly options: ForkOptions;
 };
 
+/**
+ * What `gateway status` read of the host CPU budget (05_gateway.md "Host CPU budget"): the
+ * daemon's own ledger, or the reason a daemon that answered `status` did not answer `cpu-budget`
+ * — never an empty ledger standing in for one it could not read.
+ */
+export type GatewayCpuBudget = { readonly ledger: CpuBudgetStatus } | { readonly unanswered: string };
+
 export type GatewayStatus = {
   /**
    * Whether launchd has the gateway agent loaded.
@@ -766,6 +822,11 @@ export type GatewayStatus = {
    * 0.1.0 across every build, so only the executables' contents can tell them apart.
    */
   readonly staleDaemon?: StaleDaemonBinary;
+  /**
+   * The host CPU ledger the answering daemon serves on `cpu-budget`, or why it gave none.
+   * Absent when no daemon answered `status`.
+   */
+  readonly cpuBudget?: GatewayCpuBudget;
 };
 
 export type GcCandidate = {
