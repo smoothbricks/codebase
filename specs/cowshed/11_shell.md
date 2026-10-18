@@ -240,13 +240,21 @@ Each non-streaming call is one connection: the client writes one JSON request fr
 (inline stdin, a stdin chunk) as one more frame; the supervisor answers with one JSON response frame, then the raw bytes
 the answer carries (a log chunk), and both sides close. A frame is a big-endian `u32` length and that many bytes. A long
 call — `wait`, a following log read — therefore holds only its own connection: no call queues behind another, nothing is
-multiplexed, and a client that disconnects abandons only its own call, never a job.
+multiplexed, and a client that disconnects abandons only its own call, never a job — except `hold`, below.
 
 `processEvents` holds its own connection. The supervisor validates the caller's authority and opens the retained native
 subscription before acknowledging it. The client then sends the stream-lane demands defined in
 [07_api.md, “A stream-lane call answers each demand”](07_api.md#napi-streaming-frozen). Each `next` receives one
 canonical process event, an end, or an error; `close` remains readable while a demand awaits an event. Disconnecting or
 closing drops only that subscription, never the job. No public cursor or long-poll operation is exposed.
+
+`hold` holds its own connection too, and is the one call whose disconnection reaches a job (05_gateway.md, "A gate lives
+with its operator"). The client reads the served authority from `hello` and refuses a supervisor serving another
+incarnation than its job's before anything is held, so a grant advance between admission and hold changes nothing. The
+supervisor validates the authority and the job and acknowledges with `null`. It then answers the job's terminal
+`JobInfo` when the job ends, or `null` again when the client sends the demand `release`, which lets the job outlive the
+connection. A connection that closes before either has left a running job with nobody waiting for it: the supervisor
+kills it under the authority it serves then, and says so on its stderr.
 
 - **hello** — the supervisor answers with its build, the authority it serves (repository, workspace, incarnation, grant
   and lifecycle revisions) and its pid. A client reads the build first and refuses any other by name (`Conflict`), so

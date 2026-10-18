@@ -32,6 +32,7 @@ use cowshed_core::metadata::{
 };
 use cowshed_core::metadata::{EgressMode, EgressRule};
 use cowshed_core::repository::RepoId;
+use cowshed_core::runtime::supervisor_socket::JobHold;
 use cowshed_core::runtime::{ProjectRuntime, RecoveryScope};
 use cowshed_core::storage::apfs::native::MacOsApfsExecutionHost;
 use cowshed_core::storage::apfs::rekey::RekeyReport;
@@ -968,9 +969,10 @@ impl CliService for ActorBridge {
         )
         .await?;
         let submit = cowshed_os::timing::span("exec", "submit");
+        let gate = command.request.class == cowshed_core::api::JobserverClass::Gate;
         // The gate class is the operator's: it travels the coordinator route, which a worker
         // capability cannot take. The parser refused a gate with a session.
-        let job = if command.request.class == cowshed_core::api::JobserverClass::Gate {
+        let job = if gate {
             self.coordinator()?.exec(&worker, command.request).await?
         } else if let Some(session_name) = command.session.as_deref() {
             worker
@@ -991,8 +993,33 @@ impl CliService for ActorBridge {
                 end: ExecEnd::Backgrounded,
             });
         }
+        let hold = if gate {
+            let descriptor = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| {
+                    CowshedError::internal("the CLI project runtime has already been shut down")
+                })?
+                .descriptor();
+            let socket = cowshed_core::runtime::supervisor_socket::socket_path(
+                descriptor.storage.store(),
+                &descriptor.repo_id,
+                worker.name(),
+            );
+            Some(
+                hold_gate(
+                    &job,
+                    &socket,
+                    &worker.info().workspace_incarnation,
+                    job.id(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let _relay = cowshed_os::timing::span("exec", "relay");
-        relay_foreground(&job, command.timeout, presentation, stdout, stderr).await
+        relay_foreground(&job, hold, command.timeout, presentation, stdout, stderr).await
     }
 
     async fn reconcile_gateway(&mut self) -> Result<()> {
@@ -1034,6 +1061,7 @@ pub(crate) trait ForegroundJob: Sync {
     async fn status(&self) -> Result<JobInfo>;
     /// Leave the job running with no client attached.
     async fn detach(&self) -> Result<()>;
+    async fn kill(&self) -> Result<()>;
     /// Copy one of the job's streams to `writer` as it is produced, to its end.
     async fn relay(&self, stream: JobStream, writer: &mut (dyn Write + Send)) -> Result<()>;
 }
@@ -1052,6 +1080,10 @@ impl ForegroundJob for JobHandle {
         JobHandle::detach(self).await
     }
 
+    async fn kill(&self) -> Result<()> {
+        JobHandle::kill(self).await
+    }
+
     async fn relay(&self, stream: JobStream, writer: &mut (dyn Write + Send)) -> Result<()> {
         let mut stream = self.logs(stream, 0, true).await?;
         while let Some(chunk) = stream.next().await {
@@ -1061,14 +1093,32 @@ impl ForegroundJob for JobHandle {
     }
 }
 
+/// Hold a foreground gate job for as long as this process lives (05_gateway.md, "A gate lives
+/// with its operator"): a gate nobody waits for any more would keep its place at the head of the
+/// gate queue. A gate that cannot be held is killed rather than left running for nobody.
+pub(crate) async fn hold_gate(
+    job: &impl ForegroundJob,
+    socket: &Path,
+    incarnation: &cowshed_core::metadata::WorkspaceIncarnation,
+    id: cowshed_core::api::JobId,
+) -> Result<JobHold> {
+    match cowshed_core::runtime::supervisor_socket::hold(socket, incarnation, id).await {
+        Ok(hold) => Ok(hold),
+        Err(error) => Err(merge_primary(error, job.kill().await.err())),
+    }
+}
+
 /// Relay one foreground job to this process until it ends, or until the caller's `timeout`.
 ///
 /// The job's output streams to `stdout` and `stderr` the whole time. With no timeout the relay
 /// lasts as long as the job. When a timeout passes, the job's status decides: a job still
-/// running is detached and reported still running; a job that ended meanwhile has nothing to
-/// reattach to, so its output is drained to EOF and its end is the command's.
+/// running is released from `hold`, detached and reported still running; a job that ended
+/// meanwhile has nothing to reattach to, so its output is drained to EOF and its end is the
+/// command's. A `hold` dropped before the job ends — a failed relay, or this process ending —
+/// kills the job.
 pub(crate) async fn relay_foreground(
     job: &impl ForegroundJob,
+    hold: Option<JobHold>,
     timeout: Option<Duration>,
     presentation: ExecPresentation,
     stdout: &mut (dyn Write + Send),
@@ -1104,6 +1154,9 @@ pub(crate) async fn relay_foreground(
     let info = job.status().await?;
     if info.state.is_terminal() {
         return Ok(finished_now(finished.await?));
+    }
+    if let Some(hold) = hold {
+        hold.release().await?;
     }
     job.detach().await?;
     Ok(ExecResult {
@@ -5588,6 +5641,7 @@ mod tests {
             let (mut stdout, mut stderr) = (terminal.clone(), Terminal::default());
             let relay = relay_foreground(
                 &handle,
+                None,
                 Some(Duration::from_secs(60)),
                 ExecPresentation::Raw,
                 &mut stdout,
@@ -5627,6 +5681,7 @@ mod tests {
                 Duration::from_secs(5),
                 relay_foreground(
                     &handle,
+                    None,
                     Some(Duration::from_millis(50)),
                     ExecPresentation::Raw,
                     &mut stdout,
@@ -5664,6 +5719,7 @@ mod tests {
             let (mut stdout, mut stderr) = (terminal.clone(), Terminal::default());
             let relay = relay_foreground(
                 &handle,
+                None,
                 command.timeout,
                 ExecPresentation::Raw,
                 &mut stdout,
@@ -5697,6 +5753,7 @@ mod tests {
                     Duration::from_secs(5),
                     relay_foreground(
                         &handle,
+                        None,
                         Some(Duration::from_millis(50)),
                         ExecPresentation::Raw,
                         &mut stdout,

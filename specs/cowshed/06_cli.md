@@ -435,6 +435,9 @@ or status of the command's to give. `--background` asks not to wait at all: the 
 0, and stderr names how to reach the job. The CLI has no verb that reattaches to a job; the API does
 (`WorkspaceHandle::job`, 07_api.md). Leaving a job running changes attachment only. It forces memory-only prefixes into
 lazy protected files so later reads and checkpoints are durable; it does not imply every terminal job has stream paths.
+A `--class gate` command is held for as long as `cowshed exec` runs (11_shell.md, `hold`): an exec process that ends
+first, however it ends, leaves a gate nobody waits for, and the supervisor kills it (05_gateway.md, "A gate lives with
+its operator"). `--timeout` releases the hold before it leaves the gate running; `--background` takes none.
 
 `--register` (on `cowshed fork`) additionally adds a `cowshed/<ws>` remote in the **main** workspace pointing at the new
 workspace's canonical mount, so a human in main can fetch and review the workspace's branch in place. Off by default
