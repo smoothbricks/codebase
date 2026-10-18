@@ -24,7 +24,7 @@ pub mod status;
 pub mod task_server;
 
 pub use cpu_budget::{
-    CPU_TOKENS_OP, CpuBudgetStatus, CpuCheckoutStatus, CpuGateWaiter, CpuTokensRequest,
+    CPU_TOKENS_OP, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuTokensRequest,
     JOBSERVER_OP, JobserverAnswer, JobserverClass, JobserverJob, JobserverRequest,
     cpu_pool_directory,
 };

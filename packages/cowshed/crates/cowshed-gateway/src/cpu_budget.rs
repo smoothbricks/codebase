@@ -26,13 +26,15 @@
 //! [`Ledger`] is the whole policy as a pure state machine; [`CpuBudget`] is the thin actor that
 //! feeds it requests and departures and answers status.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cowshed_gateway_types::{CpuBudgetStatus, CpuCheckoutStatus, CpuGateWaiter, JobserverClass};
+use cowshed_gateway_types::{
+    CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, JobserverClass,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::disk_lease::{Claim, Ticket};
@@ -491,10 +493,52 @@ impl Ledger {
             })
             .collect();
         gate_queue.sort_unstable_by_key(|(waiter, _)| waiter.order());
+        // Gate-class holders, summed per gate job and checkout: the oldest job is the head.
+        let mut gate_jobs: BTreeMap<(Ticket, &Arc<str>), CpuGateJob> = BTreeMap::new();
+        let mut background = Vec::new();
+        for (name, checkout) in &self.checkouts {
+            let mut stake = CpuCheckoutStatus {
+                checkout: name.to_string(),
+                held: 0,
+                running: 0,
+                waiting: 0,
+            };
+            for holder in &checkout.running {
+                match holder.class {
+                    JobserverClass::Gate => {
+                        let job =
+                            gate_jobs
+                                .entry((holder.job, name))
+                                .or_insert_with(|| CpuGateJob {
+                                    checkout: name.to_string(),
+                                    job: holder.job,
+                                    held: 0,
+                                    running: 0,
+                                });
+                        job.held += holder.tokens;
+                        job.running += 1;
+                    }
+                    JobserverClass::Background => {
+                        stake.held += holder.tokens;
+                        stake.running += 1;
+                    }
+                }
+            }
+            stake.waiting = checkout
+                .waiting
+                .iter()
+                .filter(|waiter| waiter.class == JobserverClass::Background)
+                .count();
+            if stake.held + stake.running + stake.waiting > 0 {
+                background.push(stake);
+            }
+        }
+        background.sort_unstable_by(|left, right| left.checkout.cmp(&right.checkout));
         CpuBudgetStatus {
             total: self.total,
             held: self.total - self.free,
             checkouts,
+            gate_jobs: gate_jobs.into_values().collect(),
             gate_queue: gate_queue
                 .into_iter()
                 .map(|(waiter, name)| CpuGateWaiter {
@@ -503,6 +547,7 @@ impl Ledger {
                     want: waiter.want,
                 })
                 .collect(),
+            background,
         }
     }
 }

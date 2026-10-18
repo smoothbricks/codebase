@@ -457,14 +457,24 @@ export type CpuBudgetStatus = {
   readonly total: number & tags.Type<'uint64'>;
   readonly held: number & tags.Type<'uint64'>;
   /**
-   * One entry per checkout holding or waiting for tokens.
+   * One entry per checkout holding or waiting for tokens, every class together.
    */
   readonly checkouts: ReadonlyArray<CpuCheckoutStatus>;
+  /**
+   * The gate jobs whose runners hold tokens, oldest job first: the first is the head of the
+   * gate queue, the land every returned token goes to while it wants one.
+   */
+  readonly gateJobs: ReadonlyArray<CpuGateJob>;
   /**
    * The gate-class requests waiting, in the order returned tokens go to them: the oldest gate
    * job's first, and within one job in the order its tasks asked.
    */
   readonly gateQueue: ReadonlyArray<CpuGateWaiter>;
+  /**
+   * Each checkout's background-class stake alone, for the checkouts that have one: what is
+   * served behind the gate jobs.
+   */
+  readonly background: ReadonlyArray<CpuCheckoutStatus>;
 };
 
 export type CpuCheckoutStatus = {
@@ -481,6 +491,25 @@ export type CpuCheckoutStatus = {
    * Runners waiting for a grant.
    */
   readonly waiting: number & tags.Type<'uint64'>;
+};
+
+/**
+ * One gate job's runners that hold tokens, in one checkout.
+ */
+export type CpuGateJob = {
+  readonly checkout: string;
+  /**
+   * The gate job, as its admission number: the smaller is the older job.
+   */
+  readonly job: number & tags.Type<'uint64'>;
+  /**
+   * Tokens its granted runners hold.
+   */
+  readonly held: number & tags.Type<'uint64'>;
+  /**
+   * Its runners holding tokens.
+   */
+  readonly running: number & tags.Type<'uint64'>;
 };
 
 /**

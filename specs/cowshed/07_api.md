@@ -1400,10 +1400,13 @@ supervisor that ran the job retires.
   daemon started that it is still recovering, never 0 (11_shell.md "Supervisor recovery").
   `cpuBudget = { ledger: CpuBudgetStatus } | { unanswered: <reason> }` is the daemon's own `cpu-budget` answer verbatim,
   or the control client's reason a daemon that answered `status` did not answer it (one from before the request refuses
-  it); never an empty ledger in its place, and absent when no daemon answered `status`.
-  `CpuBudgetStatus = { total, held, checkouts, gateQueue }` with `checkouts = [{ checkout, held, running, waiting }]`
-  and `gateQueue = [{ checkout, job, want }]` in the order returned tokens go to it (05_gateway.md "Host CPU budget",
-  Wire). `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
+  it; one from before `gateJobs` answers a ledger this build cannot read, and the reason names the missing field); never
+  an empty ledger in its place, and absent when no daemon answered `status`.
+  `CpuBudgetStatus = { total, held, checkouts, gateJobs, gateQueue, background }`: `checkouts` (every class) and
+  `background` (background class alone) are `[{ checkout, held, running, waiting }]`, `gateJobs` is
+  `[{ checkout, job, held, running }]` oldest job first (the head of the gate queue first), and `gateQueue` is
+  `[{ checkout, job, want }]` in the order returned tokens go to it (05_gateway.md "Host CPU budget", Wire).
+  `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
 
 `JsonEnvelope<T>` has only the private-body constructors `success(T)` → `{"ok":true,"result":T}` and
 `failure(CowshedError)` → `{"ok":false,"error":{"code","message","hint"}}`. `T` must implement the sealed core-only

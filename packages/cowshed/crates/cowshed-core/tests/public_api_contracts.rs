@@ -1160,10 +1160,22 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
                     running: 4,
                     waiting: 1,
                 }],
+                gate_jobs: vec![cowshed_gateway_types::CpuGateJob {
+                    checkout: "/w/land".into(),
+                    job: 7,
+                    held: 12,
+                    running: 3,
+                }],
                 gate_queue: vec![cowshed_gateway_types::CpuGateWaiter {
                     checkout: "/w/land".into(),
                     job: 7,
                     want: 6,
+                }],
+                background: vec![cowshed_gateway_types::CpuCheckoutStatus {
+                    checkout: "/w/land".into(),
+                    held: 1,
+                    running: 1,
+                    waiting: 0,
                 }],
             },
         )),
@@ -1173,7 +1185,9 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         serde_json::to_value(&ledger).unwrap()["cpuBudget"],
         json!({"ledger":{"total":18,"held":13,
             "checkouts":[{"checkout":"/w/land","held":13,"running":4,"waiting":1}],
-            "gateQueue":[{"checkout":"/w/land","job":7,"want":6}]}})
+            "gateJobs":[{"checkout":"/w/land","job":7,"held":12,"running":3}],
+            "gateQueue":[{"checkout":"/w/land","job":7,"want":6}],
+            "background":[{"checkout":"/w/land","held":1,"running":1,"waiting":0}]}})
     );
     assert_eq!(
         serde_json::from_value::<GatewayStatus>(serde_json::to_value(&ledger).unwrap()).unwrap(),

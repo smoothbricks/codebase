@@ -467,12 +467,42 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
     // Then the younger land's task asks through its pool, and the older land's task asks last.
     let mut younger_task = Asker::child(&younger_pool, 1).await;
     let mut older_task = Asker::child(&older_pool, 1).await;
-    let queue: Vec<(String, u64)> = ledger(&socket)
-        .await
+    let status = ledger(&socket).await;
+    // The running gate jobs, the head — the older land — first, each on its orchestrator's token;
+    // the feature shed is the background served behind them.
+    assert_eq!(
+        status
+            .gate_jobs
+            .iter()
+            .map(|job| (job.checkout.as_str(), job.held, job.running))
+            .collect::<Vec<_>>(),
+        [("/w/older", 1, 1), ("/w/younger", 1, 1)],
+        "{status:?}"
+    );
+    assert!(
+        status.gate_jobs[0].job < status.gate_jobs[1].job,
+        "{status:?}"
+    );
+    assert_eq!(
+        status.background,
+        [cowshed_gateway_types::CpuCheckoutStatus {
+            checkout: "/w/feature".into(),
+            held: 2,
+            running: 2,
+            waiting: 1,
+        }],
+        "{status:?}"
+    );
+    let queue: Vec<(String, u64)> = status
         .gate_queue
         .into_iter()
         .map(|waiter| (waiter.checkout, waiter.job))
         .collect();
+    assert_eq!(
+        queue.iter().map(|(_, job)| *job).collect::<Vec<_>>(),
+        [status.gate_jobs[0].job, status.gate_jobs[1].job],
+        "a waiting task names the gate job it serves: {queue:?}"
+    );
     assert_eq!(
         queue
             .iter()

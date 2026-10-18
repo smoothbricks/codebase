@@ -1228,20 +1228,22 @@ nothing installed says so rather than failing.
 running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
 
 `status` reports health without starting the service, then the host CPU ledger the daemon serves (05 Gateway, "Host CPU
-budget"): tokens held of the total, each checkout's held tokens, running and waiting runners, and the gate queue in the
-order returned tokens go to it — the gate job (its admission number; the smaller is the older land) and its want:
+budget") in the order it serves it: tokens held of the total; the running gate jobs, the head — the oldest land — first;
+the gate queue in the order returned tokens go to it; then each checkout's background work. A gate job is named by its
+admission number (the smaller is the older land):
 
 ```
 $ cowshed gateway status
 cowshed: gateway is healthy: launchd loaded; control socket answers at /private/cowshed/store/gateway.sock
 cowshed: gateway versions: cli 0.1.0; daemon 0.1.0
 cowshed: gateway cpu budget: held 18/18 tokens
-cowshed: gateway cpu budget: /Users/me/Dev/app: held 17, running 5, waiting 2
-cowshed: gateway cpu budget: /Users/me/Dev/lib: held 1, running 1, waiting 1
+cowshed: gateway gate head: /Users/me/Dev/app gate job 4: held 15, running 4
+cowshed: gateway gate job behind the head: /Users/me/Dev/lib gate job 9: held 1, running 1
 cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them
 cowshed: gateway gate queue 1: /Users/me/Dev/app gate job 4 want 6
 cowshed: gateway gate queue 2: /Users/me/Dev/app gate job 4 want 2
 cowshed: gateway gate queue 3: /Users/me/Dev/lib gate job 9 want 18
+cowshed: gateway background: /Users/me/Dev/app: held 2, running 1, waiting 0
 ```
 
 A daemon that answers but does not know `cpu-budget` (one from before it) is reported as not answering it, never as an
@@ -1266,11 +1268,16 @@ reason under `cpuBudget.unanswered`; `cpuBudget` is absent when no daemon answer
           { "checkout": "/Users/me/Dev/app", "held": 17, "running": 5, "waiting": 2 },
           { "checkout": "/Users/me/Dev/lib", "held": 1, "running": 1, "waiting": 1 }
         ],
+        "gateJobs": [
+          { "checkout": "/Users/me/Dev/app", "job": 4, "held": 15, "running": 4 },
+          { "checkout": "/Users/me/Dev/lib", "job": 9, "held": 1, "running": 1 }
+        ],
         "gateQueue": [
           { "checkout": "/Users/me/Dev/app", "job": 4, "want": 6 },
           { "checkout": "/Users/me/Dev/app", "job": 4, "want": 2 },
           { "checkout": "/Users/me/Dev/lib", "job": 9, "want": 18 }
-        ]
+        ],
+        "background": [{ "checkout": "/Users/me/Dev/app", "held": 2, "running": 1, "waiting": 0 }]
       }
     }
   }

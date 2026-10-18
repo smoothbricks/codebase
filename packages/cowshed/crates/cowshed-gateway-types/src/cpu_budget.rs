@@ -174,11 +174,30 @@ impl<'a> CpuTokensRequest<'a> {
 pub struct CpuBudgetStatus {
     pub total: usize,
     pub held: usize,
-    /// One entry per checkout holding or waiting for tokens.
+    /// One entry per checkout holding or waiting for tokens, every class together.
     pub checkouts: Vec<CpuCheckoutStatus>,
+    /// The gate jobs whose runners hold tokens, oldest job first: the first is the head of the
+    /// gate queue, the land every returned token goes to while it wants one.
+    pub gate_jobs: Vec<CpuGateJob>,
     /// The gate-class requests waiting, in the order returned tokens go to them: the oldest gate
     /// job's first, and within one job in the order its tasks asked.
     pub gate_queue: Vec<CpuGateWaiter>,
+    /// Each checkout's background-class stake alone, for the checkouts that have one: what is
+    /// served behind the gate jobs.
+    pub background: Vec<CpuCheckoutStatus>,
+}
+
+/// One gate job's runners that hold tokens, in one checkout.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuGateJob {
+    pub checkout: String,
+    /// The gate job, as its admission number: the smaller is the older job.
+    pub job: u64,
+    /// Tokens its granted runners hold.
+    pub held: usize,
+    /// Its runners holding tokens.
+    pub running: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
