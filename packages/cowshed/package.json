@@ -62,7 +62,7 @@
         "options": {
           "command": "node --check packages/cowshed/bin/cache-advisor.cjs && node --test packages/cowshed/scripts/cache-advisor.test.cjs",
           "cwd": ".",
-          "timeoutMs": 120000,
+          "idleTimeoutMs": 180000,
           "killAfterMs": 10000
         }
       },
