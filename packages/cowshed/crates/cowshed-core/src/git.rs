@@ -2023,32 +2023,27 @@ impl GitRepository {
         timed_async(
             "fork",
             "inherited-branches",
-            self.prune_inherited_branches(name, source),
+            self.prune_inherited_branches(name),
         )
         .await?;
         Ok(main_remote)
     }
 
-    /// Delete every local branch this clone carried from `source` unchanged, keeping only its own
-    /// `cowshed/<name>`: one branch per workspace, so the branches removal measures are the
-    /// branches the workspace's own work made (02_workspaces.md, fork mint step 6). A carried
-    /// branch is deleted only while its tip equals the source's branch of the same name - the
-    /// source still holds that branch, so the copy carries nothing of its own. Any other branch
-    /// stays for removal's containment gate to judge. Replaying is safe: a deleted branch is no
-    /// longer listed.
-    async fn prune_inherited_branches(&self, name: &str, source: &Path) -> Result<()> {
+    /// Delete every local branch this clone carried, keeping only its own `cowshed/<name>`: a
+    /// workspace holds one branch, the one it rebases on main and lands, and reaches main's
+    /// branches through the `main` remote (02_workspaces.md, fork mint step 6). Mint runs before
+    /// publication, so nothing in the clone is the workspace's own work yet; every carried branch
+    /// is a copy of the source's as it stood at capture, and the source decides its fate. A copy
+    /// kept here would be a branch work can land on unseen, and one `rm` must judge against main
+    /// forever after. Replaying is safe: a deleted branch is no longer listed.
+    async fn prune_inherited_branches(&self, name: &str) -> Result<()> {
         let (_, own) = workspace_branch(name);
-        let source_tips = Self::from_root(&self.store_root, source)
-            .ref_tips(&["refs/heads"])
-            .await?;
         let carried: Vec<OsString> = self
             .ref_tips(&["refs/heads"])
             .await?
-            .into_iter()
-            .filter(|(branch, tip)| {
-                branch.as_slice() != own.as_bytes() && source_tips.get(branch) == Some(tip)
-            })
-            .filter_map(|(branch, _)| {
+            .into_keys()
+            .filter(|branch| branch.as_slice() != own.as_bytes())
+            .filter_map(|branch| {
                 branch
                     .strip_prefix(b"refs/heads/")
                     .map(|short| OsString::from_vec(short.to_vec()))
@@ -6070,16 +6065,18 @@ mod tests {
         assert_eq!(Path::new(&remotes[0].url), &*main);
     }
 
-    /// A clone carries every branch its source had. Mint keeps the workspace's own branch and
-    /// any branch whose tip no longer equals the source's, and deletes the rest: the source still
-    /// holds them, and a branch removal does not measure is a branch whose work it can destroy.
+    /// A clone carries every branch its source had. Mint keeps only the workspace's own branch:
+    /// a carried branch goes whether or not its tip still equals the source's, and one the source
+    /// has since dropped goes too, so `rm` has the workspace's one branch to judge.
     #[tokio::test]
-    async fn mint_prunes_the_branches_the_clone_carried_unchanged() {
+    async fn mint_keeps_only_the_workspace_branch() {
         let store = crate::temp_root::FixtureStore::new();
         let main = repository();
         git(&main, &["branch", "carried"]);
         git(&main, &["branch", "moved"]);
+        git(&main, &["branch", "dropped"]);
         let mount = clone_image(&main);
+        git(&main, &["branch", "-D", "dropped"]);
         let advanced = git_stdout(
             &mount,
             &[
@@ -6100,8 +6097,8 @@ mod tests {
             |root: &Path| git_stdout(root, &["for-each-ref", "--format=%(refname)", "refs/heads"]);
         assert_eq!(
             branches(&mount),
-            "refs/heads/cowshed/raven\nrefs/heads/moved\n",
-            "only the workspace's own branch and the one that moved in the clone remain"
+            "refs/heads/cowshed/raven\n",
+            "only the workspace's own branch remains"
         );
         assert_eq!(
             branches(&main),
@@ -6125,9 +6122,9 @@ mod tests {
         let switched = Command::new("git")
             .arg("-C")
             .arg(&root)
-            .args(["switch", "--quiet", "main"])
+            .args(["switch", "--quiet", "--detach"])
             .status_locked()
-            .expect("move HEAD away after branch creation");
+            .expect("move HEAD off the workspace branch, the only branch preparation kept");
         assert!(switched.success());
         repo.prepare_workspace("raven", &root, &source, Some("main"), true)
             .await
