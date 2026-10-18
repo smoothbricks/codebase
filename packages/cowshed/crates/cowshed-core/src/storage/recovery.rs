@@ -19,6 +19,106 @@ pub const TRASH_NAMESPACE: &str = ".trash";
 /// abandons unlanded work: `sessions/.trash/<ws>-<tip>.bundle`. It is the only copy of those
 /// commits, so only a sweep explicitly authorized for them reclaims it.
 pub const ABANDON_BUNDLE_EXTENSION: &str = "bundle";
+
+/// What a project's trash keeps of `rm --abandon`: its abandon bundles, the only copy of the
+/// commits each removal gave up, which only an explicit `gc --abandoned` deletes. The surfaces
+/// that never otherwise show the trash — `ls --all`, plain `gc`, `doctor` — name them with this.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeptAbandonBundles {
+    pub trash: PathBuf,
+    pub count: usize,
+    /// Allocated bytes, as `gc --dry-run --abandoned` counts them.
+    pub bytes: u64,
+}
+
+impl KeptAbandonBundles {
+    pub const HINT: &'static str =
+        "cowshed gc --dry-run --abandoned lists them; cowshed gc --abandoned deletes them";
+
+    /// The bundles an `--abandoned` gc preview names; `None` when it names none.
+    pub fn named_by(
+        candidates: &[crate::storage::lifecycle::StorageGcCandidate],
+    ) -> CowshedResult<Option<Self>> {
+        let mut kept: Option<Self> = None;
+        for candidate in candidates.iter().filter(|candidate| {
+            candidate.reason() == crate::storage::lifecycle::StorageGcReason::AbandonedBundle
+        }) {
+            let summary = kept.get_or_insert_with(|| Self {
+                trash: candidate
+                    .path()
+                    .parent()
+                    .unwrap_or(candidate.path())
+                    .to_owned(),
+                count: 0,
+                bytes: 0,
+            });
+            summary
+                .add(candidate.bytes())
+                .ok_or_else(|| CowshedError::internal("abandon bundle byte accounting overflow"))?;
+        }
+        Ok(kept)
+    }
+
+    /// The bundles directly in `trash`, by the same rule a sweep uses: a regular file with the
+    /// bundle extension. `None` when there are none, including when `trash` does not exist.
+    pub fn in_trash(trash: &Path) -> io::Result<Option<Self>> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let entries = match std::fs::read_dir(trash) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut kept: Option<Self> = None;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path
+                .extension()
+                .is_none_or(|extension| extension != ABANDON_BUNDLE_EXTENSION)
+            {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            let summary = kept.get_or_insert_with(|| Self {
+                trash: trash.to_owned(),
+                count: 0,
+                bytes: 0,
+            });
+            metadata
+                .blocks()
+                .checked_mul(512)
+                .and_then(|bytes| summary.add(bytes))
+                .ok_or_else(|| io::Error::other("abandon bundle byte accounting overflow"))?;
+        }
+        Ok(kept)
+    }
+
+    /// `None` when the byte total would overflow.
+    fn add(&mut self, bytes: u64) -> Option<()> {
+        self.count += 1;
+        self.bytes = self.bytes.checked_add(bytes)?;
+        Some(())
+    }
+}
+
+impl std::fmt::Display for KeptAbandonBundles {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} keeps {} abandon {} totalling {} bytes, the only copy of the commits \
+             `rm --abandon` gave up, which no plain gc deletes",
+            self.trash.display(),
+            self.count,
+            if self.count == 1 { "bundle" } else { "bundles" },
+            self.bytes
+        )
+    }
+}
+
 /// Same-parent, hidden mountpoint names retaining root-owned system debris; never workspaces.
 pub const ROOT_HELD_MOUNT_PREFIX: &str = ".root-held-";
 pub const LIFECYCLE_INTENTS_FILE: &str = "lifecycle-intents.json";

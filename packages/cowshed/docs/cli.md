@@ -653,6 +653,10 @@ git fetch <bundle> HEAD:refs/heads/recovered-raven
 Bundle verification uses a temporary bare repository, and the bundle is staged beside its final name until it verifies.
 Interrupting `rm --abandon` removes both before the command exits; a retry revalidates any bundle already published.
 
+Bundles stay until `cowshed gc --abandoned`, but they are never out of sight: a plain `cowshed gc` says how many the
+trash keeps and their bytes, `cowshed doctor` reports them as an `abandon-bundles` finding, and `cowshed ls --all` names
+each project's after its table.
+
 `cowshed rm main --restore` is the reverse of `adopt`: it puts the pre-adoption checkout back and unbinds the project.
 Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.
 

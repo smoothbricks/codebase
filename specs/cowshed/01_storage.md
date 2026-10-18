@@ -263,7 +263,10 @@ burden with retention _conventions_, enforced by `cowshed gc`, never by a backgr
   are not bundle candidates. Plain `gc`, opportunistic collection, and `doctor --repair` never authorize their
   reclamation. Only explicit `--abandoned` (`GcOptions.abandoned: true`) adds the `abandonedBundle` category to the
   exact plan. `gc --dry-run --abandoned` lists those candidates and their allocated bytes without deleting them.
-  Reclamation is final: preserve the abandoned commits in another repository before requesting it.
+  Reclamation is final: preserve the abandoned commits in another repository before requesting it. Keeping them is never
+  hiding them: a plain `gc` reports how many the trash keeps and their allocated bytes, `doctor` reports them as an
+  `abandon-bundles` info finding, and `ls --all` names each project's after its table. Naming them authorizes nothing;
+  the plain sweep's own plan still never holds one.
 - Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
   one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
   trash image and empty mountpoint. Preview and execution validate the repository, workspace, incarnation, checkpoint

@@ -46,6 +46,7 @@ use cowshed_core::storage::host_config::{
 };
 use cowshed_core::storage::job_artifact::{ArtifactConfig, repair_workspace_record_sequences};
 use cowshed_core::storage::lifecycle::{DerivedWorkspace, MountIntent, MountState, Pin, Substrate};
+use cowshed_core::storage::recovery::KeptAbandonBundles;
 use cowshed_core::storage::{StorageLayout, discover_session_images};
 use cowshed_core::{
     AdoptedProject, CowshedError, ErrorCode, GatewayInventoryError, GatewayStoreBackend, JobHandle,
@@ -119,6 +120,10 @@ pub trait CliService: Send {
         Err(CowshedError::internal(
             "CLI service does not support store-wide workspace discovery",
         ))
+    }
+    /// What each project's trash keeps of `rm --abandon`, which `ls --all` names after its table.
+    async fn kept_abandon_bundles(&mut self) -> Result<Vec<(RepoId, KeptAbandonBundles)>> {
+        Ok(Vec::new())
     }
     async fn other_adopted_project_count(&mut self) -> Result<usize> {
         Ok(0)
@@ -670,6 +675,14 @@ async fn list_all_adopted_projects() -> Result<Vec<ProjectWorkspaces>> {
         .map_err(project_inventory_error)
 }
 
+async fn kept_abandon_bundles() -> Result<Vec<(RepoId, KeptAbandonBundles)>> {
+    host_inventory()
+        .await?
+        .kept_abandon_bundles()
+        .await
+        .map_err(project_inventory_error)
+}
+
 #[async_trait]
 impl CliService for ActorBridge {
     async fn adopt(&mut self, options: AdoptOptions) -> Result<WorkspaceInfo> {
@@ -753,6 +766,10 @@ impl CliService for ActorBridge {
 
     async fn list_all(&mut self) -> Result<Vec<ProjectWorkspaces>> {
         list_all_adopted_projects().await
+    }
+
+    async fn kept_abandon_bundles(&mut self) -> Result<Vec<(RepoId, KeptAbandonBundles)>> {
+        kept_abandon_bundles().await
     }
 
     async fn other_adopted_project_count(&mut self) -> Result<usize> {
@@ -1433,6 +1450,9 @@ where
                 let mut projects = service.list_all().await?;
                 sort_project_listing(&mut projects);
                 emit_project_listing(output, json, args, projects).await?;
+                if !json {
+                    emit_kept_abandon_bundles(output, &service.kept_abandon_bundles().await?)?;
+                }
             } else {
                 let mut workspaces = service.list().await?;
                 sort_workspace_listing(&mut workspaces);
@@ -3505,6 +3525,23 @@ async fn emit_project_listing<W: Write, E: Write>(
     emit_project_workspaces_table(output, &projects)
 }
 
+/// Name what each project's trash keeps of `rm --abandon`: the only copy of commits that removal
+/// gave up, in a dot-directory no listing shows and no plain gc deletes.
+fn emit_kept_abandon_bundles<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    kept: &[(RepoId, KeptAbandonBundles)],
+) -> Result<()> {
+    for (repo_id, bundles) in kept {
+        output
+            .guidance(&format!(
+                "{repo_id}: {bundles}; {}",
+                KeptAbandonBundles::HINT
+            ))
+            .map_err(output_error)?;
+    }
+    Ok(())
+}
+
 async fn emit_workspace_listing<W: Write, E: Write>(
     output: &mut Output<W, E>,
     json: bool,
@@ -5019,6 +5056,9 @@ where
             let mut projects = list_all_adopted_projects().await?;
             sort_project_listing(&mut projects);
             emit_project_listing(output, cli.global.json, args, projects).await?;
+            if !cli.global.json {
+                emit_kept_abandon_bundles(output, &kept_abandon_bundles().await?)?;
+            }
             Ok(success())
         }
         Command::Doctor(_) => {

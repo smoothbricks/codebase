@@ -11365,6 +11365,28 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             )
             .await
             .map_err(native_storage_error)?;
+        // A plain sweep keeps abandon bundles by design, so it says so instead of leaving them
+        // in a dot-directory nothing lists: the `--abandoned` preview names them, deleting none.
+        if !options.abandoned {
+            let bundles = self
+                .substrate
+                .preview_gc(
+                    &self.descriptor.repo_id,
+                    StorageGcOptions {
+                        abandoned_bundles: true,
+                    },
+                )
+                .await
+                .map_err(native_storage_error)?;
+            if let Some(kept) =
+                crate::storage::recovery::KeptAbandonBundles::named_by(bundles.candidates())?
+            {
+                eprintln!(
+                    "cowshed: {kept}; {}",
+                    crate::storage::recovery::KeptAbandonBundles::HINT
+                );
+            }
+        }
         let candidates = plan
             .candidates()
             .iter()
@@ -12899,12 +12921,15 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // A blocked collection sends the operator here, so this reads gc's own preview rather than a
         // second scan that could disagree with the command that forwarded to it. A preview that
         // cannot be taken at all is itself the finding — reporting a healthy host while `gc` refuses
-        // leaves the operator with no next move.
+        // leaves the operator with no next move. It is the `--abandoned` preview, so the abandon
+        // bundles a plain sweep keeps are named too; a preview deletes nothing.
         match self
             .substrate
             .preview_gc(
                 &self.descriptor.repo_id,
-                crate::storage::lifecycle::StorageGcOptions::default(),
+                crate::storage::lifecycle::StorageGcOptions {
+                    abandoned_bundles: true,
+                },
             )
             .await
         {
@@ -12999,6 +13024,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                         ),
                         hint: "cowshed gc".into(),
                         path: Some(first.path().to_owned()),
+                    });
+                }
+                if let Some(kept) =
+                    crate::storage::recovery::KeptAbandonBundles::named_by(plan.candidates())?
+                {
+                    findings.push(crate::api::dto::Finding {
+                        code: "abandon-bundles".into(),
+                        severity: crate::api::dto::FindingSeverity::Info,
+                        message: kept.to_string(),
+                        hint: crate::storage::recovery::KeptAbandonBundles::HINT.into(),
+                        path: Some(kept.trash),
                     });
                 }
             }
