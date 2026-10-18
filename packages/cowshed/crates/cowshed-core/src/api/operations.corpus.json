@@ -80,7 +80,6 @@
     "admissionKey": "gate-7",
     "class": "gate",
     "want": 8,
-    "waitMs": 120000,
     "scope": "hostGate"
   },
   "worker.exec": {

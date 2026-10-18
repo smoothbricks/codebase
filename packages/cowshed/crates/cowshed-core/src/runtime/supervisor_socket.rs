@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -416,7 +416,6 @@ struct ExecWire {
     admission_key: Option<AdmissionKey>,
     class: JobserverClass,
     want: NonZeroUsize,
-    wait_ms: Option<NonZeroU32>,
     scope: ExecScope,
 }
 
@@ -1243,7 +1242,6 @@ async fn answer(
                 admission_key: request.admission_key,
                 class: request.class,
                 want: request.want,
-                wait_ms: request.wait_ms,
                 scope: request.scope,
             };
             let session = wire.map(session);
@@ -2092,7 +2090,6 @@ async fn forward_exec(
             admission_key: request.admission_key,
             class: request.class,
             want: request.want,
-            wait_ms: request.wait_ms,
             scope: request.scope,
         }),
     };
@@ -2633,7 +2630,6 @@ mod admission_source_tests {
                 "admissionKey": null,
                 "class": "gate",
                 "want": 8,
-                "waitMs": 120000,
                 "scope": "hostGate"
             }
         });
@@ -2646,7 +2642,6 @@ mod admission_source_tests {
         assert_eq!(source, AdmissionSource::Coordinator);
         assert_eq!(request.class, JobserverClass::Gate);
         assert_eq!(request.want.get(), 8);
-        assert_eq!(request.wait_ms.map(NonZeroU32::get), Some(120_000));
         assert_eq!(request.scope, ExecScope::HostGate);
 
         let mut unrouted = call;

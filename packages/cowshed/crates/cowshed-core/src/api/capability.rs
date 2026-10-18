@@ -336,12 +336,11 @@ impl ControllerRuntime for ActorRuntime {
         request.command.validate().map_err(|error| {
             CowshedError::usage(error.to_string(), "provide a valid bounded command")
         })?;
-        crate::api::dto::validate_scheduling(request.class, request.wait_ms, request.scope)
-            .map_err(|error| {
-                CowshedError::cpu_admission(CpuAdmissionRefusal::InvalidRequest {
-                    detail: error.to_string(),
-                })
-            })?;
+        crate::api::dto::validate_scheduling(request.class, request.scope).map_err(|error| {
+            CowshedError::cpu_admission(CpuAdmissionRefusal::InvalidRequest {
+                detail: error.to_string(),
+            })
+        })?;
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
         let ExecRequest {
             command,
@@ -355,7 +354,6 @@ impl ControllerRuntime for ActorRuntime {
             admission_key,
             class,
             want,
-            wait_ms,
             scope,
         } = request;
         let (stdin, inline, mut stream) = match stdin {
@@ -388,7 +386,6 @@ impl ControllerRuntime for ActorRuntime {
             admission_key,
             class,
             want,
-            wait_ms,
             scope,
         };
         let job_id = match (source, inline) {
@@ -2646,7 +2643,7 @@ mod tests {
     use crate::api::operations::{self, OPERATIONS, Scope};
     use serde_json::json;
     use std::future::{self, Future};
-    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
     fn empty_params() -> Params {
@@ -3063,7 +3060,6 @@ mod tests {
             admission_key: None,
             class: JobserverClass::Background,
             want: NonZeroUsize::MIN,
-            wait_ms: None,
             scope: ExecScope::Workspace,
         }
     }
@@ -4053,7 +4049,7 @@ mod tests {
                 assert_eq!(exec["method"], "worker.exec");
                 let params = exec["params"].as_object().expect("params");
                 assert_eq!(params.get("want"), wants.map(|want| json!(want)).as_ref());
-                for omitted in ["class", "waitMs", "scope"] {
+                for omitted in ["class", "scope"] {
                     assert!(params.get(omitted).is_none(), "{omitted} is omitted");
                 }
                 write_rpc_success(&mut server, exec["id"].as_u64().unwrap(), json!(7), None).await;
@@ -4078,7 +4074,6 @@ mod tests {
         for scope in [ExecScope::Workspace, ExecScope::HostGate] {
             let mut request = exec_request(StdinSource::Empty);
             request.class = JobserverClass::Gate;
-            request.wait_ms = NonZeroU32::new(120_000);
             request.scope = scope;
             let error = handle
                 .exec(request)
@@ -4129,7 +4124,6 @@ mod tests {
                     "stderrCopy": null,
                     "class": "gate",
                     "want": 8,
-                    "waitMs": 120000,
                     "scope": "hostGate",
                 })
             );
@@ -4140,7 +4134,6 @@ mod tests {
         let mut request = exec_request(StdinSource::Empty);
         request.class = JobserverClass::Gate;
         request.want = NonZeroUsize::new(8).unwrap();
-        request.wait_ms = NonZeroU32::new(120_000);
         request.scope = ExecScope::HostGate;
         request.env = [
             ("PROJECT_SETTING".to_owned(), "custom-value".to_owned()),
@@ -4161,7 +4154,6 @@ mod tests {
         let worker = workspace_handle(Arc::clone(&runtime));
         let mut request = exec_request(StdinSource::Empty);
         request.class = JobserverClass::Gate;
-        request.wait_ms = NonZeroU32::new(120_000);
         request.scope = ExecScope::HostGate;
         request.env = [("PROJECT_SETTING".to_owned(), "custom-value".to_owned())].into();
         let error = runtime
@@ -4185,38 +4177,26 @@ mod tests {
         assert!(outcome.is_err(), "no call reached the controller");
     }
 
-    /// A scheduling the gateway cannot accept — a gate with no bound, background with one, the
-    /// host gate as background — is refused as an invalid request before the controller hears
-    /// anything, even under coordinator authority.
+    /// A scheduling the gateway cannot accept — the host gate as background — is refused as an
+    /// invalid request before the controller hears anything, even under coordinator authority.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_scheduling_the_gateway_cannot_accept_is_refused_before_any_call() {
         let (runtime, mut server) = actor_pair();
         let worker = workspace_handle(Arc::clone(&runtime));
         let coordinator = coordinator(runtime);
-        for (class, wait_ms, scope) in [
-            (JobserverClass::Gate, None, ExecScope::Workspace),
-            (
-                JobserverClass::Background,
-                NonZeroU32::new(1),
-                ExecScope::Workspace,
-            ),
-            (JobserverClass::Background, None, ExecScope::HostGate),
-        ] {
-            let mut request = exec_request(StdinSource::Empty);
-            request.class = class;
-            request.wait_ms = wait_ms;
-            request.scope = scope;
-            let error = coordinator
-                .exec(&worker, request)
-                .await
-                .expect_err("an invalid scheduling");
-            assert_eq!(error.code, ErrorCode::Usage);
-            assert!(matches!(
-                error.cpu_admission_source(),
-                Some(CpuAdmissionRefusal::InvalidRequest { .. })
-            ));
-        }
+        let mut request = exec_request(StdinSource::Empty);
+        request.class = JobserverClass::Background;
+        request.scope = ExecScope::HostGate;
+        let error = coordinator
+            .exec(&worker, request)
+            .await
+            .expect_err("an invalid scheduling");
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert!(matches!(
+            error.cpu_admission_source(),
+            Some(CpuAdmissionRefusal::InvalidRequest { .. })
+        ));
         drop((worker, coordinator));
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),

@@ -52,8 +52,6 @@ pub struct JobserverRequest<'a> {
     checkout: &'a str,
     command: &'a str,
     class: JobserverClass,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    wait_ms: Option<std::num::NonZeroU32>,
     pool: bool,
     job: JobserverJob<'a>,
 }
@@ -71,7 +69,6 @@ impl<'a> JobserverRequest<'a> {
             checkout,
             command,
             class: JobserverClass::Background,
-            wait_ms: None,
             pool: true,
             job,
         }
@@ -80,7 +77,6 @@ impl<'a> JobserverRequest<'a> {
         want: NonZeroUsize,
         checkout: &'a str,
         command: &'a str,
-        wait_ms: std::num::NonZeroU32,
         job: JobserverJob<'a>,
     ) -> Self {
         Self {
@@ -89,14 +85,13 @@ impl<'a> JobserverRequest<'a> {
             checkout,
             command,
             class: JobserverClass::Gate,
-            wait_ms: Some(wait_ms),
             pool: true,
             job,
         }
     }
 }
 
-/// The grant/timeout as a supervisor reads it; unrelated control fields are ignored.
+/// The grant or refusal as a supervisor reads it; unrelated control fields are ignored.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobserverAnswer {
@@ -105,8 +100,6 @@ pub struct JobserverAnswer {
     pub tokens: Option<NonZeroUsize>,
     pub fifo: Option<std::path::PathBuf>,
     pub cpu_pool: Option<std::path::PathBuf>,
-    pub cpu_budget: Option<CpuBudgetStatus>,
-    pub wait_ms: Option<u64>,
     pub code: Option<String>,
     pub error: Option<String>,
 }

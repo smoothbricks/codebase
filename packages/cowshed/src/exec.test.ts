@@ -49,12 +49,12 @@ describe('exec', () => {
 
   it('forwards the typed scheduling as the generated request spells it and refuses what it cannot spell', async () => {
     const { worker, sent } = recordingWorker();
-    const scheduling = { class: 'gate', want: 8, waitMs: 120_000, scope: 'hostGate' } satisfies ExecOptions;
+    const scheduling = { class: 'gate', want: 8, scope: 'hostGate' } satisfies ExecOptions;
     await expect(exec(worker, null, { argv: ['gate'], ...scheduling })).rejects.toThrow('recorded');
     expect(sent).toHaveLength(1);
     expect(sent[0]?.args).toMatchObject(scheduling);
     // An untyped caller naming a class, a demand or a scope the wire has no spelling for is refused unsent.
-    for (const invalid of ['"class":"foreground"', '"want":0', '"waitMs":0', '"scope":"host"']) {
+    for (const invalid of ['"class":"foreground"', '"want":0', '"scope":"host"']) {
       await expect(exec(worker, null, JSON.parse(`{"argv":["x"],${invalid}}`))).rejects.toThrow();
     }
     expect(sent).toHaveLength(1);
@@ -73,7 +73,6 @@ describe('exec', () => {
       argv: ['gate'],
       class: 'gate',
       want: 8,
-      waitMs: 120_000,
       scope: 'hostGate',
     } satisfies ExecOptions & {
       readonly argv: readonly string[];
@@ -94,7 +93,6 @@ describe('exec', () => {
           stdin: { kind: 'empty' },
           class: 'gate',
           want: 8,
-          waitMs: 120_000,
           scope: 'hostGate',
         },
         bytes: undefined,

@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::collections::HashMap;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -672,9 +672,6 @@ pub struct ExecParams {
     /// The most CPU tokens the command can use at once; omitted for one.
     #[serde(default = "minimum_want", skip_serializing_if = "is_minimum_want")]
     pub want: NonZeroUsize,
-    /// A gate's bound, in milliseconds, on waiting for its CPU grant; omitted for background.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wait_ms: Option<NonZeroU32>,
     /// Where the command runs; omitted for the workspace sandbox.
     #[serde(default, skip_serializing_if = "is_workspace")]
     pub scope: ExecScope,
@@ -913,14 +910,14 @@ mod tests {
         assert_eq!(request.params().expect("encode"), params);
     }
 
-    /// A request that names no scheduling is ordinary work: background, one token, no admission
-    /// bound, in the workspace sandbox. Its defaults are omitted again when it is encoded.
+    /// A request that names no scheduling is ordinary work: background, one token, in the
+    /// workspace sandbox. Its defaults are omitted again when it is encoded.
     #[test]
     fn an_exec_that_names_no_scheduling_is_ordinary_background_work() {
         let params = corpus()
             .remove("worker.exec")
             .expect("worker.exec corpus request");
-        for field in ["class", "want", "waitMs", "scope"] {
+        for field in ["class", "want", "scope"] {
             assert!(
                 params.get(field).is_none(),
                 "{field} is omitted by the corpus"
@@ -932,7 +929,6 @@ mod tests {
         };
         assert_eq!(exec.class, JobserverClass::Background);
         assert_eq!(exec.want, NonZeroUsize::MIN);
-        assert_eq!(exec.wait_ms, None);
         assert_eq!(exec.scope, ExecScope::Workspace);
         assert_eq!(request.params().expect("encode"), params);
     }
@@ -950,18 +946,16 @@ mod tests {
         };
         assert_eq!(exec.class, JobserverClass::Gate);
         assert_eq!(exec.want.get(), 8);
-        assert_eq!(exec.wait_ms.map(NonZeroU32::get), Some(120_000));
         assert_eq!(exec.scope, ExecScope::HostGate);
         assert_eq!(request.params().expect("encode"), params);
     }
 
-    /// Zero tokens, a zero bound and an unknown class or scope are refused as usage before any
-    /// admission: the wire has no spelling for them.
+    /// Zero tokens and an unknown class or scope are refused as usage before any admission: the
+    /// wire has no spelling for them.
     #[test]
     fn exec_scheduling_refuses_what_the_wire_cannot_spell() {
         for (field, value) in [
             ("want", serde_json::json!(0)),
-            ("waitMs", serde_json::json!(0)),
             ("class", serde_json::json!("foreground")),
             ("scope", serde_json::json!("host")),
         ] {

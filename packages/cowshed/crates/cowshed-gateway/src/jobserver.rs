@@ -19,11 +19,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The byte a GNU make jobserver hands out as one token.
 const TOKEN_BYTE: u8 = b'+';
 
-/// Whole-grant admission, never a request to resize a live FIFO.
+/// Whole-grant admission, never a request to resize a live FIFO. Neither class has an admission
+/// deadline: a request waits in the ledger's order until it is granted or its client leaves.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum JobserverAdmission {
     Background,
-    Gate { wait_ms: std::num::NonZeroU32 },
+    Gate,
 }
 
 impl JobserverAdmission {
@@ -31,16 +32,7 @@ impl JobserverAdmission {
     pub(crate) fn rank(self) -> crate::cpu_budget::Rank {
         match self {
             Self::Background => crate::cpu_budget::Rank::Background,
-            Self::Gate { .. } => crate::cpu_budget::Rank::Gate,
-        }
-    }
-
-    pub(crate) async fn deadline(self) {
-        match self {
-            Self::Background => std::future::pending::<()>().await,
-            Self::Gate { wait_ms } => {
-                tokio::time::sleep(std::time::Duration::from_millis(u64::from(wait_ms.get()))).await
-            }
+            Self::Gate => crate::cpu_budget::Rank::Gate,
         }
     }
 }

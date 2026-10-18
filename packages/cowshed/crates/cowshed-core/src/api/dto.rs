@@ -18,7 +18,7 @@ use sha2::Digest;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -2573,7 +2573,7 @@ pub enum JobFailure {
     /// record; any process group it could not safely identify remains diagnosed in the ledger.
     SupervisorLost,
     /// The job's host CPU admission failed before its command ran: the gateway refused it or was
-    /// unreachable, a gate's bound expired, or its grant was lost. The cause is on stderr.
+    /// unreachable, or its grant was lost. The cause is on stderr.
     CpuAdmission,
     /// The nice of the job's owned command could not be set, so the command never ran.
     Priority,
@@ -2597,8 +2597,6 @@ pub struct ExecRequest {
     pub class: JobserverClass,
     /// The most CPU tokens the command can use at once; its grant is between one and this count.
     pub want: NonZeroUsize,
-    /// A gate's bound, in milliseconds, on waiting for its grant: present exactly for a gate.
-    pub wait_ms: Option<NonZeroU32>,
     /// Where the command runs: the workspace sandbox, or a coordinator's host gate, which is a gate.
     pub scope: ExecScope,
 }
@@ -2615,27 +2613,9 @@ pub enum ExecScope {
     HostGate,
 }
 
-/// The pairings an exec's scheduling may carry (05_gateway.md "A gate wait is bounded and
-/// diagnosed"): a gate names a positive admission bound, background names none, and the host
-/// gate is a gate.
-pub fn validate_scheduling(
-    class: JobserverClass,
-    wait_ms: Option<NonZeroU32>,
-    scope: ExecScope,
-) -> Result<(), DtoError> {
-    match (class, wait_ms) {
-        (JobserverClass::Gate, Some(_)) | (JobserverClass::Background, None) => {}
-        (JobserverClass::Gate, None) => {
-            return Err(DtoError::InvalidScheduling(
-                "a gate names a positive waitMs",
-            ));
-        }
-        (JobserverClass::Background, Some(_)) => {
-            return Err(DtoError::InvalidScheduling(
-                "a background exec names no waitMs",
-            ));
-        }
-    }
+/// The pairings an exec's scheduling may carry (05_gateway.md "Host CPU budget"): the host gate
+/// scope is a gate, and every other pairing is valid.
+pub fn validate_scheduling(class: JobserverClass, scope: ExecScope) -> Result<(), DtoError> {
     if scope == ExecScope::HostGate && class != JobserverClass::Gate {
         return Err(DtoError::InvalidScheduling(
             "the host gate scope requires the gate class",

@@ -1569,10 +1569,9 @@ operational error and does not change the already-established process result.
 Every job takes host CPU tokens from the gateway before its command starts (05_gateway.md, "Host CPU budget"), at a
 class and demand its request names. An ordinary command is `background` and wants one token; `--want <n>` names the
 tokens a heavy runner can use at once, and its grant is between one and `n`. `--class gate` admits the command as the
-operator's gate: it waits for whole returned tokens ahead of queued background work and runs at nice 0, where background
-runs at +10, for at most `--wait-ms <n>` (default 120000), then fails with `gate-admission-timeout` and the holders it
-waited on. `--wait-ms` and `--host` are valid only with `--class gate`, and a gate cannot name a `--session`. Only this
-trusted route may ask for a gate: a workspace's own capability (`worker.exec`) is refused with a typed
+operator's gate: it waits for whole returned tokens ahead of queued background work with no deadline, and runs at nice
+0, where background runs at +10. `--host` is valid only with `--class gate`, and a gate cannot name a `--session`. Only
+this trusted route may ask for a gate: a workspace's own capability (`worker.exec`) is refused with a typed
 class-not-permitted error before anything runs, and no environment variable confers the class. `--host` runs the gate
 once at the host boundary, outside the workspace sandbox, for the real-APFS host gate. `JobInfo` reports the admitted
 `class` and `scope`, the observed `nice`, and the granted `cpuTokens`.

@@ -47,7 +47,6 @@ export type AdmissionField =
   | 'stderrCopy'
   | 'class'
   | 'want'
-  | 'waitMs'
   | 'scope';
 
 /**
@@ -446,62 +445,9 @@ export type CpuAdmissionRefusal =
       readonly code: string;
       readonly error: string;
     })
-  | ({ readonly reason: 'gateAdmissionTimeout' } & {
-      readonly waitMs: number & tags.Type<'uint64'>;
-      readonly cpuBudget: CpuBudgetStatus;
-    })
   | ({ readonly reason: 'protocol' } & {
       readonly detail: string;
     });
-
-/**
- * The budget as the gateway reports it in its status: the host total, how many tokens are held,
- * and by whom. `held` plus the free tokens is always `total`.
- */
-export type CpuBudgetStatus = {
-  readonly total: number & tags.Type<'uint64'>;
-  readonly held: number & tags.Type<'uint64'>;
-  /**
-   * One entry per checkout holding or waiting for tokens.
-   */
-  readonly checkouts: ReadonlyArray<CpuCheckoutStatus>;
-  /**
-   * The gate-class requests waiting, in the order returned tokens go to them: the oldest gate
-   * job's first, and within one job in the order its tasks asked.
-   */
-  readonly gateQueue: ReadonlyArray<CpuGateWaiter>;
-};
-
-export type CpuCheckoutStatus = {
-  readonly checkout: string;
-  /**
-   * Tokens its granted runners hold.
-   */
-  readonly held: number & tags.Type<'uint64'>;
-  /**
-   * Runners holding tokens.
-   */
-  readonly running: number & tags.Type<'uint64'>;
-  /**
-   * Runners waiting for a grant.
-   */
-  readonly waiting: number & tags.Type<'uint64'>;
-};
-
-/**
- * One waiting gate-class request.
- */
-export type CpuGateWaiter = {
-  readonly checkout: string;
-  /**
-   * The gate job it serves, as that job's admission number: the smaller is the older job.
-   */
-  readonly job: number & tags.Type<'uint64'>;
-  /**
-   * The tokens it asked for.
-   */
-  readonly want: number & tags.Type<'uint64'>;
-};
 
 /**
  * CPU time in microseconds, cumulative from the start of whatever it counts: one process's own
@@ -634,10 +580,6 @@ export type ExecParams = {
    * The most CPU tokens the command can use at once; omitted for one.
    */
   readonly want?: number & tags.Type<'uint64'> & tags.Minimum<1>;
-  /**
-   * A gate's bound, in milliseconds, on waiting for its CPU grant; omitted for background.
-   */
-  readonly waitMs?: number & tags.Type<'uint32'> & tags.Minimum<1>;
   /**
    * Where the command runs; omitted for the workspace sandbox.
    */

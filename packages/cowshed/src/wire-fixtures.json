@@ -185,12 +185,12 @@
       "started": "2026-01-02T03:04:05Z",
       "state": "failed",
       "stderr": {
-        "bytes": 41,
-        "sha256": "f3683ad2deadf965ac71955924d6d381e83c095b86fb646ce4c9e9513584c4af",
+        "bytes": 55,
+        "sha256": "c8b57e681e07a3ffcb3f5ab58f748800735ca3c9a18a1f6d4acee618b2ced87b",
         "storage": {
           "artifact": {
             "data": {
-              "data": "gate-admission-timeout: waited 120000 ms\n",
+              "data": "jobserver admission is unavailable: connection refused\n",
               "encoding": "utf8"
             },
             "kind": "inline"
@@ -198,7 +198,7 @@
           "kind": "captured"
         },
         "summary": {
-          "text": "gate-admission-timeout: waited 120000 ms\n",
+          "text": "jobserver admission is unavailable: connection refused\n",
           "truncated": false,
           "version": 1
         }

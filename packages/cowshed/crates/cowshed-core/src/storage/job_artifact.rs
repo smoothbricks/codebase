@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -164,11 +164,16 @@ const SAMPLE_COLUMNS: [&str; 5] = [
 /// The first of [`SAMPLE_COLUMNS`].
 const SAMPLE_COLUMN: usize = ADMISSION_COLUMN + ADMISSION_COLUMNS;
 /// The job's host CPU admission and its owned child's placement, which layout 10 appended after
-/// [`SAMPLE_COLUMNS`] (05_gateway.md "Host CPU budget"): the class, the tokens it wants and a
-/// gate's admission bound, present in every job record; then the tokens its grant held and the
+/// [`SAMPLE_COLUMNS`] (05_gateway.md "Host CPU budget"): the class and the tokens it wants,
+/// present in every job record; `cpu_wait_ms`, retired; then the tokens its grant held and the
 /// nice its command was observed at, present only in the terminal record of a job that was granted
 /// and whose command was observed; then the scope it ran in, present in every job record. Nothing
 /// here is inferred for a job that never got that far.
+///
+/// `cpu_wait_ms` held a gate's admission bound until gate admission lost its bound. Layouts grow
+/// only by trailing columns, so the column stays: this build writes it null, and a record an
+/// earlier build wrote may still name a positive bound, which nothing enforces: a record is only
+/// checked to name no zero bound, and the bound is never read into it.
 const CPU_COLUMNS: [&str; 6] = [
     "cpu_class",
     "cpu_want",
@@ -445,40 +450,24 @@ pub struct JobAdmission {
 }
 
 /// The host CPU admission a job asked for (05_gateway.md "Host CPU budget"): the scope it runs
-/// in, its class, the tokens it wants, and a gate's bound on its wait. A gate always names a bound
-/// and background never does, and only a gate runs at the host boundary, so [`Self::new`] is the
-/// only way to one.
+/// in, its class and the tokens it wants. Only a gate runs at the host boundary, so [`Self::new`]
+/// is the only way to one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobScheduling {
     scope: ExecScope,
     class: JobserverClass,
     want: NonZeroUsize,
-    wait_ms: Option<NonZeroU32>,
 }
 
 impl JobScheduling {
-    /// `None` when the parts disagree: a gate without a bound, background with one, or a host
-    /// gate scope for background work.
-    pub fn new(
-        scope: ExecScope,
-        class: JobserverClass,
-        want: NonZeroUsize,
-        wait_ms: Option<NonZeroU32>,
-    ) -> Option<Self> {
-        let bounded = match (class, wait_ms) {
-            (JobserverClass::Gate, Some(_)) | (JobserverClass::Background, None) => true,
-            (JobserverClass::Gate, None) | (JobserverClass::Background, Some(_)) => false,
-        };
-        let scoped = match (scope, class) {
-            (ExecScope::Workspace, _) | (ExecScope::HostGate, JobserverClass::Gate) => true,
-            (ExecScope::HostGate, JobserverClass::Background) => false,
-        };
-        (bounded && scoped).then_some(Self {
-            scope,
-            class,
-            want,
-            wait_ms,
-        })
+    /// `None` for a host gate scope with background work.
+    pub fn new(scope: ExecScope, class: JobserverClass, want: NonZeroUsize) -> Option<Self> {
+        match (scope, class) {
+            (ExecScope::Workspace, _) | (ExecScope::HostGate, JobserverClass::Gate) => {
+                Some(Self { scope, class, want })
+            }
+            (ExecScope::HostGate, JobserverClass::Background) => None,
+        }
     }
 
     pub fn scope(self) -> ExecScope {
@@ -492,21 +481,15 @@ impl JobScheduling {
     pub fn want(self) -> NonZeroUsize {
         self.want
     }
-
-    pub fn wait_ms(self) -> Option<NonZeroU32> {
-        self.wait_ms
-    }
 }
 
-/// What a request that names no scheduling asks for: background in its workspace, one token, no
-/// bound.
+/// What a request that names no scheduling asks for: background in its workspace, one token.
 impl Default for JobScheduling {
     fn default() -> Self {
         Self {
             scope: ExecScope::Workspace,
             class: JobserverClass::Background,
             want: NonZeroUsize::MIN,
-            wait_ms: None,
         }
     }
 }
@@ -4576,9 +4559,7 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
         Arc::new(UInt64Array::from(vec![Some(token_column(
             scheduling.want(),
         )?)])),
-        Arc::new(UInt32Array::from(vec![
-            scheduling.wait_ms().map(NonZeroU32::get),
-        ])),
+        Arc::new(UInt32Array::from(vec![None::<u32>])),
         Arc::new(UInt64Array::from(vec![
             record.cpu_tokens.map(token_column).transpose()?,
         ])),
@@ -4775,20 +4756,11 @@ fn decode_cpu(
     let scope = parse_scope(string(batch, first + 5)?.value(0))?;
     let class = parse_class(string(batch, first)?.value(0))?;
     let want = decode_tokens(uint64(batch, first + 1)?.value(0), "cpu_want")?;
-    let wait_ms = (!batch.column(first + 2).is_null(0))
-        .then(|| {
-            uint32(batch, first + 2).and_then(|column| {
-                NonZeroU32::new(column.value(0))
-                    .ok_or_else(|| ArtifactError::Arrow("cpu_wait_ms is zero".into()))
-            })
-        })
-        .transpose()?;
-    let scheduling = JobScheduling::new(scope, class, want, wait_ms).ok_or_else(|| {
-        ArtifactError::Arrow(
-            "a gate names its admission bound, background names none, and only a gate runs at              the host boundary"
-                .into(),
-        )
-    })?;
+    if !batch.column(first + 2).is_null(0) && uint32(batch, first + 2)?.value(0) == 0 {
+        return Err(ArtifactError::Arrow("cpu_wait_ms is zero".into()));
+    }
+    let scheduling = JobScheduling::new(scope, class, want)
+        .ok_or_else(|| ArtifactError::Arrow("only a gate runs at the host boundary".into()))?;
     let cpu_tokens = (!batch.column(first + 3).is_null(0))
         .then(|| {
             uint64(batch, first + 3).and_then(|column| decode_tokens(column.value(0), "cpu_tokens"))
@@ -7703,22 +7675,21 @@ mod tests {
         );
     }
 
-    fn gate(want: usize, wait_ms: u32) -> JobScheduling {
+    fn gate(want: usize) -> JobScheduling {
         JobScheduling::new(
             ExecScope::Workspace,
             JobserverClass::Gate,
             NonZeroUsize::new(want).unwrap(),
-            NonZeroU32::new(wait_ms),
         )
         .unwrap()
     }
 
-    /// Layout 10 appends the job's CPU class, demand, gate bound, granted tokens and observed
-    /// nice after layout 9's sample columns, and layout 9 stays the exact prefix.
+    /// Layout 10 appends the job's CPU class, demand, retired gate bound, granted tokens and
+    /// observed nice after layout 9's sample columns, and layout 9 stays the exact prefix.
     #[test]
     fn layout_ten_appends_the_cpu_columns_after_the_complete_layout_nine_prefix() {
         let record = JobArtifactRecord {
-            scheduling: gate(6, 120_000),
+            scheduling: gate(6),
             cpu_tokens: NonZeroUsize::new(4),
             nice: Some(0),
             ..valid_job_record(9)
@@ -7742,7 +7713,7 @@ mod tests {
         assert_eq!(
             round_trip(&record),
             record,
-            "the class, demand, bound, grant and observed nice survive"
+            "the class, demand, grant and observed nice survive"
         );
         let background = JobArtifactRecord {
             scheduling: JobScheduling::default(),
@@ -7770,7 +7741,7 @@ mod tests {
         let record = JobArtifactRecord {
             resources: Some(sample(9, 1_234_567, 4242)),
             admission: Some(keyed("op-layout-eleven", AdmittedStdin::Empty)),
-            scheduling: gate(6, 120_000),
+            scheduling: gate(6),
             cpu_tokens: NonZeroUsize::new(4),
             nice: Some(0),
             ..valid_job_record(9)
@@ -8003,13 +7974,12 @@ mod tests {
         ));
 
         let base = admitted(&JobArtifactRecord {
-            scheduling: gate(2, 5_000),
+            scheduling: gate(2),
             ..valid_job_record(9)
         });
         for (column, why) in [
             (CPU_COLUMN, "no class"),
             (CPU_COLUMN + 1, "no demand"),
-            (CPU_COLUMN + 2, "a gate without its bound"),
             (CPU_COLUMN + 5, "no scope"),
         ] {
             assert!(
@@ -8017,12 +7987,23 @@ mod tests {
                 "{why} is damage"
             );
         }
-        let bounded_background = replace_column(
-            &admitted(&valid_job_record(9)),
+        // An earlier build's gate named its admission bound: the record still reads, and the
+        // bound is not part of it.
+        let bounded_gate = replace_column(
+            &base,
             CPU_COLUMN + 2,
-            Arc::new(UInt32Array::from(vec![Some(5_000)])),
+            Arc::new(UInt32Array::from(vec![Some(120_000)])),
         );
-        assert!(batch_to_protected_record(&bounded_background).is_err());
+        assert_eq!(
+            batch_to_protected_record(&bounded_gate).unwrap(),
+            batch_to_protected_record(&base).unwrap()
+        );
+        let zero_bound = replace_column(
+            &base,
+            CPU_COLUMN + 2,
+            Arc::new(UInt32Array::from(vec![Some(0)])),
+        );
+        assert!(batch_to_protected_record(&zero_bound).is_err());
         let zero_tokens = replace_column(
             &admitted(&valid_job_record(9)),
             CPU_COLUMN + 3,
@@ -8032,39 +8013,24 @@ mod tests {
     }
 
     #[test]
-    fn scheduling_admits_only_a_bounded_gate_or_unbounded_background() {
+    fn scheduling_admits_a_host_gate_only_for_the_gate_class() {
         let want = NonZeroUsize::new(3).unwrap();
-        let bound = NonZeroU32::new(120_000);
         let workspace = ExecScope::Workspace;
-        assert!(JobScheduling::new(workspace, JobserverClass::Gate, want, None).is_none());
-        assert!(JobScheduling::new(workspace, JobserverClass::Background, want, bound).is_none());
         assert!(
-            JobScheduling::new(ExecScope::HostGate, JobserverClass::Background, want, None)
-                .is_none(),
+            JobScheduling::new(ExecScope::HostGate, JobserverClass::Background, want).is_none(),
             "only a gate runs at the host boundary"
         );
-        let gate = JobScheduling::new(workspace, JobserverClass::Gate, want, bound).unwrap();
+        let gate = JobScheduling::new(workspace, JobserverClass::Gate, want).unwrap();
         assert_eq!(
-            (gate.scope(), gate.class(), gate.want(), gate.wait_ms()),
-            (workspace, JobserverClass::Gate, want, bound)
+            (gate.scope(), gate.class(), gate.want()),
+            (workspace, JobserverClass::Gate, want)
         );
-        let host =
-            JobScheduling::new(ExecScope::HostGate, JobserverClass::Gate, want, bound).unwrap();
+        let host = JobScheduling::new(ExecScope::HostGate, JobserverClass::Gate, want).unwrap();
         assert_eq!(host.scope(), ExecScope::HostGate);
         let ordinary = JobScheduling::default();
         assert_eq!(
-            (
-                ordinary.scope(),
-                ordinary.class(),
-                ordinary.want(),
-                ordinary.wait_ms()
-            ),
-            (
-                workspace,
-                JobserverClass::Background,
-                NonZeroUsize::MIN,
-                None
-            )
+            (ordinary.scope(), ordinary.class(), ordinary.want()),
+            (workspace, JobserverClass::Background, NonZeroUsize::MIN)
         );
         let host_record = JobArtifactRecord {
             scheduling: host,
@@ -8096,7 +8062,7 @@ mod tests {
                 1,
                 &argv_true(),
                 Some(admission.clone()),
-                gate(8, 120_000),
+                gate(8),
                 OutputTargets::default(),
             )
             .unwrap();
@@ -8123,7 +8089,7 @@ mod tests {
         let mut reopened = store_at(&root, ArtifactConfig::default());
         match reopened.admitted(&admission.key) {
             AdmissionLookup::Admitted { scheduling, .. } => {
-                assert_eq!(scheduling, gate(8, 120_000));
+                assert_eq!(scheduling, gate(8));
             }
             other => panic!("the key reads back as {other:?}"),
         }
@@ -8133,7 +8099,7 @@ mod tests {
             .expect("the terminal record");
         assert_eq!(
             (record.scheduling, record.cpu_tokens, record.nice),
-            (gate(8, 120_000), NonZeroUsize::new(6), Some(0))
+            (gate(8), NonZeroUsize::new(6), Some(0))
         );
     }
 

@@ -730,8 +730,6 @@ impl Serves<CoordinatorExec> for Coordinator {
             #[serde(default = "minimum_want")]
             want: NonZeroUsize,
             #[serde(default)]
-            wait_ms: Option<NonZeroU32>,
-            #[serde(default)]
             scope: ExecScope,
         }
         let Caller {
@@ -750,7 +748,6 @@ impl Serves<CoordinatorExec> for Coordinator {
             admission_key,
             class,
             want,
-            wait_ms,
             scope,
         } = decode::<CoordinatorExec, Caller>(arguments)?;
         Ok(ExecParams {
@@ -770,7 +767,6 @@ impl Serves<CoordinatorExec> for Coordinator {
             admission_key,
             class,
             want,
-            wait_ms,
             scope,
         })
     }
@@ -824,8 +820,6 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             #[serde(default = "minimum_want")]
             want: NonZeroUsize,
             #[serde(default)]
-            wait_ms: Option<NonZeroU32>,
-            #[serde(default)]
             scope: ExecScope,
         }
         let Caller {
@@ -842,7 +836,6 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             admission_key,
             class,
             want,
-            wait_ms,
             scope,
         } = decode::<WorkerExec, Caller>(arguments)?;
         Ok(ExecParams {
@@ -862,7 +855,6 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             admission_key,
             class,
             want,
-            wait_ms,
             scope,
         })
     }

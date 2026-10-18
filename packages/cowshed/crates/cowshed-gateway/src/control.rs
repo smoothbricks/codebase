@@ -437,7 +437,6 @@ struct JobserverIn {
     tokens: CpuTokensIn,
     #[serde(default)]
     class: cowshed_gateway_types::JobserverClass,
-    wait_ms: Option<std::num::NonZeroU32>,
     #[serde(default)]
     pool: bool,
     job: Option<JobserverJobIn>,
@@ -496,9 +495,6 @@ struct ControlResponse {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_pool: Option<String>,
-    /// Actual admission wait on a gate timeout, not the requested bound.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    wait_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_budget: Option<CpuBudgetStatus>,
     /// What a selected task-server unit runs under.
@@ -525,8 +521,6 @@ pub enum ControlFailureCode {
     /// The daemon's startup pass has not restored its sessions yet: a session change now would
     /// race that restore. Retry once status reports no `healing`.
     Healing,
-    /// A gate's explicit admission bound elapsed; its live holder snapshot is in cpuBudget.
-    GateAdmissionTimeout,
     Rejected,
 }
 
@@ -1078,7 +1072,6 @@ async fn hold_jobserver<R, W>(
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let asked = std::time::Instant::now();
     if write_response(&mut writer, &lease(LeaseState::Queued))
         .await
         .is_err()
@@ -1102,21 +1095,6 @@ async fn hold_jobserver<R, W>(
                 return;
             }
         },
-
-        () = options.admission.deadline() => {
-            let status = budget.status().await;
-            let holders = status.as_ref().map(|status| status.checkouts.iter()
-                .filter(|checkout| checkout.held > 0)
-                .map(|checkout| format!("{}: {} tokens in {} running grant(s)", checkout.checkout, checkout.held, checkout.running))
-                .collect::<Vec<_>>().join("; "));
-            let wait_ms = u64::try_from(asked.elapsed().as_millis()).expect("an admission wait fits u64 milliseconds");
-            let error = format!("gate admission waited {wait_ms} ms; live checkout holders: {}",
-                holders.as_deref().unwrap_or("CPU budget unavailable"));
-            let response = ControlResponse { cpu_budget: status, wait_ms: Some(wait_ms),
-                ..failure(ControlFailureCode::GateAdmissionTimeout, error) };
-            let _ = write_response(&mut writer, &response).await;
-            return;
-        },
         _ = reader.read(&mut discard) => return,
     };
     let mut fifo = match fifos.create(tokens) {
@@ -1137,13 +1115,11 @@ async fn hold_jobserver<R, W>(
         // A gate's children rank as the gate job does, by its age, at every return; background
         // children share the grant they were lent.
         let source = match options.admission {
-            crate::jobserver::JobserverAdmission::Gate { .. } => {
-                crate::jobserver::PoolSource::Relay {
-                    host: budget.clone(),
-                    checkout,
-                    job: stake.job(),
-                }
-            }
+            crate::jobserver::JobserverAdmission::Gate => crate::jobserver::PoolSource::Relay {
+                host: budget.clone(),
+                checkout,
+                job: stake.job(),
+            },
             crate::jobserver::JobserverAdmission::Background => crate::jobserver::PoolSource::Lent(
                 std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
             ),
@@ -1275,7 +1251,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         DISK_LEASE_OP => &["op", "class", "share", "command"],
         CPU_TOKENS_OP => &["op", "want", "checkout", "command"],
         JOBSERVER_OP => &[
-            "op", "want", "checkout", "command", "class", "waitMs", "pool", "job", "grow",
+            "op", "want", "checkout", "command", "class", "pool", "job", "grow",
         ],
         _ => {
             return Err(ControlError::Encoding(
@@ -1307,7 +1283,6 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             let JobserverIn {
                 tokens,
                 class,
-                wait_ms,
                 pool,
                 job,
                 grow,
@@ -1318,10 +1293,13 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                         .to_owned(),
                 ));
             }
-            let admission = match (class, wait_ms) {
-                (cowshed_gateway_types::JobserverClass::Background, None) => crate::jobserver::JobserverAdmission::Background,
-                (cowshed_gateway_types::JobserverClass::Gate, Some(wait_ms)) => crate::jobserver::JobserverAdmission::Gate { wait_ms },
-                _ => return Err(ControlError::Encoding("a gate jobserver request requires nonzero waitMs; background requests have no deadline".to_owned())),
+            let admission = match class {
+                cowshed_gateway_types::JobserverClass::Background => {
+                    crate::jobserver::JobserverAdmission::Background
+                }
+                cowshed_gateway_types::JobserverClass::Gate => {
+                    crate::jobserver::JobserverAdmission::Gate
+                }
             };
             let pool_job = if pool {
                 let job = job.ok_or_else(|| {
@@ -1751,7 +1729,6 @@ fn success() -> ControlResponse {
         tokens: None,
         fifo: None,
         cpu_pool: None,
-        wait_ms: None,
         cpu_budget: None,
         task_grant: None,
         task_queue: None,

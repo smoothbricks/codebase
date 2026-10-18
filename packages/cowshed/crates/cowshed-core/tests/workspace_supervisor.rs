@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::future::Future;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -564,7 +564,6 @@ fn scripted_harness(label: &str) -> (Harness, mpsc::UnboundedReceiver<CpuRequest
 fn gate(request: ExecRequest) -> ExecRequest {
     ExecRequest {
         class: JobserverClass::Gate,
-        wait_ms: NonZeroU32::new(120_000),
         ..request
     }
 }
@@ -716,7 +715,6 @@ fn request(stdin: StdinSource) -> ExecRequest {
         admission_key: None,
         class: JobserverClass::Background,
         want: NonZeroUsize::MIN,
-        wait_ms: None,
         scope: ExecScope::Workspace,
     }
 }
@@ -3398,8 +3396,8 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
                 });
             }
             AdmissionField::Want => changed.want = NonZeroUsize::new(4).unwrap(),
-            AdmissionField::Class | AdmissionField::WaitMs | AdmissionField::Scope => {
-                unreachable!("a class, its bound and its scope change together, below")
+            AdmissionField::Class | AdmissionField::Scope => {
+                unreachable!("a class and its scope change together, below")
             }
         }
         let refused = remote
@@ -3416,23 +3414,19 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
             "the changed field is {field:?}"
         );
     }
-    // A gate names its bound, and the host boundary is a gate's: their fields change together,
-    // and only a coordinator may ask for either.
+    // The gate class and the host-gate scope change together, and only a coordinator may ask for
+    // either.
     for (changed, fields) in [
         (
             gate(keyed("op-fields", StdinSource::Empty)),
-            vec![AdmissionField::Class, AdmissionField::WaitMs],
+            vec![AdmissionField::Class],
         ),
         (
             ExecRequest {
                 scope: ExecScope::HostGate,
                 ..gate(keyed("op-fields", StdinSource::Empty))
             },
-            vec![
-                AdmissionField::Scope,
-                AdmissionField::Class,
-                AdmissionField::WaitMs,
-            ],
+            vec![AdmissionField::Scope, AdmissionField::Class],
         ),
     ] {
         let refused = remote
@@ -3536,7 +3530,6 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
                     "env": sent.env,
                                         "class": sent.class,
                     "want": sent.want,
-                    "waitMs": sent.wait_ms,
                     "scope": sent.scope,
                     "trace": null,
                     "stdin": { "kind": "inline" },
@@ -7699,12 +7692,8 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
     let cpu = asked.recv().await.expect("the job asks the CPU budget");
     let job = JobId::new(1).unwrap();
     assert_eq!(
-        (cpu.ask.class, cpu.ask.want, cpu.ask.wait_ms),
-        (
-            JobserverClass::Background,
-            NonZeroUsize::new(6).unwrap(),
-            None
-        )
+        (cpu.ask.class, cpu.ask.want),
+        (JobserverClass::Background, NonZeroUsize::new(6).unwrap())
     );
     assert_eq!(cpu.ask.checkout, root.join("workspace"));
     assert_eq!(cpu.ask.job.2, job);
@@ -7819,7 +7808,7 @@ async fn a_refused_cpu_admission_fails_the_job_before_any_command() {
     });
     let refusal = || {
         CowshedError::conflict(
-            "gate-admission-timeout: waited 5000ms; holders: /w: 8 tokens in 1 running grant(s)",
+            "gateway refused the CPU grant: /w: 8 tokens in 1 running grant(s)",
             "retry once the holders finish",
         )
     };
@@ -7896,7 +7885,7 @@ async fn a_worker_gate_is_refused_before_any_record_request_or_spawn() {
     assert!(h.spawned.try_recv().is_err(), "no spawn");
 }
 
-/// A coordinator's gate asks with its bound, runs at the supervisor's own nice, and may name the
+/// A coordinator's gate asks for its tokens, runs at the supervisor's own nice, and may name the
 /// host boundary for an argv; a host-gate script, which needs the sandboxed exec host, is refused
 /// before any effect.
 #[tokio::test]
@@ -7920,12 +7909,8 @@ async fn a_coordinator_gate_runs_at_gate_nice_and_may_reach_the_host_boundary() 
         });
         let cpu = asked.recv().await.unwrap();
         assert_eq!(
-            (cpu.ask.class, cpu.ask.want, cpu.ask.wait_ms),
-            (
-                JobserverClass::Gate,
-                NonZeroUsize::new(8).unwrap(),
-                NonZeroU32::new(120_000)
-            )
+            (cpu.ask.class, cpu.ask.want),
+            (JobserverClass::Gate, NonZeroUsize::new(8).unwrap())
         );
         cpu.answer.send(Ok(NonZeroUsize::new(8).unwrap())).unwrap();
         let job = exec.await.unwrap().unwrap();
