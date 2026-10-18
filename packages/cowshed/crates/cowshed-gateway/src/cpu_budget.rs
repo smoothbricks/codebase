@@ -15,13 +15,13 @@
 //!
 
 //! Fairness only acts when a grant is made: a running nextest or cargo cannot hand tokens back.
-//! Class ranks first: while any gate-class request waits, every returned token goes to gate-class
-//! work and background requests stay queued. A land's gate runs as a gate job whose pool relays
-//! each of its tasks' asks here at gate class (`jobserver.rs`), ranked by the gate job's own
-//! admission: gate work is served oldest job first, and within one job in the order its tasks
-//! asked, so an older land takes every returned token its tasks want before a younger land's
-//! tasks get one. Existing grants drain whole; their FIFOs, implicit make token and test-thread
-//! sizing are never resized.
+//! Class ranks first: while any gate-class request waits, returned tokens go to gate-class work
+//! ahead of queued background. A land's gate runs as a gate job whose pool relays each of its
+//! tasks' asks here at gate class (`jobserver.rs`), ranked by the gate job's own admission: gate
+//! work is served oldest job first, and within one job in the order its tasks asked, so an older
+//! land takes every returned token its tasks want before a younger land's tasks get more than
+//! the one-token floor that keeps a younger land, like background, from starving. Existing grants
+//! drain whole; their FIFOs, implicit make token and test-thread sizing are never resized.
 //!
 //! [`Ledger`] is the whole policy as a pure state machine; [`CpuBudget`] is the thin actor that
 //! feeds it requests and departures and answers status.
@@ -232,11 +232,12 @@ impl Ledger {
     /// takes `min(want, free)` before a running one grows, in the order they asked. A short
     /// gate-class holder — one that asked to grow and holds less than its `want` — takes
     /// `min(want − held, free)` more once no task of its own job or an older one waits. So a land
-    /// takes every returned token its tasks want before a younger land gets one, and both before
-    /// queued background work; no holder ever passes its own `want`. Background is not starved
-    /// meanwhile: while gate-class work wants tokens, a background checkout that waits holding
-    /// nothing still gets one token first, as long as background as a whole then still holds
-    /// less than half the host, so gate-class work always holds the larger part.
+    /// takes every returned token its tasks want before a younger land gets more than its floor,
+    /// and both before queued background work; no holder ever passes its own `want`. The work
+    /// behind the job being served is not starved meanwhile: a background checkout, or a younger
+    /// gate job, that waits holding nothing still gets one token first, as long as that work as a
+    /// whole then still holds less than half the host, so the job being served and the older ones
+    /// always hold the larger part.
     ///
     /// With no gate-class demand, background is fair between checkouts. The next grant goes to
     /// the waiting checkout that holds the fewest tokens (the older head waiter on a tie), to its
@@ -332,12 +333,19 @@ impl Ledger {
         })
     }
 
-    /// The next step while gate-class work wants tokens: a starved background checkout's one
-    /// token, else the oldest gate job's next want — a waiting task's `min(want, free)` before a
-    /// short holder's growth. `None` when no gate-class work wants a token.
+    /// The next step while gate-class work wants tokens: a starved claimant's one token, else the
+    /// oldest gate job's next want — a waiting task's `min(want, free)` before a short holder's
+    /// growth. `None` when no gate-class work wants a token.
+    ///
+    /// The work behind the gate job served now is background and every younger gate job. A
+    /// claimant among it that holds nothing — a background checkout, or a younger gate job — gets
+    /// one token first, oldest request first, while that work as a whole then still holds less
+    /// than half the host. Every grant is whole, so two younger gate jobs each holding their floor
+    /// token wait on nothing the other holds: each runs on its token, and its tasks queue behind
+    /// the older jobs until those stop wanting.
     fn next_gate(&self) -> Option<Pick> {
         let free = self.free;
-        let ((_, step, _), name, index, tokens) = self
+        let ((head, step, _), name, index, tokens) = self
             .checkouts
             .iter()
             .flat_map(|(name, checkout)| {
@@ -362,25 +370,45 @@ impl Ledger {
                 starts.chain(grows)
             })
             .min_by_key(|(key, _, _, _)| *key)?;
-        let background: usize = self
-            .checkouts
-            .values()
-            .flat_map(|checkout| &checkout.running)
-            .filter(|holder| holder.class == JobserverClass::Background)
+        let holders = || {
+            self.checkouts
+                .values()
+                .flat_map(|checkout| &checkout.running)
+        };
+        let behind: usize = holders()
+            .filter(|holder| holder.class == JobserverClass::Background || holder.job > head)
             .map(|holder| holder.tokens)
             .sum();
-        let starved = (2 * (background + 1) < self.total)
+        let job_holds = &|job: Ticket| {
+            holders().any(|holder| holder.class == JobserverClass::Gate && holder.job == job)
+        };
+        let starved = (2 * (behind + 1) < self.total)
             .then(|| {
                 self.checkouts
                     .iter()
-                    .filter(|(_, checkout)| checkout.held == 0)
-                    .filter_map(|(name, checkout)| {
-                        let (position, waiter) = checkout
-                            .waiting
-                            .iter()
-                            .enumerate()
-                            .find(|(_, waiter)| waiter.class == JobserverClass::Background)?;
-                        Some((name, position, waiter.ticket))
+                    .flat_map(|(name, checkout)| {
+                        let background =
+                            (checkout.held == 0)
+                                .then(|| {
+                                    checkout.waiting.iter().enumerate().find(|(_, waiter)| {
+                                        waiter.class == JobserverClass::Background
+                                    })
+                                })
+                                .flatten();
+                        let younger_gates =
+                            checkout
+                                .waiting
+                                .iter()
+                                .enumerate()
+                                .filter(move |(_, waiter)| {
+                                    waiter.class == JobserverClass::Gate
+                                        && waiter.job > head
+                                        && !job_holds(waiter.job)
+                                });
+                        background
+                            .into_iter()
+                            .chain(younger_gates)
+                            .map(move |(position, waiter)| (name, position, waiter.ticket))
                     })
                     .min_by_key(|(_, _, ticket)| *ticket)
             })
@@ -1079,16 +1107,17 @@ mod tests {
     }
 
     #[test]
-    fn an_older_land_takes_every_token_its_tasks_want_before_a_younger_land_gets_one() {
+    fn an_older_land_takes_every_token_its_tasks_want_past_a_younger_lands_floor() {
         let mut clock = Clock::new(18);
         assert_eq!(clock.ask_task(0, 1, 0, "a", 18), [(1, 18)]);
         assert_eq!(clock.ask_task(1, 2, 9, "b", 18), []);
         assert_eq!(clock.ask_task(1, 3, 0, "a", 18), []);
         assert_eq!(clock.ask(2, 4, "c", 18), []);
-        // c holds nothing, so it keeps its one token; then a's second task, though it asked after
-        // b's, takes the rest, because a's gate job is older.
-        assert_eq!(clock.leave(3, 1), [(4, 1), (3, 17)]);
-        assert_eq!(clock.leave(4, 3), [(2, 17)]);
+        // b's younger gate job and c each hold nothing, so each keeps its one token, oldest ask
+        // first; then a's second task, though it asked after b's, takes the rest, because a's
+        // gate job is older.
+        assert_eq!(clock.leave(3, 1), [(2, 1), (4, 1), (3, 16)]);
+        assert_eq!(clock.leave(4, 3), []);
         assert!(clock.balanced());
     }
 
@@ -1097,13 +1126,51 @@ mod tests {
         let mut clock = Clock::new(6);
         assert_eq!(clock.ask(0, 1, "x", 6), [(1, 6)]);
         assert_eq!(clock.ask_land(1, 2, "land", 6), []);
-        assert_eq!(clock.ask_land(1, 3, "land", 6), []);
+        assert_eq!(clock.ask_task(1, 3, 2, "land", 6), []);
         assert_eq!(clock.ask(2, 4, "y", 1), []);
         assert_eq!(clock.ask(2, 5, "x", 1), []);
         // Each background checkout holding nothing gets one token while background stays under
         // half the host; the land's oldest task takes the remaining four.
         assert_eq!(clock.leave(3, 1), [(4, 1), (5, 1), (2, 4)]);
         assert_eq!(clock.leave(4, 2), [(3, 4)]);
+        assert!(clock.balanced());
+    }
+
+    /// The measured failure: an older land's gate job held 13 of 18 tokens in 5 grants with more
+    /// of its tasks queued, background held the other 5, and a younger land's gate job, in a
+    /// checkout that already held a background token, asked for its orchestrator's one token. With
+    /// no floor of its own it waited for the whole older land and died on its admission bound.
+    /// Now the first returned token starts it, a second younger land too, neither waits on the
+    /// other's token, and their tasks queue behind the older land until it stops wanting.
+    #[test]
+    fn a_younger_land_starts_on_its_floor_while_an_older_land_holds_most_of_the_host() {
+        let mut clock = Clock::new(18);
+        for (ticket, checkout) in [
+            (1, "code-mode"),
+            (2, "selector"),
+            (3, "bun143"),
+            (4, "caches"),
+            (5, "caches"),
+        ] {
+            assert_eq!(clock.ask(0, ticket, checkout, 1), [(ticket, 1)]);
+        }
+        assert_eq!(clock.ask_land(1, 10, "infer", 1), [(10, 1)]);
+        for ticket in 11..=14 {
+            assert_eq!(clock.ask_task(2, ticket, 10, "infer", 3), [(ticket, 3)]);
+        }
+        assert_eq!(clock.ledger.status().held, 18);
+        assert_eq!(clock.ask_task(3, 15, 10, "infer", 3), []);
+        assert_eq!(clock.ask_land(4, 20, "code-mode", 1), []);
+        assert_eq!(clock.ask_land(5, 30, "other", 1), []);
+        // An older task returns 3: each younger land takes its floor token, oldest first, and the
+        // older land's queued task takes the last.
+        assert_eq!(clock.leave(6, 11), [(20, 1), (30, 1), (15, 1)]);
+        // The younger lands hold their floor now, so their tasks wait behind the older land's.
+        assert_eq!(clock.ask_task(7, 21, 20, "code-mode", 3), []);
+        assert_eq!(clock.ask_task(7, 16, 10, "infer", 3), []);
+        assert_eq!(clock.leave(8, 12), [(16, 3)]);
+        // The older land wants nothing more: the older of the younger lands is served next.
+        assert_eq!(clock.leave(9, 13), [(21, 3)]);
         assert!(clock.balanced());
     }
 
@@ -1142,12 +1209,13 @@ mod tests {
 
     #[test]
     fn an_older_land_build_grows_before_a_younger_land_task_starts() {
-        let mut clock = Clock::new(4);
+        let mut clock = Clock::new(5);
+        assert_eq!(clock.ask_land(0, 9, "b", 1), [(9, 1)]);
         assert_eq!(clock.ask(0, 1, "x", 3), [(1, 3)]);
         assert_eq!(clock.ask_task_build(1, 2, 0, "a", 4), [(2, 1)]);
         assert_eq!(clock.ask_task(2, 3, 9, "b", 2), []);
         // Three tokens return: a's build takes them all to reach its want, since a's gate job is
-        // older; b's task starts when a returns its tokens.
+        // older and b's job already holds its floor; b's task starts when a returns its tokens.
         assert_eq!(clock.leave(3, 1), [(2, 4)]);
         assert_eq!(clock.leave(4, 2), [(3, 2)]);
         assert!(clock.balanced());

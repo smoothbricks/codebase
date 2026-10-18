@@ -665,9 +665,14 @@ core count.
   not by when the task asked. While any gate-class work wants tokens, the oldest gate job's next want is served once a
   token is free, wherever its requests sit in their checkouts' queues: a waiting task takes `min(want, free)`, in the
   order that job's tasks asked, before a running task of that job grows ("A short build grows" below). All of it comes
-  ahead of every queued background request (both jobserver and `cpu-tokens`). Background is not starved meanwhile: a
-  background checkout that waits holding nothing is granted one token first, as long as background as a whole then still
-  holds less than half of N, so gate-class work holds the larger part. A running gate grant blocks nobody: with no
+  ahead of every queued background request (both jobserver and `cpu-tokens`). The work behind the gate job being served
+  — background and every younger gate job — is not starved meanwhile: a background checkout, or a younger gate job, that
+  waits holding nothing is granted one token first, oldest request first, as long as that work as a whole then still
+  holds less than half of N, so the job being served and the older ones hold the larger part. A younger land is thereby
+  "almost background" (tg#7019): its orchestrator starts on its floor token, and its tasks queue behind the older land's
+  until the older land stops wanting. Every grant is whole, so two younger gate jobs on their floor tokens wait on
+  nothing the other holds. Measured without that floor: a younger land asking for its orchestrator's one token while the
+  older land held 13 of 18 tokens waited out the older land and failed. A running gate grant blocks nobody: with no
   gate-class work wanting tokens, ordinary checkout fairness serves background from the free tokens. An in-flight
   background grant stays exactly as it is until its child exits or its connection closes. This is priority on genuinely
   returned tokens, not a reserved budget, budget increase, or stolen allocation. Conservation remains
@@ -679,9 +684,10 @@ core count.
   its pool relays every task's ask, from the host or from inside the sandbox, as a gate-class request for the
   workspace's checkout, ranked by the job's own admission. A land therefore takes returned tokens at every task, in the
   order its tasks ask, and is never frozen at the width of its first grant. Same-repo lands are already serialized by
-  the per-repository land lock. Lands of two repositories are served oldest gate job first: the older land's tasks take
-  every returned token they want, the younger land's tasks take what the older one does not ask for, and the younger
-  takes the older one's place when it completes. Neither is preempted: a running task of either keeps its grant.
+  the per-repository land lock. Lands of two repositories are served oldest gate job first: the younger land's
+  orchestrator starts on its floor token, the older land's tasks take every returned token they want, the younger land's
+  tasks take what the older one does not ask for, and the younger takes the older one's place when it completes. Neither
+  is preempted: a running task of either keeps its grant.
 - **A short build grows** (2026-10-17, Danny chose option C of tg#6761). A grant taken at the first returned token can
   be far below its `want`: measured, a land task's nextest asked for 18 tokens on a host another shed held whole, waited
   32 s and ran its whole suite with 1 (`tokens=1/18`). A runner whose parallelism is a make jobserver can use tokens
@@ -690,12 +696,12 @@ core count.
   `--no-run`, `nextest archive` — asks with `"grow": true`; test runners keep their first grant, so no token sits idle
   in a fifo nobody reads. A growing holder that holds less than its `want` takes `min(want − held, free)` more from
   returned tokens that no waiter ahead of it takes: a gate-class build grows once no task of its own gate job or of an
-  older one waits, ahead of a younger gate job's tasks and of background, under the same background floor; a background
-  build grows only while no background request waits. It never passes its own `want`, so one task cannot starve the rest
-  of its own gate. Conservation is unchanged: growth moves tokens from `free` to that holder. The holder hears each new
-  total as `{"ok":true,"lease":"grown","tokens":<total>}` on its connection, and the launcher hands the difference to
-  Cargo's jobserver fifo and says `cowshed: cargo jobserver grew tokens=<from>/<want> -> <to>/<want>` on stderr, beside
-  its `cowshed: cargo jobserver granted tokens=<g>/<want>`. Closing the connection still returns everything held.
+  older one waits, ahead of a younger gate job's tasks and of background, under the same floor; a background build grows
+  only while no background request waits. It never passes its own `want`, so one task cannot starve the rest of its own
+  gate. Conservation is unchanged: growth moves tokens from `free` to that holder. The holder hears each new total as
+  `{"ok":true,"lease":"grown","tokens":<total>}` on its connection, and the launcher hands the difference to Cargo's
+  jobserver fifo and says `cowshed: cargo jobserver grew tokens=<from>/<want> -> <to>/<want>` on stderr, beside its
+  `cowshed: cargo jobserver granted tokens=<g>/<want>`. Closing the connection still returns everything held.
 - **What gate priority does not guarantee.** A background test's CPU grant cannot be shrunk mid-run: Cargo's implicit
   make token and libtest/nextest threads sized from the original grant do not return FIFO bytes. The gateway does not
   resize a running FIFO, kill peer work, or use `SIGSTOP`/`SIGCONT`: wall and idle bounds would keep advancing during a
