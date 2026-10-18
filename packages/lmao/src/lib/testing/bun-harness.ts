@@ -110,6 +110,7 @@ type BunDescribe = typeof _describe;
 type BunIt = typeof _it;
 type BunDescribeLabel = Parameters<BunDescribe>[0];
 type BunTestOptions = Parameters<BunIt>[2];
+type BunTestOptionsGiven = Exclude<BunTestOptions, undefined>;
 
 const ciOnlyDisabledMessage =
   '.only is disabled in CI environments to prevent accidentally skipping tests. To override, set the environment variable CI=false.';
@@ -535,9 +536,25 @@ function createTestTracerInstance<
   function createWrappedIt(origIt: typeof _it, describeStack: string[]) {
     function wrappedItBase(name: string, fn: TestBody, options?: BunTestOptions): void;
     function wrappedItBase(name: string, fn: DoneTestBody, options?: BunTestOptions): void;
-    function wrappedItBase(name: string, fn: TestBody | DoneTestBody, options?: BunTestOptions): void {
+    // bun-types 1.4.3 also declares the options-first form, `it(label, options, fn)`.
+    function wrappedItBase(name: string, options: BunTestOptionsGiven, fn: TestBody | DoneTestBody): void;
+    function wrappedItBase(
+      name: string,
+      fnOrOptions: TestBody | DoneTestBody | BunTestOptionsGiven,
+      optionsOrFn?: BunTestOptions | TestBody | DoneTestBody,
+    ): void {
       const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
-      origIt(name, () => runTracedTest(name, fn, describePath), options);
+      if (typeof fnOrOptions === 'function') {
+        if (typeof optionsOrFn === 'function') {
+          throw new TypeError(`it("${name}"): options must follow the test function, not a second function`);
+        }
+        origIt(name, () => runTracedTest(name, fnOrOptions, describePath), optionsOrFn);
+        return;
+      }
+      if (typeof optionsOrFn !== 'function') {
+        throw new TypeError(`it("${name}"): the options-first form needs a test function after the options`);
+      }
+      origIt(name, fnOrOptions, () => runTracedTest(name, optionsOrFn, describePath));
     }
 
     const wrappedIt = Object.assign(wrappedItBase, {

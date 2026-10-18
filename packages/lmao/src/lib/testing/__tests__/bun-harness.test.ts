@@ -7,13 +7,20 @@ import { type BunTestModuleShape, makeBunTestSuiteTracer, makeTestTracer } from 
 
 type BunTestModuleLike = BunTestModuleShape;
 
-/** What the harness handed the underlying runner: the label and bun's timeout/options slot. */
-type Registration = { name: string; options: unknown };
+/** What the harness handed the underlying runner: the label, bun's timeout/options slot, and which slot held it. */
+type Registration = { name: string; options: unknown; optionsFirst?: true };
+
+type ImmediateBody = () => unknown | Promise<unknown>;
 
 function createImmediateTestFn(registrations?: Registration[]): BunTestModuleLike['it'] {
-  const runBase = (name: string, fn: () => unknown | Promise<unknown>, options?: unknown) => {
-    registrations?.push({ name, options });
-    return fn();
+  const runBase = (name: string, fnOrOptions: ImmediateBody | unknown, optionsOrFn?: ImmediateBody | unknown) => {
+    if (typeof fnOrOptions === 'function') {
+      registrations?.push({ name, options: optionsOrFn });
+      return fnOrOptions();
+    }
+    if (typeof optionsOrFn !== 'function') throw new TypeError(`${name}: no test function`);
+    registrations?.push({ name, options: fnOrOptions, optionsFirst: true });
+    return optionsOrFn();
   };
   return Object.assign(runBase, it, {
     only: runBase,
@@ -142,11 +149,17 @@ describe('bun harness per-test options forwarding', () => {
     await wrapped.it('bare millisecond timeout', () => undefined, 300_000);
     await wrapped.test('full options object', () => undefined, { timeout: 250, retry: 2 });
     await wrapped.it('caller passed nothing', () => undefined);
+    let ranOptionsFirst = false;
+    await wrapped.it('options before the function', { timeout: 125 }, () => {
+      ranOptionsFirst = true;
+    });
 
     expect(registrations).toEqual([
       { name: 'bare millisecond timeout', options: 300_000 },
       { name: 'full options object', options: { timeout: 250, retry: 2 } },
       { name: 'caller passed nothing', options: undefined },
+      { name: 'options before the function', options: { timeout: 125 }, optionsFirst: true },
     ]);
+    expect(ranOptionsFirst).toBe(true);
   });
 });
