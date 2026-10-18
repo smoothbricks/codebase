@@ -72,11 +72,14 @@
  * provider's own builds, lands and installs never change a file a running
  * consumer task resolves (linked-snapshots.ts). The snapshot is taken here, at
  * the install and shell-entry boundary, and only when the provider's Nx
- * targets vouch for every copied byte; otherwise the refusal is said and the
- * alias keeps its current binding. The plugin that vouches is the one the
- * declarations bind: a declared @smoothbricks/nx-plugin is probed from its
- * checkout, since every `bun install` has put the published plugin back at its
- * alias before this file runs as the postinstall.
+ * targets vouch for every copied byte; otherwise the refusal is said and each
+ * alias keeps the sealed snapshot its receipt records. An install has re-pointed
+ * the alias at the lockfile's version before this file runs as its postinstall,
+ * so "keeps" means binding that recorded snapshot again; an alias with none
+ * keeps the installed version, and the refusal counts it. The plugin that
+ * vouches is the one the declarations bind: a declared @smoothbricks/nx-plugin
+ * is probed from its checkout, since every `bun install` has put the published
+ * plugin back at its alias before this file runs as the postinstall.
  *
  * Declarations are applied at the end of every install. smoo's root script
  * policy makes the root's `postinstall` run this file, and bun runs the
@@ -114,7 +117,13 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
-import { pluginProbe, type SnapshotDeclaration, snapshotBinding } from './linked-snapshots.ts';
+import {
+  pluginProbe,
+  recordedSnapshot,
+  type SealedSnapshot,
+  type SnapshotDeclaration,
+  snapshotBinding,
+} from './linked-snapshots.ts';
 
 interface DeveloperLink {
   /** Where the link is, relative to the project root. */
@@ -386,12 +395,21 @@ export interface DeclaredLinkChange {
 
 /**
  * A declaration this machine cannot honour now: its checkout directory is not there to link to (the installed
- * version stays), no snapshot of it can be made (whatever the alias binds now stays), or an alias still links the
- * live checkout without a receipt, which a declaration never claims retroactively.
+ * version stays), no snapshot of it can be made, or an alias still links the live checkout without a receipt, which a
+ * declaration never claims retroactively. A refused snapshot names what its aliases keep: the sealed snapshots their
+ * receipts record (`kept`), and the count of aliases that had none and so keep the version the install left
+ * (`installed`).
  */
 export type UnavailableDeclaredLink =
   | { readonly kind: 'absent'; readonly name: string; readonly target: string; readonly reason: string }
-  | { readonly kind: 'snapshot-refused'; readonly name: string; readonly source: string; readonly reason: string }
+  | {
+      readonly kind: 'snapshot-refused';
+      readonly name: string;
+      readonly source: string;
+      readonly reason: string;
+      readonly kept: readonly string[];
+      readonly installed: number;
+    }
   | { readonly kind: 'snapshot-unclaimed'; readonly name: string; readonly path: string; readonly source: string };
 
 export interface DeclaredLinksPlan {
@@ -442,7 +460,9 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
     if (snapshot !== undefined) {
       const outcome = await snapshotBinding(root, name, source, snapshot, probe);
       if (outcome.kind === 'refused') {
-        unavailable.push({ kind: 'snapshot-refused', name, source, reason: outcome.reason });
+        const kept = keptSnapshots(root, trees, name, recorded);
+        changes.push(...kept.changes);
+        unavailable.push({ kind: 'snapshot-refused', name, source, reason: outcome.reason, ...kept.said });
         continue;
       }
       binding = { kind: 'snapshot', target: outcome.directory, id: outcome.id };
@@ -479,6 +499,55 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
     }
   }
   return { changes, unavailable };
+}
+
+/**
+ * What the aliases of `name` keep when no snapshot of it can be made: each the sealed snapshot its receipt records.
+ * An install re-points every alias at the lockfile's version before its postinstall plans this, so the binding an
+ * alias had is its receipt's, never what it links now. An alias still on its receipt is left alone, unsaid: its
+ * current binding stays. An alias whose receipt names no snapshot left in the store keeps what the install left, and
+ * is counted so the refusal says so. A developer's own link out of the checkout stays theirs.
+ */
+function keptSnapshots(
+  root: string,
+  trees: readonly string[],
+  name: string,
+  recorded: ReadonlyMap<string, DeclaredLinkReceipt>,
+): {
+  readonly changes: readonly DeclaredLinkChange[];
+  readonly said: { readonly kept: readonly string[]; readonly installed: number };
+} {
+  const changes: DeclaredLinkChange[] = [];
+  const kept = new Set<string>();
+  // One verification per sealed snapshot, however many trees alias it.
+  const verified = new Map<string, SealedSnapshot | null>();
+  let installed = 0;
+  for (const tree of trees) {
+    const entry = path.join(tree, name);
+    const at = path.join(root, entry);
+    const stats = lstatSync(at, { throwIfNoEntry: false });
+    if (stats === undefined) continue;
+    const text = stats.isSymbolicLink() ? readlinkSync(at) : null;
+    const receipt = recorded.get(entry);
+    if (text !== null && text === receipt?.target) continue;
+    if (text !== null && !containsPath(path.resolve(root), resolvedTarget(root, { path: entry, target: text })))
+      continue;
+    let binding: SealedSnapshot | null = null;
+    if (receipt !== undefined) {
+      const target = resolvedTarget(root, receipt);
+      binding = verified.has(target)
+        ? (verified.get(target) ?? null)
+        : recordedSnapshot(root, entry, name, receipt.target);
+      verified.set(target, binding);
+    }
+    if (binding === null) {
+      installed += 1;
+      continue;
+    }
+    kept.add(binding.id);
+    changes.push({ path: entry, binding: { kind: 'snapshot', target: binding.directory, id: binding.id } });
+  }
+  return { changes, said: { kept: [...kept], installed } };
 }
 
 /**
@@ -524,11 +593,20 @@ export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void 
           `! smoo.developerLinks ${unavailable.name}: ${unavailable.target} ${unavailable.reason}; the installed version stays`,
         );
         break;
-      case 'snapshot-refused':
+      case 'snapshot-refused': {
+        const keeps = [
+          ...unavailable.kept.map((id) => `its aliases stay bound to snapshot ${id}`),
+          ...(unavailable.installed === 0
+            ? []
+            : [
+                `${unavailable.installed} ${unavailable.installed === 1 ? 'alias with no recorded snapshot keeps' : 'aliases with no recorded snapshot keep'} the installed version`,
+              ]),
+        ];
         console.error(
-          `! smoo.developerLinks ${unavailable.name}: no snapshot of ${unavailable.source}: ${unavailable.reason}; its current binding stays`,
+          `! smoo.developerLinks ${unavailable.name}: no snapshot of ${unavailable.source}: ${unavailable.reason}; ${keeps.length === 0 ? 'its current binding stays' : keeps.join('; ')}`,
         );
         break;
+      }
       case 'snapshot-unclaimed':
         console.error(
           `! smoo.developerLinks ${unavailable.name}: ${unavailable.path} links the live checkout ${unavailable.source} without a receipt, so it is not bound to a snapshot; remove that link and run the install once to bind it`,

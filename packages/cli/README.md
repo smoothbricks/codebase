@@ -732,19 +732,23 @@ bind: the checkout a `@smoothbricks/nx-plugin` declaration names when this machi
 Every `bun install` has put the lockfile's published plugin back at that alias when the postinstall runs, and a
 published plugin older than the provider cannot read its receipts. The provider enables `producerReceipts.targets` in
 its Nx plugin options, naming every target a consumer's `snapshot.targets` names: an unnamed target never gets a
-receipt, so that consumer's snapshot refuses and any install that re-points the alias leaves it on the published
-version. Actual pre/post task evidence binds committed HEAD/tree, clean tracked source, successful task identities
-including uncached prerequisites, argv, declared environment/tool identity, independent product output SHA-256 and wall
-time. The consumer validates the receipt against its declaration; a missing, mismatched or unbound receipt takes the
-graph RPC path and refuses loudly without a build. Old receipts without the producer contract refuse too. Every copied
-file must be HEAD's tracked blob or an attested public output with the same bytes. A modified captured source, untracked
-actual input, stale output or provider write during copying refuses and retains every alias's current binding; an
-unrelated untracked user file does not decide the committed tree. The snapshot is named by one SHA-256 over its census
-(path, type, executable bit and bytes or link text), producer root/HEAD/tree, file-input provenance, every task id/hash
-and the bound producer identity, sealed read-only under `.cache/linked-snapshots/<id>`, and never changes; a new
-provider state is a new snapshot. A cowshed checkout declares `.cache/linked-snapshots` as `[build] state`, so snapshots
-live on its build volume; until a refresh has linked that path, capture refuses and names `cowshed exec`. An unrecorded
-alias that already links the live checkout is reported, not claimed: remove it and install once to bind the snapshot.
+receipt, so that consumer's snapshot refuses. Actual pre/post task evidence binds committed HEAD/tree, clean tracked
+source, successful task identities including uncached prerequisites, argv, declared environment/tool identity,
+independent product output SHA-256 and wall time. The consumer validates the receipt against its declaration; a missing,
+mismatched or unbound receipt takes the graph RPC path and refuses loudly without a build. Old receipts without the
+producer contract refuse too. Every copied file must be HEAD's tracked blob or an attested public output with the same
+bytes. A modified captured source, untracked actual input, stale output or provider write during copying refuses. Every
+refusal says its cause and what each alias keeps: the sealed snapshot its `.smoo-declared-links` receipt records. Bun
+has already re-pointed the alias at the lockfile's version when the postinstall runs, so keeping means binding that
+recorded snapshot again, verified, never the provider's current state; a shell entry that installed nothing leaves the
+binding as it is. An alias with no recorded snapshot left in the store keeps the installed (published) version, and the
+refusal counts it. An unrelated untracked user file does not decide the committed tree. The snapshot is named by one
+SHA-256 over its census (path, type, executable bit and bytes or link text), producer root/HEAD/tree, file-input
+provenance, every task id/hash and the bound producer identity, sealed read-only under `.cache/linked-snapshots/<id>`,
+and never changes; a new provider state is a new snapshot. A cowshed checkout declares `.cache/linked-snapshots` as
+`[build] state`, so snapshots live on its build volume; until a refresh has linked that path, capture refuses and names
+`cowshed exec`. An unrecorded alias that already links the live checkout is reported, not claimed: remove it and install
+once to bind the snapshot.
 
 An empty commit with the same tree retains the published receipt and its original producer basis. A changed tree
 requires a new production. Multiple targets may have different basis commits for the same tree; the snapshot retains

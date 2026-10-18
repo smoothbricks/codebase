@@ -41,8 +41,11 @@
  * provenance, every task id and hash, and the digest of each target's whole
  * producer completion record (argv, environment identity, inputs, tools, output
  * digest, wall time). Other bytes, another commit, another task hash or another
- * production is another snapshot, and nothing binds without a fresh probe, so no
- * name or provenance is ever reused for a provider state it does not describe.
+ * production is another snapshot, and nothing is captured without a fresh probe,
+ * so no name or provenance is ever reused for a provider state it does not
+ * describe. When no fresh snapshot can be made, an alias keeps the sealed one
+ * its receipt records (`recordedSnapshot`), verified: the provider state it was
+ * taken from, not the provider's current one.
  * A receipt without a producer record of a known version, as an older plugin's
  * cache hit gives, is refused. Files are sealed read-only, and a reader that
  * trusts a snapshot verifies its census, its retained producer records and its
@@ -131,9 +134,14 @@ export interface SnapshotReceipt {
   readonly census: readonly CensusEntry[];
 }
 
-export type SnapshotBinding =
-  | { readonly kind: 'snapshot'; readonly id: string; readonly directory: string }
-  | { readonly kind: 'refused'; readonly reason: string };
+/** A sealed snapshot an alias binds: its id and the declared package's directory inside it. */
+export interface SealedSnapshot {
+  readonly kind: 'snapshot';
+  readonly id: string;
+  readonly directory: string;
+}
+
+export type SnapshotBinding = SealedSnapshot | { readonly kind: 'refused'; readonly reason: string };
 
 /** Asks the provider whether `target` is current, without running anything. */
 export type ProducerProbe = (target: string, providerRoot: string) => Promise<EnsureBuiltProbeResult>;
@@ -848,6 +856,25 @@ export function sealedSnapshotOf(
     }
     if (path.dirname(at) === at) return null;
   }
+}
+
+/**
+ * The sealed snapshot of `name` in this checkout's store that `linkText`, an alias's recorded link at `entry`, binds,
+ * once it verifies; or null when that text names no snapshot left in the store. When no new snapshot can be made the
+ * alias keeps this one: an install has re-pointed it at the lockfile's version before its postinstall runs, and a
+ * sealed snapshot never changes, so binding it again restores the binding the alias had, for the provider state it
+ * was taken from.
+ */
+export function recordedSnapshot(root: string, entry: string, name: string, linkText: string): SealedSnapshot | null {
+  const target = path.resolve(root, path.dirname(entry), linkText);
+  const inside = path.relative(path.resolve(root, SNAPSHOT_STORE), target);
+  if (inside === '' || !contained(inside)) return null;
+  const directory = path.resolve(root, SNAPSHOT_STORE, inside.split(path.sep)[0] ?? inside);
+  if (readSealed(directory) === null) return null;
+  const receipt = verifySnapshot(directory);
+  if (receipt.name !== name || path.join(directory, receipt.packagePath) !== target)
+    throw new SnapshotRefusal(`${entry} records ${linkText}, which is not snapshot ${receipt.id}'s ${name}`);
+  return { kind: 'snapshot', id: receipt.id, directory: target };
 }
 
 /**

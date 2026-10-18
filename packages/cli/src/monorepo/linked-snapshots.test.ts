@@ -441,12 +441,14 @@ function writePlugin(directory: string, module: string): void {
   write(join(directory, 'ensure-built.js'), module);
 }
 
+/** Where an install leaves the consumer's published plugin: Bun's store entry its alias links. */
+const PLUGIN_STORE = '.bun/@smoothbricks+nx-plugin@0.0.0/node_modules/@smoothbricks/nx-plugin';
+
 /** A consumer's installed plugin, a link into Bun's store as an install leaves it: planDeclaredLinks's default path. */
 function installPlugin({ consumer }: Fixture, module: string): void {
-  const store = '.bun/@smoothbricks+nx-plugin@0.0.0/node_modules/@smoothbricks/nx-plugin';
-  writePlugin(join(consumer, 'node_modules', store), module);
+  writePlugin(join(consumer, 'node_modules', PLUGIN_STORE), module);
   mkdirSync(join(consumer, 'node_modules/@smoothbricks'), { recursive: true });
-  symlinkSync(join('..', store), join(consumer, 'node_modules/@smoothbricks/nx-plugin'));
+  symlinkSync(join('..', PLUGIN_STORE), join(consumer, 'node_modules/@smoothbricks/nx-plugin'));
 }
 
 /** The read-only probe a current plugin exports, answering from the provider's actual output bytes. */
@@ -455,6 +457,15 @@ const PROBE_BUILT = `${PROBE}\nexport async function probeBuilt({ target, cwd })
 /** A plugin from before probeBuilt: its only entry builds, so calling it would write the provider. */
 function buildingPlugin(marker: string): string {
   return `import { writeFileSync } from 'node:fs';\nexport async function ensureBuilt() { writeFileSync(${JSON.stringify(marker)}, 'built'); return { disposition: 'hit' }; }\n`;
+}
+
+/** The probe of a provider whose latest producer run refused, as SB's lmao producer did. */
+const REFUSED_PROBE = `export async function probeBuilt({ target, cwd }) { return { disposition: 'failed', reason: { kind: 'provider-proof', taskId: target, workspaceRoot: cwd, detail: 'Producer tool/module nodes changed across actual execution' } }; }\n`;
+
+/** What every `bun install` does before its postinstall: the alias links the lockfile's store entry again. */
+function reinstall(alias: string): void {
+  rmSync(alias);
+  symlinkSync('.bun/linked-api@1.0.0/node_modules/linked-api', alias);
 }
 
 const PLAN = `
@@ -587,5 +598,44 @@ await links.keepDeveloperLinks(root, async () => {
     const after = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
     expect(after.stderr).not.toContain('links the live checkout');
     expect(JSON.parse(after.stdout)).toEqual({ changes: [], unavailable: [] });
+  });
+
+  it('keeps the recorded snapshot an install re-pointed when no new snapshot can be made', () => {
+    const checkout = fixture();
+    installPlugin(checkout, PROBE_BUILT);
+    const alias = declare(checkout);
+    const first = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
+    expect(first.status, first.stderr).toBe(0);
+    const bound = readlinkSync(alias);
+    const id = bound.split('/')[3];
+    const receipts = readFileSync(join(checkout.consumer, 'node_modules/.smoo-declared-links'), 'utf8');
+    writePlugin(join(checkout.consumer, 'node_modules', PLUGIN_STORE), REFUSED_PROBE);
+    reinstall(alias);
+    const postinstall = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
+    expect(postinstall.status, postinstall.stderr).toBe(0);
+    expect(postinstall.stderr).toContain('Producer tool/module nodes changed across actual execution');
+    expect(postinstall.stderr).toContain(`its aliases stay bound to snapshot ${id}`);
+    expect(readlinkSync(alias)).toBe(bound);
+    expect(readFileSync(join(checkout.consumer, 'node_modules/.smoo-declared-links'), 'utf8')).toBe(receipts);
+    // A shell entry with nothing installed leaves the binding as it is and says so.
+    const entry = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
+    expect(entry.stderr).toContain('its current binding stays');
+    expect(JSON.parse(entry.stdout).changes).toEqual([]);
+  });
+
+  it('says the installed version stays when the recorded snapshot is gone', () => {
+    const checkout = fixture();
+    installPlugin(checkout, PROBE_BUILT);
+    const alias = declare(checkout);
+    expect(spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer]).status).toBe(0);
+    const store = join(checkout.consumer, '.cache/linked-snapshots');
+    spawnSync('chmod', ['-R', 'u+w', store]);
+    rmSync(store, { recursive: true });
+    writePlugin(join(checkout.consumer, 'node_modules', PLUGIN_STORE), REFUSED_PROBE);
+    reinstall(alias);
+    const postinstall = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
+    expect(postinstall.status, postinstall.stderr).toBe(0);
+    expect(postinstall.stderr).toContain('1 alias with no recorded snapshot keeps the installed version');
+    expect(readlinkSync(alias)).toBe('.bun/linked-api@1.0.0/node_modules/linked-api');
   });
 });
