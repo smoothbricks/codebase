@@ -2026,7 +2026,7 @@ mod tests {
         let coverage = LeafCoverage::new(900).unwrap();
         let leader_pid = leader.pid.cast_unsigned();
 
-        let mut census = Census::led_by(leader_pid);
+        let mut census = Census::led_by(leader_pid, std::time::Instant::now());
         observe(
             &mut census,
             std::slice::from_ref(&stranger),
@@ -2042,7 +2042,7 @@ mod tests {
             "another life of the pid is no member"
         );
 
-        let mut census = Census::led_by(leader_pid);
+        let mut census = Census::led_by(leader_pid, std::time::Instant::now());
         observe(
             &mut census,
             std::slice::from_ref(leader),

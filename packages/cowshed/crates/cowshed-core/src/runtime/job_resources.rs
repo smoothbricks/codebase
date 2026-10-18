@@ -120,6 +120,16 @@ impl Sampling {
         }
     }
 
+    /// When the job's clock started, the instant its first owned process spawned, while the job
+    /// owns processes: the origin of `wallUs`, and of its processes' usage windows.
+    #[cfg(target_os = "macos")]
+    pub(super) fn origin(&self) -> Option<Instant> {
+        match self {
+            Self::Live(sampler) => Some(sampler.spawned),
+            Self::Unowned | Self::Frozen { .. } => None,
+        }
+    }
+
     /// The process that leads the job's group now, or last led it once the job ended; `None`
     /// while no process of the job's exists, or if none ever did.
     pub(super) fn leader(&self) -> Option<&Birth> {
@@ -271,8 +281,9 @@ impl JobSampler {
     /// The legacy spawn sink's census, allocated only when that path is actually sampled.
     #[cfg(target_os = "macos")]
     pub(super) fn census(&mut self) -> &mut super::job_attribution::Census {
-        self.census
-            .get_or_insert_with(|| super::job_attribution::Census::led_by(self.leader.pid()))
+        self.census.get_or_insert_with(|| {
+            super::job_attribution::Census::led_by(self.leader.pid(), self.spawned)
+        })
     }
 
     /// The share of the job's accounted CPU its observed processes must cover for a leaf.

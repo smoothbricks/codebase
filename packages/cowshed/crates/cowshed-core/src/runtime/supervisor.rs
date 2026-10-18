@@ -5364,6 +5364,7 @@ impl SupervisorActor {
                     job_id.get()
                 );
             }
+            clock_observation(job);
         }
         if let Some(owned) = process.process() {
             // A one-shot command is the job's first process.
@@ -6783,6 +6784,23 @@ fn own_process(job: &mut JobStateRecord, process: OwnedProcess, coverage: LeafCo
                 error.message
             ),
         }
+    }
+    #[cfg(target_os = "macos")]
+    clock_observation(job);
+}
+
+/// Start the job's process observation on the job's clock once both exist: its monitor, and the
+/// spawn of its first owned process, the origin of `wallUs`. Either may come first; the origin
+/// never changes, so saying it again changes nothing.
+#[cfg(target_os = "macos")]
+fn clock_observation(job: &JobStateRecord) {
+    if let (Some(monitor), Some(origin)) = (&job.monitor, job.sampling.origin())
+        && let Err(error) = monitor.clock(origin)
+    {
+        eprintln!(
+            "cowshed: starting job {}'s process windows on its clock: {error}",
+            job.info.job_id.get()
+        );
     }
 }
 

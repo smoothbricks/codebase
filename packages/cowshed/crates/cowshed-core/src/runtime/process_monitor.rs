@@ -39,6 +39,9 @@ enum Request {
         reason: ProcessCoverageGap,
         reply: mpsc::SyncSender<Result<()>>,
     },
+    Clock {
+        origin: Instant,
+    },
     Finish {
         reply: mpsc::SyncSender<Result<()>>,
     },
@@ -222,6 +225,13 @@ impl ProcessMonitor {
     pub(crate) fn gap(&self, reason: ProcessCoverageGap) -> Result<()> {
         self.driver
             .acknowledged(|reply| Request::Gap { reason, reply })
+    }
+
+    /// The job's clock started at `origin`, the instant its first owned process spawned and the
+    /// origin of its samples' `wallUs`: usage windows open on it from then on. A refusal reaches
+    /// readers as the observation's error.
+    pub(crate) fn clock(&self, origin: Instant) -> Result<()> {
+        self.driver.send(Request::Clock { origin })
     }
 
     /// Drain the job's accounting boundary. Still-live descendants remain watched, and their
@@ -467,6 +477,12 @@ impl Writer {
                         self.publish(result.clone());
                         let _ = reply.send(result);
                     }
+                    Request::Clock { origin } => {
+                        // Starting the clock changes no record; only its refusal is news.
+                        if let Err(error) = self.observer.clock(origin) {
+                            self.publish(Err(observation_error(error)));
+                        }
+                    }
                     Request::Finish { reply } => {
                         self.finished = true;
                         let result = self.observer.drain().map_err(observation_error);
@@ -696,5 +712,39 @@ mod tests {
         }
         drop(events);
         assert!(monitor.tree().unwrap().processes[0].exit.is_none());
+    }
+
+    /// The supervisor stamps the job's clock after the watch has read the root: that read opens
+    /// no window, and the windows the writer's ticks close are placed on the clock it was told.
+    #[tokio::test]
+    async fn a_clocked_monitor_places_the_windows_its_ticks_close_on_the_job_s_clock() {
+        use crate::api::resources::WallMicros;
+
+        let monitor = ProcessMonitor::prepare(JobId::new(1).unwrap()).unwrap();
+        monitor.watch(std::process::id()).unwrap();
+        let origin = Instant::now();
+        monitor.clock(origin).unwrap();
+        // A subscriber shortens the writer's ticks after its first.
+        let _events = monitor.subscribe(Duration::from_millis(20)).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let window = loop {
+            let usage = monitor.tree().unwrap().processes[0].usage;
+            if let Some(window) = usage.and_then(|usage| usage.cpu_window) {
+                break window;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no tick closed a window: {usage:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // The watch's own read came before the origin; the first window opened at a tick after it.
+        assert!(window.opened_us > WallMicros::new(0).unwrap(), "{window:?}");
+        assert!(window.opened_us < window.closed_us, "{window:?}");
+        assert!(
+            window.closed_us <= WallMicros::of(origin.elapsed()).unwrap(),
+            "{window:?} is on a clock that started at the origin it was told"
+        );
+        monitor.finish().unwrap();
     }
 }

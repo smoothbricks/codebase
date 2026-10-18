@@ -289,8 +289,10 @@ impl TracedJob {
         let start = Instant::now();
         let publisher = JobSpanPublisher::start(telemetry.to_path_buf());
         let info = running_job();
+        let mut fold = JobProcessFold::new(info.job_id, start);
+        fold.clock(start).expect("the job's clock starts once");
         Self {
-            fold: JobProcessFold::new(info.job_id, start),
+            fold,
             projection: ProcessSpanProjection::new(
                 info.trace.trace_id.as_str(),
                 job_span_thread(&info.repo_id, &info.workspace_incarnation, info.job_id),

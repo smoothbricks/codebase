@@ -12,6 +12,7 @@
 //! that feeds it on macOS.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::api::process::{
     JobLeafAttribution, JobProcessLeaf, PERMILLE_WHOLE, ProcessCoverage, ProcessCoverageGap,
@@ -150,12 +151,13 @@ impl AttributionSummary {
 }
 
 impl Census {
-    /// A census of a job led by `leader`, the job's first owned process.
-    pub fn led_by(leader: u32) -> Self {
+    /// A census of a job led by `leader`, the job's first owned process, which spawned at
+    /// `origin`: the job's clock.
+    pub fn led_by(leader: u32, origin: Instant) -> Self {
         Self {
             lives: Vec::new(),
             by_identity: HashMap::new(),
-            usage: ProcessUsageFold::default(),
+            usage: ProcessUsageFold::clocked(origin),
             leader,
             leaders: vec![leader],
             boundary: 0,
@@ -417,7 +419,7 @@ mod tests {
     #[test]
     fn the_leaf_is_named_only_from_the_required_share_of_the_accounted_cpu() {
         let at = Instant::now();
-        let mut census = Census::led_by(100);
+        let mut census = Census::led_by(100, Instant::now());
         boundary(
             &mut census,
             at,
@@ -427,7 +429,7 @@ mod tests {
         for (observed_extra, permille, attributed) in
             [(0, 899, false), (1, 900, true), (51, 950, true)]
         {
-            let mut census = Census::led_by(100);
+            let mut census = Census::led_by(100, Instant::now());
             boundary(
                 &mut census,
                 at,
@@ -471,7 +473,7 @@ mod tests {
     /// No accounted CPU names no leaf and says why, rather than a share of nothing.
     #[test]
     fn a_job_with_no_accounted_cpu_says_so() {
-        let mut census = Census::led_by(100);
+        let mut census = Census::led_by(100, Instant::now());
         boundary(&mut census, Instant::now(), &[(100, "/bin/sh", 0, 0)]);
         let answer = census.attribute(cpu(0, 0), coverage(900)).expect("exact");
         assert_eq!(answer.leaf, JobLeafAttribution::NoAccountedCpu);
@@ -482,7 +484,7 @@ mod tests {
     /// in the signed reconciliation, never clamped away.
     #[test]
     fn observation_beyond_the_total_covers_the_whole_and_keeps_its_signed_excess() {
-        let mut census = Census::led_by(100);
+        let mut census = Census::led_by(100, Instant::now());
         boundary(
             &mut census,
             Instant::now(),
@@ -509,7 +511,7 @@ mod tests {
     #[test]
     fn ties_go_to_the_earlier_birth_then_the_lower_pid_whatever_the_discovery_order() {
         let at = Instant::now();
-        let mut census = Census::led_by(100);
+        let mut census = Census::led_by(100, Instant::now());
         // Found first, born last: pid 300's birth token is 2100.
         boundary(
             &mut census,
@@ -534,7 +536,7 @@ mod tests {
         assert_eq!((leaf.pid, leaf.program.as_str()), (200, "early"));
 
         // Equal CPU and equal birth: the lower pid.
-        let mut census = Census::led_by(100);
+        let mut census = Census::led_by(100, Instant::now());
         for (pid, program) in [(201, "higher"), (150, "lower")] {
             let process = ProcessIdentity {
                 pid,
@@ -559,7 +561,7 @@ mod tests {
     #[test]
     fn the_coverage_names_the_first_missed_observation_and_is_never_complete() {
         let at = Instant::now();
-        let mut lone = Census::led_by(100);
+        let mut lone = Census::led_by(100, Instant::now());
         boundary(&mut lone, at, &[(100, "/bin/sh", 5, 5)]);
         lone.lead(200);
         boundary(
@@ -576,7 +578,7 @@ mod tests {
             "the activation left without a read after its exit"
         );
 
-        let mut alone = Census::led_by(100);
+        let mut alone = Census::led_by(100, Instant::now());
         boundary(&mut alone, at, &[(100, "/bin/sh", 5, 5)]);
         assert_eq!(
             alone
@@ -588,7 +590,7 @@ mod tests {
             }
         );
 
-        let mut forked = Census::led_by(100);
+        let mut forked = Census::led_by(100, Instant::now());
         boundary(
             &mut forked,
             at,
@@ -616,7 +618,7 @@ mod tests {
     #[test]
     fn a_member_without_an_image_is_never_named() {
         let at = Instant::now();
-        let mut census = Census::led_by(100);
+        let mut census = Census::led_by(100, Instant::now());
         census.found(life(100), Some(image("/bin/sh")));
         read(&mut census, life(100), at, 10, 0);
         census.found(life(100), None);
@@ -657,7 +659,7 @@ mod tests {
     #[test]
     fn an_image_the_kernel_refused_unnames_the_life_and_stays_a_gap() {
         let at = Instant::now();
-        let mut census = Census::led_by(100);
+        let mut census = Census::led_by(100, Instant::now());
         boundary(&mut census, at, &[(100, "/bin/sh", 10, 0)]);
         census.unread_image(life(100));
         read(&mut census, life(100), at + Duration::from_secs(1), 15, 0);

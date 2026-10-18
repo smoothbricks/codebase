@@ -211,7 +211,7 @@ pub struct ProcessUsage {
     /// core: `cpu_window`'s share against [`BUSY_CPU_PERMILLE`], idle while no window closed.
     pub busy: bool,
     /// The supervisor's last closed sample window of its own CPU, with the share `busy` judges;
-    /// absent until two reads a positive span apart closed one.
+    /// absent until two reads on the job's clock a positive span apart closed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_window: Option<ProcessCpuWindow>,
     /// What it holds resident now; zero once it has exited.
@@ -223,15 +223,18 @@ pub struct ProcessUsage {
 
 /// One process's last closed CPU sample window: the span between the two reads of its own
 /// counters that bound it, and the share of one core its own CPU took over that span. A share is
-/// comparable only with its window, so the window is part of the value. Windows tile a life: each
-/// opens where the one before it closed, so a reader tells a window it already saw (the same
-/// `closed_us`) from the next one (`opened_us` at the last `closed_us`) and from one it missed
-/// (`opened_us` past it).
+/// comparable only with its window, so the window is part of the value. It is placed on the job's
+/// clock, the one [`JobResourceSample::wall_us`](super::resources::JobResourceSample) counts:
+/// a read before that clock started (the observer reads a job's root before its spawn returns)
+/// opens no window. Windows tile a life from its first read on the clock: each opens where the
+/// one before it closed, so a reader tells a window it already saw (the same `closed_us`) from
+/// the next one (`opened_us` at the last `closed_us`) and from one it missed (`opened_us` past
+/// it).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProcessCpuWindow {
-    /// Where the window opened, in whole microseconds after the process's first usage read, on
-    /// the supervisor's monotonic clock.
+    /// Where the window opened, in whole microseconds since the job's first owned process
+    /// spawned: the origin of `wallUs`, on the supervisor's monotonic clock.
     pub opened_us: WallMicros,
     /// Where it closed, on the same clock; equal to `opened_us` for a window under a microsecond.
     pub closed_us: WallMicros,

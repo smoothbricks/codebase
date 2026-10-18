@@ -8,6 +8,11 @@
 //! can neither reset the window nor see a different answer from the first. The kernel reads are
 //! the thin shell below the fold; each is fenced to the one life it names.
 //!
+//! Windows are placed on the job's clock, whose origin is the instant its first owned process
+//! spawned: the origin of a job sample's `wallUs`. The observer reads a job's root before the
+//! supervisor stamps that origin, so a read before the clock started opens no window; the first
+//! read on it opens the first.
+//!
 //! A life's usage is final only when it was read after the life exited (an exited, unreaped
 //! process still answers). An exit with no such read keeps the last usage observed and makes
 //! the usage coverage a gap ([`ProcessCoverageGap::UnreadFinalUsage`]). A life whose counters
@@ -99,19 +104,19 @@ pub enum UsageFoldError {
         span_ns: u128,
     },
     #[error(
-        "process {pid} was read {elapsed:?} after its first read, past what a microsecond count holds exactly"
+        "process {pid} was read {elapsed:?} after the job's clock started, past what a microsecond count holds exactly"
     )]
     ClockInexact { pid: u32, elapsed: Duration },
+    #[error("the job's clock started at {first:?}, and again at {then:?}")]
+    Reclocked { first: Instant, then: Instant },
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Counted {
-    /// When the life was first read: the origin its windows are placed on.
-    first: Instant,
     latest: UsageReading,
-    /// The reading the current window opened at: the last one a positive span after its
-    /// predecessor.
-    window: UsageReading,
+    /// The reading the current window opened at: the first one on the job's clock, then the
+    /// last one a positive span after its predecessor. `None` while no read was on the clock.
+    window: Option<UsageReading>,
     /// The last window closed; `None` until one has.
     closed: Option<ProcessCpuWindow>,
     /// The most it was read holding.
@@ -126,15 +131,45 @@ struct Life {
 
 #[derive(Debug, Default)]
 pub struct ProcessUsageFold {
+    /// When the job's clock started: the instant its first owned process spawned. `None` until
+    /// the supervisor says.
+    origin: Option<Instant>,
     lives: HashMap<ProcessIdentity, Life>,
     /// The first exit whose usage was not read after it.
     gap: Option<ProcessCoverageGap>,
 }
 
 impl ProcessUsageFold {
+    /// A fold whose job clock started at `origin`.
+    pub fn clocked(origin: Instant) -> Self {
+        Self {
+            origin: Some(origin),
+            ..Self::default()
+        }
+    }
+
+    /// The job's clock started at `origin`, the instant its first owned process spawned: reads
+    /// from then on open windows placed on it. It starts once; the same origin again is no
+    /// change, another one is refused.
+    pub fn clock(&mut self, origin: Instant) -> Result<(), UsageFoldError> {
+        match self.origin {
+            None => {
+                self.origin = Some(origin);
+                Ok(())
+            }
+            Some(first) if first == origin => Ok(()),
+            Some(first) => Err(UsageFoldError::Reclocked {
+                first,
+                then: origin,
+            }),
+        }
+    }
+
     pub fn apply(&mut self, observation: UsageObservation) -> Result<(), UsageFoldError> {
         match observation {
             UsageObservation::Read { process, reading } => {
+                // The job's clock, if this reading is on it.
+                let origin = self.origin.filter(|origin| reading.at >= *origin);
                 let life = self.lives.entry(process).or_default();
                 if life.exited {
                     return Err(UsageFoldError::AfterExit { pid: process.pid });
@@ -142,14 +177,13 @@ impl ProcessUsageFold {
                 // A refused reading leaves the life as it was.
                 let counted = match &life.counted {
                     None => Counted {
-                        first: reading.at,
                         latest: reading,
-                        window: reading,
+                        window: origin.map(|_| reading),
                         // No span has passed in which it could have been busy.
                         closed: None,
                         rss_peak: reading.resident,
                     },
-                    Some(counted) => counted.read(process.pid, reading)?,
+                    Some(counted) => counted.read(process.pid, reading, origin)?,
                 };
                 life.counted = Some(counted);
                 Ok(())
@@ -203,7 +237,14 @@ impl ProcessUsageFold {
 }
 
 impl Counted {
-    fn read(&self, pid: u32, reading: UsageReading) -> Result<Self, UsageFoldError> {
+    /// Fold `reading`, taken on the job's clock that started at `origin`, or before it started
+    /// when `origin` is `None`.
+    fn read(
+        &self,
+        pid: u32,
+        reading: UsageReading,
+        origin: Option<Instant>,
+    ) -> Result<Self, UsageFoldError> {
         let latest = self.latest;
         if latest.exited && !reading.exited {
             return Err(UsageFoldError::Revived { pid });
@@ -259,7 +300,16 @@ impl Counted {
             }
         }
         let rss_peak = self.rss_peak.max(reading.resident);
-        let Some(span_ns) = NonZeroU128::new(reading.at.duration_since(self.window.at).as_nanos())
+        let (Some(origin), Some(window)) = (origin, self.window) else {
+            // Off the clock a read judges nothing; the first read on it opens the first window.
+            return Ok(Self {
+                latest: reading,
+                window: origin.map(|_| reading),
+                rss_peak,
+                ..*self
+            });
+        };
+        let Some(span_ns) = NonZeroU128::new(reading.at.duration_since(window.at).as_nanos())
         else {
             // No time passed in which to judge: the window stays open, the judgment stands.
             return Ok(Self {
@@ -268,7 +318,7 @@ impl Counted {
                 ..*self
             });
         };
-        let cpu_us = reading.cpu_total() - self.window.cpu_total();
+        let cpu_us = reading.cpu_total() - window.cpu_total();
         let cpu_permille = OneCoreCpuPermille::of_window(cpu_us, span_ns).map_err(|_| {
             UsageFoldError::ShareInexact {
                 pid,
@@ -276,17 +326,16 @@ impl Counted {
                 span_ns: span_ns.get(),
             }
         })?;
-        let since_first = |at: Instant| {
-            let elapsed = at.duration_since(self.first);
+        let on_clock = |at: Instant| {
+            let elapsed = at.duration_since(origin);
             WallMicros::of(elapsed).map_err(|_| UsageFoldError::ClockInexact { pid, elapsed })
         };
         Ok(Self {
-            first: self.first,
             latest: reading,
-            window: reading,
+            window: Some(reading),
             closed: Some(ProcessCpuWindow {
-                opened_us: since_first(self.window.at)?,
-                closed_us: since_first(reading.at)?,
+                opened_us: on_clock(window.at)?,
+                closed_us: on_clock(reading.at)?,
                 cpu_permille,
             }),
             rss_peak,
@@ -726,7 +775,7 @@ mod tests {
         fold.usage(process).expect("a read life").busy
     }
 
-    /// The window from `opened_us` to `closed_us` after the life's first read, at `cpu_permille`.
+    /// The window from `opened_us` to `closed_us` on the job's clock, at `cpu_permille`.
     fn cpu_window(opened_us: u64, closed_us: u64, cpu_permille: u64) -> ProcessCpuWindow {
         ProcessCpuWindow {
             opened_us: WallMicros::new(opened_us).expect("a position"),
@@ -739,7 +788,7 @@ mod tests {
     fn busy_is_the_share_of_one_window_and_flips_back_to_idle() {
         let process = identity(40);
         let start = Instant::now();
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(start);
         fold.apply(read(process, reading(start, 0, 0))).unwrap();
         assert!(!busy(&fold, process), "no window has passed yet");
 
@@ -775,13 +824,13 @@ mod tests {
     }
 
     /// The share `busy` judges is published with the window it was measured over: windows tile
-    /// the life from its first read, a zero-length reading keeps the last one, and the share is
-    /// rounded down from the exact span, so it says busy exactly when `busy` does.
+    /// the life from its first read on the job's clock, a zero-length reading keeps the last one,
+    /// and the share is rounded down from the exact span, so it says busy exactly when `busy` does.
     #[test]
     fn the_share_is_published_with_the_window_it_was_measured_over() {
         let process = identity(44);
         let start = Instant::now();
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(start);
         let usage = |fold: &ProcessUsageFold| fold.usage(process).expect("a read life");
         fold.apply(read(process, reading(start, 0, 0))).unwrap();
         assert_eq!(
@@ -815,12 +864,67 @@ mod tests {
         assert!(!usage.busy);
     }
 
+    /// The observer reads a job's root at watch and at exec, before the supervisor stamps the
+    /// job's clock when the spawn returns: those reads open no window, the first read on the
+    /// clock opens the first, and every window is placed on the job's clock.
+    #[test]
+    fn a_read_before_the_job_s_clock_started_opens_no_window() {
+        let process = identity(39);
+        let start = Instant::now();
+        let mut fold = ProcessUsageFold::default();
+        let usage = |fold: &ProcessUsageFold| fold.usage(process).expect("a read life");
+        fold.apply(read(process, reading(start, 0, 0))).unwrap();
+        let exec = start + Duration::from_millis(2);
+        fold.apply(read(process, reading(exec, 5_000, 0))).unwrap();
+        let off_clock = usage(&fold);
+        assert_eq!(off_clock.cpu_window, None, "no read was on the clock");
+        assert!(
+            !off_clock.busy,
+            "5 ms over 2 ms judged nothing off the clock"
+        );
+
+        // The spawn returned 3 ms in: the job's clock starts there, once.
+        let origin = start + Duration::from_millis(3);
+        fold.clock(origin).unwrap();
+        assert_eq!(
+            fold.clock(origin),
+            Ok(()),
+            "the same origin again is no change"
+        );
+        assert_eq!(
+            fold.clock(start),
+            Err(UsageFoldError::Reclocked {
+                first: origin,
+                then: start,
+            })
+        );
+
+        let tick = origin + Duration::from_secs(1);
+        fold.apply(read(process, reading(tick, 5_000, 0))).unwrap();
+        assert_eq!(
+            usage(&fold).cpu_window,
+            None,
+            "one read on the clock closes none"
+        );
+        fold.apply(read(
+            process,
+            reading(tick + Duration::from_secs(1), 955_000, 0),
+        ))
+        .unwrap();
+        let on_clock = usage(&fold);
+        assert_eq!(
+            on_clock.cpu_window,
+            Some(cpu_window(1_000_000, 2_000_000, 950))
+        );
+        assert!(on_clock.busy);
+    }
+
     #[test]
     fn storage_counters_never_fall_and_an_unavailable_source_stays_said() {
         let process = identity(47);
         let start = Instant::now();
         let second = |n| start + Duration::from_secs(n);
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(start);
         let doing = |io, reading| UsageReading { io, ..reading };
         fold.apply(read(
             process,
@@ -853,7 +957,7 @@ mod tests {
         let process = identity(46);
         let start = Instant::now();
         let second = |n| start + Duration::from_secs(n);
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(start);
         let rss = |fold: &ProcessUsageFold| {
             let usage = fold.usage(process).expect("a read life");
             (usage.rss_bytes.get(), usage.rss_peak_bytes.get())
@@ -881,7 +985,7 @@ mod tests {
     fn a_zero_length_window_judges_nothing_and_divides_by_nothing() {
         let process = identity(41);
         let start = Instant::now();
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(start);
         fold.apply(read(process, reading(start, 0, 0))).unwrap();
         // A second reading at the first one's instant, CPU already advanced.
         fold.apply(read(process, reading(start, 30_000, 0)))
@@ -908,7 +1012,7 @@ mod tests {
         let start = Instant::now();
         for nanos in [1, 999] {
             let process = identity(49);
-            let mut fold = ProcessUsageFold::default();
+            let mut fold = ProcessUsageFold::clocked(start);
             fold.apply(read(process, reading(start, 0, 0))).unwrap();
             fold.apply(read(
                 process,
@@ -937,7 +1041,7 @@ mod tests {
     fn reading_the_usage_never_moves_the_window() {
         let process = identity(42);
         let start = Instant::now();
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(start);
         fold.apply(read(process, reading(start, 0, 0))).unwrap();
         fold.apply(read(
             process,
@@ -956,7 +1060,7 @@ mod tests {
     fn an_exited_life_keeps_its_last_counters_and_takes_no_more() {
         let process = identity(43);
         let start = Instant::now();
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(start);
         fold.apply(read(process, reading(start, 70_000, 5_000)))
             .unwrap();
         fold.apply(UsageObservation::Exited { process }).unwrap();
@@ -1005,7 +1109,7 @@ mod tests {
     fn usage_read_after_the_exit_is_final_and_no_read_runs_it_again() {
         let process = identity(48);
         let start = Instant::now();
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(start);
         fold.apply(read(process, reading(start, 1_000, 0))).unwrap();
         let at_exit = UsageReading {
             exited: true,
@@ -1032,7 +1136,7 @@ mod tests {
         let process = identity(45);
         let start = Instant::now();
         let later = start + Duration::from_secs(1);
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(start);
         fold.apply(read(process, reading(later, 10, 10))).unwrap();
         let other = UsageReading {
             started: StartStamp(8),
@@ -1366,7 +1470,7 @@ mod tests {
         let mut release = parent.stdin.take().expect("parent stdin");
         let mut lines = BufReader::new(parent.stdout.take().expect("parent stdout")).lines();
         let parent_life = observed(parent.id());
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(Instant::now());
         assert!(matches!(tick(&mut fold, &parent_life), Sampled::Read(_)));
 
         let burner_pid: u32 = next_report(&mut lines, "burning")[0].parse().expect("pid");
@@ -1457,7 +1561,7 @@ mod tests {
         next_report(&mut lines, "reaped");
 
         let waiting = read_leader(&leader).expect("the held, waiting leader");
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(Instant::now());
         assert!(matches!(tick(&mut fold, &parent_life), Sampled::Read(_)));
         let row = total(fold.usage(parent_life.identity).expect("the parent's row"));
         let cpu =
@@ -1553,7 +1657,7 @@ mod tests {
     fn an_exited_unreaped_life_is_read_to_its_end_and_gone_once_reaped() {
         let (mut child, stdin) = held_shell();
         let life = observed(child.id());
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(Instant::now());
         assert!(matches!(tick(&mut fold, &life), Sampled::Read(_)));
         exit_unreaped(&child, stdin);
         assert!(
@@ -1576,7 +1680,7 @@ mod tests {
         let (mut child, stdin) = held_shell();
         let life = observed(child.id());
         exit_unreaped(&child, stdin);
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(Instant::now());
         #[cfg(target_os = "linux")]
         assert!(matches!(tick(&mut fold, &life), Sampled::Read(_)));
         #[cfg(target_os = "macos")]
@@ -1599,7 +1703,7 @@ mod tests {
             own_counters(pid).expect("a reaped pid's read"),
             None::<OwnCounters>
         );
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(Instant::now());
         assert_eq!(tick(&mut fold, &life), Sampled::Gone);
         fold.apply(UsageObservation::Exited {
             process: life.identity,
@@ -1711,7 +1815,7 @@ mod tests {
         const MIB: u64 = 1 << 20;
         let mut large = Fixture::start("allocate 96", "allocated");
         let small = Fixture::start("allocate 24", "allocated");
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(Instant::now());
         let read = |fold: &mut ProcessUsageFold, allocator: &Fixture| {
             assert!(matches!(tick(fold, &allocator.life), Sampled::Read(_)));
             let usage = fold.usage(allocator.life.identity).expect("usage");
@@ -1774,7 +1878,7 @@ mod tests {
         let (first, second) = (path("first"), path("second"));
         let mut writer_reader = Fixture::start(&format!("io 8 4 {first}"), "ready");
         let mut writer = Fixture::start(&format!("io 2 0 {second}"), "ready");
-        let mut fold = ProcessUsageFold::default();
+        let mut fold = ProcessUsageFold::clocked(Instant::now());
         for fixture in [&writer_reader, &writer] {
             assert!(matches!(tick(&mut fold, &fixture.life), Sampled::Read(_)));
         }
