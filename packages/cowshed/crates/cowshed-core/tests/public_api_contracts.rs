@@ -699,6 +699,34 @@ fn output_limit_is_an_explicit_terminal_projection() {
     assert!(serde_json::from_value::<JobInfo>(value).is_err());
 }
 
+/// A job killed before its command existed never ran: it is projected killed with no pid and no
+/// exit status. A killed job that owned a process keeps the status it ended with; one that omits
+/// it is refused, so the two facts never share a projection.
+#[test]
+fn a_job_killed_before_it_ran_has_no_exit_and_one_that_ran_keeps_its_own() {
+    let mut never_ran = finished_job(None);
+    never_ran.state = JobState::Killed;
+    never_ran.pid = None;
+    never_ran.exit = None;
+    never_ran.resources = None;
+    never_ran.nice = None;
+    never_ran.cpu_tokens = None;
+    let value = serde_json::to_value(&never_ran).expect("a job killed while queued is projected");
+    assert!(value.get("exit").is_none() && value.get("pid").is_none());
+    assert_eq!(
+        serde_json::from_value::<JobInfo>(value).expect("and decoded"),
+        never_ran
+    );
+
+    let mut ran = finished_job(None);
+    ran.state = JobState::Killed;
+    ran.exit = None;
+    assert!(
+        ran.validate().is_err(),
+        "a killed job that owned a process keeps its status"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_record_enforces_terminal_invariants_both_directions() {

@@ -1787,7 +1787,10 @@ One boundary answer, no ambiguity:
   client operation, not the durable job. Callers invoke `JobHandle.kill()` explicitly. A completed explicit kill or
   workspace retirement records `JobState::Killed` while retaining the operating system's actual `ExitStatus`. A child
   that handles SIGTERM may report `Exited`, including code zero; a child terminated by the signal reports `Signaled`.
-  Both are valid in `JobInfo` and `ExecRecord`; neither may omit the observed exit status.
+  Both are valid in `JobInfo` and `ExecRecord`; neither may omit the observed exit status. A job killed before its
+  command existed — withdrawn while queued for its CPU grant (11_shell.md, "Server-owned CPU admission and nice
+  placement") — never ran: its `JobInfo` is `Killed` with no `pid` and no `exit`. A killed `JobInfo` with a `pid` and no
+  `exit` is refused, so "never ran" and "ran and was killed" never share a projection.
 - **Binary stdin** is supported without shell interpolation: `ExecOptions.stdin` accepts inline `Uint8Array`,
   backpressured `AsyncIterable<Uint8Array>`, or a workspace-relative file object with the canonical no-follow open.
 - **Stdin lifecycle is observable.** Open occurs after `JobId` allocation; EOF closes child stdin once, cancellation

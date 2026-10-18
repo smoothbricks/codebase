@@ -2026,6 +2026,11 @@ impl JobInfo {
             | (JobState::Killed, Some(_))
             | (JobState::OutputLimit | JobState::Failed, _)
             | (JobState::Queued | JobState::Running, None) => {}
+            // Killed before its command existed -- withdrawn while queued for its CPU grant
+            // (11_shell.md "Server-owned CPU admission and nice placement"): it never ran, so it
+            // has no status. A job that owned a process has a pid and keeps the status it ended
+            // with, so "never ran" and "ran and was killed" stay distinct.
+            (JobState::Killed, None) if self.pid.is_none() => {}
             _ => {
                 return Err(DtoError::InvalidJobProjection(
                     "exit kind does not agree with job state",
