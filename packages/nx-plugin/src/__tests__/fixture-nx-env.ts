@@ -42,6 +42,12 @@ const repositoryRoot = join(import.meta.dir, '../../../..');
  * daemons of one workspace bind two paths. With the directory named, they bind
  * one: a test whose subject is two daemons on two socket paths names a second
  * directory for the second. Building the environment publishes nothing.
+ *
+ * NX_NATIVE_FILE_CACHE_DIRECTORY is the fixture's own too. Nx loads its native
+ * binding from a copy in that cache, by default `/tmp/.nx/<uid>/native-cache`,
+ * which every Nx on the host shares and any `nx reset` deletes. A load that loses
+ * that race falls back to Nx's WASI binding without a word, and fails later on
+ * what WASI lacks (`FileLock is not a constructor`, from a task output lease).
  */
 export function fixtureNxEnv(workspace: string, socketDirectory: string): Record<string, string> {
   const env: Record<string, string> = {};
@@ -59,6 +65,7 @@ export function fixtureNxEnv(workspace: string, socketDirectory: string): Record
     NX_SOCKET_DIR: socketDirectory,
     NX_WORKSPACE_DATA_DIRECTORY: join(workspace, '.nx/workspace-data'),
     NX_CACHE_DIRECTORY: join(workspace, '.nx/cache'),
+    NX_NATIVE_FILE_CACHE_DIRECTORY: join(workspace, '.nx/native-file-cache'),
   };
 }
 
