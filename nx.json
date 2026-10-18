@@ -29,6 +29,13 @@
       "{workspaceRoot}/packages/cowshed/scripts/*.sh",
       "{workspaceRoot}/packages/lmao/src/lib/schema/systemSchema.ts",
       "{workspaceRoot}/packages/lmao/src/lib/capacityTuning.ts"
+    ],
+    "bunToolchain": [
+      "{workspaceRoot}/tooling/direnv/nixpkgs-overlay/flake.nix",
+      "{workspaceRoot}/tooling/direnv/nixpkgs-overlay/_sources/generated.nix",
+      {
+        "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun --revision"
+      }
     ]
   },
   "targetDefaults": {
@@ -42,7 +49,7 @@
     },
     "test": {
       "cache": true,
-      "inputs": ["default", "^default"]
+      "inputs": ["default", "^default", "bunToolchain"]
     },
     "cargo-test": {
       "inputs": ["default", "^default"]
