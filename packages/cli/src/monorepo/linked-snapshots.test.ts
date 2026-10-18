@@ -131,7 +131,9 @@ function fixture(): Fixture {
       dependencies: { 'linked-leaf': 'workspace:*', 'store-dep': '1.0.0' },
     }),
   );
-  write(join(source, 'tsconfig.json'), JSON.stringify({ extends: '../../tsconfig.base.json' }));
+  // Solution-style, as lmao's: its sources take their compiler options only through the referenced project.
+  write(join(source, 'tsconfig.json'), JSON.stringify({ files: [], references: [{ path: './tsconfig.lib.json' }] }));
+  write(join(source, 'tsconfig.lib.json'), JSON.stringify({ extends: '../../tsconfig.base.json', include: ['src'] }));
   write(join(source, 'src/index.js'), 'export { leaf } from "linked-leaf";\nexport { store } from "store-dep";\n');
   write(
     join(source, 'src/native.js'),
@@ -233,6 +235,7 @@ describe('linked package snapshots', () => {
     const root = join(snapshot.directory, '..', '..');
     expect(readFileSync(join(root, 'packages/leaf/dist/index.js'), 'utf8')).toBe('export const leaf = "first";\n');
     expect(readFileSync(join(root, '.cache/native/lib.bin'), 'utf8')).toBe('native-one');
+    expect(JSON.parse(readFileSync(join(snapshot.directory, 'tsconfig.lib.json'), 'utf8')).include).toEqual(['src']);
     expect(readFileSync(join(root, 'tsconfig.base.json'), 'utf8')).toContain('strict');
     expect(
       lstatSync(join(root, 'node_modules/.bun/store-dep@1.0.0/node_modules/store-dep/index.js')).mode & 0o222,

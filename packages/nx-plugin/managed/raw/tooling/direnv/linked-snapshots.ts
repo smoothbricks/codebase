@@ -15,8 +15,9 @@
  *
  * - every provider workspace package in the declared package's link closure:
  *   its manifest, the files its manifest's `files` publishes, and its
- *   `tsconfig.json` with every relative `extends` (Bun applies a source
- *   module's tsconfig `paths`);
+ *   `tsconfig.json` with every relative `extends` and project `references`
+ *   entry it reaches (Bun applies a source module's tsconfig `paths`, and a
+ *   solution-style config gives sources their options through a reference);
  * - the provider root manifest, which owns the files outside every package;
  * - the native library each declared artifact module's `nativeArtifactPath({})`
  *   names: the checkout's own build, never a consumer override;
@@ -371,10 +372,21 @@ function readManifest(manifestPath: string): Record<string, unknown> {
   return Object.fromEntries(Object.entries(manifest));
 }
 
-/** A package's `tsconfig.json` and every configuration it extends, by relative path only. */
+/**
+ * A package's `tsconfig.json` and every configuration it reaches, by relative path only: each `extends` and each
+ * project `references` entry. A solution-style `tsconfig.json` (no files of its own) gives its sources their compiler
+ * options only through a referenced project, so a source consumer that reads the package's tsconfig needs that
+ * project too; it is a compile input, not documentation.
+ */
 function tsconfigChain(config: string): string[] {
   if (lstatSync(config, { throwIfNoEntry: false }) === undefined) return [];
   const chain: string[] = [];
+  const relative = (file: string, edge: 'extends' | 'references', target: unknown): string => {
+    if (typeof target !== 'string' || !(target.startsWith('./') || target.startsWith('../'))) {
+      throw new SnapshotRefusal(`${file} ${edge} ${JSON.stringify(target)}, which a snapshot cannot carry`);
+    }
+    return path.resolve(path.dirname(file), target);
+  };
   const visit = (file: string) => {
     if (chain.includes(file)) return;
     chain.push(file);
@@ -384,16 +396,31 @@ function tsconfigChain(config: string): string[] {
     } catch (error) {
       throw new SnapshotRefusal(`cannot read ${file}: ${error instanceof Error ? error.message : String(error)}`);
     }
-    const extended = typeof parsed === 'object' && parsed !== null ? Reflect.get(parsed, 'extends') : undefined;
-    if (extended === undefined) return;
-    for (const base of Array.isArray(extended) ? extended : [extended]) {
-      if (typeof base !== 'string' || !(base.startsWith('./') || base.startsWith('../'))) {
-        throw new SnapshotRefusal(`${file} extends ${JSON.stringify(base)}, which a snapshot cannot carry`);
+    if (typeof parsed !== 'object' || parsed === null) return;
+    const extended: unknown = Reflect.get(parsed, 'extends');
+    if (extended !== undefined) {
+      for (const base of Array.isArray(extended) ? extended : [extended]) {
+        const resolved = relative(file, 'extends', base);
+        const named = path.extname(resolved) === '.json' ? resolved : `${resolved}.json`;
+        if (lstatSync(named, { throwIfNoEntry: false }) === undefined) {
+          throw new SnapshotRefusal(`${file} extends ${base}, which does not exist`);
+        }
+        visit(named);
       }
-      const resolved = path.resolve(path.dirname(file), base);
-      const named = path.extname(resolved) === '.json' ? resolved : `${resolved}.json`;
+    }
+    const references: unknown = Reflect.get(parsed, 'references');
+    if (references === undefined) return;
+    if (!Array.isArray(references)) throw new SnapshotRefusal(`${file} references is not an array`);
+    for (const reference of references) {
+      const target: unknown =
+        typeof reference === 'object' && reference !== null ? Reflect.get(reference, 'path') : undefined;
+      const resolved = relative(file, 'references', target);
+      // A reference names a project directory (its tsconfig.json) or a configuration file.
+      const named = lstatSync(resolved, { throwIfNoEntry: false })?.isDirectory()
+        ? path.join(resolved, 'tsconfig.json')
+        : resolved;
       if (lstatSync(named, { throwIfNoEntry: false }) === undefined) {
-        throw new SnapshotRefusal(`${file} extends ${base}, which does not exist`);
+        throw new SnapshotRefusal(`${file} references ${String(target)}, which does not exist`);
       }
       visit(named);
     }
