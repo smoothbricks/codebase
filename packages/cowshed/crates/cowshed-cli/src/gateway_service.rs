@@ -2,12 +2,13 @@ use crate::args::GatewayCommand;
 use crate::build_record::{BuildRecord, unproven_refusal, unrecorded_refusal};
 use crate::install_basis::{self, InstallSlot};
 use crate::launchd::{
-    BunDirectory, COWSHED_BINARY_NAME, ExecutableDigest, ExecutableInstallState, ExistingPlist,
-    GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState, InstalledExecutable,
-    JOBSERVER_LAUNCHER_NAME, LaunchAgentSpec, LaunchAgentTarget, LaunchctlCommand, LaunchdExecutor,
-    LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem, NativeLaunchctlCommand,
-    PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink, kickstart_hint, plan_executable_install,
-    plan_executable_remove, plan_install, plan_launcher_link, plan_remove, replace_symlink,
+    BunDirectory, COWSHED_BINARY_NAME, DevenvProfile, ExecutableDigest, ExecutableInstallState,
+    ExistingPlist, GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState,
+    InstalledExecutable, JOBSERVER_LAUNCHER_NAME, LaunchAgentSpec, LaunchAgentTarget,
+    LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
+    NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink, kickstart_hint,
+    plan_executable_install, plan_executable_remove, plan_install, plan_launcher_link, plan_remove,
+    replace_symlink,
 };
 use crate::output::Output;
 use crate::path_entry::PathEntryOutcome;
@@ -853,13 +854,19 @@ pub fn gateway_launch_agent(home: &Path) -> Result<(HostStableExecutable, Launch
     Ok((executable, target))
 }
 
-/// The `bun` this invocation's `PATH` provides, for the gateway agent's `PATH`. Its absence is a
-/// setup error, refused before anything is installed: cowshed bundles no interpreter (tg#7504).
+/// The `bun` this invocation's `PATH` provides, for the gateway agent's `PATH`, named as a profile
+/// nix or devenv keeps ([`BunDirectory`]). No `bun`, or one only a bare store path names, is a setup
+/// error refused before anything is installed: cowshed bundles no interpreter (tg#7504), and keeps
+/// no store path alive for one.
 fn invoking_bun() -> Result<BunDirectory> {
-    BunDirectory::on_path(&std::env::var_os("PATH").unwrap_or_default()).map_err(|reason| {
+    BunDirectory::on_path(
+        &std::env::var_os("PATH").unwrap_or_default(),
+        DevenvProfile::of_environment().as_ref(),
+    )
+    .map_err(|reason| {
         CowshedError::environment_missing(
             format!("the gateway runs its Nx cache server with bun: {reason}"),
-            "run this cowshed's setup from a shell whose PATH has bun (devenv provides it)",
+            "run this cowshed's setup from main's devenv shell, or from a shell whose PATH has bun in a nix profile (such as /etc/profiles/per-user/$USER/bin)",
         )
     })
 }
@@ -2756,7 +2763,7 @@ mod tests {
         let bun = directory.join("bun");
         fs::write(&bun, b"#!/bin/sh\n").unwrap();
         fs::set_permissions(&bun, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        BunDirectory::on_path(directory.as_os_str()).unwrap()
+        BunDirectory::on_path(directory.as_os_str(), None).unwrap()
     }
 
     /// A home whose gateway agent is installed with a current plist and no binary yet.

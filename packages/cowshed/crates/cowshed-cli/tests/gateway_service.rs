@@ -70,9 +70,10 @@ impl LaunchctlCommand for RecordingLaunchctl {
     }
 }
 
-/// The bun a devenv shell's `PATH` resolves to; the gateway agent's `PATH` leads with it.
+/// The bun a devenv shell's `PATH` provides, named by the profile link devenv keeps; the gateway
+/// agent's `PATH` leads with it.
 fn bun() -> BunDirectory {
-    BunDirectory::new("/nix/store/0000000000000000000000000000000b-bun-1.4.2/bin".into())
+    BunDirectory::new("/Users/test/Dev/project/tooling/direnv/.devenv/profile/bin".into())
         .expect("valid bun directory")
 }
 
