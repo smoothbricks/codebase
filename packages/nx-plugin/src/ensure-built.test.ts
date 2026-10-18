@@ -1,8 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { chmod, cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { Task } from 'nx/src/config/task-graph';
@@ -10,6 +11,7 @@ import type { DaemonProcessJson } from 'nx/src/daemon/cache';
 import { expandOutputs } from 'nx/src/native';
 import { getExecutorNameForTask } from 'nx/src/tasks-runner/utils';
 import { signalToCode } from 'nx/src/utils/exit-codes';
+import { readModulePackageJson } from 'nx/src/utils/package-json';
 import typia from 'typia';
 import { nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
 import type { EnsureBuiltProbeResult } from './ensure-built.js';
@@ -34,6 +36,7 @@ import {
   workspaceEnvironment,
   workspaceFileChanges,
 } from './ensure-built.js';
+import { graphInstallationIdentity } from './ensure-built-witness.js';
 import { managedAssetsRoot } from './managed-assets.js';
 import { NX_LONGEST_SOCKET_NAME, ownedSocketDirectory, pidsWorkingIn } from './testing.js';
 
@@ -566,7 +569,8 @@ const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(packageRoot));
 const binEntry = join(packageRoot, 'src', 'bin', 'smoo-nx-exec.ts');
 const builtBinEntry = join(packageRoot, 'dist', 'bin', 'smoo-nx-exec.js');
-const nxEntry = join(repoRoot, 'node_modules', '.bin', 'nx');
+/** The Nx CLI of a fixture workspace's own installation. */
+const nxEntry = (workspace: string) => join(workspace, 'node_modules', '.bin', 'nx');
 const MARKER = 'EXEC_OK';
 /**
  * Reports what the exec'd process inherited: the marker proves execve
@@ -723,6 +727,104 @@ const FIXTURE_NX_JSON = {
   plugins: ['@smoothbricks/nx-plugin'],
 };
 
+/** What {@link graphInstallationIdentity} binds: resolution edges `[from, name, physical manifest]`, node stamps, file hashes. */
+interface InstallationCensus {
+  readonly resolutions: readonly (readonly [string, string, string | null])[];
+  readonly nodes: readonly { readonly path: string; readonly stamp: string }[];
+  readonly files: readonly { readonly path: string; readonly sha256: string }[];
+}
+
+/** The graph witness's installation identity resolved from `root`; an unproved installation fails loudly. */
+function installationIdentity(root: string): string {
+  let unproved = 'no detail';
+  const identity = graphInstallationIdentity(
+    root,
+    FIXTURE_NX_JSON,
+    readModulePackageJson,
+    expandOutputs,
+    null,
+    (detail) => {
+      unproved = detail;
+    },
+  );
+  if (identity === null) throw new Error(`the Nx installation resolved from ${root} is unproved: ${unproved}`);
+  return identity;
+}
+
+/** The installation this file's fixtures share, and its identity when the copy was made. */
+interface OwnedInstallation {
+  readonly root: string;
+  readonly identity: string;
+}
+
+let ownedInstallation: Promise<OwnedInstallation> | undefined;
+
+/**
+ * The Nx installation this test file owns, made on first use and shared by its fixtures.
+ *
+ * The graph witness binds node stamps (ctime included) of every file in the closure of Nx, this plugin and
+ * TypeScript. Linked from the repository, that closure is the host's: on CI its files are hardlinks in the shared
+ * Bun store, and any other task that installs, restores or cleans changes their link count, so their ctime, so the
+ * fixture's installation identity, between two calls of one test. A fixture must not take an input it does not own.
+ *
+ * So the closure is copied, exactly as the witness's own census resolves it in the repository: each package once,
+ * with the census's own exclusions (`node_modules`, `.git`, `.nx`), each dependency edge relinked beside its copy as
+ * Bun's isolated layout does, the top-level packages' bins in `.bin`. Every copy is a new inode, cloned where the
+ * volume allows and written otherwise, so no link count is shared with anything outside this file. The cost is one
+ * copy of the whole closure per run of this file, not one per fixture: the fixtures only read it, which their
+ * suite proves when it retires the copy.
+ */
+function fixtureInstallation(): Promise<OwnedInstallation> {
+  ownedInstallation ??= (async () => {
+    const { resolutions } = typia.json.assertParse<InstallationCensus>(installationIdentity(repoRoot));
+    const root = await nxFixtureRoot('ensure-built-installation-');
+    const modules = join(root, 'node_modules');
+    // Each source package root's copy, inside a store directory whose node_modules also holds its dependency links.
+    const copies = new Map<
+      string,
+      { readonly store: string; readonly copy: string; readonly bin: string | Record<string, string> | undefined }
+    >();
+    for (const [, , manifest] of resolutions) {
+      if (manifest === null || copies.has(dirname(manifest))) continue;
+      const { name, bin } = typia.json.assertParse<{ name: string; bin?: string | Record<string, string> }>(
+        await readFile(manifest, 'utf8'),
+      );
+      const store = join(modules, '.store', String(copies.size), 'node_modules');
+      copies.set(dirname(manifest), { store, copy: join(store, name), bin });
+    }
+    const copyOf = (source: string) => {
+      const copied = copies.get(source);
+      if (copied === undefined) throw new Error(`${source} resolves dependencies but is not in the census`);
+      return copied;
+    };
+    await Promise.all(
+      [...copies].map(([source, { copy }]) =>
+        cp(source, copy, {
+          recursive: true,
+          verbatimSymlinks: true,
+          mode: constants.COPYFILE_FICLONE,
+          filter: (path) => path === source || !['node_modules', '.git', '.nx'].includes(basename(path)),
+        }),
+      ),
+    );
+    for (const [from, name, manifest] of resolutions) {
+      if (manifest === null) continue;
+      const link = join(from === repoRoot ? modules : copyOf(from).store, name);
+      await mkdir(dirname(link), { recursive: true });
+      await symlink(relative(dirname(link), copyOf(dirname(manifest)).copy), link, 'dir');
+      if (from !== repoRoot) continue;
+      const { bin } = copyOf(dirname(manifest));
+      const commands = typeof bin === 'string' ? { [basename(name)]: bin } : (bin ?? {});
+      for (const [command, path] of Object.entries(commands)) {
+        await mkdir(join(modules, '.bin'), { recursive: true });
+        await symlink(relative(join(modules, '.bin'), join(link, path)), join(modules, '.bin', command));
+      }
+    }
+    return { root, identity: installationIdentity(root) };
+  })();
+  return ownedInstallation;
+}
+
 /**
  * Two projects, `app:build` reading `lib:build`'s outputs through
  * `dependentTasksOutputFiles`: Nx's runner-warmup hasher leaves such a task
@@ -739,8 +841,7 @@ async function writeTwoProjectWorkspace(workspace: string, builds: string, publi
   await writeFile(join(workspace, '.gitignore'), '.nx\nnode_modules\npackages/*/dist\n');
   await mkdir(join(workspace, 'packages', 'app'), { recursive: true });
   await mkdir(join(workspace, 'packages', 'lib'), { recursive: true });
-  // The repository's own node_modules, so the fixture resolves the Nx this package is written against.
-  await symlink(join(repoRoot, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+  await symlink(join((await fixtureInstallation()).root, 'node_modules'), join(workspace, 'node_modules'), 'dir');
   const nxJson = publishReceipts
     ? {
         ...FIXTURE_NX_JSON,
@@ -792,6 +893,36 @@ async function writeTwoProjectWorkspace(workspace: string, builds: string, publi
 }
 
 describe('smoo-nx-exec with a fresh daemon', () => {
+  // The fixtures share one installation because none writes into it; otherwise one fixture's write would be
+  // another's input. Its identity when retired must be the one it was made with.
+  afterAll(async () => {
+    if (ownedInstallation === undefined) return;
+    const { root, identity } = await ownedInstallation;
+    try {
+      const retired = installationIdentity(root);
+      if (retired !== identity) {
+        const entries = (census: string) => {
+          const { nodes, files } = typia.json.assertParse<InstallationCensus>(census);
+          return new Set([
+            ...nodes.map(({ path, stamp }) => `${path} ${stamp}`),
+            ...files.map(({ path, sha256 }) => `${path} ${sha256}`),
+          ]);
+        };
+        const made = entries(identity);
+        const now = entries(retired);
+        const changed = [
+          ...[...made].filter((entry) => !now.has(entry)).map((entry) => `- ${entry}`),
+          ...[...now].filter((entry) => !made.has(entry)).map((entry) => `+ ${entry}`),
+        ];
+        throw new Error(
+          `a fixture changed the installation it shares, in ${root}:\n${changed.slice(0, 20).join('\n')}`,
+        );
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   /**
    * The socket directory a call entered from another workspace's shell is given for `workspace`, or null where the
    * packaged socket owner has no managed shell runtime to bind in (`DEVENV_RUNTIME` unset), and Nx keeps its own
@@ -826,7 +957,7 @@ describe('smoo-nx-exec with a fresh daemon', () => {
         await writeTwoProjectWorkspace(workspace, builds);
         const built = await run(
           'node',
-          nxEntry,
+          nxEntry(workspace),
           workspace,
           ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
           { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace },
@@ -958,7 +1089,7 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
           const ownEnv: Record<string, string> = providerSockets === null ? {} : { NX_SOCKET_DIR: providerSockets };
           const built = await run(
             'node',
-            nxEntry,
+            nxEntry(workspace),
             workspace,
             ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
             { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace },
@@ -1002,7 +1133,7 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
           expect(sourceCommit.status, sourceCommit.stdout + sourceCommit.stderr).toBe(0);
           const published = await run(
             'node',
-            nxEntry,
+            nxEntry(workspace),
             workspace,
             ['run', 'app:build', '--outputStyle=static-failures-only'],
             { NX_DAEMON: 'true', NX_WORKSPACE_ROOT_PATH: workspace, ...ownEnv },
@@ -1141,7 +1272,7 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
           // cached and on disk, recorded by no daemon.
           const built = await run(
             'node',
-            nxEntry,
+            nxEntry(workspace),
             workspace,
             ['run-many', '-t', 'build', '-p', 'app', '--outputStyle=static-failures-only'],
             { NX_DAEMON: 'false', NX_WORKSPACE_ROOT_PATH: workspace },
