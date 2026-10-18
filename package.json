@@ -146,6 +146,9 @@
           "rustWorkspace",
           {
             "env": "LMAO_GIT_REVISION"
+          },
+          {
+            "externalDependencies": []
           }
         ]
       },
@@ -154,6 +157,9 @@
           "rustWorkspace",
           {
             "env": "LMAO_GIT_REVISION"
+          },
+          {
+            "externalDependencies": []
           }
         ]
       },
