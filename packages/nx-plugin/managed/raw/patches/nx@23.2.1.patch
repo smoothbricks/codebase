@@ -1578,6 +1578,138 @@ index 28c9655c4612dcc85a881816f172dce98642bb0c..ea65f019024da507dd81f4ace1202091
      }
      catch (e) {
          // we need to include the workspace validity errors in the final error
+diff --git a/dist/src/project-graph/error-types.d.ts b/dist/src/project-graph/error-types.d.ts
+index 46d9dfad0c1027d000776a78c3afb87e713ffa97..0eff844129dad8f03eb6ab5f8b57b4d49718b1f9 100644
+--- a/dist/src/project-graph/error-types.d.ts
++++ b/dist/src/project-graph/error-types.d.ts
+@@ -66,6 +66,12 @@ export declare class ProjectConfigurationsError extends Error {
+     constructor(errors: Array<MergeNodesError | AggregateCreateNodesError | ProjectsWithNoNameError | MultipleProjectsWithSameNameError | WorkspaceValidityError>, partialProjectConfigurationsResult: ConfigurationResult);
+ }
+ export declare function isProjectConfigurationsError(e: unknown): e is ProjectConfigurationsError;
++export declare function formatErrorMessages(error: unknown): string;
++export declare function formatProjectGraphError(error: ProjectGraphError | ProjectConfigurationsError, isVerbose: boolean): {
++    title: string;
++    bodyLines: string[];
++};
++export declare function formatErrorStackAndCause(error: Error): string;
+ /**
+  * This error should be thrown when a `createNodesV2` function hits a recoverable error.
+  * It allows Nx to recieve partial results and continue processing for better UX.
+diff --git a/dist/src/project-graph/error-types.js b/dist/src/project-graph/error-types.js
+index 1ce005430eef99e12234a5471c9761a2f7acc905..45d4d373853eebea7325450c36148e9985f74789 100644
+--- a/dist/src/project-graph/error-types.js
++++ b/dist/src/project-graph/error-types.js
+@@ -13,6 +13,9 @@ exports.isAggregateProjectGraphError = isAggregateProjectGraphError;
+ exports.isCreateMetadataError = isCreateMetadataError;
+ exports.isAggregateCreateNodesError = isAggregateCreateNodesError;
+ exports.isMergeNodesError = isMergeNodesError;
++exports.formatErrorMessages = formatErrorMessages;
++exports.formatProjectGraphError = formatProjectGraphError;
++exports.formatErrorStackAndCause = formatErrorStackAndCause;
+ const tslib_1 = require("tslib");
+ class StaleProjectGraphCacheError extends Error {
+     constructor() {
+@@ -333,9 +336,10 @@ function formatAggregateCreateNodesError(error, pluginName) {
+             errorStackLines.push(` - ${file}:`);
+         }
+         for (const e of errors) {
+-            const messageLines = e.message.split('\n');
+-            // Errors deserialized from a plugin worker may arrive without a stack.
+-            const stackLines = (e.stack ?? e.message).split('\n');
++            const messageLines = formatErrorMessages(e).split('\n');
++            // Errors deserialized from a plugin worker may arrive without a
++            // stack; formatErrorStackAndCause falls back to the message.
++            const stackLines = formatErrorStackAndCause(e).split('\n');
+             if (file) {
+                 errorBodyLines.push(...messageLines.map((line) => `      ${line}`));
+                 errorStackLines.push(...stackLines.map((line) => `     ${line}`));
+@@ -475,10 +479,81 @@ function indentString(str, indent) {
+             .map((line) => ' '.repeat(indent) + line)
+             .join('\n'));
+ }
++// Every message an error carries, without stacks: its own, its `cause` chain
++// and its nested `errors` (AggregateCreateNodesError entries are [file, error]
++// pairs). An AggregateCreateNodesError's message already lists its entries
++// (formatAggregateCreateNodesError), so they are not repeated. A shared error
++// in separate branches stays visible in each; a circular one is named.
++function formatErrorMessages(error, ancestors = new Set()) {
++    const isObject = error !== null && typeof error === 'object';
++    if (isObject) {
++        if (ancestors.has(error)) {
++            return '[Circular error]';
++        }
++        ancestors.add(error);
++    }
++    let message = Array.isArray(error) ? '' : String(error?.message ?? error);
++    if (error?.cause !== undefined) {
++        message += `\nCaused by: ${formatErrorMessages(error.cause, ancestors)}`;
++    }
++    const nestedErrors = Array.isArray(error)
++        ? error
++        : isObject && isAggregateCreateNodesError(error)
++            ? undefined
++            : error?.errors;
++    if (Array.isArray(nestedErrors)) {
++        for (const nested of nestedErrors) {
++            message += `${message ? '\n' : ''}${formatErrorMessages(nested, ancestors)}`;
++        }
++    }
++    if (isObject) {
++        ancestors.delete(error);
++    }
++    return message;
++}
++// nrwl/nx#37103: without --verbose, name every underlying error (messages and
++// causes) instead of the bare "Failed to process project graph." headline.
++function formatProjectGraphError(error, isVerbose) {
++    const errors = isProjectConfigurationsError(error)
++        ? error.errors
++        : error.getErrors();
++    let title = error.message;
++    if (error.cause &&
++        typeof error.cause === 'object' &&
++        'message' in error.cause) {
++        title += ' ' + error.cause.message + '.';
++    }
++    return {
++        title,
++        bodyLines: isVerbose
++            ? [formatErrorStackAndCause(error)]
++            : [
++                ...errors.map((e) => formatErrorMessages(e)),
++                '',
++                'Pass --verbose to see the stacktraces.',
++            ],
++    };
++}
+ function formatErrorStackAndCause(error) {
+-    const cause = error.cause && error.cause instanceof Error ? error.cause : null;
+-    return (error.stack +
+-        (cause
+-            ? `\nCaused by: \n${indentString(cause.stack ?? cause.message, 2)}`
+-            : ''));
++    const cause = describeCause(error.cause);
++    return ((error.stack ?? error.message) +
++        (cause ? `\nCaused by: \n${indentString(cause, 2)}` : ''));
++}
++function describeCause(cause) {
++    if (!cause) {
++        return null;
++    }
++    if (cause instanceof Error) {
++        return cause.stack ?? cause.message;
++    }
++    if (typeof cause === 'object') {
++        const { stack, message } = cause;
++        if (typeof stack === 'string') {
++            return stack;
++        }
++        if (typeof message === 'string') {
++            return message;
++        }
++    }
++    return String(cause);
+ }
 diff --git a/dist/src/project-graph/nx-deps-cache.d.ts b/dist/src/project-graph/nx-deps-cache.d.ts
 index 5bc1e76b319294101cc9b038dc6eb0ad01036b13..baf7908aeb206f1c4e26ed0c8578465d8b510776 100644
 --- a/dist/src/project-graph/nx-deps-cache.d.ts
@@ -1672,61 +1804,36 @@ index a880a6620cd7ac46e4bd189bc2034ce58825769a..ef3c99a115e7114ea78da379316a0478
      })) {
          return true;
 diff --git a/dist/src/project-graph/plugins/get-plugins.js b/dist/src/project-graph/plugins/get-plugins.js
-index df153050063fa81b915d3004d3a87cd397f73b19..7d751ed7b895ea88735361b481c9437339ef7ffa 100644
+index df153050063fa81b915d3004d3a87cd397f73b19..ddc9b044fd4b74e7d25d95f6f636c1b721a301eb 100644
 --- a/dist/src/project-graph/plugins/get-plugins.js
 +++ b/dist/src/project-graph/plugins/get-plugins.js
-@@ -296,7 +296,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
+@@ -22,6 +22,7 @@ const is_sandbox_1 = require("../../utils/is-sandbox");
+ const native_1 = require("../../native");
+ const output_1 = require("../../utils/output");
+ const transpiler_1 = require("./transpiler");
++const error_types_1 = require("../error-types");
+ /**
+  * Stuff for specified NX Plugins.
+  */
+@@ -296,7 +297,7 @@ async function loadDefaultNxPlugins(root = workspace_root_1.workspaceRoot) {
              fn();
          }
          const errorMessage = errors
 -            .map((e) => `  - ${e.pluginName}: ${e.error.message}`)
-+            .map((e) => `  - ${e.pluginName}: ${formatPluginLoadError(e.error).replace(/\n/g, '\n    ')}`)
++            .map((e) => `  - ${e.pluginName}: ${(0, error_types_1.formatErrorMessages)(e.error).replace(/\n/g, '\n    ')}`)
              .join('\n');
          throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} default Nx plugin(s):\n${errorMessage}`);
      }
-@@ -361,7 +361,7 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
+@@ -361,7 +362,7 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
              fn();
          }
          const errorMessage = errors
 -            .map((e) => `  - ${e.pluginName}: ${e.error.message}`)
-+            .map((e) => `  - ${e.pluginName}: ${formatPluginLoadError(e.error).replace(/\n/g, '\n    ')}`)
++            .map((e) => `  - ${e.pluginName}: ${(0, error_types_1.formatErrorMessages)(e.error).replace(/\n/g, '\n    ')}`)
              .join('\n');
          throw new AggregateError(errors.map((e) => e.error), `Failed to load ${errors.length} Nx plugin(s):\n${errorMessage}`);
      }
-@@ -376,6 +376,32 @@ async function loadSpecifiedNxPlugins(pluginsConfigurations, root = workspace_ro
-     };
-     return plugins;
- }
-+// Plugin resolution can wrap configuration errors before a plugin ever runs.
-+// Keep their causes and aggregate entries in the non-verbose diagnostic too.
-+function formatPluginLoadError(error, ancestors = new Set()) {
-+    const isObject = error !== null && typeof error === 'object';
-+    if (isObject) {
-+        if (ancestors.has(error)) {
-+            return '[Circular error]';
-+        }
-+        ancestors.add(error);
-+    }
-+    let message = Array.isArray(error) ? '' : String(error?.message ?? error);
-+    if (error?.cause !== undefined) {
-+        message += `\nCaused by: ${formatPluginLoadError(error.cause, ancestors)}`;
-+    }
-+    // AggregateCreateNodesError entries can be [file, error] pairs.
-+    const nestedErrors = Array.isArray(error) ? error : error?.errors;
-+    if (Array.isArray(nestedErrors)) {
-+        for (const nested of nestedErrors) {
-+            message += `${message ? '\n' : ''}${formatPluginLoadError(nested, ancestors)}`;
-+        }
-+    }
-+    if (isObject) {
-+        ancestors.delete(error);
-+    }
-+    return message;
-+}
- function reasonToError(reason) {
-     if (reason instanceof Error) {
-         return reason;
-@@ -385,6 +411,12 @@ function reasonToError(reason) {
+@@ -385,6 +386,12 @@ function reasonToError(reason) {
          if ('stack' in reason) {
              error.stack = String(reason.stack);
          }
@@ -1834,6 +1941,26 @@ index 3659fdd1955d56e60cc0158d19ac55d59916d78e..92e6700adfc52a380b3e9e37b655fbc9
      }
      /**
       * Returns the current session count for a phase. Useful for testing.
+diff --git a/dist/src/project-graph/project-graph.js b/dist/src/project-graph/project-graph.js
+index a23de7d0f27d7bc222ee09f4904f5d236510d01d..247ed0fe9f7a1a1a3d8d91d0d772763e9068b1be 100644
+--- a/dist/src/project-graph/project-graph.js
++++ b/dist/src/project-graph/project-graph.js
+@@ -149,14 +149,7 @@ function handleProjectGraphError(opts, e) {
+     if (opts.exitOnError) {
+         const isVerbose = process.env.NX_VERBOSE_LOGGING === 'true';
+         if (e instanceof error_types_1.ProjectGraphError) {
+-            let title = e.message;
+-            const bodyLines = isVerbose
+-                ? [e.stack]
+-                : ['Pass --verbose to see the stacktraces.'];
+-            output_1.output.error({
+-                title,
+-                bodyLines: bodyLines,
+-            });
++            output_1.output.error((0, error_types_1.formatProjectGraphError)(e, isVerbose));
+         }
+         else if (typeof e.message === 'string') {
+             const lines = e.message.split('\n');
 diff --git a/dist/src/tasks-runner/cache.d.ts b/dist/src/tasks-runner/cache.d.ts
 index 34aa44f81f1df63c5d33e58d8b55d15fcf1d7619..edf41406f465726828fa447bd10d71a49a2ede8a 100644
 --- a/dist/src/tasks-runner/cache.d.ts
@@ -3140,6 +3267,83 @@ index 0000000000000000000000000000000000000000..9f8639b22d29c8a4aca18a0efaec7a26
 +    }
 +    exports.TaskOutputLeases = TaskOutputLeases;
 +}
+diff --git a/dist/src/utils/handle-errors.js b/dist/src/utils/handle-errors.js
+index 41697164fa6d52a98ed5cc95be6b24f64f2ced5b..500aca4f73f366ba2910cdbd93963333310313dd 100644
+--- a/dist/src/utils/handle-errors.js
++++ b/dist/src/utils/handle-errors.js
+@@ -1,6 +1,7 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.handleErrors = handleErrors;
++const error_types_1 = require("../project-graph/error-types");
+ const logger_1 = require("./logger");
+ const output_1 = require("./output");
+ const handle_import_1 = require("./handle-import");
+@@ -17,35 +18,9 @@ async function handleErrors(isVerbose, fn) {
+         if (err.constructor.name === 'UnsuccessfulWorkflowExecution') {
+             logger_1.logger.error('The generator workflow failed. See above.');
+         }
+-        else if (err.name === 'ProjectGraphError') {
+-            const projectGraphError = err;
+-            let title = projectGraphError.message;
+-            if (projectGraphError.cause &&
+-                typeof projectGraphError.cause === 'object' &&
+-                'message' in projectGraphError.cause) {
+-                title += ' ' + projectGraphError.cause.message + '.';
+-            }
+-            output_1.output.error({
+-                title,
+-                bodyLines: isVerbose
+-                    ? formatErrorStackAndCause(projectGraphError, isVerbose)
+-                    : projectGraphError.getErrors().map((e) => e.message),
+-            });
+-        }
+-        else if (err.name === 'ProjectConfigurationsError') {
+-            const projectConfigurationsError = err;
+-            let title = projectConfigurationsError.message;
+-            if (projectConfigurationsError.cause &&
+-                typeof projectConfigurationsError.cause === 'object' &&
+-                'message' in projectConfigurationsError.cause) {
+-                title += ' ' + projectConfigurationsError.cause.message + '.';
+-            }
+-            output_1.output.error({
+-                title,
+-                bodyLines: isVerbose
+-                    ? formatErrorStackAndCause(projectConfigurationsError, isVerbose)
+-                    : projectConfigurationsError.errors.map((e) => e.message),
+-            });
++        else if (err.name === 'ProjectGraphError' ||
++            err.name === 'ProjectConfigurationsError') {
++            output_1.output.error((0, error_types_1.formatProjectGraphError)(err, isVerbose));
+         }
+         else if (err.name === 'MinReleaseAgeViolationError') {
+             // A cooldown violation already carries a user-shaped headline plus
+@@ -59,7 +34,7 @@ async function handleErrors(isVerbose, fn) {
+             const lines = (err.message ? err.message : err.toString()).split('\n');
+             const bodyLines = lines.slice(1);
+             if (isVerbose) {
+-                bodyLines.push(...formatErrorStackAndCause(err, isVerbose));
++                bodyLines.push((0, error_types_1.formatErrorStackAndCause)(err));
+             }
+             else if (err.stack) {
+                 bodyLines.push('Pass --verbose to see the stacktrace.');
+@@ -76,16 +51,3 @@ async function handleErrors(isVerbose, fn) {
+         return 1;
+     }
+ }
+-function formatErrorStackAndCause(error, verbose) {
+-    return [
+-        verbose ? error.stack || error.message : error.message,
+-        ...(error.cause && typeof error.cause === 'object'
+-            ? [
+-                'Caused by:',
+-                verbose && 'stack' in error.cause
+-                    ? error.cause.stack.toString()
+-                    : error.cause.toString(),
+-            ]
+-            : []),
+-    ];
+-}
 diff --git a/dist/src/utils/installation-directory.d.ts b/dist/src/utils/installation-directory.d.ts
 index dc1784edc9f48944589213847e653720b25990fc..f830bb52acb7f4652e45ea4afb7a24adc4adf7a8 100644
 --- a/dist/src/utils/installation-directory.d.ts

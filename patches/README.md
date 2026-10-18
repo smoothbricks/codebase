@@ -189,6 +189,25 @@ stack trace to explain a configuration failure.
 same-named projects and a local plugin, then native, serialized and circular plugin-load failures. Drop this hunk only
 when the installed upstream version preserves these diagnostics, retaining the regressions.
 
+## Project-graph error causes
+
+The project-graph error hunks carry [nrwl/nx PR #37103](https://github.com/nrwl/nx/pull/37103) (`a935bb7d0af8`, not in
+23.2.1) to the pinned distribution. Stock 23.2.1 `handleProjectGraphError` printed only
+`Failed to process project graph.` and `Pass --verbose to see the stacktraces.` for every command that exits on a graph
+error (`run-many`, `affected`, `exec`, `release` …): a consumer's CI failed that way for days, and only a
+`NX_VERBOSE_LOGGING=true` reproduction named the createNodes refusal. `formatProjectGraphError` now serves both that
+handler and `handleErrors`: without `--verbose` the body names every underlying error, then the hint.
+
+Beyond upstream, the body uses the plugin-load formatter, moved to `error-types.js` as `formatErrorMessages` and shared
+by `get-plugins.js`: each error's message, its complete `cause` chain and its nested `errors`, circular references
+named. An `AggregateCreateNodesError` message already lists its entries (`formatAggregateCreateNodesError`, which now
+formats each entry the same way), so they are not repeated. Verbose stack lines include each entry's cause.
+
+`packages/nx-plugin/src/nx-project-graph-errors.test.ts` drives the actual installed Nx: a local plugin whose
+createNodes throws an error with a cause, under `run-many` and `show projects`, in-process and isolated. The non-verbose
+output must name the message and its cause without stack frames; verbose keeps frames and the chain. Drop the carried
+hunks when the installed upstream version contains #37103, retaining the regression and the cause chain.
+
 ## Event-driven daemon validity
 
 The daemon-validity hunks adapt [nrwl/nx PR #37113](https://github.com/nrwl/nx/pull/37113)
