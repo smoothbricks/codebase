@@ -74,9 +74,50 @@ jobs:
       - name: 🔍 Lint
         run: smoo github-ci nx-smart --target lint --name "Lint" --step 7
 
+      - name: diag closure watcher start
+        run: |
+          root="$(cd ../.. && pwd)"
+          mkdir -p /tmp/ebr-ws && ln -sfn "$root/node_modules" /tmp/ebr-ws/node_modules && echo '{}' > /tmp/ebr-ws/package.json
+          cat > /tmp/ebr-ws/watch.ts <<EOF
+          import { createRequire } from 'node:module';
+          import { appendFileSync, lstatSync, readdirSync } from 'node:fs';
+          import { graphInstallationIdentity, nodeStamp } from '$root/packages/nx-plugin/dist/ensure-built-witness.js';
+          const root = '/tmp/ebr-ws';
+          const out = '/tmp/ebr-ws/changes.log';
+          const req = createRequire(root + '/package.json');
+          const pj = req('nx/src/utils/package-json');
+          const { expandOutputs } = req('nx/src/native');
+          const id = graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, pj.readModulePackageJson, expandOutputs, null, (d) => appendFileSync(out, 'UNPROVED ' + d + '\n'));
+          const stats = new Map(JSON.parse(id).nodes.map((n) => [n.path, lstatSync(n.path, { bigint: true })]));
+          const names = new Map([...stats].filter(([, s]) => s.isDirectory()).map(([p]) => [p, readdirSync(p)]));
+          const fields = ['dev', 'ino', 'mode', 'nlink', 'size', 'mtimeNs', 'ctimeNs'];
+          appendFileSync(out, new Date().toISOString() + ' watching ' + stats.size + '\n');
+          let n = 0;
+          for (;;) {
+            for (const [path, before] of stats) {
+              let now;
+              try { now = lstatSync(path, { bigint: true }); } catch (e) { appendFileSync(out, new Date().toISOString() + ' GONE ' + path + '\n'); stats.delete(path); continue; }
+              if (nodeStamp(now) !== nodeStamp(before) || now.nlink !== before.nlink) {
+                let extra = '';
+                if (names.has(path)) { const was = names.get(path); const is = readdirSync(path); names.set(path, is); extra = ' added=' + JSON.stringify(is.filter((x) => !was.includes(x))) + ' removed=' + JSON.stringify(was.filter((x) => !is.includes(x))); }
+                if (n++ < 400) appendFileSync(out, new Date().toISOString() + ' MOVED ' + path + ' ' + fields.filter((f) => now[f] !== before[f]).map((f) => f + ':' + String(before[f]) + '->' + String(now[f])).join(',') + extra + '\n');
+                stats.set(path, now);
+              }
+            }
+            await Bun.sleep(20);
+          }
+          EOF
+          nohup bun /tmp/ebr-ws/watch.ts > /tmp/ebr-ws/watch.out 2>&1 &
+          sleep 20; cat /tmp/ebr-ws/changes.log /tmp/ebr-ws/watch.out
+
       # Step 8
       - name: 🧪 Unit Tests
         run: smoo github-ci nx-smart --target test --name "Unit Tests" --step 8
+
+      - name: diag closure watcher report
+        if: always()
+        run: |
+          echo "WATCHREPORT begin"; cat /tmp/ebr-ws/changes.log /tmp/ebr-ws/watch.out; echo "WATCHREPORT end"
 
       # Step 9
       - name: 🌐 Browser Tests
