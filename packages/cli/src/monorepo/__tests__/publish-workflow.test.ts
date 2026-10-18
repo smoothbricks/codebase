@@ -13,6 +13,7 @@ import {
   type PublishWorkflowDefinitionOptions,
   type PublishWorkflowNxTarget,
   type PublishWorkflowVersionOutputs,
+  type ReleaseVersionMode,
   renderPublishWorkflowYaml,
   runPublishWorkflow,
 } from '@smoothbricks/nx-plugin/managed-files/publish-workflow';
@@ -1482,13 +1483,14 @@ describe('publish workflow definition', () => {
     expect(downstream.versionSawNxVersionActions).toBe(false);
   });
 
-  it('repairs older gaps, skips validation for mode none, and still completes current HEAD publish', async () => {
+  it('repairs older gaps and skips validation for mode none', async () => {
     const scenario = publishWorkflowScenario({
       repairs: [
         { tag: '@scope/a@1.1.0', npmMissing: false, githubMissing: true },
         { tag: '@scope/b@2.0.0-beta.1', npmMissing: true, githubMissing: true },
       ],
-      current: [{ tag: '@scope/a@1.2.0', npmMissing: true, githubMissing: false }],
+      // `none` means HEAD carries no release: a HEAD release target reports `complete`.
+      current: [],
       bump: 'auto',
       dryRun: false,
       version: { mode: 'none', projects: [] },
@@ -1502,10 +1504,70 @@ describe('publish workflow definition', () => {
     expect(outcome.repairBuildArtifacts).toEqual(['@scope/b']);
     expect(outcome.validation).toEqual({ checks: 0, builds: [], lints: [], tests: [], validates: 0 });
     expect(outcome.publishRan).toBe(true);
-    expect(outcome.publishCompletedTags).toEqual(['@scope/a@1.2.0']);
-    expect(outcome.createdTags).toEqual(['@scope/a@1.2.0']);
+    expect(outcome.publishCompletedTags).toEqual([]);
+    expect(outcome.createdTags).toEqual([]);
+    expect(outcome.remainingDurableGaps).toEqual([]);
+  });
+
+  it('builds and validates a HEAD release target before the prebuilt publish completes it', async () => {
+    // `smoo release retag-unpublished` moved the tags to HEAD; npm still lacks both versions.
+    const scenario = publishWorkflowScenario({
+      repairs: [],
+      current: [
+        { tag: '@scope/a@1.2.0', npmMissing: true, githubMissing: true },
+        { tag: '@scope/b@2.0.0', npmMissing: true, githubMissing: true },
+      ],
+      bump: 'auto',
+      dryRun: false,
+      version: { mode: 'complete', projects: ['a', 'b'] },
+    });
+
+    const outcome = await scenario.run();
+
+    expect(outcome.validation).toEqual({
+      checks: 1,
+      builds: ['a', 'b'],
+      lints: ['a', 'b'],
+      tests: ['a', 'b'],
+      validates: 1,
+    });
+    expect(outcome.publishSawPrebuiltArtifacts).toBe(true);
+    expect(outcome.publishCompletedTags).toEqual(['@scope/a@1.2.0', '@scope/b@2.0.0']);
     expect(outcome.publishSawCreatedTags).toBe(true);
     expect(outcome.remainingDurableGaps).toEqual([]);
+  });
+
+  it('opens every gate the prebuilt publish depends on for a HEAD release target, and none for no release', async () => {
+    const workflow = typia.assert<{
+      jobs: Record<string, { steps: Array<{ name?: string; if?: string; run?: string }> }>;
+    }>(Bun.YAML.parse(await formattedPublishWorkflow(renderPublishWorkflowYaml(codebaseWorkflowOptions))));
+    const steps = new Map(
+      Object.values(workflow.jobs)
+        .flatMap((job) => job.steps)
+        .map((step) => [step.name, step]),
+    );
+    const dependencies = [
+      '🔍 Lint (${{ steps.plan.outputs.mode }})',
+      '🧪 Unit Tests (${{ steps.plan.outputs.mode }})',
+      '🔨 Build (${{ steps.version.outputs.mode }})',
+      '🐧 Build supplemental Linux targets',
+      '📤 Upload validated build outputs',
+      '📤 Upload supplemental Linux outputs',
+      '📦 Apply verified Linux outputs',
+      '🍎 Apply verified macOS outputs',
+    ];
+
+    for (const name of dependencies) {
+      const gate = steps.get(name)?.if;
+      expect({ name, complete: modeGateAdmits(gate, 'complete'), none: modeGateAdmits(gate, 'none') }).toEqual({
+        name,
+        complete: true,
+        none: false,
+      });
+    }
+    const publish = steps.get('📦 Publish release (${{ needs.linux-release-candidate.outputs.mode }})');
+    expect(publish?.if).toBeUndefined();
+    expect(publish?.run).toContain('smoo release publish --prebuilt');
   });
 
   it('validates a new release before publishing current HEAD gaps', async () => {
@@ -1603,6 +1665,8 @@ interface WorkflowOutcome {
   createdTags: string[];
   publishSawCreatedTags: boolean;
   remainingDurableGaps: string[];
+  /** Every npm-missing HEAD package was built before publish: `--prebuilt` refuses one that was not. */
+  publishSawPrebuiltArtifacts: boolean;
 }
 
 function publishWorkflowScenario(config: WorkflowScenarioConfig): { run(): Promise<WorkflowOutcome> } {
@@ -1631,6 +1695,7 @@ class WorkflowScenarioState {
   private productionDeployRan = false;
   private publishSawValidation = false;
   private publishSawTags = false;
+  private publishSawPrebuilt = false;
   private readonly createdTags = new Set<string>();
   private readonly repaired = new Set<string>();
   private readonly repairBuilds = new Set<string>();
@@ -1732,6 +1797,9 @@ class WorkflowScenarioState {
         this.publishSawValidation = this.config.version.mode === 'none' || this.validationState.validates > 0;
         // Publishing must never be the first writer of a release tag.
         this.publishSawTags = this.config.current.every((gap) => this.createdTags.has(gap.tag));
+        this.publishSawPrebuilt = this.config.current
+          .filter((gap) => gap.npmMissing)
+          .every((gap) => this.validationState.builds.includes(projectNameFromTag(gap.tag)));
         if (dryRun) {
           return;
         }
@@ -1777,6 +1845,7 @@ class WorkflowScenarioState {
       createdTags: [...this.createdTags].sort(),
       publishSawCreatedTags: this.publishSawTags,
       remainingDurableGaps: [...this.durableGaps].sort(),
+      publishSawPrebuiltArtifacts: this.publishSawPrebuilt,
     };
   }
 
@@ -1817,6 +1886,27 @@ function packageNameFromTag(tag: string): string {
     throw new Error(`Invalid release tag fixture ${tag}.`);
   }
   return tag.slice(0, versionSeparator);
+}
+
+/** The fixtures' Nx project is the unscoped package name: `@scope/a@1.2.0` releases project `a`. */
+function projectNameFromTag(tag: string): string {
+  const packageName = packageNameFromTag(tag);
+  return packageName.slice(packageName.lastIndexOf('/') + 1);
+}
+
+/**
+ * Evaluates a release gate of the one shape the workflow renders,
+ * `<source>.outputs.mode != '<mode>'`, for `mode`. Any other shape fails the
+ * test rather than being guessed at.
+ */
+function modeGateAdmits(gate: string | undefined, mode: ReleaseVersionMode): boolean {
+  const excluded = gate?.match(
+    /^(?:steps\.(?:plan|version)|needs\.linux-release-candidate)\.outputs\.mode != '([a-z-]+)'$/,
+  )?.[1];
+  if (excluded === undefined) {
+    throw new Error(`Not a release mode gate: ${String(gate)}`);
+  }
+  return mode !== excluded;
 }
 
 it('omits sibling checkout steps when no sources are declared', () => {

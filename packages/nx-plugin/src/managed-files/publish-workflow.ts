@@ -133,8 +133,19 @@ export interface PublishWorkflowInputs {
   dryRun: boolean;
 }
 
+/**
+ * The `mode=` output of `smoo release version --github-output`, which every
+ * release gate in this workflow reads. `new`: Nx created a release commit.
+ * `complete`: HEAD already carries the release (a rerun, or tags moved by
+ * `smoo release retag-unpublished`) and publish completes its missing durable
+ * state. `dry-run`: the preview of a release. `none`: nothing to release.
+ * Every mode but `none` names packages the workflow must build and validate,
+ * because `smoo release publish --prebuilt` refuses an unbuilt package.
+ */
+export type ReleaseVersionMode = 'new' | 'complete' | 'dry-run' | 'none';
+
 export interface PublishWorkflowVersionOutputs {
-  mode: 'new' | 'none';
+  mode: ReleaseVersionMode;
   projects: string[];
 }
 

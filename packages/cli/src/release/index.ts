@@ -49,6 +49,7 @@ export {
   withPrivateNpmUserconfig,
 } from './private-npm.js';
 
+import type { ReleaseVersionMode } from '@smoothbricks/nx-plugin/managed-files/publish-workflow';
 import { PLATFORM_TARGET_GLOBS, RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import { ciApiContext } from '../github-ci/api.js';
 import { readProjectTargets } from '../nx/index.js';
@@ -98,7 +99,6 @@ import {
   type ReleaseRepairOutputsShell,
   type ReleaseRepairShell,
   type ReleaseSummary,
-  type ReleaseVersionMode,
   repairPendingTargets,
   runReleaseTag,
   runReleaseVersion,
@@ -210,12 +210,13 @@ export async function releaseVersion(root: string, options: ReleaseVersionOption
     },
     { bump, dryRun: options.dryRun === true },
   );
-  if (result.status === 'already-release-target') {
-    console.log('HEAD is already a release target; publish will complete any missing durable state.');
-  } else if (result.status === 'no-release-needed') {
+  if (result.mode === 'complete') {
+    console.log(
+      `HEAD is already the release target for ${packageSummary(result.packages)}; the workflow builds it and publish completes any missing durable state.`,
+    );
+  } else if (result.mode === 'none') {
     console.log('Nx did not create a release commit; no release needed.');
-  }
-  if (result.status === 'dry-run') {
+  } else if (result.mode === 'dry-run') {
     await writeReleasePreviewSummary(root, packages, result.packages);
   }
   await writeReleaseGithubOutput(options.githubOutput, result.packages, result.mode);

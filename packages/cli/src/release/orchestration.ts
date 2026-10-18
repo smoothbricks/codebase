@@ -1,7 +1,6 @@
+import type { ReleaseVersionMode } from '@smoothbricks/nx-plugin/managed-files/publish-workflow';
 import type { ReleasePackageInfo, ReleaseTarget } from './core.js';
 import { planPublishActions } from './publish-plan.js';
-
-export type ReleaseVersionMode = 'new' | 'dry-run' | 'none';
 
 export interface ReleaseSummary<Package extends ReleasePackageInfo = ReleasePackageInfo> {
   sha: string;
@@ -101,26 +100,27 @@ export interface ReleaseTagResult<Package extends ReleasePackageInfo = ReleasePa
   status: 'tagged' | 'dry-run' | 'no-release';
 }
 
-export interface ReleaseVersionResult<Package extends ReleasePackageInfo = ReleasePackageInfo> {
-  mode: ReleaseVersionMode;
-  packages: Package[];
-  status: 'already-release-target' | 'dry-run' | 'new-release' | 'no-release-needed';
-}
+/** `none` is the one mode that names nothing to build, validate or publish. */
+export type ReleaseVersionResult<Package extends ReleasePackageInfo = ReleasePackageInfo> =
+  | { mode: 'none'; packages: [] }
+  | { mode: Exclude<ReleaseVersionMode, 'none'>; packages: Package[] };
 
 export async function runReleaseVersion<Package extends ReleasePackageInfo>(
   shell: ReleaseVersionShell<Package>,
   options: { bump: string; dryRun: boolean },
 ): Promise<ReleaseVersionResult<Package>> {
-  if (!options.dryRun) {
-    const localRelease = await shell.releasePackagesAtHead();
-    if (localRelease.length > 0) {
-      return { mode: 'none', packages: localRelease, status: 'already-release-target' };
-    }
+  // A HEAD that already carries the release (a rerun, or tags moved here by
+  // `retag-unpublished`) is the release target itself. The workflow must build
+  // and validate it like a new one -- `publish --prebuilt` refuses an unbuilt
+  // package -- and the dry-run plan gating lint and test must agree.
+  const atHead = await shell.releasePackagesAtHead();
+  if (atHead.length > 0) {
+    return { mode: 'complete', packages: atHead };
   }
 
   const versionPackages = await shell.releaseVersionPackages();
   if (versionPackages.length === 0) {
-    return { mode: 'none', packages: [], status: 'no-release-needed' };
+    return { mode: 'none', packages: [] };
   }
   if (options.bump === 'auto') {
     // Nx derives an automatic bump from the commits since the package's last
@@ -138,7 +138,7 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
   const headBeforeVersioning = await shell.gitHead();
   const dryRunPackages = await shell.runNxReleaseVersion(versionPackages, options.bump, options.dryRun);
   if (options.dryRun) {
-    return { mode: 'dry-run', packages: dryRunPackages, status: 'dry-run' };
+    return { mode: 'dry-run', packages: dryRunPackages };
   }
 
   await shell.assertCleanGitTree();
@@ -146,17 +146,17 @@ export async function runReleaseVersion<Package extends ReleasePackageInfo>(
   const releasedPackages = await shell.releasePackagesAtHead();
   if (headAfterVersioning === headBeforeVersioning) {
     if (releasedPackages.length > 0) {
-      return { mode: 'none', packages: releasedPackages, status: 'already-release-target' };
+      return { mode: 'complete', packages: releasedPackages };
     }
     if (options.bump !== 'auto') {
       throw new Error(`Nx did not create a release commit for forced --bump ${options.bump}.`);
     }
-    return { mode: 'none', packages: [], status: 'no-release-needed' };
+    return { mode: 'none', packages: [] };
   }
   if (releasedPackages.length === 0) {
     throw new Error('Nx created a release commit that versions none of the current release packages.');
   }
-  return { mode: 'new', packages: releasedPackages, status: 'new-release' };
+  return { mode: 'new', packages: releasedPackages };
 }
 
 /**
