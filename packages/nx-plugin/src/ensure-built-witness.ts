@@ -121,13 +121,23 @@ export function nodesUnchanged(nodes: readonly NodeWitness[]): boolean {
 
 /**
  * The witnessed nodes whose stamp is no longer the one read, named for a refusal (the first eight in witness order, a
- * gone one with its error code, and how many more), or null when none moved.
+ * gone one with its error code, and how many more), or null when none moved. A node whose device, inode, mode, size
+ * and mtime are unchanged and only its ctime moved (a same-mode chmod, which Bun's bin linking does to a shared store
+ * file on any checkout's install) asks for a comparison, not a verdict: `same` re-reads it, and one it finds as
+ * recorded has not changed. Without `same` every move counts.
  */
-export function movedNodes(nodes: readonly NodeWitness[]): string | null {
+export function movedNodes(
+  nodes: readonly NodeWitness[],
+  same: (path: string) => boolean = () => false,
+): string | null {
   const moved: string[] = [];
   for (const node of nodes) {
     try {
-      if (nodeStamp(lstatSync(node.path, { bigint: true })) !== node.stamp) moved.push(node.path);
+      const stamp = nodeStamp(lstatSync(node.path, { bigint: true }));
+      if (stamp === node.stamp) continue;
+      // nodeStamp ends with the ctime: everything before it is the identity a same-mode chmod keeps.
+      const kept = stamp.slice(0, stamp.lastIndexOf(':')) === node.stamp.slice(0, node.stamp.lastIndexOf(':'));
+      if (!kept || !same(node.path)) moved.push(node.path);
     } catch (error) {
       if (!systemError(error)) throw error;
       moved.push(`${node.path} (${error.code})`);
@@ -191,11 +201,16 @@ export function graphInstallationIdentity(
   const census = graphInstallationCensus(workspaceRoot, nxJson, resolvePackage, expand, localInputs, onUnproved);
   if (census === null) return null;
   try {
-    for (const node of census.nodes) {
-      if (nodeStamp(lstatSync(node.path, { bigint: true })) !== node.stamp) {
-        onUnproved?.(`Installed module node changed during inspection: ${node.path}`);
-        return null;
-      }
+    // A file whose ctime alone moved is re-hashed: Bun's bin linking on any checkout's install re-chmods a shared
+    // store file to the mode it already has (movedNodes).
+    const hashes = new Map(census.files.map(({ path, sha256 }) => [path, sha256]));
+    const moved = movedNodes(
+      census.nodes,
+      (path) => hashes.get(path) === createHash('sha256').update(readFileSync(path)).digest('hex'),
+    );
+    if (moved !== null) {
+      onUnproved?.(`Installed module node changed during inspection: ${moved}`);
+      return null;
     }
   } catch (error) {
     if (systemError(error) && ['EACCES', 'EPERM', 'EIO'].includes(error.code)) throw error;

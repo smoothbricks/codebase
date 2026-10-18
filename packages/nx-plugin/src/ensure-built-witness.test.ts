@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, writeFileSync } from 'node:fs';
 import {
   chmod,
   mkdir,
@@ -24,7 +24,9 @@ import typia from 'typia';
 import {
   type GraphWitness,
   graphInstallationIdentity,
+  movedNodes,
   type NodeWitness,
+  nodeStamp,
   nodesUnchanged,
   readGraphWitness,
   reusableGraph,
@@ -438,6 +440,54 @@ describe('installed graph input identity', () => {
     ).toBeNull();
     expect(changed).toBe(true);
     expect(detail).toContain(marker);
+  });
+
+  it("re-hashes a public file whose ctime alone moved during census, as Bun's bin linking moves a shared store file", async () => {
+    const { plugin, resolver } = await packages();
+    const output = join(plugin, 'dist/index.js');
+    const mode = (await stat(output)).mode & 0o7777;
+    let rechmodded = false;
+    let detail = '';
+    // Any checkout's install that links a bin re-chmods its store target to the mode it already has.
+    const sameMode: typeof resolver = (name, paths) => {
+      const resolved = resolver(name, paths);
+      if (name === 'alias' && !rechmodded) {
+        chmodSync(output, mode);
+        rechmodded = true;
+      }
+      return resolved;
+    };
+    const proof = graphInstallationIdentity(
+      root,
+      { plugins: ['@smoothbricks/nx-plugin'] },
+      sameMode,
+      expandOutputs,
+      null,
+      (reason) => {
+        detail = reason;
+      },
+    );
+    expect(rechmodded).toBe(true);
+    expect(detail).toBe('');
+    // Bound, with the bytes it read: the identity carries the stamps of that census, not a later one's.
+    expect(parsed(proof).files.find(({ path }) => path === output)?.sha256).toBe(
+      createHash('sha256').update('exports.value = 1;').digest('hex'),
+    );
+  });
+
+  it('names every moved node, and re-reads only one whose ctime alone moved', async () => {
+    const file = join(root, 'stamped');
+    await writeFile(file, 'before');
+    const witness = (): NodeWitness[] => [{ path: file, stamp: nodeStamp(lstatSync(file, { bigint: true })) }];
+    const chmodded = witness();
+    chmodSync(file, (await stat(file)).mode & 0o7777);
+    expect(movedNodes(chmodded)).toBe(file);
+    expect(movedNodes(chmodded, () => true)).toBeNull();
+    const written = witness();
+    await writeFile(file, 'after!');
+    expect(movedNodes(written, () => true)).toBe(file);
+    await rm(file);
+    expect(movedNodes(written)).toBe(`${file} (ENOENT)`);
   });
 
   it('fails loudly for unreadable required module bytes rather than publishing an installation witness', async () => {
