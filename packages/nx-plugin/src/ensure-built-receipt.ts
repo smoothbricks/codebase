@@ -30,8 +30,15 @@ export interface ProducerSourceWitness {
   readonly nodes: readonly NodeWitness[];
   readonly outputs: readonly string[];
 }
+/**
+ * Git as receipts read it: the checkout and nothing of the operator's home. The producer hooks run in whichever process
+ * Nx runs plugins in, a workspace's sandboxed daemon included, which adopts a host client's HOME; git with that HOME
+ * reads the operator's global configuration, the sandbox denies it, and git dies (specs/cowshed/04_sandbox.md, the
+ * runtime-input contract). A receipt's tree, HEAD and tracked-file status are read under the repository's own
+ * configuration alone, so a host run and a sandboxed run agree on them.
+ */
 export function receiptGit(root: string, args: string[]): ReceiptEvidence<string> {
-  const env = { ...process.env };
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
   for (const key of [
     'GIT_DIR',
     'GIT_COMMON_DIR',

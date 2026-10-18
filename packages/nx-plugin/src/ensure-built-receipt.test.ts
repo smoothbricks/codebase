@@ -91,6 +91,28 @@ describe('provider receipt', () => {
       else process.env.GIT_DIR = saved;
     }
   });
+  it("reads provider provenance without the operator's global git configuration", async () => {
+    // The cowshed sandbox denies the operator's global git configuration to a workspace's Nx daemon, which runs these
+    // hooks under a host client's HOME; git then dies "unable to access". A self-referencing link fails git the same
+    // way (ELOOP), where an unreadable file would only warn (EACCES).
+    const home = join(root, 'operator-home');
+    await mkdir(home);
+    await symlink('.gitconfig', join(home, '.gitconfig'));
+    const names = ['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'] as const;
+    const saved = names.map((name) => [name, process.env[name]] as const);
+    for (const name of names) delete process.env[name];
+    process.env.HOME = home;
+    try {
+      const captured = captureProducerSource(root, producerOutputPaths(root, [task], expandOutputs));
+      expect(captured.ok ? 'captured' : captured.detail).toBe('captured');
+      expect(producerSourceUnchanged(root, source)).toEqual({ ok: true, value: true });
+    } finally {
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
   it('names current hashes, HEAD/tree, independent file digests, link text and empty directory modes', async () => {
     const result = providerReceipt(root, task.id, [task], proof, expandOutputs, source, producer);
     expect(result.disposition).toBe('hit');
