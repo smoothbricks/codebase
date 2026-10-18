@@ -887,7 +887,8 @@ again at any level above it.
   the target, and the carry indexes every entry it places, so nothing it writes escapes Nx's eviction; its staging
   directory is its own to delete (Land, "Carry"). Gc never opens a volume's contents. Cargo's target directory is
   bounded by the tree it builds; cowshed does not prune it.
-- A workspace's build volume retires with the workspace (`cowshed rm`), unless main adopted it.
+- A workspace's build volume retires with the workspace (`cowshed rm`, which collects before it answers, an unfinished
+  clone's removal included), unless main adopted it.
 
 ## Rules that keep it warm
 

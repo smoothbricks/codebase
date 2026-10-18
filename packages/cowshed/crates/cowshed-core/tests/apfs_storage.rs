@@ -15,9 +15,9 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::storage::CheckpointLabel;
 use cowshed_core::storage::apfs::{
     AdoptExecutionError, Alongside, ApfsBlockingLane, ApfsExecutionHost, ApfsStorageError,
-    ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY, IncarnationSource,
+    ApfsSubstrate, ApfsSubstrateConfig, DEFAULT_IMAGE_CAPACITY, FoundMount, IncarnationSource,
     MarkerExpectation, MetadataPolicy, PendingAdoption, PublicationError, ResumableClone,
-    RetireExecutionError, volume_key,
+    ResumedMount, RetireExecutionError, StagedExecutionError, volume_key,
 };
 use cowshed_core::storage::lifecycle::{
     AdoptHandoff, AdoptRequest, CheckpointFact, DefragmentOutcome, Destination, ExtentCount,
@@ -418,6 +418,27 @@ impl ApfsExecutionHost for FakeHost {
         self.record("attach-mounted+checked");
         self.mount(&FakeAttachment, mount_point, access, browse)?;
         Ok(FakeAttachment)
+    }
+
+    /// Reuses a mount the fake already holds at `mount_point`, as the native host reuses a
+    /// surviving kernel mount; otherwise attaches and mounts.
+    fn attach_and_mount_resumable(
+        &self,
+        image: &Path,
+        mount_point: &Path,
+        _: &LifecycleWorkspace,
+    ) -> Result<ResumedMount<Self::Attachment>, ApfsStorageError> {
+        if self.mounted_paths_now().contains(mount_point) {
+            self.record("reuse-mount");
+            return Ok(ResumedMount {
+                attachment: FakeAttachment,
+                found: FoundMount::Mounted,
+            });
+        }
+        Ok(ResumedMount {
+            attachment: self.attach_mounted(image, mount_point, MountAccess::ReadWrite, false)?,
+            found: FoundMount::Detached,
+        })
     }
 
     fn copy_tree(&self, source: &Path, _: &Path) -> Result<(), ApfsStorageError> {
@@ -3123,20 +3144,48 @@ async fn pending_clone_retirement_inspects_before_trash_without_activation() {
     let refusal = substrate
         .execute_pending_clone_retirement(metadata.clone(), original.clone(), |stage| async move {
             assert!(stage.resuming);
-            Err::<(), _>("unlanded commits")
+            Err::<(), _>(stage.mount_point)
         })
-        .await
-        .expect_err("Git safety refusal keeps the pending clone");
-    assert!(matches!(
-        refusal,
-        cowshed_core::storage::apfs::StagedExecutionError::Initializer("unlanded commits")
-    ));
+        .await;
+    let Err(StagedExecutionError::Initializer(mount)) = refusal else {
+        panic!("a Git safety refusal keeps the pending clone");
+    };
     assert!(
         !host
             .events()
             .iter()
             .any(|event| event == "atomic-retire-to-trash")
     );
+    // The refusal changed nothing, so the image it attached to inspect is detached again.
+    assert!(
+        host.mounted_paths_now().is_empty(),
+        "a refused retirement leaves no mount it made"
+    );
+    assert!(host.events().iter().any(|event| event == "detach:Release"));
+
+    // Found mounted, a refused retirement keeps that mount and detaches nothing.
+    host.mount(&FakeAttachment, &mount, MountAccess::ReadWrite, false)
+        .expect("mount as an earlier verb left it");
+    host.clear_events();
+    let refusal = substrate
+        .execute_pending_clone_retirement(metadata.clone(), original.clone(), |_| async move {
+            Err::<(), _>("unlanded commits")
+        })
+        .await;
+    assert!(matches!(
+        refusal,
+        Err(StagedExecutionError::Initializer("unlanded commits"))
+    ));
+    assert_eq!(host.mounted_paths_now(), BTreeSet::from([mount.clone()]));
+    let events = host.events();
+    assert!(events.iter().any(|event| event == "reuse-mount"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("detach") || event == "unmount"),
+        "{events:?}"
+    );
+    host.clear_events();
     let (retired, proof) = substrate
         .execute_pending_clone_retirement(metadata, original, |stage| async move {
             assert_eq!(stage.workspace, pending);

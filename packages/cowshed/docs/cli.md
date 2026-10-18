@@ -593,7 +593,13 @@ interactive command builds; forcing `CARGO_INCREMENTAL=0` there would compile ev
 
 ### `cowshed rm <name> [--force] [--restore] [--abandon]`
 
-Marks the workspace deleted and returns immediately; detach and image deletion happen in the background.
+Marks the workspace deleted and answers immediately; detach and image deletion run in the background, and the `cowshed`
+process waits for them before it exits, so nothing is left for a later `gc`. Before answering, `rm` collects the build
+volumes no checkout links any more — the workspace's own volume and seed among them, an unfinished clone's included —
+and names any it has to keep and why.
+
+An unfinished clone (a create or fork that never published its workspace) is removed the same way, by name. A refusal
+leaves its image as `rm` found it: attached and mounted only if it already was.
 
 cwd or `--project` selects the project as for any verb. Run from outside every project, `rm <name>` finds the workspace
 the way `detach <name>` does — from the store, by its session name — and refuses with the projects named when more than
@@ -644,8 +650,8 @@ Recover an abandoned bundle from main's repository, which holds its one prerequi
 git fetch <bundle> HEAD:refs/heads/recovered-raven
 ```
 
-Bundle verification uses a temporary bare repository. Interrupting `rm --abandon` removes that repository before the
-command exits; a retry revalidates any bundle already published.
+Bundle verification uses a temporary bare repository, and the bundle is staged beside its final name until it verifies.
+Interrupting `rm --abandon` removes both before the command exits; a retry revalidates any bundle already published.
 
 `cowshed rm main --restore` is the reverse of `adopt`: it puts the pre-adoption checkout back and unbinds the project.
 Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.

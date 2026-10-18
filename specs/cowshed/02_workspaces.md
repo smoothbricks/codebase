@@ -1157,15 +1157,17 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
 5. Background (spawned detached): detach the mount (escalating to `-force` after a 10 s monotonic wall-clock grace,
    including disk-lease and command waits, not merely poll sleeps), unlink the trashed image and companions, every
    checkpoint (including pinned checkpoints), every pre-restore undo image and companion/fact, then the empty checkpoint
-   and mountpoint directories. Interrupted cleanup is resumed idempotently by `cowshed gc` only from exact, revalidated
-   retirement trash metadata; a missing canonical image alone is never cleanup authority.
+   and mountpoint directories. The process that spawned it waits for it before exiting, so a command that has already
+   answered leaves no trash behind for a later `gc`. Interrupted cleanup is resumed idempotently by `cowshed gc` only
+   from exact, revalidated retirement trash metadata; a missing canonical image alone is never cleanup authority.
 
 The in-progress Git gate follows operation state (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `rebase-merge`, or
 `rebase-apply`), not a leftover `.git/AUTO_MERGE` tree: Git can retain that tree after an operation finishes. A stale
 tree alone never blocks removal.
 
 The verified bundle's temporary bare repository belongs to the removal attempt, not the next `gc`: cancellation or an
-interrupted verification removes it before leaving the operation.
+interrupted verification removes it before leaving the operation. So does the `.partial` bundle it stages beside the
+final name: the attempt renames it into place or removes it, cancellation included, since no sweep ever owns one.
 
 Removal persists its exact options before the authorized retirement mutation. If a process dies after canonical
 retirement but before acknowledging the call, startup observes the workspace absent and records completion without
@@ -1174,8 +1176,11 @@ authorized mutating request reruns the safety fences and retirement.
 
 A named `rm` can retire an unfinished fork without activating it. The exact pending image is mounted and validated under
 its image lock, then receives the same dirty-state, HEAD-stability and landed-work checks as an active workspace. A
-refusal preserves the image and original clone intent. Once retirement is authorized, its journal record retains the
-original clone source so an interrupted removal can recover.
+refusal preserves the image and original clone intent and leaves its mount state as it found it: an image the `rm`
+attached to inspect is detached again, and one it found mounted stays mounted. Once retirement is authorized, its
+journal record retains the original clone source so an interrupted removal can recover. Once it is retired, the `rm`
+collects build volumes before it answers, as every removal does: the clone's own volume and seed, which no `gc` could
+collect while its create or fork stood journaled, go with it.
 
 Removal-scoped startup never finishes the named target's own unpublished clone: it leaves the clone intent for the `rm`
 to retire, so whatever stopped the clone — a duplicate port block, a start revision the source no longer holds — cannot

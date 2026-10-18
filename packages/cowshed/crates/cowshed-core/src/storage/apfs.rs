@@ -254,6 +254,24 @@ pub struct ResumableClone {
     pub image: PathBuf,
 }
 
+/// How [`ApfsExecutionHost::attach_and_mount_resumable`] found a pending image, so a caller that
+/// ends without changing it can leave it exactly that way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FoundMount {
+    /// Its volume was already mounted at the mount point, and the call reused that mount.
+    Mounted,
+    /// It was attached without a mount, and the call mounted that attachment.
+    Attached,
+    /// It was detached, and the call attached and mounted it.
+    Detached,
+}
+
+/// A pending image mounted at its canonical mount point, and how it was found.
+pub struct ResumedMount<A> {
+    pub attachment: A,
+    pub found: FoundMount,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoreFence {
     pub pending: PendingPublicationFact,
@@ -471,7 +489,7 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
         workspace: &LifecycleWorkspace,
     ) -> Result<Option<Self::Attachment>, ApfsStorageError> {
         self.attach_and_mount_resumable(image, mount_point, workspace)
-            .map(Some)
+            .map(|resumed| Some(resumed.attachment))
     }
     /// Release and reclaim an unpublished canonical image no attachment handle is held for:
     /// whatever the kernel still attaches from it, then the image, its companion and sidecar.
@@ -498,14 +516,18 @@ pub trait ApfsExecutionHost: Send + Sync + 'static {
     ) -> Result<(), ApfsStorageError>;
     /// Attach and mount a pending canonical image, reusing an exact surviving kernel mount or
     /// checking its pinned unmounted crash-left volume with `fsck_apfs`, then using `mount_apfs`.
+    /// The answer says which of those it found, so a caller can put the image back as it was.
     /// Implementations own cleanup when attachment or mounting fails.
     fn attach_and_mount_resumable(
         &self,
         image: &Path,
         mount_point: &Path,
         _workspace: &LifecycleWorkspace,
-    ) -> Result<Self::Attachment, ApfsStorageError> {
-        self.attach_mounted(image, mount_point, MountAccess::ReadWrite, false)
+    ) -> Result<ResumedMount<Self::Attachment>, ApfsStorageError> {
+        Ok(ResumedMount {
+            attachment: self.attach_mounted(image, mount_point, MountAccess::ReadWrite, false)?,
+            found: FoundMount::Detached,
+        })
     }
     /// Rename the volume of `attachment`, a verified attachment of an image under the store
     /// mounted at `mount_point`, through that mount root held open (`cowshed_apfs::OwnedVolumeRoot`):
@@ -1347,8 +1369,9 @@ where
         }
     }
 
-    /// Retire an unfinished clone without ever publishing it as runnable. Inspection runs
-    /// on its verified mount under the image lock; a refusal preserves the pending payload.
+    /// Retire an unfinished clone without ever publishing it. Inspection runs on its verified
+    /// mount under the image lock; a refusal preserves the pending payload and leaves its mount
+    /// state as it found it.
     pub async fn execute_pending_clone_retirement<F, Fut, R, E>(
         &self,
         metadata: crate::metadata::DetachedWorkspaceMetadata,
@@ -1398,13 +1421,26 @@ where
         let prepared = StagedCallbackGuard::new(
             Arc::clone(&self.host),
             prepared,
-            preserve_prepared_clone::<H>,
+            restore_prepared_mount::<H>,
         );
         let value = match inspect(prepared.get().stage.clone()).await {
             Ok(value) => value,
             Err(error) => {
-                let _prepared = prepared.into_prepared();
-                return Err(StagedExecutionError::Initializer(error));
+                // Nothing was retired, so the image goes back as it was found: a removal that
+                // mounted it to inspect it must not leave it mounted.
+                let prepared = prepared.into_prepared();
+                let host = Arc::clone(&self.host);
+                let restored = self
+                    .lane
+                    .dispatch(move || restore_prepared_mount(host.as_ref(), prepared))
+                    .await;
+                return Err(match restored {
+                    Ok(()) => StagedExecutionError::Initializer(error),
+                    Err(cleanup) => StagedExecutionError::InitializerCleanup {
+                        initializer: error,
+                        cleanup,
+                    },
+                });
             }
         };
         let prepared = prepared.into_prepared();
@@ -1417,6 +1453,7 @@ where
                     stage,
                     attachment,
                     image,
+                    found: _,
                 } = prepared;
                 let trash = retired_image_path(&config, &stage.workspace)?;
                 let revision = stage.workspace.revision().get().checked_add(1).ok_or(
@@ -2139,6 +2176,7 @@ struct PreparedClone<A> {
     stage: WorkspaceStage,
     attachment: A,
     image: PathBuf,
+    found: FoundMount,
 }
 
 struct PendingRestore {
@@ -2644,7 +2682,9 @@ fn finish_adoption<H: ApfsExecutionHost>(
         hand_over_checkout(host, &checkout, handoff)?;
     }
     let image = canonical_image_path(config, workspace)?;
-    let attachment = host.attach_and_mount_resumable(&image, &checkout, workspace)?;
+    let attachment = host
+        .attach_and_mount_resumable(&image, &checkout, workspace)?
+        .attachment;
     if let Err(primary) = host.validate_marker(&checkout, &expected) {
         return detach_after_failure(host, attachment, primary, "canonical validation");
     }
@@ -2762,7 +2802,7 @@ fn mount_clone_stage<H: ApfsExecutionHost>(
     let canonical_mount = mount_point(config, &workspace)?;
     let canonical_companion = companion_path(&canonical_image);
     // An attach refusal preserves the pending payload: it can be reporting a crash-left mount.
-    let attachment =
+    let ResumedMount { attachment, found } =
         host.attach_and_mount_resumable(&canonical_image, &canonical_mount, &workspace)?;
     let prepared = timed_apfs_step("canonical", "creds", || {
         host.mint_workspace_credentials(
@@ -2791,7 +2831,16 @@ fn mount_clone_stage<H: ApfsExecutionHost>(
         })
     });
     if resuming {
-        return prepared.map(|()| PreparedClone {
+        // Nothing ran on the stage yet, so a refused preparation leaves the pending image as it
+        // was found; the next verb naming it mounts it again.
+        if let Err(primary) = prepared {
+            return combine_cleanup(
+                "pending clone preparation",
+                primary,
+                restore_found_mount(host, attachment, found),
+            );
+        }
+        return Ok(PreparedClone {
             stage: WorkspaceStage {
                 workspace,
                 mount_point: canonical_mount,
@@ -2800,6 +2849,7 @@ fn mount_clone_stage<H: ApfsExecutionHost>(
             },
             attachment,
             image: canonical_image,
+            found,
         });
     }
     if let Err(primary) = prepared {
@@ -2818,6 +2868,7 @@ fn mount_clone_stage<H: ApfsExecutionHost>(
         },
         attachment,
         image: canonical_image,
+        found,
     })
 }
 
@@ -2831,6 +2882,30 @@ fn preserve_prepared_clone<H: ApfsExecutionHost>(
     Ok(())
 }
 
+/// Leave a pending image as [`ApfsExecutionHost::attach_and_mount_resumable`] found it: a mount
+/// it reused stays, a mount it made on a surviving attachment is undone, and an image it
+/// attached is detached.
+fn restore_found_mount<H: ApfsExecutionHost>(
+    host: &H,
+    attachment: H::Attachment,
+    found: FoundMount,
+) -> Result<(), ApfsStorageError> {
+    match found {
+        FoundMount::Mounted => Ok(()),
+        FoundMount::Attached => host.unmount_attachment(&attachment),
+        FoundMount::Detached => host.detach(attachment, DetachIntent::Release),
+    }
+}
+
+/// A pending retirement that ends without retiring — refused or cancelled — changed nothing the
+/// image must stay mounted for, so it puts the mount back as it found it.
+fn restore_prepared_mount<H: ApfsExecutionHost>(
+    host: &H,
+    prepared: PreparedClone<H::Attachment>,
+) -> Result<(), ApfsStorageError> {
+    restore_found_mount(host, prepared.attachment, prepared.found)
+}
+
 fn commit_prepared_clone<H: ApfsExecutionHost>(
     host: &H,
     _config: &ApfsSubstrateConfig,
@@ -2840,6 +2915,7 @@ fn commit_prepared_clone<H: ApfsExecutionHost>(
         stage,
         attachment,
         image,
+        found: _,
     } = prepared;
     // The callback has already run and may have changed external Git state. On failure, `?`
     // leaves the exact PendingFence clone mounted so recovery can rerun initialization and

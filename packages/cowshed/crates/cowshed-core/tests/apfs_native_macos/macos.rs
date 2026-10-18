@@ -30,8 +30,8 @@ use cowshed_core::storage::apfs::native::{
     SystemKernelMountSource,
 };
 use cowshed_core::storage::apfs::{
-    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, Labelled, MarkerExpectation,
-    MetadataPolicy,
+    ApfsExecutionHost, ApfsStorageError, ApfsSubstrateConfig, FoundMount, Labelled,
+    MarkerExpectation, MetadataPolicy,
 };
 use cowshed_core::storage::deletion_log::DELETION_LOG_FILE;
 use cowshed_core::storage::lifecycle::{
@@ -7098,9 +7098,15 @@ fn recovering_an_unmounted_attachment_mounts_its_pinned_volume_without_reattachi
     let host = native_host(&fixture, runner.clone());
     let mount = fixture.root.join("recovered-mount");
 
-    let attachment = host
+    let resumed = host
         .attach_and_mount_resumable(image.image(), &mount, &workspace())
         .expect("reuse the existing attachment");
+    assert_eq!(
+        resumed.found,
+        FoundMount::Attached,
+        "an unmounted attachment is found attached, so a refusal unmounts only"
+    );
+    let attachment = resumed.attachment;
 
     assert_eq!(attachment.volume_device(), "/dev/disk10s1");
     assert_eq!(
