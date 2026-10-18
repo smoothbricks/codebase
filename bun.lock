@@ -83,7 +83,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.2.4",
+      "version": "0.2.5-next.0",
       "bin": {
         "cowshed": "./bin/cowshed",
       },
@@ -215,7 +215,7 @@
     },
     "packages/nx-cache-server": {
       "name": "@smoothbricks/nx-cache-server",
-      "version": "0.1.1",
+      "version": "0.1.2-next.0",
       "bin": {
         "nx-cache-server": "./dist/ts/main.js",
       },
