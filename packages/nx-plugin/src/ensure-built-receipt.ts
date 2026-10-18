@@ -12,7 +12,7 @@ import type {
   EnsureBuiltProducerReceipt,
   EnsureBuiltReceipt,
 } from './ensure-built.js';
-import { type NodeWitness, nodeStamp, nodesUnchanged } from './ensure-built-witness.js';
+import { movedNodes, type NodeWitness, nodeStamp, nodesUnchanged } from './ensure-built-witness.js';
 
 export type ReceiptEvidence<T> =
   | { readonly ok: true; readonly value: T }
@@ -207,7 +207,8 @@ export function captureProducerSource(
     const dirty = dirtyProviderPaths(status.value).filter((path) => !excluded.has(path));
     if (dirty.length !== 0)
       return { ok: false, detail: `Tracked source/index differs from ${head}: ${dirty.join(', ')}` };
-    if (!nodesUnchanged(nodes)) return { ok: false, detail: 'Tracked source moved during producer pre capture' };
+    const moved = movedNodes(nodes);
+    if (moved !== null) return { ok: false, detail: `Tracked source moved during producer pre capture: ${moved}` };
     return { ok: true, value: { head, headTree: tree.value.trim(), files, nodes, outputs } };
   } catch (error) {
     if (error instanceof Error) return { ok: false, detail: `Cannot prove tracked producer tree: ${error.message}` };
@@ -222,12 +223,13 @@ export function producerSourceUnchanged(root: string, before: ProducerSourceWitn
   const outputs = new Set(before.outputs.filter((path) => !graphConfiguration(path)));
   const tree = receiptGit(root, ['rev-parse', '--verify', `${revision.value.trim()}^{tree}`]);
   if (!tree.ok) return tree;
-  if (
-    tree.value.trim() !== before.headTree ||
-    dirtyProviderPaths(status.value).some((path) => !outputs.has(path)) ||
-    !nodesUnchanged(before.nodes)
-  )
-    return { ok: false, detail: 'Producer HEAD/tracked source nodes changed across actual task execution' };
+  const changed = 'Producer HEAD/tracked source nodes changed across actual task execution';
+  if (tree.value.trim() !== before.headTree)
+    return { ok: false, detail: `${changed}: HEAD's tree is ${tree.value.trim()}, not ${before.headTree}` };
+  const dirty = dirtyProviderPaths(status.value).filter((path) => !outputs.has(path));
+  if (dirty.length !== 0) return { ok: false, detail: `${changed}: ${dirty.join(', ')} differ from HEAD` };
+  const moved = movedNodes(before.nodes);
+  if (moved !== null) return { ok: false, detail: `${changed}: ${moved}` };
   return { ok: true, value: true };
 }
 /** Enumerate exact public nodes; never exempt a broad directory of tracked source. */
