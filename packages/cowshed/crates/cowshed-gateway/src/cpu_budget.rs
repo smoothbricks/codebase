@@ -33,7 +33,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cowshed_gateway_types::{
-    CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, JobserverClass,
+    CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
+    JobserverClass,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -123,6 +124,10 @@ struct Holder {
     tokens: usize,
     want: usize,
     grows: bool,
+    /// Who asked, as the status names the holder.
+    claim: Claim,
+    /// When it was granted: the lease's age starts here, and a growth does not renew it.
+    granted: Instant,
 }
 
 impl Holder {
@@ -275,6 +280,8 @@ impl Ledger {
                         tokens,
                         want: waiter.want,
                         grows: waiter.grows,
+                        claim: waiter.claim.clone(),
+                        granted: now,
                     });
                     self.free -= tokens;
                     effects.push(Effect::Grant {
@@ -469,7 +476,8 @@ impl Ledger {
         })
     }
 
-    pub(crate) fn status(&self) -> CpuBudgetStatus {
+    /// The ledger at `now`, every granted lease named with its age at that instant.
+    pub(crate) fn status(&self, now: Instant) -> CpuBudgetStatus {
         let mut checkouts: Vec<CpuCheckoutStatus> = self
             .checkouts
             .iter()
@@ -493,44 +501,33 @@ impl Ledger {
             })
             .collect();
         gate_queue.sort_unstable_by_key(|(waiter, _)| waiter.order());
-        // Gate-class holders, summed per gate job and checkout: the oldest job is the head.
-        let mut gate_jobs: BTreeMap<(Ticket, &Arc<str>), CpuGateJob> = BTreeMap::new();
+        // Gate-class holders, grouped per gate job and checkout: the oldest job is the head.
+        let mut gate_jobs: BTreeMap<(Ticket, &Arc<str>), Vec<&Holder>> = BTreeMap::new();
         let mut background = Vec::new();
         for (name, checkout) in &self.checkouts {
-            let mut stake = CpuCheckoutStatus {
-                checkout: name.to_string(),
-                held: 0,
-                running: 0,
-                waiting: 0,
-            };
+            let mut stake = Vec::new();
             for holder in &checkout.running {
                 match holder.class {
-                    JobserverClass::Gate => {
-                        let job =
-                            gate_jobs
-                                .entry((holder.job, name))
-                                .or_insert_with(|| CpuGateJob {
-                                    checkout: name.to_string(),
-                                    job: holder.job,
-                                    held: 0,
-                                    running: 0,
-                                });
-                        job.held += holder.tokens;
-                        job.running += 1;
-                    }
-                    JobserverClass::Background => {
-                        stake.held += holder.tokens;
-                        stake.running += 1;
-                    }
+                    JobserverClass::Gate => gate_jobs
+                        .entry((holder.job, name))
+                        .or_default()
+                        .push(holder),
+                    JobserverClass::Background => stake.push(holder),
                 }
             }
-            stake.waiting = checkout
+            let waiting = checkout
                 .waiting
                 .iter()
                 .filter(|waiter| waiter.class == JobserverClass::Background)
                 .count();
-            if stake.held + stake.running + stake.waiting > 0 {
-                background.push(stake);
+            if !stake.is_empty() || waiting > 0 {
+                let (held, holders) = leases(stake, now);
+                background.push(CpuBackgroundStake {
+                    checkout: name.to_string(),
+                    held,
+                    waiting,
+                    holders,
+                });
             }
         }
         background.sort_unstable_by(|left, right| left.checkout.cmp(&right.checkout));
@@ -538,7 +535,18 @@ impl Ledger {
             total: self.total,
             held: self.total - self.free,
             checkouts,
-            gate_jobs: gate_jobs.into_values().collect(),
+            gate_jobs: gate_jobs
+                .into_iter()
+                .map(|((job, name), holders)| {
+                    let (held, holders) = leases(holders, now);
+                    CpuGateJob {
+                        checkout: name.to_string(),
+                        job,
+                        held,
+                        holders,
+                    }
+                })
+                .collect(),
             gate_queue: gate_queue
                 .into_iter()
                 .map(|(waiter, name)| CpuGateWaiter {
@@ -550,6 +558,25 @@ impl Ledger {
             background,
         }
     }
+}
+
+/// One group's granted leases as the status names them, the oldest grant first, with the tokens
+/// they hold together. The age is the lease's, from its grant: the ledger knows no other.
+fn leases(mut holders: Vec<&Holder>, now: Instant) -> (usize, Vec<CpuHolder>) {
+    holders.sort_unstable_by_key(|holder| (holder.granted, holder.ticket));
+    let held = holders.iter().map(|holder| holder.tokens).sum();
+    let holders = holders
+        .into_iter()
+        .map(|holder| CpuHolder {
+            pid: holder.claim.pid,
+            command: holder.claim.command.to_string(),
+            tokens: holder.tokens,
+            want: holder.want,
+            held_ms: u64::try_from(now.saturating_duration_since(holder.granted).as_millis())
+                .unwrap_or(u64::MAX),
+        })
+        .collect();
+    (held, holders)
 }
 
 enum Message {
@@ -728,7 +755,7 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                 ledger.leave(Instant::now(), ticket, &mut effects);
             }
             Message::Status { reply } => {
-                let _ = reply.send(ledger.status());
+                let _ = reply.send(ledger.status(Instant::now()));
             }
         }
         for effect in effects.drain(..) {
@@ -957,6 +984,68 @@ mod tests {
                         == checkout.held
                 })
         }
+
+        /// The ledger as its status reports it `ms` after the clock's origin.
+        fn status(&self, ms: u64) -> CpuBudgetStatus {
+            self.ledger.status(self.origin + Duration::from_millis(ms))
+        }
+    }
+
+    /// Every granted lease is named — its client's pid, its command, its tokens of its want and
+    /// the age of its grant — oldest grant first, so a reader tells a live holder from an orphan
+    /// without guessing from the checkout. Measured 2026-10-18: a ledger that said only
+    /// `land-test-hang: held 15, running 1` read as an orphan, and a live 34-minute
+    /// `cargo test … fleet_coder` was killed by hand. A growth does not renew a lease's age, and
+    /// a waiter is counted, never named as a holder.
+    #[test]
+    fn the_status_names_each_lease_with_its_pid_command_and_the_age_of_its_grant() {
+        let lease = |ticket: Ticket, tokens: usize, want: usize, held_ms: u64| CpuHolder {
+            pid: Some(7),
+            command: format!("t{ticket}"),
+            tokens,
+            want,
+            held_ms,
+        };
+        let mut clock = Clock::new(8);
+        assert_eq!(clock.ask(0, 1, "shed", 4), [(1, 4)]);
+        assert_eq!(clock.ask_land(1_000, 2, "land", 1), [(2, 1)]);
+        assert_eq!(clock.ask_build(2_000, 3, "shed", 8), [(3, 3)]);
+        let status = clock.status(3_000);
+        assert_eq!(
+            status.gate_jobs,
+            [CpuGateJob {
+                checkout: "land".into(),
+                job: 2,
+                held: 1,
+                holders: vec![lease(2, 1, 1, 2_000)],
+            }]
+        );
+        assert_eq!(
+            status.background,
+            [CpuBackgroundStake {
+                checkout: "shed".into(),
+                held: 7,
+                waiting: 0,
+                holders: vec![lease(1, 4, 4, 3_000), lease(3, 3, 8, 1_000)],
+            }]
+        );
+
+        assert_eq!(clock.ask(4_000, 4, "shed", 1), []);
+        assert_eq!(clock.status(4_000).background[0].waiting, 1);
+        // The first lease returns: the waiter starts, then the build grows by what is left.
+        assert_eq!(clock.leave(5_000, 1), [(4, 1), (3, 6)]);
+        let status = clock.status(9_000);
+        assert_eq!(status.gate_jobs[0].holders, [lease(2, 1, 1, 8_000)]);
+        assert_eq!(
+            status.background,
+            [CpuBackgroundStake {
+                checkout: "shed".into(),
+                held: 7,
+                waiting: 0,
+                holders: vec![lease(3, 6, 8, 7_000), lease(4, 1, 1, 4_000)],
+            }]
+        );
+        assert!(clock.balanced());
     }
 
     #[test]
@@ -965,10 +1054,10 @@ mod tests {
         assert_eq!(clock.ask(0, 1, "a", 4), [(1, 4)]);
         assert_eq!(clock.leave(1, 1), []);
         assert_eq!(clock.ask(2, 2, "a", 64), [(2, 18)]);
-        assert_eq!(clock.ledger.status().held, 18);
+        assert_eq!(clock.status(2).held, 18);
         assert_eq!(clock.leave(3, 2), []);
-        assert_eq!(clock.ledger.status().held, 0);
-        assert!(clock.ledger.status().checkouts.is_empty());
+        assert_eq!(clock.status(3).held, 0);
+        assert!(clock.status(3).checkouts.is_empty());
         assert!(clock.balanced());
     }
 
@@ -1002,7 +1091,7 @@ mod tests {
         assert_eq!(clock.ask(0, 1, "a", 12), [(1, 12)]);
         // b's fair share is 9, but no peer waits: the remaining 6 must not sit idle.
         assert_eq!(clock.ask(1, 2, "b", 18), [(2, 6)]);
-        assert_eq!(clock.ledger.status().held, 18);
+        assert_eq!(clock.status(1).held, 18);
         assert_eq!(clock.leave(2, 2), []);
         assert_eq!(clock.leave(3, 1), []);
         assert!(clock.balanced());
@@ -1029,14 +1118,14 @@ mod tests {
         for ticket in 0..60 {
             clock.ask(0, ticket, "busy", 1);
         }
-        assert_eq!(clock.ledger.status().held, 12);
+        assert_eq!(clock.status(0).held, 12);
         assert_eq!(clock.ask(1, 100, "quiet", 1), []);
         assert_eq!(clock.ask(1, 101, "quiet", 1), []);
         // Every token busy returns goes to quiet until quiet holds as much as busy would allow.
         assert_eq!(clock.leave(2, 0), [(100, 1)]);
         assert_eq!(clock.leave(3, 1), [(101, 1)]);
         assert_eq!(clock.leave(4, 2), [(12, 1)]);
-        let status = clock.ledger.status();
+        let status = clock.status(4);
         assert_eq!(status.checkouts[0].checkout, "busy");
         assert_eq!(status.checkouts[0].held, 10);
         assert_eq!(status.checkouts[1].held, 2);
@@ -1066,10 +1155,10 @@ mod tests {
         assert_eq!(clock.ask(0, 2, "a", 2), [(2, 2)]);
         assert_eq!(clock.ask(1, 3, "b", 2), []);
         assert_eq!(clock.leave(2, 3), []);
-        assert_eq!(clock.ledger.status().checkouts.len(), 1);
+        assert_eq!(clock.status(2).checkouts.len(), 1);
         assert_eq!(clock.leave(3, 1), []);
         assert_eq!(clock.leave(3, 2), []);
-        assert_eq!(clock.ledger.status().held, 0);
+        assert_eq!(clock.status(3).held, 0);
         // An unknown ticket — a stake dropped twice, or a grant already returned — is ignored.
         assert_eq!(clock.leave(4, 1), []);
         assert!(clock.balanced());
@@ -1136,8 +1225,7 @@ mod tests {
         assert_eq!(clock.ask_task(4, 6, 2, "b", 2), []);
         assert_eq!(clock.ask_task(5, 7, 1, "a", 2), []);
         let queue: Vec<(String, u64)> = clock
-            .ledger
-            .status()
+            .status(5)
             .gate_queue
             .into_iter()
             .map(|waiter| (waiter.checkout, waiter.job))
@@ -1203,7 +1291,7 @@ mod tests {
         for ticket in 11..=14 {
             assert_eq!(clock.ask_task(2, ticket, 10, "infer", 3), [(ticket, 3)]);
         }
-        assert_eq!(clock.ledger.status().held, 18);
+        assert_eq!(clock.status(2).held, 18);
         assert_eq!(clock.ask_task(3, 15, 10, "infer", 3), []);
         assert_eq!(clock.ask_land(4, 20, "code-mode", 1), []);
         assert_eq!(clock.ask_land(5, 30, "other", 1), []);
@@ -1279,7 +1367,7 @@ mod tests {
         // returned while it runs at three of eight stays free rather than held idle by it.
         assert_eq!(clock.ask_task(3, 4, 0, "land", 8), [(4, 3)]);
         assert_eq!(clock.leave(4, 3), []);
-        assert_eq!(clock.ledger.status().held, 7);
+        assert_eq!(clock.status(4).held, 7);
         assert!(clock.balanced());
     }
 

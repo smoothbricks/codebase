@@ -469,29 +469,66 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
     let mut older_task = Asker::child(&older_pool, 1).await;
     let status = ledger(&socket).await;
     // The running gate jobs, the head — the older land — first, each on its orchestrator's token;
-    // the feature shed is the background served behind them.
+    // the feature shed is the background served behind them. Every lease names its client — this
+    // process, the socket's peer — its command, its tokens of its want, and the age of its grant,
+    // the oldest grant first.
+    let me = Some(i32::try_from(std::process::id()).expect("a pid fits i32"));
+    let leases = |holders: &[cowshed_gateway_types::CpuHolder]| {
+        holders
+            .iter()
+            .map(|holder| {
+                (
+                    holder.pid,
+                    holder.command.clone(),
+                    holder.tokens,
+                    holder.want,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
         status
             .gate_jobs
             .iter()
-            .map(|job| (job.checkout.as_str(), job.held, job.running))
+            .map(|job| (job.checkout.as_str(), job.held, leases(&job.holders)))
             .collect::<Vec<_>>(),
-        [("/w/older", 1, 1), ("/w/younger", 1, 1)],
+        [
+            (
+                "/w/older",
+                1,
+                vec![(me, "nx run-many -t gate".to_owned(), 1, 1)]
+            ),
+            (
+                "/w/younger",
+                1,
+                vec![(me, "nx run-many -t gate".to_owned(), 1, 1)]
+            ),
+        ],
         "{status:?}"
     );
     assert!(
         status.gate_jobs[0].job < status.gate_jobs[1].job,
         "{status:?}"
     );
+    let [feature] = status.background.as_slice() else {
+        panic!("one background stake: {status:?}");
+    };
     assert_eq!(
-        status.background,
-        [cowshed_gateway_types::CpuCheckoutStatus {
-            checkout: "/w/feature".into(),
-            held: 2,
-            running: 2,
-            waiting: 1,
-        }],
+        (feature.checkout.as_str(), feature.held, feature.waiting),
+        ("/w/feature", 2, 1),
         "{status:?}"
+    );
+    assert_eq!(
+        leases(&feature.holders),
+        [
+            (me, "cargo nextest run".to_owned(), 1, 1),
+            (me, "cargo nextest run".to_owned(), 1, 1)
+        ],
+        "{status:?}"
+    );
+    assert!(
+        feature.holders[0].held_ms >= feature.holders[1].held_ms,
+        "the oldest grant first: {status:?}"
     );
     let queue: Vec<(String, u64)> = status
         .gate_queue
@@ -515,6 +552,16 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
     // Each returned token goes to the oldest land first, then the younger land, then the feature.
     drop(feature_one);
     assert_eq!(older_task.granted(Duration::from_secs(10)).await, Some(1));
+    // A task its pool relays is named too: by its own pid, the pool socket's peer.
+    let status = ledger(&socket).await;
+    assert_eq!(
+        leases(&status.gate_jobs[0].holders),
+        [
+            (me, "nx run-many -t gate".to_owned(), 1, 1),
+            (me, "child CPU pool".to_owned(), 1, 1)
+        ],
+        "{status:?}"
+    );
     assert_eq!(younger_task.granted(Duration::from_millis(50)).await, None);
     drop(older_task);
     assert_eq!(younger_task.granted(Duration::from_secs(10)).await, Some(1));

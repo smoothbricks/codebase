@@ -1418,12 +1418,16 @@ supervisor that ran the job retires.
   the daemon started that it is still recovering, never 0 (11_shell.md "Supervisor recovery").
   `cpuBudget = { ledger: CpuBudgetStatus } | { unanswered: <reason> }` is the daemon's own `cpu-budget` answer verbatim,
   or the control client's reason a daemon that answered `status` did not answer it (one from before the request refuses
-  it; one from before `gateJobs` answers a ledger this build cannot read, and the reason names the missing field); never
-  an empty ledger in its place, and absent when no daemon answered `status`.
-  `CpuBudgetStatus = { total, held, checkouts, gateJobs, gateQueue, background }`: `checkouts` (every class) and
-  `background` (background class alone) are `[{ checkout, held, running, waiting }]`, `gateJobs` is
-  `[{ checkout, job, held, running }]` oldest job first (the head of the gate queue first), and `gateQueue` is
-  `[{ checkout, job, want }]` in the order returned tokens go to it (05_gateway.md "Host CPU budget", Wire).
+  it; one from before `gateJobs` or `holders` answers a ledger this build cannot read, and the reason names the missing
+  field); never an empty ledger in its place, and absent when no daemon answered `status`.
+  `CpuBudgetStatus = { total, held, checkouts, gateJobs, gateQueue, background }`: `checkouts` (every class) is
+  `[{ checkout, held, running, waiting }]`, `background` (background class alone) is
+  `[{ checkout, held, waiting, holders }]`, `gateJobs` is `[{ checkout, job, held, holders }]` oldest job first (the
+  head of the gate queue first), and `gateQueue` is `[{ checkout, job, want }]` in the order returned tokens go to it.
+  `holders` is `[CpuHolder]`, one per granted lease, oldest grant first:
+  `CpuHolder = { pid?, command, tokens, want, heldMs }`, the client's peer pid, the command it named, the tokens it
+  holds now of its `want`, and the milliseconds since its grant — the lease's age, not its process's (05_gateway.md
+  "Host CPU budget", Wire).
   `AuditEvent = { timestamp, repoId, workspaceIncarnation, workspace, action, decision, reason?, trace }`.
 
 `JsonEnvelope<T>` has only the private-body constructors `success(T)` → `{"ok":true,"result":T}` and

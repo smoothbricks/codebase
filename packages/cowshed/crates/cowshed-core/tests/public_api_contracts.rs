@@ -1186,25 +1186,37 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
                 checkouts: vec![cowshed_gateway_types::CpuCheckoutStatus {
                     checkout: "/w/land".into(),
                     held: 13,
-                    running: 4,
+                    running: 2,
                     waiting: 1,
                 }],
                 gate_jobs: vec![cowshed_gateway_types::CpuGateJob {
                     checkout: "/w/land".into(),
                     job: 7,
                     held: 12,
-                    running: 3,
+                    holders: vec![cowshed_gateway_types::CpuHolder {
+                        pid: Some(4120),
+                        command: "nx run-many -t gate".into(),
+                        tokens: 12,
+                        want: 18,
+                        held_ms: 125_000,
+                    }],
                 }],
                 gate_queue: vec![cowshed_gateway_types::CpuGateWaiter {
                     checkout: "/w/land".into(),
                     job: 7,
                     want: 6,
                 }],
-                background: vec![cowshed_gateway_types::CpuCheckoutStatus {
+                background: vec![cowshed_gateway_types::CpuBackgroundStake {
                     checkout: "/w/land".into(),
                     held: 1,
-                    running: 1,
                     waiting: 0,
+                    holders: vec![cowshed_gateway_types::CpuHolder {
+                        pid: None,
+                        command: "cargo test".into(),
+                        tokens: 1,
+                        want: 18,
+                        held_ms: 7,
+                    }],
                 }],
             },
         )),
@@ -1213,10 +1225,12 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
     assert_eq!(
         serde_json::to_value(&ledger).unwrap()["cpuBudget"],
         json!({"ledger":{"total":18,"held":13,
-            "checkouts":[{"checkout":"/w/land","held":13,"running":4,"waiting":1}],
-            "gateJobs":[{"checkout":"/w/land","job":7,"held":12,"running":3}],
+            "checkouts":[{"checkout":"/w/land","held":13,"running":2,"waiting":1}],
+            "gateJobs":[{"checkout":"/w/land","job":7,"held":12,"holders":[
+                {"pid":4120,"command":"nx run-many -t gate","tokens":12,"want":18,"heldMs":125000}]}],
             "gateQueue":[{"checkout":"/w/land","job":7,"want":6}],
-            "background":[{"checkout":"/w/land","held":1,"running":1,"waiting":0}]}})
+            "background":[{"checkout":"/w/land","held":1,"waiting":0,"holders":[
+                {"command":"cargo test","tokens":1,"want":18,"heldMs":7}]}]}})
     );
     assert_eq!(
         serde_json::from_value::<GatewayStatus>(serde_json::to_value(&ledger).unwrap()).unwrap(),

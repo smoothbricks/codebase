@@ -184,7 +184,7 @@ pub struct CpuBudgetStatus {
     pub gate_queue: Vec<CpuGateWaiter>,
     /// Each checkout's background-class stake alone, for the checkouts that have one: what is
     /// served behind the gate jobs.
-    pub background: Vec<CpuCheckoutStatus>,
+    pub background: Vec<CpuBackgroundStake>,
 }
 
 /// One gate job's runners that hold tokens, in one checkout.
@@ -194,10 +194,10 @@ pub struct CpuGateJob {
     pub checkout: String,
     /// The gate job, as its admission number: the smaller is the older job.
     pub job: u64,
-    /// Tokens its granted runners hold.
+    /// Tokens its granted runners hold: the sum of its holders' tokens.
     pub held: usize,
-    /// Its runners holding tokens.
-    pub running: usize,
+    /// Its granted leases, one per runner holding tokens, the oldest grant first.
+    pub holders: Vec<CpuHolder>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -210,6 +210,39 @@ pub struct CpuCheckoutStatus {
     pub running: usize,
     /// Runners waiting for a grant.
     pub waiting: usize,
+}
+
+/// One checkout's background-class stake: what it holds, who of it waits, and each granted lease.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuBackgroundStake {
+    pub checkout: String,
+    /// Tokens its granted background runners hold: the sum of its holders' tokens.
+    pub held: usize,
+    /// Background runners waiting for a grant.
+    pub waiting: usize,
+    /// Its granted leases, one per background runner holding tokens, the oldest grant first.
+    pub holders: Vec<CpuHolder>,
+}
+
+/// One granted lease, as the ledger knows it: the client that holds it, what it said the tokens
+/// are for, and since when. A lease is one connection, granted once; its age is the grant's, not
+/// its process's, and a growth does not renew it. The ledger never scans processes: `pid` is the
+/// socket's peer, and `ps -p <pid>` tells the rest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuHolder {
+    /// The client process, when its socket named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// What the client said the tokens are for.
+    pub command: String,
+    /// The tokens it holds now, growth included.
+    pub tokens: usize,
+    /// The tokens it asked for.
+    pub want: usize,
+    /// Milliseconds since its grant.
+    pub held_ms: u64,
 }
 
 /// One waiting gate-class request.

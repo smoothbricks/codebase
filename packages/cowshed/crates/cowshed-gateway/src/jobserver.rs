@@ -322,6 +322,11 @@ async fn serve_pool(
     directory: std::sync::Arc<PathBuf>,
 ) {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
+    // The pid names the child in the ledger's status; nothing is decided by it.
+    let pid = stream
+        .peer_cred()
+        .ok()
+        .and_then(|credentials| credentials.pid());
     let mut reader = BufReader::new(stream);
     let mut frame = Vec::new();
     let parsed = match (&mut reader).take(4097).read_until(b'\n', &mut frame).await {
@@ -352,7 +357,7 @@ async fn serve_pool(
             return;
         }
     };
-    let claim = crate::disk_lease::Claim::new("child CPU pool", None);
+    let claim = crate::disk_lease::Claim::new("child CPU pool", pid);
     let (stake, granted, mut growth) = if grow {
         let (stake, granted, growth) = budget.ask_growing(checkout, want, claim, rank);
         (stake, granted, Some(growth))

@@ -102,6 +102,33 @@ impl GatewayControlClient {
             .ok_or(ControlError::InvalidResponse)
     }
 
+    /// The gate jobs a gateway restart now would cut off (05_gateway.md, "An install waits for
+    /// the gates in flight"): every gate job whose runners hold tokens and every gate job a
+    /// waiting request serves, oldest first. It reads `gateJobs` and `gateQueue` of the
+    /// `cpu-budget` answer and nothing else of the ledger, so an install reads the gates of a
+    /// running gateway of another build, whose ledger has fields this one lacks or does not know.
+    pub async fn gates_in_flight(
+        &self,
+    ) -> Result<BTreeSet<cowshed_core::api::GateJobRef>, ControlError> {
+        let response: GatesResponse = self.exchange(&ControlRequest::CpuBudget).await?;
+        if !response.ok {
+            return Err(ControlError::Rejected {
+                code: response.code.ok_or(ControlError::InvalidResponse)?,
+                message: response.error.ok_or(ControlError::InvalidResponse)?,
+            });
+        }
+        let gates = response.cpu_budget.ok_or(ControlError::InvalidResponse)?;
+        Ok(gates
+            .gate_jobs
+            .into_iter()
+            .chain(gates.gate_queue)
+            .map(|gate| cowshed_core::api::GateJobRef {
+                job: gate.job,
+                checkout: gate.checkout,
+            })
+            .collect())
+    }
+
     pub async fn install(&self, session: &WorkspaceSession) -> Result<(), ControlError> {
         session
             .validate()
@@ -250,13 +277,21 @@ impl GatewayControlClient {
     }
 
     async fn send(&self, request: &ControlRequest) -> Result<ControlResponse, ControlError> {
+        let response = self.exchange(request).await?;
+        check_response(&response)?;
+        Ok(response)
+    }
+
+    /// One request, and its one answer line read as `T`.
+    async fn exchange<T: serde::de::DeserializeOwned>(
+        &self,
+        request: &ControlRequest,
+    ) -> Result<T, ControlError> {
         let (mut stream, encoded) = self.connect_and_encode(request).await?;
         stream.write_all(&encoded).await?;
         stream.shutdown().await?;
         let mut reader = BufReader::new(stream);
-        let response = read_response_line(&mut reader).await?;
-        check_response(&response)?;
-        Ok(response)
+        read_answer_line(&mut reader).await
     }
 
     async fn connect_and_encode(
@@ -473,6 +508,32 @@ struct JobserverJobIn {
 struct AuthenticatedControlRequestIn {
     controller_credential: String,
     request: serde_json::Value,
+}
+
+/// What [`GatewayControlClient::gates_in_flight`] reads of a `cpu-budget` answer: its outcome and
+/// the gate work, and nothing else. Unknown fields are not refused here, unlike everywhere else
+/// on this wire: an install reads the ledger of the gateway it is about to replace.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GatesResponse {
+    ok: bool,
+    code: Option<ControlFailureCode>,
+    error: Option<String>,
+    cpu_budget: Option<GatesWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GatesWire {
+    gate_jobs: Vec<GateWire>,
+    gate_queue: Vec<GateWire>,
+}
+
+/// A running gate job or a waiting gate-class request, by the gate job it serves.
+#[derive(Deserialize)]
+struct GateWire {
+    checkout: String,
+    job: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1682,6 +1743,15 @@ async fn read_response_line<R>(reader: &mut BufReader<R>) -> Result<ControlRespo
 where
     R: AsyncRead + Unpin,
 {
+    read_answer_line(reader).await
+}
+
+/// One answer line of at most [`MAX_CONTROL_MESSAGE`] bytes, read as `T`.
+async fn read_answer_line<T, R>(reader: &mut BufReader<R>) -> Result<T, ControlError>
+where
+    T: serde::de::DeserializeOwned,
+    R: AsyncRead + Unpin,
+{
     let mut bytes = Vec::new();
     reader
         .take(MAX_CONTROL_MESSAGE + 1)
@@ -1998,5 +2068,58 @@ mod tests {
             expect_eof(&mut reader).await,
             Err(ControlError::MessageTooLarge)
         ));
+    }
+
+    /// An install reads the gates of the gateway it is about to replace, which is of another
+    /// build (05_gateway.md "An install waits for the gates in flight"). A ledger that lacks a
+    /// field this build reports (here `holders`, with a `running` this build no longer reads)
+    /// still names its gates, while the full ledger read refuses it: a refused read would let the
+    /// install restart the gateway without waiting, and cut a running land off.
+    #[tokio::test]
+    async fn an_install_reads_the_gates_of_a_ledger_from_another_build() {
+        // Under `/tmp`: a bind path is capped at `sun_path`'s 104 bytes.
+        let id = Uuid::new_v4().simple().to_string();
+        let root = PathBuf::from(format!("/tmp/csgates-{}", &id[..8]));
+        std::fs::create_dir(&root).expect("root");
+        let socket = root.join("gateway.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let answer = serde_json::json!({"ok": true, "cpuBudget": {"total": 4, "held": 3,
+            "checkouts": [{"checkout": "/w/land", "held": 2, "running": 2, "waiting": 1},
+                {"checkout": "/w/f", "held": 1, "running": 1, "waiting": 0}],
+            "gateJobs": [{"checkout": "/w/land", "job": 3, "held": 2, "running": 2}],
+            "gateQueue": [{"checkout": "/w/other", "job": 5, "want": 2},
+                {"checkout": "/w/land", "job": 3, "want": 1}],
+            "background": [{"checkout": "/w/f", "held": 1, "running": 1, "waiting": 0}]}});
+        let answering = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let request = read_request_line(&mut stream).await.expect("one request");
+                assert_eq!(request.as_slice(), b"{\"op\":\"cpu-budget\"}\n");
+                stream
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .await
+                    .expect("answer");
+            }
+        });
+        let client = GatewayControlClient::new(socket).expect("client");
+        assert_eq!(
+            client.gates_in_flight().await.expect("the gates"),
+            BTreeSet::from([
+                cowshed_core::api::GateJobRef {
+                    job: 3,
+                    checkout: "/w/land".into(),
+                },
+                cowshed_core::api::GateJobRef {
+                    job: 5,
+                    checkout: "/w/other".into(),
+                },
+            ])
+        );
+        assert!(
+            client.cpu_budget().await.is_err(),
+            "the full ledger of another build is not this build's"
+        );
+        answering.await.expect("the answers");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
