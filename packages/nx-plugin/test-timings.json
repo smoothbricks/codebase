@@ -52,6 +52,7 @@
     "src/bun-bootstrap.test.ts": 378,
     "src/ensure-built-witness.test.ts": 280,
     "src/test-walk-policy.test.ts": 280,
+    "src/managed-files/setup-devenv-free-disk.test.ts": 277,
     "src/package-target-policy.test.ts": 208,
     "src/nextest-extraction.test.ts": 151,
     "src/executors/bounded-exec/cpu-tokens.test.ts": 136,
