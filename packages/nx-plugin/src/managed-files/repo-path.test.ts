@@ -126,4 +126,33 @@ describe('managed repo-path', () => {
       });
     },
   );
+
+  it("names this checkout's own shell's evaluated profile, never the checkout's re-pointable link", async () => {
+    await withRepoPath(async (fixture) => {
+      // The link is what any activation of the checkout last pointed it at; the shell evaluated another profile.
+      const evaluated = join(fixture.root, 'evaluated-profile');
+      await executable(join(evaluated, 'bin/bun'), 'evaluated-bun');
+      await executable(join(fixture.entries[0], 'bun'), 'link-bun');
+      const run = (args: readonly string[], devenvRoot: string) => {
+        const result = spawnSync(join(fixture.tools, 'bash'), [fixture.helper, ...args], {
+          encoding: 'utf8',
+          env: { HOME: fixture.home, PATH: fixture.tools, DEVENV_ROOT: devenvRoot, DEVENV_PROFILE: evaluated },
+        });
+        expect(result.stderr).toBe('');
+        expect(result.status).toBe(0);
+        return result.stdout;
+      };
+      const own = join(fixture.root, 'tooling/direnv');
+      expect(run(['--print'], own).split('\n')[0]).toBe(join(evaluated, 'bin'));
+      // Another checkout's shell, inherited by a hook run here, does not name this checkout's profile.
+      expect(run(['--print'], join(fixture.root, 'system-bin')).split('\n')[0]).toBe(fixture.entries[0]);
+
+      const selected = spawnSync(join(fixture.tools, 'bash'), ['-c', 'bun'], {
+        encoding: 'utf8',
+        env: { HOME: fixture.home, PATH: run([], own).trimEnd() },
+      });
+      expect(selected.stderr).toBe('');
+      expect(selected.stdout).toBe('evaluated-bun\n');
+    });
+  });
 });

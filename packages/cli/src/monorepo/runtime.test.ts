@@ -1,6 +1,32 @@
 import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { PackageJson } from '../lib/json.js';
-import { runtimeTypesRangeForPublishedVersions, validateRuntimePins } from './runtime.js';
+import { runtimeTypesRangeForPublishedVersions, runtimeVersionsFromPath, validateRuntimePins } from './runtime.js';
+
+describe('runtimeVersionsFromPath', () => {
+  test("reads the shell's runtimes, never the checkout's devenv profile link", async () => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-runtime-'));
+    try {
+      // The link any activation of the checkout re-points; here it names another evaluation's runtimes.
+      const linked = join(root, 'tooling/direnv/.devenv/profile/bin');
+      await mkdir(linked, { recursive: true });
+      for (const name of ['bun', 'node']) {
+        await writeFile(join(linked, name), "#!/bin/sh\nprintf '9.9.9\\n'\n", { mode: 0o755 });
+      }
+      const node = spawnSync('node', ['--version'], { encoding: 'utf8' });
+      expect(node.status).toBe(0);
+      expect(await runtimeVersionsFromPath(root)).toEqual({
+        node: node.stdout.trim().replace(/^v/, ''),
+        bun: Bun.version,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('runtimeTypesRangeForPublishedVersions', () => {
   test('anchors a caret range at the newest published version in the installed Node major', () => {

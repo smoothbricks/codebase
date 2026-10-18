@@ -10,9 +10,19 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# The devenv profile's bin. Inside this checkout's own devenv shell it is the profile that shell evaluated,
+# DEVENV_PROFILE: an immutable store path, so `bun` there is the one devenv declared for this shell. The
+# checkout's `.devenv/profile` link is a place, not that declaration: every activation of the checkout re-points
+# it, and a fork inherits its source's. Outside a shell of this checkout — a git hook run from a plain terminal
+# or from another checkout's shell — the link is the only name for this checkout's profile.
+profile="$root/tooling/direnv/.devenv/profile"
+if [[ -n "${DEVENV_PROFILE:-}" && "${DEVENV_ROOT:-}" -ef "$root/tooling/direnv" ]]; then
+  profile="$DEVENV_PROFILE"
+fi
+
 # Order: most-specific → least-specific.
 entries=(
-  "$root/tooling/direnv/.devenv/profile/bin"
+  "$profile/bin"
   "$root/tooling/git-hooks"
   "$root/tooling"
   "$root/tooling/node_modules/.bin"

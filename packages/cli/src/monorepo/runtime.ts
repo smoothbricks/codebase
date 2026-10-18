@@ -1,4 +1,3 @@
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   ensureDependencyMap,
@@ -17,13 +16,16 @@ export interface RuntimeVersions {
   bun: string;
 }
 
-/** Live runtime versions from the shell PATH — the single source sync AND validate derive from. */
+/**
+ * Live runtime versions of the `bun` and `node` the shell's PATH resolves — the single source sync AND validate derive
+ * from, and the same binaries shell entry probes for drift. The devenv shell declares them; reading a checkout path
+ * instead (`tooling/direnv/.devenv/profile`, a link any other activation of the checkout re-points) wrote that link's
+ * version over the shell's.
+ */
 export async function runtimeVersionsFromPath(root: string): Promise<RuntimeVersions> {
-  const node = runtimeCommand(root, 'node');
-  const bun = runtimeCommand(root, 'bun');
   return {
-    node: (await runText(node, ['--version'], root)).trim().replace(/^v/, ''),
-    bun: (await runText(bun, ['--version'], root)).trim(),
+    node: (await runText('node', ['--version'], root)).trim().replace(/^v/, ''),
+    bun: (await runText('bun', ['--version'], root)).trim(),
   };
 }
 
@@ -213,12 +215,4 @@ function parseVersion(version: string): [number, number, number] | null {
 function parseVersionLenient(version: string): string | null {
   const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
   return match ? `${match[1]}.${match[2]}.${match[3]}` : null;
-}
-
-function runtimeCommand(root: string, name: 'bun' | 'node'): string {
-  const candidates = [
-    join(root, 'tooling', 'direnv', '.devenv', 'profile', 'bin', name),
-    join(root, 'tooling', 'devenv', '.profile', 'bin', name),
-  ];
-  return candidates.find((path) => existsSync(path)) ?? name;
 }

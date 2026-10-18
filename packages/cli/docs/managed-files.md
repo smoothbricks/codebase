@@ -50,6 +50,11 @@ hook or tooling calls. With no active environment, its repository entries are un
 `--github-path` modes use the same entries, with the existing reverse order for GitHub PATH writes. Installed Cargo and
 cowshed launchers still prepend their owned directory after composition, so activating Python does not replace them.
 
+Its devenv profile entry is the profile the shell evaluated, `DEVENV_PROFILE`, when `DEVENV_ROOT` is this checkout's
+`tooling/direnv`: a store path no other activation can move. Outside that shell — a git hook run from a plain terminal
+or from another checkout's shell — it is the checkout's `tooling/direnv/.devenv/profile` link, the only name for that
+checkout's profile there.
+
 Shell fixtures for `github-actions-bootstrap` and `repo-path` resolve their required Bash and coreutils executables from
 the active toolchain into private tool directories before scrubbing `PATH`. They run without `/usr/bin:/bin`, which does
 not provide coreutils on NixOS. The install fixture still delegates lock evaluation to the real Nix executable, but
