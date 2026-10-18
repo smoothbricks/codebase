@@ -1213,12 +1213,16 @@ Versioning:
   `publish`.
 - `smoo release version` selects the current release target before validation by running [Nx Release][nx-release]
   versioning. npm registry state is not used to decide whether versioning should run. If `HEAD` is already a release
-  target, versioning returns `mode=none` and leaves idempotent completion to `smoo release publish`.
-- `smoo release version --github-output "$GITHUB_OUTPUT"` appends `mode=new|none` and `projects=<comma-list>`. The
-  managed publish workflow uses `mode != "none"` to build, lint, test, and validate exactly the commit that
-  `smoo release publish` will publish. `projects` is a comma-separated Nx project-name list, not an npm package-name
-  list. The validation and publish step names include the selected mode so the [GitHub Actions] run shows whether it is
-  creating a new release or recording a no-op.
+  target (a rerun, or tags moved there by `smoo release retag-unpublished`), versioning skips Nx, returns
+  `mode=complete` with the packages released at `HEAD`, and leaves idempotent completion to `smoo release publish`. The
+  dry-run plan answers the same way, so lint and test gate the same packages.
+- `smoo release version --github-output "$GITHUB_OUTPUT"` appends `mode=new|complete|dry-run|none` and
+  `projects=<comma-list>`. The managed publish workflow uses `mode != "none"` to build, lint, test, validate, upload and
+  apply exactly the commit that `smoo release publish --prebuilt` will publish, so a `complete` target is built like a
+  `new` one; `--prebuilt` refuses a package whose verified build is missing. `none` means nothing to release. `projects`
+  is a comma-separated Nx project-name list, not an npm package-name list. The validation and publish step names include
+  the selected mode so the [GitHub Actions] run shows whether it is creating a new release, completing the one at
+  `HEAD`, or recording a no-op.
 - An explicit bump with a non-empty selection is mandatory progress when `HEAD` is not already a release target: after
   pending releases are repaired, `bump=patch|minor|major|prerelease` must make Nx create a new release commit, and smoo
   fails if Nx returns without moving `HEAD`. Every bump mode may no-op with `mode=none` when the selection is empty: no

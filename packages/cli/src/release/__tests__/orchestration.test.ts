@@ -167,13 +167,37 @@ describe('release orchestration', () => {
     expect(summary.githubReleaseLinks).toEqual([]);
   });
 
-  it('does not run Nx versioning when HEAD is already a release target', async () => {
+  it('reports a HEAD release target as complete without running Nx versioning', async () => {
     const shell = new RecordingVersionShell({ releasePackagesAtHead: [[stable]] });
 
     const result = await runReleaseVersion(shell, { bump: 'patch', dryRun: false });
 
-    expect(result).toEqual({ mode: 'none', packages: [stable], status: 'already-release-target' });
+    expect(result).toEqual({ mode: 'complete', packages: [stable] });
     expect(shell.nxRuns).toEqual([]);
+  });
+
+  it('plans a HEAD release target as complete in dry run, so the gates validate what publish ships', async () => {
+    // Tags moved to HEAD by retag-unpublished leave no package-local change for
+    // the Nx preview to find; the plan must still name the packages at HEAD.
+    const shell = new RecordingVersionShell({ releasePackagesAtHead: [[stable]], releaseVersionPackages: [] });
+
+    const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: true });
+
+    expect(result).toEqual({ mode: 'complete', packages: [stable] });
+    expect(shell.nxRuns).toEqual([]);
+  });
+
+  it('reports complete when Nx leaves HEAD in place on a release target', async () => {
+    const shell = new RecordingVersionShell({
+      releasePackagesAtHead: [[], [stable]],
+      releaseVersionPackages: [stable],
+      heads: ['same', 'same'],
+    });
+
+    const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: false });
+
+    expect(result).toEqual({ mode: 'complete', packages: [stable] });
+    expect(shell.cleanChecks).toBe(1);
   });
 
   it('runs forced Nx versioning for an untagged HEAD and reports a new release commit', async () => {
@@ -185,17 +209,20 @@ describe('release orchestration', () => {
 
     const result = await runReleaseVersion(shell, { bump: 'patch', dryRun: false });
 
-    expect(result).toEqual({ mode: 'new', packages: [stable], status: 'new-release' });
+    expect(result).toEqual({ mode: 'new', packages: [stable] });
     expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable', '@scope/prerelease'], bump: 'patch', dryRun: false }]);
     expect(shell.cleanChecks).toBe(1);
   });
 
-  it('skips auto Nx versioning when no package-local candidates exist', async () => {
+  it.each([
+    ['skips auto Nx versioning when no package-local candidates exist', 'auto'],
+    ['no-ops an explicit bump when the changed-set selection is empty', 'patch'],
+  ] as const)('%s', async (_case, bump) => {
     const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [] });
 
-    const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: false });
+    const result = await runReleaseVersion(shell, { bump, dryRun: false });
 
-    expect(result).toEqual({ mode: 'none', packages: [], status: 'no-release-needed' });
+    expect(result).toEqual({ mode: 'none', packages: [] });
     expect(shell.nxRuns).toEqual([]);
     expect(shell.cleanChecks).toBe(0);
   });
@@ -210,16 +237,6 @@ describe('release orchestration', () => {
     expect(shell.nxRuns).toEqual([]);
   });
 
-  it('no-ops an explicit bump when the changed-set selection is empty', async () => {
-    const shell = new RecordingVersionShell({ releasePackagesAtHead: [[]], releaseVersionPackages: [] });
-
-    const result = await runReleaseVersion(shell, { bump: 'patch', dryRun: false });
-
-    expect(result).toEqual({ mode: 'none', packages: [], status: 'no-release-needed' });
-    expect(shell.nxRuns).toEqual([]);
-    expect(shell.cleanChecks).toBe(0);
-  });
-
   it('runs auto Nx versioning only for selected package-local candidates', async () => {
     const shell = new RecordingVersionShell({
       releasePackagesAtHead: [[], [stable]],
@@ -229,7 +246,7 @@ describe('release orchestration', () => {
 
     const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: false });
 
-    expect(result).toEqual({ mode: 'new', packages: [stable], status: 'new-release' });
+    expect(result).toEqual({ mode: 'new', packages: [stable] });
     expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: false }]);
   });
 
@@ -239,7 +256,7 @@ describe('release orchestration', () => {
 
     const result = await runReleaseVersion(shell, { bump: 'auto', dryRun: true });
 
-    expect(result).toEqual({ mode: 'dry-run', packages: [preview], status: 'dry-run' });
+    expect(result).toEqual({ mode: 'dry-run', packages: [preview] });
     expect(shell.nxRuns).toEqual([{ packages: ['@scope/stable'], bump: 'auto', dryRun: true }]);
   });
 
