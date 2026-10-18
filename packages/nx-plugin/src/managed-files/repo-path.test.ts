@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { managedAssetsRoot } from '../managed-assets.js';
 
@@ -153,6 +153,20 @@ describe('managed repo-path', () => {
       });
       expect(selected.stderr).toBe('');
       expect(selected.stdout).toBe('evaluated-bun\n');
+    });
+  });
+
+  it("reaches the installed cowshed through the real uid's passwd home when the caller passes only PATH", async () => {
+    await withRepoPath(async (fixture) => {
+      // A formatter or hook that passes { PATH } alone leaves HOME unset; it is not the helper's to require.
+      const result = spawnSync(join(fixture.tools, 'bash'), [fixture.helper], {
+        encoding: 'utf8',
+        env: { PATH: fixture.tools },
+      });
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+      const installed = join(userInfo().homedir, 'Library/Application Support/dev.cowshed/bin');
+      expect(result.stdout).toBe(`${[installed, ...fixture.entries].join(':')}:${fixture.tools}\n`);
     });
   });
 });
