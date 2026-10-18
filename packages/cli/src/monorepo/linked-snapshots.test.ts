@@ -181,8 +181,8 @@ function fixture(): Fixture {
   return { provider, source, consumer };
 }
 
-function run(script: string, args: string[]): unknown {
-  const child = spawnSync(process.execPath, ['-e', script, ...args], { encoding: 'utf8' });
+function run(script: string, args: string[], env: NodeJS.ProcessEnv = process.env): unknown {
+  const child = spawnSync(process.execPath, ['-e', script, ...args], { encoding: 'utf8', env });
   if (child.status !== 0) throw new Error(`child failed: ${child.stderr}`);
   return JSON.parse(child.stdout);
 }
@@ -191,8 +191,9 @@ function capture(
   { consumer, source }: Fixture,
   mode: 'hit' | 'miss' | 'no-producer' | 'producer-v2' | 'other-argv' = 'hit',
   frozen: unknown = null,
+  env: NodeJS.ProcessEnv = process.env,
 ): { readonly binding: SnapshotBinding; readonly verified: string | null } {
-  const result = run(CAPTURE, [RAW, JSON.stringify([consumer, source, DECLARATION, mode, frozen])]);
+  const result = run(CAPTURE, [RAW, JSON.stringify([consumer, source, DECLARATION, mode, frozen])], env);
   if (typeof result !== 'object' || result === null) throw new Error('capture printed no result');
   const binding: unknown = Reflect.get(result, 'binding');
   const verified: unknown = Reflect.get(result, 'verified');
@@ -238,6 +239,21 @@ describe('linked package snapshots', () => {
     ).toBe(0);
     // An unchanged provider under the same receipt is the same snapshot, and an existing one is bound only once it verifies.
     expect(snapshotOf(capture(checkout)).id).toBe(snapshot.id);
+  });
+
+  it("lists the provider's tracked blobs without the operator's global git configuration", () => {
+    const checkout = fixture();
+    // Frozen, so the fixture's own probe runs no git under the environment below.
+    const frozen = run(FREEZE, [checkout.provider]);
+    // A sandboxed shell entry keeps the operator's HOME but may not read its git configuration, and git dies
+    // "unable to access" it; a self-referencing link fails git the same way (ELOOP).
+    const home = join(checkout.consumer, '..', 'operator-home');
+    mkdirSync(home);
+    symlinkSync('.gitconfig', join(home, '.gitconfig'));
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
+    for (const name of ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'XDG_CONFIG_HOME']) delete env[name];
+    const result = capture(checkout, 'hit', frozen, env);
+    expect(result.verified).toBe(snapshotOf(result).id);
   });
 
   it('reuses a same-tree receipt and names a distinct producer or task identity', () => {
