@@ -7947,6 +7947,53 @@ async fn a_job_killed_while_queued_leaves_the_queue_without_a_command() {
     assert!(h.process.try_recv().is_err(), "nothing was signalled");
 }
 
+/// A job killed while it waits for its grant is reported over the supervisor's socket, where a
+/// workspace's owner polls it: killed, with no pid and no exit status, because it never ran. Its
+/// owner, having seen it end, retires the workspace. A projection that refused this state left
+/// the owner unable to see the job end, so the owner kept the workspace forever.
+#[tokio::test]
+async fn a_job_killed_while_queued_is_reported_over_the_socket_and_its_workspace_retires() {
+    let (h, mut asked, _root) = scripted_harness("cpu-withdraw-served");
+    let (remote, _path) = served(&h.handle).await;
+    let job = remote
+        .exec_background(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .expect("a background exec is answered at admission");
+    let cpu = asked.recv().await.unwrap();
+    remote.kill(job).await.unwrap();
+    cpu.withdrawn
+        .await
+        .expect("the cancelled job's request left the queue");
+    let ended = remote.info(job).await.expect("the killed job is reported");
+    assert_eq!(
+        (
+            ended.state,
+            ended.pid,
+            ended.exit.as_ref(),
+            ended.resources.as_ref()
+        ),
+        (JobState::Killed, None, None, None),
+        "killed before its command existed: nothing ran, so nothing exited"
+    );
+    assert_eq!(
+        remote
+            .list()
+            .await
+            .expect("the workspace's jobs are listed"),
+        vec![ended],
+        "one job killed while queued does not refuse the list its owner stops jobs from"
+    );
+    remote
+        .retire(NxDaemonRetirement::Recorded)
+        .await
+        .expect("the workspace retires once its killed job is seen to end");
+}
+
 /// A refused admission -- a gate whose bound elapsed, a gateway that is not there -- fails the
 /// job before any command: a foreground caller gets the refusal itself, a background caller reads
 /// it on the job's stderr, and the record types the failure.
