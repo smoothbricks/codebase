@@ -5,7 +5,6 @@ import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { resolveFromWorkspace } from 'nx/src/utils/installation-directory.js';
 import { readModulePackageJson } from 'nx/src/utils/package-json.js';
-import { guardEvent } from './__tests__/counted-cargo.js';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 
 /**
@@ -58,7 +57,6 @@ it('keeps the source-import edges of the installed Nx, resolving typescript from
     const child = spawn('node', [join(nx, 'dist/bin/nx.js'), 'graph', `--file=${graphFile}`], {
       cwd: root,
       env: fixtureNxEnv(root, socketDirectory),
-      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let output = '';
@@ -68,29 +66,13 @@ it('keeps the source-import edges of the installed Nx, resolving typescript from
     child.stderr?.setEncoding('utf8').on('data', (text: string) => {
       output += text;
     });
-    const { promise: ended, resolve, reject } = Promise.withResolvers<number | null>();
-    child.once('error', reject);
-    child.once('close', resolve);
-    let code: number | null;
-    try {
-      code = await guardEvent(
-        ended,
-        'nx graph to close',
-        () => `pid ${child.pid}, exit ${child.exitCode}, signal ${child.signalCode}\n${output}`,
-      );
-    } catch (error) {
-      if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
-        try {
-          process.kill(process.platform === 'win32' ? child.pid : -child.pid, 'SIGKILL');
-        } catch (killError) {
-          if (!(killError instanceof Error && 'code' in killError && killError.code === 'ESRCH')) {
-            throw new AggregateError([error, killError], 'could not retire the failed fixture Nx command');
-          }
-        }
-      }
-      await ended.catch(() => undefined);
-      throw error;
-    }
+    // The test waits for what it needs, the command's close, however long a loaded host makes the real Nx take: a
+    // deadline here measured the host, not the resolution (a 15 s guard failed a land gate at load 20 with the command
+    // still running). A command that never closes is the runner's idle-hang backstop's to report.
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', resolve);
+    });
     expect(code, output).toBe(0);
     expect(JSON.parse(await readFile(graphFile, 'utf8'))).toMatchObject({
       graph: { dependencies: { b: [{ source: 'b', target: 'a', type: 'static' }] } },
