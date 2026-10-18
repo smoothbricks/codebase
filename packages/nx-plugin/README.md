@@ -890,9 +890,11 @@ receipt valid and its original basis SHA unchanged; the consumer never rewrites 
 tree invalidates the receipt. Multi-target consumers require one tree and retain each producer's actual basis.
 
 The consumer validates this stored receipt against its declared target, committed-tree/configuration identity, declared
-environment/tool inputs and actual output census. It never re-hashes the provider's task graph in its own environment. A
-valid receipt is the hit. A missing, mismatched, stale or unbound receipt requires the authoritative graph RPC, then a
-loud miss/refusal without running a target or writing provider outputs. A managed consumer requires the installed
+environment/tool inputs and actual output census. It never re-hashes the provider's task graph in its own environment.
+Its read of the recorded tools must stay stable through that census on the same terms as the producer's: a tool node
+whose ctime alone moved is re-read and compared with the receipt, and a refusal names the nodes that moved. A valid
+receipt is the hit. A missing, mismatched, stale or unbound receipt requires the authoritative graph RPC, then a loud
+miss/refusal without running a target or writing provider outputs. A managed consumer requires the installed
 `probeBuilt` operation and the complete producer-receipt contract; an old receipt lacking it refuses, never falls back
 to `ensureBuilt` or a producer writer. `ensureBuilt` remains the normal build/stream operation with its existing
 hit/built/failed results and Nx's current source/cache/artifact verdict.
