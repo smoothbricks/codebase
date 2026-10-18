@@ -16,3 +16,5 @@ slow-timeout = { period = "30s" }
 [[profile.default.overrides]]
 filter = 'test(/compile_fail|fail_to_compile/)'
 slow-timeout = { period = "180s" }
+
+# diag: re-key cargo test tasks so they execute beside the nx-plugin shards

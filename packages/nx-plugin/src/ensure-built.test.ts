@@ -838,7 +838,7 @@ describe('smoo-nx-exec with a fresh daemon', () => {
           reuseEntry,
           `
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { appendFileSync, existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { chmod, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -865,6 +865,7 @@ daemonClient.getProjectGraphAndSourceMaps = async () => {
 };
 const results = [];
 async function check(label) {
+  appendFileSync(process.env.ENSURE_BUILT_GRAPH_DIAG, JSON.stringify({ check: label }) + '\\n');
   const before = requests;
   const result = await ensureBuilt({ target: 'app:build', cwd: process.cwd() });
   results.push({ label, requests: requests - before, disposition: result.disposition, witnessExists: existsSync(witness) });
@@ -909,12 +910,17 @@ try {
 await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
 `,
         );
+        const diagPath = join(root, 'graph-diag.jsonl');
         const reused = await run('bun', reuseEntry, workspace, [], {
           NX_DAEMON: 'true',
           NX_USE_LOCAL: 'true',
           NX_WORKSPACE_ROOT_PATH: workspace,
           NX_SOCKET_DIR: socketDirectory,
+          ENSURE_BUILT_GRAPH_DIAG: diagPath,
         });
+        console.error(
+          `ENSURE_BUILT_GRAPH_DIAG ${workspace}\nSTDERR ${reused.stderr}\nSTDOUT ${reused.stdout}\n${await readFile(diagPath, 'utf8').catch((e) => String(e))}\nRESULTS ${await readFile(resultsPath, 'utf8').catch((e) => String(e))}`,
+        );
         expect(reused.code, reused.stdout + reused.stderr).toBe(0);
         // A changed dependency configuration may legitimately run app:build;
         // its streamed logs are not the graph-observation protocol.

@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
 import {
+  appendFileSync,
   closeSync,
   existsSync,
   lstatSync,
@@ -50,6 +51,7 @@ import {
   readGraphWitness,
   reusableGraph,
   snapshotsEqual,
+  type WorkspaceSnapshot,
   workspaceSnapshot,
   writeWitness,
 } from './ensure-built-witness.js';
@@ -1048,27 +1050,107 @@ async function currentProjectGraph(
     await daemonClient.updateWorkspaceContext(created, updated, deleted);
   }
   performance.measure('ensureBuilt:inputs', 'ensureBuilt:inputs:start');
+  const diagPath = process.env.ENSURE_BUILT_GRAPH_DIAG;
+  const diag = (record: Record<string, unknown>) => {
+    if (diagPath) appendFileSync(diagPath, `${JSON.stringify({ t: new Date().toISOString(), ...record })}\n`);
+  };
+  const envDigest = Object.fromEntries(
+    Object.entries(process.env)
+      .sort(([l], [r]) => l.localeCompare(r))
+      .map(([k, v]) => [k, createHash('sha256').update(String(v)).digest('hex').slice(0, 10)]),
+  );
+  const identityDiff = (left: string | null, right: string | null) => {
+    if (left === null || right === null) return { left: left === null, right: right === null };
+    const l: Record<string, unknown> = JSON.parse(left);
+    const r: Record<string, unknown> = JSON.parse(right);
+    const out: Record<string, unknown> = {};
+    for (const key of ['resolutions', 'nodes', 'files'] as const) {
+      const lv = l[key];
+      const rv = r[key];
+      const ls = new Set(Array.isArray(lv) ? lv.map((x) => JSON.stringify(x)) : []);
+      const rs = new Set(Array.isArray(rv) ? rv.map((x) => JSON.stringify(x)) : []);
+      out[key] = {
+        onlyLeft: [...ls].filter((x) => !rs.has(x)).slice(0, 15),
+        onlyRight: [...rs].filter((x) => !ls.has(x)).slice(0, 15),
+      };
+    }
+    out.localInputs =
+      JSON.stringify(l.localInputs) === JSON.stringify(r.localInputs) ? 'same' : { l: l.localInputs, r: r.localInputs };
+    return out;
+  };
+  const snapshotDiff = (left: WorkspaceSnapshot, right: WorkspaceSnapshot) => {
+    const lh = new Map(left.files.map(({ file, hash }) => [file, hash]));
+    const rh = new Map(right.files.map(({ file, hash }) => [file, hash]));
+    return {
+      stable: [left.stable, right.stable],
+      counts: [left.files.length, right.files.length],
+      differ: [...new Set([...lh.keys(), ...rh.keys()])].filter((f) => lh.get(f) !== rh.get(f)).slice(0, 20),
+      nodesL: left.nodes
+        .filter((n) => !nodesUnchanged([n]))
+        .map((n) => n.path)
+        .slice(0, 20),
+    };
+  };
+  const unproved: string[] = [];
   const installation = graphInstallationIdentity(
     workspaceRoot,
     nxJson,
     packageResolution.readModulePackageJson,
     expandOutputs,
     graphInputContractIdentity(workspaceRoot, nxJson, before),
+    (detail) => unproved.push(detail),
   );
   const cached = nodesUnchanged(before.nodes)
     ? reusableGraph(witness, workspaceRoot, environment, installation, before)
     : null;
+  diag({
+    phase: 'decide',
+    pid: process.pid,
+    witness: witness !== null,
+    forceGraphRpc,
+    cached: cached !== null,
+    installationNull: installation === null,
+    unproved,
+    beforeNodesUnchanged: nodesUnchanged(before.nodes),
+    changesFedToDaemon: [created, updated, deleted],
+    ...(witness === null
+      ? {}
+      : {
+          rootSame: witness.workspaceRoot === workspaceRoot,
+          environmentSame: witness.environment === environment,
+          installationSame: witness.installation === installation,
+          snapshotSame: snapshotsEqual(witness.snapshot, before),
+          ...(witness.installation === installation
+            ? {}
+            : { installationDiff: identityDiff(witness.installation, installation) }),
+          ...(snapshotsEqual(witness.snapshot, before) ? {} : { snapshotDiff: snapshotDiff(witness.snapshot, before) }),
+        }),
+    ...(witness === null || witness.environment !== environment ? { envDigest } : {}),
+  });
   if (!forceGraphRpc && cached !== null) return cached;
   const { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
   const after = workspaceSnapshot(workspaceRoot, new WorkspaceContext(workspaceRoot, data), before);
+  const finalUnproved: string[] = [];
   const finalInstallation = graphInstallationIdentity(
     workspaceRoot,
     nxJson,
     packageResolution.readModulePackageJson,
     expandOutputs,
     graphInputContractIdentity(workspaceRoot, nxJson, after),
+    (detail) => finalUnproved.push(detail),
   );
   const stableGeneration = snapshotsEqual(before, after) && nodesUnchanged(before.nodes);
+  diag({
+    phase: 'after-rpc',
+    stableGeneration,
+    snapshotsEqual: snapshotsEqual(before, after),
+    beforeNodesUnchanged: nodesUnchanged(before.nodes),
+    installationSame: installation === finalInstallation,
+    finalUnproved,
+    ...(installation === finalInstallation ? {} : { installationDiff: identityDiff(installation, finalInstallation) }),
+    ...(snapshotsEqual(before, after) ? {} : { snapshotDiff: snapshotDiff(before, after) }),
+    writesWitness: installation !== null && installation === finalInstallation && stableGeneration,
+  });
   if (installation !== null && installation === finalInstallation && stableGeneration) {
     const next: GraphWitness = { version: 1, workspaceRoot, environment, installation, snapshot: after, projectGraph };
     writeWitness(witnessPath, next);
