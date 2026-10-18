@@ -402,10 +402,13 @@ with unchanged resolution inputs starts no Cargo process either.
 
 Literal `include_str!` and `include_bytes!` files also belong to the closure, including data inside a crate and tracked
 files outside its directory (such as a shipped Markdown skill). One Rust lexer excludes comments and example strings;
-computed paths and arbitrary build-script reads still need explicit inputs. External path-package digests include the
-same literal data bytes. Inferred `napi-*` and repository-root `cargo-wasm` builds use this resolved closure rather than
-every Rust file in the workspace, while retaining their toolchain pins, wrapper scripts, N-API configuration and CLI
-version.
+computed paths and arbitrary build-script reads still need explicit inputs. A compiled-in file is named only when Nx's
+file index holds both it and the source including it: an ignored one is a build output, whose bytes no fileset can hash
+and which reaches consumers through its producer's dependency outputs. Naming it would only key the project graph on the
+names the last producer run left on disk, so a run regenerating content-named files would move every key it was hashed
+under. External path-package digests include the same literal data bytes. Inferred `napi-*` and repository-root
+`cargo-wasm` builds use this resolved closure rather than every Rust file in the workspace, while retaining their
+toolchain pins, wrapper scripts, N-API configuration and CLI version.
 
 Runtime file identities are rooted in Cargo package name/version and the declared input role, not in the consuming
 checkout's absolute path or depth. Source paths are package-relative; compiled-in data keeps its declaring source and

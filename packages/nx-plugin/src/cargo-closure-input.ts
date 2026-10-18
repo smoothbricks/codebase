@@ -60,6 +60,8 @@ const GLOB_SYNTAX = /[*?[\]{}()!,]/;
  */
 export interface CargoClosureSource {
   readonly manifest: string;
+  /** The Nx workspace root as the computation names it, which Nx's file index is keyed by. */
+  readonly workspaceRoot: string;
   /** The canonical Nx workspace root. */
   readonly root: string;
   readonly cargo: CargoResolve;
@@ -90,7 +92,7 @@ export async function resolveCargoClosureSource(
 ): Promise<CargoClosureSource> {
   const [root, index] = await Promise.all([realpath(workspaceRoot), indexed]);
   const cargo = await readCargoResolve(join(root, manifest), root, index);
-  return { manifest, root, cargo, indexed: index, compiledFilesCache };
+  return { manifest, workspaceRoot, root, cargo, indexed: index, compiledFilesCache };
 }
 
 /**
@@ -112,6 +114,16 @@ export async function resolveCargoClosureSource(
  * An in-workspace member missing from Nx's file index is a typed refusal,
  * never a whole-workspace runtime hash. Only outside-workspace members need
  * the external-only runtime input.
+ *
+ * A compiled-in file is named only when Nx's file index holds both it and the
+ * source that includes it. An ignored one is a build output: no fileset can
+ * hash its bytes, which reach a consumer through its producer's dependency
+ * outputs instead, so naming it would add nothing to any task's key except
+ * the names of whatever output last ran. That state is exactly what a project
+ * graph must not read (`globIndexedFiles`): a producer that regenerates
+ * content-named files would otherwise move every key of the graph it was
+ * hashed under, and the run that compiled a tree would leave its verdict
+ * under a key no later run of the same tree computes.
  */
 export async function cargoClosureInputs(
   projectRoot: string,
@@ -140,6 +152,7 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
   const { root, cargo, indexed } = source;
   const packageDirectories: string[] = [];
   const files: string[] = [];
+  const compiledIn: { readonly declaring: string; readonly file: string }[] = [];
   const compiledFiles = new Set<string>();
   let external = false;
   try {
@@ -154,10 +167,13 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
       if (!indexed.has(posix.join(directory, 'Cargo.toml'))) {
         throw new Error(`the Cargo package ${directory} is not in Nx's file index (an ignored directory)`);
       }
-      for (const { file } of compiledInFiles(pkg.directory, source.compiledFilesCache)) {
-        const path = indexablePath(root, file);
-        if (path === null) throw new Error(`${directory} compiles ${file}, which Nx's file index cannot hold`);
-        compiledFiles.add(path);
+      for (const compiled of compiledInFiles(pkg.directory, source.compiledFilesCache)) {
+        const file = indexablePath(root, compiled.file);
+        if (file === null) throw new Error(`${directory} compiles ${compiled.file}, which Nx's file index cannot hold`);
+        // The scan starts inside this package's indexable directory, so its sources can always be named.
+        const declaring = indexablePath(root, compiled.source);
+        if (declaring === null) throw new Error(`${compiled.source} was scanned outside ${directory}`);
+        compiledIn.push({ declaring, file });
       }
       packageDirectories.push(directory);
       for (const file of [...pkg.sources, pkg.governingManifest]) {
@@ -166,8 +182,14 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
         files.push(path);
       }
     }
-    const unglobbable = [...packageDirectories, ...files, ...compiledFiles].find((path) => GLOB_SYNTAX.test(path));
+    const compiledPaths = [...new Set(compiledIn.flatMap(({ declaring, file }) => [declaring, file]))];
+    const unglobbable = [...packageDirectories, ...files, ...compiledPaths].find((path) => GLOB_SYNTAX.test(path));
     if (unglobbable !== undefined) throw new Error(`${unglobbable} contains glob syntax, so no fileset can name it`);
+    // Literal paths, so each matches exactly itself in the index.
+    const held = new Set(compiledPaths.length === 0 ? [] : await globIndexedFiles(source.workspaceRoot, compiledPaths));
+    for (const { declaring, file } of compiledIn) {
+      if (held.has(declaring) && held.has(file)) compiledFiles.add(file);
+    }
   } catch (error) {
     throw new CargoClosureInputError(projectRoot, error);
   }

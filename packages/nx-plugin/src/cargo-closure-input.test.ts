@@ -215,6 +215,50 @@ it('keys literal compiled-in data inside and outside crate directories without k
   }
 });
 
+it('names no compiled-in build output, so a producer run leaves the closure it was hashed under unchanged', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-compiled-output-')));
+  try {
+    const { workspace } = await closureFixture(
+      root,
+      'node_modules/\ntarget/\ndist/\n.nx/\ncrates/leaf/src/generated/\n',
+      {
+        'workspace/crates/leaf/src/lib.rs': [
+          'pub fn answer() -> u8 { 1 }',
+          'pub const TABLE: &[u8] = include_bytes!("generated/table.bin");',
+          'pub const SKILL: &str = include_str!("../../../skills/SKILL.md");',
+        ].join('\n'),
+        'workspace/skills/SKILL.md': 'skill-one',
+      },
+    );
+    // A producer's run: ignored outputs, content-named ones among them, and a generated source including those.
+    const generated = join(workspace, 'crates/leaf/src/generated');
+    const produce = async (content: string) => {
+      await rm(generated, { recursive: true, force: true });
+      await mkdir(generated, { recursive: true });
+      await writeFile(join(generated, 'table.bin'), content);
+      await writeFile(join(generated, `chunk-${content}.js`), content);
+      await writeFile(
+        join(generated, 'vocabulary.rs'),
+        `pub const CHUNK: &str = include_str!("chunk-${content}.js");\n`,
+      );
+    };
+    const closure = async () => {
+      resetWorkspaceContext();
+      return closureOf(byFile(await graphComputation(workspace)()), 'packages/app');
+    };
+
+    const unproduced = await closure();
+    expect(unproduced).toContain('{workspaceRoot}/skills/SKILL.md');
+    expect(JSON.stringify(unproduced)).not.toContain('generated/');
+    await produce('one');
+    expect(await closure()).toEqual(unproduced);
+    await produce('two');
+    expect(await closure()).toEqual(unproduced);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it('refuses a closure member in an ignored directory, which no fileset can see, instead of hashing the whole workspace', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-ignored-')));
   try {
