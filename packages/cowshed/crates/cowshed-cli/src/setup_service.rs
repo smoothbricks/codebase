@@ -28,6 +28,7 @@ use crate::gateway_service::{
     CliInstall, Downgrade, ServiceBinaryRefresh, canonical_home, gateway_launch_agent,
     output_error, remove_host_stable_executable, remove_launch_agent, remove_path_entries,
 };
+use crate::install_basis::InstallSlot;
 use crate::launchd::RemovalOutcome;
 use crate::output::Output;
 use crate::path_entry::PathEntryOutcome;
@@ -311,17 +312,20 @@ pub trait HostSetup: Send {
     }
 }
 
-/// The real host, rooted at the canonical home every other host verb resolves.
+/// The real host, rooted at the canonical home every other host verb resolves, and the install
+/// slot this setup holds for its whole run.
 pub struct NativeHostSetup {
     home: PathBuf,
+    slot: InstallSlot,
     /// Whether this run may install a build that does not contain the installed cowshed.
     downgrade: Downgrade,
 }
 
 impl NativeHostSetup {
-    pub fn for_canonical_home(downgrade: Downgrade) -> Result<Self> {
+    pub fn for_canonical_home(slot: InstallSlot, downgrade: Downgrade) -> Result<Self> {
         Ok(Self {
             home: canonical_home()?,
+            slot,
             downgrade,
         })
     }
@@ -347,7 +351,7 @@ impl HostSetup for NativeHostSetup {
 
     async fn refresh_host_services(&mut self) -> Result<Vec<ServiceBinaryRefresh>> {
         Ok(
-            crate::gateway_service::refresh_gateway_binary(&self.home, self.downgrade)
+            crate::gateway_service::refresh_gateway_binary(&self.slot, &self.home, self.downgrade)
                 .await?
                 .into_iter()
                 .collect(),
@@ -608,7 +612,7 @@ impl HostSetup for NativeHostSetup {
                 .await
                 .is_ok_and(|status| status.running);
         if gateway {
-            crate::gateway_service::stop_for_host_move().await?;
+            crate::gateway_service::stop_for_host_move(&self.slot).await?;
         }
         if sccache_running {
             crate::capabilities::sccache::service::stop_for_host_move()?;
@@ -621,7 +625,7 @@ impl HostSetup for NativeHostSetup {
                 })?;
         // Restarted whatever the moves did: a writer left stopped is a host setup broke.
         if gateway {
-            crate::gateway_service::start_after_host_move(self.downgrade).await?;
+            crate::gateway_service::start_after_host_move(&self.slot, self.downgrade).await?;
         }
         if sccache_running {
             start_service(None).await?;
@@ -756,12 +760,15 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    let _slot = crate::gateway_service::take_install_slot(&canonical_home()?).await?;
-    let mut host = NativeHostSetup::for_canonical_home(if args.downgrade {
-        Downgrade::Allow
-    } else {
-        Downgrade::Refuse
-    })?;
+    let slot = crate::gateway_service::take_install_slot(&canonical_home()?).await?;
+    let mut host = NativeHostSetup::for_canonical_home(
+        slot,
+        if args.downgrade {
+            Downgrade::Allow
+        } else {
+            Downgrade::Refuse
+        },
+    )?;
     dispatch(&mut host, args, json, output).await
 }
 

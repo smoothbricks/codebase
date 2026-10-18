@@ -1393,11 +1393,13 @@ supervisor that ran the job retires.
   `LandedReport = { landedHead, targetBranch, previousTargetHead?, targetWasCheckedOut, retired, buildVolume }`;
   preservation-only delivery has no landed, build-volume or retirement fields; `MirrorInfo = { url, mirror }`;
   `CheckpointQuota = { maxCount, maxBytes }`.
-- `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon?, cpuBudget? }`;
-  `healing = { mounting: { projects } } | "restoringSessions"` says how far the daemon's startup pass has got — the
-  projects it still mounts, never 0, then the sessions it restores from them — and is absent once that pass is over
-  (05_gateway.md "Startup contract"); `recovering = { supervisors }` counts the workspace supervisors from before the
-  daemon started that it is still recovering, never 0 (11_shell.md "Supervisor recovery").
+- `GatewayStatus = { installed, running, socket, cliVersion, daemonVersion?, activeWorkspaces, drainCause?, healing?, recovering?, staleDaemon?, cpuBudget?, pendingInstall? }`;
+  `pendingInstall = { waitingFor: [{ job, checkout }] }` is an install that holds the install slot and the gate jobs it
+  waits for before it restarts the gateway, absent while the slot is free (05_gateway.md "A pending install is
+  visible"); `healing = { mounting: { projects } } | "restoringSessions"` says how far the daemon's startup pass has got
+  — the projects it still mounts, never 0, then the sessions it restores from them — and is absent once that pass is
+  over (05_gateway.md "Startup contract"); `recovering = { supervisors }` counts the workspace supervisors from before
+  the daemon started that it is still recovering, never 0 (11_shell.md "Supervisor recovery").
   `cpuBudget = { ledger: CpuBudgetStatus } | { unanswered: <reason> }` is the daemon's own `cpu-budget` answer verbatim,
   or the control client's reason a daemon that answered `status` did not answer it (one from before the request refuses
   it; one from before `gateJobs` answers a ledger this build cannot read, and the reason names the missing field); never

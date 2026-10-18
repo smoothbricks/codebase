@@ -182,6 +182,15 @@ is taken. A host move inside `setup` restarts the gateway under the slot `setup`
 workers each built and installed a cowshed within an hour, neither aware of the other's commits, and nothing serialized
 who filled the slot.
 
+**A pending install is visible.** `cowshed gateway status` says when an install holds the slot, without taking it from
+the install: it tries a shared `flock(2)` on `install.lock` without blocking, which fails exactly while an install holds
+it, and lets go at once when it succeeds (an installer arriving in that instant waits for it as for any install, and
+says so). While it waits for gates ("An install waits for the gates in flight"), the holder records the gate jobs it
+waits for in `install.wait` beside the lock, written whole and renamed into place on every change and removed when the
+wait ends; an installer removes a record a dead holder left when it takes the slot, so while the slot is held the record
+is the holder's. Status reports `pendingInstall: { waitingFor: [{ job, checkout }] }` (empty while the holder waits for
+no gate), absent while the slot is free; `gateway start`'s own report, which holds the slot, carries none.
+
 **Build records and the basis.** A release build records the commit `HEAD` names and that commit's committer time
 (`build.rs`: `COWSHED_BUILD_COMMIT`, `COWSHED_BUILD_COMMIT_TIME`); the time is read from that one commit, so a shallow
 clone records it too. Its Git HEAD/reflog watch paths are emitted relative to the build-script manifest directory, so a

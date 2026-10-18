@@ -3776,6 +3776,30 @@ pub struct GatewayStatus {
     /// Absent when no daemon answered `status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_budget: Option<GatewayCpuBudget>,
+    /// An install that holds the install slot, and the gate jobs it waits for before it restarts
+    /// the gateway (05_gateway.md "The install slot"). Absent while no install holds the slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_install: Option<PendingInstall>,
+}
+
+/// An install that holds the install slot, as `gateway status` observes it without taking the
+/// slot from it. It is also what the installer records while it waits for gates, so the two
+/// cannot disagree on its shape.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingInstall {
+    /// The gate jobs the installer waits for before it restarts the gateway, oldest first;
+    /// empty while it is not waiting for any.
+    pub waiting_for: Vec<GateJobRef>,
+}
+
+/// One gate job, as an installer that waits for it names it.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GateJobRef {
+    /// The gate job's admission number: the smaller is the older job.
+    pub job: u64,
+    pub checkout: String,
 }
 
 /// The daemon and CLI executables, when their contents differ.

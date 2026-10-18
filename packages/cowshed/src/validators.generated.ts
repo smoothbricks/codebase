@@ -419,6 +419,11 @@ export const assertForkRequestList = typia.createAssertEquals<readonly Api.ForkR
 export const parseForkRequestList = (json: string): readonly Api.ForkRequest[] =>
   assertForkRequestList(JSON.parse(json));
 
+export const assertGateJobRef = typia.createAssertEquals<Api.GateJobRef>();
+export const parseGateJobRef = (json: string): Api.GateJobRef => assertGateJobRef(JSON.parse(json));
+export const assertGateJobRefList = typia.createAssertEquals<readonly Api.GateJobRef[]>();
+export const parseGateJobRefList = (json: string): readonly Api.GateJobRef[] => assertGateJobRefList(JSON.parse(json));
+
 export const assertGatewayCpuBudget = typia.createAssertEquals<Api.GatewayCpuBudget>();
 export const parseGatewayCpuBudget = (json: string): Api.GatewayCpuBudget => assertGatewayCpuBudget(JSON.parse(json));
 export const assertGatewayCpuBudgetList = typia.createAssertEquals<readonly Api.GatewayCpuBudget[]>();
@@ -782,6 +787,12 @@ export const parseOutputSummary = (json: string): Api.OutputSummary => assertOut
 export const assertOutputSummaryList = typia.createAssertEquals<readonly Api.OutputSummary[]>();
 export const parseOutputSummaryList = (json: string): readonly Api.OutputSummary[] =>
   assertOutputSummaryList(JSON.parse(json));
+
+export const assertPendingInstall = typia.createAssertEquals<Api.PendingInstall>();
+export const parsePendingInstall = (json: string): Api.PendingInstall => assertPendingInstall(JSON.parse(json));
+export const assertPendingInstallList = typia.createAssertEquals<readonly Api.PendingInstall[]>();
+export const parsePendingInstallList = (json: string): readonly Api.PendingInstall[] =>
+  assertPendingInstallList(JSON.parse(json));
 
 export const assertPortBlock = typia.createAssertEquals<Api.PortBlock>();
 export const parsePortBlock = (json: string): Api.PortBlock => assertPortBlock(JSON.parse(json));

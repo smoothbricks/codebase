@@ -811,6 +811,17 @@ export type ForkRequest = {
 };
 
 /**
+ * One gate job, as an installer that waits for it names it.
+ */
+export type GateJobRef = {
+  /**
+   * The gate job's admission number: the smaller is the older job.
+   */
+  readonly job: number & tags.Type<'uint64'>;
+  readonly checkout: string;
+};
+
+/**
  * What `gateway status` read of the host CPU budget (05_gateway.md "Host CPU budget"): the
  * daemon's own ledger, or the reason a daemon that answered `status` did not answer `cpu-budget`
  * — never an empty ledger standing in for one it could not read.
@@ -856,6 +867,11 @@ export type GatewayStatus = {
    * Absent when no daemon answered `status`.
    */
   readonly cpuBudget?: GatewayCpuBudget;
+  /**
+   * An install that holds the install slot, and the gate jobs it waits for before it restarts
+   * the gateway (05_gateway.md "The install slot"). Absent while no install holds the slot.
+   */
+  readonly pendingInstall?: PendingInstall;
 };
 
 export type GcCandidate = {
@@ -1611,6 +1627,19 @@ export type OutputSummary = {
   readonly version: number & tags.Type<'uint32'> & tags.Maximum<65535>;
   readonly text: string;
   readonly truncated: boolean;
+};
+
+/**
+ * An install that holds the install slot, as `gateway status` observes it without taking the
+ * slot from it. It is also what the installer records while it waits for gates, so the two
+ * cannot disagree on its shape.
+ */
+export type PendingInstall = {
+  /**
+   * The gate jobs the installer waits for before it restarts the gateway, oldest first;
+   * empty while it is not waiting for any.
+   */
+  readonly waitingFor: ReadonlyArray<GateJobRef>;
 };
 
 export type PortBlock = {
