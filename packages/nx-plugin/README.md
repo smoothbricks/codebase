@@ -1225,6 +1225,13 @@ pinned Bun 1.4.2). A test waits for the event it is waiting for, however long a 
 that never returns still ends the run through `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that
 report no tests; a target names at least one of the two.
 
+A job waiting for a CPU token is queued, not idle. A descendant whose own work waits in the host's CPU queue (a test's
+scratch cowshed project, say) writes `{"op":"host-wait"}` on the `BOUNDED_EXEC_CPU_POOL` it inherited and holds the
+connection while the work waits; while any such wait is held, the idle clock is stopped and keeps the time it had left,
+and it runs on from there when the last wait closes. stderr says `bounded-exec: idle clock stopped` and `… restarted`,
+and an expiry names the queued time it did not count (`specs/cowshed/05_gateway.md`, "A queued descendant is not idle").
+`timeoutMs` is never stopped.
+
 The final-five-second pre-signal snapshot attributes the runner's process tree and observed resources, with explicit
 incomplete/raced results and no delay to termination. Its timing, visibility and evidence contract is defined in
 `specs/cowshed/08_testing.md`, "Integration tests (real substrate)".

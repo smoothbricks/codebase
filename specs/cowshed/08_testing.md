@@ -506,12 +506,13 @@ remains a separate guard before rebase.
 
 Every test target, the groups included, is bounded by progress alone: the run ends when the time since the last finished
 test reaches its configured `idleTimeoutMs` (`BOUNDED_TEST_IDLE_TIMEOUT_MS` in the plugin's test-target policy), and
-names the tests still running. There is no count-multiplied outer wall-clock budget and no per-test bound kills a test:
-a Bun leg deletes Bun's own 5000 ms per-test deadline with `--timeout=0`, and no test carries one of its own
-(`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries `--no-tests=fail`, so a filter that
-selects nothing fails rather than passing a run of no test. The RAM host walk and real-process CPU-pool
-production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing case bounds. The shards
-exclude `*-host.test.ts`; the host target names both owned host files.
+names the tests still running. Time a descendant reports its own work queued for host CPU tokens is not idle time and is
+not counted (05_gateway.md, "A queued descendant is not idle"). There is no count-multiplied outer wall-clock budget and
+no per-test bound kills a test: a Bun leg deletes Bun's own 5000 ms per-test deadline with `--timeout=0`, and no test
+carries one of its own (`packages/nx-plugin/README.md`, "Bounded Test Targets"). A group's runner carries
+`--no-tests=fail`, so a filter that selects nothing fails rather than passing a run of no test. The RAM host walk and
+real-process CPU-pool production-wiring proofs run in `test-host`, outside the four pure Bun shards, with the existing
+case bounds. The shards exclude `*-host.test.ts`; the host target names both owned host files.
 
 An unfinished test name is not holder attribution. During the final five seconds of an unchanged no-progress interval,
 the executor takes one bounded pre-signal snapshot of its runner, descendants and retained process group. Resumed

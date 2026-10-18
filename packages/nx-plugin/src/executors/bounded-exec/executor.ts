@@ -8,6 +8,7 @@ import {
   CPU_POOL_ENV,
   type CpuPool,
   createCpuPool,
+  type HostWaits,
   type InheritedCpuPool,
   readInheritedCpuPool,
   takeParentCpuTokens,
@@ -404,10 +405,26 @@ export async function runBoundedExec(
     );
   }
 
+  // Descendant work queued for host CPU tokens, as its pool hears it (`host-wait`): while any is held the idle clock
+  // is stopped, because a queued job is not an idle one (specs/cowshed/05_gateway.md, "The bounds start at the
+  // grant"). The clock it stops is made with the command below; a wait held before then is counted and honoured there.
+  let heldWaits = 0;
+  let idleClock: { stop(): void; restart(): void } | null = null;
+  const hostWaits: HostWaits = {
+    begin: () => {
+      heldWaits += 1;
+      if (heldWaits === 1) idleClock?.stop();
+    },
+    end: () => {
+      heldWaits -= 1;
+      if (heldWaits === 0) idleClock?.restart();
+    },
+  };
+
   // A granted run serves a sub-pool of its own grant, so its descendants draw from that and never from above it.
   // A pool that cannot be set up refuses the run: no command runs unbudgeted.
   if (grant !== null) {
-    const created = await createCpuPool(grant.tokens, grant.closed);
+    const created = await createCpuPool(grant.tokens, grant.closed, hostWaits);
     if (!created.ok) {
       return refuse(`cowshed: cpu pool unavailable: ${created.error}; refusing to run the command\n`);
     }
@@ -451,14 +468,17 @@ export async function runBoundedExec(
     clearTimeout(captureTimer);
     idleCapture?.controller.abort();
   };
-  const armIdleTimer = (): void => {
-    if (idleTimeoutMs === undefined || state.settled || state.expiry !== null) {
-      return;
-    }
+  // What is left of the current no-progress interval. A finished test sets it back to `idleTimeoutMs`; a held host
+  // wait keeps it unspent: the clock is stopped while descendant work is queued for CPU tokens, and runs on from where
+  // it stopped once the last wait ends. `queuedMs` is the queued time this interval has not counted, for the report.
+  let idleLeftMs = idleTimeoutMs ?? 0;
+  let queuedMs = 0;
+  let queuedSinceMs: number | null = null;
+  const scheduleIdle = (limitMs: number, leftMs: number): void => {
     clearTimeout(idleTimer);
     cancelCapture();
     const capture: NonNullable<typeof idleCapture> = {
-      expiresAtMs: Date.now() + idleTimeoutMs,
+      expiresAtMs: Date.now() + leftMs,
       controller: new AbortController(),
       result: { kind: 'pending', startedAtMs: null },
     };
@@ -496,12 +516,51 @@ export async function runBoundedExec(
             },
           );
       },
-      Math.max(0, idleTimeoutMs - HANG_CAPTURE_MS),
+      Math.max(0, leftMs - HANG_CAPTURE_MS),
     );
-    idleTimer = setTimeout(
-      () => expire({ kind: 'idle', limitMs: idleTimeoutMs, tests: progress.inFlight() }),
-      idleTimeoutMs,
-    );
+    idleTimer = setTimeout(() => expire({ kind: 'idle', limitMs, tests: progress.inFlight() }, queuedMs), leftMs);
+  };
+  const armIdleTimer = (): void => {
+    if (idleTimeoutMs === undefined || state.settled || state.expiry !== null) {
+      return;
+    }
+    idleLeftMs = idleTimeoutMs;
+    queuedMs = 0;
+    if (queuedSinceMs !== null) {
+      queuedSinceMs = Date.now();
+      return;
+    }
+    scheduleIdle(idleTimeoutMs, idleLeftMs);
+  };
+  idleClock = {
+    stop: () => {
+      if (idleTimeoutMs === undefined || state.settled || state.expiry !== null || queuedSinceMs !== null) {
+        return;
+      }
+      const now = Date.now();
+      queuedSinceMs = now;
+      if (idleCapture !== undefined) {
+        idleLeftMs = Math.max(0, idleCapture.expiresAtMs - now);
+      }
+      clearTimeout(idleTimer);
+      cancelCapture();
+      idleCapture = undefined;
+      appendStderr(
+        `bounded-exec: idle clock stopped: a descendant's work is queued for host CPU tokens; ${idleLeftMs}ms of idleTimeoutMs=${idleTimeoutMs} left\n`,
+      );
+    },
+    restart: () => {
+      if (idleTimeoutMs === undefined || state.settled || state.expiry !== null || queuedSinceMs === null) {
+        return;
+      }
+      const waitedMs = Date.now() - queuedSinceMs;
+      queuedMs += waitedMs;
+      queuedSinceMs = null;
+      appendStderr(
+        `bounded-exec: idle clock restarted: no descendant's work is queued for host CPU tokens after ${waitedMs}ms; ${idleLeftMs}ms of idleTimeoutMs=${idleTimeoutMs} left\n`,
+      );
+      scheduleIdle(idleTimeoutMs, idleLeftMs);
+    },
   };
 
   // Only the CHILD's own output is read for progress. The diagnostics below go
@@ -573,7 +632,8 @@ export async function runBoundedExec(
   // the reader unable to tell a wedged toolchain from a loaded machine — the
   // two have opposite fixes.
   let termination: Promise<void> = Promise.resolve();
-  const expire = (bound: ExpiredBound): void => {
+  // `queuedMs` is the time the idle interval did not count because descendant work was queued for host CPU tokens.
+  const expire = (bound: ExpiredBound, queuedMs = 0): void => {
     if (state.settled || state.expiry !== null) {
       return;
     }
@@ -583,7 +643,9 @@ export async function runBoundedExec(
     const elapsedMs = Date.now() - startedAt;
     appendStderr(
       bound.kind === 'idle'
-        ? `\nCommand made no progress: no test finished for ${bound.limitMs}ms (idleTimeoutMs=${bound.limitMs}) after ${elapsedMs}ms of runtime; ${
+        ? `\nCommand made no progress: no test finished for ${bound.limitMs}ms (idleTimeoutMs=${bound.limitMs})${
+            queuedMs > 0 ? `, not counting ${queuedMs}ms queued for host CPU tokens,` : ''
+          } after ${elapsedMs}ms of runtime; ${
             bound.tests.length > 0
               ? `still running: ${bound.tests.join(', ')}`
               : 'the runner named no test still running'
@@ -652,6 +714,8 @@ export async function runBoundedExec(
   const totalTimer =
     timeoutMs === undefined ? undefined : setTimeout(() => expire({ kind: 'total', limitMs: timeoutMs }), timeoutMs);
   armIdleTimer();
+  // A wait its pool heard before the command started stops the clock it was not yet there to stop.
+  if (heldWaits > 0) idleClock.stop();
 
   // A grant's connection is a ledger entry, not the command's owner (05_gateway.md "Host CPU budget": a gateway
   // restart forgets every grant, and what runs under it runs on over budget until it finishes). Its close, while the

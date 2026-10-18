@@ -807,6 +807,19 @@ core count.
   gateway goes is refused, as any premature close is, and its runner never starts.
 - **The bounds start at the grant.** The executor's `timeoutMs` and `idleTimeoutMs` start when the command starts, after
   the grant: a wait for the host is not the command's time.
+- **A queued descendant is not idle** (2026-10-18, Danny: a job waiting for a CPU token is queued, not idle; "idle"
+  means nothing is happening while nothing is expected to happen). Work a command starts can queue for host tokens of
+  its own — a test's scratch project, whose cowshed jobs ask the host under that project's checkouts, holds no token of
+  the command's pool. A descendant that knows its work waits tells the run on the pool it inherited: it writes
+  `{"op":"host-wait"}` on `BOUNDED_EXEC_CPU_POOL`, is answered `{"ok":true,"wait":"held"}` at once, and holds the
+  connection for as long as the work waits. Every pool of the run, a sub-pool it served Cargo's launcher included,
+  counts to the run. While at least one is held the run's idle clock is stopped: the time left of its no-progress
+  interval is kept, nothing is spent, and stderr says `bounded-exec: idle clock stopped`. When the last closes — the
+  token arrived, the work was withdrawn, or the descendant died, which closes its socket — the clock runs on from what
+  was left and stderr says `bounded-exec: idle clock restarted` with the queued time. A finished test still sets the
+  interval back to `idleTimeoutMs`. An expiry names the queued time it did not count. Only a held wait stops the clock:
+  a run whose descendants say nothing keeps the bound exactly as before. `timeoutMs`, a ceiling, is never stopped. A
+  wait holds no token, so it changes neither the pool's count nor any grant.
 - **Wire.** The client writes
   `{"op":"cpu-tokens","want":<n>,"priority":<u32>,"checkout":"<workspace root>","command":"<command>"}` and does not
   half-close. An omitted priority is 0. A named job also carries its existing
