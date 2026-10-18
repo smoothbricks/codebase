@@ -1227,6 +1227,12 @@ Versioning:
   pending releases are repaired, `bump=patch|minor|major|prerelease` must make Nx create a new release commit, and smoo
   fails if Nx returns without moving `HEAD`. Every bump mode may no-op with `mode=none` when the selection is empty: no
   package-local changes for blank `--projects`, or no owned release packages at all for `--projects all`.
+- A failed public `npm publish` is reported from npm's own error code. `E401`, `E403`, `ENEEDAUTH`, and `E404` on a
+  package that exists (how a rejected trusted-publishing OIDC exchange surfaces, npm/cli#9088) get the
+  `smoo release trust-publisher` guidance. `E413` reports the tarball as too large for the registry, with npm's
+  `package size:` and npm's ~200 MB ceiling
+  ([npm/documentation#1691](https://github.com/npm/documentation/issues/1691)). Any other failure repeats npm's error
+  lines verbatim, and a failure before npm ran (packing) is reported as itself.
 - `--dry-run` previews versioning and completion without pushing refs, publishing npm packages, or writing GitHub
   Releases.
 - The pack path maps unpublished `-next` lock entries to the last stable tag because `bun pm pack` resolves

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import type { ReleasePackageInfo } from '../core.js';
 import {
+  classifyNpmPublishFailure,
+  NpmPublishCommandError,
   type NpmPublishDiagnosticShell,
   npmProvenanceRunnerRefusalMarkdown,
   npmProvenanceRunnerRefusalMessage,
@@ -12,6 +14,101 @@ import {
 import { privateNpmPublishArgs, publishPrivateWithDiagnostics } from '../private-npm.js';
 
 const pkg: Pick<ReleasePackageInfo, 'name' | 'version'> = { name: '@scope/pkg', version: '1.2.3' };
+const PUBLISH_ARGS = ['publish', 'pkg.tgz', '--access', 'public', '--tag', 'latest', '--provenance'];
+
+/** npm's stderr from Publish run 39150196802, which smoo misreported as a trusted-publishing failure. */
+const E413_STDERR = [
+  'npm notice',
+  'npm notice 📦  @smoothbricks/cowshed@0.2.4',
+  'npm notice package size: 211.0 MB',
+  'npm notice unpacked size: 598.4 MB',
+  'npm notice total files: 41',
+  'npm notice Publishing to https://registry.npmjs.org/ with tag latest and public access',
+  'npm error code E413',
+  'npm error 413 Payload Too Large - PUT https://registry.npmjs.org/@smoothbricks%2fcowshed',
+  'npm error A complete log of this run can be found in: /home/runner/.npm/_logs/debug-0.log',
+  '',
+].join('\n');
+
+function npmFailure(stderr: string): NpmPublishCommandError {
+  return new NpmPublishCommandError(PUBLISH_ARGS, 1, stderr);
+}
+
+describe('npm publish failure classification', () => {
+  it('classifies only npm auth codes as authentication failures', () => {
+    for (const code of ['E401', 'E403', 'E404', 'ENEEDAUTH'] as const) {
+      expect(classifyNpmPublishFailure(`npm error code ${code}\nnpm error something\n`)).toEqual({
+        kind: 'auth',
+        code,
+      });
+    }
+    expect(classifyNpmPublishFailure('npm ERR! code ENEEDAUTH\n')).toEqual({ kind: 'auth', code: 'ENEEDAUTH' });
+  });
+
+  it('classifies E413 as too large with the packed size npm printed', () => {
+    expect(classifyNpmPublishFailure(E413_STDERR)).toEqual({ kind: 'too-large', packageSize: '211.0 MB' });
+    expect(classifyNpmPublishFailure('npm error code E413\n')).toEqual({ kind: 'too-large', packageSize: undefined });
+  });
+
+  it("keeps any other npm error verbatim, and npm's stderr tail when it printed no error line", () => {
+    const stderr = 'npm notice package size: 1 kB\nnpm error code E500\nnpm error 500 Internal Server Error - PUT x\n';
+    expect(classifyNpmPublishFailure(stderr)).toEqual({
+      kind: 'npm',
+      code: 'E500',
+      detail: 'npm error code E500\nnpm error 500 Internal Server Error - PUT x',
+    });
+    expect(classifyNpmPublishFailure('Segmentation fault\n')).toEqual({
+      kind: 'npm',
+      code: undefined,
+      detail: 'Segmentation fault',
+    });
+  });
+
+  it('reports E413 as a too-large tarball with its size and npm ceiling, never trusted-publishing advice', async () => {
+    const shell = new RecordingPublishShell({ publishFails: true, publishFailure: npmFailure(E413_STDERR) });
+
+    await expect(
+      publishWithAuthDiagnostics(pkg, shell, { tokenPresent: false, repository: 'smoothbricks/codebase' }),
+    ).rejects.toThrow(
+      "@scope/pkg@1.2.3: npm rejected the tarball as too large (E413 Payload Too Large, package size 211.0 MB; npm's ceiling is ~200 MB).",
+    );
+
+    expect(shell.errors).toHaveLength(1);
+    expect(shell.errors[0]).toContain('tarball too large (E413)');
+    expect(shell.errors[0]).toContain('Package size: 211.0 MB');
+    expect(shell.errors[0]).toContain('roughly 200 MB');
+    expect(shell.errors[0]).toContain('https://github.com/npm/documentation/issues/1691');
+    expect(shell.errors[0]).not.toContain('trusted publishing is not configured');
+    expect(shell.errors[0]).not.toContain('Run locally: smoo release trust-publisher');
+    expect(shell.summaries).toHaveLength(1);
+    expect(shell.summaries[0]).toContain('## npm rejected the package as too large');
+    expect(shell.summaries[0]).toContain('Package size: 211.0 MB');
+  });
+
+  it("reports any other npm error with npm's own lines, never trusted-publishing advice", async () => {
+    const stderr = 'npm error code EOTP\nnpm error This operation requires a one-time password.\n';
+    const shell = new RecordingPublishShell({ publishFails: true, publishFailure: npmFailure(stderr) });
+
+    await expect(publishWithAuthDiagnostics(pkg, shell, { tokenPresent: false })).rejects.toThrow(
+      '@scope/pkg@1.2.3: npm publish failed (EOTP):\nnpm error code EOTP\nnpm error This operation requires a one-time password.',
+    );
+
+    expect(shell.errors[0]).toContain('npm error This operation requires a one-time password.');
+    expect(shell.errors[0]).not.toContain('trust-publisher');
+    expect(shell.summaries[0]).toContain('## npm publish failed');
+    expect(shell.summaries[0]).toContain('npm error code EOTP');
+  });
+
+  it('rethrows a failure npm never reported, such as packing, unchanged and without a banner', async () => {
+    const packFailure = new Error('bun pm pack failed with exit code 1');
+    const shell = new RecordingPublishShell({ publishFails: true, publishFailure: packFailure });
+
+    await expect(publishWithAuthDiagnostics(pkg, shell, { tokenPresent: false })).rejects.toBe(packFailure);
+
+    expect(shell.errors).toEqual([]);
+    expect(shell.summaries).toEqual([]);
+  });
+});
 
 describe('npm publish auth diagnostics', () => {
   it('explains trusted publishing setup when an existing package publish is unauthenticated', () => {
@@ -274,14 +371,24 @@ class RecordingPublishShell implements NpmPublishDiagnosticShell {
   readonly logs: string[] = [];
   readonly errors: string[] = [];
   readonly summaries: string[] = [];
-  readonly publishFailure = new Error('ENEEDAUTH');
+  readonly publishFailure: Error;
   publishCalls = 0;
   private readonly publishFails: boolean;
   private readonly versionVisibleAfterFailure: boolean;
   private readonly statusFails: string | undefined;
 
-  constructor(options: { publishFails: boolean; versionVisibleAfterFailure?: boolean; statusFails?: string }) {
+  constructor(options: {
+    publishFails: boolean;
+    publishFailure?: Error;
+    versionVisibleAfterFailure?: boolean;
+    statusFails?: string;
+  }) {
     this.publishFails = options.publishFails;
+    this.publishFailure =
+      options.publishFailure ??
+      npmFailure(
+        'npm error code ENEEDAUTH\nnpm error need auth This command requires you to be logged in to https://registry.npmjs.org/\n',
+      );
     this.versionVisibleAfterFailure = options.versionVisibleAfterFailure === true;
     this.statusFails = options.statusFails;
   }

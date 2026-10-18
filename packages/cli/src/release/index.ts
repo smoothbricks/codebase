@@ -9,7 +9,7 @@ import { assertCollectedOutputsApplied } from '../github-ci/outputs.js';
 import { assertNoConflictMarkers } from '../lib/conflict-markers.js';
 import { withDevenvEnv } from '../lib/devenv.js';
 import { parsePackageJsonText } from '../lib/json.js';
-import { decode, run, runInteractiveStatus, runResult } from '../lib/run.js';
+import { decode, run, runInteractiveCapturingStderr, runInteractiveStatus, runResult } from '../lib/run.js';
 import {
   getWorkspacePackages,
   listPublicReleasePackages,
@@ -89,7 +89,7 @@ import {
   renderNxProjectChangelogContents,
   withNxWorkspaceRoot,
 } from './github-release.js';
-import { publishWithAuthDiagnostics } from './npm-auth.js';
+import { NpmPublishCommandError, publishWithAuthDiagnostics } from './npm-auth.js';
 import {
   bumpStableReleaseToNext,
   collectRepairPlatformOutputs,
@@ -2105,7 +2105,15 @@ interface TrustedPublisherJson {
 const parseTrustedPublisherJson = typia.json.createIsParse<TrustedPublisherJson | TrustedPublisherJson[]>();
 
 async function runNpmPublish(root: string, npmArgs: string[]): Promise<void> {
-  await runNpm(root, npmArgs, { NODE_AUTH_TOKEN: '', NPM_TOKEN: '' });
+  // stdin/stdout stay interactive for npm's OTP flow; stderr is kept so the
+  // failure is classified from npm's own error code.
+  const { exitCode, stderr } = await runInteractiveCapturingStderr('npm', npmArgs, root, {
+    NODE_AUTH_TOKEN: '',
+    NPM_TOKEN: '',
+  });
+  if (exitCode !== 0) {
+    throw new NpmPublishCommandError(npmArgs, exitCode, stderr);
+  }
 }
 
 function missingNpmPackagePublishGuidance(pkg: Pick<ReleasePackage, 'name'>): string {
