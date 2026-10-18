@@ -93,6 +93,15 @@ impl GatewayControlClient {
             .ok_or(ControlError::InvalidResponse)
     }
 
+    /// The host CPU budget's ledger (05_gateway.md "Host CPU budget", Wire): who holds and who
+    /// waits for tokens, and the gate queue in the order returned tokens go to it.
+    pub async fn cpu_budget(&self) -> Result<CpuBudgetStatus, ControlError> {
+        self.send(&ControlRequest::CpuBudget)
+            .await?
+            .cpu_budget
+            .ok_or(ControlError::InvalidResponse)
+    }
+
     pub async fn install(&self, session: &WorkspaceSession) -> Result<(), ControlError> {
         session
             .validate()

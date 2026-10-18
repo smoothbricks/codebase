@@ -795,7 +795,10 @@ core count.
   as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as `cpuBudget`: `total`, `held`, per
   checkout `held`, `running` and `waiting`, and `gateQueue`: the waiting gate-class requests in the order returned
   tokens go to them, each with its `checkout`, its gate `job` (the job's admission number; the smaller is the older job)
-  and its `want`.
+  and its `want`. `cowshed gateway status` shows this ledger and gate queue to the operator, in its human lines and as
+  `cpuBudget` in `--json` (06_cli.md; 07_api.md `GatewayStatus`), so whether queued lands wait behind the head of the
+  queue without loading it is visible rather than inferred; a daemon that does not answer `cpu-budget` is reported as
+  such, never as an empty ledger.
 - **Priority updates.** `{"op":"job-qos","job":{…}|"lease":"<lease id>","priority":<u32>}` is one-shot and answers
   `{"ok":true}`, or `not-found` for an admission that is not live. It re-keys the selected admission only while queued;
   a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions. This

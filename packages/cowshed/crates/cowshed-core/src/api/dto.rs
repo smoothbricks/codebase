@@ -3772,6 +3772,10 @@ pub struct GatewayStatus {
     /// 0.1.0 across every build, so only the executables' contents can tell them apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_daemon: Option<StaleDaemonBinary>,
+    /// The host CPU ledger the answering daemon serves on `cpu-budget`, or why it gave none.
+    /// Absent when no daemon answered `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_budget: Option<GatewayCpuBudget>,
 }
 
 /// The daemon and CLI executables, when their contents differ.
@@ -3783,6 +3787,20 @@ pub struct StaleDaemonBinary {
     pub daemon_sha256: Option<String>,
     /// SHA-256 of the executable of the CLI that asked.
     pub cli_sha256: String,
+}
+
+/// What `gateway status` read of the host CPU budget (05_gateway.md "Host CPU budget"): the
+/// daemon's own ledger, or the reason a daemon that answered `status` did not answer `cpu-budget`
+/// — never an empty ledger standing in for one it could not read.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum GatewayCpuBudget {
+    /// Tokens held and total, each checkout's runners, and the waiting gate-class requests in
+    /// the order returned tokens go to them.
+    Ledger(cowshed_gateway_types::CpuBudgetStatus),
+    /// The daemon's refusal or the transport failure, as the control client reports it: a daemon
+    /// from before `cpu-budget` existed refuses the request it does not know.
+    Unanswered(String),
 }
 
 /// Health of the host-owned sccache LaunchAgent.

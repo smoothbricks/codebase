@@ -11,8 +11,9 @@ use cowshed_cli::launchd::{
     NativeLaunchctlCommand, RemovalOutcome, STABLE_BINARY_MODE,
 };
 use cowshed_cli::output::Output;
-use cowshed_core::api::GatewayStatus as CliGatewayStatus;
+use cowshed_core::api::{GatewayCpuBudget, GatewayStatus as CliGatewayStatus};
 use cowshed_core::{CowshedError, Result};
+use cowshed_gateway_types::{CpuBudgetStatus, CpuCheckoutStatus, CpuGateWaiter};
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -265,6 +266,7 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
             healing: None,
             recovering: None,
             stale_daemon: None,
+            cpu_budget: None,
         },
     )
     .expect("status emits");
@@ -314,6 +316,7 @@ fn gateway_status_names_launchd_socket_and_both_versions() {
                 healing: None,
                 recovering: None,
                 stale_daemon: None,
+                cpu_budget: None,
             },
         )
         .expect("status emits");
@@ -334,6 +337,178 @@ fn gateway_status_names_launchd_socket_and_both_versions() {
             "{stderr}"
         );
     }
+}
+
+fn answering_status(cpu_budget: GatewayCpuBudget) -> CliGatewayStatus {
+    CliGatewayStatus {
+        installed: true,
+        running: true,
+        socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
+        cli_version: "1.4.0".into(),
+        daemon_version: Some("1.4.0".into()),
+        active_workspaces: 2,
+        drain_cause: None,
+        healing: None,
+        recovering: None,
+        stale_daemon: None,
+        cpu_budget: Some(cpu_budget),
+    }
+}
+
+/// `gateway status` shows who holds the host's CPU tokens and the gate queue in serving order,
+/// as the daemon's `cpu-budget` ledger says (05_gateway.md "Host CPU budget", Wire), in both
+/// the human lines and the JSON result.
+#[test]
+fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
+    let ledger = CpuBudgetStatus {
+        total: 18,
+        held: 17,
+        checkouts: vec![
+            CpuCheckoutStatus {
+                checkout: "/w/older-land".into(),
+                held: 13,
+                running: 3,
+                waiting: 2,
+            },
+            CpuCheckoutStatus {
+                checkout: "/w/younger-land".into(),
+                held: 4,
+                running: 1,
+                waiting: 1,
+            },
+        ],
+        gate_queue: vec![
+            CpuGateWaiter {
+                checkout: "/w/older-land".into(),
+                job: 3,
+                want: 6,
+            },
+            CpuGateWaiter {
+                checkout: "/w/older-land".into(),
+                job: 3,
+                want: 2,
+            },
+            CpuGateWaiter {
+                checkout: "/w/younger-land".into(),
+                job: 5,
+                want: 18,
+            },
+        ],
+    };
+
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    emit_gateway_status(
+        &mut output,
+        false,
+        answering_status(GatewayCpuBudget::Ledger(ledger.clone())),
+    )
+    .expect("status emits");
+    let (stdout, stderr) = output.into_inner();
+    assert!(stdout.is_empty());
+    let stderr = String::from_utf8(stderr).expect("utf8 status");
+    let ledger_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("cpu budget") || line.contains("gate queue"))
+        .collect();
+    assert_eq!(ledger_lines.len(), 7, "{stderr}");
+    for (line, expected) in ledger_lines.iter().zip([
+        "cowshed: gateway cpu budget: held 17/18 tokens",
+        "cowshed: gateway cpu budget: /w/older-land: held 13, running 3, waiting 2",
+        "cowshed: gateway cpu budget: /w/younger-land: held 4, running 1, waiting 1",
+        "cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them",
+        "cowshed: gateway gate queue 1: /w/older-land gate job 3 want 6",
+        "cowshed: gateway gate queue 2: /w/older-land gate job 3 want 2",
+        "cowshed: gateway gate queue 3: /w/younger-land gate job 5 want 18",
+    ]) {
+        assert_eq!(*line, expected, "{stderr}");
+    }
+
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    emit_gateway_status(
+        &mut output,
+        true,
+        answering_status(GatewayCpuBudget::Ledger(ledger)),
+    )
+    .expect("status emits");
+    let (stdout, stderr) = output.into_inner();
+    assert!(stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&stdout).expect("one JSON line");
+    assert_eq!(
+        json["result"]["cpuBudget"],
+        serde_json::json!({"ledger": {
+            "total": 18,
+            "held": 17,
+            "checkouts": [
+                {"checkout": "/w/older-land", "held": 13, "running": 3, "waiting": 2},
+                {"checkout": "/w/younger-land", "held": 4, "running": 1, "waiting": 1}
+            ],
+            "gateQueue": [
+                {"checkout": "/w/older-land", "job": 3, "want": 6},
+                {"checkout": "/w/older-land", "job": 3, "want": 2},
+                {"checkout": "/w/younger-land", "job": 5, "want": 18}
+            ]
+        }})
+    );
+}
+
+/// An idle host says its gate queue is empty; that is a ledger read, not a missing one.
+#[test]
+fn gateway_status_says_an_empty_gate_queue_is_empty() {
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    emit_gateway_status(
+        &mut output,
+        false,
+        answering_status(GatewayCpuBudget::Ledger(CpuBudgetStatus {
+            total: 18,
+            held: 0,
+            checkouts: Vec::new(),
+            gate_queue: Vec::new(),
+        })),
+    )
+    .expect("status emits");
+    let stderr = String::from_utf8(output.into_inner().1).expect("utf8 status");
+    assert!(
+        stderr.contains("gateway cpu budget: held 0/18 tokens"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("gateway gate queue: empty"), "{stderr}");
+}
+
+/// A daemon that answers `status` but refuses `cpu-budget` — one from before the request — is
+/// reported as not answering it, never as an idle host with an empty ledger.
+#[test]
+fn a_daemon_that_does_not_answer_cpu_budget_is_reported_as_such() {
+    let reason = "gateway control rejected operation (InvalidRequest): gateway control encoding failed: unknown gateway control operation";
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    emit_gateway_status(
+        &mut output,
+        false,
+        answering_status(GatewayCpuBudget::Unanswered(reason.into())),
+    )
+    .expect("status emits");
+    let stderr = String::from_utf8(output.into_inner().1).expect("utf8 status");
+    assert!(
+        stderr.contains(&format!(
+            "gateway cpu budget unavailable: the daemon did not answer cpu-budget: {reason}"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("held"), "{stderr}");
+    assert!(!stderr.contains("gate queue"), "{stderr}");
+
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    emit_gateway_status(
+        &mut output,
+        true,
+        answering_status(GatewayCpuBudget::Unanswered(reason.into())),
+    )
+    .expect("status emits");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.into_inner().0).expect("one JSON line");
+    assert_eq!(
+        json["result"]["cpuBudget"],
+        serde_json::json!({ "unanswered": reason })
+    );
 }
 
 fn scratch_home(label: &str) -> PathBuf {
