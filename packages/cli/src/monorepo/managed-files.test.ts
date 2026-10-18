@@ -489,23 +489,21 @@ describe('managed cache actions', () => {
     }
   });
 
-  it('restores isolated Bun aliases with the cache targets they name', async () => {
-    const action = typia.assert<{ runs: { steps: [{ with: { path: string } }] } }>(
+  it('restores isolated Bun aliases with the cache targets they name, never the install stamp', async () => {
+    const action = typia.assert<{ runs: { steps: [{ with: { path: string } }, { shell: 'bash'; run: string }] } }>(
       Bun.YAML.parse(await readFile(join(REPO_ROOT, '.github/actions/cache-node-modules/action.yml'), 'utf8')),
     );
-    const listed = typia.assert<Array<'node_modules' | '~/.bun/install/cache/links' | '!node_modules/.smoo-install'>>(
+    const paths = typia.assert<Array<'node_modules' | '~/.bun/install/cache/links'>>(
       action.runs.steps[0].with.path.trim().split('\n'),
     );
-    // The install stamp is excluded: workspace members' node_modules links are not archived, so a restored stamp
-    // would let devenv's smoo:install skip the install that recreates them (Publish run 39132666631).
-    expect(listed).toEqual(['node_modules', '~/.bun/install/cache/links', '!node_modules/.smoo-install']);
-    const paths = listed.filter((path) => path !== '!node_modules/.smoo-install');
+    const dropStamp = action.runs.steps[1].run;
     const temp = await mkdtemp(join(tmpdir(), 'smoo-bun-cache-'));
     const modules = join(temp, 'checkout', 'node_modules');
     const links = join(temp, 'home', '.bun', 'install', 'cache', 'links');
     const entry = join(links, 'fixture@1.0.0-cache');
     const storeAlias = join(modules, '.bun', 'fixture@1.0.0');
     const manifest = join(modules, 'fixture', 'package.json');
+    const stamp = join(modules, '.smoo-install');
     const content = `${JSON.stringify({ name: 'fixture', version: '1.0.0' })}\n`;
     const modulesOnly = join(temp, 'modules-only.tar');
     const configured = join(temp, 'configured.tar');
@@ -518,6 +516,7 @@ describe('managed cache actions', () => {
       await writeFile(join(entry, 'node_modules', 'fixture', 'package.json'), content);
       await symlink(entry, storeAlias);
       await symlink(join('.bun', 'fixture@1.0.0', 'node_modules', 'fixture'), join(modules, 'fixture'));
+      await writeFile(stamp, '{}\n');
       expect(await readFile(manifest, 'utf8')).toBe(content);
 
       tar('-cf', modulesOnly, relative(temp, modules));
@@ -534,6 +533,16 @@ describe('managed cache actions', () => {
       expect(await readlink(storeAlias)).toBe(entry);
       expect(await readFile(manifest, 'utf8')).toBe(content);
       expect(paths).toEqual(['node_modules', '~/.bun/install/cache/links']);
+      // actions/cache archives node_modules whole, the stamp devenv's smoo:install watches included, and a `!` path
+      // inside a listed directory excludes nothing (actions/toolkit#713). Workspace members' own node_modules links
+      // are not archived, so the step after the restore drops the stamp and only an install in this checkout can
+      // claim the tree current (Publish runs 39132666631 and 39143439571 skipped that install).
+      expect(await readFile(stamp, 'utf8')).toBe('{}\n');
+      expect(
+        Bun.spawnSync(['bash', '-c', dropStamp], { cwd: join(temp, 'checkout'), stderr: 'inherit' }).exitCode,
+      ).toBe(0);
+      await expect(readFile(stamp, 'utf8')).rejects.toThrow('ENOENT');
+      expect(await readFile(manifest, 'utf8')).toBe(content);
     } finally {
       await rm(temp, { recursive: true, force: true });
     }
