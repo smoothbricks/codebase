@@ -182,11 +182,14 @@ them, and every task that gate admits afterwards is refused. Measured 2026-10-18
 `cpu-tokens parent pool refused: the gateway closed the lease connection`, and the land failed. So an install — holding
 the slot, after its refusals and before the activation or host move that would restart a gateway that answers `status` —
 first waits until that gateway's `cpu-budget` ledger shows no gate-class work holding or wanting tokens (`gateJobs` and
-`gateQueue` both empty, "Host CPU budget", Wire). It reads the ledger once a second, with no deadline, as no admission
-has one ("No admission deadline"): the gates end, and the install goes on. It says on stderr which gate jobs it waits
-for (`gate job <n> at <checkout>`), once and again whenever they change, and when none is left. A gateway that does not
-answer `cpu-budget` is not waited on, and the install says so. An install that restarts nothing (no daemon answers, or
-the refresh finds the agent current) does not wait. The restart and its refusals themselves are unchanged.
+`gateQueue` both empty, "Host CPU budget", Wire). It reads those two fields alone, each entry's `checkout` and `job`,
+and nothing else of the ledger: the gateway it is about to replace is of another build, and a ledger field one build has
+and the other lacks must not turn the wait into a restart that cuts a gate off. It reads the ledger once a second, with
+no deadline, as no admission has one ("No admission deadline"): the gates end, and the install goes on. It says on
+stderr which gate jobs it waits for (`gate job <n> at <checkout>`), once and again whenever they change, and when none
+is left. A gateway that does not answer `cpu-budget` is not waited on, and the install says so. An install that restarts
+nothing (no daemon answers, or the refresh finds the agent current) does not wait. The restart and its refusals
+themselves are unchanged.
 
 **Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
 the new build's and the one it replaced is removed. The replaced build stays one install longer: a workspace supervisor
@@ -851,14 +854,22 @@ core count.
   as `invalid-request`. `{"op":"cpu-budget"}` is one-shot and answers the ledger as `cpuBudget`: `total`, `held`, per
   checkout `held`, `running` and `waiting` (every class together); `gateJobs`: the gate jobs whose runners hold tokens,
   oldest job first — the first is the head of the gate queue — each with its `checkout`, its gate `job` (the job's
-  admission number; the smaller is the older job), the tokens it `held` and its `running` runners; `gateQueue`: the
-  waiting gate-class requests in the order returned tokens go to them, each with its `checkout`, gate `job` and `want`;
-  and `background`: each checkout's background-class stake alone (`held`, `running`, `waiting`), for the checkouts that
-  have one. `cowshed gateway status` shows this ledger to the operator in the order it serves — the head gate job, the
-  gate jobs behind it, the gate queue, then background — in its human lines, and verbatim as `cpuBudget` in `--json`
-  (06_cli.md; 07_api.md `GatewayStatus`), so whether queued lands wait behind the head of the queue without loading it
-  is visible rather than inferred; a daemon that does not answer `cpu-budget` is reported as such, never as an empty
-  ledger.
+  admission number; the smaller is the older job), the tokens it `held` and its `holders`; `gateQueue`: the waiting
+  gate-class requests in the order returned tokens go to them, each with its `checkout`, gate `job` and `want`; and
+  `background`: each checkout's background-class stake alone (`held`, `waiting`, `holders`), for the checkouts that have
+  one. `holders` are the granted leases, one per runner holding tokens, oldest grant first, each with the client's `pid`
+  (the socket's peer; absent when the socket names none — a pool-relayed task is named by its own connection to the
+  pool), the `command` it named, the `tokens` it holds now, its `want`, and `heldMs`, the milliseconds since its grant.
+  The age is the lease's, never the process's: a lease is one connection granted once, a growth does not renew it, and a
+  process that asks again holds a new lease with its own age; the ledger never scans processes, and `ps -p <pid>` gives
+  the process's age. Measured 2026-10-18: a ledger that named only `land-test-hang: held 15, running 1` read as an
+  orphan, and a live 34-minute `cargo test … fleet_coder` another unit was waiting on was killed by hand; its holder
+  line would have said what it was and that it was live. `cowshed gateway status` shows this ledger to the operator in
+  the order it serves — the head gate job, the gate jobs behind it, the gate queue, then background, each running gate
+  job and background stake followed by its leases — in its human lines, and verbatim as `cpuBudget` in `--json`
+  (06_cli.md; 07_api.md `GatewayStatus`), so whether queued lands wait behind the head of the queue without loading it,
+  and who holds every token since when, is visible rather than inferred; a daemon that does not answer `cpu-budget` is
+  reported as such, never as an empty ledger.
 - **Priority updates.** `{"op":"job-qos","job":{…}|"lease":"<lease id>","priority":<u32>}` is one-shot and answers
   `{"ok":true}`, or `not-found` for an admission that is not live. It re-keys the selected admission only while queued;
   a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions. This

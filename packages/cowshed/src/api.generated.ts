@@ -450,6 +450,25 @@ export type CpuAdmissionRefusal =
     });
 
 /**
+ * One checkout's background-class stake: what it holds, who of it waits, and each granted lease.
+ */
+export type CpuBackgroundStake = {
+  readonly checkout: string;
+  /**
+   * Tokens its granted background runners hold: the sum of its holders' tokens.
+   */
+  readonly held: number & tags.Type<'uint64'>;
+  /**
+   * Background runners waiting for a grant.
+   */
+  readonly waiting: number & tags.Type<'uint64'>;
+  /**
+   * Its granted leases, one per background runner holding tokens, the oldest grant first.
+   */
+  readonly holders: ReadonlyArray<CpuHolder>;
+};
+
+/**
  * The budget as the gateway reports it in its status: the host total, how many tokens are held,
  * and by whom. `held` plus the free tokens is always `total`.
  */
@@ -474,7 +493,7 @@ export type CpuBudgetStatus = {
    * Each checkout's background-class stake alone, for the checkouts that have one: what is
    * served behind the gate jobs.
    */
-  readonly background: ReadonlyArray<CpuCheckoutStatus>;
+  readonly background: ReadonlyArray<CpuBackgroundStake>;
 };
 
 export type CpuCheckoutStatus = {
@@ -503,13 +522,13 @@ export type CpuGateJob = {
    */
   readonly job: number & tags.Type<'uint64'>;
   /**
-   * Tokens its granted runners hold.
+   * Tokens its granted runners hold: the sum of its holders' tokens.
    */
   readonly held: number & tags.Type<'uint64'>;
   /**
-   * Its runners holding tokens.
+   * Its granted leases, one per runner holding tokens, the oldest grant first.
    */
-  readonly running: number & tags.Type<'uint64'>;
+  readonly holders: ReadonlyArray<CpuHolder>;
 };
 
 /**
@@ -525,6 +544,35 @@ export type CpuGateWaiter = {
    * The tokens it asked for.
    */
   readonly want: number & tags.Type<'uint64'>;
+};
+
+/**
+ * One granted lease, as the ledger knows it: the client that holds it, what it said the tokens
+ * are for, and since when. A lease is one connection, granted once; its age is the grant's, not
+ * its process's, and a growth does not renew it. The ledger never scans processes: `pid` is the
+ * socket's peer, and `ps -p <pid>` tells the rest.
+ */
+export type CpuHolder = {
+  /**
+   * The client process, when its socket named one.
+   */
+  readonly pid?: number & tags.Type<'int32'>;
+  /**
+   * What the client said the tokens are for.
+   */
+  readonly command: string;
+  /**
+   * The tokens it holds now, growth included.
+   */
+  readonly tokens: number & tags.Type<'uint64'>;
+  /**
+   * The tokens it asked for.
+   */
+  readonly want: number & tags.Type<'uint64'>;
+  /**
+   * Milliseconds since its grant.
+   */
+  readonly heldMs: number & tags.Type<'uint64'>;
 };
 
 /**

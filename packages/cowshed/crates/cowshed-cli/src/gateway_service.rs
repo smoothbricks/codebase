@@ -986,23 +986,6 @@ async fn read_cpu_budget(client: &GatewayControlClient) -> GatewayCpuBudget {
 /// How often an install that waits for gates reads the ledger again.
 const GATE_POLL: Duration = Duration::from_secs(1);
 
-/// The gate jobs a gateway restart now would cut off, oldest first: every gate job whose runners
-/// hold tokens, and every gate job a waiting request serves.
-fn gates_in_flight(ledger: &cowshed_gateway_types::CpuBudgetStatus) -> BTreeSet<GateJobRef> {
-    ledger
-        .gate_jobs
-        .iter()
-        .map(|job| GateJobRef {
-            job: job.job,
-            checkout: job.checkout.clone(),
-        })
-        .chain(ledger.gate_queue.iter().map(|waiter| GateJobRef {
-            job: waiter.job,
-            checkout: waiter.checkout.clone(),
-        }))
-        .collect()
-}
-
 /// Hold an install that is about to restart the running gateway until no gate-class work holds
 /// or wants CPU tokens (05_gateway.md "An install waits for the gates in flight").
 ///
@@ -1031,8 +1014,8 @@ async fn watch_gates(
 ) -> Result<()> {
     let mut named: Option<BTreeSet<GateJobRef>> = None;
     loop {
-        let gates = match client.cpu_budget().await {
-            Ok(ledger) => gates_in_flight(&ledger),
+        let gates = match client.gates_in_flight().await {
+            Ok(gates) => gates,
             Err(error) => {
                 return writeln!(
                     stderr,
@@ -1494,7 +1477,9 @@ fn pending_install_line(pending: &PendingInstall) -> String {
 /// The host CPU ledger in the operator's words (05_gateway.md "Host CPU budget"), in the order the
 /// ledger serves it: tokens held of the total; the running gate jobs, the head — the oldest — first;
 /// the waiting gate-class requests in the order returned tokens go to them; then each checkout's
-/// background stake, served behind them. Or why the daemon gave no ledger.
+/// background stake, served behind them. Each running gate job and background stake is followed
+/// by its leases, oldest grant first, so the reader sees who holds the tokens and since when
+/// rather than guessing from the checkout. Or why the daemon gave no ledger.
 fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
     let ledger = match budget {
         GatewayCpuBudget::Ledger(ledger) => ledger,
@@ -1504,27 +1489,34 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
             )];
         }
     };
-    let mut lines = Vec::with_capacity(
-        4 + ledger.gate_jobs.len() + ledger.gate_queue.len() + ledger.background.len(),
-    );
-    lines.push(format!(
+    let mut lines = vec![format!(
         "gateway cpu budget: held {}/{} tokens",
         ledger.held, ledger.total
-    ));
-    match ledger.gate_jobs.split_first() {
-        None => lines.push("gateway gate head: no gate job is running".to_owned()),
-        Some((head, behind)) => {
-            lines.push(format!(
-                "gateway gate head: {} gate job {}: held {}, running {}",
-                head.checkout, head.job, head.held, head.running
-            ));
-            lines.extend(behind.iter().map(|job| {
-                format!(
-                    "gateway gate job behind the head: {} gate job {}: held {}, running {}",
-                    job.checkout, job.job, job.held, job.running
-                )
-            }));
-        }
+    )];
+    if ledger.gate_jobs.is_empty() {
+        lines.push("gateway gate head: no gate job is running".to_owned());
+    }
+    for (place, job) in ledger.gate_jobs.iter().enumerate() {
+        let title = if place == 0 {
+            "gateway gate head"
+        } else {
+            "gateway gate job behind the head"
+        };
+        lines.push(format!(
+            "{title}: {} gate job {}: held {}, running {}",
+            job.checkout,
+            job.job,
+            job.held,
+            job.holders.len()
+        ));
+        lines.extend(job.holders.iter().map(|holder| {
+            format!(
+                "gateway gate lease: {} gate job {}: {}",
+                job.checkout,
+                job.job,
+                lease_words(holder)
+            )
+        }));
     }
     if ledger.gate_queue.is_empty() {
         lines.push("gateway gate queue: empty".to_owned());
@@ -1546,13 +1538,44 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
     if ledger.background.is_empty() {
         lines.push("gateway background: none".to_owned());
     }
-    lines.extend(ledger.background.iter().map(|stake| {
-        format!(
+    for stake in &ledger.background {
+        lines.push(format!(
             "gateway background: {}: held {}, running {}, waiting {}",
-            stake.checkout, stake.held, stake.running, stake.waiting
-        )
-    }));
+            stake.checkout,
+            stake.held,
+            stake.holders.len(),
+            stake.waiting
+        ));
+        lines.extend(stake.holders.iter().map(|holder| {
+            format!(
+                "gateway background lease: {}: {}",
+                stake.checkout,
+                lease_words(holder)
+            )
+        }));
+    }
     lines
+}
+
+/// `pid 71437, 15/18 tokens, granted 34m07s ago: cargo test …`: one lease as the operator reads
+/// it. The age is the grant's; `ps -p <pid>` gives the process's.
+fn lease_words(holder: &cowshed_gateway_types::CpuHolder) -> String {
+    let pid = holder
+        .pid
+        .map_or_else(|| "pid unknown".to_owned(), |pid| format!("pid {pid}"));
+    let seconds = holder.held_ms / 1000;
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    let age = if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    };
+    format!(
+        "{pid}, {}/{} tokens, granted {age} ago: {}",
+        holder.tokens, holder.want, holder.command
+    )
 }
 
 /// The build an install would put in place: its bytes, what they hash to, and what the build

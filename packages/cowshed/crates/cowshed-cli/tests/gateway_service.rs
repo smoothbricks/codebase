@@ -15,7 +15,9 @@ use cowshed_core::api::{
     GateJobRef, GatewayCpuBudget, GatewayStatus as CliGatewayStatus, PendingInstall,
 };
 use cowshed_core::{CowshedError, Result};
-use cowshed_gateway_types::{CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter};
+use cowshed_gateway_types::{
+    CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
+};
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -448,7 +450,8 @@ fn gateway_status_says_an_install_is_pending_and_which_gates_it_waits_for() {
 /// `gateway status` shows who holds the host's CPU tokens in the order the ledger serves them —
 /// the head gate job, the gate jobs behind it, the gate queue, then background — as the daemon's
 /// `cpu-budget` ledger says (05_gateway.md "Host CPU budget", Wire), in both the human lines and
-/// the JSON result.
+/// the JSON result. Every lease is named by its pid, its tokens of its want, the age of its grant
+/// and its command, so a live holder is never taken for an orphan by its checkout's name.
 #[test]
 fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
     let ledger = CpuBudgetStatus {
@@ -473,13 +476,34 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
                 checkout: "/w/older-land".into(),
                 job: 3,
                 held: 12,
-                running: 2,
+                holders: vec![
+                    CpuHolder {
+                        pid: Some(101),
+                        command: "nx run-many -t test".into(),
+                        tokens: 10,
+                        want: 18,
+                        held_ms: 125_000,
+                    },
+                    CpuHolder {
+                        pid: Some(102),
+                        command: "child CPU pool".into(),
+                        tokens: 2,
+                        want: 4,
+                        held_ms: 3_400,
+                    },
+                ],
             },
             CpuGateJob {
                 checkout: "/w/younger-land".into(),
                 job: 5,
                 held: 1,
-                running: 1,
+                holders: vec![CpuHolder {
+                    pid: None,
+                    command: "child CPU pool".into(),
+                    tokens: 1,
+                    want: 1,
+                    held_ms: 61_000,
+                }],
             },
         ],
         gate_queue: vec![
@@ -500,17 +524,29 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
             },
         ],
         background: vec![
-            CpuCheckoutStatus {
+            CpuBackgroundStake {
                 checkout: "/w/older-land".into(),
                 held: 1,
-                running: 1,
                 waiting: 0,
+                holders: vec![CpuHolder {
+                    pid: Some(9),
+                    command: "bun test".into(),
+                    tokens: 1,
+                    want: 1,
+                    held_ms: 3_725_000,
+                }],
             },
-            CpuCheckoutStatus {
+            CpuBackgroundStake {
                 checkout: "/w/younger-land".into(),
                 held: 3,
-                running: 1,
                 waiting: 0,
+                holders: vec![CpuHolder {
+                    pid: Some(71437),
+                    command: "cargo --frozen test -p app".into(),
+                    tokens: 3,
+                    want: 18,
+                    held_ms: 2_047_999,
+                }],
             },
         ],
     };
@@ -534,13 +570,18 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
         [
             "cowshed: gateway cpu budget: held 17/18 tokens",
             "cowshed: gateway gate head: /w/older-land gate job 3: held 12, running 2",
+            "cowshed: gateway gate lease: /w/older-land gate job 3: pid 101, 10/18 tokens, granted 2m05s ago: nx run-many -t test",
+            "cowshed: gateway gate lease: /w/older-land gate job 3: pid 102, 2/4 tokens, granted 3s ago: child CPU pool",
             "cowshed: gateway gate job behind the head: /w/younger-land gate job 5: held 1, running 1",
+            "cowshed: gateway gate lease: /w/younger-land gate job 5: pid unknown, 1/1 tokens, granted 1m01s ago: child CPU pool",
             "cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them",
             "cowshed: gateway gate queue 1: /w/older-land gate job 3 want 6",
             "cowshed: gateway gate queue 2: /w/older-land gate job 3 want 2",
             "cowshed: gateway gate queue 3: /w/younger-land gate job 5 want 18",
             "cowshed: gateway background: /w/older-land: held 1, running 1, waiting 0",
+            "cowshed: gateway background lease: /w/older-land: pid 9, 1/1 tokens, granted 1h02m05s ago: bun test",
             "cowshed: gateway background: /w/younger-land: held 3, running 1, waiting 0",
+            "cowshed: gateway background lease: /w/younger-land: pid 71437, 3/18 tokens, granted 34m07s ago: cargo --frozen test -p app",
         ],
         "{stderr}"
     );
@@ -565,8 +606,13 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
                 {"checkout": "/w/younger-land", "held": 4, "running": 2, "waiting": 1}
             ],
             "gateJobs": [
-                {"checkout": "/w/older-land", "job": 3, "held": 12, "running": 2},
-                {"checkout": "/w/younger-land", "job": 5, "held": 1, "running": 1}
+                {"checkout": "/w/older-land", "job": 3, "held": 12, "holders": [
+                    {"pid": 101, "command": "nx run-many -t test", "tokens": 10, "want": 18, "heldMs": 125000},
+                    {"pid": 102, "command": "child CPU pool", "tokens": 2, "want": 4, "heldMs": 3400}
+                ]},
+                {"checkout": "/w/younger-land", "job": 5, "held": 1, "holders": [
+                    {"command": "child CPU pool", "tokens": 1, "want": 1, "heldMs": 61000}
+                ]}
             ],
             "gateQueue": [
                 {"checkout": "/w/older-land", "job": 3, "want": 6},
@@ -574,8 +620,12 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
                 {"checkout": "/w/younger-land", "job": 5, "want": 18}
             ],
             "background": [
-                {"checkout": "/w/older-land", "held": 1, "running": 1, "waiting": 0},
-                {"checkout": "/w/younger-land", "held": 3, "running": 1, "waiting": 0}
+                {"checkout": "/w/older-land", "held": 1, "waiting": 0, "holders": [
+                    {"pid": 9, "command": "bun test", "tokens": 1, "want": 1, "heldMs": 3725000}
+                ]},
+                {"checkout": "/w/younger-land", "held": 3, "waiting": 0, "holders": [
+                    {"pid": 71437, "command": "cargo --frozen test -p app", "tokens": 3, "want": 18, "heldMs": 2047999}
+                ]}
             ]
         }})
     );

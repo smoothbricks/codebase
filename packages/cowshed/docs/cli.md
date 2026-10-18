@@ -1238,25 +1238,32 @@ running other bytes is reported with the remedy `cowshed setup`, run from the co
 `status` reports health without starting the service, then the host CPU ledger the daemon serves (05 Gateway, "Host CPU
 budget") in the order it serves it: tokens held of the total; the running gate jobs, the head — the oldest land — first;
 the gate queue in the order returned tokens go to it; then each checkout's background work. A gate job is named by its
-admission number (the smaller is the older land):
+admission number (the smaller is the older land). Each running gate job and background stake is followed by its leases,
+oldest grant first: the client's pid (the socket's peer), its tokens of its want, the age of its grant — the lease's,
+not the process's; `ps -p <pid>` gives that — and the command it named:
 
 ```
 $ cowshed gateway status
 cowshed: gateway is healthy: launchd loaded; control socket answers at /private/cowshed/store/gateway.sock
 cowshed: gateway versions: cli 0.1.0; daemon 0.1.0
 cowshed: gateway cpu budget: held 18/18 tokens
-cowshed: gateway gate head: /Users/me/Dev/app gate job 4: held 15, running 4
+cowshed: gateway gate head: /Users/me/Dev/app gate job 4: held 15, running 2
+cowshed: gateway gate lease: /Users/me/Dev/app gate job 4: pid 4120, 1/1 tokens, granted 12m30s ago: nx run-many -t gate
+cowshed: gateway gate lease: /Users/me/Dev/app gate job 4: pid 4388, 14/18 tokens, granted 2m05s ago: child CPU pool
 cowshed: gateway gate job behind the head: /Users/me/Dev/lib gate job 9: held 1, running 1
+cowshed: gateway gate lease: /Users/me/Dev/lib gate job 9: pid 5012, 1/1 tokens, granted 40s ago: nx run-many -t gate
 cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them
 cowshed: gateway gate queue 1: /Users/me/Dev/app gate job 4 want 6
 cowshed: gateway gate queue 2: /Users/me/Dev/app gate job 4 want 2
 cowshed: gateway gate queue 3: /Users/me/Dev/lib gate job 9 want 18
 cowshed: gateway background: /Users/me/Dev/app: held 2, running 1, waiting 0
+cowshed: gateway background lease: /Users/me/Dev/app: pid 3977, 2/18 tokens, granted 34m07s ago: cargo --frozen test -p app
 ```
 
 A daemon that answers but does not know `cpu-budget` (one from before it) is reported as not answering it, never as an
 idle host. Its JSON result is the standard frozen envelope, with the ledger verbatim under `cpuBudget.ledger`, or the
-reason under `cpuBudget.unanswered`; `cpuBudget` is absent when no daemon answers:
+reason under `cpuBudget.unanswered`; `cpuBudget` is absent when no daemon answers. A lease whose socket named no peer
+has no `pid`:
 
 ```json
 {
@@ -1273,19 +1280,41 @@ reason under `cpuBudget.unanswered`; `cpuBudget` is absent when no daemon answer
         "total": 18,
         "held": 18,
         "checkouts": [
-          { "checkout": "/Users/me/Dev/app", "held": 17, "running": 5, "waiting": 2 },
+          { "checkout": "/Users/me/Dev/app", "held": 17, "running": 3, "waiting": 2 },
           { "checkout": "/Users/me/Dev/lib", "held": 1, "running": 1, "waiting": 1 }
         ],
         "gateJobs": [
-          { "checkout": "/Users/me/Dev/app", "job": 4, "held": 15, "running": 4 },
-          { "checkout": "/Users/me/Dev/lib", "job": 9, "held": 1, "running": 1 }
+          {
+            "checkout": "/Users/me/Dev/app",
+            "job": 4,
+            "held": 15,
+            "holders": [
+              { "pid": 4120, "command": "nx run-many -t gate", "tokens": 1, "want": 1, "heldMs": 750000 },
+              { "pid": 4388, "command": "child CPU pool", "tokens": 14, "want": 18, "heldMs": 125000 }
+            ]
+          },
+          {
+            "checkout": "/Users/me/Dev/lib",
+            "job": 9,
+            "held": 1,
+            "holders": [{ "pid": 5012, "command": "nx run-many -t gate", "tokens": 1, "want": 1, "heldMs": 40000 }]
+          }
         ],
         "gateQueue": [
           { "checkout": "/Users/me/Dev/app", "job": 4, "want": 6 },
           { "checkout": "/Users/me/Dev/app", "job": 4, "want": 2 },
           { "checkout": "/Users/me/Dev/lib", "job": 9, "want": 18 }
         ],
-        "background": [{ "checkout": "/Users/me/Dev/app", "held": 2, "running": 1, "waiting": 0 }]
+        "background": [
+          {
+            "checkout": "/Users/me/Dev/app",
+            "held": 2,
+            "waiting": 0,
+            "holders": [
+              { "pid": 3977, "command": "cargo --frozen test -p app", "tokens": 2, "want": 18, "heldMs": 2047000 }
+            ]
+          }
+        ]
       }
     }
   }
