@@ -186,10 +186,6 @@ pub enum CpuAdmissionRefusal {
         code: String,
         error: String,
     },
-    GateAdmissionTimeout {
-        wait_ms: u64,
-        cpu_budget: cowshed_gateway_types::CpuBudgetStatus,
-    },
     Protocol {
         detail: String,
     },
@@ -231,7 +227,6 @@ pub enum AdmissionField {
     StderrCopy,
     Class,
     Want,
-    WaitMs,
     Scope,
 }
 
@@ -249,7 +244,6 @@ impl AdmissionField {
             Self::StderrCopy => "stderrCopy",
             Self::Class => "class",
             Self::Want => "want",
-            Self::WaitMs => "waitMs",
             Self::Scope => "scope",
         }
     }
@@ -412,10 +406,9 @@ impl CowshedError {
                 format!("class-not-permitted: worker exec cannot request {class:?} / {scope:?}"),
                 "use the trusted coordinator/operator gate path; workers admit only background workspace work",
             ),
-            CpuAdmissionRefusal::InvalidRequest { detail } => Self::usage(
-                detail,
-                "gate requires positive waitMs; background has no admission deadline; HostGate requires Gate",
-            ),
+            CpuAdmissionRefusal::InvalidRequest { detail } => {
+                Self::usage(detail, "the host gate scope requires the gate class")
+            }
             CpuAdmissionRefusal::GatewayUnavailable { socket, error } => Self::environment_missing(
                 format!(
                     "jobserver admission at {} is unavailable: {error}",
@@ -426,25 +419,6 @@ impl CowshedError {
             CpuAdmissionRefusal::GatewayRefused { code, error } => Self::environment_missing(
                 format!("jobserver admission refused ({code}): {error}"),
                 "inspect cowshed gateway status and use the matching installed build",
-            ),
-            CpuAdmissionRefusal::GateAdmissionTimeout {
-                wait_ms,
-                cpu_budget,
-            } => Self::conflict(
-                format!(
-                    "gate-admission-timeout after {wait_ms} ms; live checkout holders: {}",
-                    cpu_budget
-                        .checkouts
-                        .iter()
-                        .filter(|checkout| checkout.held > 0)
-                        .map(|checkout| format!(
-                            "{}: {} tokens in {} running grant(s)",
-                            checkout.checkout, checkout.held, checkout.running
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ),
-                "let the named in-flight grants finish or cancel your own work; the gate never freezes background tests",
             ),
             CpuAdmissionRefusal::Protocol { detail } => Self::environment_missing(
                 format!("jobserver admission protocol failed: {detail}"),

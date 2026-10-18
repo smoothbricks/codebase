@@ -5,7 +5,7 @@
 use cowshed_os::fork_lock::Fenced;
 use std::fmt;
 use std::future::Future;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,7 +26,6 @@ use crate::repository::RepoId;
 pub struct JobCpuAsk {
     pub class: JobserverClass,
     pub want: NonZeroUsize,
-    pub wait_ms: Option<NonZeroU32>,
     pub checkout: PathBuf,
     pub command: String,
     pub job: (RepoId, WorkspaceIncarnation, JobId),
@@ -116,17 +115,6 @@ async fn answer(reader: &mut BufReader<Fenced<UnixStream>>) -> Result<JobserverA
 }
 
 fn refused(answer: JobserverAnswer) -> CowshedError {
-    if answer.code.as_deref() == Some("gate-admission-timeout") {
-        if let (Some(wait_ms), Some(cpu_budget)) = (answer.wait_ms, answer.cpu_budget) {
-            return CowshedError::cpu_admission(CpuAdmissionRefusal::GateAdmissionTimeout {
-                wait_ms,
-                cpu_budget,
-            });
-        }
-        return CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-            detail: "gate-admission-timeout omitted its actual wait or holder snapshot".to_owned(),
-        });
-    }
     CowshedError::cpu_admission(CpuAdmissionRefusal::GatewayRefused {
         code: answer.code.unwrap_or_else(|| "refused".to_owned()),
         error: answer
@@ -139,10 +127,6 @@ impl JobCpuAdmission for GatewayJobCpu {
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
         let socket = Arc::clone(&self.socket);
         Box::pin(async move {
-            if (ask.class == JobserverClass::Gate) != ask.wait_ms.is_some() {
-                return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::InvalidRequest {
-                    detail: "a gate requires positive waitMs; a background request has no admission deadline".to_owned() }));
-            }
             let mut connect = std::pin::pin!(UnixStream::connect(socket.as_path()));
             // Darwin creates a socket then sets CLOEXEC. Fence each poll, never an async wait,
             // so no concurrently spawned child can keep this lease descriptor beyond exec.
@@ -169,14 +153,11 @@ impl JobCpuAdmission for GatewayJobCpu {
                 workspace_incarnation: ask.job.1.as_str(),
                 job_id: NonZeroU64::new(ask.job.2.get()).expect("a validated JobId is nonzero"),
             };
-            let request = match (ask.class, ask.wait_ms) {
-                (JobserverClass::Background, None) => {
+            let request = match ask.class {
+                JobserverClass::Background => {
                     JobserverRequest::background(ask.want, &checkout, command, job)
                 }
-                (JobserverClass::Gate, Some(wait_ms)) => {
-                    JobserverRequest::gate(ask.want, &checkout, command, wait_ms, job)
-                }
-                _ => unreachable!("scheduling was validated before connection"),
+                JobserverClass::Gate => JobserverRequest::gate(ask.want, &checkout, command, job),
             };
             let mut frame = serde_json::to_vec(&request).map_err(|error| {
                 CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {

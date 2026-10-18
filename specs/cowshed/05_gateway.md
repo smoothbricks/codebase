@@ -709,18 +709,18 @@ core count.
   background churn, but no fixed latency is promised while every token is genuinely held. Gate priority promises
   admission order, not a fixed test duration. The supervisor's separate nice placement below lowers background
   scheduling weight without raising a gate above default.
-- **A gate wait is bounded and diagnosed.** A gate jobserver request must name an explicit positive uint32 `waitMs`. The
-  trusted operator request `cowshed exec <workspace> --class gate --host --want N [--wait-ms N] -- COMMAND [ARGS...]`
-  defaults its gate wait to **120000 ms**; the explicit per-invocation `--wait-ms` overrides that admission bound only.
-  It sends `{"op":"jobserver","class":"gate","waitMs":120000,"want":<n>,"checkout":"<root>","command":"…"}`. The wait
-  ends at the returned-token grant, never deliberately at the bound. Expiry answers
-  `{"ok":false,"code":"gate-admission-timeout","error":"…","waitMs":<actual wait>,"cpuBudget":{…}}`: the error names the
-  actual wait and current checkout holders, with each held count and running-grant count; `cpuBudget` is the live ledger
-  snapshot. The timed-out request leaves the queue. Unknown classes, a missing/zero gate bound, or a background bound
-  are invalid requests. Ordinary builds keep **no admission deadline**. Running task wall/idle bounds still start at
+- **No admission deadline, for any class** (Danny tg#6679, tg#6693). A gate is the highest-priority work there is, so it
+  is never failed for waiting in the order that serves it: a gate jobserver request, like a background one, waits until
+  it is granted or its client closes the connection, which leaves the queue. The operator request is
+  `cowshed exec <workspace> --class gate --host --want N -- COMMAND [ARGS...]`, and it sends
+  `{"op":"jobserver","class":"gate","want":<n>,"checkout":"<root>","command":"…"}`. A waiting request holds nothing, so
+  its wait costs nobody; who holds the host while it waits is the live `cpu-budget` ledger below, not a refusal.
+  Measured with the 120000 ms bound this replaced: a younger land's gate was refused after 120003 ms while an older land
+  held 13 of 18 tokens, killing the land for waiting in the very order the ledger serves. An unknown class is an invalid
+  request, and so is a `waitMs` field: it is no longer part of the request. Running task wall/idle bounds still start at
   their grant.
 - **The task server owns the live grant and nice.** Work enters the existing `cowshed exec` / workspace supervisor, not
-  a gate-host or taskpolicy wrapper. Its typed request carries class, want, waitMs and scope. Only a trusted
+  a gate-host or taskpolicy wrapper. Its typed request carries class, want and scope. Only a trusted
   coordinator/operator may request Gate or HostGate; a worker request is refused with typed class-not-permitted before
   job or spawn effects. Ordinary commands default Background, want1 and Workspace scope; producers that need parallel
   work supply their actual demand. The supervisor records Queued, asks the gateway off its actor path and spawns only
@@ -762,7 +762,7 @@ core count.
   back to normal. A band change is a live transition on the job's retained process identities (the Darwin and Linux
   placements of "Bands"); one that cannot cover a forked tree whole reports `IncompleteCoverage` and claims no
   transition. Bands never admit, queue or size a job — the token ledger alone does that. Demotion does not reclaim
-  tokens from a live background test grant: bounded gate admission above, not an OS band, diagnoses that wait. An idle
+  tokens from a live background test grant: the token ledger's gate order, not an OS band, serves that wait. An idle
   host leaves every band's work at full speed.
 - **Crash safety by connection.** The grant is tied to the connection: on exit, `SIGKILL` included, the kernel closes
   the socket and the gateway returns the tokens at once. A request that closes while queued leaves the queue. A gateway
@@ -794,8 +794,8 @@ core count.
   operation, malformed protocol and premature close all fail with their actual reason. Only a positively nonmanaged
   host/CI checkout may run unbudgeted only when NotFound proves gateway absence. ConnectionRefused can come from a live
   saturated listener, so it and every other connect error refuse. A connected refusal or protocol error is never
-  absence, in any checkout. Noncompiling discovery and inherited grants keep their existing precedence. An ordinary
-  grant has no deadline; a gate's positive waitMs remains bounded.
+  absence, in any checkout. Noncompiling discovery and inherited grants keep their existing precedence. No grant, gate
+  or background, has an admission deadline.
 - **Spans.** The executor prints
   `cowshed: cpu-tokens wait done elapsed=<ms>ms status=ok tokens=<g>/<want> runner=<kind>` before the command's own
   output (`status=err … runs unbudgeted: <reason>` without a grant), so a slow or failing task says how long it waited

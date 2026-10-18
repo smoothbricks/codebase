@@ -4879,10 +4879,6 @@ impl SupervisorActor {
             (AdmissionField::Scope, scheduling.scope() != request.scope),
             (AdmissionField::Class, scheduling.class() != request.class),
             (AdmissionField::Want, scheduling.want() != request.want),
-            (
-                AdmissionField::WaitMs,
-                scheduling.wait_ms() != request.wait_ms,
-            ),
         ]
         .into_iter()
         .filter_map(|(field, differs)| differs.then_some(field))
@@ -4921,16 +4917,13 @@ impl SupervisorActor {
         // The host boundary takes no session overlay a worker controls. Environment names do
         // not restrict execution; the public-name projection is applied only when recording.
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
-        let scheduling =
-            JobScheduling::new(request.scope, request.class, request.want, request.wait_ms)
-                .ok_or_else(|| {
-                    CowshedError::usage(
-                        "a gate names its admission bound (waitMs), background names none, and \
-                         only a gate runs at the host boundary",
-                        "pass --wait-ms only with --class gate, and the host-gate scope only for a \
-                         gate",
-                    )
-                })?;
+        let scheduling = JobScheduling::new(request.scope, request.class, request.want)
+            .ok_or_else(|| {
+                CowshedError::usage(
+                    "the host-gate scope requires the gate class",
+                    "pass --class gate with the host-gate scope",
+                )
+            })?;
         // The host boundary has no sandbox to narrow and no exec host to interpret a script.
         if scheduling.scope() == ExecScope::HostGate {
             if matches!(request.command, ExecCommand::Script(_)) {
@@ -5042,7 +5035,6 @@ impl SupervisorActor {
             admission_key: _,
             class: _,
             want: _,
-            wait_ms: _,
             scope: _,
         } = request;
         command.validate().map_err(|error| {
@@ -5205,7 +5197,6 @@ impl SupervisorActor {
             let ask = self.cpu.admit(JobCpuAsk {
                 class: scheduling.class(),
                 want: scheduling.want(),
-                wait_ms: scheduling.wait_ms(),
                 checkout: self.workspace_root.clone(),
                 command: command_label(&info.command),
                 job: (

@@ -247,7 +247,6 @@ export type CoordinatorExecArguments = Pick<
   | 'admissionKey'
   | 'class'
   | 'want'
-  | 'waitMs'
   | 'scope'
 >;
 
@@ -941,7 +940,6 @@ export type WorkerExecArguments = Pick<
   | 'admissionKey'
   | 'class'
   | 'want'
-  | 'waitMs'
   | 'scope'
 >;
 

@@ -111,11 +111,11 @@ struct Asker {
 }
 
 impl Asker {
-    async fn jobserver(socket: &Path, want: usize, checkout: &str, wait_ms: u32) -> Self {
+    async fn jobserver(socket: &Path, want: usize, checkout: &str) -> Self {
         let stream = UnixStream::connect(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
         let request = serde_json::json!({ "op": "jobserver", "want": want, "checkout": checkout,
-            "command": "land gate", "class": "gate", "waitMs": wait_ms });
+            "command": "land gate", "class": "gate" });
         writer
             .write_all(format!("{request}\n").as_bytes())
             .await
@@ -134,7 +134,7 @@ impl Asker {
         let stream = UnixStream::connect(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
         let request = serde_json::json!({ "op": "jobserver", "want": 1, "checkout": checkout,
-            "command": "nx run-many -t gate", "class": "gate", "waitMs": 120_000, "pool": true,
+            "command": "nx run-many -t gate", "class": "gate", "pool": true,
             "job": { "repoId": "owner/repo", "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
                 "jobId": 1 } });
         writer
@@ -375,7 +375,7 @@ async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background
     let mut holder = Asker::ask(&socket, 4, "/w/background").await;
     assert_eq!(holder.granted(Duration::from_secs(10)).await, Some(4));
     let mut old_background = Asker::ask(&socket, 4, "/w/same").await;
-    let mut gate = Asker::jobserver(&socket, 4, "/w/same", 120_000).await;
+    let mut gate = Asker::jobserver(&socket, 4, "/w/same").await;
     assert_eq!(gate.granted(Duration::from_millis(50)).await, None);
     assert_eq!(
         ledger(&socket)
@@ -405,11 +405,11 @@ async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_running_gate_holds_up_neither_background_nor_a_later_gate_while_tokens_are_free() {
     let (gateway, root, socket) = gateway(8).await;
-    let mut gate = Asker::jobserver(&socket, 4, "/w/gate", 120_000).await;
+    let mut gate = Asker::jobserver(&socket, 4, "/w/gate").await;
     assert_eq!(gate.granted(Duration::from_secs(10)).await, Some(4));
     let mut background = Asker::ask(&socket, 1, "/w/background").await;
     assert_eq!(background.granted(Duration::from_secs(10)).await, Some(1));
-    let mut next_gate = Asker::jobserver(&socket, 2, "/w/next-gate", 120_000).await;
+    let mut next_gate = Asker::jobserver(&socket, 2, "/w/next-gate").await;
     assert_eq!(next_gate.granted(Duration::from_secs(10)).await, Some(2));
     assert_eq!(ledger(&socket).await.held, 7);
     drop((gate, background, next_gate));
@@ -492,43 +492,39 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// The measured failure, over the socket: an older land's gate job holds most of the host with
+/// more of its tasks queued, background holds the rest (one token in the younger land's own
+/// checkout), and a younger land's gate job asks for its orchestrator's token. It is served at the
+/// first returned token, on its floor, ahead of the older land's queued task, and no admission
+/// bound ever refuses it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_bounded_gate_timeout_names_unchanged_live_holders_and_leaves_no_queue_barrier() {
-    let (gateway, root, socket) = gateway(4).await;
-    let mut holder = Asker::ask(&socket, 4, "/w/live-test").await;
-    assert_eq!(holder.granted(Duration::from_secs(10)).await, Some(4));
-    let mut background = Asker::ask(&socket, 4, "/w/after-timeout").await;
-    let asked = std::time::Instant::now();
-    let mut gate = Asker::jobserver(&socket, 4, "/w/gate", 60).await;
-    let refusal = tokio::time::timeout(Duration::from_secs(10), gate.answer())
-        .await
-        .expect("bounded refusal");
-    assert_eq!(refusal["ok"], false, "{refusal}");
-    assert_eq!(refusal["code"], "gate-admission-timeout", "{refusal}");
-    assert!(
-        refusal["error"]
-            .as_str()
-            .unwrap()
-            .contains("/w/live-test: 4 tokens"),
-        "{refusal}"
-    );
-    assert!(asked.elapsed() >= Duration::from_millis(60));
-    assert_eq!(refusal["cpuBudget"]["held"], 4);
-    assert_eq!(ledger(&socket).await.held, 4);
-    drop((gate, holder));
-    assert_eq!(background.granted(Duration::from_secs(10)).await, Some(4));
-    drop(background);
+async fn a_younger_land_is_served_its_floor_while_an_older_land_holds_most_of_the_host() {
+    let (gateway, root, socket) = gateway(8).await;
+    let (older, older_pool) = Asker::gate_job(&socket, "/w/older").await;
+    let mut older_task = Asker::child(&older_pool, 5).await;
+    assert_eq!(older_task.granted(Duration::from_secs(10)).await, Some(5));
+    let mut own = Asker::ask(&socket, 1, "/w/younger").await;
+    assert_eq!(own.granted(Duration::from_secs(10)).await, Some(1));
+    let mut other = Asker::ask(&socket, 1, "/w/other").await;
+    assert_eq!(other.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(ledger(&socket).await.held, 8);
+    let mut older_next = Asker::child(&older_pool, 5).await;
+    let mut younger = Asker::jobserver(&socket, 1, "/w/younger").await;
+    assert_eq!(younger.granted(Duration::from_millis(50)).await, None);
+    drop(older_task);
+    assert_eq!(younger.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(older_next.granted(Duration::from_secs(10)).await, Some(4));
+    drop((older, older_next, own, other, younger));
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn jobserver_class_and_gate_bounds_are_validated_without_changing_ordinary_requests() {
+async fn jobserver_class_is_validated_and_a_wait_bound_is_an_unknown_field() {
     let (gateway, root, socket) = gateway(4).await;
     for fields in [
-        serde_json::json!({"class":"gate"}),
-        serde_json::json!({"class":"gate","waitMs":0}),
-        serde_json::json!({"class":"pretend-gate","waitMs":100}),
+        serde_json::json!({"class":"pretend-gate"}),
+        serde_json::json!({"class":"gate","waitMs":120_000}),
         serde_json::json!({"class":"background","waitMs":100}),
     ] {
         let mut request = serde_json::json!({"op":"jobserver","want":4,"checkout":"/w/refused","command":"cargo test"});

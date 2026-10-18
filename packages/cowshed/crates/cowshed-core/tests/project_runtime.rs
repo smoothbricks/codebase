@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1315,7 +1315,6 @@ impl ProjectRuntimeHost for FakeHost {
             source,
             class: request.class,
             want: request.want,
-            wait_ms: request.wait_ms,
             scope: request.scope,
         });
         if let Some(supervisor) = self.supervisors.get(&workspace) {
@@ -1804,7 +1803,6 @@ struct Admitted {
     source: AdmissionSource,
     class: JobserverClass,
     want: NonZeroUsize,
-    wait_ms: Option<NonZeroU32>,
     scope: ExecScope,
 }
 
@@ -1869,8 +1867,8 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
         workspace: WorkspaceName::new("main").expect("main"),
         workspace_incarnation: serde_json::from_value(incarnation.clone()).expect("incarnation"),
     };
-    let gate = json!({"class": "gate", "waitMs": 120_000, "want": 8});
-    let host_gate = json!({"class": "gate", "waitMs": 120_000, "want": 8, "scope": "hostGate"});
+    let gate = json!({"class": "gate", "want": 8});
+    let host_gate = json!({"class": "gate", "want": 8, "scope": "hostGate"});
     let host_only = json!({"scope": "hostGate"});
 
     for authority in [worker.clone(), coordinator(repo.clone())] {
@@ -1921,7 +1919,6 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
         .expect("a worker admits a heavy ordinary runner"),
         json!(1)
     );
-    let bound = NonZeroU32::new(120_000);
     let eight = NonZeroUsize::new(8).unwrap();
     assert_eq!(
         *admitted.lock().unwrap(),
@@ -1930,21 +1927,18 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
                 source: AdmissionSource::Coordinator,
                 class: JobserverClass::Gate,
                 want: eight,
-                wait_ms: bound,
                 scope: ExecScope::Workspace,
             },
             Admitted {
                 source: AdmissionSource::Coordinator,
                 class: JobserverClass::Gate,
                 want: eight,
-                wait_ms: bound,
                 scope: ExecScope::HostGate,
             },
             Admitted {
                 source: AdmissionSource::Worker,
                 class: JobserverClass::Background,
                 want: NonZeroUsize::new(4).unwrap(),
-                wait_ms: None,
                 scope: ExecScope::Workspace,
             },
         ]
@@ -1958,7 +1952,7 @@ async fn router_confines_a_host_gate_session_without_restricting_environment_nam
     let (_runtime, router, repo, mut events, admitted, incarnation) =
         start_recording_admissions(&root).await;
     let gate = |extra: Value| {
-        let mut ask = json!({"class": "gate", "waitMs": 120_000, "scope": "hostGate"});
+        let mut ask = json!({"class": "gate", "scope": "hostGate"});
         ask.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
@@ -2034,19 +2028,14 @@ async fn a_worker_connection_cannot_call_the_coordinator_exec_route() {
 }
 
 /// A scheduling the gateway cannot accept is an invalid request even under coordinator
-/// authority — a gate with no bound, background with one, the host gate as background — and a
-/// worker asking for the gate meets the authority refusal first, whatever else it got wrong.
+/// authority — the host gate as background — and a worker asking for the gate meets the authority
+/// refusal first, whatever else it got wrong.
 #[tokio::test]
 async fn router_refuses_an_unpaired_scheduling_before_admission() {
     let root = test_root();
     let (_runtime, router, repo, mut events, admitted, incarnation) =
         start_recording_admissions(&root).await;
-    for ask in [
-        json!({"class": "gate"}),
-        json!({"waitMs": 1}),
-        json!({"scope": "hostGate"}),
-        json!({"waitMs": 1, "scope": "hostGate"}),
-    ] {
+    for ask in [json!({"scope": "hostGate"})] {
         let error = route(
             &router,
             coordinator(repo.clone()),
@@ -2413,7 +2402,6 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
             command: ExecCommand::Argv(vec![CommandArg::from("build")]),
             class: JobserverClass::Background,
             want: NonZeroUsize::MIN,
-            wait_ms: None,
             scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
@@ -2741,7 +2729,6 @@ async fn exec_in(
             command,
             class: JobserverClass::Background,
             want: NonZeroUsize::MIN,
-            wait_ms: None,
             scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
@@ -2824,7 +2811,6 @@ async fn a_keyed_lookup_reaches_one_job_or_proven_absence_over_the_controller() 
         command: ExecCommand::Argv(vec![CommandArg::from("build")]),
         class: JobserverClass::Background,
         want: NonZeroUsize::MIN,
-        wait_ms: None,
         scope: ExecScope::Workspace,
         cwd: None,
         mode: RunSandboxMode::ReadWrite,
@@ -4165,7 +4151,6 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
         ),
         class: JobserverClass::Background,
         want: NonZeroUsize::MIN,
-        wait_ms: None,
         scope: ExecScope::Workspace,
         cwd: None,
         mode: RunSandboxMode::ReadWrite,
@@ -4567,7 +4552,6 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
             ),
             class: JobserverClass::Background,
             want: NonZeroUsize::MIN,
-            wait_ms: None,
             scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
@@ -4728,7 +4712,6 @@ async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
             ),
             class: JobserverClass::Background,
             want: NonZeroUsize::MIN,
-            wait_ms: None,
             scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,
@@ -4987,7 +4970,6 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
             command: ExecCommand::Argv(vec![CommandArg::from("cat")]),
             class: JobserverClass::Background,
             want: NonZeroUsize::MIN,
-            wait_ms: None,
             scope: ExecScope::Workspace,
             cwd: None,
             mode: RunSandboxMode::ReadWrite,

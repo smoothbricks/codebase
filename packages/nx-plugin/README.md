@@ -1375,16 +1375,15 @@ The absent-parent fixture uses the executor's injectable budget with a real, con
 proves a positive allocation and re-acquires it after the command ends, rather than depending on free tokens in the
 host-wide gateway while the test runner itself holds an allocation. A bare count or unbudgeted success is not proof. A
 land gate (`tooling/land-host.sh`) enters the existing task server with
-`cowshed exec <workspace> --class gate --host [--want N] [--wait-ms N] -- COMMAND [ARGS...]` after daemon-stop. It
-requires a real gateway jobserver `class: "gate"` grant for its own orchestrator; its live pool lends nothing of its own
-and relays every child's ask to the host as a gate-class request, so each task the gate starts is served FIFO ahead of
-every other exec's queued work. No environment-only class or unbudgeted fallback is accepted. The default **120000 ms**
-admission wait is explicitly overridable per invocation. Running background tests/FIFOs are never shrunk, frozen or
-killed to manufacture tokens. An expired wait returns `gate-admission-timeout` naming the wait and current checkout
-holders; it changes no task wall/idle bound. Requested/granted count and actual queue wait are logged, and a child's
-nonzero exit is preserved exactly. Compiling Cargo under the live pool takes a local allocation and receives its own
-private child pool, so grandchildren never compete with their occupied ancestor. See `specs/cowshed/05_gateway.md`,
-"Gate admission: FIFO ahead of background, never starving it", for the guarantee and its deliberate limits.
+`cowshed exec <workspace> --class gate --host [--want N] -- COMMAND [ARGS...]` after daemon-stop. It requires a real
+gateway jobserver `class: "gate"` grant for its own orchestrator; its live pool lends nothing of its own and relays
+every child's ask to the host as a gate-class request, so each task the gate starts is served FIFO ahead of every other
+exec's queued work. No environment-only class or unbudgeted fallback is accepted. The gate waits for its grant with no
+deadline, ahead of queued background work. Running background tests/FIFOs are never shrunk, frozen or killed to
+manufacture tokens. Requested/granted count and actual queue wait are logged, and a child's nonzero exit is preserved
+exactly. Compiling Cargo under the live pool takes a local allocation and receives its own private child pool, so
+grandchildren never compete with their occupied ancestor. See `specs/cowshed/05_gateway.md`, "Gate admission: FIFO ahead
+of background, never starving it", for the guarantee and its deliberate limits.
 
 Every `bounded-exec` task records why it ended in `.nx/workspace-data/bounded-exec/<task>/verdict.json`, keyed by the
 task id and the hash it ran at:

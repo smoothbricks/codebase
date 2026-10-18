@@ -6265,7 +6265,6 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
             admission_key: None,
             class: cowshed_core::api::JobserverClass::Background,
             want: std::num::NonZeroUsize::MIN,
-            wait_ms: None,
             scope: cowshed_core::api::ExecScope::Workspace,
         })
         .await

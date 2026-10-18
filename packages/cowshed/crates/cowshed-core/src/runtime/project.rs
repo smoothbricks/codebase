@@ -2205,13 +2205,11 @@ fn exec_request(
     upload: Option<Bytes>,
 ) -> Result<(WorkerScope, Option<String>, ExecRequest)> {
     let command = exec_command(params.argv, params.script)?;
-    crate::api::dto::validate_scheduling(params.class, params.wait_ms, params.scope).map_err(
-        |error| {
-            CowshedError::cpu_admission(CpuAdmissionRefusal::InvalidRequest {
-                detail: error.to_string(),
-            })
-        },
-    )?;
+    crate::api::dto::validate_scheduling(params.class, params.scope).map_err(|error| {
+        CowshedError::cpu_admission(CpuAdmissionRefusal::InvalidRequest {
+            detail: error.to_string(),
+        })
+    })?;
     crate::api::dto::validate_host_gate_request(params.scope, params.session.is_some())?;
     let stdin = match params.stdin {
         ExecStdin::Empty => {
@@ -2280,7 +2278,6 @@ fn exec_request(
             admission_key: params.admission_key,
             class: params.class,
             want: params.want,
-            wait_ms: params.wait_ms,
             scope: params.scope,
         },
     ))
@@ -5009,7 +5006,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 admission_key: None,
                 class: cowshed_gateway_types::JobserverClass::Background,
                 want: std::num::NonZeroUsize::MIN,
-                wait_ms: None,
                 scope: crate::api::dto::ExecScope::Workspace,
             };
             let job = handle
@@ -15181,7 +15177,6 @@ mod removal_supervisor_tests {
                     admission_key: None,
                     class: cowshed_gateway_types::JobserverClass::Background,
                     want: std::num::NonZeroUsize::MIN,
-                    wait_ms: None,
                     scope: crate::api::dto::ExecScope::Workspace,
                 },
                 super::super::supervisor_socket::AdmissionSource::Worker,
@@ -15979,7 +15974,6 @@ fn land_check_request(check: &str) -> ExecRequest {
         admission_key: None,
         class: crate::api::dto::JobserverClass::Background,
         want: NonZeroUsize::MIN,
-        wait_ms: None,
         scope: crate::api::dto::ExecScope::Workspace,
     }
 }
@@ -16224,7 +16218,6 @@ fn nx_probe_request(mount: &Path, root: &Path, script: bytes::Bytes) -> Result<E
         admission_key: None,
         class: crate::api::dto::JobserverClass::Background,
         want: NonZeroUsize::MIN,
-        wait_ms: None,
         scope: crate::api::dto::ExecScope::Workspace,
     })
 }

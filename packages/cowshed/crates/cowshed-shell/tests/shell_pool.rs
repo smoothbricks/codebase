@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -254,7 +254,6 @@ fn request(argv: &[&str]) -> ExecRequest {
         admission_key: None,
         class: JobserverClass::Background,
         want: NonZeroUsize::MIN,
-        wait_ms: None,
         scope: ExecScope::Workspace,
     }
 }
@@ -262,7 +261,6 @@ fn request(argv: &[&str]) -> ExecRequest {
 fn gate(request: ExecRequest) -> ExecRequest {
     ExecRequest {
         class: JobserverClass::Gate,
-        wait_ms: NonZeroU32::new(120_000),
         ..request
     }
 }

@@ -2239,7 +2239,6 @@ pub(crate) fn exec_command<R: AsyncRead + Send + 'static>(
             admission_key: None,
             class: args.class,
             want: args.want,
-            wait_ms: args.wait_ms,
             scope: args.scope,
         },
         session: args.session,
@@ -5515,7 +5514,6 @@ mod tests {
                     admission_key: None,
                     class: cowshed_core::api::JobserverClass::Background,
                     want: std::num::NonZeroUsize::MIN,
-                    wait_ms: None,
                     scope: cowshed_core::api::ExecScope::Workspace,
                 })
                 .await

@@ -111,9 +111,10 @@ export interface Coordinator {
   doctor(): Promise<Api.DoctorReport>;
   worker(workspace: string): Promise<WorkspaceHandle>;
   /**
-   * Admits one job under coordinator authority: the only route that may ask for the gate class (with its bounded
-   * waitMs) or the host-gate scope. The worker capability supplies only the workspace incarnation the job is fenced
-   * to; a worker's own exec never admits a gate and is refused with the typed class-not-permitted error.
+   * Admits one job under coordinator authority: the only route that may ask for the gate class (a gate waits for its
+   * grant with no deadline, ahead of queued background work) or the host-gate scope. The worker capability supplies only
+   * the workspace incarnation the job is fenced to; a worker's own exec never admits a gate and is refused with the typed
+   * class-not-permitted error.
    */
   exec(worker: WorkspaceHandle, request: ExecRequest): Promise<JobHandle>;
 }

@@ -4,7 +4,7 @@ use cowshed_os::fork_lock::Run as _;
 use serde_json::json;
 use std::ffi::OsString;
 use std::fs;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
@@ -1642,35 +1642,20 @@ fn sealed_job_and_cpu_failures_keep_their_exact_wire_spellings() {
     );
 }
 
-/// The pairings an exec's scheduling may carry: a gate names a positive bound, background names
-/// none, and the host gate is a gate.
+/// The pairings an exec's scheduling may carry: the host gate is a gate, and every other pairing
+/// is valid.
 #[test]
-fn exec_scheduling_pairs_class_bound_and_scope() {
-    let bound = NonZeroU32::new(120_000);
-    for (class, wait_ms, scope, valid) in [
-        (JobserverClass::Background, None, ExecScope::Workspace, true),
-        (JobserverClass::Gate, bound, ExecScope::Workspace, true),
-        (JobserverClass::Gate, bound, ExecScope::HostGate, true),
-        (JobserverClass::Gate, None, ExecScope::Workspace, false),
-        (JobserverClass::Gate, None, ExecScope::HostGate, false),
-        (
-            JobserverClass::Background,
-            bound,
-            ExecScope::Workspace,
-            false,
-        ),
-        (JobserverClass::Background, None, ExecScope::HostGate, false),
-        (
-            JobserverClass::Background,
-            bound,
-            ExecScope::HostGate,
-            false,
-        ),
+fn exec_scheduling_pairs_class_and_scope() {
+    for (class, scope, valid) in [
+        (JobserverClass::Background, ExecScope::Workspace, true),
+        (JobserverClass::Gate, ExecScope::Workspace, true),
+        (JobserverClass::Gate, ExecScope::HostGate, true),
+        (JobserverClass::Background, ExecScope::HostGate, false),
     ] {
         assert_eq!(
-            validate_scheduling(class, wait_ms, scope).is_ok(),
+            validate_scheduling(class, scope).is_ok(),
             valid,
-            "{class:?} {wait_ms:?} {scope:?}"
+            "{class:?} {scope:?}"
         );
     }
 }

@@ -759,16 +759,7 @@ mod parity_tests {
             Some(&["worker.exec", "coordinator.exec"]),
         ),
         (
-            &[
-                "exec",
-                "parity",
-                "--class",
-                "gate",
-                "--wait-ms",
-                "60000",
-                "--",
-                "true",
-            ],
+            &["exec", "parity", "--class", "gate", "--", "true"],
             Some(&["worker.exec", "coordinator.exec"]),
         ),
         (

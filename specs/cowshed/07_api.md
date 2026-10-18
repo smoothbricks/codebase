@@ -134,7 +134,6 @@ pub struct ExecRequest {
 
     pub class: JobserverClass,            // Background by default; Gate requires trusted coordinator
     pub want: NonZeroUsize,               // default1; actual command demand, bounded to granted tokens
-    pub wait_ms: Option<NonZeroU32>,       // Some iff Gate; background has no admission deadline
     pub scope: ExecScope,                 // Workspace default; HostGate requires trusted Gate
 }
 
@@ -1802,8 +1801,9 @@ completion, and normalized workspace-relative source where applicable, never inl
 
 `Coordinator::exec(worker, request)` is the trusted `coordinator.exec` upload route; the worker handle supplies only the
 immutable workspace/incarnation fence. Ordinary `worker.exec` admits only Background / Workspace. Requesting Gate or
-HostGate there is typed class-not-permitted before snapshot, record, CPU request or spawn. Scope, class, want and waitMs
-bind keyed admission just like command/env: changing one under the same key is keyConflict, never a new spawn.
+HostGate there is typed class-not-permitted before snapshot, record, CPU request or spawn. Scope, class and want bind
+keyed admission just like command/env: changing one under the same key is keyConflict, never a new spawn. No class has
+an admission deadline (05_gateway.md, "No admission deadline, for any class").
 
 `ExecScope` is Workspace (default) or HostGate. HostGate requires Gate, argv, read-write mode and no session; it runs
 one host one-shot without ExecutedChild or shell activation, never a new wrapper. No worker gains host authority. The
@@ -1830,8 +1830,8 @@ identity because it cannot reach the command. The existing Arrow record proof co
 unrecorded private map is retained to make a repeat work.
 
 JobInfo and SealedJob expose admitted class/scope, actual cpuTokens and observed nice (absent before placement).
-CowshedError carries typed cpuAdmission (including gateAdmissionTimeout with actual waitMs/cpuBudget holder evidence)
-and priority (actual pid, requested/observed nice and errno). A failed or absent observation is never fabricated.
+CowshedError carries typed cpuAdmission (the gateway's refusal, an invalid request or a protocol failure) and priority
+(actual pid, requested/observed nice and errno). A failed or absent observation is never fabricated.
 
 Records now use layout11: layout10's columns remain an exact prefix, followed by nullable Binary admission_env_sha256,
 exactly 32 bytes and present exactly for keyed job records. Earlier histories are retained untouched and set aside, not

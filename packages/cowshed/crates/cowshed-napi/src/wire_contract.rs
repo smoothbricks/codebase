@@ -532,8 +532,8 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ..exited.clone()
     };
 
-    // A job whose host CPU admission failed before its command ran: a gate's bound expired. It
-    // holds no grant and was never observed, and it is the one job that ran as the host gate.
+    // A job whose host CPU admission failed before its command ran: the gateway was unreachable.
+    // It holds no grant and was never observed, and it is the one job that ran as the host gate.
     let cpu_admission_failed = JobInfo {
         job_id: JobId::new(9).expect("fixture job id"),
         state: JobState::Failed,
@@ -541,7 +541,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         pid: None,
         resources: None,
         stdout: inline_stream(""),
-        stderr: inline_stream("gate-admission-timeout: waited 120000 ms\n"),
+        stderr: inline_stream("jobserver admission is unavailable: connection refused\n"),
         failure: Some(cowshed_core::api::JobFailure::CpuAdmission),
         class: JobserverClass::Gate,
         scope: ExecScope::HostGate,

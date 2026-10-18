@@ -436,7 +436,7 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
             .expect("connect the gate job");
         let request = serde_json::json!({ "op": "jobserver", "want": 1,
             "checkout": root.display().to_string(), "command": "nx run-many -t gate",
-            "class": "gate", "waitMs": 120_000, "pool": true,
+            "class": "gate", "pool": true,
             "job": { "repoId": "owner/repo",
                 "workspaceIncarnation": "0123456789abcdef0123456789abcdef", "jobId": 1 } });
         stream
