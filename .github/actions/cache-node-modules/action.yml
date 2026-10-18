@@ -10,9 +10,12 @@ runs:
         # Isolated Bun links and their targets are one dependency tree.
         # ttsc plugin/GOCACHE stay under $TTSC_CACHE_DIR (.cache/ttsc).
         # v2 isolates restore-keys from older Darwin caches with a broken TS dual-package hoist.
+        # The install stamp stays out: workspace members' own node_modules links are not archived,
+        # so a restored tree is a seed and only an install in this checkout may claim it current.
         path: |
           node_modules
           ~/.bun/install/cache/links
+          !node_modules/.smoo-install
         # prettier-ignore
         key: ${{ runner.os }}-${{ runner.arch }}-node-v2-${{ hashFiles('.npmrc', 'bun.lock', 'package.json', 'packages/*/package.json') }}
         restore-keys: |
