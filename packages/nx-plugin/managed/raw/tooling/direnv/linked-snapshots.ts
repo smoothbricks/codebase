@@ -54,9 +54,9 @@
  * has not linked yet is refused, never filled: a refresh discards a real
  * directory at a declared path.
  *
- * Dependency-free except for the probe, which a capture loads from the
- * consumer's installed @smoothbricks/nx-plugin only when it needs one: shell
- * entry imports this before anything is installed.
+ * Dependency-free except for the probe, which a capture loads only when it
+ * needs one, from the @smoothbricks/nx-plugin its caller names (`pluginProbe`):
+ * shell entry imports this before anything is installed.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -171,7 +171,7 @@ export async function snapshotBinding(
   name: string,
   source: string,
   declaration: SnapshotDeclaration,
-  probe: ProducerProbe = installedProbe(root),
+  probe: ProducerProbe,
 ): Promise<SnapshotBinding> {
   try {
     const store = snapshotStore(root);
@@ -206,19 +206,21 @@ function snapshotStore(root: string): string {
 }
 
 /**
- * The consumer's installed nx-plugin probe, loaded when a capture first asks. An installed plugin without the
- * read-only `probeBuilt` is refused before anything is called: its `ensureBuilt` builds, and a capture must never
- * write the provider.
+ * The probe of the @smoothbricks/nx-plugin that `from` resolves, loaded when a capture first asks. A plugin without
+ * the read-only `probeBuilt` is refused before anything is called: its `ensureBuilt` builds, and a capture must never
+ * write the provider. `from` is the plugin the consumer binds, never merely what its last install left: a plain
+ * `bun install` re-points a declared plugin alias at the lockfile's published version before the postinstall that
+ * captures runs (developer-links.ts).
  */
-function installedProbe(root: string): ProducerProbe {
+export function pluginProbe(from: string): ProducerProbe {
   return async (target, providerRoot) => {
     // Dynamic by necessity: this file runs before anything is installed, and only a capture needs the plugin.
-    const specifier = Bun.resolveSync('@smoothbricks/nx-plugin/ensure-built', root);
+    const specifier = Bun.resolveSync('@smoothbricks/nx-plugin/ensure-built', from);
     const plugin: unknown = await import(specifier);
     const probeBuilt = typeof plugin === 'object' && plugin !== null ? Reflect.get(plugin, 'probeBuilt') : undefined;
     if (!isProbeBuilt(probeBuilt)) {
       throw new SnapshotRefusal(
-        `the installed @smoothbricks/nx-plugin (${specifier}) has no read-only probeBuilt, so ${target} cannot be vouched for without building it; install a plugin that exports probeBuilt`,
+        `the @smoothbricks/nx-plugin resolved from ${from} (${specifier}) has no read-only probeBuilt, so ${target} cannot be vouched for without building it; bind a plugin that exports probeBuilt`,
       );
     }
     return probeBuilt({ target, cwd: providerRoot });

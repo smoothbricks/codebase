@@ -70,7 +70,10 @@
  * consumer task resolves (linked-snapshots.ts). The snapshot is taken here, at
  * the install and shell-entry boundary, and only when the provider's Nx
  * targets vouch for every copied byte; otherwise the refusal is said and the
- * alias keeps its current binding.
+ * alias keeps its current binding. The plugin that vouches is the one the
+ * declarations bind: a declared @smoothbricks/nx-plugin is probed from its
+ * checkout, since every `bun install` has put the published plugin back at its
+ * alias before this file runs as the postinstall.
  *
  * Declarations are applied at the end of every install. smoo's root script
  * policy makes the root's `postinstall` run this file, and bun runs the
@@ -108,7 +111,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
-import { type SnapshotDeclaration, snapshotBinding } from './linked-snapshots.ts';
+import { pluginProbe, type SnapshotDeclaration, snapshotBinding } from './linked-snapshots.ts';
 
 interface DeveloperLink {
   /** Where the link is, relative to the project root. */
@@ -389,6 +392,7 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
   const canonicalRoot = realpathSync(root);
   const trees = nodeModulesTrees(root);
   const recorded = readDeclaredRecord(root);
+  const probe = pluginProbe(snapshotPluginRoot(root, anchor, declared));
   const changes: DeclaredLinkChange[] = [];
   const unavailable: UnavailableDeclaredLink[] = [];
   for (const { name, directory: relative, snapshot } of declared) {
@@ -405,7 +409,7 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
     }
     let binding: DeclaredBinding = { kind: 'checkout', target: source };
     if (snapshot !== undefined) {
-      const outcome = await snapshotBinding(root, name, source, snapshot);
+      const outcome = await snapshotBinding(root, name, source, snapshot, probe);
       if (outcome.kind === 'refused') {
         unavailable.push({ kind: 'snapshot-refused', name, source, reason: outcome.reason });
         continue;
@@ -444,6 +448,19 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
     }
   }
   return { changes, unavailable };
+}
+
+/**
+ * Where the @smoothbricks/nx-plugin that vouches for snapshots resolves from: the checkout its declaration links when
+ * this machine has it, else the root's install, which is then what its aliases keep. Never the root's install over
+ * a declaration: an install re-points the plugin alias at the lockfile's published version before this runs, and
+ * that version cannot read a producer receipt only the declared checkout's plugin writes.
+ */
+function snapshotPluginRoot(root: string, anchor: string, declared: readonly DeclaredLink[]): string {
+  const plugin = declared.find(({ name }) => name === '@smoothbricks/nx-plugin');
+  if (plugin === undefined) return root;
+  const source = declaredTarget(root, anchor, plugin.directory);
+  return unavailableReason(source) === null ? source : root;
 }
 
 /**

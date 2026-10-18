@@ -409,19 +409,25 @@ describe('linked package snapshots', () => {
   });
 });
 
-/** A consumer plugin whose `ensure-built` module is `module`, so planDeclaredLinks takes its real default path. */
+const PLUGIN_MANIFEST = JSON.stringify({
+  name: '@smoothbricks/nx-plugin',
+  version: '0.0.0',
+  type: 'module',
+  exports: { './ensure-built': './ensure-built.js' },
+});
+
+/** A plugin package at `directory` whose `ensure-built` module is `module`. */
+function writePlugin(directory: string, module: string): void {
+  write(join(directory, 'package.json'), PLUGIN_MANIFEST);
+  write(join(directory, 'ensure-built.js'), module);
+}
+
+/** A consumer's installed plugin, a link into Bun's store as an install leaves it: planDeclaredLinks's default path. */
 function installPlugin({ consumer }: Fixture, module: string): void {
-  const plugin = join(consumer, 'node_modules/@smoothbricks/nx-plugin');
-  write(
-    join(plugin, 'package.json'),
-    JSON.stringify({
-      name: '@smoothbricks/nx-plugin',
-      version: '0.0.0',
-      type: 'module',
-      exports: { './ensure-built': './ensure-built.js' },
-    }),
-  );
-  write(join(plugin, 'ensure-built.js'), module);
+  const store = '.bun/@smoothbricks+nx-plugin@0.0.0/node_modules/@smoothbricks/nx-plugin';
+  writePlugin(join(consumer, 'node_modules', store), module);
+  mkdirSync(join(consumer, 'node_modules/@smoothbricks'), { recursive: true });
+  symlinkSync(join('..', store), join(consumer, 'node_modules/@smoothbricks/nx-plugin'));
 }
 
 /** The read-only probe a current plugin exports, answering from the provider's actual output bytes. */
@@ -441,14 +447,18 @@ process.stdout.write(JSON.stringify(plan));
 `;
 
 describe('snapshot declarations', () => {
-  function declare({ consumer, source }: Fixture): string {
+  /** Declares the snapshot of `linked-api`, with any `extra` checkout declarations beside it. */
+  function declare({ consumer, source }: Fixture, extra: Readonly<Record<string, string>> = {}): string {
     write(
       join(consumer, 'package.json'),
       JSON.stringify({
         name: 'consumer',
         private: true,
         smoo: {
-          developerLinks: { 'linked-api': { directory: join('..', 'provider/packages/api'), snapshot: DECLARATION } },
+          developerLinks: {
+            'linked-api': { directory: join('..', 'provider/packages/api'), snapshot: DECLARATION },
+            ...extra,
+          },
         },
       }),
     );
@@ -469,6 +479,22 @@ describe('snapshot declarations', () => {
     expect(readFileSync(join(checkout.consumer, 'node_modules/.smoo-declared-links'), 'utf8')).toContain(
       readlinkSync(alias),
     );
+  });
+
+  it('probes through the plugin checkout a declaration links, never the published one an install put back', () => {
+    const checkout = fixture();
+    const marker = join(checkout.provider, '..', 'provider-built');
+    // A plain `bun install` re-points the declared plugin alias at the lockfile's version before its postinstall.
+    installPlugin(checkout, buildingPlugin(marker));
+    const declared = join(checkout.consumer, '..', 'plugin');
+    writePlugin(declared, PROBE_BUILT);
+    const alias = declare(checkout, { '@smoothbricks/nx-plugin': join('..', 'plugin') });
+    const child = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
+    expect(child.status, child.stderr).toBe(0);
+    expect(child.stderr).not.toContain('no snapshot');
+    expect(readlinkSync(alias)).toMatch(/^\.\.\/\.cache\/linked-snapshots\/[0-9a-f]{64}\/packages\/api$/);
+    expect(realpathSync(join(checkout.consumer, 'node_modules/@smoothbricks/nx-plugin'))).toBe(declared);
+    expect(lstatSync(marker, { throwIfNoEntry: false })).toBeUndefined();
   });
 
   it('refuses before any call when the installed plugin has no read-only probeBuilt', () => {

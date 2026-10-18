@@ -1,4 +1,4 @@
-// A linked-package snapshot vouched for by real Nx: the managed snapshot module's default probe, which loads the
+// A linked-package snapshot vouched for by real Nx: the managed snapshot module's `pluginProbe`, which loads the
 // plugin product a consumer installs (this package's built `ensure-built`) and calls its read-only `probeBuilt`
 // against a provider workspace whose nx.json enables this plugin's producer receipts. No receipt is injected: the
 // production record, task hash, HEAD and every output byte come from the provider's own Nx run, and a provider no
@@ -19,11 +19,11 @@ const nxEntry = join(repoRoot, 'node_modules', '.bin', 'nx');
 const SNAPSHOTS = join(managedAssetsRoot, 'raw/tooling/direnv/linked-snapshots.ts');
 const DECLARATION = { targets: ['linked-api:build'], artifactModules: [] };
 
-/** One capture through the default probe, in a fresh Bun process as shell entry runs it: no plugins preloaded. */
+/** One capture via the consumer's installed plugin in a fresh Bun process, as shell entry runs it: none preloaded. */
 const CAPTURE = `
 const snapshots = await import(Bun.argv[1]);
 const [consumer, source, declaration] = JSON.parse(Bun.argv[2]);
-const binding = await snapshots.snapshotBinding(consumer, 'linked-api', source, declaration);
+const binding = await snapshots.snapshotBinding(consumer, 'linked-api', source, declaration, snapshots.pluginProbe(consumer));
 const receipt = binding.kind === 'snapshot' ? snapshots.verifySnapshot(binding.directory.slice(0, -'/packages/api'.length)) : null;
 await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify({ binding, receipt }), error => error ? reject(error) : resolve()));
 `;
