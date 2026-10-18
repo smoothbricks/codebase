@@ -1,20 +1,8 @@
 import { type ChildProcess, type ChildProcessByStdio, execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { channel } from 'node:diagnostics_channel';
-import { constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
-import {
-  access,
-  lstat,
-  mkdir,
-  readdir,
-  readFile,
-  readlink,
-  realpath,
-  rename,
-  rm,
-  stat,
-  writeFile,
-} from 'node:fs/promises';
+import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { lstat, mkdir, readdir, readFile, readlink, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -390,15 +378,16 @@ function resolutionFiles(
   if (cargo !== null) paths.add(join(cargo.root, 'Cargo.toml'));
   const directories = new Set<string>([root]);
   for (const file of paths) directories.add(dirname(file));
+  const ancestors = new Set<string>();
   for (const directory of directories) {
     paths.add(join(directory, 'Cargo.lock'));
-    for (let ancestor = directory; ; ancestor = dirname(ancestor)) {
+    for (let ancestor = directory; !ancestors.has(ancestor); ancestor = dirname(ancestor)) {
+      ancestors.add(ancestor);
       paths.add(join(ancestor, '.cargo/config'));
       paths.add(join(ancestor, '.cargo/config.toml'));
       paths.add(join(ancestor, 'rust-toolchain'));
       paths.add(join(ancestor, 'rust-toolchain.toml'));
       paths.add(join(ancestor, 'Cargo.toml'));
-      if (dirname(ancestor) === ancestor) break;
     }
   }
   for (const pin of CARGO_TOOLCHAIN_PIN_INPUTS) paths.add(pin.replace('{workspaceRoot}', root));
@@ -409,12 +398,12 @@ function resolutionFiles(
 }
 
 /** Toolchain selection can change even while the declared pin's bytes do not. */
-async function cargoExecutable(): Promise<string> {
+function cargoExecutable(): string {
   for (const directory of (process.env.PATH ?? '').split(delimiter)) {
     const executable = resolve(directory, process.platform === 'win32' ? 'cargo.exe' : 'cargo');
     try {
-      await access(executable, constants.X_OK);
-      return await realpath(executable);
+      accessSync(executable, constants.X_OK);
+      return realpathSync.native(executable);
     } catch (error) {
       if (
         !(
@@ -429,21 +418,24 @@ async function cargoExecutable(): Promise<string> {
   return '<cargo-not-on-PATH>';
 }
 
-async function resolutionKey(
+function resolutionKey(
   root: string,
   manifest: string,
   cargo: CargoResolve | null,
   indexed: ReadonlySet<string>,
-): Promise<string> {
+): string {
   const cargoHome = resolve(process.env.CARGO_HOME ?? join(homedir(), '.cargo'));
-  const executable = await cargoExecutable();
+  const executable = cargoExecutable();
   const hash = createHash('sha256').update(
     `${RESOLVE_CACHE_SCHEMA}\0${root}\0${manifest}\0${cargoHome}\0${executable}\0${process.env.RUSTUP_TOOLCHAIN ?? ''}\0${process.env.RUSTUP_HOME ?? ''}\0`,
   );
   for (const file of [...resolutionFiles(root, manifest, cargo, indexed)].sort()) {
     hash.update(file).update('\0');
     try {
-      const [bytes, canonical] = await Promise.all([readFile(file), realpath(file)]);
+      // Most ancestor inputs are absent. Read first so those paths need no
+      // canonical lookup; small resolution files need no per-file async dispatch.
+      const bytes = readFileSync(file);
+      const canonical = realpathSync.native(file);
       hash.update(`${canonical}\0${bytes.length}\0`).update(bytes);
     } catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
@@ -538,7 +530,7 @@ export async function readCargoResolve(
       }
     } else await state.ready;
     for (let joined = 0; joined <= 3; joined += 1) {
-      const key = await resolutionKey(root, manifest, state.cached?.cargo ?? null, index);
+      const key = resolutionKey(root, manifest, state.cached?.cargo ?? null, index);
       const pending = state.pending;
       if (pending !== undefined) {
         if (joined === 3) break;
@@ -605,9 +597,8 @@ async function resolveAndCache(
   // A warm cache answers with no lock: reading it and keying it spawns nothing and
   // waits for nobody, so an unchanged workspace never queues behind a foreign flight.
   state.cached = await loadResolveCache(file);
-  {
-    const key = await resolutionKey(root, manifest, state.cached?.cargo ?? null, indexed);
-    if (state.cached?.key === key) return state.cached.cargo;
+  if (state.cached !== null && state.cached.key === resolutionKey(root, manifest, state.cached.cargo, indexed)) {
+    return state.cached.cargo;
   }
   const lockFile = join(directory, 'resolve.lock');
   const parentBeforeLock = await observeCacheParent(directory);
@@ -617,7 +608,7 @@ async function resolveAndCache(
     state.cached = await loadResolveCache(file);
     let inputs = state.cached?.cargo ?? null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const before = await resolutionKey(root, manifest, inputs, indexed);
+      const before = resolutionKey(root, manifest, inputs, indexed);
       if (state.cached?.key === before) return state.cached.cargo;
       const knownFiles = resolutionFiles(root, manifest, inputs, indexed);
       // A filesystem timestamp, not a sandbox's wall clock: a newly
@@ -628,8 +619,8 @@ async function resolveAndCache(
       const cargo = cargoFromMetadata(metadata);
       // Capture the published key before validation. Reading it afterwards
       // could pair a post-edit key with Cargo's pre-edit answer.
-      const key = await resolutionKey(root, manifest, cargo, indexed);
-      let changed = before !== (await resolutionKey(root, manifest, inputs, indexed));
+      const key = resolutionKey(root, manifest, cargo, indexed);
+      let changed = before !== resolutionKey(root, manifest, inputs, indexed);
       for (const added of resolutionFiles(root, manifest, cargo, indexed)) {
         if (knownFiles.has(added)) continue;
         try {

@@ -365,6 +365,11 @@ unknown). A successful flight holds the lease until closing the child's stdin re
 A timed-out Cargo command is killed, and resolution refuses instead of hanging graph construction or returning a stale
 closure.
 
+Resolution expands shared ancestors once and reads current file bytes directly, without per-file asynchronous dispatch
+or canonical-path probes for missing files. Standalone calls retain a fresh native manifest census; graph callers use
+the graph's existing index. Canonical paths and contents still key metadata, including ignored and external packages;
+source bytes are read on every hash call, not kept in a runtime-result cache.
+
 ### Cargo closure input
 
 Custom Cargo targets that replace inferred inputs need the source closure of the crates they build. The plugin infers it

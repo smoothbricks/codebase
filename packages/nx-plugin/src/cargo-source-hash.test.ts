@@ -1,11 +1,11 @@
 import { expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
-import { hashCargoPathInputs } from './cargo-source-hash.js';
+import { hashCargoPathInputs, readCargoResolve } from './cargo-source-hash.js';
 
 useFixtureCargoHome();
 
@@ -255,6 +255,81 @@ it('include-workspace hashes in-workspace transitive source edits without changi
     await rm(root, { recursive: true, force: true });
   }
 });
+
+it.each(['external', 'workspace/node_modules/external'])(
+  'follows same-size same-mtime dependency edits in %s and hashes the newly reached source bytes',
+  async (externalDirectory) => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-hash-boundary-')));
+    const workspace = join(root, 'workspace');
+    const manifest = join(workspace, 'Cargo.toml');
+    const external = join(root, externalDirectory);
+    const externalManifest = join(external, 'Cargo.toml');
+    async function put(file: string, text: string): Promise<void> {
+      await mkdir(dirname(file), { recursive: true });
+      await writeFile(file, text);
+    }
+    const dependencyManifest = (name: string) =>
+      '[package]\nname="external"\nversion="0.1.0"\nedition="2021"\n[workspace]\n' +
+      `[dependencies]\nside={path=${JSON.stringify(relative(external, join(root, name)))}}\n`;
+    const sideManifest = '[package]\nname="side"\nversion="0.1.0"\nedition="2021"\n[workspace]\n';
+    const timestamp = new Date(1_700_000_000_000);
+    try {
+      // A nested installed workspace must not be auto-enrolled as a member of this one.
+      await put(
+        manifest,
+        '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n[workspace]\nexclude=["node_modules/external"]\n' +
+          `[dependencies]\nexternal={path=${JSON.stringify(relative(workspace, external))}}\n`,
+      );
+      await put(join(workspace, 'src/lib.rs'), 'pub fn app() {}\n');
+      await put(externalManifest, dependencyManifest('left'));
+      await put(join(external, 'src/lib.rs'), 'pub fn external() {}\n');
+      for (const side of ['left', 'rght']) {
+        await put(join(root, side, 'Cargo.toml'), sideManifest);
+        await put(join(root, side, 'src/lib.rs'), 'pub fn side() -> u8 { 1 }\n');
+      }
+      execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
+      await put(join(workspace, '.gitignore'), 'node_modules/\n.nx/\n');
+      execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', manifest], { stdio: 'pipe' });
+      await utimes(externalManifest, timestamp, timestamp);
+      const before = await stat(externalManifest);
+      const lock = await readFile(join(workspace, 'Cargo.lock'), 'utf8');
+      const initialResolve = await readCargoResolve(manifest, workspace);
+      expect(initialResolve.local.map((pkg) => pkg.manifest)).toContain(join(root, 'left/Cargo.toml'));
+      const initial = await hashCargoPathInputs(manifest, workspace);
+
+      // Both packages have the same name/version, so the locked graph stays
+      // valid. Only the dependency manifest's bytes identify its new location.
+      await writeFile(externalManifest, dependencyManifest('rght'));
+      await utimes(externalManifest, timestamp, timestamp);
+      const after = await stat(externalManifest);
+      expect(after.size).toBe(before.size);
+      expect(after.mtimeMs).toBe(before.mtimeMs);
+      const changedResolve = await readCargoResolve(manifest, workspace);
+      const manifests = changedResolve.local.map((pkg) => pkg.manifest);
+      expect(manifests).toContain(join(root, 'rght/Cargo.toml'));
+      expect(manifests).not.toContain(join(root, 'left/Cargo.toml'));
+      expect(await readFile(join(workspace, 'Cargo.lock'), 'utf8')).toBe(lock);
+      const changed = await hashCargoPathInputs(manifest, workspace);
+      expect(changed).not.toBe(initial);
+
+      await writeFile(join(root, 'left/src/lib.rs'), 'pub fn side() -> u8 { 2 }\n');
+      expect(await hashCargoPathInputs(manifest, workspace)).toBe(changed);
+      const source = join(root, 'rght/src/lib.rs');
+      const sourceBefore = await stat(source);
+      await writeFile(source, 'pub fn side() -> u8 { 2 }\n');
+      await utimes(source, sourceBefore.atime, sourceBefore.mtime);
+      const sourceChanged = await hashCargoPathInputs(manifest, workspace);
+      expect(sourceChanged).not.toBe(changed);
+
+      await rm(join(root, 'rght/Cargo.toml'));
+      await expect(hashCargoPathInputs(manifest, workspace)).rejects.toThrow('Locked offline Cargo resolution failed');
+      await put(join(root, 'rght/Cargo.toml'), sideManifest);
+      expect(await hashCargoPathInputs(manifest, workspace)).toBe(sourceChanged);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 it('include-workspace CLI accepts an optional manifest and refuses unsupported arguments', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cargo-hash-cli-'));
