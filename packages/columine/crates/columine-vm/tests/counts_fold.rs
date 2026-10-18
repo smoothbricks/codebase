@@ -1,6 +1,6 @@
 //! Counts fold against an independent model: a histogram is a plain array of
-//! counts, decay divides every count by two, and the frame is decoded back
-//! into that model after every sample.
+//! counts, decay maps every count `c` to `(c + 1) >> 1` (so a count of one
+//! survives), and the frame is decoded back into that model after every sample.
 //!
 //! The module is schema-blind, so these frames are opaque byte layouts built
 //! here for geometry alone: leading bytes, a constant region (count, three
@@ -127,7 +127,7 @@ impl Model {
         for (hist, &bucket) in self.hists.iter_mut().zip(&sample.buckets) {
             if hist[bucket as usize] == 65_535 {
                 for count in hist.iter_mut() {
-                    *count /= 2;
+                    *count = (*count + 1) >> 1;
                 }
             }
             hist[bucket as usize] += 1;
@@ -331,14 +331,14 @@ fn an_absent_row_starts_from_the_elements_init_frame() {
 }
 
 #[test]
-fn a_full_bin_halves_its_whole_histogram_before_counting() {
+fn a_full_bin_decays_its_whole_histogram_before_counting() {
     let code = standard();
     let op = CountsFoldOp::decode(&code, 0).unwrap();
     let mut history = Model {
         n: 70_000,
         ..Model::ZERO
     };
-    history.hists[0][..3].copy_from_slice(&[65_535, 5_543, 7]);
+    history.hists[0][..4].copy_from_slice(&[65_535, 1, 0, 3]);
     // Axis 1 holds a full bin the sample does not land in: it must not decay.
     history.hists[1][..2].copy_from_slice(&[65_535, 9]);
     history.hists[2][0] = 65_534;
@@ -346,12 +346,14 @@ fn a_full_bin_halves_its_whole_histogram_before_counting() {
     fold_batch(&op, &mut row, &[sample([0, 1, 0], 0)]).unwrap();
     let folded = Model::decode(row.as_deref().unwrap());
     assert_eq!(folded.n, 70_001);
-    assert_eq!(folded.hists[0][..3], [32_768, 2_771, 3]);
+    // 65535 decays to 32768 and then counts the sample; the tail count of one
+    // survives, zero stays zero and three rounds up to two.
+    assert_eq!(folded.hists[0][..4], [32_769, 1, 0, 2]);
     assert_eq!(folded.hists[1][..2], [65_535, 10]);
     assert_eq!(folded.hists[2][0], 65_535);
-    // The next sample on axis 2's now-full bin halves it then.
+    // The next sample on axis 2's now-full bin decays it then.
     fold_batch(&op, &mut row, &[sample([1, 1, 0], 0)]).unwrap();
-    assert_eq!(Model::decode(row.as_deref().unwrap()).hists[2][0], 32_768);
+    assert_eq!(Model::decode(row.as_deref().unwrap()).hists[2][0], 32_769);
 }
 
 #[test]

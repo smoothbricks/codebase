@@ -31,8 +31,10 @@
 //! this module must not be read as performing it.
 //!
 //! One sample adds one to the count, one to one bin of each histogram, and
-//! ORs one byte into each mask. A bin about to pass `u16::MAX` halves its
-//! whole histogram (floor) first; a count at `u32::MAX` refuses the sample.
+//! ORs one byte into each mask. A bin about to pass `u16::MAX` first decays
+//! its whole histogram, every count `c` becoming `(c + 1) >> 1`, so a count
+//! of one — a rare tail sample — survives the decay; a count at `u32::MAX`
+//! refuses the sample.
 //! Only count, element and mask bytes change — no length, region word or
 //! element count. Every refusal is decided by [`CountsFoldOp::prepare`],
 //! which only borrows, so a refused sample has mutated nothing;
@@ -174,7 +176,7 @@ pub struct CountsFoldPlan {
     /// Frame-absolute offset of each histogram's element zero.
     bins_at: [u32; MAX_COUNTS_HISTOGRAMS],
     buckets: [u8; MAX_COUNTS_HISTOGRAMS],
-    /// Bit `h` set: histogram `h` halves before its bucket counts.
+    /// Bit `h` set: histogram `h` decays before its bucket counts.
     decay: u8,
     masks: [u8; MAX_COUNTS_MASKS],
 }
@@ -189,7 +191,7 @@ impl CountsFoldPlan {
         self.count
     }
 
-    /// Whether histogram `h` halves before its bucket counts.
+    /// Whether histogram `h` decays before its bucket counts.
     pub const fn decays(&self, h: usize) -> bool {
         h < MAX_COUNTS_HISTOGRAMS && self.decay & (1 << h) != 0
     }
@@ -581,10 +583,13 @@ impl<'p> CountsFoldOp<'p> {
             if plan.decays(h) {
                 for bin in 0..u32::from(hist.bin_count) {
                     let at = bins_at + bin * BIN_WIDTH;
-                    bytes::write_u16(frame, at, bytes::read_u16(frame, at) >> 1);
+                    // `(c + 1) >> 1` without widening: `u16::MAX + 1` would
+                    // not fit, `(c >> 1) + (c & 1)` never exceeds 32768.
+                    let count = bytes::read_u16(frame, at);
+                    bytes::write_u16(frame, at, (count >> 1) + (count & 1));
                 }
             }
-            // Below u16::MAX here: either it was, or decay just halved it.
+            // Below u16::MAX here: either it was, or decay just brought it to 32768.
             let at = bins_at + u32::from(bucket) * BIN_WIDTH;
             let Some(next) = bytes::read_u16(frame, at).checked_add(1) else {
                 columine_types::die!(
