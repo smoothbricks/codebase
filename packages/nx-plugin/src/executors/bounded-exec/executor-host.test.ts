@@ -405,9 +405,10 @@ function childEnv(extra: Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   return { ...env, ...extra };
 }
 
-/** A parent's CPU pool of `tokens`, open while `body` runs. Its upstream never closes on its own. */
+/** A parent's CPU pool of `tokens`, open while `body` runs. Its upstream never closes on its own, and no run owns the
+ * host waits its children report. */
 async function withPool<T>(tokens: number, body: (pool: CpuPool) => Promise<T>): Promise<T> {
-  const created = await createCpuPool(tokens, new Promise<void>(() => {}));
+  const created = await createCpuPool(tokens, new Promise<void>(() => {}), { begin() {}, end() {} });
   if (!created.ok) {
     throw new Error(`cpu pool: ${created.error}`);
   }

@@ -190,6 +190,56 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).not.toContain('fake tests::quick (cwd=');
   });
 
+  it("stops the idle clock while a descendant's work is queued for host CPU tokens, and runs it on after", async () => {
+    const workspace = await createWorkspace();
+    // The runner finishes a test, then says through its pool that work it started is queued for host tokens, ends that
+    // wait and goes silent. While the wait is held the clock moves well past the bound and nothing fires; once the wait
+    // ends the same move ends the run.
+    await workspace.write(
+      'queued-runner.js',
+      [
+        "const { connect } = require('node:net');",
+        "console.error('        PASS [   0.010s] (1/2) fake tests::quick');",
+        `const socket = connect(process.env.${CPU_POOL_ENV});`,
+        `socket.on('connect', () => socket.write('{"op":"host-wait"}\\n'));`,
+        "socket.once('data', (reply) => { console.log('host wait ' + reply.toString().trim()); socket.end(); });",
+        "socket.on('close', () => setInterval(() => {}, 60_000));",
+        '',
+      ].join('\n'),
+    );
+    const budget: CpuBudget = {
+      async take() {
+        return heldGrant(1, []);
+      },
+    };
+
+    const { result } = await onProgressClock(
+      (chunk) => chunk.includes('bounded-exec: idle clock'),
+      1_000,
+      () =>
+        runBoundedExec(
+          { command: 'node queued-runner.js', idleTimeoutMs: 400, killAfterMs: 0 },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+          budget,
+        ),
+    );
+
+    const output = result.terminalOutput;
+    expect(result.success).toBe(false);
+    expect(output).toContain('host wait {"ok":true,"wait":"held"}');
+    const stopped = output.indexOf(
+      "bounded-exec: idle clock stopped: a descendant's work is queued for host CPU tokens",
+    );
+    const restarted = output.indexOf('bounded-exec: idle clock restarted');
+    const expired = output.indexOf('Command made no progress: no test finished for 400ms (idleTimeoutMs=400)');
+    // The 1000 ms move while the wait was held fired nothing; the one after it ended the run.
+    expect(stopped).toBeGreaterThan(-1);
+    expect(restarted).toBeGreaterThan(stopped);
+    expect(expired).toBeGreaterThan(restarted);
+  });
+
   it('emits a completed pre-expiry snapshot or an explicit incomplete capture without waiting for it', async () => {
     const workspace = await createWorkspace();
     // Child output drives the fake executor clock; the heartbeat period is not a timing oracle.
@@ -1475,9 +1525,10 @@ function heldGrant(tokens: number, released: number[]): TokenGrant {
   };
 }
 
-/** A parent's CPU pool of `tokens`, open while `body` runs. Its upstream never closes on its own. */
+/** A parent's CPU pool of `tokens`, open while `body` runs. Its upstream never closes on its own, and no run owns the
+ * host waits its children report. */
 async function withPool<T>(tokens: number, body: (pool: CpuPool) => Promise<T>): Promise<T> {
-  const created = await createCpuPool(tokens, new Promise<void>(() => {}));
+  const created = await createCpuPool(tokens, new Promise<void>(() => {}), { begin() {}, end() {} });
   if (!created.ok) {
     throw new Error(`cpu pool: ${created.error}`);
   }

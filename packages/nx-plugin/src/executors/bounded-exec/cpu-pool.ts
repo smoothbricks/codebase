@@ -42,6 +42,16 @@ export interface CpuPool {
 
 type CloseOutcome = { ok: true } | { ok: false; error: string };
 
+/**
+ * The run's count of descendant work queued for host CPU tokens (specs/cowshed/05_gateway.md, "The bounds start at
+ * the grant"). A queued job is not an idle one: its owner stops the run's idle clock while any wait is held. Every
+ * pool of one run, its sub-pools included, reports to the same one.
+ */
+export interface HostWaits {
+  begin(): void;
+  end(): void;
+}
+
 /** The one line a child sends: a count of whole tokens, at least one. */
 interface CpuPoolRequest {
   op: 'cpu-pool';
@@ -55,13 +65,22 @@ interface CpuPoolRequest {
   grow?: boolean;
 }
 
+/**
+ * A descendant's word that work it started waits in a host CPU queue (a cowshed job the gateway holds `waiting`). It
+ * is held like a grant: the wait lasts while its connection does, so a descendant that dies ends its wait.
+ */
+interface HostWaitRequest {
+  op: 'host-wait';
+}
+
 /** The pool's answers, in `holdLease`'s framing. */
 type CpuPoolReply =
   | { ok: true; lease: 'queued' }
   | { ok: true; lease: 'granted'; tokens: number; pool?: string }
+  | { ok: true; wait: 'held' }
   | { ok: false; code: 'invalid-request'; error: string };
 
-const parseRequest = typia.json.createIsParse<CpuPoolRequest>();
+const parseRequest = typia.json.createIsParse<CpuPoolRequest | HostWaitRequest>();
 const stringifyReply = typia.json.createStringify<CpuPoolReply>();
 
 /** A request over this many bytes is refused as `invalid-request` (specs/cowshed/05_gateway.md, "Wire"). */
@@ -74,11 +93,13 @@ const POOL_DIRECTORY = 'cpu-pool-';
 const POOL_SOCKET = 'p.sock';
 const CLOSED_WHILE_MADE = 'the grant that lends this CPU pool closed while the pool was being made';
 
-/** A child's phase. Tokens are owed back only while `holding`; a queued child holds nothing. */
+/** A child's phase. Tokens are owed back only while `holding`; a queued child holds nothing; a `waiting` child holds a
+ * host wait on the run's idle clock. */
 type Phase =
   | { readonly kind: 'reading' }
   | { readonly kind: 'queued' }
   | { readonly kind: 'holding'; readonly tokens: number }
+  | { readonly kind: 'waiting' }
   | { readonly kind: 'done' };
 
 /** A child connection and what the pool owes it. Its grant, or its place in line, ends with the connection. */
@@ -150,12 +171,14 @@ export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number
 
 /**
  * Make a pool of `tokens` that lives while `closed` does: when `closed` resolves the pool refuses
- * grants, ends its child connections and removes its directory. Setup failures are values; a
- * non-positive or unsafe count is a programmer bug and throws.
+ * grants, ends its child connections and removes its directory. A child's `host-wait` is reported
+ * to `waits` for as long as its connection holds it; a sub-pool reports to the same `waits`.
+ * Setup failures are values; a non-positive or unsafe count is a programmer bug and throws.
  */
 export async function createCpuPool(
   tokens: number,
   closed: Promise<void>,
+  waits: HostWaits,
 ): Promise<{ ok: true; pool: CpuPool } | { ok: false; error: string }> {
   if (!Number.isSafeInteger(tokens) || tokens < 1) {
     throw new RangeError(`a CPU pool holds a positive safe integer of tokens, not ${tokens}`);
@@ -209,7 +232,7 @@ export async function createCpuPool(
         if (waiter.child.socket.destroyed) done();
         else waiter.child.socket.once('close', done);
       });
-      const creation = createCpuPool(granted, ended).then(async (made) => {
+      const creation = createCpuPool(granted, ended, waits).then(async (made) => {
         if (!made.ok) {
           failures.push(made.error);
           // Keep holding until close credits exactly this allocation once.
@@ -256,6 +279,8 @@ export async function createCpuPool(
         }
       } else if (child.phase.kind === 'holding') {
         free += child.phase.tokens;
+      } else if (child.phase.kind === 'waiting') {
+        waits.end();
       }
       child.phase = { kind: 'done' };
       drain();
@@ -299,7 +324,7 @@ export async function createCpuPool(
       }
       const line = buffered.subarray(0, newline).toString('utf8');
       buffered = EMPTY;
-      let request: CpuPoolRequest | null;
+      let request: CpuPoolRequest | HostWaitRequest | null;
       try {
         request = parseRequest(line);
       } catch (error) {
@@ -308,7 +333,17 @@ export async function createCpuPool(
         request = null;
       }
       if (request === null) {
-        refuse(child, 'a request is {"op":"cpu-pool","want":<a whole number of tokens, at least 1>}');
+        refuse(
+          child,
+          'a request is {"op":"cpu-pool","want":<a whole number of tokens, at least 1>} or {"op":"host-wait"}',
+        );
+        return;
+      }
+      if (request.op === 'host-wait') {
+        // Counted from here until the connection closes, which `close` reports however it ends.
+        child.phase = { kind: 'waiting' };
+        waits.begin();
+        socket.write(frame({ ok: true, wait: 'held' }));
         return;
       }
       child.phase = { kind: 'queued' };

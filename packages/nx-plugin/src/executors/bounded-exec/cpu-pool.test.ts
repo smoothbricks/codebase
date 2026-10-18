@@ -9,6 +9,7 @@ import {
   CPU_POOL_ENV,
   type CpuPool,
   createCpuPool,
+  type HostWaits,
   type InheritedCpuPool,
   readInheritedCpuPool,
   takeParentCpuTokens,
@@ -19,9 +20,48 @@ import { CPU_TOKENS_ENV, type TokenGrant } from './cpu-tokens.js';
 type PoolReply =
   | { ok: true; lease: 'queued' }
   | { ok: true; lease: 'granted'; tokens: number; pool?: string }
+  | { ok: true; wait: 'held' }
   | { ok: false; code: 'invalid-request'; error: string };
 
 const parseReply = typia.json.createAssertParse<PoolReply>();
+
+/**
+ * A run's host waits as the pool reports them: how many are held now, every begin and end in order, and `reaches(n)`,
+ * which resolves once the count is `n` (the pool hears a close after its client does).
+ */
+interface CountedWaits extends HostWaits {
+  readonly held: () => number;
+  readonly events: ('begin' | 'end')[];
+  reaches(count: number): Promise<void>;
+}
+
+function countedWaits(): CountedWaits {
+  const events: ('begin' | 'end')[] = [];
+  const watchers: { count: number; done: () => void }[] = [];
+  let held = 0;
+  const changed = (): void => {
+    for (const watcher of watchers.filter((each) => each.count === held)) {
+      watchers.splice(watchers.indexOf(watcher), 1);
+      watcher.done();
+    }
+  };
+  return {
+    held: () => held,
+    events,
+    reaches: (count) =>
+      count === held ? Promise.resolve() : new Promise<void>((done) => watchers.push({ count, done })),
+    begin: () => {
+      held += 1;
+      events.push('begin');
+      changed();
+    },
+    end: () => {
+      held -= 1;
+      events.push('end');
+      changed();
+    },
+  };
+}
 
 type Granted = Extract<TokenGrant, { granted: true }>;
 
@@ -57,8 +97,12 @@ afterEach(async () => {
 });
 
 /** Make a pool of `tokens` and read its endpoint back through the same path a child uses. */
-async function openPool(tokens: number, closed: Promise<void> = NEVER): Promise<Opened> {
-  const made = await createCpuPool(tokens, closed);
+async function openPool(
+  tokens: number,
+  closed: Promise<void> = NEVER,
+  waits: HostWaits = countedWaits(),
+): Promise<Opened> {
+  const made = await createCpuPool(tokens, closed, waits);
   if (!made.ok) {
     throw new Error(made.error);
   }
@@ -182,7 +226,7 @@ describe('the parent-held CPU pool', () => {
     const cargo = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 4, children: true }));
     expect(await cargo.next()).toEqual(QUEUED);
     const granted = await cargo.next();
-    if (!granted.ok || granted.lease !== 'granted' || granted.pool === undefined)
+    if (!granted.ok || !('lease' in granted) || granted.lease !== 'granted' || granted.pool === undefined)
       throw new Error('no live child pool granted');
     expect(granted.tokens).toBe(4);
     expect(granted.pool).not.toBe(parent.socket);
@@ -322,7 +366,7 @@ describe('the parent-held CPU pool', () => {
   });
 
   it('names the endpoint and count it holds, in private owned paths, and removes them on close', async () => {
-    const made = await createCpuPool(3, NEVER);
+    const made = await createCpuPool(3, NEVER, countedWaits());
     if (!made.ok) {
       throw new Error(made.error);
     }
@@ -355,6 +399,49 @@ describe('the parent-held CPU pool', () => {
       expect(await refused.next()).toMatchObject({ ok: false, code: 'invalid-request' });
     }
     expect((await takeOrThrow(parent, 2)).tokens).toBe(2);
+  });
+
+  it("counts a descendant's host wait for as long as its connection holds it, through a child pool too", async () => {
+    const waits = countedWaits();
+    const { parent } = await openPool(4, NEVER, waits);
+    const held: PoolReply = { ok: true, wait: 'held' };
+    const direct = childOf(parent.socket, JSON.stringify({ op: 'host-wait' }));
+    expect(await direct.next()).toEqual(held);
+    expect(waits.held()).toBe(1);
+    // A wait holds no token: the whole pool is still there to grant.
+    expect(await grantedFor(parent, 4)).toBe(4);
+
+    // Cargo's launcher is served a child pool; the test it runs reports its waits there, to the same run.
+    const cargo = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 2, children: true }));
+    expect(await cargo.next()).toEqual(QUEUED);
+    const granted = await cargo.next();
+    if (!granted.ok || !('lease' in granted) || granted.lease !== 'granted' || granted.pool === undefined) {
+      throw new Error(`no live child pool granted: ${JSON.stringify(granted)}`);
+    }
+    const nested = childOf(granted.pool, JSON.stringify({ op: 'host-wait' }));
+    expect(await nested.next()).toEqual(held);
+    expect(waits.held()).toBe(2);
+
+    direct.socket.destroy();
+    await direct.closed;
+    // The server sees the close after the client does; the count follows it.
+    await waits.reaches(1);
+    // The child pool's close ends the waits its children held.
+    cargo.socket.destroy();
+    await nested.closed;
+    await waits.reaches(0);
+    expect(waits.events).toEqual(['begin', 'begin', 'end', 'end']);
+  });
+
+  it('ends a host wait whose holder writes past its one request', async () => {
+    const waits = countedWaits();
+    const { parent } = await openPool(1, NEVER, waits);
+    const waiter = childOf(parent.socket, JSON.stringify({ op: 'host-wait' }));
+    expect(await waiter.next()).toEqual({ ok: true, wait: 'held' });
+    waiter.socket.write(`${JSON.stringify({ op: 'host-wait' })}\n`);
+    await waiter.closed;
+    await waits.reaches(0);
+    expect(waits.events).toEqual(['begin', 'end']);
   });
 
   it('destroys a granted child that sends a second request, returning its tokens', async () => {
@@ -417,7 +504,7 @@ describe('the parent-held CPU pool', () => {
   });
 
   it('reports a teardown that cannot remove its directory, and reports the same outcome on every close', async () => {
-    const made = await createCpuPool(2, NEVER);
+    const made = await createCpuPool(2, NEVER, countedWaits());
     if (!made.ok) {
       throw new Error(made.error);
     }
@@ -443,9 +530,9 @@ describe('the parent-held CPU pool', () => {
 
   it('makes no pool when its grant closes during setup, and refuses a non-positive count', async () => {
     const before = cpuPoolDirectories();
-    const made = await createCpuPool(2, Promise.resolve());
+    const made = await createCpuPool(2, Promise.resolve(), countedWaits());
     expect(made.ok).toBe(false);
     expect(cpuPoolDirectories()).toEqual(before);
-    await expect(createCpuPool(0, NEVER)).rejects.toBeInstanceOf(RangeError);
+    await expect(createCpuPool(0, NEVER, countedWaits())).rejects.toBeInstanceOf(RangeError);
   });
 });
