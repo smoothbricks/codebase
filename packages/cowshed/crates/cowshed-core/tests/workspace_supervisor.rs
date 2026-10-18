@@ -5776,10 +5776,31 @@ async fn a_streams_counts_survive_its_promotion_to_a_protected_file() {
 #[cfg(target_os = "macos")]
 const BURN_SECONDS: f64 = 0.5;
 
-/// What a job's leaders and the burners they reaped cost beyond what the burners measured:
-/// a Python interpreter's start per burner and `sh`'s own work. Far less than one more burner.
+/// What `wait4` reports as the test reaps a scripted leader: its own CPU and every child it
+/// reaped, with theirs. That is the kernel's own total for the whole tree, read after every
+/// sample it bounds; the job source reads the same counters while the tree lives, so no sample
+/// may exceed it, whatever an interpreter's start or `sh`'s own work cost on this host.
 #[cfg(target_os = "macos")]
-const SLACK_US: u64 = 300_000;
+fn reaped_cpu_us(leader: std::process::Child) -> u64 {
+    let pid = libc::pid_t::try_from(leader.id()).unwrap();
+    // SAFETY: an all-zero rusage is a valid value of the plain C struct.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let mut status = 0;
+    // SAFETY: reaping the test's own exited child, which nothing else waits for.
+    let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+    assert_eq!(reaped, pid, "wait4: {}", std::io::Error::last_os_error());
+    let micros = |time: libc::timeval| {
+        u64::try_from(time.tv_sec).unwrap() * 1_000_000 + u64::try_from(time.tv_usec).unwrap()
+    };
+    micros(usage.ru_utime) + micros(usage.ru_stime)
+}
+
+/// The units between the two readings, not the host: `wait4` truncates its user and system
+/// times to whole microseconds and the job source converts its own and its reaped children's
+/// user and system nanoseconds field by field, so the two may differ by under a microsecond for
+/// each of those four fields.
+#[cfg(target_os = "macos")]
+const WAIT4_TRUNCATION_US: u64 = 4;
 
 /// A command line that burns [`BURN_SECONDS`] of its own CPU, then reports it.
 #[cfg(target_os = "macos")]
@@ -5971,8 +5992,8 @@ async fn a_job_s_cpu_keeps_the_descendants_that_ended_between_samples() {
     );
     let accounted = accounted_us(&running);
     assert!(
-        (burned..burned + SLACK_US).contains(&accounted),
-        "the job's {accounted} us hold the {burned} us its reaped children burned, once"
+        accounted >= burned,
+        "the job's {accounted} us hold the {burned} us its reaped children burned"
     );
     let own = cowshed_core::runtime::job_accounting::read_leader(&Birth::of(pid))
         .unwrap()
@@ -5995,15 +6016,19 @@ async fn a_job_s_cpu_keeps_the_descendants_that_ended_between_samples() {
         .expect("a terminal sample");
     let sealed = accounted_us(&terminal);
     assert!(
-        (accounted..burned + SLACK_US).contains(&sealed),
-        "the terminal {sealed} us keep the running {accounted} us and add no child again"
+        sealed >= accounted,
+        "the terminal {sealed} us keep the running {accounted} us"
     );
     assert_eq!(
         handle.sealed(job_id).await.unwrap().resources,
         Some(terminal),
         "the sealed sample keeps the totals"
     );
-    reap(leader);
+    let total = reaped_cpu_us(leader);
+    assert!(
+        sealed <= total + WAIT4_TRUNCATION_US,
+        "the terminal {sealed} us add no child again: the kernel reaped the tree at {total} us"
+    );
 }
 
 /// A cold host's activation counts up to its end and the command from its start, each once:
@@ -6041,10 +6066,20 @@ async fn an_activation_and_its_command_each_count_once() {
     .await;
     let activation = host.burned();
     host.expect("activated");
+    let ended = cowshed_core::runtime::job_accounting::read_leader(&Birth::of(host.child.id()));
+    let ended_us = {
+        let usage = ended
+            .as_ref()
+            .expect("the host's usage as its activation ended");
+        usage.own.user_us.get()
+            + usage.own.sys_us.get()
+            + usage.children.user_us.get()
+            + usage.children.sys_us.get()
+    };
     job.events
         .send(ProcessEvent::ActivationEnded {
             job_id,
-            usage: cowshed_core::runtime::job_accounting::read_leader(&Birth::of(host.child.id())),
+            usage: ended,
         })
         .await
         .unwrap();
@@ -6070,15 +6105,10 @@ async fn an_activation_and_its_command_each_count_once() {
     reap(host.exit());
 
     let both = activation + ran;
-    assert!(
-        served > SLACK_US,
-        "the host's later {served} us would show if charged"
-    );
     let running = accounted_us(&handle.resources(job_id).await.unwrap());
     assert!(
-        (both..both + SLACK_US).contains(&running),
-        "the job's {running} us are its activation's {activation} us and its command's {ran} us, \
-         once each, without the host's later {served} us"
+        running >= both,
+        "the job's {running} us hold its activation's {activation} us and its command's {ran} us"
     );
 
     let command = command.exit();
@@ -6091,10 +6121,15 @@ async fn an_activation_and_its_command_each_count_once() {
         .expect("a terminal sample");
     let sealed = accounted_us(&terminal);
     assert!(
-        (running..both + SLACK_US).contains(&sealed),
-        "the terminal {sealed} us keep both intervals once"
+        sealed >= running,
+        "the terminal {sealed} us keep the running {running} us"
     );
-    reap(command);
+    let command_us = reaped_cpu_us(command);
+    assert!(
+        sealed <= ended_us + command_us + WAIT4_TRUNCATION_US,
+        "the job's {sealed} us are its activation's {ended_us} us as it ended and its command's \
+         {command_us} us, once each, without the host's later {served} us"
+    );
 }
 
 /// A command line that reports `spinning <pid>` as it starts and holds until a line arrives on
@@ -6221,10 +6256,10 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
         "the share is the window's CPU over its wall time: {:?} of {opened:?} and {busy:?}",
         window_shares(&opened, &busy)
     );
-    let accounted = accounted_us(&busy);
+    let busy_us = accounted_us(&busy);
     assert!(
-        (burned..burned + SLACK_US).contains(&accounted),
-        "the job's {accounted} us hold the {burned} us its leader burned"
+        busy_us >= burned,
+        "the job's {busy_us} us hold the {burned} us its leader burned"
     );
     let read_again = handle.resources(job_id).await.unwrap();
     measured_share(&read_again);
@@ -6275,10 +6310,10 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
         "the idle share is the new window's: {:?} of {ticked:?} and {idle:?}",
         window_shares(&ticked, &idle)
     );
-    let accounted = accounted_us(&idle);
+    let idle_us = accounted_us(&idle);
     assert!(
-        (burned..burned + SLACK_US).contains(&accounted),
-        "the job's {accounted} us hold the {burned} us its leader burned"
+        idle_us >= burned,
+        "the job's {idle_us} us hold the {burned} us its leader burned"
     );
 
     let leader = leader.exit();
@@ -6295,7 +6330,12 @@ async fn a_busy_job_reads_its_measured_cpu_share_and_its_busy_leader_as_leaf() {
         Some(terminal),
         "the sealed sample keeps the measured share and leaf"
     );
-    reap(leader);
+    let total = reaped_cpu_us(leader);
+    assert!(
+        busy_us.max(idle_us) <= total + WAIT4_TRUNCATION_US,
+        "the job's {busy_us} and {idle_us} us are its leader's alone: the kernel reaped it at \
+         {total} us"
+    );
 }
 
 /// When a forked child does the work, the leaf is that child: the observed process with the most
@@ -6374,7 +6414,7 @@ async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
     let reaped = handle.resources(job_id).await.unwrap();
     let accounted = accounted_us(&reaped);
     assert!(
-        (burned..burned + SLACK_US).contains(&accounted),
+        accounted >= burned,
         "reaped, the child's {burned} us are in the source's {accounted} us"
     );
     assert!(
@@ -6392,7 +6432,11 @@ async fn a_busy_child_is_the_leaf_until_the_census_no_longer_covers_the_job() {
     let leader = leader.exit();
     complete(&job, b"", b"", ExitStatus::Exited { code: 0 }).await;
     handle.wait(job_id).await.unwrap();
-    reap(leader);
+    let total = reaped_cpu_us(leader);
+    assert!(
+        accounted <= total + WAIT4_TRUNCATION_US,
+        "the source's {accounted} us hold the child once: the kernel reaped the tree at {total} us"
+    );
 }
 
 /// Linux has no job accounting source until a job runs in its own cgroup: a sample of an owned
