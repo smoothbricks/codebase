@@ -10,6 +10,7 @@
     "src/cargo-resolve-cache.test.ts": 11421,
     "src/executors/bounded-exec/ram-temp.test.ts": 10766,
     "src/producer-receipts.test.ts": 10581,
+    "src/typescript-resolution.test.ts": 10482,
     "src/executors/napi-cross-toolchain/executor.test.ts": 10474,
     "src/nx-daemon-claim.test.ts": 9477,
     "src/cargo-source-hash.test.ts": 9179,
