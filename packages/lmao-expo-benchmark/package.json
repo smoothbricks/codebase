@@ -68,7 +68,8 @@
         ],
         "inputs": [
           "default",
-          "pluginScenarioSources"
+          "pluginScenarioSources",
+          "bunToolchain"
         ],
         "options": {
           "command": "bun test --timeout=0 src",
