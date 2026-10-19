@@ -1,7 +1,10 @@
 //! Developer package bindings carried by a mint and kept across package-manager installs.
 //! The snapshot grants nothing: only the mint may add its captured canonical sibling targets
-//! to controller-owned read grants. Job and package-manager snapshots restore existing entries.
+//! to controller-owned read grants. Job and package-manager snapshots restore existing entries,
+//! except a link the managed declaration made and no longer names: that link is the declaration's,
+//! so no snapshot keeps it and an install leaves the version it installs.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io;
@@ -22,6 +25,11 @@ pub const ROOT_ENV: &str = "COWSHED_PACKAGE_MANAGER_ROOT";
 /// leads PATH after shell activation (15_capabilities.md, "Bootstrap executables").
 pub const MANAGER_BIN_ENV: &str = "COWSHED_MANAGER_BIN";
 pub const INSTALL_OBSERVED_ENV: &str = "COWSHED_INSTALL_OBSERVED";
+
+/// The managed declaration's receipts, relative to the checkout: one row per alias
+/// `smoo.developerLinks` linked, with the exact link text it wrote (`DECLARED_RECORD` in the
+/// managed `tooling/direnv/developer-links.ts`; cli README, "Declared Links").
+const DECLARED_RECORD: &str = "node_modules/.smoo-declared-links";
 
 /// The shared package-store roots a checkout's installers write to. A link into one is the
 /// installer's own entry, never a developer binding. Classification only: a root grants no read.
@@ -126,7 +134,15 @@ fn environment_root(home: &SharedToolHome) -> Option<PathBuf> {
 #[derive(Debug, Default)]
 pub struct DeveloperLinks {
     links: Vec<DeveloperLink>,
+    /// Links `smoo.developerLinks` made and no longer names: never restored, only said.
+    released: Vec<ReleasedLink>,
     stores: PackageStores,
+}
+
+#[derive(Debug)]
+struct ReleasedLink {
+    at: PathBuf,
+    target: PathBuf,
 }
 
 #[derive(Debug)]
@@ -183,8 +199,10 @@ impl DeveloperLinks {
     pub fn capture(root: &Path, mode: CaptureMode, stores: PackageStores) -> Result<Self> {
         let root = fs::canonicalize(root).map_err(|error| link_error(root, error))?;
         let volume = build_volume(&root)?;
+        let released = released_links(&root)?;
         let mut snapshot = Self {
             links: Vec::new(),
+            released: Vec::new(),
             stores,
         };
         crate::capabilities::installed_javascript_trees(&root, |tree| {
@@ -205,10 +223,16 @@ impl DeveloperLinks {
                         fs::read_dir(&scope).map_err(|error| link_error(&scope, error))?
                     {
                         let package = package.map_err(|error| link_error(&scope, error))?;
-                        snapshot.capture_entry(&root, volume.as_deref(), package, mode)?;
+                        snapshot.capture_entry(
+                            &root,
+                            volume.as_deref(),
+                            &released,
+                            package,
+                            mode,
+                        )?;
                     }
                 } else if kind.is_symlink() {
-                    snapshot.capture_entry(&root, volume.as_deref(), entry, mode)?;
+                    snapshot.capture_entry(&root, volume.as_deref(), &released, entry, mode)?;
                 }
             }
             snapshot.capture_executables(&root, tree, mode)?;
@@ -222,11 +246,14 @@ impl DeveloperLinks {
 
     /// `volume` is the physical build volume `root` reaches through its build link: the checkout's
     /// own build state, declared state included, lives there (16_build_volumes.md), so a product
-    /// a contained link reaches through it is owned like one beneath `root`.
+    /// a contained link reaches through it is owned like one beneath `root`. `released` holds the
+    /// receipts of links the declaration no longer names; a link still spelled as its receipt
+    /// records is the declaration's own and is released rather than captured.
     fn capture_entry(
         &mut self,
         root: &Path,
         volume: Option<&Path>,
+        released: &BTreeMap<PathBuf, PathBuf>,
         entry: fs::DirEntry,
         mode: CaptureMode,
     ) -> Result<()> {
@@ -240,6 +267,13 @@ impl DeveloperLinks {
         }
         let target = fs::read_link(&at).map_err(|error| link_error(&at, error))?;
         let relative = at.strip_prefix(root).expect("the package tree is owned");
+        if released.get(relative) == Some(&target) {
+            self.released.push(ReleasedLink {
+                at: relative.to_owned(),
+                target,
+            });
+            return Ok(());
+        }
         let parent = relative.parent().expect("a package link has a parent");
         let resolved = crate::inherited_links::resolve_in_source(root, parent, &target);
         // Bun and pnpm's own package-store entries are installer state, not developer choices.
@@ -373,6 +407,7 @@ impl DeveloperLinks {
     }
 
     pub fn restore(&self, root: &Path, mode: RestoreMode) -> Result<Vec<String>> {
+        self.say_released(root)?;
         if self.is_empty() {
             return Ok(Vec::new());
         }
@@ -395,6 +430,23 @@ impl DeveloperLinks {
         crate::build_volume::discard::reap(root);
         Ok(findings)
     }
+
+    /// Names each released link the job or install displaced. Restoration never touches a
+    /// released alias, so this reads the state the installer left.
+    fn say_released(&self, root: &Path) -> Result<()> {
+        for link in &self.released {
+            let at = root.join(&link.at);
+            let current = current_target(&at).map_err(|error| link_error(&at, error))?;
+            if current.as_deref() != Some(link.target.as_os_str().as_bytes()) {
+                eprintln!(
+                    "cowshed: developer link {} -> {} is not restored: smoo.developerLinks no longer declares its package",
+                    link.at.display(),
+                    link.target.display()
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 fn link_error(path: &Path, error: impl std::fmt::Display) -> CowshedError {
@@ -414,6 +466,63 @@ fn build_volume(root: &Path) -> Result<Option<PathBuf>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(link_error(&link, error)),
     }
+}
+
+/// One row of `DECLARED_RECORD`; its `declaration` field is the managed script's own.
+#[derive(serde::Deserialize)]
+struct Receipt {
+    path: String,
+    target: PathBuf,
+}
+
+/// The receipts of links `smoo.developerLinks` made and no longer names, by alias, each with the
+/// link text the declaration wrote: the same rule `keepDeveloperLinks` applies before an install
+/// (cli README, "Declared Links"). A checkout without receipts reads no manifest. Malformed
+/// ownership is an error, never no ownership, as in the managed script's `readDeclaredRecord`.
+fn released_links(root: &Path) -> Result<BTreeMap<PathBuf, PathBuf>> {
+    let record = root.join(DECLARED_RECORD);
+    let bytes = match fs::read(&record) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(link_error(&record, error)),
+    };
+    let receipts: Vec<Receipt> =
+        serde_json::from_slice(&bytes).map_err(|error| link_error(&record, error))?;
+    if receipts.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let manifest = root.join("package.json");
+    let manifest_bytes = fs::read(&manifest).map_err(|error| link_error(&manifest, error))?;
+    let manifest_value: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| link_error(&manifest, error))?;
+    let declared = match manifest_value
+        .get("smoo")
+        .and_then(|smoo| smoo.get("developerLinks"))
+    {
+        None => None,
+        Some(serde_json::Value::Object(declared)) => Some(declared),
+        Some(_) => {
+            return Err(link_error(
+                &manifest,
+                "smoo.developerLinks must map package names to checkout directories",
+            ));
+        }
+    };
+    let mut released = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for Receipt { path, target } in receipts {
+        if !seen.insert(path.clone()) {
+            return Err(link_error(&record, format!("duplicate receipt for {path}")));
+        }
+        // The package an alias stands for in its tree: `name` or `@scope/name`.
+        let package = path
+            .rsplit_once("node_modules/")
+            .map_or(path.as_str(), |(_, package)| package);
+        if declared.is_none_or(|declared| !declared.contains_key(package)) {
+            released.insert(PathBuf::from(path), target);
+        }
+    }
+    Ok(released)
 }
 
 /// The installer's own entries: a link into the checkout's own `.bun`/`.pnpm`, or into a shared
@@ -1117,6 +1226,7 @@ mod tests {
                 target: target.clone(),
                 binding: Binding::Unclassified,
             }],
+            released: Vec::new(),
             stores: PackageStores::default(),
         };
         assert_eq!(links.sibling_targets().count(), 0);
@@ -1181,6 +1291,143 @@ mod tests {
         );
     }
 
+    /// A checkout whose root manifest declares `links` as `smoo.developerLinks`, with Bun's store
+    /// entry for `@scope/dev` and its alias linked to that entry, as a fresh install leaves it.
+    fn declaring_checkout(scratch: &Path, links: &str) -> PathBuf {
+        let root = scratch.join("checkout");
+        fs::create_dir_all(root.join(STORE_ENTRY)).unwrap();
+        fs::create_dir_all(root.join("node_modules/@scope")).unwrap();
+        declare(&root, links);
+        for args in [&["init", "--quiet"][..], &["add", "package.json"]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status_locked()
+                    .unwrap()
+                    .success()
+            );
+        }
+        relink(STORE_LINK, &root.join("node_modules/@scope/dev"));
+        root
+    }
+
+    const STORE_ENTRY: &str = "node_modules/.bun/@scope+dev@1.0.0/node_modules/@scope/dev";
+    /// The alias text Bun writes for `@scope/dev`: its store entry, from `node_modules/@scope`.
+    const STORE_LINK: &str = "../.bun/@scope+dev@1.0.0/node_modules/@scope/dev";
+
+    fn declare(root: &Path, links: &str) {
+        fs::write(
+            root.join("package.json"),
+            format!("{{\"smoo\":{{\"developerLinks\":{links}}}}}\n"),
+        )
+        .unwrap();
+    }
+
+    fn relink(target: impl AsRef<Path>, at: &Path) {
+        match fs::remove_file(at) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!("{error}"),
+        }
+        symlink(target, at).unwrap();
+    }
+
+    /// What `developer-links.ts` records for each alias it linked (`writeDeclaredRecord`).
+    fn record(root: &Path, receipts: &[(&str, &str, &Path)]) {
+        let rows: Vec<_> = receipts
+            .iter()
+            .map(|(path, declaration, target)| {
+                serde_json::json!({ "path": path, "declaration": declaration, "target": target })
+            })
+            .collect();
+        fs::write(
+            root.join(DECLARED_RECORD),
+            format!("{}\n", serde_json::Value::Array(rows)),
+        )
+        .unwrap();
+    }
+
+    /// Declare a link, install, stop declaring it, install again: the second install leaves the
+    /// lockfile's version, and neither the wrapper's snapshot nor the job's terminal cleanup puts
+    /// the dropped link back. Each install is what lands on disk under a covered `bun install`:
+    /// the wrapper's snapshot, Bun re-pointing the alias at its store entry, then the managed
+    /// postinstall linking each declared alias and recording its receipt.
+    #[test]
+    fn a_link_the_declaration_no_longer_names_is_not_restored_by_the_next_install() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-undeclared");
+        let sibling = scratch.join("sibling");
+        fs::create_dir_all(&sibling).unwrap();
+        let root = declaring_checkout(&scratch, r#"{"@scope/dev":"../sibling"}"#);
+        let alias = root.join("node_modules/@scope/dev");
+        let install = |postinstall: &dyn Fn()| {
+            let links = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap();
+            relink(STORE_LINK, &alias);
+            postinstall();
+            links.restore(&root, RestoreMode::CoveredInstall).unwrap();
+        };
+        let link_declared = || {
+            relink(&sibling, &alias);
+            record(
+                &root,
+                &[("node_modules/@scope/dev", "../sibling", &sibling)],
+            );
+        };
+
+        install(&link_declared);
+        assert_eq!(fs::read_link(&alias).unwrap(), sibling);
+
+        declare(&root, "{}");
+        let job = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap();
+        install(&|| {});
+        assert_eq!(fs::read_link(&alias).unwrap(), Path::new(STORE_LINK));
+        let findings = job
+            .restore(&root, RestoreMode::JobTerminalObservedInstall)
+            .unwrap();
+        assert!(findings.is_empty());
+        assert_eq!(fs::read_link(&alias).unwrap(), Path::new(STORE_LINK));
+    }
+
+    /// The converse, under an install whose postinstall did not run (`--ignore-scripts`): the
+    /// declared link comes back from the snapshot, and so do the developer's own links, one with
+    /// no receipt and one retargeted away from its receipt's text, declared or not.
+    #[test]
+    fn declared_and_developer_links_survive_an_install() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-declared");
+        let [sibling, manual, retargeted] = ["sibling", "manual", "retargeted"].map(|name| {
+            let directory = scratch.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            directory
+        });
+        let root = declaring_checkout(&scratch, r#"{"@scope/dev":"../sibling"}"#);
+        let alias = root.join("node_modules/@scope/dev");
+        relink(&sibling, &alias);
+        relink(&manual, &root.join("node_modules/manual"));
+        relink(&retargeted, &root.join("node_modules/retargeted"));
+        record(
+            &root,
+            &[
+                ("node_modules/@scope/dev", "../sibling", &sibling),
+                ("node_modules/retargeted", "../old", &scratch.join("old")),
+            ],
+        );
+        let links = DeveloperLinks::capture_job(&root, fixture_stores(&root)).unwrap();
+        assert_eq!(links.links.len(), 3);
+        relink(STORE_LINK, &alias);
+        fs::remove_file(root.join("node_modules/manual")).unwrap();
+        fs::remove_file(root.join("node_modules/retargeted")).unwrap();
+        links.restore(&root, RestoreMode::CoveredInstall).unwrap();
+        assert_eq!(fs::read_link(&alias).unwrap(), sibling);
+        assert_eq!(
+            fs::read_link(root.join("node_modules/manual")).unwrap(),
+            manual
+        );
+        assert_eq!(
+            fs::read_link(root.join("node_modules/retargeted")).unwrap(),
+            retargeted
+        );
+    }
+
     /// Restores are grouped by held parent: a parent with a changed entry is synced once, and a
     /// parent whose links already name their targets is not synced at all.
     #[test]
@@ -1199,6 +1446,7 @@ mod tests {
                     binding: Binding::Unclassified,
                 })
                 .collect(),
+            released: Vec::new(),
             stores: PackageStores::default(),
         };
         take_syncs();

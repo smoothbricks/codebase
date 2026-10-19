@@ -160,7 +160,11 @@ Each detector returns data through one `CapabilityContribution`:
   `add`, `remove`, `update`. Other invocations execute the recorded program directly, without guessing another CLI or
   changing explicit relinks. The wrapper snapshots live developer package links and their executable aliases before the
   install, and restores them before returning its actual exit or signal, so `bun install && nx ...` uses those links in
-  one job.
+  one job. A link the declaration made and no longer names, one whose text still matches its
+  `node_modules/.smoo-declared-links` receipt while the root manifest's `smoo.developerLinks` no longer names its
+  package, is the declaration's and not a developer link (packages/cli/README.md, "Declared Links"): no snapshot
+  captures it, so neither the wrapper nor terminal cleanup restores it, the install leaves the version it installs, and
+  the wrapper names it on stderr.
 
   The supervisor uses the same snapshot/restore implementation at job admission and terminal cleanup, including failed
   or killed installs. Terminal cleanup has two distinct failures, each labelled in the sealed job's stderr: a link
