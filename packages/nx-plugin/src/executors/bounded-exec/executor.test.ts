@@ -132,7 +132,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     // The command never exits, so only the ceiling under test can end it.
     const result = await runBoundedExec(
-      { command: 'node -e "setInterval(() => {}, 1 << 30)"', timeoutMs: 50, killAfterMs: 0 },
+      { command: 'node -e "process.stdin.resume()"', timeoutMs: 50, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -150,7 +150,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     // The command never exits and never speaks, so only the progress bound under test can end it.
     const result = await runBoundedExec(
-      { command: 'node -e "setInterval(() => {}, 1 << 30)"', idleTimeoutMs: 100, killAfterMs: 0 },
+      { command: 'node -e "process.stdin.resume()"', idleTimeoutMs: 100, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -520,7 +520,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         '  process.exit(0);',
         '});',
         "fs.writeFileSync('cooperative-ready.fifo', 'ready pid=' + process.pid + '\\n');",
-        'setInterval(() => {}, 1 << 30);',
+        'process.stdin.resume();',
         '',
       ].join('\n'),
     );
@@ -594,7 +594,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       },
     };
     const result = await runBoundedExec(
-      { command: 'node -e "setInterval(() => {}, 1 << 30)"', timeoutMs: 50, killAfterMs: 10 },
+      { command: 'node -e "process.stdin.resume()"', timeoutMs: 50, killAfterMs: 10 },
       workspace.context,
       killer,
       null,
@@ -672,7 +672,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         "const fs = require('node:fs');",
         "fs.openSync('descendant-lifetime.fifo', 'w');",
         "fs.writeFileSync('descendant-ready.fifo', 'ready pid=' + process.pid + '\\n');",
-        'setInterval(() => {}, 1 << 30);',
+        // Its stdin is /dev/null, so it holds itself: a wait no event ever ends, until a signal does.
+        'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
         '',
       ].join('\n'),
     );
@@ -681,7 +682,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       [
         "import { spawn } from 'node:child_process';",
         "spawn(process.execPath, ['group-child.js'], { stdio: 'ignore' });",
-        'setInterval(() => {}, 1 << 30);',
+        'process.stdin.resume();',
         '',
       ].join('\n'),
     );

@@ -132,13 +132,14 @@ describe('bounded-exec verdicts', () => {
   });
 
   it('records the total bound as a bound and the progress bound as a wedge', async () => {
-    expect(await verdictOf('node -e "setInterval(() => console.log(1), 10)"', { timeoutMs: 200 })).toMatchObject({
+    // Each command holds on its stdin, which bounded-exec keeps open and never writes: it never exits, so only the
+    // bound under test can end it.
+    expect(await verdictOf('node -e "process.stdin.resume()"', { timeoutMs: 200 })).toMatchObject({
       outcome: 'bound',
       bound: 'total',
       limitMs: 200,
     });
-    // A command that never exits and never speaks: nothing but the progress bound can end it.
-    expect(await verdictOf('node -e "setInterval(() => {}, 1 << 30)"', { idleTimeoutMs: 100 })).toMatchObject({
+    expect(await verdictOf('node -e "process.stdin.resume()"', { idleTimeoutMs: 100 })).toMatchObject({
       outcome: 'wedged',
       idleMs: 100,
       tests: [],
@@ -316,7 +317,7 @@ process.on('SIGTERM', () => {
   process.exit(143);
 });
 fs.writeFileSync('runner-ready.fifo', 'ready pid=' + process.pid + '\\n');
-setInterval(() => console.log('running'), 10);
+process.stdin.resume();
 `;
     let armed: Promise<void> | undefined;
     let report = '';
