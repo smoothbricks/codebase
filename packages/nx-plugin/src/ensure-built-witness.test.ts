@@ -16,6 +16,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import fc from 'fast-check';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import { expandOutputs, WorkspaceContext } from 'nx/src/native';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory';
@@ -31,6 +32,7 @@ import {
   readGraphWitness,
   reusableGraph,
   snapshotsEqual,
+  stampMove,
   workspaceSnapshot,
   writeWitness,
 } from './ensure-built-witness.js';
@@ -531,5 +533,35 @@ describe('installed graph input identity', () => {
     expect(
       graphInstallationIdentity(root, { plugins: ['@smoothbricks/nx-plugin'] }, resolver, expandOutputs, null),
     ).toBeNull();
+  });
+});
+
+// The classification every tool-node reader shares, over generated stat fields rather than a filesystem: no clock
+// tick, timestamp granularity or concurrent install decides these verdicts, so they are the same on every platform.
+describe('a stamp move is judged by the two stamps alone', () => {
+  const u64 = fc.bigInt({ min: 0n, max: 2n ** 64n - 1n });
+  const fields = fc.record({ dev: u64, ino: u64, mode: u64, size: u64, mtimeNs: u64, ctimeNs: u64 });
+  const identity = fc.constantFrom('dev', 'ino', 'mode', 'size', 'mtimeNs');
+
+  it('reads a node whose stamp is unchanged as the same node', () => {
+    fc.assert(fc.property(fields, (stats) => stampMove(nodeStamp(stats), nodeStamp(stats)) === 'same'));
+  });
+
+  it('reads a move of the ctime alone as a ctime move, in either direction and at any distance', () => {
+    fc.assert(
+      fc.property(fields, u64, (stats, ctimeNs) => {
+        fc.pre(ctimeNs !== stats.ctimeNs);
+        return stampMove(nodeStamp(stats), nodeStamp({ ...stats, ctimeNs })) === 'ctime';
+      }),
+    );
+  });
+
+  it('reads a move of device, inode, mode, size or mtime as moved, whatever the ctime did', () => {
+    fc.assert(
+      fc.property(fields, identity, u64, u64, (stats, field, value, ctimeNs) => {
+        fc.pre(value !== stats[field]);
+        return stampMove(nodeStamp(stats), nodeStamp({ ...stats, [field]: value, ctimeNs })) === 'moved';
+      }),
+    );
   });
 });

@@ -26,9 +26,24 @@ interface InstalledPackageManifest {
   readonly packageJson: PackageJson;
 }
 
+/** The stat fields a node's identity is read from. */
+export type StampFields = Pick<BigIntStats, 'dev' | 'ino' | 'mode' | 'size' | 'mtimeNs' | 'ctimeNs'>;
+
 /** Identity of a previously read node, not a timestamp freshness threshold. */
-export function nodeStamp(stats: BigIntStats): string {
+export function nodeStamp(stats: StampFields): string {
   return `${stats.dev}:${stats.ino}:${stats.mode}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+}
+
+/**
+ * How an observed stamp compares with the recorded one: `same`; `ctime` when device, inode, mode, size and mtime are
+ * kept and only the ctime moved (a same-mode chmod, which Bun's bin linking does to a shared store file on any
+ * checkout's install); otherwise `moved`. A function of the two stamps alone, so no filesystem or clock decides it.
+ */
+export function stampMove(recorded: string, observed: string): 'same' | 'ctime' | 'moved' {
+  if (observed === recorded) return 'same';
+  // nodeStamp ends with the ctime: everything before it is the identity a same-mode chmod keeps.
+  const kept = observed.slice(0, observed.lastIndexOf(':')) === recorded.slice(0, recorded.lastIndexOf(':'));
+  return kept ? 'ctime' : 'moved';
 }
 
 export interface NodeWitness {
@@ -133,11 +148,9 @@ export function movedNodes(
   const moved: string[] = [];
   for (const node of nodes) {
     try {
-      const stamp = nodeStamp(lstatSync(node.path, { bigint: true }));
-      if (stamp === node.stamp) continue;
-      // nodeStamp ends with the ctime: everything before it is the identity a same-mode chmod keeps.
-      const kept = stamp.slice(0, stamp.lastIndexOf(':')) === node.stamp.slice(0, node.stamp.lastIndexOf(':'));
-      if (!kept || !same(node.path)) moved.push(node.path);
+      const move = stampMove(node.stamp, nodeStamp(lstatSync(node.path, { bigint: true })));
+      if (move === 'same') continue;
+      if (move === 'moved' || !same(node.path)) moved.push(node.path);
     } catch (error) {
       if (!systemError(error)) throw error;
       moved.push(`${node.path} (${error.code})`);
