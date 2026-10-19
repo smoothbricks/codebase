@@ -275,9 +275,9 @@ The `@smoothbricks/nx-plugin:cargo-resolve` diagnostics channel reports `{ phase
 joins an existing flight. With no subscribers, inference neither allocates nor publishes an event. The cache regressions
 use this readiness signal and Cargo control-channel events to prove concurrency and child teardown without sleep-based
 timing assumptions; their outer hang guards report still-open test spans and process/gate state. The counted Cargo
-fixture delegates to the command selected before its shim was installed, with that original search path. An installed
-jobserver launcher remains in the chain; it must not rediscover the counted shim and recursively enter the broker. The
-real-producer regression covers both counted metadata and forwarded workspace discovery, with one metadata child.
+fixture delegates to the command selected before its shim was installed, with that original search path, so nothing it
+starts rediscovers the counted shim and recursively enters the broker. The real-producer regression covers both counted
+metadata and forwarded workspace discovery, with one metadata child.
 
 Keep workspace-owned runtime state outside Nx's source index. The root `.nxignore` ignores every dot path with `.*` and
 re-includes each tracked dot input by its dot-named prefix, such as `!/.github` or `!/packages/lmao/.cargo`: a dot-named
@@ -1453,31 +1453,42 @@ per core, whatever `--jobs` says), a cargo build one per core, anything else one
 bounded by positive inherited `NEXTEST_TEST_THREADS`/`CARGO_BUILD_JOBS` ceilings. A configured count can lower an
 inherited ceiling, never raise it. The runner uses `min(bounded request, granted tokens)`: nextest's environment and
 named flag, Bun's parallel flag, Stryker's, Vitest's and go's worker flag (added when the command names none),
-cargo-mutants' jobserver tasks, `--jobs` and per-process test threads, and Cargo's jobs are sized to that limit. A
-runner that starts its own workers or jobserver (cargo-mutants, Stryker, Vitest, `go test`) ignores the `cargo`
-launcher's fifo, so it must run under `bounded-exec`; the inferred `mutation` target does. Cargo's `RUST_TEST_THREADS`
-retains its independent inherited/configured ceiling. `BOUNDED_EXEC_CPU_TOKENS`, the sub-ledger and telemetry still name
-the actual held grant. The gateway shares tokens fairly between checkouts (Nx workspace roots). `timeoutMs` and
-`idleTimeoutMs` start at the grant. The tokens go back when the command exits, or with the executor's socket when it is
-killed. The wait prints one `cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. On a host whose
-gateway socket does not exist (a CI runner, a machine without cowshed), the plugin's `preTasksExecution` serves each Nx
-run that inherits no pool its own `BOUNDED_EXEC_CPU_POOL` of one token per core, and `postTasksExecution` closes it: the
-run's targets, started side by side under `NX_PARALLEL=100%`, queue for its cores instead of each sizing its runner to
-the whole host (`specs/cowshed/05_gateway.md`, "A run without a gateway budgets itself"). Its scope is one run. A
-command no pool and no gateway answers runs exactly as configured and nothing is said; a gateway from before the budget
-runs it unbudgeted and stderr says so.
+cargo-mutants' jobserver tasks, `--jobs` and per-process test threads, and a cargo build's libtest and nextest test
+threads are sized to that limit. Cargo's rustc count needs no flag: the run's sub-pool is a GNU make jobserver fifo that
+`CARGO_MAKEFLAGS` and `MAKEFLAGS` name, so Cargo, its build scripts and every nested `cargo` share the grant's count
+with the sub-pool's socket children, and no grant sets `CARGO_BUILD_JOBS`. A command whose runner the executor cannot
+see (a script) gets `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS` set to its whole held grant, since test threads take
+no jobserver token. A runner that starts its own workers or jobserver (cargo-mutants, Stryker, Vitest, `go test`)
+ignores that fifo, so it must run under `bounded-exec`, whose runner kinds size its own flag; the inferred `mutation`
+target does. Test threads retain their independent inherited/configured ceilings. `BOUNDED_EXEC_CPU_TOKENS`, the
+sub-ledger and telemetry still name the actual held grant. The gateway shares tokens fairly between checkouts (Nx
+workspace roots). `timeoutMs` and `idleTimeoutMs` start at the grant. The tokens go back when the command exits, or with
+the executor's socket when it is killed. The wait prints one
+`cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. On a host whose gateway socket does not exist
+(a CI runner, a machine without cowshed), the plugin's `preTasksExecution` serves each Nx run that inherits no pool its
+own `BOUNDED_EXEC_CPU_POOL` of one token per core, with its jobserver fifo in `CARGO_MAKEFLAGS` for the Cargo that
+`nx:run-commands` starts, and `postTasksExecution` closes it: the run's targets, started side by side under
+`NX_PARALLEL=100%`, queue for its cores instead of each sizing its runner to the whole host
+(`specs/cowshed/05_gateway.md`, "A run without a gateway budgets itself"). Its scope is one run. A command no pool and
+no gateway answers runs exactly as configured and nothing is said; a gateway from before the budget runs it unbudgeted
+and stderr says so.
 
-A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual token count. A nested default executor asks
-that immediate parent pool for its own demand, instead of taking from the host while the parent holds its grant; the
-pool grants at most what it can. A lent pool accounts for siblings together; each admitted child serves only its own
-allocation to grandchildren. Closing a child's connection returns its local allocation, never the parent's upstream
-grant. Upstream loss revokes the downstream pool, so a dead parent grants nothing more; a command whose grant closes
-while it runs (a gateway restart, or the lending parent's exit) runs on over budget to its own exit, and stderr says
-`cowshed: cpu-tokens grant ended`. A bare count or absent endpoint follows normal host admission. A connected parent
-pool's refusal or protocol failure instead fails admission: taking from the host then could wait on the parent's own
-grant. `options.env` cannot inject either marker. Parent-pool grants record `cpu.inherited: true` and their actual local
-wait; the span also says `inherited=true`. Pool setup, listener and cleanup errors fail rather than bypassing
-accounting. Command bounds stay unchanged.
+A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual token count, and the same count as a make
+jobserver fifo beside it: `g − 1` token bytes, the command holding the implicit first, which the pool lends a socket
+child only once the fifo is empty. A socket grant takes fifo bytes first and that slot last, and its release writes the
+bytes back; the pool waits for a fifo byte on the event loop, so a token Cargo writes back wakes the queued child. Its
+close drains and removes the fifo. A nested default executor asks that immediate parent pool for its own demand, instead
+of taking from the host while the parent holds its grant; the pool grants at most what it can. A lent pool accounts for
+siblings together; each admitted child serves only its own allocation to grandchildren. Closing a child's connection
+returns its local allocation, never the parent's upstream grant. Upstream loss revokes the downstream pool, so a dead
+parent grants nothing more; a command whose grant closes while it runs (a gateway restart, or the lending parent's exit)
+runs on over budget to its own exit, and stderr says `cowshed: cpu-tokens grant ended`. A bare count or absent endpoint
+follows normal host admission. A connected parent pool's refusal or protocol failure instead fails admission: taking
+from the host then could wait on the parent's own grant. `options.env` cannot inject either marker, nor a jobserver
+(`CARGO_MAKEFLAGS`, `MAKEFLAGS`, `MFLAGS`); a parent make's jobserver the executor inherits still reaches an ungranted
+command. Parent-pool grants record `cpu.inherited: true` and their actual local wait; the span also says
+`inherited=true`. Pool setup, listener and cleanup errors fail rather than bypassing accounting. Command bounds stay
+unchanged.
 
 The absent-parent fixture uses the executor's injectable budget with a real, controlled outer pool as its backing. It
 proves a positive allocation and re-acquires it after the command ends, rather than depending on free tokens in the

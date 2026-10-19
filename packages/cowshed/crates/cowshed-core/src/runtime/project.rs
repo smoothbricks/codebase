@@ -17334,9 +17334,9 @@ fn validate_grant_sandbox(config: &crate::sandbox::SandboxConfig) -> Result<()> 
             error.to_string(),
             "repair the named deny path and retry",
         ),
-        crate::sandbox::SandboxError::InstalledCargo { .. } => CowshedError::environment_missing(
+        crate::sandbox::SandboxError::InstalledCowshed { .. } => CowshedError::environment_missing(
             error.to_string(),
-            "repair the installed cowshed and cargo links, then rerun cowshed setup",
+            "repair the installed cowshed link, then rerun cowshed setup",
         ),
     })
 }

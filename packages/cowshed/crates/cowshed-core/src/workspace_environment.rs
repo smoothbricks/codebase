@@ -43,7 +43,7 @@ pub enum WorkspaceEnvironmentError {
     UnexportableTempDir(std::path::PathBuf),
     #[error("workspace capability variable {0} cannot be exported as UTF-8 shell text")]
     UnexportableCapability(&'static str),
-    #[error("installed cargo directory {0:?} cannot be exported as UTF-8 shell text")]
+    #[error("installed cowshed directory {0:?} cannot be exported as UTF-8 shell text")]
     UnexportableInstalledDirectory(std::path::PathBuf),
     #[error(transparent)]
     Publication(#[from] MetadataError),

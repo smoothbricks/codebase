@@ -31,6 +31,9 @@ describe('a run without a gateway', () => {
       throw new Error(`the run published no pool: ${JSON.stringify(env)}`);
     }
     expect(pool.tokens).toBe(4);
+    // A Cargo that Nx's own `nx:run-commands` starts reads the same count through the run's jobserver fifo.
+    expect(env.CARGO_MAKEFLAGS).toMatch(/^-j --jobserver-auth=fifo:\/\S+$/);
+    expect(env.MAKEFLAGS).toBe(env.CARGO_MAKEFLAGS);
     // Nightly 477's shape: two mutation sweeps, each asking for the whole host. The first holds the run's cores;
     // the second queues for them instead of starting a second host's worth of workers beside it.
     const first = await takeParentCpuTokens(pool, 31);

@@ -22,7 +22,7 @@ use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap}
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
-use cowshed_core::runtime::job_cpu::{JobCpuAdmission, JobCpuAsk, JobCpuGrant};
+use cowshed_core::runtime::job_cpu::{HeldTokens, JobCpuAdmission, JobCpuAsk, JobCpuGrant};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
@@ -465,8 +465,16 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
     }
 }
 
-/// The pool every test grant names; nothing in these tests connects to it.
+/// The pool and jobserver fifo every test grant names; nothing in these tests connects to them.
 const TEST_POOL: &str = "/nonexistent/cowshed-test-cpu-pool.sock";
+const TEST_FIFO: &str = "/nonexistent/cowshed-test-cpu-pool.fifo";
+
+fn held(tokens: NonZeroUsize) -> HeldTokens {
+    HeldTokens {
+        tokens,
+        fifo: PathBuf::from(TEST_FIFO),
+    }
+}
 
 /// The gateway's CPU budget for these tests: each request is granted its whole want at once, so
 /// a job spawns as soon as it is admitted; a resident is granted its pool alone, as the gateway
@@ -483,7 +491,7 @@ impl JobCpuAdmission for ImmediateCpu {
                     JobCpuGrant::resident(pool, Box::new(()))
                 }
                 ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
-                    JobCpuGrant::new(ask.want, pool, Box::new(()))
+                    JobCpuGrant::new(held(ask.want), pool, Box::new(()))
                 }
             })
         })
@@ -540,7 +548,7 @@ impl JobCpuAdmission for ScriptedCpu {
             let tokens = answered.await.expect("the test answers each request")?;
             queued.disarm();
             Ok(JobCpuGrant::new(
-                tokens,
+                held(tokens),
                 PathBuf::from(TEST_POOL),
                 Box::new(Signal(Some(release))),
             ))
@@ -6552,7 +6560,7 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     assert_eq!(argv, &nx_daemon_start(&project));
     assert_eq!(first.request.mode, RunSandboxMode::ReadWrite);
     assert_eq!(
-        (first.request.cpu.tokens, first.request.cpu.nice),
+        (first.request.cpu.held.as_ref(), first.request.cpu.nice),
         (None, 10),
         "the daemon holds no token and runs at background nice"
     );
@@ -7918,13 +7926,13 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
     let spawned = h.spawned.recv().await.unwrap();
     assert_eq!(
         (
-            spawned.request.cpu.tokens,
+            spawned.request.cpu.held.clone(),
             spawned.request.cpu.pool.as_path(),
             spawned.request.cpu.nice,
             spawned.request.scope,
         ),
         (
-            NonZeroUsize::new(4),
+            Some(held(NonZeroUsize::new(4).unwrap())),
             Path::new(TEST_POOL),
             10,
             ExecScope::Workspace

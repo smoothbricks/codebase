@@ -12,12 +12,13 @@ import { GATEWAY_SOCKET } from './gateway-lease.js';
  * Every runner sizes itself to the whole host unless something budgets it, and without a gateway nothing did: under
  * `NX_PARALLEL=100%` Nx starts every target side by side and each one's runner takes the whole machine. The run
  * therefore serves its own pool of one token per core, as a gateway-granted executor serves its children, and every
- * task inherits it: `bounded-exec` and the `cargo` launcher take from it as from any parent pool, FIFO, the head
- * taking `min(want, free)` once one token is free, so the runners of one run together stay within the cores.
+ * task inherits it: `bounded-exec` takes from it as from any parent pool, FIFO, the head taking `min(want, free)` once
+ * one token is free, and a Cargo that Nx's own `nx:run-commands` starts reads its jobserver fifo through the
+ * `CARGO_MAKEFLAGS` the pool exports, so the runners of one run together stay within the cores.
  *
  * The run serves it only when nothing else budgets it: it inherits no pool, and the gateway's control socket does
- * not exist. Only `ENOENT` proves the gateway absent, as for the launcher; a socket that exists but does not answer
- * may be a live, saturated gateway, and a run budgeting itself beside it would count the host twice.
+ * not exist. Only `ENOENT` proves the gateway absent; a socket that exists but does not answer may be a live,
+ * saturated gateway, and a run budgeting itself beside it would count the host twice.
  */
 
 /** The pools this process serves, by Nx run id, until that run's `postTasksExecution`. */

@@ -7,15 +7,15 @@ use std::path::{Path, PathBuf};
 
 use cowshed_apfs::image::ImageCapacity;
 use cowshed_cli::launchd::{
-    BunDirectory, COWSHED_BINARY_NAME, CommandStatus, ControlAction, ControlExecutionError,
-    ControlPlan, DevenvProfile, ExecutableDigest, ExecutableInstallState, ExistingPlist,
-    FilesystemOperation, GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState,
-    InstalledExecutable, JOBSERVER_LAUNCHER_NAME, LAUNCHCTL_EXECUTABLE, LaunchAgentSpec,
-    LaunchctlCommand, LaunchctlOutput, LaunchdError, LaunchdExecutor, LaunchdFilesystem,
-    LaunchdServiceStatus, Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE,
-    SCCACHE_BINARY_NAME, SCCACHE_LABEL, STABLE_BINARY_MODE, ServiceLifecycle, StableLink,
-    StoreBackedProgram, plan_executable_install, plan_executable_remove, plan_install,
-    plan_launcher_link, plan_remove, replace_symlink,
+    BunDirectory, CARGO_LINK_NAME, COWSHED_BINARY_NAME, CommandStatus, ControlAction,
+    ControlExecutionError, ControlPlan, DevenvProfile, ExecutableDigest, ExecutableInstallState,
+    ExistingPlist, FilesystemOperation, GATEWAY_LABEL, HostStableExecutable, InstallOutcome,
+    InstallState, InstalledExecutable, LAUNCHCTL_EXECUTABLE, LaunchAgentSpec, LaunchctlCommand,
+    LaunchctlOutput, LaunchdError, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus,
+    Mutation, NativeFilesystem, PRIVATE_DIRECTORY_MODE, PRIVATE_PLIST_MODE, SCCACHE_BINARY_NAME,
+    SCCACHE_LABEL, STABLE_BINARY_MODE, ServiceLifecycle, StableLink, StoreBackedProgram,
+    plan_cargo_link_removal, plan_executable_install, plan_executable_remove, plan_install,
+    plan_remove, replace_symlink,
 };
 
 #[cfg(target_os = "macos")]
@@ -1193,39 +1193,22 @@ fn current_install() -> ExecutableInstallState {
     }
 }
 
-/// The cargo link follows the stable name, so one publication or rollback
-/// switches the launcher and daemon to the same stored build.
+/// The `cargo` link an earlier install left is removed and the directory synced, so the removal is
+/// durable; nothing is planted in its place.
 #[test]
-fn launcher_link_plan_follows_the_stable_name_beside_it() {
+fn cargo_link_removal_plan_removes_the_link_and_plants_nothing() {
     let binary_directory = PathBuf::from(BINARY_DIRECTORY);
-    let stable_name = PathBuf::from(COWSHED_BINARY_NAME);
 
     assert_eq!(
-        plan_launcher_link(&binary_directory, &StableLink::Absent).operations(),
+        plan_cargo_link_removal(&binary_directory).operations(),
         [
-            Mutation::CreateTemporarySymlink {
-                directory: binary_directory.clone(),
-                name_prefix: format!(".{JOBSERVER_LAUNCHER_NAME}.link."),
-                target: stable_name.clone(),
-            },
-            Mutation::RenameTemporaryFile {
-                destination: binary_directory.join(JOBSERVER_LAUNCHER_NAME),
+            Mutation::RemoveFile {
+                path: binary_directory.join(CARGO_LINK_NAME),
             },
             Mutation::SyncDirectory {
                 path: binary_directory.clone()
             },
         ]
-    );
-    assert!(plan_launcher_link(&binary_directory, &StableLink::To(stable_name)).is_noop());
-    assert!(!plan_launcher_link(&binary_directory, &StableLink::To(stored_name())).is_noop());
-    // A link saying any other installed executable — the Nx cache server's, as its install once
-    // left it — is repaired to `cowshed`, the only binary that answers to `cargo`.
-    assert!(
-        !plan_launcher_link(
-            &binary_directory,
-            &StableLink::To(PathBuf::from("nx-cache-server"))
-        )
-        .is_noop()
     );
 }
 

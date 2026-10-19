@@ -2572,7 +2572,14 @@ impl cowshed_core::runtime::job_cpu::JobCpuAdmission for GrantingCpu {
                 cowshed_core::api::ExecClass::Background
                 | cowshed_core::api::ExecClass::Interactive
                 | cowshed_core::api::ExecClass::Gate => {
-                    cowshed_core::runtime::job_cpu::JobCpuGrant::new(ask.want, pool, Box::new(()))
+                    cowshed_core::runtime::job_cpu::JobCpuGrant::new(
+                        cowshed_core::runtime::job_cpu::HeldTokens {
+                            tokens: ask.want,
+                            fifo: PathBuf::from("/nonexistent/cowshed-test-cpu-pool.fifo"),
+                        },
+                        pool,
+                        Box::new(()),
+                    )
                 }
             })
         })

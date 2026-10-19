@@ -26,7 +26,7 @@ use cowshed_core::api::{
 use cowshed_core::error::{ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
-use cowshed_core::runtime::job_cpu::{JobCpuAdmission, JobCpuAsk, JobCpuGrant};
+use cowshed_core::runtime::job_cpu::{HeldTokens, JobCpuAdmission, JobCpuAsk, JobCpuGrant};
 use cowshed_core::runtime::shell_host::ShellHostProgram;
 use cowshed_core::runtime::shell_pool::ShellPoolConfig;
 use cowshed_core::runtime::supervisor::{
@@ -55,8 +55,9 @@ fn shell_host() -> PathBuf {
     )
 }
 
-/// The pool every test grant names; the commands here only read its name.
+/// The pool and jobserver fifo every test grant names; the commands here only read their names.
 const TEST_POOL: &str = "/nonexistent/cowshed-test-cpu-pool.sock";
+const TEST_FIFO: &str = "/nonexistent/cowshed-test-cpu-pool.fifo";
 
 /// The gateway's CPU budget for these tests: each request is granted its whole want at once, and
 /// a resident is granted its pool alone, as the gateway answers one.
@@ -72,7 +73,11 @@ impl JobCpuAdmission for GrantingCpu {
                     JobCpuGrant::resident(pool, Box::new(()))
                 }
                 ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
-                    JobCpuGrant::new(ask.want, pool, Box::new(()))
+                    let held = HeldTokens {
+                        tokens: ask.want,
+                        fifo: PathBuf::from(TEST_FIFO),
+                    };
+                    JobCpuGrant::new(held, pool, Box::new(()))
                 }
             })
         })

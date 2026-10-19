@@ -238,7 +238,7 @@ async fn host_controller_shell_activation_owns_a_runtime_directory_the_profile_l
 }
 
 fn install_real_tool(sandbox: &SandboxConfig, name: &str) {
-    // PATH may start with the jobserver launcher; CARGO names the real driver.
+    // CARGO names the real driver Cargo ran this test with.
     let installed = match name {
         "cargo" => PathBuf::from(
             std::env::var_os("CARGO").expect("Cargo publishes its real compiler driver"),
@@ -1121,7 +1121,10 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
         mode: cowshed_core::api::RunSandboxMode::ReadWrite,
         scope: cowshed_core::api::ExecScope::Workspace,
         cpu: cowshed_core::runtime::supervisor::CpuPlacement {
-            tokens: Some(std::num::NonZeroUsize::MIN),
+            held: Some(cowshed_core::runtime::job_cpu::HeldTokens {
+                tokens: std::num::NonZeroUsize::MIN,
+                fifo: std::path::PathBuf::from("/nonexistent/cowshed-test-cpu-pool.fifo"),
+            }),
             pool: std::path::PathBuf::from("/nonexistent/cowshed-test-cpu-pool.sock"),
             nice: 10,
         },
@@ -1426,7 +1429,7 @@ async fn host_controller_cargo_discovery_asks_the_toolchain_the_dev_environment_
         &mount.join(".cowshed/bin/cargo"),
         "#!/bin/sh\necho 'the bootstrap cargo cannot read this project' >&2\nexit 101\n",
     );
-    // PATH starts with the jobserver launcher; CARGO names the real driver.
+    // CARGO names the real driver Cargo ran this test with.
     let real_cargo = std::fs::canonicalize(
         std::env::var_os("CARGO").expect("Cargo publishes its real compiler driver"),
     )
@@ -2269,11 +2272,13 @@ bun -e 'if (require("install-probe-dependency") !== 7) process.exit(1)'
     }
 }
 
-/// The managed PATH helper runs after project hooks under the real child profile.
-/// HOME stays private; only the current installed CLI copy is readable/executable.
+/// The managed PATH helper runs after project hooks under the real child profile. `cargo` is the
+/// project toolchain's own: nothing installed answers to it (05_gateway.md "Cargo reads its
+/// holder's jobserver"). HOME stays private; only the current installed CLI copy is
+/// readable/executable, through its stable name.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-async fn host_controller_managed_cargo_path_uses_the_installed_binary_with_private_home() {
+async fn host_controller_managed_cargo_is_the_toolchain_and_the_installed_cli_stays_read_only() {
     use cowshed_core::workspace_environment::EnvironmentMount;
     use sha2::Digest as _;
     use std::io::Read as _;
@@ -2329,7 +2334,6 @@ async fn host_controller_managed_cargo_path_uses_the_installed_binary_with_priva
         bin.join("cowshed"),
     )
     .expect("stable name");
-    std::os::unix::fs::symlink("cowshed", bin.join("cargo")).expect("launcher name");
     let unrelated = bin.join("unrelated-record");
     std::fs::write(&unrelated, "controller-only record").expect("unrelated installed record");
     let source_record =
@@ -2378,13 +2382,14 @@ private_home=$6
 test "$HOME" = "$private_home"
 test "$(command -v cargo)" = "$expected"
 cargo --version
+"$bin/cowshed" --version
 /usr/bin/od -An -tx1 -N4 "$installed"
 if /bin/cat "$unrelated"; then exit 91; fi
 if /bin/cat "$source_record"; then exit 92; fi
 if /bin/ls "$bin"; then exit 93; fi
 if printf 'must stay immutable' >> "$installed"; then exit 94; fi
 if /bin/mkdir "$bin/new-entry"; then exit 95; fi
-printf 'installed-launcher-first;private-home;single-binary-read-only\n'
+printf 'toolchain-cargo;private-home;single-binary-read-only\n'
 "#;
     let (exit, stdout, stderr) = run_in_sandbox(
         &sandbox,
@@ -2394,7 +2399,7 @@ printf 'installed-launcher-first;private-home;single-binary-read-only\n'
             "-c".into(),
             script.into(),
             "managed-cargo".into(),
-            bin.join("cargo").into_os_string(),
+            mount.join("toolchain/bin/cargo").into_os_string(),
             installed.into_os_string(),
             unrelated.into_os_string(),
             bin.into_os_string(),
@@ -2411,8 +2416,9 @@ printf 'installed-launcher-first;private-home;single-binary-read-only\n'
     );
     let stdout = String::from_utf8(stdout).expect("text observations");
     assert!(stdout.contains("cargo "), "{stdout}");
+    assert!(stdout.contains("cowshed "), "{stdout}");
     assert!(
-        stdout.contains("installed-launcher-first;private-home;single-binary-read-only"),
+        stdout.contains("toolchain-cargo;private-home;single-binary-read-only"),
         "{stdout}"
     );
     std::fs::remove_dir_all(root).expect("remove the completed fixture");

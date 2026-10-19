@@ -1,5 +1,17 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readSync,
+  rmSync,
+  statSync,
+  writeSync,
+} from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { connect, type Socket } from 'node:net';
 import { dirname, join } from 'node:path';
@@ -82,10 +94,15 @@ const QUEUED: PoolReply = { ok: true, lease: 'queued' };
 const pools: CpuPool[] = [];
 const sockets: Socket[] = [];
 const directories: string[] = [];
+// Descriptors a test opened on a pool's jobserver fifo, as a make-protocol client does.
+const descriptors: number[] = [];
 
 afterEach(async () => {
   for (const socket of sockets.splice(0)) {
     socket.destroy();
+  }
+  for (const fd of descriptors.splice(0)) {
+    closeSync(fd);
   }
   for (const pool of pools.splice(0)) {
     // Every pool a test leaves open is closed here, and its outcome is asserted, not dropped.
@@ -220,8 +237,59 @@ async function untilLine(stream: ReadableStream<Uint8Array>, marker: string): Pr
   reader.releaseLock();
 }
 
+/** The fifo a pool's environment names for Cargo and make, which name the same one. */
+function jobserverFifo(pool: CpuPool): string {
+  const flags = pool.environment.CARGO_MAKEFLAGS ?? '';
+  expect(pool.environment.MAKEFLAGS).toBe(flags);
+  const named = /^-j --jobserver-auth=fifo:(\/\S+)$/.exec(flags)?.[1];
+  if (named === undefined) {
+    throw new Error(`the pool names no jobserver fifo: ${JSON.stringify(pool.environment)}`);
+  }
+  return named;
+}
+
+/**
+ * A make-protocol client of `fifo`, opened read-write as Cargo opens it, and non-blocking here so that `take` reads
+ * what the fifo holds now and an empty fifo reads 0.
+ */
+function jobserverClient(fifo: string): { take(most: number): number; give(count: number): void } {
+  const fd = openSync(fifo, constants.O_RDWR | constants.O_NONBLOCK);
+  descriptors.push(fd);
+  return {
+    take(most) {
+      try {
+        return readSync(fd, Buffer.alloc(most), 0, most, null);
+      } catch (error) {
+        if (error instanceof Error && 'code' in error && error.code === 'EAGAIN') return 0;
+        throw error;
+      }
+    },
+    give(count) {
+      expect(writeSync(fd, Buffer.alloc(count, '+'))).toBe(count);
+    },
+  };
+}
+
+/** Wait for `count` token bytes in `fifo` and take them, as a blocked Cargo does; resolves to the count it took. */
+async function awaitTokens(fifo: string, count: number): Promise<number> {
+  const fd = openSync(fifo, constants.O_RDONLY | constants.O_NONBLOCK);
+  const reader = Bun.file(fd).stream().getReader();
+  let taken = 0;
+  try {
+    while (taken < count) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      taken += chunk.value.byteLength;
+    }
+  } finally {
+    await reader.cancel();
+    closeSync(fd);
+  }
+  return taken;
+}
+
 describe('the parent-held CPU pool', () => {
-  it('serves a Cargo allocation as its own live child pool without competing with the occupied ancestor', async () => {
+  it('serves an allocation as its own live child pool without competing with the occupied ancestor', async () => {
     const { parent, pool } = await openPool(4);
     const cargo = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 4, children: true }));
     expect(await cargo.next()).toEqual(QUEUED);
@@ -382,7 +450,7 @@ describe('the parent-held CPU pool', () => {
     }
   });
 
-  it('names the endpoint and count it holds, in private owned paths, and removes them on close', async () => {
+  it('names its endpoint, count and jobserver fifo in private owned paths, and removes them on close', async () => {
     const made = await createCpuPool(3, NEVER, countedWaits());
     if (!made.ok) {
       throw new Error(made.error);
@@ -396,8 +464,17 @@ describe('the parent-held CPU pool', () => {
     expect(made.pool.environment[CPU_TOKENS_ENV]).toBe('3');
     expect(statSync(dirname(inherited.socket)).mode & 0o777).toBe(0o700);
     expect(statSync(inherited.socket).mode & 0o777).toBe(0o600);
+    // The jobserver fifo lies beside the socket, as private, and holds the pool's tokens but the implicit first.
+    const fifo = jobserverFifo(made.pool);
+    expect(dirname(fifo)).toBe(dirname(inherited.socket));
+    expect(statSync(fifo).isFIFO()).toBe(true);
+    expect(statSync(fifo).mode & 0o777).toBe(0o600);
+    const cargo = jobserverClient(fifo);
+    expect(cargo.take(3)).toBe(2);
+    cargo.give(2);
     expect(await made.pool.close()).toEqual({ ok: true });
     expect(await made.pool.close()).toEqual({ ok: true });
+    expect(existsSync(fifo)).toBe(false);
     expect(existsSync(dirname(inherited.socket))).toBe(false);
   });
 
@@ -428,7 +505,7 @@ describe('the parent-held CPU pool', () => {
     // A wait holds no token: the whole pool is still there to grant.
     expect(await grantedFor(parent, 4)).toBe(4);
 
-    // Cargo's launcher is served a child pool; the test it runs reports its waits there, to the same run.
+    // A child is served a pool of its own; the test it runs reports its waits there, to the same run.
     const cargo = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 2, children: true }));
     expect(await cargo.next()).toEqual(QUEUED);
     const granted = await cargo.next();
@@ -552,5 +629,54 @@ describe('the parent-held CPU pool', () => {
     expect(made.ok).toBe(false);
     expect(cpuPoolDirectories()).toEqual(before);
     await expect(createCpuPool(0, NEVER, countedWaits())).rejects.toBeInstanceOf(RangeError);
+  });
+
+  it("lends a 1-token pool's implicit slot to a socket child, since its fifo holds no byte", async () => {
+    const { pool, parent } = await openPool(1);
+    expect(jobserverClient(jobserverFifo(pool)).take(1)).toBe(0);
+    // The holder is not using its own token while it waits on this child: lending it is what avoids the deadlock.
+    const first = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 2 }));
+    expect(await first.next()).toEqual(QUEUED);
+    expect(await first.next()).toEqual({ ok: true, lease: 'granted', tokens: 1 });
+    const second = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 1 }));
+    expect(await second.next()).toEqual(QUEUED);
+    first.socket.destroy();
+    expect(await second.next()).toEqual({ ok: true, lease: 'granted', tokens: 1 });
+  });
+
+  it('grants no byte a fifo reader holds, and wakes its queued head when the reader writes it back', async () => {
+    const { pool, parent } = await openPool(2);
+    const cargo = jobserverClient(jobserverFifo(pool));
+    // Cargo takes the fifo's one byte: only the implicit slot is left to lend.
+    expect(cargo.take(1)).toBe(1);
+    const first = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 2 }));
+    expect(await first.next()).toEqual(QUEUED);
+    expect(await first.next()).toEqual({ ok: true, lease: 'granted', tokens: 1 });
+    const second = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 1 }));
+    expect(await second.next()).toEqual(QUEUED);
+    const third = childOf(parent.socket, JSON.stringify({ op: 'cpu-pool', want: 1 }));
+    expect(await third.next()).toEqual(QUEUED);
+    // No socket child releases anything: only the fifo turning readable can wake the head, and it takes the byte.
+    cargo.give(1);
+    expect(await second.next()).toEqual({ ok: true, lease: 'granted', tokens: 1 });
+    // The implicit slot goes back with the first child, to the next in line.
+    first.socket.destroy();
+    expect(await third.next()).toEqual({ ok: true, lease: 'granted', tokens: 1 });
+  });
+
+  it("writes a released child's bytes back to the fifo, where Cargo and the next child both find them", async () => {
+    const { pool, parent } = await openPool(3);
+    const fifo = jobserverFifo(pool);
+    const cargo = jobserverClient(fifo);
+    const holder = await takeOrThrow(parent, 3);
+    expect(holder.tokens).toBe(3);
+    // The grant took both bytes and the implicit slot: the fifo is empty while it holds them.
+    expect(cargo.take(2)).toBe(0);
+    holder.release();
+    await holder.closed;
+    // The pool hears the close after the child does; a waiting reader takes the two bytes it writes back.
+    expect(await awaitTokens(fifo, 2)).toBe(2);
+    cargo.give(2);
+    expect(await grantedFor(parent, 3)).toBe(3);
   });
 });

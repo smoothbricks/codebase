@@ -2,13 +2,13 @@ use crate::args::GatewayCommand;
 use crate::build_record::{BuildRecord, unproven_refusal, unrecorded_refusal};
 use crate::install_basis::{self, InstallSlot};
 use crate::launchd::{
-    BunDirectory, COWSHED_BINARY_NAME, DevenvProfile, ExecutableDigest, ExecutableInstallState,
-    ExistingPlist, GATEWAY_LABEL, HostStableExecutable, InstallOutcome, InstallState,
-    InstalledExecutable, JOBSERVER_LAUNCHER_NAME, LaunchAgentSpec, LaunchAgentTarget,
-    LaunchctlCommand, LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
+    BunDirectory, CARGO_LINK_NAME, COWSHED_BINARY_NAME, DevenvProfile, ExecutableDigest,
+    ExecutableInstallState, ExistingPlist, GATEWAY_LABEL, HostStableExecutable, InstallOutcome,
+    InstallState, InstalledExecutable, LaunchAgentSpec, LaunchAgentTarget, LaunchctlCommand,
+    LaunchdExecutor, LaunchdFilesystem, LaunchdServiceStatus, NativeFilesystem,
     NativeLaunchctlCommand, PRIVATE_DIRECTORY_MODE, RemovalOutcome, StableLink, kickstart_hint,
-    plan_executable_install, plan_executable_remove, plan_install, plan_launcher_link, plan_remove,
-    replace_symlink,
+    plan_cargo_link_removal, plan_executable_install, plan_executable_remove, plan_install,
+    plan_remove, replace_symlink,
 };
 use crate::output::Output;
 use crate::path_entry::PathEntryOutcome;
@@ -791,13 +791,13 @@ pub fn remove_host_stable_executable(executable: &HostStableExecutable) -> Resul
 }
 
 /// Everything an install of cowshed leaves in the host-stable directory, in the order to remove
-/// it: the links (the jobserver launcher's, then the stable name, so nothing launchd could start
-/// dangles), then each stored copy and the build record beside it.
+/// it: the links (the `cargo` link an earlier install planted, then the stable name, so nothing
+/// launchd could start dangles), then each stored copy and the build record beside it. A `cargo`
+/// no install planted is left, as every other neighbour is.
 pub(crate) fn installed_files(executable: &HostStableExecutable) -> Result<Vec<PathBuf>> {
     let mut present = Vec::new();
-    let launcher = executable.directory().join(JOBSERVER_LAUNCHER_NAME);
-    if inspect_existing(&launcher)?.is_some() {
-        present.push(launcher);
+    if observe_cargo_link(executable)? == CargoLink::Planted {
+        present.push(executable.directory().join(CARGO_LINK_NAME));
     }
     if inspect_existing(executable.path())?.is_some() {
         present.push(executable.path().to_path_buf());
@@ -1763,8 +1763,8 @@ where
     F: LaunchdFilesystem,
 {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    remove_planted_cargo_link(executor, &executable)?;
     install_stored_executable(executor, &executable, &executable_digest(source)?, source)?;
-    link_jobserver_launcher(executor, executable.directory())?;
     Ok(executable)
 }
 
@@ -1784,54 +1784,118 @@ where
     Ok(())
 }
 
-/// Point `cargo` in the host-stable `directory` at the stable `cowshed` name beside it.
-///
-/// Called by the cowshed installs alone, after the stable name runs the build they installed,
-/// never by the generic stored-executable install: the Nx cache server is installed through that
-/// too, and a launcher link planted there followed whichever executable went in last.
-fn link_jobserver_launcher<F, C>(
+/// Remove the `cargo` link an earlier install planted beside the stable name. cowshed no longer
+/// answers as `cargo` — a CPU grant reaches Cargo as the make jobserver configuration Cargo reads
+/// itself (05_gateway.md, "Host CPU budget") — so that link would make `cargo` on a `PATH` holding
+/// the directory run the cowshed CLI. Anything else named `cargo` there is not cowshed's: it is
+/// refused by its path and what it is, and left as found.
+fn remove_planted_cargo_link<F, C>(
     executor: &mut LaunchdExecutor<F, C>,
-    directory: &Path,
+    executable: &HostStableExecutable,
 ) -> Result<()>
 where
     F: LaunchdFilesystem,
 {
-    let launcher = observe_launcher_link(directory)?;
-    executor
-        .execute_install(&plan_launcher_link(directory, &launcher))
-        .map_err(launchd_error)?;
-    Ok(())
-}
-
-/// What the `cargo` link beside the stable name currently is.
-fn observe_launcher_link(directory: &Path) -> Result<StableLink> {
-    let path = directory.join(JOBSERVER_LAUNCHER_NAME);
-    match inspect_existing(&path)? {
-        None => Ok(StableLink::Absent),
-        Some(metadata) if metadata.uid() != effective_uid() => Err(CowshedError::integrity(
-            format!(
-                "the installed {JOBSERVER_LAUNCHER_NAME} launcher is not owned by this user: {}",
-                path.display()
-            ),
-            "remove it and rerun the service start command",
-        )),
-        Some(metadata) if metadata.file_type().is_symlink() => {
-            Ok(StableLink::To(fs::read_link(&path).map_err(|error| {
-                CowshedError::internal(format!(
-                    "could not read the link {}: {error}",
-                    path.display()
-                ))
-            })?))
+    match observe_cargo_link(executable)? {
+        CargoLink::Absent => Ok(()),
+        CargoLink::Planted => {
+            executor
+                .execute_install(&plan_cargo_link_removal(executable.directory()))
+                .map_err(launchd_error)?;
+            Ok(())
         }
-        Some(metadata) if metadata.is_file() => Ok(StableLink::Foreign),
-        Some(_) => Err(CowshedError::integrity(
+        CargoLink::Foreign(found) => Err(CowshedError::integrity(
             format!(
-                "the installed {JOBSERVER_LAUNCHER_NAME} launcher is not a regular file or a link: {}",
-                path.display()
+                "{} is {}, not the `cargo` link an earlier cowshed install planted, and cowshed removes nothing else",
+                executable.directory().join(CARGO_LINK_NAME).display(),
+                found.describe()
             ),
-            "remove it and rerun the service start command",
+            "move it out of that directory and rerun the command",
         )),
     }
+}
+
+/// What `cargo` in the host-stable directory is.
+#[derive(Debug, Eq, PartialEq)]
+enum CargoLink {
+    Absent,
+    /// The link an earlier install planted: a symbolic link this user owns saying, relative to the
+    /// directory, the stable name or a stored copy of an executable cowshed installs there.
+    Planted,
+    /// Anything else, which is not cowshed's to remove.
+    Foreign(ForeignCargo),
+}
+
+/// A `cargo` in the host-stable directory that no cowshed install planted.
+#[derive(Debug, Eq, PartialEq)]
+enum ForeignCargo {
+    NotOwned { uid: u32 },
+    Link(PathBuf),
+    File,
+    Other,
+}
+
+impl ForeignCargo {
+    fn describe(&self) -> String {
+        match self {
+            Self::NotOwned { uid } => format!("owned by uid {uid}, not this user"),
+            Self::Link(target) => format!("a link saying {}", target.display()),
+            Self::File => "a regular file".to_owned(),
+            Self::Other => "neither a regular file nor a link".to_owned(),
+        }
+    }
+}
+
+/// The executables whose names an install gave the `cargo` link it planted: the link said the
+/// executable an install had just written, first as its stored copy and then as its stable name,
+/// and the Nx cache server's install left it saying its own until the link was pinned to
+/// `cowshed`.
+const CARGO_LINK_PLANTERS: [&str; 2] = [COWSHED_BINARY_NAME, "nx-cache-server"];
+
+fn observe_cargo_link(executable: &HostStableExecutable) -> Result<CargoLink> {
+    let path = executable.directory().join(CARGO_LINK_NAME);
+    let Some(metadata) = inspect_existing(&path)? else {
+        return Ok(CargoLink::Absent);
+    };
+    if metadata.uid() != effective_uid() {
+        return Ok(CargoLink::Foreign(ForeignCargo::NotOwned {
+            uid: metadata.uid(),
+        }));
+    }
+    if metadata.is_file() {
+        return Ok(CargoLink::Foreign(ForeignCargo::File));
+    }
+    if !metadata.file_type().is_symlink() {
+        return Ok(CargoLink::Foreign(ForeignCargo::Other));
+    }
+    let target = fs::read_link(&path).map_err(|error| {
+        CowshedError::internal(format!(
+            "could not read the link {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(if planted_cargo_target(executable.home(), &target)? {
+        CargoLink::Planted
+    } else {
+        CargoLink::Foreign(ForeignCargo::Link(target))
+    })
+}
+
+/// `target` is what a `cargo` link a cowshed install planted says: one name, relative to the
+/// directory, that is the stable name or a stored copy of one of [`CARGO_LINK_PLANTERS`].
+fn planted_cargo_target(home: &Path, target: &Path) -> Result<bool> {
+    let mut components = target.components();
+    let (Some(std::path::Component::Normal(name)), None) = (components.next(), components.next())
+    else {
+        return Ok(false);
+    };
+    for planter in CARGO_LINK_PLANTERS {
+        let planter = HostStableExecutable::new(home, planter).map_err(launchd_error)?;
+        if name == planter.name() || planter.stored_digest(name).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Where the provenance of the installed cowshed is written down.
@@ -2203,9 +2267,9 @@ where
     C: LaunchctlCommand,
 {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    remove_planted_cargo_link(executor, &executable)?;
     let retained = retain_previous_executable(executor, &executable)?;
     install_stored_executable(executor, &executable, &candidate.digest, &candidate.source)?;
-    link_jobserver_launcher(executor, executable.directory())?;
     record_installed_source(&executable, &candidate.source);
     record_installed_build(&executable, candidate);
     match activate_launch_agent(executor, effective_uid(), spec.target(), plist) {
@@ -2501,6 +2565,9 @@ where
     F: LaunchdFilesystem,
 {
     let executable = HostStableExecutable::new(home, COWSHED_BINARY_NAME).map_err(launchd_error)?;
+    // Whatever the build: a setup that finds its cowshed current still removes the `cargo` link
+    // an earlier install left.
+    remove_planted_cargo_link(executor, &executable)?;
     let state = observe_executable_install(&executable, &candidate.digest, &candidate.source)?;
     let replaced = installed_binary_is_stale(&executable, &candidate.digest, &state);
     if replaced {
@@ -2527,9 +2594,6 @@ where
             retained.as_deref(),
         );
     }
-    // Also when the stable name already ran this build: a setup is what repairs a `cargo` link
-    // that says anything but `cowshed`, as the Nx cache server's install once left it.
-    link_jobserver_launcher(executor, executable.directory())?;
     let from_installed_copy = candidate
         .source
         .parent()
@@ -3072,23 +3136,41 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
-    /// `cargo` says `cowshed` after every setup, including one whose cowshed is already current:
-    /// the Nx cache server's install once re-pointed it at `nx-cache-server`, which refuses every
-    /// cargo argument, and a setup with nothing else to change returned with it so.
+    /// Every setup removes the `cargo` link an earlier install planted, including a setup whose
+    /// cowshed is already current, in each shape an install ever gave it: the stable name or a
+    /// stored copy, of cowshed or of the Nx cache server. Left there, `cargo` on `PATH` would run
+    /// the cowshed CLI. An install over a host with no `cargo` link creates none.
     #[tokio::test]
-    async fn every_setup_leaves_cargo_saying_cowshed() {
-        let (home, executable, _) = host_with_agent("cargo-launcher");
+    async fn every_setup_removes_the_cargo_link_an_earlier_install_planted() {
+        let (home, executable, _) = host_with_agent("cargo-planted");
         let candidate = build(&home, "release", b"the installed release", None);
         install_host_stable_executable(&mut LaunchdExecutor::native(), &home, &candidate.source)
             .unwrap();
-        let launcher = executable.directory().join(JOBSERVER_LAUNCHER_NAME);
-        replace_symlink(Path::new("nx-cache-server"), &launcher).unwrap();
+        let cargo = executable.directory().join(CARGO_LINK_NAME);
+        let absent = |run: &str| {
+            assert_eq!(
+                fs::symlink_metadata(&cargo).err().map(|error| error.kind()),
+                Some(io::ErrorKind::NotFound),
+                "{run}"
+            );
+        };
+        absent("an install with no cargo link");
+        let companion = HostStableExecutable::new(&home, "nx-cache-server").unwrap();
         let mut executor: RecordingExecutor = LaunchdExecutor::new(
             NativeFilesystem::new(),
             RecordingGatewayLaunchctl::default(),
         );
 
-        for run in ["the setup that repairs it", "the setup after it"] {
+        for planted in [
+            Some(PathBuf::from(COWSHED_BINARY_NAME)),
+            Some(executable.stored_link(&candidate.digest)),
+            Some(PathBuf::from(companion.name())),
+            Some(companion.stored_link(&candidate.digest)),
+            None,
+        ] {
+            if let Some(target) = &planted {
+                replace_symlink(target, &cargo).unwrap();
+            }
             refresh_gateway_from(
                 &home,
                 IncomingBuild {
@@ -3120,15 +3202,103 @@ mod tests {
                         ..
                     }
                 ),
-                "{run}: {installed:?}"
+                "{planted:?}: {installed:?}"
             );
-            assert_eq!(
-                fs::read_link(&launcher).unwrap(),
-                Path::new(COWSHED_BINARY_NAME),
-                "{run}"
-            );
+            absent(&format!("a setup over cargo -> {planted:?}"));
         }
+
+        // The uninstall takes a planted link with everything else an install left.
+        replace_symlink(Path::new(COWSHED_BINARY_NAME), &cargo).unwrap();
+        assert_eq!(
+            remove_host_stable_executable(&executable).unwrap(),
+            RemovalOutcome::Removed
+        );
+        absent("an uninstall");
         fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A `cargo` in the host-stable directory that no install planted is not cowshed's: every
+    /// install refuses it by its path and what it is before it installs anything, and leaves it as
+    /// it was found; the uninstall leaves it as every other neighbour.
+    #[tokio::test]
+    async fn an_install_refuses_a_cargo_no_install_planted_and_leaves_it() {
+        #[derive(Clone, Copy)]
+        enum Found {
+            File(&'static [u8]),
+            Link(&'static str),
+        }
+        for (label, found, said) in [
+            ("cargo-file", Found::File(b"a cargo"), "a regular file"),
+            (
+                "cargo-absolute",
+                Found::Link("/usr/local/bin/cargo"),
+                "a link saying /usr/local/bin/cargo",
+            ),
+            ("cargo-other", Found::Link("rustup"), "a link saying rustup"),
+            (
+                "cargo-nested",
+                Found::Link("../bin/cowshed"),
+                "a link saying ../bin/cowshed",
+            ),
+        ] {
+            let (home, executable, _) = host_with_agent(label);
+            let candidate = build(&home, "release", b"the installed release", None);
+            let cargo = executable.directory().join(CARGO_LINK_NAME);
+            let left = |run: &str| match found {
+                Found::File(bytes) => assert_eq!(fs::read(&cargo).unwrap(), bytes, "{run}"),
+                Found::Link(target) => {
+                    assert_eq!(fs::read_link(&cargo).unwrap(), Path::new(target), "{run}")
+                }
+            };
+            match found {
+                Found::File(bytes) => fs::write(&cargo, bytes).unwrap(),
+                Found::Link(target) => replace_symlink(Path::new(target), &cargo).unwrap(),
+            }
+            let refused = |error: CowshedError, run: &str| {
+                assert_eq!(error.code.as_str(), "integrity", "{run}: {}", error.message);
+                assert!(
+                    error.message.contains(&cargo.display().to_string())
+                        && error.message.contains(said),
+                    "{run}: {}",
+                    error.message
+                );
+            };
+
+            let error = install_host_stable_executable(
+                &mut LaunchdExecutor::native(),
+                &home,
+                &candidate.source,
+            )
+            .expect_err("the install refuses");
+            refused(error, "install");
+            assert_eq!(
+                fs::symlink_metadata(executable.path())
+                    .err()
+                    .map(|error| error.kind()),
+                Some(io::ErrorKind::NotFound),
+                "{label}: the refused install installed nothing"
+            );
+            left("install");
+
+            let error = install_cli_from(
+                &home,
+                &candidate,
+                false,
+                Ok(()),
+                std::ffi::OsStr::new(""),
+                &mut LaunchdExecutor::native(),
+            )
+            .expect_err("the setup refuses");
+            refused(error, "setup");
+            left("setup");
+
+            assert_eq!(
+                remove_host_stable_executable(&executable).unwrap(),
+                RemovalOutcome::AlreadyAbsent
+            );
+            left("uninstall");
+            fs::remove_dir_all(home).unwrap();
+        }
     }
 
     /// The installed artifact is authoritative: a daemon that answers while running other bytes
@@ -3420,13 +3590,15 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
-    /// A failed activation must leave the host exactly as it was found: the stable name runs the
-    /// build it ran, and the copy of the build the failed install brought is no one's business.
+    /// A failed activation must leave the host's build exactly as it was found: the stable name
+    /// runs the build it ran, and the copy of the build the failed install brought is no one's
+    /// business. The `cargo` link an earlier install planted is gone before the agent is asked to
+    /// load and stays gone: it is no build's, and nothing plants it again.
     #[test]
     fn a_failed_activation_puts_the_previous_build_back() {
         struct RefusingLaunchctl {
             stable: PathBuf,
-            launcher: PathBuf,
+            cargo: PathBuf,
             candidate: ExecutableDigest,
             saw_candidate: bool,
         }
@@ -3438,7 +3610,10 @@ mod tests {
             ) -> io::Result<crate::launchd::LaunchctlOutput> {
                 if arguments[0] == "bootstrap" && !self.saw_candidate {
                     assert_eq!(executable_digest(&self.stable).unwrap(), self.candidate);
-                    assert_eq!(executable_digest(&self.launcher).unwrap(), self.candidate);
+                    assert!(
+                        fs::symlink_metadata(&self.cargo).is_err(),
+                        "cargo is gone before the agent loads"
+                    );
                     self.saw_candidate = true;
                 }
                 Ok(crate::launchd::LaunchctlOutput {
@@ -3462,14 +3637,14 @@ mod tests {
         );
         install_host_stable_executable(&mut LaunchdExecutor::native(), &home, &first.source)
             .unwrap();
-        let launcher = executable.directory().join(JOBSERVER_LAUNCHER_NAME);
+        let cargo = executable.directory().join(CARGO_LINK_NAME);
+        replace_symlink(Path::new(COWSHED_BINARY_NAME), &cargo).unwrap();
         assert_eq!(executable_digest(executable.path()).unwrap(), first.digest);
-        assert_eq!(executable_digest(&launcher).unwrap(), first.digest);
         let mut executor = LaunchdExecutor::new(
             NativeFilesystem::new(),
             RefusingLaunchctl {
                 stable: executable.path().to_path_buf(),
-                launcher: launcher.clone(),
+                cargo: cargo.clone(),
                 candidate: second.digest.clone(),
                 saw_candidate: false,
             },
@@ -3498,7 +3673,11 @@ mod tests {
             b"the supervised release build"
         );
         assert_eq!(executable_digest(executable.path()).unwrap(), first.digest);
-        assert_eq!(executable_digest(&launcher).unwrap(), first.digest);
+        assert_eq!(
+            fs::symlink_metadata(&cargo).err().map(|error| error.kind()),
+            Some(io::ErrorKind::NotFound),
+            "the rollback plants no cargo link"
+        );
         fs::remove_dir_all(home).unwrap();
     }
 

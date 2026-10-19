@@ -193,12 +193,6 @@ impl Ledger {
         Self::with(total, background_limit(total))
     }
 
-    /// A parent's lent pool: its tokens are a grant the host already made, and no gate asks it,
-    /// so its children may hold all of them.
-    fn lent(tokens: NonZeroUsize) -> Self {
-        Self::with(tokens.get(), tokens.get())
-    }
-
     fn with(total: usize, background: usize) -> Self {
         Self {
             total,
@@ -689,11 +683,6 @@ impl CpuBudget {
     /// Start the host's budget. It runs until the last handle and stake are gone.
     pub(crate) fn start(limits: CpuBudgetLimits) -> Self {
         Self::serve(Ledger::host(limits))
-    }
-
-    /// Start a parent's lent pool of `tokens`, a grant already made: all of it is its children's.
-    pub(crate) fn lent(tokens: NonZeroUsize) -> Self {
-        Self::serve(Ledger::lent(tokens))
     }
 
     fn serve(ledger: Ledger) -> Self {

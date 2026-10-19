@@ -420,23 +420,25 @@ physical resizing, read-only mounts and legacy-image conversion remain native-ho
 `/private/tmp/cowshed-dtest-<pid>-<n>-<label>` and share process cleanup with the image fixtures, but neither their
 setup nor their cleanup enumerates or releases disk images.
 
-Cargo lifecycle fixtures discover the real toolchain behind the installed launcher using its absolute executable PATH
-entries and canonical-identity exclusion (03_caches.md, "The `cargo` jobserver launcher"; 05_gateway.md, "The installed
-cowshed"). The compiler belongs beside that real Cargo, never beside the cowshed wrapper. Cargo lock fixtures still
-invoke ambient `cargo`: after build-script readiness they independently report its parent PID and Cargo executable,
-check those against the kernel executable/argv and launcher parent edge, retain its kernel process group, and match the
-lock refusal to that actual Cargo process, not the entry launcher's PID. An observed FIFO is checked as a live kernel
-FIFO. A direct test-binary run outside inherited budget variables additionally compares the fixture checkout's actual
-held gateway grant with its reported count, then proves the FIFO and checkout grant are released when Cargo ends; an
-inherited count alone is never a grant claim (05_gateway.md, "Host CPU budget", "The jobserver run"). Existing profile
-locks, the newly-created-profile control, seed preservation and native/Directory lifecycle oracles remain unchanged
-(16_build_volumes.md, "Targets and seeds"). The native build-volume holder subprocess uses `--nocapture --quiet` so
-inherited single-thread libtest formatting cannot prefix its actual-PID record. Its kernel-holder, forced-release
-diagnostics, checkout-label ownership and reclamation assertions remain exact.
+Cargo lifecycle fixtures run the real Cargo that drives the test (`CARGO`, or the first executable `cargo` on an
+absolute `PATH` entry); nothing installed answers to `cargo` (03_caches.md, "Cargo reads its budget from its holder").
+Cargo lock fixtures still invoke ambient `cargo`: after build-script readiness they independently report its parent PID
+and Cargo executable, check those against the kernel executable/argv and the entry process's parent edge, retain its
+kernel process group, and match the lock refusal to that actual Cargo process. An observed FIFO — one a holder
+configured — is checked as a live kernel FIFO only its user can open. Existing profile locks, the newly-created-profile
+control, seed preservation and native/Directory lifecycle oracles remain unchanged (16_build_volumes.md, "Targets and
+seeds"). The native build-volume holder subprocess uses `--nocapture --quiet` so inherited single-thread libtest
+formatting cannot prefix its actual-PID record. Its kernel-holder, forced-release diagnostics, checkout-label ownership
+and reclamation assertions remain exact.
 
-Launcher case fixtures clear both inherited `BOUNDED_EXEC_CPU_POOL` and `BOUNDED_EXEC_CPU_TOKENS` before selecting their
-case-local inputs. A runner's live pool must not turn the count-only sizing case into parent-pool admission; the real
-gateway grant, FIFO lifetime, kill and refusal oracles remain unchanged.
+The holder's configuration is proved against real Cargo (`cowshed-gateway`'s `tests/jobserver_cargo.rs`): a job's
+one-token grant, asked as the supervisor asks it, names its fifo beside its pool socket; a real `cargo test` under
+exactly the variables the holder exports compiles one crate at a time (a rustc wrapper records each compile's start and
+end), the test's nested `cargo build` reads the same fifo and compiles one at a time, the test's nested job asking the
+pool socket for every core is lent the holder's own token, and the host ledger holds that one grant with nobody waiting.
+The same build with nothing exported compiles independent crates side by side. Those fixtures clear every inherited
+sizing variable (`CARGO_MAKEFLAGS`, `MAKEFLAGS`, `MFLAGS`, `CARGO_BUILD_JOBS`, the test-thread counts, the pool markers,
+a rustc wrapper) before they set their own, so the runner's own grant cannot size them.
 
 Directory build-state freshness uses observed filesystem change times, not synthetic wall-clock marks. If a listed child
 or subtree disappears during a live scan, the nearest surviving ancestor records that removal; the root uses its

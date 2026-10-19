@@ -46,6 +46,9 @@ const NEXTEST_PIECE =
   `extracted="$(node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-nextest-extract.js .cache/nextest/archive.tar.zst)" && ` +
   `cargo --frozen nextest run --binaries-metadata "$extracted/m.json" --workspace-remap . -E 'package(core)' --partition hash:1/5 --no-tests=pass`;
 
+/** The test-thread ceilings of a run whose environment names none. */
+const NO_CEILINGS = { rust: null, nextest: null };
+
 describe('cowshed CPU budget client', () => {
   it('asks for what each runner would run at once', () => {
     expect(runnerDemand(NEXTEST_PIECE, undefined, 18, {})).toEqual({ kind: 'nextest', want: 18 });
@@ -70,7 +73,7 @@ describe('cowshed CPU budget client', () => {
     expect(runnerDemand('cargo test --workspace -- --nocapture', undefined, 18, {})).toEqual({
       kind: 'cargo',
       want: 18,
-      testThreads: null,
+      testThreads: NO_CEILINGS,
     });
     expect(runnerDemand('bun test --timeout=0 --parallel=3', undefined, 18, {})).toEqual({
       kind: 'bun-parallel',
@@ -89,20 +92,29 @@ describe('cowshed CPU budget client', () => {
     expect(runnerDemand('bun test --timeout=0 native.test.ts', undefined, 18, {})).toEqual({
       kind: 'process',
       want: 1,
+      testThreads: NO_CEILINGS,
     });
     expect(runnerDemand('cargo --frozen test --workspace', undefined, 18, {})).toEqual({
       kind: 'cargo',
       want: 18,
-      testThreads: null,
+      testThreads: NO_CEILINGS,
     });
     expect(runnerDemand('napi build --platform --release', undefined, 8, {})).toEqual({
       kind: 'cargo',
       want: 8,
-      testThreads: null,
+      testThreads: NO_CEILINGS,
     });
-    expect(runnerDemand('bun scripts/test-shard.ts 3', undefined, 18, {})).toEqual({ kind: 'process', want: 1 });
+    expect(runnerDemand('bun scripts/test-shard.ts 3', undefined, 18, {})).toEqual({
+      kind: 'process',
+      want: 1,
+      testThreads: NO_CEILINGS,
+    });
     // A declared parallelism outranks what the command names, within inherited ceilings.
-    expect(runnerDemand('bun scripts/test-shard.ts 3', 2, 18, {})).toEqual({ kind: 'process', want: 2 });
+    expect(runnerDemand('bun scripts/test-shard.ts 3', 2, 18, {})).toEqual({
+      kind: 'process',
+      want: 2,
+      testThreads: NO_CEILINGS,
+    });
     expect(runnerDemand('cargo nextest run --test-threads=4', 6, 18, {})).toEqual({ kind: 'nextest', want: 6 });
   });
 
@@ -132,7 +144,11 @@ describe('cowshed CPU budget client', () => {
     // A declared parallelism outranks the flag.
     expect(runnerDemand('bun stryker run --concurrency 8', 2, 18, {})).toEqual({ kind: 'stryker', want: 2 });
     // A test file named for Stryker is one bun process.
-    expect(runnerDemand('bun test stryker.test.ts', undefined, 18, {})).toEqual({ kind: 'process', want: 1 });
+    expect(runnerDemand('bun test stryker.test.ts', undefined, 18, {})).toEqual({
+      kind: 'process',
+      want: 1,
+      testThreads: NO_CEILINGS,
+    });
   });
 
   it("asks for Vitest's --maxWorkers and go test's -p, else each runner's own per-core default", () => {
@@ -226,7 +242,7 @@ describe('cowshed CPU budget client', () => {
     expect(runnerDemand('cargo test -p mutants', undefined, 18, {})).toEqual({
       kind: 'cargo',
       want: 18,
-      testThreads: null,
+      testThreads: NO_CEILINGS,
     });
   });
 
@@ -308,14 +324,41 @@ describe('cowshed CPU budget client', () => {
     expect(sizeRunner({ kind: 'bun-parallel', want: 18 }, 'bun test --parallel', 7).command).toBe(
       'bun test --parallel=7',
     );
-    expect(sizeRunner({ kind: 'cargo', want: 18, testThreads: null }, 'cargo test', 4).env).toEqual({
+    // Cargo's rustc count is its pool's jobserver fifo, never a `CARGO_BUILD_JOBS` from the grant; its test threads
+    // take no token, so they are sized here, libtest's and nextest's alike.
+    expect(sizeRunner({ kind: 'cargo', want: 18, testThreads: NO_CEILINGS }, 'cargo test', 4).env).toEqual({
       [CPU_TOKENS_ENV]: '4',
-      CARGO_BUILD_JOBS: '4',
       RUST_TEST_THREADS: '4',
+      NEXTEST_TEST_THREADS: '4',
     });
-    expect(sizeRunner({ kind: 'process', want: 1 }, 'bun scripts/x.ts', 1)).toEqual({
+    expect(sizeRunner({ kind: 'process', want: 1, testThreads: NO_CEILINGS }, 'bun scripts/x.ts', 1)).toEqual({
       command: 'bun scripts/x.ts',
-      env: { [CPU_TOKENS_ENV]: '1' },
+      env: { [CPU_TOKENS_ENV]: '1', RUST_TEST_THREADS: '1', NEXTEST_TEST_THREADS: '1' },
+    });
+  });
+
+  it("sizes a process's test threads to its held grant, under inherited and configured ceilings", () => {
+    // A script's own `cargo test` takes rustc tokens from the executor's jobserver fifo, but its test threads take
+    // none, so the executor sets them to the whole grant the process holds.
+    const unbounded = runnerDemand('bun scripts/x.ts', 5, 18, {});
+    expect(unbounded).toEqual({ kind: 'process', want: 5, testThreads: NO_CEILINGS });
+    expect(sizeRunner(unbounded, 'bun scripts/x.ts', 5)).toEqual({
+      command: 'bun scripts/x.ts',
+      env: { [CPU_TOKENS_ENV]: '5', RUST_TEST_THREADS: '5', NEXTEST_TEST_THREADS: '5' },
+    });
+    const capped = runnerDemand(
+      'bun scripts/x.ts',
+      5,
+      18,
+      { RUST_TEST_THREADS: '4', NEXTEST_TEST_THREADS: '3' },
+      { RUST_TEST_THREADS: '2', NEXTEST_TEST_THREADS: '64' },
+    );
+    // A configured count lowers an inherited ceiling and never raises it.
+    expect(capped).toEqual({ kind: 'process', want: 5, testThreads: { rust: 2, nextest: 3 } });
+    expect(sizeRunner(capped, 'bun scripts/x.ts', 5).env).toEqual({
+      [CPU_TOKENS_ENV]: '5',
+      RUST_TEST_THREADS: '2',
+      NEXTEST_TEST_THREADS: '3',
     });
   });
 
@@ -325,7 +368,7 @@ describe('cowshed CPU budget client', () => {
     const nextest = runnerDemand('cargo nextest run --test-threads=18', 18, 18, inherited, configured);
     const cargo = runnerDemand('cargo test', 18, 18, inherited, configured);
     expect(nextest).toEqual({ kind: 'nextest', want: 6 });
-    expect(cargo).toEqual({ kind: 'cargo', want: 4, testThreads: 2 });
+    expect(cargo).toEqual({ kind: 'cargo', want: 4, testThreads: { rust: 2, nextest: 6 } });
     for (const tokens of [15, 18]) {
       expect(sizeRunner(nextest, 'cargo nextest run --test-threads=18', tokens)).toEqual({
         command: 'cargo nextest run --test-threads=6',
@@ -333,15 +376,15 @@ describe('cowshed CPU budget client', () => {
       });
       expect(sizeRunner(cargo, 'cargo test', tokens).env).toEqual({
         [CPU_TOKENS_ENV]: String(tokens),
-        CARGO_BUILD_JOBS: '4',
         RUST_TEST_THREADS: '2',
+        NEXTEST_TEST_THREADS: '4',
       });
     }
     expect(sizeRunner(nextest, NEXTEST_PIECE, 3).env.NEXTEST_TEST_THREADS).toBe('3');
     expect(sizeRunner(cargo, 'cargo test', 3).env).toEqual({
       [CPU_TOKENS_ENV]: '3',
-      CARGO_BUILD_JOBS: '3',
       RUST_TEST_THREADS: '2',
+      NEXTEST_TEST_THREADS: '3',
     });
     expect(runnerDemand(NEXTEST_PIECE, 18, 18, inherited, { NEXTEST_TEST_THREADS: '2' }).want).toBe(2);
     expect(runnerDemand('cargo build', 18, 18, {}, { CARGO_BUILD_JOBS: '4' }).want).toBe(4);
@@ -360,7 +403,9 @@ describe('cowshed CPU budget client', () => {
 
   it('reads back the count a runner was sized to', () => {
     expect(
-      parseInheritedTokens(sizeRunner({ kind: 'process', want: 5 }, 'bun scripts/x.ts', 5).env[CPU_TOKENS_ENV]),
+      parseInheritedTokens(
+        sizeRunner({ kind: 'process', want: 5, testThreads: NO_CEILINGS }, 'bun scripts/x.ts', 5).env[CPU_TOKENS_ENV],
+      ),
     ).toBe(5);
   });
 

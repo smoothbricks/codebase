@@ -29,13 +29,22 @@ export type RunnerKind =
   | 'process';
 
 /**
- * What a runner asks the budget for. Cargo also carries its independent test-thread ceiling; cargo-mutants carries
- * how many cargo processes it runs at once, which share its grant.
+ * The inherited ceilings, lowered by configuration, of test threads, which take no make jobserver token: libtest's
+ * `RUST_TEST_THREADS` and nextest's `NEXTEST_TEST_THREADS`. Null where neither environment names one.
+ */
+export interface TestThreadCeilings {
+  readonly rust: number | null;
+  readonly nextest: number | null;
+}
+
+/**
+ * What a runner asks the budget for. A cargo build, and a process whose script may start Cargo, carry the test-thread
+ * ceilings their sizing keeps; cargo-mutants carries how many cargo processes it runs at once, which share its grant.
  */
 export type Demand =
-  | { kind: 'cargo'; want: number; testThreads: number | null }
+  | { kind: 'cargo' | 'process'; want: number; testThreads: TestThreadCeilings }
   | { kind: 'cargo-mutants'; want: number; jobs: number }
-  | { kind: Exclude<RunnerKind, 'cargo' | 'cargo-mutants'>; want: number };
+  | { kind: Exclude<RunnerKind, 'cargo' | 'cargo-mutants' | 'process'>; want: number };
 
 /** Every budgeted command learns its grant here, so a script that starts a runner can size it. */
 export const CPU_TOKENS_ENV = 'BOUNDED_EXEC_CPU_TOKENS';
@@ -138,7 +147,15 @@ export function runnerDemand(
   const want = Math.max(1, Math.min(requested, ceiling ?? requested));
   switch (kind) {
     case 'cargo':
-      return { kind, want, testThreads: inheritedCeiling(inherited.RUST_TEST_THREADS, configured?.RUST_TEST_THREADS) };
+    case 'process':
+      return {
+        kind,
+        want,
+        testThreads: {
+          rust: inheritedCeiling(inherited.RUST_TEST_THREADS, configured?.RUST_TEST_THREADS),
+          nextest: inheritedCeiling(inherited.NEXTEST_TEST_THREADS, configured?.NEXTEST_TEST_THREADS),
+        },
+      };
     case 'cargo-mutants':
       return { kind, want, jobs };
     default:
@@ -259,8 +276,12 @@ function withSizedFlag(command: string, invocation: RegExp, flag: RegExp, sized:
 }
 
 /**
- * Size the runner to the lesser of its bounded demand and grant, retaining Cargo's test-thread ceiling.
- * Rewrite named flags so they cannot outrank that ceiling. `CPU_TOKENS_ENV` still reports the actual held grant.
+ * Size the runner to the lesser of its bounded demand and grant, keeping the test-thread ceilings. Rewrite named flags
+ * so they cannot outrank that size. `CPU_TOKENS_ENV` still reports the actual held grant.
+ *
+ * Cargo's rustc count is the pool's: the executor's sub-pool exports its jobserver fifo, so no `CARGO_BUILD_JOBS`
+ * comes from the grant (specs/cowshed/05_gateway.md, "The jobserver fifo"). Test threads take no jobserver token, so a
+ * cargo build's test threads are its size, and a process's, whose script may start Cargo, are its whole held grant.
  */
 export function sizeRunner(
   demand: Demand,
@@ -279,14 +300,18 @@ export function sizeRunner(
     case 'bun-parallel':
       return { command: command.replace(BUN_PARALLEL, `--parallel=${count}`), env: { [CPU_TOKENS_ENV]: held } };
     case 'cargo':
+    case 'process': {
+      const threads = demand.kind === 'cargo' ? runnerCount : tokens;
+      const { rust, nextest } = demand.testThreads;
       return {
         command,
         env: {
           [CPU_TOKENS_ENV]: held,
-          CARGO_BUILD_JOBS: count,
-          RUST_TEST_THREADS: String(Math.min(runnerCount, demand.testThreads ?? runnerCount)),
+          RUST_TEST_THREADS: String(Math.min(threads, rust ?? threads)),
+          NEXTEST_TEST_THREADS: String(Math.min(threads, nextest ?? threads)),
         },
       };
+    }
     case 'stryker':
     case 'vitest':
     case 'go-test': {
@@ -313,8 +338,6 @@ export function sizeRunner(
         },
       };
     }
-    case 'process':
-      return { command, env: { [CPU_TOKENS_ENV]: held } };
   }
 }
 

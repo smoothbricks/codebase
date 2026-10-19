@@ -558,7 +558,7 @@ async function shim(
     join(bin, 'cargo'),
     [
       '#!/bin/sh',
-      // Delegate with the caller's original search path: a launcher must not resolve this shim again.
+      // Delegate with the caller's original search path: nothing the real Cargo starts may resolve this shim again.
       `export PATH=${quote(path)}`,
       `real=${quote(real)}`,
       `if [ "$1" != metadata ]; then ${forward}; fi`,

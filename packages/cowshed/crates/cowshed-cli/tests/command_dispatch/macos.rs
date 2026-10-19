@@ -2147,18 +2147,11 @@ fn directory_a_failed_nx_test_leaves_no_daemon_under_its_root_substrate_lifecycl
     assert!(!root.exists(), "{} was removed", root.display());
 }
 
-/// The real Rust toolchain behind the installed Cargo launcher, resolved at run time like
-/// [`repository_nx`]. Follow the launcher's executable and canonical-identity PATH rules
-/// (03_caches.md, "The `cargo` jobserver launcher"), not the directory beside the wrapper.
+/// The real Rust toolchain on the test's `PATH`, resolved at run time like [`repository_nx`]: the
+/// first executable `cargo` in an absolute `PATH` directory, followed to its real file so `rustc`
+/// is the one beside it. Nothing stands in for `cargo` on `PATH` (05_gateway.md, "Host CPU
+/// budget": a grant reaches Cargo as configuration Cargo reads).
 fn rust_toolchain() -> PathBuf {
-    use cowshed_cli::launchd::{COWSHED_BINARY_NAME, HostStableExecutable};
-
-    let home = PathBuf::from(std::env::var_os("HOME").expect("the test's host HOME"));
-    let launcher = HostStableExecutable::new(&home, COWSHED_BINARY_NAME)
-        .expect("the installed cowshed path")
-        .path()
-        .canonicalize()
-        .ok();
     let path = std::env::var_os("PATH").expect("the test's PATH");
     let cargo = std::env::split_paths(&path)
         .filter(|directory| directory.is_absolute())
@@ -2166,9 +2159,9 @@ fn rust_toolchain() -> PathBuf {
         .find(|candidate| {
             candidate.metadata().is_ok_and(|metadata| {
                 metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            }) && (launcher.is_none() || candidate.canonicalize().ok() != launcher)
+            })
         })
-        .expect("real cargo on PATH beyond the installed jobserver launcher")
+        .expect("cargo on PATH")
         .canonicalize()
         .expect("the real cargo resolves");
     let bin = cargo.parent().expect("cargo has a directory").to_path_buf();
@@ -2181,7 +2174,7 @@ fn rust_toolchain() -> PathBuf {
         cargo.display()
     );
     eprintln!(
-        "fixture Rust toolchain: launcher={launcher:?}, cargo={}, rustc={}",
+        "fixture Rust toolchain: cargo={}, rustc={}",
         cargo.display(),
         rustc.canonicalize().expect("rustc resolves").display()
     );

@@ -62,18 +62,15 @@ cowshed setup                          # install that build; `cowshed` on PATH n
 and only another install changes them ([gateway.md](gateway.md#start-at-login-launchd)). A later `cowshed setup` typed
 at the shell runs that installed copy, so it repairs the host but installs nothing new.
 
-The managed Cargo path is published from the controller's trusted host installation, not from the private `HOME` inside
-a sandbox. The same environment writer runs after shell PATH hooks, so a toolchain cannot displace the launcher. Sandbox
-profiles permit only the current installed binary to be read and executed, with lookup metadata; the install directory
-and controller records remain closed to reads/writes, and the gateway control socket remains host-only
-([03 Caches](../../../specs/cowshed/03_caches.md), launcher; [04 Sandbox](../../../specs/cowshed/04_sandbox.md),
-installed-launcher exception).
+The managed environment is published from the controller's trusted host installation, not from the private `HOME` inside
+a sandbox. Sandbox profiles permit only the current installed binary to be read and executed, through its stable name
+with lookup metadata; the install directory and controller records remain closed to reads/writes, and the gateway
+control socket remains host-only ([04 Sandbox](../../../specs/cowshed/04_sandbox.md), installed-cowshed exception).
 
-The same directory also holds `cargo`, a relative link to the stable `cowshed` name. In the managed environment it comes
-first on `PATH` and launches the next real Cargo under the gateway's jobserver budget. Inherited jobservers,
-`bounded-exec` grants and non-compiling commands avoid a second grant; an absent gateway runs Cargo unbudgeted and says
-why. Install and failed-activation rollback switch the launcher and daemon to the same content-addressed bytes through
-the one stable name ([03 Caches](../../../specs/cowshed/03_caches.md), "The `cargo` jobserver launcher";
+Nothing installed answers to `cargo`, and setup removes the `cargo -> cowshed` link earlier installs planted. A job's
+CPU grant reaches Cargo as configuration Cargo already reads: the process holding the grant exports `CARGO_MAKEFLAGS`
+naming the grant's make jobserver fifo, and the test-thread counts. A Cargo no holder started runs as it does
+unconfigured ([03 Caches](../../../specs/cowshed/03_caches.md), "Cargo reads its budget from its holder";
 [05 Gateway](../../../specs/cowshed/05_gateway.md#host-cpu-budget)).
 
 From a checkout of this repository, build the host's release CLI with `nx run cowshed:cli-<platform>:production`

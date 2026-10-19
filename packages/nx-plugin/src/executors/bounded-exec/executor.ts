@@ -64,8 +64,14 @@ const EXIT_CODE_BY_SIGNAL: Partial<Record<NodeJS.Signals, number>> = {
   SIGTERM: 143,
 };
 
-/** The variables the CPU budget sets for the command it grants: no target's environment may set them. */
-const BUDGET_ENV = [CPU_TOKENS_ENV, CPU_POOL_ENV];
+/** The pool descriptor: only a grant may give it, so neither the target's nor the inherited environment passes it on. */
+const POOL_ENV = [CPU_TOKENS_ENV, CPU_POOL_ENV];
+/**
+ * The variables the CPU budget sets for the command it grants: no target's environment may set them. A jobserver the
+ * executor itself inherits, a parent make's, still reaches an ungranted command by Cargo's own rule; a granted one's
+ * sub-pool names its own fifo over it.
+ */
+const BUDGET_ENV = [...POOL_ENV, 'CARGO_MAKEFLAGS', 'MAKEFLAGS', 'MFLAGS'];
 
 export interface BoundedExecContext {
   root: string;
@@ -859,14 +865,14 @@ function buildCommand(options: BoundedExecOptions): string {
 
 /** The lease's directory is the command's TMPDIR unless the target names one itself. */
 function mergeEnv(lease: RamTempLease | null, env: Record<string, string>): NodeJS.ProcessEnv {
-  const inherited = withoutBudgetEnv(process.env);
+  const inherited = withoutPoolEnv(process.env);
   return lease === null ? { ...inherited, ...env } : { ...inherited, TMPDIR: lease.directory, ...env };
 }
 
-/** The process's environment without the CPU budget's variables: a pool and its count only a grant may give. */
-function withoutBudgetEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+/** The process's environment without the CPU pool's descriptor: a pool and its count only a grant may give. */
+function withoutPoolEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const kept = { ...env };
-  for (const name of BUDGET_ENV) {
+  for (const name of POOL_ENV) {
     delete kept[name];
   }
   return kept;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single source of truth for repo-local PATH and installed Cargo launcher precedence.
+# Single source of truth for repo-local PATH and the installed cowshed's place in it.
 # All tooling that sets up PATH must call this instead of hardcoding paths.
 #
 # Usage:

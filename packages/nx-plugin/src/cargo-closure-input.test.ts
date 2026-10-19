@@ -254,7 +254,7 @@ function leafControls(workspace: string, edit: (path: string, text: string) => P
   };
 }
 
-it('delegates counted Cargo through the caller launcher without re-entering its broker', async () => {
+it("delegates counted Cargo to the caller's own cargo without re-entering its broker", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-counted-delegate-')));
   let fixtureCargo: CountedCargo | undefined;
   try {

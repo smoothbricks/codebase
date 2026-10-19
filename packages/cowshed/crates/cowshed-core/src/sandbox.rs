@@ -472,7 +472,7 @@ pub enum SandboxError {
     InvalidPath { path: PathBuf, reason: &'static str },
     GrantIntersectsDeny { grant: PathBuf, deny: PathBuf },
     DenyResolution { path: PathBuf, cause: String },
-    InstalledCargo { path: PathBuf, cause: String },
+    InstalledCowshed { path: PathBuf, cause: String },
 }
 
 impl fmt::Display for SandboxError {
@@ -495,9 +495,9 @@ impl fmt::Display for SandboxError {
                 grant.display(),
                 deny.display()
             ),
-            Self::InstalledCargo { path, cause } => write!(
+            Self::InstalledCowshed { path, cause } => write!(
                 formatter,
-                "cannot resolve the installed cargo launcher {}: {cause}",
+                "cannot resolve the installed cowshed {}: {cause}",
                 path.display()
             ),
             Self::DenyResolution { path, cause } => write!(
@@ -814,6 +814,14 @@ pub fn seatbelt_profile(
             &mut profile,
             &format!("(allow file-read-metadata (subpath \"{directory}\"))"),
         );
+        // A pool's make jobserver fifo lives beside its socket (05_gateway.md "Cargo reads its
+        // holder's jobserver"): its tokens are read and written back, and nothing else there is.
+        push_line(
+            &mut profile,
+            &format!(
+                "(allow file-read-data file-write-data (require-all (subpath \"{directory}\") (vnode-type FIFO)))"
+            ),
+        );
     }
     for socket in &sockets {
         push_line(
@@ -869,32 +877,32 @@ pub fn seatbelt_profile(
         SandboxProfileRole::GitDiscovery | SandboxProfileRole::GitDiscoveryGitOnly
     ) {
         let directory = crate::host_dirs::installed_binary_directory(&config.home);
-        let launcher = directory.join("cargo");
-        let installed = match std::fs::canonicalize(&launcher) {
+        let stable = directory.join("cowshed");
+        let installed = match std::fs::canonicalize(&stable) {
             Ok(path) => Some(path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
-                return Err(SandboxError::InstalledCargo {
-                    path: launcher.clone(),
+                return Err(SandboxError::InstalledCowshed {
+                    path: stable.clone(),
                     cause: error.to_string(),
                 });
             }
         };
         if let Some(installed) = installed {
             let metadata =
-                std::fs::metadata(&installed).map_err(|error| SandboxError::InstalledCargo {
+                std::fs::metadata(&installed).map_err(|error| SandboxError::InstalledCowshed {
                     path: installed.clone(),
                     cause: error.to_string(),
                 })?;
             if !metadata.is_file() {
                 return Err(SandboxError::InvalidPath {
                     path: installed,
-                    reason: "the installed cargo launcher must resolve to one regular executable",
+                    reason: "the installed cowshed must resolve to one regular executable",
                 });
             }
-            // Only the installed copy is readable. Lookup of cargo -> cowshed
-            // and their ancestors needs metadata, never directory contents.
-            for name in [&launcher, &directory.join("cowshed"), &installed] {
+            // Only the installed copy is readable. Lookup of the stable name and its ancestors
+            // needs metadata, never directory contents.
+            for name in [&stable, &installed] {
                 for ancestor in name.ancestors() {
                     push_literal_rule(&mut profile, "allow file-read-metadata", ancestor)?;
                 }

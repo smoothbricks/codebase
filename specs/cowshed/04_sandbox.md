@@ -130,15 +130,23 @@ writes — but cannot add a permission absent from the enclosing execution profi
 ;; No cache lives under the cowshed tree, so nothing here is carved back for one.
 ;; sccache's store is daemon-write-only (03_caches.md) — clients speak to the host
 ;; daemon over the socket above and never touch the store directly.
-;; The installed Cargo launcher is the one host-install exception (03_caches.md):
-;; derive its absolute identity from the trusted controller HOME, resolve cargo
-;; through the stable cowshed name, and allow read/exec of ONLY that installed
-;; binary. Alias and ancestor metadata allow lookup; the bin directory cannot
-;; be listed or written, unrelated install records remain unreadable, and no
-;; rule opens gateway.sock. Shell HOME remains the private workspace HOME.
+;; The installed cowshed is the one host-install exception: derive its absolute
+;; identity from the trusted controller HOME, resolve the stable cowshed name,
+;; and allow read/exec of ONLY that installed binary. Stable-name and ancestor
+;; metadata allow lookup; the bin directory cannot be listed or written,
+;; unrelated install records remain unreadable, and no rule opens gateway.sock.
+;; Shell HOME remains the private workspace HOME. Nothing installed answers to
+;; `cargo` (03_caches.md, "Cargo reads its budget from its holder").
 (allow file-read* file-read-data (literal "<actual installed cowshed binary>"))
 (allow process-exec (literal "<actual installed cowshed binary>"))
-(allow file-read-metadata … exact launcher aliases and ancestor literals …)
+(allow file-read-metadata … the stable name and ancestor literals …)
+;; The workspace's CPU pool directory: connect to a pool socket, and read and
+;; write the make jobserver FIFO beside it (05_gateway.md, "Cargo reads its
+;; holder's jobserver"); never list the directory or open anything else there.
+(allow network-outbound (remote unix-socket (path-prefix "<cpu pool dir>/")))
+(allow file-read-metadata (subpath "<cpu pool dir>"))
+(allow file-read-data file-write-data
+  (require-all (subpath "<cpu pool dir>") (vnode-type FIFO)))
 ;; All other HOME carve-backs come only from detected capabilities' contributions
 ;; (15_capabilities.md), which the capability merge collects in one place. A
 ;; shared cache is strictly beneath HOME and never intersects a protected path or

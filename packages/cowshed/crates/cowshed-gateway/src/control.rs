@@ -1239,6 +1239,7 @@ async fn hold_jobserver<R, W>(
                 host: budget.clone(),
                 checkout,
                 job: stake.job(),
+                tokens: std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
             },
             crate::jobserver::JobserverAdmission::Background => crate::jobserver::PoolSource::Lent(
                 std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
@@ -1246,7 +1247,7 @@ async fn hold_jobserver<R, W>(
         };
         (source, job)
     });
-    let Some((mut fifo, pool)) = answer_grant(&mut writer, &fifos, tokens, source).await else {
+    let Some(mut served) = answer_grant(&mut writer, &fifos, tokens, source).await else {
         return;
     };
     // Hold until the client closes. A growing grant writes each token it is given into the
@@ -1262,7 +1263,7 @@ async fn hold_jobserver<R, W>(
         tokio::select! {
             read = reader.read(&mut discard) => if !matches!(read, Ok(read) if read > 0) { break },
             grown = grown => match grown {
-                Some(to) => match fifo.fill(to - held) {
+                Some(to) => match served.fill(to - held) {
                     Ok(()) => {
                         held = to;
                         let answer = ControlResponse { tokens: Some(to), ..lease(LeaseState::Grown) };
@@ -1273,54 +1274,74 @@ async fn hold_jobserver<R, W>(
                     Err(error) => eprintln!(
                         "cowshed: cannot hand {} grown token(s) to jobserver fifo {}: {error}; they stay held until the build ends",
                         to - held,
-                        fifo.path().display()
+                        served.fifo().display()
                     ),
                 },
                 None => growth = None,
             },
         }
     }
-    if let Some(pool) = pool
-        && let Err(error) = pool.close().await
-    {
-        eprintln!("cowshed: jobserver CPU pool did not close: {error}");
-    }
-    fifo.drain_and_unlink();
+    served.close().await;
     drop(stake);
 }
 
-/// Create a granted jobserver's fifo and, for a job, its private pool, and answer the grant.
-/// `None` once either cannot be made, which is answered, or the client is gone.
+/// What a jobserver grant is served as: a job's private pool, whose make jobserver fifo holds the
+/// grant's tokens and lends them to its children, or a bare fifo for a client that serves none.
+enum Served {
+    Pool(crate::jobserver::CpuPool),
+    Fifo(crate::jobserver::JobserverFifo),
+}
+
+impl Served {
+    /// The fifo the grant names for `CARGO_MAKEFLAGS`.
+    fn fifo(&self) -> &Path {
+        match self {
+            Self::Pool(pool) => pool.fifo().expect("a token-holding pool has a fifo"),
+            Self::Fifo(fifo) => fifo.path(),
+        }
+    }
+
+    /// Hand `tokens` more to the running client: what a growing grant was given.
+    fn fill(&mut self, tokens: usize) -> std::io::Result<()> {
+        match self {
+            Self::Pool(pool) => pool.fill(tokens),
+            Self::Fifo(fifo) => fifo.fill(tokens),
+        }
+    }
+
+    /// Close the pool and drain and unlink the fifo; tokens a client still holds are its own.
+    async fn close(self) {
+        match self {
+            Self::Pool(pool) => {
+                if let Err(error) = pool.close().await {
+                    eprintln!("cowshed: jobserver CPU pool did not close: {error}");
+                }
+            }
+            Self::Fifo(fifo) => fifo.drain_and_unlink(),
+        }
+    }
+}
+
+/// Serve a granted jobserver — for a job, its private pool and that pool's fifo; otherwise a
+/// fifo of its own — and answer the grant. `None` once it cannot be made, which is answered, or
+/// the client is gone.
 async fn answer_grant<W>(
     writer: &mut W,
     fifos: &crate::jobserver::JobserverFifos,
     tokens: usize,
     pool: Option<(crate::jobserver::PoolSource, &JobserverJobIn)>,
-) -> Option<(
-    crate::jobserver::JobserverFifo,
-    Option<crate::jobserver::CpuPool>,
-)>
+) -> Option<Served>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let fifo = match fifos.create(tokens) {
-        Ok(fifo) => fifo,
-        Err(error) => {
-            let _ = write_response(
-                writer,
-                &failure(
-                    ControlFailureCode::Rejected,
-                    format!("cannot create the jobserver fifo: {error}"),
-                ),
-            )
-            .await;
-            return None;
-        }
-    };
-    let pool = match pool {
-        None => None,
-        Some((source, job)) => match fifos.create_pool(source, &job.workspace_incarnation) {
-            Ok(pool) => {
+    let served = match pool {
+        None => fifos
+            .create(tokens)
+            .map(Served::Fifo)
+            .map_err(|error| format!("cannot create the jobserver fifo: {error}")),
+        Some((source, job)) => fifos
+            .create_pool(source, &job.workspace_incarnation)
+            .map(|pool| {
                 cowshed_os::timing::event("jobserver", || {
                     format!(
                         "pool {tokens} for {}/{} job {} at {}",
@@ -1330,35 +1351,31 @@ where
                         pool.path().display()
                     )
                 });
-                Some(pool)
-            }
-            Err(error) => {
-                let _ = write_response(
-                    writer,
-                    &failure(
-                        ControlFailureCode::Rejected,
-                        format!("cannot serve the job's CPU pool: {error}"),
-                    ),
-                )
-                .await;
-                fifo.drain_and_unlink();
-                return None;
-            }
-        },
+                Served::Pool(pool)
+            })
+            .map_err(|error| format!("cannot serve the job's CPU pool: {error}")),
+    };
+    let served = match served {
+        Ok(served) => served,
+        Err(error) => {
+            let _ = write_response(writer, &failure(ControlFailureCode::Rejected, error)).await;
+            return None;
+        }
     };
     let answer = ControlResponse {
-        cpu_pool: pool
-            .as_ref()
-            .map(|pool| pool.path().to_string_lossy().into_owned()),
+        cpu_pool: match &served {
+            Served::Pool(pool) => Some(pool.path().to_string_lossy().into_owned()),
+            Served::Fifo(_) => None,
+        },
         tokens: Some(tokens),
-        fifo: Some(fifo.path().to_string_lossy().into_owned()),
+        fifo: Some(served.fifo().to_string_lossy().into_owned()),
         ..lease(LeaseState::Granted)
     };
     if write_response(writer, &answer).await.is_err() {
-        fifo.drain_and_unlink();
+        served.close().await;
         return None;
     }
-    Some((fifo, pool))
+    Some(served)
 }
 
 /// Connect to a requester's live CPU pool. Only a pool that cannot be reached is absent.
@@ -1480,9 +1497,10 @@ async fn hold_parent_jobserver<R, W>(
             job,
         )
     });
-    let Some((fifo, mut pool)) = answer_grant(&mut writer, &fifos, tokens, source).await else {
+    let Some(served) = answer_grant(&mut writer, &fifos, tokens, source).await else {
         return;
     };
+    let mut served = Some(served);
     let mut parent_open = true;
     let mut parent_byte = [0_u8; 1];
     loop {
@@ -1496,20 +1514,18 @@ async fn hold_parent_jobserver<R, W>(
                     "cowshed: the requester's CPU pool {} ended its {tokens}-token grant; the job runs on over budget until it ends, and its own pool lends nothing more",
                     parent_path.display()
                 );
-                if let Some(pool) = pool.take()
-                    && let Err(error) = pool.close().await
+                // Its own pool's fifo goes with it: a Cargo that holds it open keeps what it reads.
+                if matches!(served, Some(Served::Pool(_)))
+                    && let Some(pool) = served.take()
                 {
-                    eprintln!("cowshed: jobserver CPU pool did not close: {error}");
+                    pool.close().await;
                 }
             }
         }
     }
-    if let Some(pool) = pool
-        && let Err(error) = pool.close().await
-    {
-        eprintln!("cowshed: jobserver CPU pool did not close: {error}");
+    if let Some(served) = served {
+        served.close().await;
     }
-    fifo.drain_and_unlink();
     drop(parent);
 }
 

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
@@ -357,7 +356,15 @@ impl JobCpuAdmission for ImmediateCpu {
                     JobCpuGrant::resident(pool, Box::new(()))
                 }
                 ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
-                    JobCpuGrant::new(ask.want, pool, Box::new(()))
+                    let fifo = PathBuf::from("/nonexistent/cowshed-cpu-pool.fifo");
+                    JobCpuGrant::new(
+                        super::job_cpu::HeldTokens {
+                            tokens: ask.want,
+                            fifo,
+                        },
+                        pool,
+                        Box::new(()),
+                    )
                 }
             })
         })
@@ -577,31 +584,49 @@ pub struct ProcessSpawnRequest {
 
 /// What a spawn places a job's owned command under: its CPU grant, served to the command as the
 /// live pool and count every nested runner borrows from (05_gateway.md "Nested runners use a
-/// parent-held sub-ledger"), and the nice its class runs at. A resident holds no tokens: its
-/// count is 0 and its pool asks the host for each child (05_gateway.md "A resident holds no
-/// token").
+/// parent-held sub-ledger") and as the make jobserver fifo Cargo reads (05_gateway.md "Cargo
+/// reads its holder's jobserver"), and the nice its class runs at. A resident holds no tokens:
+/// its count is 0, it has no fifo, and its pool asks the host for each child (05_gateway.md "A
+/// resident holds no token").
 #[derive(Clone, Debug)]
 pub struct CpuPlacement {
-    pub tokens: Option<NonZeroUsize>,
+    pub held: Option<super::job_cpu::HeldTokens>,
     pub pool: PathBuf,
     pub nice: i32,
 }
 
 impl CpuPlacement {
     /// The variables only the grant's authority sets, laid over the caller's: a caller cannot
-    /// name a pool or a count it was not granted. The root FIFO is never offered beside the pool,
-    /// which would count the same tokens twice.
-    pub(super) fn environment(&self) -> [(OsString, OsString); 2] {
-        [
+    /// name a pool, a count or a jobserver it was not granted. The fifo is the pool's own, whose
+    /// bytes its socket children take, so the two never count one token twice. Test threads take
+    /// no jobserver token, so they are sized to the grant where the caller named no count.
+    pub(super) fn environment(
+        &self,
+        caller: &BTreeMap<String, String>,
+    ) -> Vec<(OsString, OsString)> {
+        let tokens = self.held.as_ref().map_or(0, |held| held.tokens.get());
+        let mut environment = vec![
             (
                 OsString::from("BOUNDED_EXEC_CPU_POOL"),
                 self.pool.clone().into_os_string(),
             ),
             (
                 OsString::from("BOUNDED_EXEC_CPU_TOKENS"),
-                OsString::from(self.tokens.map_or(0, NonZeroUsize::get).to_string()),
+                OsString::from(tokens.to_string()),
             ),
-        ]
+        ];
+        if let Some(held) = &self.held {
+            let mut flags = OsString::from("-j --jobserver-auth=fifo:");
+            flags.push(&held.fifo);
+            environment.push((OsString::from("CARGO_MAKEFLAGS"), flags.clone()));
+            environment.push((OsString::from("MAKEFLAGS"), flags));
+            for name in ["RUST_TEST_THREADS", "NEXTEST_TEST_THREADS"] {
+                if !caller.contains_key(name) {
+                    environment.push((OsString::from(name), OsString::from(tokens.to_string())));
+                }
+            }
+        }
+        environment
     }
 }
 
@@ -1184,7 +1209,9 @@ fn one_shot_plan(
     Ok(plan)
 }
 
-/// The installed cargo launcher leads exact private-bin tool links; no host tool profile joins PATH.
+/// The installed cowshed's directory leads exact private-bin tool links; no host tool profile
+/// joins PATH. Nothing there answers to `cargo`: the toolchain's own Cargo reads the job's grant
+/// from its environment ([`CpuPlacement`]).
 /// The package-manager wrapper route sits just ahead of the other bootstrap links: it is the one
 /// directory the exec host re-leads after shell activation, so it leads before activation too.
 fn bootstrap_path(sandbox: &SandboxConfig) -> Result<OsString> {
@@ -1464,8 +1491,8 @@ async fn point_runtime_link(link: &Path, runtime_dir: &Path) -> Result<()> {
 /// agent-harness `CI` in a development checkout, and no CPU authority but the job's own grant.
 /// GitHub/Forgejo Actions identifies real CI with `GITHUB_ACTIONS=true`; a bare `CI` changes
 /// Cargo unit identities but names no runner. A caller's make jobserver (`CARGO_MAKEFLAGS`,
-/// `MAKEFLAGS`, `MFLAGS`) would outrank the job's pool in the Cargo launcher and run its builds
-/// on someone else's tokens, and its pool markers are the grant's to set ([`CpuPlacement`]).
+/// `MAKEFLAGS`, `MFLAGS`) would run the job's builds on someone else's tokens, and the job's own
+/// jobserver and pool markers are the grant's to set ([`CpuPlacement`]).
 /// What the sandbox owns or withholds is laid over this by [`SandboxEnvironment`].
 /// Variables that name a CPU authority; only a job's own grant sets them.
 const CALLER_CPU_AUTHORITY: [&str; 5] = [
@@ -1969,8 +1996,9 @@ impl SpawnSink for SystemSpawnSink {
         }
         let plan = one_shot_plan(sandbox, profile, cwd, argv)?;
         let mut environment = environment.child(&request.env);
-        // The grant's pool and count are the authority's, laid over whatever the caller named.
-        environment.extend(request.cpu.environment());
+        // The grant's pool, count and jobserver are the authority's, laid over whatever the
+        // caller named.
+        environment.extend(request.cpu.environment(&request.env));
         spawn_fenced(
             sandboxed_command(&plan, &environment),
             request.job_id,
@@ -2007,7 +2035,7 @@ fn host_gate_command(request: &ProcessSpawnRequest, cwd: &Path) -> Result<tokio:
         .args(arguments)
         .current_dir(cwd)
         .envs(caller_environment(&request.env))
-        .envs(request.cpu.environment())
+        .envs(request.cpu.environment(&request.env))
         .env("PWD", cwd);
     Ok(command)
 }
@@ -5328,7 +5356,7 @@ impl SupervisorActor {
             }
         };
         let cpu = CpuPlacement {
-            tokens: grant.tokens(),
+            held: grant.held().cloned(),
             pool: grant.pool().to_path_buf(),
             nice: class_nice(job.info.class),
         };

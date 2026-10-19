@@ -537,9 +537,7 @@ in {
     #    use, so a hook and a shell resolve one binary the same way. The Rust
     #    toolchain's store bin then goes ahead of all of it (rustToolchainBin
     #    above): the same files the profile links, named by a path no checkout
-    #    owns. Ahead of even that goes the installed cowshed's bin, whose
-    #    `cargo` link is the jobserver launcher, so the budget reaches builds
-    #    no Nx executor started.
+    #    owns.
     # 3. ttsc drives the native TypeScript 7 binary while Nx imports the TypeScript
     #    6 API, so the two must be named separately.
     # 4. ttsc caches in the checkout's .cache/ttsc (the path the CI ttsc-plugin

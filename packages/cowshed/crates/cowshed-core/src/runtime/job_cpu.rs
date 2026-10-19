@@ -65,18 +65,26 @@ enum Holder {
     Injected { _owner: Box<dyn Send + Sync> },
 }
 
-/// A job's standing with the host budget: the tokens it holds, or none for a resident, and the
-/// live pool its descendants borrow from -- the grant's own tokens, a gate's relay, or a
-/// resident's relay that asks the host for each child.
+/// The tokens a job holds and the make jobserver fifo that holds them beside its pool, which the
+/// job's command reads as `CARGO_MAKEFLAGS` (05_gateway.md "Cargo reads its holder's jobserver").
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeldTokens {
+    pub tokens: NonZeroUsize,
+    pub fifo: PathBuf,
+}
+
+/// A job's standing with the host budget: the tokens it holds and their fifo, or none for a
+/// resident, and the live pool its descendants borrow from -- the grant's own tokens, a gate's
+/// relay, or a resident's relay that asks the host for each child.
 pub struct JobCpuGrant {
-    tokens: Option<NonZeroUsize>,
+    held: Option<HeldTokens>,
     pool: PathBuf,
     _holder: Holder,
 }
 impl fmt::Debug for JobCpuGrant {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         out.debug_struct("JobCpuGrant")
-            .field("tokens", &self.tokens)
+            .field("held", &self.held)
             .field("pool", &self.pool)
             .finish_non_exhaustive()
     }
@@ -85,9 +93,9 @@ impl JobCpuGrant {
     /// An injected admission provider owns the real allocation represented by this holder.
     /// Production uses the gateway connection; this seam also lets external behavioral fixtures
     /// supply their own owning allocation without pretending an environment count is a grant.
-    pub fn new(tokens: NonZeroUsize, pool: PathBuf, holder: Box<dyn Send + Sync>) -> Self {
+    pub fn new(held: HeldTokens, pool: PathBuf, holder: Box<dyn Send + Sync>) -> Self {
         Self {
-            tokens: Some(tokens),
+            held: Some(held),
             pool,
             _holder: Holder::Injected { _owner: holder },
         }
@@ -95,14 +103,18 @@ impl JobCpuGrant {
     /// An injected resident standing: a pool and no tokens.
     pub fn resident(pool: PathBuf, holder: Box<dyn Send + Sync>) -> Self {
         Self {
-            tokens: None,
+            held: None,
             pool,
             _holder: Holder::Injected { _owner: holder },
         }
     }
     /// The tokens the job holds; `None` for a resident, which holds none.
     pub fn tokens(&self) -> Option<NonZeroUsize> {
-        self.tokens
+        self.held.as_ref().map(|held| held.tokens)
+    }
+    /// The tokens and their fifo; `None` for a resident.
+    pub fn held(&self) -> Option<&HeldTokens> {
+        self.held.as_ref()
     }
     pub fn pool(&self) -> &Path {
         &self.pool
@@ -233,13 +245,13 @@ impl JobCpuAdmission for GatewayJobCpu {
             }
             // A token-holding grant names its tokens, its fifo and its pool; a resident's names
             // only its pool, since it holds no token and its children ask the host through it.
-            let (tokens, pool) = match (ask.class, granted.tokens, granted.cpu_pool, granted.fifo) {
+            let (held, pool) = match (ask.class, granted.tokens, granted.cpu_pool, granted.fifo) {
                 (
                     ExecClass::Background | ExecClass::Interactive | ExecClass::Gate,
                     Some(tokens),
                     Some(pool),
-                    Some(_fifo),
-                ) => (Some(tokens), pool),
+                    Some(fifo),
+                ) => (Some(HeldTokens { tokens, fifo }), pool),
                 (ExecClass::Resident | ExecClass::InteractiveResident, None, Some(pool), None) => {
                     (None, pool)
                 }
@@ -264,8 +276,9 @@ impl JobCpuAdmission for GatewayJobCpu {
                         detail: error.to_string(),
                     })
                 })?;
-            if tokens.is_some_and(|tokens| tokens > ask.want)
-                || pool.parent() != Some(scope.as_path())
+            if held.as_ref().is_some_and(|held| {
+                held.tokens > ask.want || held.fifo.parent() != Some(scope.as_path())
+            }) || pool.parent() != Some(scope.as_path())
             {
                 return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
                     detail:
@@ -278,14 +291,14 @@ impl JobCpuAdmission for GatewayJobCpu {
                 format!(
                     "grant class={:?} tokens={}/{} pool={} checkout={}",
                     ask.class,
-                    tokens.map_or(0, NonZeroUsize::get),
+                    held.as_ref().map_or(0, |held| held.tokens.get()),
                     ask.want,
                     pool.display(),
                     ask.checkout.display()
                 )
             });
             Ok(JobCpuGrant {
-                tokens,
+                held,
                 pool,
                 _holder: Holder::Gateway {
                     _connection: connection,

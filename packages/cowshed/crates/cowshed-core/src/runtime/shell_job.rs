@@ -163,9 +163,10 @@ impl WorkspaceShells {
                 pool
             }
         };
-        // The grant's pool and count are the authority's, laid over whatever the caller named.
+        // The grant's pool, count and jobserver are the authority's, laid over whatever the
+        // caller named.
         let mut overlay = spawn.environment.overlay(spawn.caller);
-        overlay.extend(spawn.cpu.environment());
+        overlay.extend(spawn.cpu.environment(spawn.caller));
         let (stdin_read, stdin_write) = pipe().map_err(pipe_error)?;
         let (stdout_read, stdout_write) = pipe().map_err(pipe_error)?;
         let (stderr_read, stderr_write) = pipe().map_err(pipe_error)?;

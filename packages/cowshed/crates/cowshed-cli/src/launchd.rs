@@ -22,10 +22,11 @@ pub const PRIVATE_PLIST_MODE: u32 = 0o600;
 pub const STABLE_BINARY_MODE: u32 = 0o755;
 pub const COWSHED_BINARY_NAME: &str = "cowshed";
 
-/// The name the jobserver launcher answers to beside the stable `cowshed` name:
-/// the same stored copy, reached as `cargo` (03_caches.md, "The `cargo`
-/// jobserver launcher").
-pub const JOBSERVER_LAUNCHER_NAME: &str = "cargo";
+/// `cargo` in the host-stable directory. Earlier installs linked it beside the stable `cowshed`
+/// name, and that binary answered as `cargo`; cowshed no longer does — a CPU grant reaches Cargo
+/// as the make jobserver configuration Cargo reads itself (05_gateway.md, "Host CPU budget") — so
+/// an install removes the link an earlier one left and nothing creates it.
+pub const CARGO_LINK_NAME: &str = "cargo";
 pub const SCCACHE_BINARY_NAME: &str = "sccache";
 
 pub const LIBRARY_DIRECTORY: &str = "Library";
@@ -912,36 +913,13 @@ pub fn plan_executable_install(
     InstallPlan { operations }
 }
 
-/// Plan the `cargo` link in the host-stable `directory` to the relative stable cowshed name: one
-/// rename of that stable name publishes the same stored build for the launcher and daemon,
-/// including when a failed activation restores the previous build. A link that already names the
-/// stable name plans nothing.
-///
-/// The target is [`COWSHED_BINARY_NAME`] and nothing else, whichever executable was installed
-/// last: only cowshed answers to `cargo` (05_gateway.md, "Name in `bin`"). Deriving it from the
-/// executable an install had just written pointed `cargo` at `nx-cache-server`, which refuses
-/// every cargo argument.
-pub fn plan_launcher_link(directory: &Path, current: &StableLink) -> InstallPlan {
-    let target = PathBuf::from(COWSHED_BINARY_NAME);
-    if *current == StableLink::To(target.clone()) {
-        return InstallPlan {
-            operations: Vec::new(),
-        };
-    }
+/// Plan the removal of the `cargo` link an earlier install left in the host-stable `directory`.
+/// Left there, `cargo` on a `PATH` holding that directory would run the cowshed CLI. The caller
+/// has judged the link one a cowshed install planted; anything else there is not cowshed's to
+/// remove.
+pub fn plan_cargo_link_removal(directory: &Path) -> InstallPlan {
     InstallPlan {
-        operations: vec![
-            Mutation::CreateTemporarySymlink {
-                directory: directory.to_path_buf(),
-                name_prefix: format!(".{JOBSERVER_LAUNCHER_NAME}.link."),
-                target,
-            },
-            Mutation::RenameTemporaryFile {
-                destination: directory.join(JOBSERVER_LAUNCHER_NAME),
-            },
-            Mutation::SyncDirectory {
-                path: directory.to_path_buf(),
-            },
-        ],
+        operations: plan_remove_file(&directory.join(CARGO_LINK_NAME), directory, true),
     }
 }
 

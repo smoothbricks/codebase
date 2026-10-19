@@ -1,6 +1,9 @@
+import { execFile } from 'node:child_process';
+import { closeSync, constants, openSync, readSync, writeSync } from 'node:fs';
 import { chmod, rm } from 'node:fs/promises';
-import { createServer, type Server, type Socket } from 'node:net';
+import { createServer, type Server, Socket } from 'node:net';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import typia from 'typia';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_TOKENS_ENV, parseInheritedTokens, type TokenGrant } from './cpu-tokens.js';
@@ -17,6 +20,13 @@ import { holdLease } from './gateway-lease.js';
  * its FIFO queue. A grant lasts while its connection does, so a child that dies returns its tokens
  * with its socket. A pool grants only from its own count, and a pool whose upstream grant has gone
  * grants nothing.
+ *
+ * The same count is a GNU make jobserver fifo beside the socket, mode 0600, which Cargo, its build
+ * scripts and every nested `cargo` read through `CARGO_MAKEFLAGS`/`MAKEFLAGS` (specs/cowshed/05_gateway.md,
+ * "The jobserver fifo"). A pool of `g` holds `g − 1` token bytes there; the holder's own command holds the
+ * implicit first token. A socket grant takes fifo bytes first and that implicit slot last, which the holder
+ * is not using while it waits on the child it lends it to; release writes the bytes back and frees the slot.
+ * A Cargo reading the fifo and a nested runner holding a socket grant so share one count.
  */
 
 /** The environment name a child reads its parent's pool endpoint from; its count is `CPU_TOKENS_ENV`. */
@@ -31,12 +41,12 @@ export interface InheritedCpuPool {
 
 /** A running pool: the environment a child inherits to reach it, and how to close it. */
 export interface CpuPool {
-  /** The endpoint and the count the pool actually holds. */
+  /** The endpoint, the count the pool actually holds, and its make jobserver fifo. */
   readonly environment: Record<string, string>;
   /**
-   * Refuses new grants, ends every child connection and removes the pool's directory. The outcome is
-   * cached: every call, and an upstream-loss close, returns the first close's outcome. A failed
-   * cleanup is an `ok: false` value, never a rejection.
+   * Refuses new grants, ends every child connection, drains and closes the jobserver fifo, and removes the pool's
+   * directory with the fifo in it. The outcome is cached: every call, and an upstream-loss close, returns the first
+   * close's outcome. A failed cleanup is an `ok: false` value, never a rejection.
    */
   close(): Promise<CloseOutcome>;
 }
@@ -57,11 +67,11 @@ export interface HostWaits {
 interface CpuPoolRequest {
   op: 'cpu-pool';
   want: number & typia.tags.Type<'uint32'> & typia.tags.Minimum<1>;
-  /** Ask the owning pool to serve this allocation as its own child pool (Cargo's host launcher). */
+  /** Ask the owning pool to serve this allocation as its own child pool, with a jobserver fifo of its own. */
   children?: boolean;
   /**
-   * Cargo's launcher asks a compile-only build to grow. This pool lends a fixed count, so it accepts the field and never
-   * grows a child; the gateway's pools do (specs/cowshed/05_gateway.md, "A short build grows").
+   * A compile-only build's ask to grow. A gateway pool grows such a grant; this pool lends a fixed count, so it accepts
+   * the field and never grows a child (specs/cowshed/05_gateway.md, "A short build grows").
    */
   grow?: boolean;
 }
@@ -92,14 +102,22 @@ const TOO_LONG = `a request is one line of at most ${MAX_REQUEST_BYTES} bytes`;
 const EMPTY: Buffer = Buffer.alloc(0);
 const POOL_DIRECTORY = 'cpu-pool-';
 const POOL_SOCKET = 'p.sock';
+/** The jobserver fifo's name beside the socket; the directory's random name is what makes the path unguessable. */
+const POOL_FIFO = 'j';
+/** The byte make's protocol writes for a token. Any byte read is one token; the pool writes this one back. */
+const TOKEN = 0x2b;
 const CLOSED_WHILE_MADE = 'the grant that lends this CPU pool closed while the pool was being made';
+const run = promisify(execFile);
 
-/** A child's phase. Tokens are owed back only while `holding`; a queued child holds nothing; a `waiting` child holds a
- * host wait on the run's idle clock. */
+/**
+ * A child's phase. Tokens are owed back only while `holding`: the bytes it took from the jobserver fifo, and whether it
+ * holds the pool's implicit slot. A queued child holds nothing; a `waiting` child holds a host wait on the run's idle
+ * clock.
+ */
 type Phase =
   | { readonly kind: 'reading' }
   | { readonly kind: 'queued' }
-  | { readonly kind: 'holding'; readonly tokens: number }
+  | { readonly kind: 'holding'; readonly bytes: number; readonly slot: boolean }
   | { readonly kind: 'waiting' }
   | { readonly kind: 'done' };
 
@@ -175,11 +193,159 @@ export async function takeParentCpuTokens(parent: InheritedCpuPool, want: number
   return { granted: true, tokens, release: lease.release, closed: lease.closed, inherited: true };
 }
 
+/** A thrown value's message. */
+const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** Write `count` token bytes to the fifo's descriptor; a short write throws. The fifo holds a pipe buffer of them. */
+function writeTokens(fd: number, count: number): void {
+  if (count === 0) {
+    return;
+  }
+  const written = writeSync(fd, Buffer.alloc(count, TOKEN));
+  if (written !== count) {
+    throw new Error(`it took ${written} of ${count} token bytes`);
+  }
+}
+
+/** Up to `most` token bytes read from the fifo's non-blocking descriptor: 0 when it is empty. */
+function readTokens(fd: number, into: Buffer, most: number): number {
+  try {
+    return readSync(fd, into, 0, Math.min(most, into.length), null);
+  } catch (error) {
+    const code = error instanceof Error && 'code' in error ? error.code : undefined;
+    if (code === 'EAGAIN' || code === 'EWOULDBLOCK') {
+      return 0;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Make the jobserver fifo at `path`, mode 0600, holding `bytes` tokens. Node has no mkfifo, so the system's `mkfifo`
+ * makes it. The pool keeps it open read-write and non-blocking: the fifo always has a writer, so its bytes outlive
+ * every client that opens and closes it, and the pool's own reads and writes never block.
+ */
+async function makeJobserverFifo(
+  path: string,
+  bytes: number,
+): Promise<{ ok: true; fd: number } | { ok: false; error: string }> {
+  try {
+    await run('mkfifo', ['-m', '600', path]);
+  } catch (error) {
+    return { ok: false, error: `the CPU pool's jobserver fifo could not be made: ${describe(error)}` };
+  }
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDWR | constants.O_NONBLOCK);
+  } catch (error) {
+    return { ok: false, error: `the CPU pool's jobserver fifo could not be opened: ${describe(error)}` };
+  }
+  try {
+    writeTokens(fd, bytes);
+  } catch (error) {
+    const failure = `the CPU pool's jobserver fifo did not take its ${bytes} tokens: ${describe(error)}`;
+    try {
+      closeSync(fd);
+    } catch (closing) {
+      return { ok: false, error: `${failure}; its descriptor did not close: ${describe(closing)}` };
+    }
+    return { ok: false, error: failure };
+  }
+  return { ok: true, fd };
+}
+
+/** The one Bun API the readability wait uses: a descriptor read as Bun's own poll-driven byte stream. */
+interface BunFileStreams {
+  file(fd: number): { stream(): ReadableStream<Uint8Array> };
+}
+
+function isBunFileStreams(runtime: unknown): runtime is BunFileStreams {
+  return typeof runtime === 'object' && runtime !== null && 'file' in runtime && typeof runtime.file === 'function';
+}
+
+const bunRuntime: unknown = Reflect.get(globalThis, 'Bun');
+/** Bun's file streams when this process runs on Bun, else null (Node). */
+const bunFiles: BunFileStreams | null = isBunFileStreams(bunRuntime) ? bunRuntime : null;
+
+/** A wait for the fifo to become readable, until `stop`. */
+interface FifoWatch {
+  stop(): void;
+}
+
+/**
+ * Wait, event-driven, for token bytes in the fifo at `path`: no polling loop and no blocking read on the threadpool.
+ * A fresh non-blocking read descriptor is watched by the runtime's event loop. Every byte it reads is taken from the
+ * fifo and reaches `took` as tokens in hand, also after `stop`; `stop` leaves unread bytes in the fifo.
+ *
+ * Node watches the descriptor as a libuv pipe stream (`net.Socket({ fd })`). Bun's `node:net` never reads a fifo, and
+ * its `tty` and `fs` read streams leave a blocking read behind that takes the next token after they are destroyed
+ * (measured on Bun 1.4.3), so on Bun the wait reads through `Bun.file(fd).stream()`, which polls the descriptor and
+ * leaves the fifo untouched when cancelled.
+ */
+function watchFifo(
+  path: string,
+  took: (bytes: number) => void,
+  failed: (error: string) => void,
+): { ok: true; watch: FifoWatch } | { ok: false; error: string } {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch (error) {
+    return { ok: false, error: describe(error) };
+  }
+  if (bunFiles !== null) {
+    const reader = bunFiles.file(fd).stream().getReader();
+    let stopped = false;
+    const next = (): void => {
+      void reader.read().then(
+        (chunk) => {
+          if (chunk.done) {
+            return;
+          }
+          took(chunk.value.byteLength);
+          if (!stopped) next();
+        },
+        (error: unknown) => {
+          if (!stopped) failed(describe(error));
+        },
+      );
+    };
+    next();
+    const release = (): void => {
+      try {
+        closeSync(fd);
+      } catch (error) {
+        failed(`its watch descriptor did not close: ${describe(error)}`);
+      }
+    };
+    return {
+      ok: true,
+      watch: {
+        stop: () => {
+          stopped = true;
+          void reader.cancel().then(release, release);
+        },
+      },
+    };
+  }
+  let reader: Socket;
+  try {
+    reader = new Socket({ fd, readable: true, writable: false });
+  } catch (error) {
+    closeSync(fd);
+    return { ok: false, error: describe(error) };
+  }
+  reader.on('data', (chunk: Buffer) => took(chunk.length));
+  reader.on('error', (error) => failed(error.message));
+  // Destroying the stream closes its descriptor and stops its reads at once.
+  return { ok: true, watch: { stop: () => reader.destroy() } };
+}
+
 /**
  * Make a pool of `tokens` that lives while `closed` does: when `closed` resolves the pool refuses
- * grants, ends its child connections and removes its directory. A child's `host-wait` is reported
- * to `waits` for as long as its connection holds it; a sub-pool reports to the same `waits`.
- * Setup failures are values; a non-positive or unsafe count is a programmer bug and throws.
+ * grants, ends its child connections, drains its jobserver fifo and removes its directory. A child's
+ * `host-wait` is reported to `waits` for as long as its connection holds it; a sub-pool reports to the
+ * same `waits`. Setup failures are values; a non-positive or unsafe count is a programmer bug and throws.
  */
 export async function createCpuPool(
   tokens: number,
@@ -193,13 +359,26 @@ export async function createCpuPool(
   try {
     directory = await ownedSocketDirectory(POOL_DIRECTORY, POOL_SOCKET);
   } catch (error) {
-    return {
-      ok: false,
-      error: `the CPU pool's directory could not be made: ${error instanceof Error ? error.message : String(error)}`,
-    };
+    return { ok: false, error: `the CPU pool's directory could not be made: ${describe(error)}` };
   }
   const socketPath = join(directory, POOL_SOCKET);
-  let free = tokens;
+  const fifoPath = join(directory, POOL_FIFO);
+  const fifo = await makeJobserverFifo(fifoPath, tokens - 1);
+  if (!fifo.ok) {
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch (error) {
+      return { ok: false, error: `${fifo.error}; its directory was not removed: ${describe(error)}` };
+    }
+    return { ok: false, error: fifo.error };
+  }
+  const jobserver = fifo.fd;
+  // The pool reads at most what it holds at once: the fifo carries no more of its tokens than that.
+  const scratch = Buffer.allocUnsafe(tokens);
+  // The holder's implicit first token, while a socket child holds it.
+  let slotLent = false;
+  // The readability wait while the queue's head finds no token, else undefined.
+  let watch: FifoWatch | undefined;
   let closing = false;
   let listening = false;
   let shut: Promise<CloseOutcome> | undefined;
@@ -215,21 +394,77 @@ export async function createCpuPool(
     resolveStarted = done;
   });
 
-  // FIFO: the head takes `min(want, free)` as one grant once any token is free. A waiting child holds
-  // nothing, so no child waits while it holds tokens another child needs.
-  const drain = (): void => {
-    while (!closing && free > 0) {
-      const waiter = queue.shift();
+  // A fault in the pool's own fifo, said and recorded; the pool then closes, as on a listener failure.
+  const fail = (failure: string): void => {
+    failures.push(failure);
+    process.stderr.write(`bounded-exec: the CPU pool at ${socketPath} failed: ${failure}\n`);
+    closeInBackground();
+  };
+
+  const returnTokens = (count: number): void => {
+    try {
+      writeTokens(jobserver, count);
+    } catch (error) {
+      fail(`its jobserver fifo did not take back ${count} tokens: ${describe(error)}`);
+    }
+  };
+
+  const stopWatching = (): void => {
+    watch?.stop();
+    watch = undefined;
+  };
+
+  // The head found no token: wake when a holder outside the pool, such as Cargo, writes one back.
+  const watchForTokens = (): void => {
+    if (watch !== undefined) {
+      return;
+    }
+    const watching = watchFifo(fifoPath, drain, (error) =>
+      fail(`its jobserver fifo failed while a child waited for a token: ${error}`),
+    );
+    if (watching.ok) {
+      watch = watching.watch;
+    } else {
+      fail(`its jobserver fifo could not be watched for a token: ${watching.error}`);
+    }
+  };
+
+  // FIFO: the head takes `min(want, available)` as one grant once any token is available, where available is the
+  // fifo bytes it can read without blocking plus the implicit slot while no child holds it. `arrived` is bytes the
+  // readability wait already took. A waiting child holds nothing, so no child waits while it holds tokens another
+  // child needs. Whatever bytes are in hand when no head can use them go straight back to the fifo.
+  function drain(arrived: number): void {
+    let inHand = arrived;
+    while (!closing) {
+      const waiter = queue[0];
       if (waiter === undefined) {
-        return;
+        break;
       }
       if (!waiter.child.socket.writable) {
         // A child that half-closed or failed while queued. Its `close` finds it gone from the queue.
+        queue.shift();
         continue;
       }
-      const granted = Math.min(waiter.want, free);
-      free -= granted;
-      waiter.child.phase = { kind: 'holding', tokens: granted };
+      if (inHand < waiter.want) {
+        try {
+          inHand += readTokens(jobserver, scratch, waiter.want - inHand);
+        } catch (error) {
+          fail(`its jobserver fifo could not be read: ${describe(error)}`);
+          return;
+        }
+      }
+      const granted = Math.min(waiter.want, inHand + (slotLent ? 0 : 1));
+      if (granted === 0) {
+        watchForTokens();
+        return;
+      }
+      queue.shift();
+      // Fifo bytes first, the implicit slot last.
+      const bytes = Math.min(granted, inHand);
+      inHand -= bytes;
+      const slot = granted > bytes;
+      if (slot) slotLent = true;
+      waiter.child.phase = { kind: 'holding', bytes, slot };
       if (!waiter.children) {
         waiter.child.socket.write(frame({ ok: true, lease: 'granted', tokens: granted }));
         continue;
@@ -259,7 +494,9 @@ export async function createCpuPool(
       creating ??= [];
       creating.push(creation);
     }
-  };
+    stopWatching();
+    if (!closing) returnTokens(inHand);
+  }
 
   const refuse = (child: Child, error: string): void => {
     child.phase = { kind: 'done' };
@@ -284,12 +521,14 @@ export async function createCpuPool(
           queue.splice(at, 1);
         }
       } else if (child.phase.kind === 'holding') {
-        free += child.phase.tokens;
+        // A closing pool drains its fifo whole; until then the bytes go back for the next holder.
+        if (child.phase.slot) slotLent = false;
+        if (!closing) returnTokens(child.phase.bytes);
       } else if (child.phase.kind === 'waiting') {
         waits.end();
       }
       child.phase = { kind: 'done' };
-      drain();
+      drain(0);
     });
     let buffered: Buffer = EMPTY;
     // Refusing releases what the connection buffered: a refused request holds no storage.
@@ -355,7 +594,7 @@ export async function createCpuPool(
       child.phase = { kind: 'queued' };
       queue.push({ child, want: request.want, children: request.children === true });
       socket.write(frame({ ok: true, lease: 'queued' }));
-      drain();
+      drain(0);
     });
   };
 
@@ -366,6 +605,7 @@ export async function createCpuPool(
   const shutdown = (): Promise<CloseOutcome> => {
     shut ??= (async (): Promise<CloseOutcome> => {
       closing = true;
+      stopWatching();
       await started;
       for (const socket of children) {
         socket.destroy();
@@ -387,10 +627,23 @@ export async function createCpuPool(
           if (!outcome.ok) failures.push(outcome.error);
         }
       }
+      // The fifo's bytes are drained before it goes: a Cargo that outlives the pool keeps its descriptor and the tokens
+      // it holds, and takes no more.
+      try {
+        let drained = readTokens(jobserver, scratch, scratch.length);
+        while (drained > 0) drained = readTokens(jobserver, scratch, scratch.length);
+      } catch (error) {
+        failures.push(`its jobserver fifo was not drained: ${describe(error)}`);
+      }
+      try {
+        closeSync(jobserver);
+      } catch (error) {
+        failures.push(`its jobserver fifo did not close: ${describe(error)}`);
+      }
       try {
         await rm(directory, { recursive: true, force: true });
       } catch (error) {
-        failures.push(`its directory was not removed: ${error instanceof Error ? error.message : String(error)}`);
+        failures.push(`its directory was not removed: ${describe(error)}`);
       }
       return failures.length === 0
         ? { ok: true }
@@ -444,17 +697,22 @@ export async function createCpuPool(
     // denies every other user the path.
     await chmod(socketPath, 0o600);
   } catch (error) {
-    return abort(
-      `the CPU pool's socket could not be made private: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    return abort(`the CPU pool's socket could not be made private: ${describe(error)}`);
   }
   if (closing) {
     return abort(CLOSED_WHILE_MADE);
   }
+  // Cargo and make read the fifo from here; `-j` with a jobserver names no count of its own.
+  const jobserverFlags = `-j --jobserver-auth=fifo:${fifoPath}`;
   return {
     ok: true,
     pool: {
-      environment: { [CPU_POOL_ENV]: socketPath, [CPU_TOKENS_ENV]: String(tokens) },
+      environment: {
+        [CPU_POOL_ENV]: socketPath,
+        [CPU_TOKENS_ENV]: String(tokens),
+        CARGO_MAKEFLAGS: jobserverFlags,
+        MAKEFLAGS: jobserverFlags,
+      },
       close: shutdown,
     },
   };

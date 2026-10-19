@@ -931,9 +931,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
             return heldGrant(tokens, released);
           },
         };
+        // Cargo's ceiling bounds its ask; its rustc count is then the sub-pool's jobserver fifo, and its test threads
+        // are sized under their own ceiling, never to the target's 64.
         for (const scenario of [
           { runner: 'nextest run', variable: 'NEXTEST_TEST_THREADS', cap: 6 },
-          { runner: 'cargo test', variable: 'CARGO_BUILD_JOBS', cap: 4 },
+          { runner: 'cargo test', variable: 'RUST_TEST_THREADS', cap: 4 },
         ]) {
           const command = `node -e "console.log('cap=' + process.env.${scenario.variable} + ' held=' + process.env.BOUNDED_EXEC_CPU_TOKENS)" # ${scenario.runner}`;
           const result = await runBoundedExec(
@@ -962,6 +964,40 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       if (previousRust === undefined) delete process.env.RUST_TEST_THREADS;
       else process.env.RUST_TEST_THREADS = previousRust;
     }
+  });
+
+  it("names the run's own jobserver fifo to its command, never one the target's env names", async () => {
+    const workspace = await createWorkspace();
+    const released: number[] = [];
+    const injected = '-j --jobserver-auth=fifo:/injected';
+    const command = `node -e "console.log(JSON.stringify([process.env.CARGO_MAKEFLAGS, process.env.MAKEFLAGS, process.env.${CPU_POOL_ENV}]))"`;
+    const result = await runBoundedExec(
+      {
+        command,
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        env: { CARGO_MAKEFLAGS: injected, MAKEFLAGS: injected, MFLAGS: injected },
+      },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+      {
+        async take() {
+          return heldGrant(2, released);
+        },
+      },
+    );
+    expect(result.success).toBe(true);
+    for (const name of ['CARGO_MAKEFLAGS', 'MAKEFLAGS', 'MFLAGS']) {
+      expect(result.terminalOutput).toContain(
+        `cowshed: ${name} in the target's env is ignored: the CPU budget sets it`,
+      );
+    }
+    // Cargo and make both read the fifo beside the sub-pool's socket that this run serves its descendants.
+    expect(result.terminalOutput).toMatch(
+      /^\["-j --jobserver-auth=fifo:(\/\S+)\/j","-j --jobserver-auth=fifo:\1\/j","\1\/p\.sock"\]$/m,
+    );
+    expect(result.terminalOutput).not.toContain('/injected');
+    expect(released).toEqual([2]);
   });
 
   it('starts the runner once granted, sized to its grant, and returns the tokens when it exits', async () => {
