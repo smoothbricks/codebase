@@ -306,6 +306,20 @@ impl CpuHolder {
     }
 }
 
+/// The most tokens background-class work holds at once on a host of `total` tokens: half the
+/// host, rounded down, and at least one (05_gateway.md "Room for a gate"). No running grant can
+/// be shrunk, so the other half is kept for gate-class work to take the moment it asks.
+pub fn background_limit(total: usize) -> usize {
+    (total / 2).max(1)
+}
+
+impl CpuBudgetStatus {
+    /// The most tokens this ledger's background-class work holds at once.
+    pub fn background_limit(&self) -> usize {
+        background_limit(self.total)
+    }
+}
+
 /// One waiting gate-class request: the gate job it serves, and the request itself.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

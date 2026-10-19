@@ -1236,21 +1236,22 @@ idempotent, and a `--purge` with nothing installed says so rather than failing.
 running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
 
 `status` reports health without starting the service, then the host CPU ledger the daemon serves (05 Gateway, "Host CPU
-budget") in the order it serves it: tokens held of the total; every lease held past the 30-minute hold limit, oldest
-first, so the first lines say who holds the host and since when (05 Gateway, "The hold limit"); the running gate jobs,
-the head — the oldest land — first; the gate queue in the order returned tokens go to it; then each checkout's
-background work. A gate job is named by its admission number (the smaller is the older land). Each running gate job and
-background stake is followed by its leases, oldest grant first: the client's pid (the socket's peer), its tokens of its
-want, the age of its grant — the lease's, not the process's; `ps -p <pid>` gives that — and the command it named. Every
-waiting request is named the same way, with how long it has waited: one gate job's tasks wait as one entry each, and
-their pids, commands and ages tell them apart. A resident (`exec --class resident`, a kept Nx daemon) holds no token, so
-it is in no line; a request it runs is.
+budget") in the order it serves it: tokens held of the total, with the most background work holds at once — half the
+host, the other half kept for a gate to start on at once (05 Gateway, "Room for a gate"); every lease held past the
+30-minute hold limit, oldest first, so the first lines say who holds the host and since when (05 Gateway, "The hold
+limit"); the running gate jobs, the head — the oldest land — first; the gate queue in the order returned tokens go to
+it; then each checkout's background work. A gate job is named by its admission number (the smaller is the older land).
+Each running gate job and background stake is followed by its leases, oldest grant first: the client's pid (the socket's
+peer), its tokens of its want, the age of its grant — the lease's, not the process's; `ps -p <pid>` gives that — and the
+command it named. Every waiting request is named the same way, with how long it has waited: one gate job's tasks wait as
+one entry each, and their pids, commands and ages tell them apart. A resident (`exec --class resident`, a kept Nx
+daemon) holds no token, so it is in no line; a request it runs is.
 
 ```
 $ cowshed gateway status
 cowshed: gateway is healthy: launchd loaded; control socket answers at /private/cowshed/store/gateway.sock
 cowshed: gateway versions: cli 0.1.0; daemon 0.1.0
-cowshed: gateway cpu budget: held 18/18 tokens
+cowshed: gateway cpu budget: held 18/18 tokens, background at most 9
 cowshed: gateway cpu hold past 30m: /Users/me/Dev/app: pid 3977, 2/18 tokens, granted 34m07s ago: cargo --frozen test -p app
 cowshed: gateway gate head: /Users/me/Dev/app gate job 4: held 15, running 2
 cowshed: gateway gate lease: /Users/me/Dev/app gate job 4: pid 4120, 1/1 tokens, granted 12m30s ago: nx run-many -t gate
@@ -1684,13 +1685,14 @@ operational error and does not change the already-established process result.
 
 Every job takes host CPU tokens from the gateway before its command starts (05_gateway.md, "Host CPU budget"), at a
 class and demand its request names. An ordinary command is `background` and wants one token; `--want <n>` names the
-tokens a heavy runner can use at once, and its grant is between one and `n`. `--class gate` admits the command as the
-operator's gate: it waits for whole returned tokens ahead of queued background work with no deadline, and runs at nice
-0, where background runs at +10. `--host` is valid only with `--class gate`, and a gate cannot name a `--session`. Only
-this trusted route may ask for a gate: a workspace's own capability (`worker.exec`) is refused with a typed
-class-not-permitted error before anything runs, and no environment variable confers the class. `--host` runs the gate
-once at the host boundary, outside the workspace sandbox, for the real-APFS host gate. `JobInfo` reports the admitted
-`class` and `scope`, the observed `nice`, and the granted `cpuTokens`.
+tokens a heavy runner can use at once, and its grant is between one and `n`. Background work never holds more than half
+the host. `--class gate` admits the command as the operator's gate: it starts at once on the half background leaves free
+while no other gate work holds it, and otherwise waits for whole returned tokens ahead of queued background work with no
+deadline; it runs at nice 0, where background runs at +10. `--host` is valid only with `--class gate`, and a gate cannot
+name a `--session`. Only this trusted route may ask for a gate: a workspace's own capability (`worker.exec`) is refused
+with a typed class-not-permitted error before anything runs, and no environment variable confers the class. `--host`
+runs the gate once at the host boundary, outside the workspace sandbox, for the real-APFS host gate. `JobInfo` reports
+the admitted `class` and `scope`, the observed `nice`, and the granted `cpuTokens`.
 
 A host gate's child starts from an empty environment. `--host` carries the operator's environment, including custom
 operator and project variables, in the normal request. There is no execution environment-name allowlist: the existing
