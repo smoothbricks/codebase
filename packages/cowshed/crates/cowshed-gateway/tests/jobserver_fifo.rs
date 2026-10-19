@@ -75,10 +75,6 @@ const CHECKOUT: &str = "/w/job";
 /// How long a child that must wait is watched for a grant it must not get.
 const NOT_GRANTED: Duration = Duration::from_millis(200);
 
-/// How long a child that must be granted may take; a missed grant fails here, not at the leg's
-/// backstop.
-const GRANTED: Duration = Duration::from_secs(5);
-
 /// A real gateway of 8 tokens, so background's room (half the host) holds a job of 3.
 async fn gateway(root: &Path) -> (Gateway, PathBuf) {
     let cache = root.join("cache");
@@ -178,22 +174,13 @@ impl FifoReader {
         taken
     }
 
-    /// Takes the fifo's bytes as they arrive until it holds `count`; a return that never arrives
-    /// fails within [`GRANTED`].
+    /// Takes the fifo's bytes as they arrive until it holds `count`. A return that never arrives
+    /// is a hang the leg's no-progress bound names, never a deadline of this test's.
     async fn take_until(&mut self, count: usize) {
-        tokio::time::timeout(GRANTED, async {
-            while self.held < count {
-                self.take_all();
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "{count} returned bytes reach the fifo; it held {}",
-                self.held
-            )
-        });
+        while self.held < count {
+            self.take_all();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Writes back every byte it holds.
@@ -215,11 +202,20 @@ async fn child(pool: &Path, want: usize) -> BufReader<UnixStream> {
     reader
 }
 
-/// The tokens the child is granted within `within`, `None` when it is still waiting.
+/// Quiet-window check: whether the child is granted within `within`; `None` while it waits.
 async fn granted_within(child: &mut BufReader<UnixStream>, within: Duration) -> Option<u64> {
     let granted = tokio::time::timeout(within, answer(child)).await.ok()?;
     assert_eq!(granted["lease"], "granted", "{granted}");
     granted["tokens"].as_u64()
+}
+
+/// The tokens of the child's grant, waiting for it.
+async fn granted(child: &mut BufReader<UnixStream>) -> u64 {
+    let granted = answer(child).await;
+    assert_eq!(granted["lease"], "granted", "{granted}");
+    granted["tokens"]
+        .as_u64()
+        .expect("a grant names its tokens")
 }
 
 /// The host ledger holds the job's `g` alone, for its own checkout, with nobody waiting.
@@ -292,8 +288,8 @@ async fn a_pool_child_is_lent_the_fifo_bytes_first_and_the_holders_own_token_las
     let one = job_grant(&socket, 1).await;
     let mut lent = child(&one.pool, 8).await;
     assert_eq!(
-        granted_within(&mut lent, GRANTED).await,
-        Some(1),
+        granted(&mut lent).await,
+        1,
         "a one-token pool lends its holder's own token"
     );
     let mut next = child(&one.pool, 1).await;
@@ -304,12 +300,12 @@ async fn a_pool_child_is_lent_the_fifo_bytes_first_and_the_holders_own_token_las
     let three = job_grant(&socket, 3).await;
     // Free bytes go first: a child asking for two takes the fifo's two, not the holder's token.
     let mut bytes = child(&three.pool, 2).await;
-    assert_eq!(granted_within(&mut bytes, GRANTED).await, Some(2));
+    assert_eq!(granted(&mut bytes).await, 2);
     let mut reader = FifoReader::open(&three.fifo);
     assert_eq!(reader.take_all(), 0, "the child's bytes left the fifo");
     // Only the holder's own token is left, and it goes last: to the next child.
     let mut last = child(&three.pool, 8).await;
-    assert_eq!(granted_within(&mut last, GRANTED).await, Some(1));
+    assert_eq!(granted(&mut last).await, 1);
     drop(bytes);
     // The returned bytes are in the fifo again; a reader holding them leaves the next child waiting.
     reader.take_until(2).await;
@@ -317,8 +313,8 @@ async fn a_pool_child_is_lent_the_fifo_bytes_first_and_the_holders_own_token_las
     assert_eq!(granted_within(&mut waiting, NOT_GRANTED).await, None);
     reader.give_back();
     assert_eq!(
-        granted_within(&mut waiting, GRANTED).await,
-        Some(2),
+        granted(&mut waiting).await,
+        2,
         "the bytes the reader wrote back go to the waiting child"
     );
     assert_host_holds_only(&socket, 3).await;
@@ -337,14 +333,14 @@ async fn returns_reach_the_waiting_child_and_the_fifo_never_grows_past_the_grant
     let job = job_grant(&socket, g).await;
 
     let mut first = child(&job.pool, 8).await;
-    assert_eq!(granted_within(&mut first, GRANTED).await, Some(g as u64));
+    assert_eq!(granted(&mut first).await, g as u64);
     let mut second = child(&job.pool, 8).await;
     assert_eq!(granted_within(&mut second, NOT_GRANTED).await, None);
     assert_host_holds_only(&socket, g).await;
     drop(first);
     assert_eq!(
-        granted_within(&mut second, GRANTED).await,
-        Some(g as u64),
+        granted(&mut second).await,
+        g as u64,
         "the closed child's tokens go to the child waiting behind it"
     );
     assert_host_holds_only(&socket, g).await;

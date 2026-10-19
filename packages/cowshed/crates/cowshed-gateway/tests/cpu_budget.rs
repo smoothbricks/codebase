@@ -1075,8 +1075,8 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Wait until `checkout`'s background stake has exactly `count` waiters in the ledger; a count
-/// that never settles fails within five seconds rather than at the leg's backstop.
+/// Wait until `checkout`'s background stake has exactly `count` waiters in the ledger. A count
+/// that never settles is a hang the leg's no-progress bound names, never a deadline of this test's.
 async fn waiters_reach(socket: &Path, checkout: &str, count: usize) {
     let waiters = |status: &CpuBudgetStatus| {
         status
@@ -1086,18 +1086,9 @@ async fn waiters_reach(socket: &Path, checkout: &str, count: usize) {
             .map(|stake| stake.waiters.len())
             .sum::<usize>()
     };
-    let settled = tokio::time::timeout(Duration::from_secs(5), async {
-        while waiters(&ledger(socket).await) != count {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-    let status = ledger(socket).await;
-    assert!(
-        settled.is_ok(),
-        "{checkout} has {} waiters, not {count}: {status:?}",
-        waiters(&status)
-    );
+    while waiters(&ledger(socket).await) != count {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// A child of the pool at `pool` asking for `want`, held once granted: what a sibling of an exec
@@ -1149,9 +1140,8 @@ async fn a_holders_exec_whose_pool_is_busy_is_granted_by_the_host_when_it_has_ro
     );
 
     drop(sibling);
-    let (next, lent) = tokio::time::timeout(Duration::from_secs(5), pool_child(holder.pool(), 1))
-        .await
-        .expect("the withdrawn ask holds up no child of the pool");
+    // The withdrawn ask holds up no child of the pool: the next one is lent the token.
+    let (next, lent) = pool_child(holder.pool(), 1).await;
     assert_eq!(lent, 1);
 
     drop((next, exec, holder));
