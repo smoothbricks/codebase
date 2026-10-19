@@ -302,7 +302,7 @@ export function describeMiss(reason: MissReason): string {
     case 'cache-disabled':
       return `the Nx cache is disabled, so ${reason.taskId} must run`;
     case 'no-daemon':
-      return `the Nx daemon is disabled, so ${reason.taskId} cannot be checked without running it`;
+      return `no Nx daemon serves this workspace, so ${reason.taskId} cannot be checked without running it`;
   }
 }
 
@@ -735,23 +735,36 @@ type PreparedWorkspaceProbe =
   | ReadyWorkspaceProbe
   | { readonly kind: 'no-daemon'; readonly reason: Extract<MissReason, { kind: 'no-daemon' }> };
 
+/**
+ * The two operations a probe is prepared for. `build` may start the workspace's Nx daemon, as `nx` itself does.
+ * `read-only` only connects to a daemon already serving the workspace, and asks it for the authoritative graph:
+ * starting one writes the workspace's data directory (`.nx/workspace-data/d`), and a read-only caller may not
+ * write it at all — a sandboxed consumer is granted its provider read-only. A daemon that exits between that
+ * connection check and the first request is the one window in which Nx's client still starts a successor.
+ */
+type ProbeOperation = 'build' | 'read-only';
+
 async function prepareWorkspaceProbe(
   workspaceRoot: string,
   selector: TargetSelector,
-  forceGraphRpc = false,
+  operation: ProbeOperation,
 ): Promise<PreparedWorkspaceProbe> {
   const taskId = selectorTaskId(selector);
+  const noDaemon: PreparedWorkspaceProbe = { kind: 'no-daemon', reason: { kind: 'no-daemon', taskId } };
   // This explicit fallback path loads no Nx. The build operation may run the
   // checkout-local CLI; the read-only operation can only report the miss.
   if (process.env.NX_DAEMON === 'false') {
-    return { kind: 'no-daemon', reason: { kind: 'no-daemon', taskId } };
+    return noDaemon;
   }
   // Runtime modules always belong to the provider's installed Nx version.
   const requireNx = createWorkspaceNxRequire(workspaceRoot);
   bindWorkspaceRoot(workspaceRoot, requireNx);
   const { daemonClient } = requireNx('nx/src/daemon/client/client');
   if (!daemonClient.enabled()) {
-    return { kind: 'no-daemon', reason: { kind: 'no-daemon', taskId } };
+    return noDaemon;
+  }
+  if (operation === 'read-only' && !(await daemonClient.isServerAvailable())) {
+    return noDaemon;
   }
   assignEnvironment(process.env, withoutOuterTaskCacheBypass(process.env));
 
@@ -771,7 +784,7 @@ async function prepareWorkspaceProbe(
   setEnvVarsBasedOnArgs(nxArgs, loadDotEnvFiles);
 
   performance.mark('ensureBuilt:graph:start');
-  const projectGraph = await currentProjectGraph(workspaceRoot, nxJson, requireNx, forceGraphRpc);
+  const projectGraph = await currentProjectGraph(workspaceRoot, nxJson, requireNx, operation === 'read-only');
   nxJson = readNxJson();
   requireProject(projectGraph, selector.project);
   const taskGraph = createTaskGraph(
@@ -819,7 +832,7 @@ async function withTaskHooks<Result>(
 }
 
 async function ensureBuiltInWorkspace(workspaceRoot: string, selector: TargetSelector): Promise<EnsureBuiltResult> {
-  const prepared = await prepareWorkspaceProbe(workspaceRoot, selector);
+  const prepared = await prepareWorkspaceProbe(workspaceRoot, selector, 'build');
   if (prepared.kind === 'no-daemon') return runViaCli(workspaceRoot, selector, prepared.reason);
   return withTaskHooks(workspaceRoot, selector, prepared, buildPreparedTarget);
 }
@@ -842,9 +855,10 @@ async function probeBuiltInWorkspace(workspaceRoot: string, selector: TargetSele
   const taskId = selectorTaskId(selector);
   const receipt = readProducerReceipt(workspaceRoot, taskId);
   if (receipt.ok) return { disposition: 'hit', receipt: receipt.value };
-  // A failed publication proof asks Nx for the authoritative generation, but
-  // never hashes against the consumer environment or starts a provider runner.
-  const prepared = await prepareWorkspaceProbe(workspaceRoot, selector, true);
+  // A failed publication proof asks a serving Nx daemon for the authoritative
+  // generation, but never hashes against the consumer environment, starts a
+  // provider runner or starts the provider's daemon.
+  const prepared = await prepareWorkspaceProbe(workspaceRoot, selector, 'read-only');
   const detail =
     prepared.kind === 'no-daemon'
       ? `${receipt.detail}; authoritative graph unavailable: ${describeMiss(prepared.reason)}`

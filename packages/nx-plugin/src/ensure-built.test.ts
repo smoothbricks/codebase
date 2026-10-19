@@ -1191,6 +1191,45 @@ await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify
     }
   });
 
+  // A sandboxed consumer is granted its provider read-only, and starting a daemon writes the provider's workspace
+  // data (`.nx/workspace-data/d`): the read-only probe connects to a serving daemon or reports that none serves.
+  it('reports no-daemon and writes nothing when no daemon serves a provider without a receipt', async () => {
+    await withNxFixture(
+      'ensure-built-probe-no-daemon-',
+      async ({ root, workspace, socketDirectory }) => {
+        await writeTwoProjectWorkspace(workspace, join(root, 'lib-builds.log'), true);
+        const listing = async () =>
+          (await readdir(workspace, { recursive: true })).filter((entry) => !entry.startsWith('node_modules')).sort();
+        const before = await listing();
+        const probeEntry = join(root, 'probe-no-daemon.ts');
+        await writeFile(
+          probeEntry,
+          `
+import { probeBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
+const result = await probeBuilt({ target: 'app:build', cwd: ${JSON.stringify(workspace)} });
+await new Promise<void>((resolve, reject) => process.stdout.write(JSON.stringify(result) + "\\n", error => error ? reject(error) : resolve()));
+`,
+        );
+        // Run from the fixture root, outside the provider workspace, as a consumer calls it.
+        const probed = await run('bun', probeEntry, root, [], { NX_DAEMON: 'true', NX_SOCKET_DIR: socketDirectory });
+        expect(probed.code, probed.stdout + probed.stderr).toBe(0);
+        const result = typia.json.assertParse<EnsureBuiltProbeResult>(probed.stdout);
+        expect(result).toMatchObject({
+          disposition: 'failed',
+          reason: { kind: 'provider-proof', taskId: 'app:build' },
+        });
+        if (result.disposition !== 'failed' || result.reason.kind !== 'provider-proof') {
+          throw new Error(`the probe must refuse with its provider proof, not ${probed.stdout}`);
+        }
+        expect(result.reason.detail).toEndWith(
+          `authoritative graph unavailable: ${describeMiss({ kind: 'no-daemon', taskId: 'app:build' })}`,
+        );
+        expect(await listing()).toEqual(before);
+      },
+      'workspace',
+    );
+  });
+
   // The graph/exec case runs real Nx because its subject is the daemon:
   // the daemon a probe starts holds no output records, so every output must be
   // vouched for by comparing the working tree with Nx's cache artifact. The

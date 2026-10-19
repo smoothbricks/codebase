@@ -947,7 +947,9 @@ environment/tool inputs and actual output census. It never re-hashes the provide
 Its read of the recorded tools must stay stable through that census on the same terms as the producer's: a tool node
 whose ctime alone moved is re-read and compared with the receipt, and a refusal names the nodes that moved. A valid
 receipt is the hit. A missing, mismatched, stale or unbound receipt requires the authoritative graph RPC, then a loud
-miss/refusal without running a target or writing provider outputs. A managed consumer requires the installed
+miss/refusal without running a target or writing provider outputs. That RPC goes only to a daemon already serving the
+provider: the probe never starts one, since a start writes the provider's workspace data and a sandboxed consumer may
+only read its provider, so with none serving the refusal names `no-daemon`. A managed consumer requires the installed
 `probeBuilt` operation and the complete producer-receipt contract; an old receipt lacking it refuses, never falls back
 to `ensureBuilt` or a producer writer. `ensureBuilt` remains the normal build/stream operation with its existing
 hit/built/failed results and Nx's current source/cache/artifact verdict.
