@@ -54,6 +54,24 @@ describe('cowshed CPU budget client', () => {
       want: 12,
     });
     expect(runnerDemand('cargo nextest run --test-threads=4', undefined, 18, {})).toEqual({ kind: 'nextest', want: 4 });
+    // `--no-capture` runs tests serially and ignores `--test-threads`: a host smoke of one test asks for one
+    // token, not one per core it would hold idle while its own scratch jobs queue for the host's tokens.
+    const smoke =
+      "cargo --frozen nextest run --archive-file a.tar.zst -E 'test(smoke)' --run-ignored only --no-capture";
+    expect(runnerDemand(smoke, undefined, 18, {})).toEqual({ kind: 'nextest', want: 1 });
+    expect(runnerDemand(`${smoke} --test-threads 4`, undefined, 18, {})).toEqual({ kind: 'nextest', want: 1 });
+    expect(runnerDemand('cargo nextest run -E all() -- --nocapture', undefined, 18, {})).toEqual({
+      kind: 'nextest',
+      want: 1,
+    });
+    // A flag that only shares the prefix is not it.
+    expect(runnerDemand('cargo nextest run --no-capture-x', undefined, 18, {})).toEqual({ kind: 'nextest', want: 18 });
+    // The same words in a cargo build are not nextest's.
+    expect(runnerDemand('cargo test --workspace -- --nocapture', undefined, 18, {})).toEqual({
+      kind: 'cargo',
+      want: 18,
+      testThreads: null,
+    });
     expect(runnerDemand('bun test --timeout=0 --parallel=3', undefined, 18, {})).toEqual({
       kind: 'bun-parallel',
       want: 3,

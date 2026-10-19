@@ -647,8 +647,9 @@ core count.
   runnable thread or process. The ledger keeps `free + Σ held = N`; it never infers a holder from a process scan.
 - **Who asks.** The `@smoothbricks/nx-plugin` `bounded-exec` executor, before it starts any command — the inferred
   nextest runners, `bun test` targets, cargo commands it runs. Its requested parallelism is the command's runner's own:
-  a `nextest run` names `--test-threads` or defaults to one per core; `bun test --parallel=N` names N workers, a bare
-  `--parallel` defaults to one per core; a cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`,
+  a `nextest run` names `--test-threads` or defaults to one per core, and one with `--no-capture` (`--nocapture` past
+  `--`) runs its tests serially whatever count it names, so it asks for one; `bun test --parallel=N` names N workers, a
+  bare `--parallel` defaults to one per core; a cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`,
   `napi build`) defaults to one job per core; anything else, one `bun test` process included, defaults to one. A
   target's `parallelism` option selects that request, but positive inherited `NEXTEST_TEST_THREADS` and
   `CARGO_BUILD_JOBS` are ceilings on their respective runners. A configured environment count may lower an inherited
