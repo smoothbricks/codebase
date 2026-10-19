@@ -16,10 +16,11 @@ import {
 } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import type { OpContextBinding } from '@smoothbricks/lmao';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
+import { whenChanged } from '../../__tests__/directory-change.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processTable, terminate } from '../../testing.js';
 import {
   type CommandOutput,
@@ -386,9 +387,8 @@ async function nativeRamVolume(): Promise<void> {
     mkdirSync(quiet);
     writeFileSync(join(quiet, 'left'), 'by a task nothing of which still runs');
     try {
-      while (!existsSync(join(leaseB.directory, 'w1'))) {
-        await sleep(5);
-      }
+      // Ends on the watch event that creates the writer's `w1` in the lease, not on a poll.
+      await whenChanged(leaseB.directory, () => existsSync(join(leaseB.directory, 'w1')));
       const fourth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
       const d = await fourth.acquire();
       if (!d.ok || d.value.kind !== 'leased') {
@@ -476,11 +476,12 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
         (call) => call.file === '/usr/bin/hdiutil' && call.args[0] === 'detach' && call.output.status !== 0,
       );
       if (failedDetach !== undefined) {
-        const mountTable = await host.run('/sbin/mount', [], 1_000);
+        // Diagnostic probes explain a failed detach: each waits for the host to answer, bounded by the leg backstop.
+        const mountTable = await host.run('/sbin/mount', [], BOUNDED_TEST_IDLE_TIMEOUT_MS);
         const filesystemHolders = await host.run(
           '/usr/bin/sudo',
           ['-n', '/usr/sbin/lsof', '-nP', '+f', '--', paths.staging],
-          1_000,
+          BOUNDED_TEST_IDLE_TIMEOUT_MS,
         );
         const added = calls.find(
           (call) => call.file === '/usr/sbin/diskutil' && call.args[0] === 'apfs' && call.args[1] === 'addVolume',
@@ -494,7 +495,7 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
         const deviceHolders = await host.run(
           '/usr/bin/sudo',
           ['-n', '/usr/sbin/lsof', '-nP', '--', ...devicePaths],
-          1_000,
+          BOUNDED_TEST_IDLE_TIMEOUT_MS,
         );
         const observations = JSON.stringify(
           {
@@ -577,7 +578,7 @@ async function inheritedTempDirectory(): Promise<void> {
     for (const directory of [inherited, supplied]) {
       const options = {
         command: `node ${JSON.stringify(probe)}`,
-        timeoutMs: 5_000,
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         parallelism: 1,
         env: {
           // If the default runner incorrectly provisions an APFS volume here, it must fail,

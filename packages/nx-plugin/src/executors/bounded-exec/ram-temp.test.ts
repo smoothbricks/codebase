@@ -7,7 +7,8 @@ import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { setTimeout as sleep } from 'node:timers/promises';
+import { whenChanged } from '../../__tests__/directory-change.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { awaitExit, ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -302,9 +303,9 @@ describe('RAM temp volume on this host', () => {
     const directory = await ownedSocketDirectory('rt-', 'missing-cowshed');
     try {
       const executable = join(directory, 'missing-cowshed');
-      const output = await createHostCommands(300, undefined, undefined, executable).run('/usr/sbin/diskutil', [
-        'info',
-      ]);
+      // The bound is the leg backstop: a missing facade fails at spawn, so the run ends at once.
+      const host = createHostCommands(BOUNDED_TEST_IDLE_TIMEOUT_MS, undefined, undefined, executable);
+      const output = await host.run('/usr/sbin/diskutil', ['info']);
       expect(output.status).toBe(1);
       expect(output.stdout).toBe('');
       expect(output.stderr).toContain(executable);
@@ -335,7 +336,7 @@ describe('RAM temp volume on this host', () => {
       server.listen(socket, listened);
       await listening;
       server.off('error', failed);
-      const host = createHostCommands(10_000, socket);
+      const host = createHostCommands(BOUNDED_TEST_IDLE_TIMEOUT_MS, socket);
       // `umount` with no operand only prints its usage, and it is a disk tool that takes a lease.
       expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
       expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
@@ -369,7 +370,7 @@ describe('RAM temp volume on this host', () => {
       server.listen(socket, listened);
       await listening;
       server.off('error', failed);
-      const host = createHostCommands(10_000, socket, 'alone');
+      const host = createHostCommands(BOUNDED_TEST_IDLE_TIMEOUT_MS, socket, 'alone');
       // `umount` with no operand only prints its usage, and it is a disk tool that takes a lease.
       expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
       expect((await host.run('/sbin/umount', [])).status).not.toBe(0);
@@ -684,9 +685,8 @@ describe('processes a task left working in its RAM lease', () => {
     let child = 0;
     try {
       child = Number(String((await once(writer.stdout, 'data'))[0]).trim());
-      while (readdirSync(lease).length < 2) {
-        await sleep(5);
-      }
+      // Ends on the watch event that brings the lease to two entries: `nested`, and the writer's first file.
+      await whenChanged(lease, () => readdirSync(lease).length >= 2);
       // None of them works in the lease by its working directory.
       expect(await pidsWorkingIn(lease)).toEqual([]);
 

@@ -5,6 +5,7 @@ import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from '../../bounded-test-policy.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool } from './cpu-pool.js';
 import { CPU_TOKENS_ENV } from './cpu-tokens.js';
 import type { BoundedExecOptions } from './schema.js';
@@ -37,8 +38,11 @@ const ACTIVE_RESOURCES = 'cowshed-test active-resources ';
 const CHURN_NAMES = ['churna', 'churnb'] as const;
 /** Written into a case's root to stop its churn workers; each checks it between runs, never mid-run. */
 const CHURN_STOP = 'churn.stop';
-/** One churn run: `true` on one token, so each lease is a real acquire, run and release. */
-const CHURN_OPTIONS: BoundedExecOptions = { command: 'true', timeoutMs: 20_000, parallelism: 1 };
+/**
+ * One churn run: `true` on one token, so each lease is a real acquire, run and release. Its `timeoutMs` is the leg
+ * backstop: a run ends on its own exit, and only a hung run reaches the bound (`specs/cowshed/08_testing.md:511-514`).
+ */
+const CHURN_OPTIONS: BoundedExecOptions = { command: 'true', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 1 };
 /** A churn worker's stdout: a `begin` line before each run it starts, a `ran` line after each run that succeeded. */
 const CHURN_BEGIN = /^cowshed-test churn [a-z]+ begin [0-9]+$/gm;
 const CHURN_RAN = /^cowshed-test churn [a-z]+ ran [0-9]+$/gm;
@@ -128,7 +132,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       const leafScript = await writeRunner(
         root,
         'leaf',
-        { command: `node -e "console.log('leaf')"`, timeoutMs: 20_000, parallelism: 1 },
+        { command: `node -e "console.log('leaf')"`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 1 },
         leafDirectory,
       );
       const nestedDirectory = join(root, 'nested');
@@ -138,7 +142,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
         const run = await startRunner(
           root,
           'nested',
-          { command: nestedCommand, cwd: PACKAGE_ROOT, timeoutMs: 20_000, parallelism: 2 },
+          { command: nestedCommand, cwd: PACKAGE_ROOT, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 2 },
           nestedDirectory,
           childEnv(pool.environment),
         );
@@ -175,7 +179,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
           `const options = ${JSON.stringify({
             command: `node -e "console.log('lease')"`,
             cwd: PACKAGE_ROOT,
-            timeoutMs: 20_000,
+            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
             parallelism: 1,
           })};`,
           `const context = ${JSON.stringify({ root })};`,
@@ -209,7 +213,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
               startRunner(
                 root,
                 name,
-                { command: siblingCommand(barrier.port, name), timeoutMs: 20_000, parallelism: 1 },
+                {
+                  command: siblingCommand(barrier.port, name),
+                  timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+                  parallelism: 1,
+                },
                 join(root, name),
                 childEnv(pool.environment),
               ),
@@ -266,7 +274,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
     await withPool(1, async (outer) => {
       const options: BoundedExecOptions = {
         command: `node -e "console.log('actual-tokens=' + process.env.${CPU_TOKENS_ENV})"`,
-        timeoutMs: 20_000,
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         parallelism: 1,
       };
       const directory = join(root, 'stale');
@@ -329,8 +337,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
         'outlives',
         {
           command: `sh -c 'echo started; read -r line < "$0"; echo finished' '${go}'`,
-          timeoutMs: 30_000,
-          killAfterMs: 2_000,
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+          killAfterMs: BOUNDED_TEST_KILL_AFTER_MS,
           parallelism: 1,
         },
         join(root, 'outlives'),
@@ -356,7 +364,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
         const unremovable = await startRunner(
           root,
           'unremovable',
-          { command: UNREMOVABLE_COMMAND, timeoutMs: 20_000, parallelism: 1 },
+          { command: UNREMOVABLE_COMMAND, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 1 },
           join(root, 'unremovable'),
           childEnv(pool.environment),
         );
@@ -371,7 +379,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
         const next = await startRunner(
           root,
           'next',
-          { command: `node -e "console.log(process.env.${CPU_TOKENS_ENV})"`, timeoutMs: 20_000, parallelism: 1 },
+          {
+            command: `node -e "console.log(process.env.${CPU_TOKENS_ENV})"`,
+            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+            parallelism: 1,
+          },
           join(root, 'next'),
           childEnv(pool.environment),
         );
