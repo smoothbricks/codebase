@@ -865,9 +865,8 @@ async fn disconnect_cancels_only_the_connection_while_routed_work_continues() {
         .await;
     started_rx.await.expect("router began work");
     drop(client);
-    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+    server
         .await
-        .expect("connection task observes disconnect")
         .expect("connection task joins")
         .expect("disconnect is clean");
 

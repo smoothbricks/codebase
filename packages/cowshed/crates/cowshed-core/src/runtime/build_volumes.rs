@@ -5048,7 +5048,8 @@ fn main() {
         let output = child.wait_with_output().await.unwrap();
         assert!(output.status.success(), "{output:?}");
         if let Some(fifo) = &witness.grant_fifo {
-            let deadline = Instant::now() + Duration::from_secs(15);
+            // The grant's release is the event; one that outlives the build meets the run's
+            // no-progress bound, which names this test.
             loop {
                 let held = cargo_budget_for(&source).await;
                 if !fifo.exists()
@@ -5062,11 +5063,6 @@ fn main() {
                     );
                     break;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "the real Cargo build's grant outlives it: {held:?}; fifo={}",
-                    fifo.display()
-                );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
@@ -5347,17 +5343,17 @@ fn main() {
             .spawn_locked()
             .unwrap();
         let pid = i32::try_from(holder.id()).expect("a pid fits i32");
-        let started = Instant::now();
         while !nx::holders(&database)
             .unwrap()
             .iter()
             .any(|held| held.pid == pid)
         {
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "tail never opened {}",
-                database.display()
-            );
+            if let Some(status) = holder.try_wait().unwrap() {
+                panic!(
+                    "tail exited ({status}) before it opened {}",
+                    database.display()
+                );
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
         let target = owner("main", '0');

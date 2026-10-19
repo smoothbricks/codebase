@@ -438,15 +438,10 @@ fn status(checkout: &Path) -> String {
 }
 
 /// The background delete is observed, never assumed: poll until the checkout has no discard.
-fn discards_drain(checkout: &Path, within: std::time::Duration) -> bool {
-    let started = std::time::Instant::now();
-    while started.elapsed() < within {
-        if discard::pending(checkout).unwrap().is_empty() {
-            return true;
-        }
+fn discards_drain(checkout: &Path) {
+    while !discard::pending(checkout).unwrap().is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    false
 }
 
 /// A refresh that died after moving old build state aside -- a crash, or a setup that exited
@@ -483,11 +478,7 @@ fn a_discard_a_crash_left_pending_is_finished_by_the_next_refresh() {
             .unwrap()
             .is_symlink()
     );
-    assert!(
-        discards_drain(&checkout, std::time::Duration::from_secs(20)),
-        "the refresh left {:?} pending",
-        discard::pending(&checkout).unwrap()
-    );
+    discards_drain(&checkout);
     assert_eq!(status(&checkout), "A  .gitignore\n");
 }
 
@@ -546,11 +537,7 @@ fn a_refresh_returns_while_the_delete_of_what_it_moved_aside_waits() {
 
     release.send(()).unwrap();
     collecting.join().unwrap().unwrap();
-    assert!(
-        discards_drain(&checkout, std::time::Duration::from_secs(20)),
-        "the refresh's background delete left {:?} pending",
-        discard::pending(&checkout).unwrap()
-    );
+    discards_drain(&checkout);
     assert_eq!(status(&checkout), "", "{}", status(&checkout));
 }
 
@@ -612,10 +599,7 @@ fn a_declared_checkout_is_discarded_and_linked_like_any_build_state() {
             .is_empty(),
         "the exact link is left alone"
     );
-    assert!(
-        discards_drain(&checkout, std::time::Duration::from_secs(20)),
-        "the background delete did not finish"
-    );
+    discards_drain(&checkout);
     assert_eq!(status(&checkout), "", "the link is excluded, never source");
 }
 

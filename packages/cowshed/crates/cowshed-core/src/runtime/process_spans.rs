@@ -1761,9 +1761,11 @@ mod tests {
             gate_write.write_all(b"x").unwrap();
             (observer, spawned.join().unwrap())
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while observer.fold().nodes().count() < 3 && std::time::Instant::now() < deadline {
+        while observer.fold().nodes().count() < 3 {
             let _ = observer.wait();
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("the job exited before its three processes were observed: {status}");
+            }
         }
         let births: Vec<_> = observer
             .fold()
@@ -1820,10 +1822,7 @@ mod tests {
             let mut file = std::fs::File::create(path).unwrap();
             file.write_all(b"x").unwrap();
         }
-        let exit_deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while observer.fold().nodes().any(|node| node.exit.is_none())
-            && std::time::Instant::now() < exit_deadline
-        {
+        while observer.fold().nodes().any(|node| node.exit.is_none()) {
             let _ = observer.wait();
         }
         let _ = child.wait();

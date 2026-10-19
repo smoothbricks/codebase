@@ -110,7 +110,21 @@ fn holder(socket: &Path, class: DiskClass, label: &'static str) -> (Receiver<()>
     (entered_rx, finish)
 }
 
-/// Whether `signal` fires within `within`, waited off the runtime the gateway serves on.
+/// Wait for `signal`, off the runtime the gateway serves on: the grant is the event, and a grant
+/// that never comes meets the run's no-progress bound, never a clock of the test's own.
+async fn enters(signal: Receiver<()>) -> Receiver<()> {
+    tokio::task::spawn_blocking(move || {
+        signal
+            .recv()
+            .expect("the holder's thread signals its entry");
+        signal
+    })
+    .await
+    .expect("wait")
+}
+
+/// Absence check: whether `signal` fires within `within`, waited off the runtime the gateway
+/// serves on. Load only makes `false` pass vacuously, never fail.
 async fn fires(signal: Receiver<()>, within: Duration) -> (Receiver<()>, bool) {
     tokio::task::spawn_blocking(move || {
         let fired = signal.recv_timeout(within).is_ok();
@@ -124,16 +138,16 @@ async fn fires(signal: Receiver<()>, within: Duration) -> (Receiver<()>, bool) {
 async fn one_class_shares_its_phase_and_the_other_runs_only_once_it_drains() {
     let (gateway, root, socket) = gateway(DiskLeaseLimits {
         per_class: NonZeroUsize::new(2).unwrap(),
-        phase_bound: Duration::from_secs(60),
+        // Not the subject: no holder here is stuck, so the bound sits at the run's backstop.
+        phase_bound: cowshed_os::test_backstop::NO_PROGRESS,
     })
     .await;
 
+    // An idle lease grants at once; a second storage command shares the phase.
     let (first, finish_first) = holder(&socket, DiskClass::Storage, "/usr/sbin/diskutil a");
-    let (_, entered) = fires(first, Duration::from_secs(10)).await;
-    assert!(entered, "an idle lease grants at once");
+    enters(first).await;
     let (second, finish_second) = holder(&socket, DiskClass::Storage, "/usr/sbin/diskutil b");
-    let (_, entered) = fires(second, Duration::from_secs(10)).await;
-    assert!(entered, "a second storage command shares the phase");
+    enters(second).await;
 
     let (mount, finish_mount) = holder(&socket, DiskClass::Namespace, "/sbin/mount_apfs x");
     let (mount, entered) = fires(mount, Duration::from_millis(500)).await;
@@ -149,13 +163,13 @@ async fn one_class_shares_its_phase_and_the_other_runs_only_once_it_drains() {
     let (mount, entered) = fires(mount, Duration::from_millis(500)).await;
     assert!(!entered, "storage has not drained");
     finish_second.send(()).unwrap();
-    let (_, entered) = fires(mount, Duration::from_secs(10)).await;
-    assert!(entered, "the drained phase goes to namespace");
+    // The drained phase goes to namespace.
+    enters(mount).await;
     let (third, entered) = fires(third, Duration::from_millis(300)).await;
     assert!(!entered, "storage waits for the namespace phase");
     finish_mount.send(()).unwrap();
-    let (_, entered) = fires(third, Duration::from_secs(10)).await;
-    assert!(entered, "and gets the phase back");
+    // And storage gets the phase back.
+    enters(third).await;
     finish_third.send(()).unwrap();
 
     gateway.drain().await.expect("drain");
@@ -171,21 +185,21 @@ async fn a_holder_stuck_past_the_bound_stops_holding_the_other_class_back() {
     })
     .await;
 
+    // The bound runs from the stuck holder's grant, which comes after its ask: entry beside it
+    // is at least `bound` after this instant, however late the host runs either thread.
+    let stuck_asked = Instant::now();
     let (stuck, _never_finished) = holder(&socket, DiskClass::Namespace, "/sbin/umount /hung");
-    let (_, entered) = fires(stuck, Duration::from_secs(10)).await;
-    assert!(entered);
-    let asked = Instant::now();
+    enters(stuck).await;
     let (attach, finish_attach) = holder(
         &socket,
         DiskClass::Storage,
         "/usr/sbin/diskutil image attach",
     );
-    let (_, entered) = fires(attach, Duration::from_secs(10)).await;
-    assert!(entered, "the stuck unmount is evicted and storage proceeds");
+    enters(attach).await;
     assert!(
-        asked.elapsed() >= bound - Duration::from_millis(50),
-        "not before the bound: {:?}",
-        asked.elapsed()
+        stuck_asked.elapsed() >= bound,
+        "the stuck unmount was evicted before the bound: {:?}",
+        stuck_asked.elapsed()
     );
     finish_attach.send(()).unwrap();
 

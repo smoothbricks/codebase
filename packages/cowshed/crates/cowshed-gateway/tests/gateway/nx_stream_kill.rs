@@ -12,10 +12,8 @@ use cowshed_gateway::{
 use cowshed_os::fork_lock::Run as _;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::DirBuilderExt as _;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
 
 const REPO: &str = "owner/nx-stream-kill";
 const SOURCE: &str = "nx-stream-source";
@@ -23,8 +21,6 @@ const HASH: &str = "42";
 const ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
 const PREVIEW_BYTES: usize = 64 * 1024;
-/// Every network wait in this test is bounded by this, so a stuck gateway fails rather than hangs.
-const STEP_LIMIT: Duration = Duration::from_secs(60);
 
 /// One request on a fresh connection, read to the connection's end.
 async fn exchange(endpoint: SocketAddr, request: String) -> String {
@@ -34,9 +30,9 @@ async fn exchange(endpoint: SocketAddr, request: String) -> String {
         .await
         .expect("write request");
     let mut response = Vec::new();
-    timeout(STEP_LIMIT, stream.read_to_end(&mut response))
+    stream
+        .read_to_end(&mut response)
         .await
-        .expect("gateway response timeout")
         .expect("read gateway response");
     String::from_utf8(response).expect("HTTP response is UTF-8")
 }
@@ -59,9 +55,9 @@ async fn put_artifact(endpoint: SocketAddr, token: &str) -> String {
             .expect("write artifact chunk");
     }
     let mut response = Vec::new();
-    timeout(STEP_LIMIT, stream.read_to_end(&mut response))
+    stream
+        .read_to_end(&mut response)
         .await
-        .expect("artifact response timeout")
         .expect("read artifact response");
     String::from_utf8(response).expect("HTTP response is UTF-8")
 }
@@ -69,10 +65,7 @@ async fn put_artifact(endpoint: SocketAddr, token: &str) -> String {
 /// Reads whatever the stream has next, at most the buffer's length. Zero bytes is a failure here,
 /// because every caller still expects more of the response.
 async fn read_some(stream: &mut TcpStream, buffer: &mut [u8]) -> usize {
-    let read = timeout(STEP_LIMIT, stream.read(buffer))
-        .await
-        .expect("gateway read timeout")
-        .expect("read gateway bytes");
+    let read = stream.read(buffer).await.expect("read gateway bytes");
     assert!(
         read > 0,
         "the gateway ended the stream before the expected bytes"
@@ -123,9 +116,9 @@ async fn host_controller_nx_backend_killed_mid_body_is_a_failed_transfer() {
         .expect("create the backend directory under the parent root");
     let (mut config, _cache) = test_config();
     config.timeouts = GatewayTimeouts {
-        request_total: STEP_LIMIT,
-        response_headers: STEP_LIMIT,
-        tunnel_total: STEP_LIMIT,
+        request_total: cowshed_os::test_backstop::NO_PROGRESS,
+        response_headers: cowshed_os::test_backstop::NO_PROGRESS,
+        tunnel_total: cowshed_os::test_backstop::NO_PROGRESS,
         ..config.timeouts
     };
     let script = server_script();
@@ -245,9 +238,7 @@ async fn host_controller_nx_backend_killed_mid_body_is_a_failed_transfer() {
     // Read on until the stream ends or errors. The status is already 200, so the only truth the
     // client sees is the cut, and the audit must name that cut as the failure.
     loop {
-        let read = timeout(STEP_LIMIT, reader.read(&mut buffer))
-            .await
-            .expect("the cut stream never ended");
+        let read = reader.read(&mut buffer).await;
         match read {
             Ok(0) | Err(_) => break,
             Ok(_) => {}

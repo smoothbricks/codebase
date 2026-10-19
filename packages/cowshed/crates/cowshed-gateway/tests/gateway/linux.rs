@@ -102,9 +102,9 @@ async fn linux_data_socket_root_is_enforced_and_serves_requests() {
         .await
         .expect("write proxy request");
     let mut response = Vec::new();
-    timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+    client
+        .read_to_end(&mut response)
         .await
-        .expect("Linux proxy timeout")
         .expect("read Linux proxy response");
     assert!(
         response.starts_with(b"HTTP/1.1 200"),

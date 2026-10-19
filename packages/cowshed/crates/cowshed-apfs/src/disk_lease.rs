@@ -784,9 +784,9 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     /// A wait only the peer ends: by answering, or by closing its socket, which it does when it
-    /// is dropped, its thread's panic included. The clock never decides it; a test stuck on it
-    /// meets the per-test hang backstop long before it elapses.
-    const PEER_ENDS: Duration = Duration::from_secs(3600);
+    /// is dropped, its thread's panic included. The clock never decides it: it is the run's
+    /// no-progress backstop.
+    const PEER_ENDS: Duration = cowshed_os::test_backstop::NO_PROGRESS;
 
     /// The bound of the one wait a scenario is about, where no answer ever comes: its elapsing is
     /// the scenario's event, and nothing else is in flight to race it.

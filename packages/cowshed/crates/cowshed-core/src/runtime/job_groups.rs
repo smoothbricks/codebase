@@ -1799,8 +1799,7 @@ mod tests {
             vec![9]
         );
         drop(group);
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while super::group_has_live_members(pgid).unwrap() && std::time::Instant::now() < deadline {
+        while super::group_has_live_members(pgid).unwrap() {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!super::group_has_live_members(pgid).unwrap());
@@ -1835,7 +1834,9 @@ mod tests {
         let ended = end_recorded(&ledger, Writer::Any, Duration::from_millis(200)).unwrap();
         assert_eq!(ended.signalled, vec![7]);
         let _ = job.wait();
-        std::thread::sleep(Duration::from_millis(100));
+        while group_alive(pgid) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(!group_alive(pgid), "the leader's child died with it");
         assert_eq!(
             end_recorded(&ledger, Writer::Any, Duration::ZERO).unwrap(),
@@ -2079,7 +2080,7 @@ mod tests {
         assert!(!exit.within(Duration::from_millis(50)).unwrap());
 
         assert!(leader.signal(libc::SIGTERM).unwrap());
-        assert!(exit.within(Duration::from_secs(5)).unwrap());
+        exit.wait().unwrap();
         job.wait().unwrap();
         assert!(
             leader.watch_exit().is_err(),
@@ -2185,10 +2186,7 @@ mod tests {
             assert!(group_alive(pgid), "{label}: the group was signalled");
 
             drop(group);
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
-            while super::group_has_live_members(pgid).unwrap()
-                && std::time::Instant::now() < deadline
-            {
+            while super::group_has_live_members(pgid).unwrap() {
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert!(super::unresolved(&ledger).unwrap().is_empty(), "{label}");

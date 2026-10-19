@@ -5649,7 +5649,7 @@ mod tests {
             let relay = relay_foreground(
                 &handle,
                 None,
-                Some(Duration::from_secs(60)),
+                None,
                 ExecPresentation::Raw,
                 &mut stdout,
                 &mut stderr,
@@ -5662,15 +5662,10 @@ mod tests {
             };
             tokio::select! {
                 _ = &mut relay => panic!("the relay returned while the job still ran"),
-                shown = tokio::time::timeout(Duration::from_secs(5), first_line) => {
-                    shown.expect("the first line reaches the terminal while the job runs");
-                }
+                () = first_line => {}
             }
             job.end();
-            let result = tokio::time::timeout(Duration::from_secs(5), relay)
-                .await
-                .expect("the relay returns once the job ends")
-                .expect("relay");
+            let result = relay.await.expect("relay");
             assert_eq!(result.end, ExecEnd::Finished);
             assert_eq!(result.info.exit, Some(ExitStatus::Exited { code: 0 }));
             assert_eq!(terminal.contents(), FIRST);
@@ -5684,19 +5679,15 @@ mod tests {
             let handle = connect(&job).await;
             let terminal = Terminal::default();
             let (mut stdout, mut stderr) = (terminal.clone(), Terminal::default());
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                relay_foreground(
-                    &handle,
-                    None,
-                    Some(Duration::from_millis(50)),
-                    ExecPresentation::Raw,
-                    &mut stdout,
-                    &mut stderr,
-                ),
+            let result = relay_foreground(
+                &handle,
+                None,
+                Some(Duration::from_millis(50)),
+                ExecPresentation::Raw,
+                &mut stdout,
+                &mut stderr,
             )
             .await
-            .expect("the relay returns")
             .expect("relay");
             assert_eq!(
                 result.end,
@@ -5756,19 +5747,15 @@ mod tests {
                 let job = ScriptedJob::new(false, 0);
                 let handle = connect(&job).await;
                 let (mut stdout, mut stderr) = (Terminal::default(), Terminal::default());
-                let result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    relay_foreground(
-                        &handle,
-                        None,
-                        Some(Duration::from_millis(50)),
-                        ExecPresentation::Raw,
-                        &mut stdout,
-                        &mut stderr,
-                    ),
+                let result = relay_foreground(
+                    &handle,
+                    None,
+                    Some(Duration::from_millis(50)),
+                    ExecPresentation::Raw,
+                    &mut stdout,
+                    &mut stderr,
                 )
                 .await
-                .expect("the relay returns at the caller's timeout")
                 .expect("relay");
                 assert!(job.detached.load(Ordering::SeqCst));
                 let mut output = Output::new(Vec::new(), Vec::new(), false);
@@ -7015,16 +7002,9 @@ mod tests {
         let (cowshed, token) = cowshed_core::Cowshed::connect(client.into()).await.unwrap();
         drop(token);
         drop(cowshed);
-        tokio::time::timeout(Duration::from_secs(1), connection)
-            .await
-            .expect("controller connection actor leaked")
-            .unwrap()
-            .unwrap();
+        connection.await.unwrap().unwrap();
         drop(router);
-        tokio::time::timeout(Duration::from_secs(1), router_actor)
-            .await
-            .expect("router actor leaked")
-            .unwrap();
+        router_actor.await.unwrap();
     }
 
     /// An unmounted main is a critical finding: it names both paths, carries a remedy, and makes

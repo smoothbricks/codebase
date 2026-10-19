@@ -16,10 +16,11 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 
 [features]
-# Test-support surface for dependants' tests: the per-thread sync counter `fsio` keeps and the
-# fork-lock probes (`held_exclusive`, `in_flight`). A dependant's `tests` link this crate as an
-# external dependency, where `cfg(test)` cannot reach them; its dev-dependency turns this on for
-# its test build only, so no shipped artifact counts syncs.
+# Test-support surface for dependants' tests: the per-thread sync counter `fsio` keeps, the
+# fork-lock probes (`held_exclusive`, `in_flight`), and the test target's no-progress backstop
+# (`test_backstop::NO_PROGRESS`). A dependant's `tests` link this crate as an external
+# dependency, where `cfg(test)` cannot reach them; its dev-dependency turns this on for its test
+# build only, so no shipped artifact counts syncs.
 test-hooks = []
 
 [dev-dependencies]

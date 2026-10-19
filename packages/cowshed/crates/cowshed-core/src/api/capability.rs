@@ -4089,12 +4089,7 @@ mod tests {
             );
         }
         drop(handle);
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            read_rpc_frame(&mut server),
-        )
-        .await
-        .expect("the connection closed with no call on it");
+        let outcome = read_rpc_frame(&mut server).await;
         assert!(outcome.is_err(), "no call reached the controller");
     }
 
@@ -4168,12 +4163,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::Usage);
         assert!(error.message.contains("session"), "{}", error.message);
         drop((worker, runtime));
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            read_rpc_frame(&mut server),
-        )
-        .await
-        .expect("the connection closed with no call on it");
+        let outcome = read_rpc_frame(&mut server).await;
         assert!(outcome.is_err(), "no call reached the controller");
     }
 
@@ -4198,12 +4188,7 @@ mod tests {
             Some(CpuAdmissionRefusal::InvalidRequest { .. })
         ));
         drop((worker, coordinator));
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            read_rpc_frame(&mut server),
-        )
-        .await
-        .expect("the connection closed with no call on it");
+        let outcome = read_rpc_frame(&mut server).await;
         assert!(outcome.is_err(), "no call reached the controller");
     }
 
@@ -4703,13 +4688,9 @@ mod tests {
             0,
             false,
         );
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while runtime.log_calls.load(Ordering::SeqCst) < 9 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("producer did not fill the bounded channel");
+        while runtime.log_calls.load(Ordering::SeqCst) < 9 {
+            tokio::task::yield_now().await;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(runtime.log_calls.load(Ordering::SeqCst), 9);
         drop(stream);
@@ -4732,13 +4713,9 @@ mod tests {
         }
 
         drop(stream);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while runtime.active_calls.load(Ordering::SeqCst) != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("poll task did not stop after receiver drop");
+        while runtime.active_calls.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]

@@ -5277,7 +5277,7 @@ mod tests {
 
     /// Writing every path before reading any answer deadlocked once git's answers filled the
     /// stdout pipe (a retired worktree's `node_modules` was enough): both sides blocked writing.
-    /// A regression must fail this test, not hang it, so the batch runs under a deadline.
+    /// A regression hangs this test; it never passes it.
     #[test]
     fn a_check_ignore_batch_larger_than_the_pipe_finishes() {
         let root = repository();
@@ -5291,8 +5291,8 @@ mod tests {
             let _ = sender.send(ignored_by_rules(&checkout, &borrowed));
         });
         let ignored = receiver
-            .recv_timeout(std::time::Duration::from_secs(120))
-            .expect("check-ignore batch deadlocked")
+            .recv()
+            .expect("check-ignore batch ended without answering")
             .expect("check-ignore batch answered");
         assert_eq!(ignored, paths);
     }

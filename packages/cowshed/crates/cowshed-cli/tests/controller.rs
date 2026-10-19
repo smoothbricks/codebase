@@ -5,7 +5,6 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use cowshed_core::Cowshed;
 use cowshed_core::metadata::WorkspaceRole;
@@ -85,9 +84,9 @@ async fn host_controller_an_embedding_process_reaches_its_project_through_the_co
     drop(token);
     drop(cowshed);
 
-    let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+    let output = child
+        .wait_with_output()
         .await
-        .expect("the controller ends once the embedder closes its end")
         .expect("wait for cowshed controller");
     assert!(
         output.status.success(),

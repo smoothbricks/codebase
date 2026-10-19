@@ -40,12 +40,66 @@ pub fn count_extents(path: &Path) -> Result<ExtentCount, ApfsStorageError> {
         let mut position = start;
         while position < end {
             position += physical_run(&file, position, end - position)
-                .map_err(|error| io_error("map image extents", path, error))?;
+                .map_err(|error| io_error("map image extents", path, error))?
+                .bytes;
             extents += 1;
         }
         offset = end;
     }
     Ok(ExtentCount::new(extents))
+}
+
+/// How many of `clone`'s data bytes sit on the same device blocks as the same offsets of `source`:
+/// the extents a `clonefile` of `source` still shares, which a copy never does (01a_apfs.md,
+/// "Clone cost follows extents, not size"). A structural witness of a clone, read from the kernel,
+/// so it holds however long the clone took on a loaded host.
+pub fn shared_bytes(source: &Path, clone: &Path) -> Result<u64, ApfsStorageError> {
+    let open = |path: &Path| {
+        let file = File::open(path)
+            .map_err(|error| io_error("open image to compare extents", path, error))?;
+        let length = file
+            .metadata()
+            .map_err(|error| io_error("inspect image to compare extents", path, error))?
+            .len();
+        Ok::<_, ApfsStorageError>((file, length))
+    };
+    let (source_file, source_length) = open(source)?;
+    let (clone_file, clone_length) = open(clone)?;
+    let length = source_length.min(clone_length);
+    let mut shared = 0_u64;
+    let mut offset = 0;
+    while let Some((start, end)) = next_data_region(&clone_file, offset, length)
+        .map_err(|error| io_error("find clone data to compare extents", clone, error))?
+    {
+        let mut position = start;
+        while position < end {
+            let theirs = physical_run(&clone_file, position, end - position)
+                .map_err(|error| io_error("map clone extents", clone, error))?;
+            let Some((source_start, source_end)) = next_data_region(&source_file, position, length)
+                .map_err(|error| io_error("find source data to compare extents", source, error))?
+            else {
+                return Ok(shared);
+            };
+            let step = if source_start > position {
+                // A hole in the source here: nothing it could share.
+                theirs.bytes.min(source_start - position)
+            } else {
+                let ours = physical_run(
+                    &source_file,
+                    position,
+                    theirs.bytes.min(source_end - position),
+                )
+                .map_err(|error| io_error("map source extents", source, error))?;
+                if ours.device == theirs.device {
+                    shared += ours.bytes;
+                }
+                ours.bytes
+            };
+            position += step;
+        }
+        offset = end;
+    }
+    Ok(shared)
 }
 
 /// Where a rewrite stages its copy: beside the image, so publishing it is a same-volume rename,
@@ -252,9 +306,15 @@ fn next_data_region(file: &File, offset: u64, length: u64) -> io::Result<Option<
     Ok(Some((start, end.min(length))))
 }
 
-/// How many bytes from `offset` on sit in one physically contiguous run, at most `length`.
+/// One physically contiguous run of a file: where it starts on the device and how many bytes long.
+struct PhysicalRun {
+    device: u64,
+    bytes: u64,
+}
+
+/// The physically contiguous run from `offset` on, at most `length` bytes.
 #[cfg(target_os = "macos")]
-fn physical_run(file: &File, offset: u64, length: u64) -> io::Result<u64> {
+fn physical_run(file: &File, offset: u64, length: u64) -> io::Result<PhysicalRun> {
     use std::os::fd::AsRawFd;
 
     let mut query = libc::log2phys {
@@ -268,11 +328,20 @@ fn physical_run(file: &File, offset: u64, length: u64) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     let contiguous = query.l2p_contigbytes;
+    let device = query.l2p_devoffset;
+    let device = u64::try_from(device).map_err(|_| {
+        io::Error::other(format!(
+            "F_LOG2PHYS_EXT reported device offset {device} at offset {offset}"
+        ))
+    })?;
     match u64::try_from(contiguous) {
         Ok(0) | Err(_) => Err(io::Error::other(format!(
             "F_LOG2PHYS_EXT reported {contiguous} contiguous bytes at offset {offset}"
         ))),
-        Ok(contiguous) => Ok(contiguous.min(length)),
+        Ok(contiguous) => Ok(PhysicalRun {
+            device,
+            bytes: contiguous.min(length),
+        }),
     }
 }
 
@@ -336,7 +405,7 @@ fn next_data_region(_: &File, _: u64, _: u64) -> io::Result<Option<(u64, u64)>> 
 }
 
 #[cfg(not(target_os = "macos"))]
-fn physical_run(_: &File, _: u64, _: u64) -> io::Result<u64> {
+fn physical_run(_: &File, _: u64, _: u64) -> io::Result<PhysicalRun> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "image extents are read with macOS F_LOG2PHYS_EXT",

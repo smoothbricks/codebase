@@ -7,7 +7,6 @@ use std::num::NonZeroUsize;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use cowshed_gateway::{
@@ -133,18 +132,16 @@ impl Asker {
         serde_json::from_str(&line).expect("an answer is JSON")
     }
 
-    /// The grant named within `within`, or `None`.
-    async fn granted(&mut self, within: Duration) -> Option<Value> {
-        let answer = tokio::time::timeout(within, self.answer()).await.ok()?;
+    /// The grant named by the next answer, waiting for it.
+    async fn granted(&mut self) -> Value {
+        let answer = self.answer().await;
         assert_eq!(answer["lease"], "granted", "{answer}");
-        Some(answer["taskGrant"].clone())
+        answer["taskGrant"].clone()
     }
 
-    /// The refusal answered within `within`.
-    async fn refused(&mut self, within: Duration) -> Value {
-        let answer = tokio::time::timeout(within, self.answer())
-            .await
-            .expect("an answer");
+    /// The refusal, waiting for the answer.
+    async fn refused(&mut self) -> Value {
+        let answer = self.answer().await;
         assert_eq!(answer["ok"], Value::Bool(false), "{answer}");
         answer
     }
@@ -192,10 +189,7 @@ async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what(
         ),
     )
     .await;
-    let grant = runner
-        .granted(Duration::from_secs(10))
-        .await
-        .expect("unit-a runs");
+    let grant = runner.granted().await;
     // The caps the server applies: the profile at a grant that can hold it.
     assert_eq!(grant["unit"], "unit-a");
     assert_eq!(grant["caps"]["nxParallel"], 2);
@@ -215,10 +209,7 @@ async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what(
     // unit-a lands: the terminal fact alone advances unit-b, no human in the loop.
     let settled = one_shot(&socket, &terminal("unit-a", TaskOutcome::Landed)).await;
     assert_eq!(settled["ok"], Value::Bool(true));
-    let grant = dependent
-        .granted(Duration::from_secs(10))
-        .await
-        .expect("unit-b runs");
+    let grant = dependent.granted().await;
     assert_eq!(grant["unit"], "unit-b");
     // Its caps clamp to the 2 tokens it asked for.
     assert_eq!(grant["caps"]["nxParallel"], 2);
@@ -234,12 +225,9 @@ async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what(
 async fn one_unit_keeps_one_live_attempt_over_the_wire() {
     let (gateway, root, socket) = gateway(4).await;
     let mut runner = Asker::ask(&socket, admit("unit", &[], 1, None)).await;
-    runner
-        .granted(Duration::from_secs(10))
-        .await
-        .expect("the first attempt runs");
+    runner.granted().await;
     let mut second = Asker::ask(&socket, admit("unit", &[], 1, None)).await;
-    let refused = second.refused(Duration::from_secs(10)).await;
+    let refused = second.refused().await;
     assert_eq!(refused["code"], "rejected", "{refused}");
     assert!(
         refused["error"]
@@ -262,10 +250,7 @@ async fn gate_band_units_share_cpu_without_exclusive_root_admission() {
     let mut first = Asker::ask(&socket, admit("first", &[], 1, None)).await;
     let mut second = Asker::ask(&socket, admit("second", &[], 1, None)).await;
     for runner in [&mut first, &mut second] {
-        let grant = runner
-            .granted(Duration::from_secs(10))
-            .await
-            .expect("independent gate-band work shares available CPU");
+        let grant = runner.granted().await;
         assert_eq!(grant["cpuTokens"], 1);
     }
     let queue = one_shot(&socket, "{\"op\":\"task-queue\"}\n").await;

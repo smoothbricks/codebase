@@ -2430,19 +2430,14 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
     let observed = tokio::select! {
         biased;
         ended = &mut wait => panic!("the wait answered before the job ended: {ended:?}"),
-        observed = tokio::time::timeout(Duration::from_secs(5), observed) => observed,
+        observed = observed => observed,
     };
-    let (first, state) = observed
-        .expect("output and status arrive while the wait is pending")
-        .expect("the calls succeed");
+    let (first, state) = observed.expect("the calls succeed");
     assert_eq!(&first[..], HeldJob::FIRST);
     assert_eq!(state, JobState::Running);
 
     held.end();
-    let ended = tokio::time::timeout(Duration::from_secs(5), wait)
-        .await
-        .expect("the wait answers once the job ends")
-        .expect("wait");
+    let ended = wait.await.expect("wait");
     assert_eq!(ended.state, JobState::Exited);
 }
 
@@ -3491,9 +3486,9 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
         .expect("oracle stdout");
     let mut oracle = Vec::new();
     while oracle.iter().filter(|&&byte| byte == b'\n').count() < 2 {
-        let chunk = tokio::time::timeout(Duration::from_secs(5), stdout.next())
+        let chunk = stdout
+            .next()
             .await
-            .expect("the held fixture reports its own identities")
             .expect("oracle did not end")
             .expect("oracle bytes");
         oracle.extend_from_slice(&chunk);
@@ -3520,7 +3515,7 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     assert_eq!(first[1].2, pid);
     // The child is watched before it is allowed to fork its grandchild. A periodic
     // census cannot account for the exec events this retained history must contain.
-    let initial = tokio::time::timeout(Duration::from_secs(5), async {
+    let initial = async {
         loop {
             let tree = job.processes().await.expect("native process tree");
             if tree.processes.len() == 2 && tree.processes[1].pid == first[1].1 {
@@ -3528,15 +3523,14 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    })
-    .await
-    .expect("the FIFO-held child reaches the retained tree");
+    }
+    .await;
     assert!(matches!(initial.coverage, ProcessCoverage::Gap { .. }));
     release(birth_gate).await;
     while oracle.iter().filter(|&&byte| byte == b'\n').count() < 3 {
-        let chunk = tokio::time::timeout(Duration::from_secs(5), stdout.next())
+        let chunk = stdout
+            .next()
             .await
-            .expect("the grandchild reports its own identity")
             .expect("oracle did not end")
             .expect("oracle bytes");
         oracle.extend_from_slice(&chunk);
@@ -3545,7 +3539,7 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
     assert_eq!(expected.len(), 3);
     assert_eq!(expected[2].0, "grandchild");
     assert_eq!(expected[2].2, expected[1].1);
-    let tree = tokio::time::timeout(Duration::from_secs(5), async {
+    let tree = async {
         loop {
             let tree = job.processes().await.expect("native process tree");
             if tree.processes.len() == 3
@@ -3556,9 +3550,8 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    })
-    .await
-    .expect("grandchild exec and first usage reach the retained native tree");
+    }
+    .await;
     for (process, (_, pid, ppid)) in tree.processes.iter().zip(&expected) {
         assert_eq!((process.pid, process.ppid), (*pid, *ppid));
         assert!(process.exit.is_none());
@@ -3607,10 +3600,7 @@ async fn host_controller_process_observations_survive_a_subscriber_drop() {
         .expect("held command ends after its gates open");
     assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 29 }));
     let mut history = Vec::new();
-    while let Some(event) = tokio::time::timeout(Duration::from_secs(5), events.next())
-        .await
-        .expect("retained stream reaches its end")
-    {
+    while let Some(event) = events.next().await {
         history.push(event.expect("native process event"));
     }
     assert_eq!(
@@ -3860,9 +3850,9 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
         .expect("oracle stdout");
     let mut oracle = Vec::new();
     while oracle.iter().filter(|&&byte| byte == b'\n').count() < 2 {
-        let chunk = tokio::time::timeout(Duration::from_secs(5), stdout.next())
+        let chunk = stdout
+            .next()
             .await
-            .expect("the held parent reports its identity")
             .expect("oracle did not end")
             .expect("oracle bytes");
         oracle.extend_from_slice(&chunk);
@@ -3870,7 +3860,7 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
     let first: Vec<_> = std::str::from_utf8(&oracle).unwrap().lines().collect();
     let root_pid: u32 = first[0].strip_prefix("root:").unwrap().parse().unwrap();
     let child_pid: u32 = first[1].strip_prefix("child:").unwrap().parse().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    async {
         loop {
             let tree = job.processes().await.expect("retained parent");
             if tree
@@ -3882,14 +3872,10 @@ async fn host_controller_a_reaped_grandchild_burst_retains_its_observation_gap()
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    })
-    .await
-    .expect("the parent is watched before its burst");
+    }
+    .await;
     release(gate).await;
-    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(5), stdout.next())
-        .await
-        .expect("the short burst finishes")
-    {
+    while let Some(chunk) = stdout.next().await {
         oracle.extend_from_slice(&chunk.expect("oracle bytes"));
     }
     let ended = job.wait().await.expect("the burst parent is reaped");
@@ -4922,14 +4908,9 @@ async fn a_pending_stdin_write_holds_no_other_call() {
     let status = tokio::select! {
         biased;
         written = &mut write => panic!("the write answered before the job took it: {written:?}"),
-        status = tokio::time::timeout(
-            Duration::from_secs(5),
-            route(&router, coordinator(repo.clone()), "job.status", job.clone()),
-        ) => status,
+        status = route(&router, coordinator(repo.clone()), "job.status", job.clone()) => status,
     };
-    let status = status
-        .expect("the status answers while the write is pending")
-        .expect("status");
+    let status = status.expect("status");
     assert_eq!(status["state"], json!("running"));
 
     gate.notify_one();
@@ -5073,9 +5054,8 @@ async fn a_reported_create_hears_its_steps_while_it_runs() {
     let heard_while_held = tokio::select! {
         biased;
         created = &mut create => panic!("the create answered while held: {created:?}"),
-        heard = tokio::time::timeout(Duration::from_secs(5), heard_while_held) => heard,
-    }
-    .expect("the steps so far arrive while the create is held");
+        heard = heard_while_held => heard,
+    };
     assert_eq!(
         heard_while_held,
         [
@@ -5086,10 +5066,7 @@ async fn a_reported_create_hears_its_steps_while_it_runs() {
     );
 
     gate.notify_one();
-    let created = tokio::time::timeout(Duration::from_secs(5), create)
-        .await
-        .expect("the create answers once released")
-        .expect("create");
+    let created = create.await.expect("create");
     assert_eq!(created.info().workspace.as_str(), "feature");
     let mut rest = Vec::new();
     while let Some(report) = reports.recv().await {

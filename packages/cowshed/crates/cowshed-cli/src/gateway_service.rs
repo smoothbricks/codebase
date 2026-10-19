@@ -4229,11 +4229,7 @@ mod tests {
             {
                 let mut lines = tokio::io::BufReader::new(&mut stream).lines();
                 for lease in ["queued", "granted"] {
-                    let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
-                        .await
-                        .expect("the gate is answered")
-                        .expect("read")
-                        .expect("an answer");
+                    let line = lines.next_line().await.expect("read").expect("an answer");
                     assert!(line.contains(&format!("\"{lease}\"")), "{line}");
                 }
             }
@@ -4300,11 +4296,7 @@ mod tests {
             assert!(!waiting.is_finished(), "the younger gate still runs");
             assert_eq!(observed(), pending(&[(both[1].job, "/w/younger-land")]));
             drop(younger);
-            let said = tokio::time::timeout(Duration::from_secs(10), waiting)
-                .await
-                .expect("the install goes on once no gate is in flight")
-                .expect("the wait task")
-                .expect("the wait");
+            let said = waiting.await.expect("the wait task").expect("the wait");
             let said = String::from_utf8(said).expect("utf-8");
             let lines: Vec<&str> = said.lines().collect();
             assert_eq!(lines.len(), 4, "{said}");

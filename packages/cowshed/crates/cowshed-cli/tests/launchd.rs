@@ -1625,7 +1625,6 @@ mod descriptor_inheritance {
     use super::*;
     use std::io::Write as _;
     use std::os::unix::net::UnixStream;
-    use std::time::Duration;
 
     const SOCKET_ENV: &str = "COWSHED_LAUNCHD_DESCRIPTOR_SOCKET";
     const CHILD_TEST: &str = "descriptor_inheritance::host_controller_launchd_descriptor_child";
@@ -1778,7 +1777,7 @@ mod descriptor_inheritance {
             String::from_utf8_lossy(&launched.stderr)
         );
         agent.loaded = true;
-        let report = tokio::time::timeout(Duration::from_secs(30), async {
+        let report = async {
             use tokio::io::AsyncReadExt as _;
             let (mut child, _) = listener.accept().await.expect("launchd child connects");
             let mut bytes = Vec::new();
@@ -1787,15 +1786,8 @@ mod descriptor_inheritance {
                 .await
                 .expect("child report reaches EOF");
             bytes
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "launched descriptor probe never connected or closed its report; stderr: {}",
-                fs::read_to_string(spec.standard_error_path())
-                    .unwrap_or_else(|error| format!("cannot read probe stderr: {error}"))
-            )
-        });
+        }
+        .await;
         let result: serde_json::Value = serde_json::from_slice(&report).unwrap_or_else(|error| {
             panic!(
                 "descriptor report {error}: {}",

@@ -531,15 +531,11 @@ async fn nx_short_content_length_is_a_failed_transfer_not_a_completed_hit() {
         .write_all(super::nx_request(endpoint, "GET", &token, "42").as_bytes())
         .await
         .expect("cache request");
-    let limit = std::time::Duration::from_secs(10);
     let mut head = Vec::new();
     let mut byte = [0; 1];
     while !head.ends_with(b"\r\n\r\n") {
         assert!(head.len() < FIXTURE_HEAD_LIMIT);
-        tokio::time::timeout(limit, client.read_exact(&mut byte))
-            .await
-            .expect("response head deadline")
-            .expect("response head");
+        client.read_exact(&mut byte).await.expect("response head");
         head.push(byte[0]);
     }
     let head = String::from_utf8(head).expect("HTTP head");
@@ -549,18 +545,16 @@ async fn nx_short_content_length_is_a_failed_transfer_not_a_completed_hit() {
         "{head}"
     );
     let mut prefix = [0; 5];
-    tokio::time::timeout(limit, client.read_exact(&mut prefix))
+    client
+        .read_exact(&mut prefix)
         .await
-        .expect("prefix deadline")
         .expect("visible body prefix");
     assert_eq!(&prefix, b"short");
     close
         .send(())
         .expect("cut the upstream after the committed prefix");
     let mut suffix = Vec::new();
-    let ended = tokio::time::timeout(limit, client.read_to_end(&mut suffix))
-        .await
-        .expect("short-body deadline");
+    let ended = client.read_to_end(&mut suffix).await;
     if let Err(error) = ended {
         assert!(
             matches!(

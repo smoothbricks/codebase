@@ -12,7 +12,6 @@ use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use cowshed_core::api::{ExitStatus, JobId};
 use cowshed_core::metadata::{
@@ -612,7 +611,6 @@ const TCP_PROBE: &str = "COWSHED_TCP_PROBE";
 const TCP_PROBE_TEST: &str = "host_controller_tcp_probe_runs_as_a_sandboxed_child";
 /// The prefix of every line the probe reports; the test harness's own output has none.
 const TCP_PROBE_LINE: &str = "tcp-probe ";
-const TCP_PROBE_IO: Duration = Duration::from_secs(3);
 /// The size every workspace's block used to be capped at, and a block grown past it.
 const CAPPED_BLOCK_SIZE: u16 = 64;
 const GROWN_BLOCK_SIZE: u16 = 128;
@@ -722,10 +720,7 @@ fn connect_beyond_the_block(base: u16, targets: Vec<u16>) {
     roundtrip(&listener, own);
     println!("{TCP_PROBE_LINE}{own} roundtrip");
     for port in targets {
-        match TcpStream::connect_timeout(
-            &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-            TCP_PROBE_IO,
-        ) {
+        match TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))) {
             Ok(_) => println!("{TCP_PROBE_LINE}{port} connected"),
             Err(error) if error.kind() == ErrorKind::PermissionDenied => {
                 println!("{TCP_PROBE_LINE}{port} denied");
@@ -780,9 +775,8 @@ fn serve_on_the_block_and_on_port_zero(base: u16, size: u16) {
 fn roundtrip(listener: &TcpListener, port: u16) {
     use std::io::{Read, Write};
 
-    let mut client =
-        TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), TCP_PROBE_IO)
-            .unwrap_or_else(|error| panic!("connect to 127.0.0.1:{port}: {error}"));
+    let mut client = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        .unwrap_or_else(|error| panic!("connect to 127.0.0.1:{port}: {error}"));
     let (mut accepted, peer) = listener
         .accept()
         .unwrap_or_else(|error| panic!("accept on {port}: {error}"));
@@ -791,14 +785,6 @@ fn roundtrip(listener: &TcpListener, port: u16) {
         client.local_addr().expect("client address"),
         "port {port} accepted a connection that is not the probe's"
     );
-    for stream in [&client, &accepted] {
-        stream
-            .set_read_timeout(Some(TCP_PROBE_IO))
-            .expect("read timeout");
-        stream
-            .set_write_timeout(Some(TCP_PROBE_IO))
-            .expect("write timeout");
-    }
     let request = port.to_be_bytes();
     client.write_all(&request).expect("request");
     let mut received = [0_u8; 2];
@@ -1184,19 +1170,10 @@ impl SandboxedChild {
         self.exit.is_some() && self.eof == 2
     }
 
-    /// Advances on the child's next event. The deadline only guards a hang, and names what is
-    /// still open when it fires.
+    /// Advances on the child's next event. A child that goes silent is ended by the harness's
+    /// no-progress backstop, not by a bound here.
     async fn step(&mut self) {
-        let Ok(event) = tokio::time::timeout(Duration::from_secs(30), self.events.recv()).await
-        else {
-            panic!(
-                "sandboxed child hung: exit {:?}, {} of 2 output streams ended\nstdout: {}\nstderr: {}",
-                self.exit,
-                self.eof,
-                String::from_utf8_lossy(&self.stdout),
-                String::from_utf8_lossy(&self.stderr)
-            );
-        };
+        let event = self.events.recv().await;
         let event = event.expect("process event channel remains open until exit and EOF");
         match event {
             ProcessEvent::Output { stream, bytes, .. } => match stream {
@@ -1616,15 +1593,10 @@ watcher.watch((error, events) => {
 readyAt = process.hrtime.bigint();
 process.stdout.write(`${process.argv[3]}watch-ready\n`);
 (async () => {
-  const deadline = setTimeout(
-    () => refuse(new Error('native callback for the allowed source change did not arrive')),
-    10000,
-  );
   try {
     await observed;
     collect(watcher.forceFlushPending());
   } finally {
-    clearTimeout(deadline);
     await watcher.stop();
   }
   assert.equal(failure, null);
@@ -1650,12 +1622,9 @@ process.stdout.write(`${process.argv[3]}watch-ready\n`);
     ))
     .await;
     watcher.close_stdin();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        watcher.until_probe_line(&format!("{TCP_PROBE_LINE}watch-ready")),
-    )
-    .await
-    .expect("watcher must start before publishing changes");
+    watcher
+        .until_probe_line(&format!("{TCP_PROBE_LINE}watch-ready"))
+        .await;
     // The positive acknowledgement follows the private mutation; no earlier denied event may be exposed.
     std::fs::write(private.join("secret.txt"), b"synthetic-after")
         .expect("publish private negative control");

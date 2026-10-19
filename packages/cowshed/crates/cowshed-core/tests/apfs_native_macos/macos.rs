@@ -842,13 +842,7 @@ fn native_host_at(root: &Path) -> MacOsApfsExecutionHost<RecordingRunner> {
 }
 
 fn wait_for_path(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
     while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
-        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -7316,9 +7310,7 @@ mod build_mount_races {
                     .unwrap()
                     .mount_build_volume(layout, id)
             });
-            waited
-                .recv_timeout(Duration::from_secs(5))
-                .expect("loser reached its second image lease");
+            waited.recv().expect("loser reached its second image lease");
             let winner = MacOsApfsExecutionHost::with_mount_source(
                 runner(&recorded, &mounts, Completion::Mount),
                 fixture.config(),

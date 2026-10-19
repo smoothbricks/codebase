@@ -3843,7 +3843,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         first_entered_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv()
             .expect("first mutation entered its lock");
 
         let (second_attempt_tx, second_attempt_rx) = std::sync::mpsc::sync_channel(1);
@@ -3864,7 +3864,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         second_attempt_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv()
             .expect("second mutation attempted the lock");
         let entered_before_release =
             second_entered_rx.recv_timeout(std::time::Duration::from_millis(100));
@@ -3877,7 +3877,7 @@ mod tests {
             .expect("first mutation");
         if entered_before_release.is_err() {
             second_entered_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
+                .recv()
                 .expect("second mutation entered after release");
         }
         second
