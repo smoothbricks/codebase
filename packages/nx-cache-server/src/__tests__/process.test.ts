@@ -135,20 +135,74 @@ async function readLines(stream: ReadableStream<Uint8Array>, count: number): Pro
 }
 
 /**
- * Resolve once a staged upload file holds bytes. The server emits no event after a staged write, and macOS
- * reports no directory change when data is written into an existing file, so a directory watch can sleep through
- * the write. A bounded stat-poll is the only signal that bytes landed.
+ * Resolve once a staged upload file holds bytes, or reject when `signal` aborts or the server process `exited` first
+ * (the error names its exit code): a dead server writes nothing, so waiting on it would only end at the leg's backstop.
+ * The server emits no event after a staged write, and macOS reports no directory change when data is written into an
+ * existing file, so a directory watch alone can sleep through the write. The directory watch wakes on the staged
+ * file's creation; a watch on that file wakes on each data write (kqueue on macOS, inotify on Linux). The file is
+ * stat'ed right after each watch is armed and after every wake, so bytes that landed before a watch existed still
+ * resolve. Every watch is closed on the way out.
  */
-async function awaitStaged(staging: string, signal: AbortSignal): Promise<void> {
-  const deadline = Date.now() + 15_000;
-  while (!signal.aborted) {
-    for (const name of await readdir(staging)) {
-      if ((await stat(join(staging, name))).size > 0) return;
-    }
-    if (Date.now() > deadline) throw new Error(`no staged upload bytes in ${staging} within 15s`);
-    await Bun.sleep(5);
+async function awaitStaged(staging: string, signal: AbortSignal, exited: Promise<number>): Promise<void> {
+  const local = new AbortController();
+  const scope = AbortSignal.any([signal, local.signal]);
+  void exited.then((code) =>
+    local.abort(new Error(`server exited with code ${code} before the staged upload materialized`)),
+  );
+  try {
+    await awaitStagedBytes(await awaitStagedFile(staging, scope), scope);
+  } catch (error) {
+    if (signal.aborted) throw new Error('staging wait aborted before the upload materialized', { cause: error });
+    if (local.signal.aborted) throw local.signal.reason;
+    throw error;
+  } finally {
+    local.abort();
   }
-  throw new Error('staging wait aborted before the upload materialized');
+}
+
+/** First staged file's path. The directory watch is armed before the listing, so a creation between them is seen. */
+async function awaitStagedFile(staging: string, scope: AbortSignal): Promise<string> {
+  const creations = watch(staging, { signal: scope })[Symbol.asyncIterator]();
+  let wake = arm(creations);
+  for (;;) {
+    const [name] = await readdir(staging);
+    if (name !== undefined) return join(staging, name);
+    const change = await until(wake, scope);
+    if (change.done) throw new Error(`directory watch on ${staging} closed before a staged upload appeared`);
+    wake = arm(creations);
+  }
+}
+
+/** Resolve once `file` holds bytes. The file watch is armed before the first stat, so an earlier write still counts. */
+async function awaitStagedBytes(file: string, scope: AbortSignal): Promise<void> {
+  const writes = watch(file, { signal: scope })[Symbol.asyncIterator]();
+  let wake = arm(writes);
+  for (;;) {
+    if ((await stat(file)).size > 0) return;
+    const change = await until(wake, scope);
+    if (change.done) throw new Error(`file watch on ${file} closed before the staged upload held bytes`);
+    wake = arm(writes);
+  }
+}
+
+/** Starts the next wait on a watch. Waits abandoned by a return reject when the watch closes in cleanup; that is expected, so it is marked handled. */
+function arm(changes: AsyncIterator<unknown>): Promise<IteratorResult<unknown>> {
+  const wake = changes.next();
+  wake.catch(() => {});
+  return wake;
+}
+
+/** Await `wake`, or reject as soon as `scope` aborts. The abort listener lives only for the wait. */
+async function until(wake: Promise<IteratorResult<unknown>>, scope: AbortSignal): Promise<IteratorResult<unknown>> {
+  scope.throwIfAborted();
+  const aborted = Promise.withResolvers<never>();
+  const onAbort = () => aborted.reject(scope.reason);
+  scope.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await Promise.race([wake, aborted.promise]);
+  } finally {
+    scope.removeEventListener('abort', onAbort);
+  }
 }
 
 function readStatus(socket: Socket): Promise<number> {
@@ -193,7 +247,7 @@ test('hard death during a real upload leaves no hit and restart reclaims staging
       'PUT /v1/cache/interrupted HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer process-write\r\nContent-Length: 8388608\r\n\r\n',
     );
     socket.write(Buffer.alloc(64 * 1024, 7));
-    await awaitStaged(staging, abort.signal);
+    await awaitStaged(staging, abort.signal, first.child.exited);
     const before = await fetch(`${first.origin}/v1/cache/interrupted`, {
       headers: { authorization: 'Bearer process-read' },
     });
@@ -294,7 +348,7 @@ test('stdin EOF drains an in-flight upload while the lease still refuses a secon
     socket.once('connect', connected.resolve);
     socket.once('error', connected.reject);
     await connected.promise;
-    const staged = awaitStaged(staging, abort.signal);
+    const staged = awaitStaged(staging, abort.signal, first.child.exited);
     socket.write(
       `PUT /v1/cache/drained HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer process-write\r\nContent-Length: ${body.byteLength}\r\n\r\n`,
     );
