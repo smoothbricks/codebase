@@ -38,6 +38,18 @@ installed copy (05_gateway.md "The installed cowshed"): setup repoints the first
 entry is a symbolic link, which is what `bun link` of the package or `bun add --global` leaves. A `PATH` entry left on
 the launcher would run whatever a checkout last built, under a daemon still running the build setup installed.
 
+### Linux artifacts
+
+Linux artifacts reference no build-host path. The CLI is a static musl executable (no PT_INTERP, no DT_NEEDED). N-API
+addons link glibc 2.17 symbol versions and carry no RUNPATH. Both are built by devenv's zig through cargo-zigbuild, with
+the same command on every host.
+
+So the CLI runs on any Linux userland of its architecture — glibc or musl, FHS or NixOS without nix-ld — and lives in
+`dist/bin/linux-<arch>/`, a directory without a libc suffix. The addon is glibc because Node is: it lives in
+`dist/native/linux-<arch>-gnu/cowshed.linux-<arch>-gnu.node`, loads on glibc ≥ 2.17 (below Node ≥ 18's own 2.28), needs
+no `libgcc_s`, and is not built for musl Node. macOS artifacts are built by `@napi-rs/cli` with the host's own
+toolchain, since they need Apple's SDK.
+
 ## Onboarding and repair
 
 Two verbs own the host story, both runnable from any directory:

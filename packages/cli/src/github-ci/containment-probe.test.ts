@@ -35,15 +35,11 @@ function cowshedShapedProject(): ProjectTargets {
       'napi-x64-linux',
       'napi-arm64-macos',
     ],
-    targetDependencies: new Map([
-      ['build', ['tsc-js', 'cli-arm64-macos', 'napi-arm64-macos']],
-      ['cli-x64-linux', ['napi-toolchain-x64-linux']],
-      ['napi-x64-linux', ['napi-toolchain-x64-linux']],
-    ]),
+    targetDependencies: new Map([['build', ['tsc-js', 'cli-arm64-macos', 'napi-arm64-macos']]]),
     targetOutputs: new Map([
       ['tsc-js', ['{projectRoot}/dist/ts']],
-      ['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']],
-      ['cli-arm64-linux', ['{projectRoot}/dist/bin/linux-arm64-gnu']],
+      ['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64']],
+      ['cli-arm64-linux', ['{projectRoot}/dist/bin/linux-arm64']],
       ['cli-arm64-macos', ['{projectRoot}/dist/bin/darwin-arm64']],
       ['napi-x64-linux', ['{projectRoot}/dist/native/linux-x64-gnu']],
       ['napi-arm64-macos', ['{projectRoot}/dist/native/darwin-arm64']],
@@ -55,8 +51,8 @@ const DIGEST = 'd'.repeat(64);
 const OTHER_DIGEST = 'e'.repeat(64);
 const PACKAGES = [{ name: 'cowshed', version: '1.0.0' }];
 const TS_ENTRY = 'packages/cowshed/dist/ts/cli.js';
-const LINUX_X64_BIN = 'packages/cowshed/dist/bin/linux-x64-gnu/cowshed';
-const LINUX_ARM64_BIN = 'packages/cowshed/dist/bin/linux-arm64-gnu/cowshed';
+const LINUX_X64_BIN = 'packages/cowshed/dist/bin/linux-x64/cowshed';
+const LINUX_ARM64_BIN = 'packages/cowshed/dist/bin/linux-arm64/cowshed';
 const LINUX_X64_NAPI = 'packages/cowshed/dist/native/linux-x64-gnu/cowshed.node';
 const DARWIN_ARM64_BIN = 'packages/cowshed/dist/bin/darwin-arm64/cowshed';
 const DARWIN_ARM64_NAPI = 'packages/cowshed/dist/native/darwin-arm64/cowshed.node';
@@ -153,7 +149,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-linux',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64-gnu', files: [fileFact(LINUX_X64_BIN)] }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64', files: [fileFact(LINUX_X64_BIN)] }],
         },
       ]),
     );
@@ -186,7 +182,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-linux',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64-gnu', files: [fileFact(LINUX_X64_BIN)] }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64', files: [fileFact(LINUX_X64_BIN)] }],
         },
       ]),
     );
@@ -206,7 +202,7 @@ describe('publish collect containment probe', () => {
         {
           project,
           target: 'cli-x64-linux',
-          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64-gnu', files: [fileFact(LINUX_X64_BIN)] }],
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64', files: [fileFact(LINUX_X64_BIN)] }],
         },
       ]),
     ).toEqual({
@@ -215,7 +211,7 @@ describe('publish collect containment probe', () => {
         {
           project: 'cowshed',
           target: 'cli-x64-linux',
-          output: '{projectRoot}/dist/bin/linux-x64-gnu',
+          output: '{projectRoot}/dist/bin/linux-x64',
           path: LINUX_X64_BIN,
           size: 4,
           mode: 0o644,
@@ -229,15 +225,15 @@ describe('publish collect containment probe', () => {
       ...cowshedShapedProject(),
       project: 'alpha',
       targets: ['cli-x64-linux'],
-      targetOutputs: new Map([['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']]]),
+      targetOutputs: new Map([['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64']]]),
     };
     const beta: ProjectTargets = {
       ...cowshedShapedProject(),
       project: 'beta',
       targets: ['other-x64-linux'],
-      targetOutputs: new Map([['other-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']]]),
+      targetOutputs: new Map([['other-x64-linux', ['{projectRoot}/dist/bin/linux-x64']]]),
     };
-    const outputs = [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64-gnu', files: [fileFact(LINUX_X64_BIN)] }];
+    const outputs = [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64', files: [fileFact(LINUX_X64_BIN)] }];
 
     expect(
       planOutputClaims([

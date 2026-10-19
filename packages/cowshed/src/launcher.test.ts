@@ -7,17 +7,17 @@ import { chmod, copyFile, mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'n
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { launcherPath, packageRootFromModule, runLauncher } from './launcher.js';
-import { NATIVE_TARGETS, platformDirectory } from './platform.js';
+import { cliDirectory, NATIVE_TARGETS } from './platform.js';
 
 const LAUNCHER = launcherPath(packageRootFromModule(import.meta.url));
-const HOST_DIRECTORY = platformDirectory(process.platform, process.arch);
+const HOST_DIRECTORY = cliDirectory(process.platform, process.arch);
 
 /** What `uname -sm` prints on the host each table row ships for. */
-const UNAME: Record<(typeof NATIVE_TARGETS)[number]['directory'], string> = {
+const UNAME: Record<(typeof NATIVE_TARGETS)[number]['cli']['directory'], string> = {
   'darwin-arm64': 'Darwin arm64',
   'darwin-x64': 'Darwin x86_64',
-  'linux-arm64-gnu': 'Linux aarch64',
-  'linux-x64-gnu': 'Linux x86_64',
+  'linux-arm64': 'Linux aarch64',
+  'linux-x64': 'Linux x86_64',
 };
 
 const fixtureRoots: string[] = [];
@@ -97,12 +97,12 @@ describe('cowshed launcher', () => {
     for (const target of NATIVE_TARGETS) {
       const f = await fixture();
       for (const other of NATIVE_TARGETS) {
-        await named(f.packaged(other.directory), other.directory);
+        await named(f.packaged(other.cli.directory), other.cli.directory);
       }
 
-      const run = launch(f.launcher, ['ls'], { home: f.home, path: await f.uname(UNAME[target.directory]) });
+      const run = launch(f.launcher, ['ls'], { home: f.home, path: await f.uname(UNAME[target.cli.directory]) });
 
-      expect(run.stdout).toBe(`${target.directory} [ls]`);
+      expect(run.stdout).toBe(`${target.cli.directory} [ls]`);
     }
   });
 

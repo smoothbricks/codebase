@@ -27,12 +27,12 @@ while [ -h "$launcher" ]; do
 done
 package=${launcher%/*}/..
 
-# Kept in step with NATIVE_TARGETS in src/platform.ts; platform.test.ts checks this table.
+# Kept in step with the `cli` directories of NATIVE_TARGETS in src/platform.ts; launcher.test.ts checks this table.
 case $(uname -sm) in
 "Darwin arm64") platform=darwin-arm64 ;;
 "Darwin x86_64") platform=darwin-x64 ;;
-"Linux aarch64" | "Linux arm64") platform=linux-arm64-gnu ;;
-"Linux x86_64") platform=linux-x64-gnu ;;
+"Linux aarch64" | "Linux arm64") platform=linux-arm64 ;;
+"Linux x86_64") platform=linux-x64 ;;
 *) platform= ;;
 esac
 
