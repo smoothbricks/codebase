@@ -181,15 +181,29 @@ async function ownedDiskFacadeFixture() {
 
 describe('RAM temp volume on this host', () => {
   it('kills a deadlined command together with everything it spawned', async () => {
-    // Ordinary helpers remain deadline-bound; disk-image tools are owned by cowshed instead.
-    const result = await createHostCommands(500).run('/bin/sh', ['-c', 'sleep 60 & echo $!; wait']);
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toMatch(/^no answer within 500 ms; killed process group \d+$/);
-    const spawned = result.stdout.trim();
-    expect(spawned).toMatch(/^\d+$/);
-    // Gone, or a zombie its new parent has yet to reap: either way no longer running.
-    const state = await createHostCommands().run('ps', ['-o', 'stat=', '-p', spawned]);
-    expect(state.status === 1 || state.stdout.trim().startsWith('Z')).toBe(true);
+    // Ordinary helpers remain deadline-bound; disk-image tools are owned by cowshed instead. The command never answers:
+    // its shell opens `lifetime`, hands it to a background `tail -f /dev/null` that never ends on its own, closes its
+    // own copy and only then prints the tail's pid. So only the deadline ends the run, a printed pid means the FIFO
+    // has a writer, and EOF on it is that descendant's death. The bound returns once it has signalled the group, not
+    // once the kernel has torn it down, so a `ps` read straight after raced the kill (Linux CI saw it still running).
+    const directory = mkdtempSync(join(realpathSync(tmpdir()), 'deadline-group-'));
+    try {
+      const lifetime = join(directory, 'lifetime.fifo');
+      execFileSync('mkfifo', [lifetime]);
+      const ended = readFile(lifetime, 'utf8');
+      const result = await createHostCommands(500).run('/bin/sh', [
+        '-c',
+        'exec 3>"$1"; tail -f /dev/null & exec 3>&-; echo $!; wait',
+        'sh',
+        lifetime,
+      ]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/^no answer within 500 ms; killed process group \d+$/);
+      expect(result.stdout.trim()).toMatch(/^\d+$/);
+      expect(await ended).toBe('');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('routes disk tools and their lifetime together without shell interpolation', () => {
