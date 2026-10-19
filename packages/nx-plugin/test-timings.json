@@ -23,6 +23,7 @@
     "src/executors/typescript-emit/executor.test.ts": 4856,
     "src/linked-snapshots.nx.test.ts": 4462,
     "src/nx-dot-input-policy.test.ts": 3918,
+    "src/test-clock-policy.test.ts": 3700,
     "src/nx-daemon-ignore-files.test.ts": 3191,
     "src/task-results.test.ts": 3168,
     "src/task-history-namespace.test.ts": 2376,

@@ -41,6 +41,12 @@
       "import": "./dist/build-state-output-policy.js",
       "default": "./dist/build-state-output-policy.js"
     },
+    "./test-clock-policy": {
+      "types": "./dist/test-clock-policy.d.ts",
+      "development": "./src/test-clock-policy.ts",
+      "import": "./dist/test-clock-policy.js",
+      "default": "./dist/test-clock-policy.js"
+    },
     "./test-walk-policy": {
       "types": "./dist/test-walk-policy.d.ts",
       "development": "./src/test-walk-policy.ts",
@@ -214,7 +220,8 @@
     "smoo-nx-nextest-extract": "./dist/bin/smoo-nx-nextest-extract.js",
     "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
     "smoo-nx-failures": "./dist/bin/smoo-nx-failures.js",
-    "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js"
+    "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
+    "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js"
   },
   "generators": "./generators.json",
   "executors": "./executors.json",
