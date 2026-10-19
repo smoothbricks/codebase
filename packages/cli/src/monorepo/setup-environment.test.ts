@@ -1346,6 +1346,61 @@ describe('what shell entry keeps linked', () => {
       );
     });
 
+    it('says an unavailable declaration without waiting for the install lock another entry holds', async () => {
+      await withManagedRepository(
+        { ...WORKSPACE, developerLinks: { '@fixture/lib': '../absent-lib' } },
+        async ({ root, startShell }) => {
+          expect(await finished(startShell())).toEqual(HEALTHY);
+          // Another entry's install, reduced to its lock: a process holding flock(2) on the checkout's install lock
+          // until its stdin closes or it is killed. It says `held` once it has it.
+          const holder = Bun.spawn({
+            cmd: [
+              'bun',
+              '-e',
+              [
+                "const { dlopen, FFIType } = require('bun:ffi');",
+                "const { openSync } = require('node:fs');",
+                "const libc = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {",
+                '  flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },',
+                '});',
+                `if (libc.symbols.flock(openSync(${JSON.stringify(join(root, 'node_modules', '.smoo-install.lock'))}, 'a'), 2) !== 0) process.exit(1);`,
+                "process.stdout.write('held\\n');",
+                'process.stdin.resume();',
+              ].join('\n'),
+            ],
+            stdout: 'pipe',
+            stderr: 'inherit',
+            stdin: 'pipe',
+          });
+          try {
+            const said = holder.stdout.getReader();
+            const first = await said.read();
+            expect(new TextDecoder().decode(first.value)).toBe('held\n');
+            said.releaseLock();
+
+            // The entry prints its wait line the moment it finds the lock held and then polls until the holder
+            // dies, so reading its stderr up to that line or its exit decides the case without a clock.
+            const entry = startShell({ links: true });
+            const waited = "setup-environment: waiting for another shell entry's install";
+            let stderr = '';
+            for await (const chunk of entry.stderr) {
+              stderr += new TextDecoder().decode(chunk);
+              if (stderr.includes(waited)) entry.kill('SIGKILL');
+            }
+            expect(stderr).not.toContain(waited);
+            expect(await entry.exited).toBe(0);
+            expect(stderr).toContain(
+              `! smoo.developerLinks @fixture/lib: ${join(dirname(root), 'absent-lib')} does not exist on this machine; the installed version stays`,
+            );
+            expect(readlinkSync(join(root, LINKED))).toBe('../../../lib');
+          } finally {
+            holder.kill('SIGKILL');
+            await holder.exited;
+          }
+        },
+      );
+    });
+
     it('reports a present checkout without a package.json as unavailable, never as an unhandled ENOENT', async () => {
       await withManagedRepository(
         { ...WORKSPACE, developerLinks: { '@fixture/lib': '../bare-lib' } },
