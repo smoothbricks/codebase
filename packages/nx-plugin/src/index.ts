@@ -466,14 +466,7 @@ function sameNapiPlatform(left: NapiPlatform, right: NapiPlatform | null): boole
 function hostPlatformTargetNames(targetNames: Iterable<string>, hostPlatform: NapiPlatform | null): string[] {
   if (hostPlatform === null) return [];
   const suffix = `-${hostPlatform.architecture}-${hostPlatform.targetFamily}`;
-  return [...new Set(targetNames)]
-    .filter(
-      // Binary targets only. A toolchain prerequisite carries the same platform
-      // suffix but produces no artifact: the cross builds that need it depend
-      // on it directly, so the aggregate stays a list of outputs.
-      (name) => name.endsWith(suffix) && !name.startsWith(NAPI_TOOLCHAIN_TARGET_PREFIX),
-    )
-    .sort();
+  return [...new Set(targetNames)].filter((name) => name.endsWith(suffix)).sort();
 }
 
 /**
@@ -566,18 +559,23 @@ function targetCommandText(target: TargetConfiguration): string {
 }
 /**
  * The N-API build's inputs beyond the Cargo sources: the toolchain pin, the
- * package's `napi` block, which names the binary and the targets, and the napi
- * CLI's resolved version from the lockfile. Neither the package version nor
- * any other lockfile entry is part of the artifact.
+ * package's `napi` block, which names the binary and the targets, and the
+ * resolved version of the npm package that drives the build (the napi CLI on
+ * macOS; none on Linux, where devenv's zig and cargo-zigbuild are covered by
+ * the pin). Neither the package version nor any other lockfile entry is part
+ * of the artifact.
  *
- * The pin is stated here rather than inherited: `napi build` compiles with the
- * same rustc and links against the same SDK as any other cargo target, but its
- * command does not spell `cargo --frozen`, which is how every other cached
- * cargo target acquires its toolchain identity. Without it a `.node` linked
- * against one toolchain hashed equal to the same sources linked against the
- * next one.
+ * The pin is stated here rather than inherited: neither `napi build` nor the
+ * `cargo-zigbuild` executor spells `cargo --frozen`, which is how every other
+ * cached cargo target acquires its toolchain identity. Without it a `.node`
+ * linked against one toolchain hashed equal to the same sources linked against
+ * the next one.
  */
-function napiInputs(projectRoot: string, repoRooted: boolean): TargetConfiguration['inputs'] {
+function napiInputs(
+  projectRoot: string,
+  repoRooted: boolean,
+  externalDependencies: readonly string[],
+): TargetConfiguration['inputs'] {
   // Runtime inputs execute from the workspace root, so the manifest is named
   // by its path from there whichever way the Cargo invocation is rooted.
   const packageJson = `./${posix.join(projectRoot, 'package.json')}`;
@@ -587,7 +585,7 @@ function napiInputs(projectRoot: string, repoRooted: boolean): TargetConfigurati
     ...(repoRooted ? ['{workspaceRoot}/scripts/*.sh'] : []),
     ...CARGO_TOOLCHAIN_PIN_INPUTS,
     runtimeInput(`bun -e 'console.log(JSON.stringify(require(${JSON.stringify(packageJson)}).napi ?? null))'`),
-    { externalDependencies: ['@napi-rs/cli'] },
+    { externalDependencies: [...externalDependencies] },
   ];
 }
 
@@ -618,31 +616,14 @@ const NAPI_TARGET_CONVENTIONS: Readonly<Record<string, NapiTargetConvention>> = 
   },
 };
 
-const NATIVE_LINUX_COMPILER_ENV = Object.freeze({ CC: 'cc', CXX: 'c++' });
-const CROSS_LINUX_COMPILER_ENV = Object.freeze({ TARGET_CC: 'clang', TARGET_CXX: 'clang++' });
-
-function usesNapiCross(target: NapiTargetConvention, hostPlatform: NapiPlatform | null): boolean {
-  return target.targetFamily === 'linux' && !sameNapiPlatform(target, hostPlatform);
-}
-
-function napiCompilerEnv(
-  target: NapiPlatform | null,
-  hostPlatform: NapiPlatform | null,
-): Readonly<Record<string, string>> | undefined {
-  if (target?.targetFamily !== 'linux') return undefined;
-  return sameNapiPlatform(target, hostPlatform) ? NATIVE_LINUX_COMPILER_ENV : CROSS_LINUX_COMPILER_ENV;
-}
-
-const NAPI_TOOLCHAIN_TARGET_PREFIX = 'napi-toolchain-';
-
 /**
- * Prerequisite target that extracts the cross toolchain one triple needs. The
- * platform suffix keeps it inside its own platform family, so it can be a
- * dependency of `napi-<arch>-linux` and package-local `cli-<arch>-linux`.
+ * The glibc symbol-version floor every Linux N-API addon links against.
+ * cargo-zigbuild reads it from the target triple's suffix
+ * (`x86_64-unknown-linux-gnu.2.17`) and links zig's stubs for exactly that
+ * glibc, so the floor is this literal on every host rather than whatever glibc
+ * the build machine carries. 2.17 is below Node ≥ 18's own 2.28 floor.
  */
-export function napiToolchainTargetName(convention: NapiTargetConvention): string {
-  return `${NAPI_TOOLCHAIN_TARGET_PREFIX}${convention.architecture}-${convention.targetFamily}`;
-}
+const LINUX_GLIBC_FLOOR = '2.17';
 
 /**
  * Cargo's two profiles. A build target's default options compile `dev`, the
@@ -1666,9 +1647,8 @@ async function createProjectTargets(
     targets[CARGO_FETCH_TARGET] = {
       executor: 'nx:run-commands',
       // The download lands in CARGO_HOME, outside the workspace: a cache hit
-      // would skip work a cold registry still needs — same reason
-      // napi-toolchain-* is uncached. Nothing here is a workspace output, so
-      // there is nothing for Nx to restore in its place.
+      // would skip work a cold registry still needs. Nothing here is a
+      // workspace output, so there is nothing for Nx to restore in its place.
       cache: false,
       options: {
         // One fetch per manifest, independent of the others: Cargo's own
@@ -2242,27 +2222,17 @@ function createNapiTargets(
   // that stale local artifacts can mask for months.
   const packageJsonPath = repoRooted ? posix.join(projectRoot, 'package.json') : 'package.json';
   const commonCommand = `--manifest-path ${config.manifestPath} --package ${config.cargoPackage} --package-json-path ${packageJsonPath}`;
-  const cargoInputs = napiInputs(projectRoot, repoRooted);
+  const cargoInputs = napiInputs(projectRoot, repoRooted, ['@napi-rs/cli']);
   const cargoCwd = repoRooted ? '.' : projectRoot;
   // A repository-root Cargo invocation runs outside the owning npm package, so
   // Nx's root-only PATH cannot resolve that package's napi CLI.
   const napiCommand = repoRooted ? posix.join(projectRoot, 'node_modules/.bin/napi') : 'napi';
   const outputPath = (projectOutput: string) => (repoRooted ? posix.join(projectRoot, projectOutput) : projectOutput);
-  const hostPlatformTargetName =
-    hostPlatform === null ? null : `napi-${hostPlatform.architecture}-${hostPlatform.targetFamily}`;
-  let nativeHostTargetName: string | null = null;
-  if (hostPlatformTargetName !== null) {
-    for (const triple of config.targets) {
-      const convention = NAPI_TARGET_CONVENTIONS[triple];
-      const targetName = convention ? `napi-${convention.architecture}-${convention.targetFamily}` : null;
-      if (targetName === hostPlatformTargetName && convention && !usesNapiCross(convention, hostPlatform)) {
-        nativeHostTargetName = targetName;
-        break;
-      }
-    }
-  }
+  const hasHostPlatformTarget = config.targets.some((triple) => {
+    const convention = NAPI_TARGET_CONVENTIONS[triple];
+    return convention !== undefined && sameNapiPlatform(convention, hostPlatform);
+  });
   const targets: Record<string, TargetConfiguration> = {};
-  const hostCompilerEnv = napiCompilerEnv(hostPlatform, hostPlatform);
 
   // The addon the test suite loads. A plain dev build shares target/debug with
   // cargo-test's dependency graph, so after the tests compile this is nearly
@@ -2281,11 +2251,10 @@ function createNapiTargets(
     options: {
       cwd: cargoCwd,
       command: `${napiCommand} build --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('.cache/native-debug')}`,
-      ...(hostCompilerEnv ? { env: hostCompilerEnv } : {}),
     },
   };
 
-  if (nativeHostTargetName === null) {
+  if (!hasHostPlatformTarget) {
     // The platform target for this host triple is the same compilation, so a
     // second cargo-napi invocation only buys a duplicate dependency graph
     // (a plain build and a `--target` build write different target/
@@ -2303,29 +2272,8 @@ function createNapiTargets(
       options: {
         cwd: cargoCwd,
         command: hostBuild('dev'),
-        ...(hostCompilerEnv ? { env: hostCompilerEnv } : {}),
       },
       configurations: { [RELEASE_CONFIGURATION]: { command: hostBuild('release') } },
-    };
-  }
-
-  for (const triple of config.targets) {
-    const convention = NAPI_TARGET_CONVENTIONS[triple];
-    if (!convention || !usesNapiCross(convention, hostPlatform)) {
-      continue;
-    }
-    // One toolchain target per triple, shared by every cross build that needs
-    // it: the inferred napi-<arch>-linux plus any package-local cli-<arch>-linux.
-    // Nx runs a shared dependency once, which is what stops those builds from
-    // racing inside the Bun store. See the executor for the failure it removes.
-    // The name carries the platform suffix so a Linux platform target's
-    // dependency closure stays Linux-only (package-target-policy).
-    targets[napiToolchainTargetName(convention)] = {
-      executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
-      // Extraction lands in ~/.napi-rs, outside the workspace: a cache hit
-      // would skip work a cold home directory still needs.
-      cache: false,
-      options: { triple },
     };
   }
 
@@ -2336,24 +2284,38 @@ function createNapiTargets(
     }
     const targetName = `napi-${convention.architecture}-${convention.targetFamily}`;
     const outputDirectory = `dist/native/${convention.outputName}`;
-    const useNapiCross = usesNapiCross(convention, hostPlatform);
-    const crossFlag = useNapiCross ? ' --use-napi-cross' : '';
-    const compilerEnv = napiCompilerEnv(convention, hostPlatform);
+    if (convention.targetFamily === 'linux') {
+      // Every host builds a Linux addon the same way: devenv's zig through
+      // cargo-zigbuild, glibc pinned by the triple suffix. The napi CLI cannot
+      // carry that suffix (it looks for the artifact under
+      // target/<triple>.2.17/), so the executor names the `.node` itself.
+      targets[targetName] = {
+        executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
+        cache: true,
+        inputs: napiInputs(projectRoot, repoRooted, []),
+        outputs: [`{projectRoot}/${outputDirectory}`],
+        options: {
+          target: `${triple}.${LINUX_GLIBC_FLOOR}`,
+          manifestPath: posix.join(cargoCwd, config.manifestPath),
+          package: config.cargoPackage,
+          output: `{projectRoot}/${outputDirectory}/${config.binaryName}.${convention.outputName}.node`,
+        },
+        configurations: { [RELEASE_CONFIGURATION]: { release: true } },
+      };
+      continue;
+    }
+    // macOS addons need Apple's SDK, which zig does not carry: the napi CLI
+    // drives the host's own toolchain and writes the platform `.d.ts`.
     const platformBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple}${crossFlag} ${commonCommand} --output-dir ${outputPath(outputDirectory)}`;
+      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple} ${commonCommand} --output-dir ${outputPath(outputDirectory)}`;
     targets[targetName] = {
       executor: 'nx:run-commands',
       cache: true,
-      ...(useNapiCross ? { dependsOn: [napiToolchainTargetName(convention)] } : {}),
       inputs: cargoInputs,
       outputs: [`{projectRoot}/${outputDirectory}`],
       options: {
         cwd: cargoCwd,
         command: platformBuild('dev'),
-        // Genuine Linux cross-compiles use Clang plus napi-rs's downloaded
-        // GNU sysroot. A native Linux target uses Nix's cc wrapper so C build
-        // scripts resolve the host libc headers instead.
-        ...(compilerEnv ? { env: compilerEnv } : {}),
       },
       configurations: { [RELEASE_CONFIGURATION]: { command: platformBuild('release') } },
     };

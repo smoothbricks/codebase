@@ -757,17 +757,21 @@ Concrete targets come from concrete files:
   one has finished. Explicit target declarations are not platform-conditional: dependency-only target nodes and their
   ordering edges remain off macOS even though no executable group runner is inferred. The ordinary `test` and
   `cargo-test` aggregates must still reach neither group.
-- Canonical `napi` package metadata provides a host `cargo-napi` target and named release targets for each configured
-  triple. Linux `--use-napi-cross` targets compile C/C++ dependencies with Clang; the NAPI CLI supplies its downloaded
-  GNU sysroot and toolchain flags. This avoids the bundled GCC's unsupported diagnostics-color flag without disabling
-  the workspace's sccache wrapper.
-- Each `--use-napi-cross` triple also gets a `napi-toolchain-<arch>-linux` prerequisite that extracts the pinned
-  `@napi-rs/cross-toolchain-<host>-target-<arch>` archive into `~/.napi-rs`, where the NAPI CLI probes for it. Every
-  cross build of that triple — the inferred `napi-<arch>-linux` and any package-local `cli-<arch>-linux` — depends on
-  it, so the CLI's own downloader never runs. That downloader `npm pack`s into its own package directory, which under
-  Bun's isolated global store is a shared (in CI host-wide) cache: two concurrent cross builds of one triple would
-  otherwise pack the same file into the same directory and one would die on the other's cleanup. The prerequisite
-  produces no artifact, so it stays out of the aggregate `build` and out of collected platform outputs.
+- Canonical `napi` package metadata provides a host `cargo-napi` target (only when no configured triple is the host's
+  own platform) and named release targets for each configured triple. macOS triples run `napi build` with the host's
+  toolchain, because a macOS addon needs Apple's SDK, which zig does not carry; the napi CLI also writes the platform
+  `.d.ts`.
+- Linux artifacts reference no build-host path. N-API addons link glibc 2.17 symbol versions and carry no RUNPATH;
+  binaries a package builds for Linux, such as a CLI, build the same way. Both are built by devenv's zig through
+  cargo-zigbuild, with the same command on every host. Each Linux triple's `napi-<arch>-linux` target runs the
+  `@smoothbricks/nx-plugin:cargo-zigbuild` executor with `--target <triple>.2.17`, and the executor copies the cdylib to
+  `dist/native/linux-<arch>-gnu/<binaryName>.linux-<arch>-gnu.node` itself: the napi CLI cannot carry the glibc suffix,
+  since it looks for the artifact under `target/<triple>.2.17/`. A package-local `cli-<arch>-linux` uses the same
+  executor with `bin` set; a static CLI targets `<arch>-unknown-linux-musl`. The executor runs `cargo-zigbuild`
+  directly, removes any compiler or linker the shell names for its triple (a Linux shell pins its host compiler for
+  `x86_64-unknown-linux-gnu`), and reads the artifact path from cargo's JSON messages. zig and cargo-zigbuild come from
+  the managed devenv module: a Linux shell carries them, a macOS shell only inside the `linux-cross` profile
+  (`tooling/devenv -P linux-cross shell -- …`).
 - `build` is inferred only when the project has at least one concrete build target to run, such as inferred `tsc-js`, a
   package-local target like `tsdown-js`, or `cargo-wasm` from this plugin. It depends on output-family wildcard targets:
   `*-js`, `*-web`, `*-html`, `*-css`, `*-ios`, `*-android`, `*-native`, `*-napi`, `*-bun`, and `*-wasm`.

@@ -268,11 +268,8 @@
         }
       },
       "cli-arm64-linux": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:cargo-zigbuild",
         "cache": true,
-        "dependsOn": [
-          "napi-toolchain-arm64-linux"
-        ],
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/skills/cowshed/SKILL.md",
@@ -288,27 +285,24 @@
           "cargoToolchain"
         ],
         "outputs": [
-          "{projectRoot}/dist/bin/linux-arm64-gnu"
+          "{projectRoot}/dist/bin/linux-arm64"
         ],
         "options": {
-          "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu",
-          "env": {
-            "CFLAGS_aarch64_unknown_linux_gnu": "-D__ARM_ARCH=8"
-          }
+          "target": "aarch64-unknown-linux-musl",
+          "manifestPath": "{projectRoot}/crates/cowshed-cli/Cargo.toml",
+          "package": "cowshed-cli",
+          "bin": "cowshed",
+          "output": "{projectRoot}/dist/bin/linux-arm64/cowshed"
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target aarch64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-arm64-gnu"
+            "release": true
           }
         }
       },
       "cli-x64-linux": {
-        "executor": "nx:run-commands",
+        "executor": "@smoothbricks/nx-plugin:cargo-zigbuild",
         "cache": true,
-        "dependsOn": [
-          "napi-toolchain-x64-linux"
-        ],
         "inputs": [
           "{projectRoot}/**/*.rs",
           "{projectRoot}/skills/cowshed/SKILL.md",
@@ -324,21 +318,18 @@
           "cargoToolchain"
         ],
         "outputs": [
-          "{projectRoot}/dist/bin/linux-x64-gnu"
+          "{projectRoot}/dist/bin/linux-x64"
         ],
         "options": {
-          "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu",
-          "env": {
-            "AR_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-ar",
-            "CC_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-gcc",
-            "CXX_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-g++",
-            "RANLIB_x86_64_unknown_linux_gnu": "x86_64-unknown-linux-gnu-ranlib"
-          }
+          "target": "x86_64-unknown-linux-musl",
+          "manifestPath": "{projectRoot}/crates/cowshed-cli/Cargo.toml",
+          "package": "cowshed-cli",
+          "bin": "cowshed",
+          "output": "{projectRoot}/dist/bin/linux-x64/cowshed"
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/linux-x64-gnu"
+            "release": true
           }
         }
       },
@@ -628,11 +619,6 @@
     "@smoothbricks/validation": "workspace:*",
     "@types/node": "^26.6.5",
     "typescript": "^6.0.3"
-  },
-  "optionalDependencies": {
-    "@napi-rs/cross-toolchain-arm64-target-aarch64": "1.0.3",
-    "@napi-rs/cross-toolchain-x64-target-aarch64": "1.0.3",
-    "@napi-rs/cross-toolchain-x64-target-x86_64": "1.0.3"
   },
   "description": "Warm git workspaces: instant isolated copy-on-write workspaces with layered sandboxing (CLI, Rust API, NAPI bindings)",
   "license": "MIT",

@@ -1918,79 +1918,47 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       // nothing from it, and a platform target's dependency closure may only reach
       // its own family (`validatePlatformTargetDependencies`).
       expect(targets['napi-arm64-macos']?.dependsOn).toBeUndefined();
-      // A macOS triple never gets a cross toolchain: `usesNapiCross` is
-      // `family === 'linux' && target !== host`, so the family decides this one
-      // and no host can change it.
-      expect(targets['napi-toolchain-x64-macos']).toBeUndefined();
-      // Everything else about the cross regime depends on WHICH host is
-      // inferring — on an x64 Linux runner `napi-x64-linux` is the native build,
-      // with no `--use-napi-cross` and no toolchain prerequisite at all. Those
-      // facts are asserted against forced platforms below instead of against
-      // whichever machine happens to run the suite.
-
-      // Exercise both host branches explicitly: this suite usually runs on
-      // Darwin, but Linux's native compiler selection is the contract at risk.
+      // Every host infers the SAME Linux addon target: devenv's zig through the
+      // cargo-zigbuild executor, glibc pinned by the triple suffix. There is no
+      // native-versus-cross branch to diverge on, so forcing a Linux host and a
+      // macOS host must yield byte-identical Linux targets, and neither may
+      // carry a compiler environment or a toolchain prerequisite.
       const linuxX64Targets = await inferProjectTargets(
         workspace,
         'packages/cowshed/package.json',
         createNodesV2ForPlatform('linux', 'x64'),
       );
-      expect(linuxX64Targets['napi-x64-linux']?.options?.command).not.toContain('--use-napi-cross');
-      expect(linuxX64Targets['napi-x64-linux']?.options?.env).toEqual({ CC: 'cc', CXX: 'c++' });
-      expect(linuxX64Targets['napi-x64-linux']?.dependsOn).toBeUndefined();
-      expect(linuxX64Targets['napi-toolchain-x64-linux']).toBeUndefined();
-      expect(linuxX64Targets['napi-arm64-linux']?.options?.command).toContain('--use-napi-cross');
-      expect(linuxX64Targets['napi-arm64-linux']?.options?.env).toEqual({
-        TARGET_CC: 'clang',
-        TARGET_CXX: 'clang++',
-      });
-      expect(linuxX64Targets['napi-debug']?.options?.env).toEqual({ CC: 'cc', CXX: 'c++' });
-
       const darwinArm64Targets = await inferProjectTargets(
         workspace,
         'packages/cowshed/package.json',
         createNodesV2ForPlatform('darwin', 'arm64'),
       );
-      expect(darwinArm64Targets['napi-x64-linux']?.options?.command).toContain('--use-napi-cross');
-      expect(darwinArm64Targets['napi-x64-linux']?.options?.env).toEqual({
-        TARGET_CC: 'clang',
-        TARGET_CXX: 'clang++',
+      expect(darwinArm64Targets['napi-x64-linux']).toMatchObject({
+        executor: '@smoothbricks/nx-plugin:cargo-zigbuild',
+        cache: true,
+        outputs: ['{projectRoot}/dist/native/linux-x64-gnu'],
+        options: {
+          target: 'x86_64-unknown-linux-gnu.2.17',
+          manifestPath: 'packages/cowshed/crates/cowshed-napi/Cargo.toml',
+          package: 'cowshed-napi',
+          output: '{projectRoot}/dist/native/linux-x64-gnu/cowshed.linux-x64-gnu.node',
+        },
+        configurations: { [RELEASE_CONFIGURATION]: { release: true } },
       });
-      expect(darwinArm64Targets['napi-x64-linux']?.dependsOn).toEqual(['napi-toolchain-x64-linux']);
-      expect(darwinArm64Targets['napi-debug']?.options?.env).toBeUndefined();
-      expect(darwinArm64Targets['napi-toolchain-arm64-linux']).toEqual({
-        executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
-        cache: false,
-        options: { triple: 'aarch64-unknown-linux-gnu' },
+      expect(darwinArm64Targets['napi-arm64-linux']?.options).toMatchObject({
+        target: 'aarch64-unknown-linux-gnu.2.17',
+        output: '{projectRoot}/dist/native/linux-arm64-gnu/cowshed.linux-arm64-gnu.node',
       });
-      expect(darwinArm64Targets['napi-toolchain-x64-linux']).toEqual({
-        executor: '@smoothbricks/nx-plugin:napi-cross-toolchain',
-        cache: false,
-        options: { triple: 'x86_64-unknown-linux-gnu' },
-      });
-      expect(darwinArm64Targets['napi-arm64-linux']?.dependsOn).toEqual(['napi-toolchain-arm64-linux']);
-      expect(darwinArm64Targets['napi-x64-linux']?.outputs).toEqual(['{projectRoot}/dist/native/linux-x64-gnu']);
-      expect(darwinArm64Targets['napi-x64-linux']?.options?.command).toBe(
-        'napi build --platform --no-js --dts cowshed.linux-x64-gnu.d.ts --target x86_64-unknown-linux-gnu --use-napi-cross --manifest-path crates/cowshed-napi/Cargo.toml --package cowshed-napi --package-json-path package.json --output-dir dist/native/linux-x64-gnu',
-      );
-      expect(darwinArm64Targets['napi-x64-linux']?.configurations?.[RELEASE_CONFIGURATION]?.command).toContain(
-        'napi build --release --platform',
-      );
-
-      // The whole rule, stated once per forced host: a triple gets a cross
-      // toolchain exactly when it is a linux triple that is not this host's own.
-      // Asserting the pair by name is what broke on Linux, where
-      // napi-toolchain-x64-linux legitimately does not exist.
-      for (const [inferred, hostTriple] of [
-        [linuxX64Targets, 'x64-linux'],
-        [darwinArm64Targets, 'arm64-macos'],
-      ] as const) {
-        for (const suffix of ['arm64-linux', 'x64-linux', 'arm64-macos', 'x64-macos']) {
-          const expectsToolchain = suffix.endsWith('-linux') && suffix !== hostTriple;
-          expect(inferred[`napi-toolchain-${suffix}`] === undefined).toBe(!expectsToolchain);
-          expect(inferred[`napi-${suffix}`]?.options?.command).toContain(
-            expectsToolchain ? '--use-napi-cross' : '--target',
-          );
+      for (const suffix of ['arm64-linux', 'x64-linux']) {
+        expect(linuxX64Targets[`napi-${suffix}`]).toEqual(darwinArm64Targets[`napi-${suffix}`]);
+        expect(darwinArm64Targets[`napi-${suffix}`]?.dependsOn).toBeUndefined();
+      }
+      for (const inferred of [linuxX64Targets, darwinArm64Targets]) {
+        expect(Object.keys(inferred).filter((name) => name.startsWith('napi-toolchain-'))).toEqual([]);
+        expect(inferred['napi-debug']?.options?.env).toBeUndefined();
+        for (const suffix of ['arm64-macos', 'x64-macos']) {
+          expect(inferred[`napi-${suffix}`]?.options?.command).toContain('napi build');
+          expect(inferred[`napi-${suffix}`]?.options?.env).toBeUndefined();
         }
       }
       // The aggregate build pulls in exactly the inferring host's

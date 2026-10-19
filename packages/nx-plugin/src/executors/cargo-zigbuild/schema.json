@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/schema",
+  "version": 2,
+  "title": "Cargo Zigbuild Executor",
+  "description": "Build one Linux binary or cdylib with devenv's zig through `cargo-zigbuild` and copy it to its output file.",
+  "type": "object",
+  "properties": {
+    "target": {
+      "type": "string",
+      "description": "Rust target triple, with cargo-zigbuild's glibc suffix where it pins one, e.g. x86_64-unknown-linux-gnu.2.17 or x86_64-unknown-linux-musl."
+    },
+    "manifestPath": {
+      "type": "string",
+      "description": "The crate's Cargo.toml, relative to the workspace root."
+    },
+    "package": {
+      "type": "string",
+      "description": "Cargo package to build."
+    },
+    "bin": {
+      "type": "string",
+      "description": "Build this binary and copy its executable. Absent, build the package's cdylib."
+    },
+    "output": {
+      "type": "string",
+      "description": "Destination file for the artifact, relative to the workspace root."
+    },
+    "release": {
+      "type": "boolean",
+      "description": "Compile cargo's release profile instead of dev."
+    }
+  },
+  "required": ["target", "manifestPath", "package", "output"],
+  "additionalProperties": false
+}

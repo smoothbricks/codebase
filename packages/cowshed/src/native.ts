@@ -12,7 +12,7 @@ import type {
   NativeWorkspaceHandleOperations,
   NativeWorkspaceRefOperations,
 } from './native.generated.js';
-import { platformDirectory } from './platform.js';
+import { addonDirectory } from './platform.js';
 import type { CoordinatorEndpoint } from './types.js';
 
 // Every controller operation's method is declared in `native.generated.ts`, from the operation
@@ -112,7 +112,7 @@ interface NativeBinary {
 }
 
 function nativeBinary(): NativeBinary {
-  const directory = platformDirectory(process.platform, process.arch);
+  const directory = addonDirectory(process.platform, process.arch);
   if (directory === null) {
     throw new Error(`Unsupported Cowshed native target: ${process.platform}-${process.arch}`);
   }
