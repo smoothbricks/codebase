@@ -485,6 +485,8 @@ describe('the parent-held CPU pool', () => {
       '{"op":"other","want":1}',
       '{"op":"cpu-pool","want":0}',
       '{"op":"cpu-pool","want":1.5}',
+      // A grant never grows, so `grow` is a field like any other this pool does not read.
+      '{"op":"cpu-pool","want":1,"grow":true}',
       'x'.repeat(5000),
       'x'.repeat(1024 * 1024),
     ];

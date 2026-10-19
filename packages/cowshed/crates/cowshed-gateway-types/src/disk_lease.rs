@@ -109,8 +109,6 @@ pub enum LeaseState {
     Queued,
     /// The client may run its command now, and holds the lease until it closes the connection.
     Granted,
-    /// A growing CPU grant now holds the answer's `tokens` in all, more than it was granted.
-    Grown,
 }
 
 /// One answer line, as a client reads it. Fields the client has no use for are ignored, so the

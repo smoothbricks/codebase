@@ -69,11 +69,6 @@ interface CpuPoolRequest {
   want: number & typia.tags.Type<'uint32'> & typia.tags.Minimum<1>;
   /** Ask the owning pool to serve this allocation as its own child pool, with a jobserver fifo of its own. */
   children?: boolean;
-  /**
-   * A compile-only build's ask to grow. A gateway pool grows such a grant; this pool lends a fixed count, so it accepts
-   * the field and never grows a child (specs/cowshed/05_gateway.md, "A short build grows").
-   */
-  grow?: boolean;
 }
 
 /**
@@ -91,7 +86,8 @@ type CpuPoolReply =
   | { ok: true; wait: 'held' }
   | { ok: false; code: 'invalid-request'; error: string };
 
-const parseRequest = typia.json.createIsParse<CpuPoolRequest | HostWaitRequest>();
+/** Exactly a request's fields, as the gateway's own pools read them: any other field is an invalid request. */
+const isRequest = typia.createEquals<CpuPoolRequest | HostWaitRequest>();
 const stringifyReply = typia.json.createStringify<CpuPoolReply>();
 
 /** A request over this many bytes is refused as `invalid-request` (specs/cowshed/05_gateway.md, "Wire"). */
@@ -569,21 +565,21 @@ export async function createCpuPool(
       }
       const line = buffered.subarray(0, newline).toString('utf8');
       buffered = EMPTY;
-      let request: CpuPoolRequest | HostWaitRequest | null;
+      let parsed: unknown;
       try {
-        request = parseRequest(line);
+        parsed = JSON.parse(line);
       } catch (error) {
-        // isParse returns null for a wrong shape, but JSON syntax errors still throw.
         if (!(error instanceof SyntaxError)) throw error;
-        request = null;
+        parsed = undefined;
       }
-      if (request === null) {
+      if (!isRequest(parsed)) {
         refuse(
           child,
           'a request is {"op":"cpu-pool","want":<a whole number of tokens, at least 1>} or {"op":"host-wait"}',
         );
         return;
       }
+      const request = parsed;
       if (request.op === 'host-wait') {
         // Counted from here until the connection closes, which `close` reports however it ends.
         child.phase = { kind: 'waiting' };

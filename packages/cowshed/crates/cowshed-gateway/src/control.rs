@@ -490,9 +490,6 @@ struct JobserverIn {
     #[serde(default)]
     pool: bool,
     job: Option<JobserverJobIn>,
-    /// A Cargo build whose fifo may be given more tokens after it starts, up to `want`.
-    #[serde(default)]
-    grow: bool,
     /// The requester's live CPU pool, which the job waits on beside the host ledger: the first
     /// grant serves it.
     parent_pool: Option<String>,
@@ -501,7 +498,6 @@ struct JobserverIn {
 struct JobserverOptions {
     admission: crate::jobserver::JobserverAdmission,
     pool_job: Option<JobserverJobIn>,
-    grow: bool,
     parent_pool: Option<PathBuf>,
 }
 
@@ -1028,19 +1024,9 @@ async fn serve<R, W>(
             let checkout: Arc<str> = Arc::from(checkout);
             let claim = Claim::new(&command, pid);
             let rank = options.admission.rank();
-            let admission = if options.grow {
-                let (stake, granted, growth) =
-                    services
-                        .cpu_budget
-                        .ask_growing(Arc::clone(&checkout), want, claim, rank);
-                (stake, granted, Some(growth))
-            } else {
-                let (stake, granted) =
-                    services
-                        .cpu_budget
-                        .ask(Arc::clone(&checkout), want, claim, rank);
-                (stake, granted, None)
-            };
+            let admission = services
+                .cpu_budget
+                .ask(Arc::clone(&checkout), want, claim, rank);
             hold_jobserver(
                 reader,
                 writer,
@@ -1193,10 +1179,9 @@ async fn hold_jobserver<R, W>(
     mut reader: R,
     mut writer: W,
     want: NonZeroUsize,
-    (stake, granted, mut growth): (
+    (stake, granted): (
         crate::cpu_budget::Stake,
         tokio::sync::oneshot::Receiver<usize>,
-        Option<tokio::sync::mpsc::UnboundedReceiver<usize>>,
     ),
     parent: Option<(PathBuf, cowshed_os::fork_lock::Fenced<UnixStream>)>,
     fifos: crate::jobserver::JobserverFifos,
@@ -1341,40 +1326,14 @@ async fn hold_jobserver<R, W>(
         };
         (source, job)
     });
-    let Some(mut served) = answer_grant(&mut writer, &fifos, tokens, source).await else {
+    let Some(served) = answer_grant(&mut writer, &fifos, tokens, source).await else {
         return;
     };
-    // Hold until the client closes. A growing grant writes each token it is given into the
-    // fifo, where the running Cargo's jobserver takes it, and tells the client its new total.
-    let mut held = tokens;
-    loop {
-        let grown = async {
-            match growth.as_mut() {
-                Some(growth) => growth.recv().await,
-                None => std::future::pending().await,
-            }
-        };
-        tokio::select! {
-            read = reader.read(&mut discard) => if !matches!(read, Ok(read) if read > 0) { break },
-            grown = grown => match grown {
-                Some(to) => match served.fill(to - held) {
-                    Ok(()) => {
-                        held = to;
-                        let answer = ControlResponse { tokens: Some(to), ..lease(LeaseState::Grown) };
-                        if write_response(&mut writer, &answer).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => eprintln!(
-                        "cowshed: cannot hand {} grown token(s) to jobserver fifo {}: {error}; they stay held until the build ends",
-                        to - held,
-                        served.fifo().display()
-                    ),
-                },
-                None => growth = None,
-            },
-        }
-    }
+    // Hold until the client closes. The fifo keeps the grant's `g − 1` bytes for the grant's
+    // whole life: nothing writes more.
+    while let Ok(read) = reader.read(&mut discard).await
+        && read > 0
+    {}
     served.close().await;
     drop(stake);
 }
@@ -1392,14 +1351,6 @@ impl Served {
         match self {
             Self::Pool(pool) => pool.fifo().expect("a token-holding pool has a fifo"),
             Self::Fifo(fifo) => fifo.path(),
-        }
-    }
-
-    /// Hand `tokens` more to the running client: what a growing grant was given.
-    fn fill(&mut self, tokens: usize) -> std::io::Result<()> {
-        match self {
-            Self::Pool(pool) => pool.fill(tokens),
-            Self::Fifo(fifo) => fifo.fill(tokens),
         }
     }
 
@@ -1569,8 +1520,7 @@ async fn hold_parent_grant<R, W>(
     loop {
         tokio::select! {
             read = reader.read(&mut discard) => if !matches!(read, Ok(read) if read > 0) { break },
-            // A pool says nothing after a grant it was not asked to grow: any byte or end is the
-            // end of its grant.
+            // A pool says nothing after its grant: any byte or end is the end of that grant.
             _ = parent.read(&mut parent_byte), if parent_open => {
                 parent_open = false;
                 eprintln!(
@@ -1734,7 +1684,6 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             "class",
             "pool",
             "job",
-            "grow",
             "parentPool",
         ],
         RESIDENT_POOL_OP => &["op", "checkout", "command", "job"],
@@ -1783,24 +1732,16 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 class,
                 pool,
                 job,
-                grow,
                 parent_pool,
             } = serde_json::from_value(value).map_err(encoding)?;
-            if grow && pool {
-                return Err(ControlError::Encoding(
-                    "a growing jobserver grant serves no CPU pool: a pool lends a fixed count"
-                        .to_owned(),
-                ));
-            }
             if let Some(parent) = &parent_pool
-                && (grow
-                    || !Path::new(parent).is_absolute()
+                && (!Path::new(parent).is_absolute()
                     || parent.len() > MAX_CHECKOUT
                     || parent.contains('\0'))
             {
                 return Err(ControlError::Encoding(format!(
                     "a parentPool is an absolute socket path of at most {MAX_CHECKOUT} bytes \
-                     without NUL, on a grant that does not grow"
+                     without NUL"
                 )));
             }
             let pool_job = if pool {
@@ -1818,7 +1759,6 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 JobserverOptions {
                     admission: class,
                     pool_job,
-                    grow,
                     parent_pool: parent_pool.map(PathBuf::from),
                 },
             )
@@ -1828,7 +1768,6 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 JobserverOptions {
                     admission: crate::jobserver::JobserverAdmission::Background,
                     pool_job: None,
-                    grow: false,
                     parent_pool: None,
                 },
             )

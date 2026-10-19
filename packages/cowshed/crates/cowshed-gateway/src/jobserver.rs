@@ -134,11 +134,6 @@ impl JobserverFifo {
         &self.path
     }
 
-    /// Hand `tokens` more token bytes to the running client: what a growing grant was given.
-    pub(crate) fn fill(&mut self, tokens: usize) -> io::Result<()> {
-        self.file.write_all(&vec![TOKEN_BYTE; tokens])
-    }
-
     /// Drain the token bytes left in the fifo and unlink it. A cargo that
     /// outlives its holder keeps its own descriptor and runs over budget
     /// until it finishes; what it still holds is not the gateway's to reclaim.
@@ -292,17 +287,6 @@ impl CpuPool {
         self.fifo.as_ref().map(JobserverFifo::path)
     }
 
-    /// Put `tokens` more in the pool's fifo: what its growing grant was given.
-    pub(crate) fn fill(&mut self, tokens: usize) -> io::Result<()> {
-        match self.fifo.as_mut() {
-            Some(fifo) => fifo.fill(tokens),
-            None => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "a pool without a fifo holds no tokens to grow",
-            )),
-        }
-    }
-
     pub(crate) async fn close(mut self) -> io::Result<()> {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -351,9 +335,9 @@ fn opaque_name() -> String {
 /// A lent pool's free tokens: the bytes in its make jobserver fifo, which Cargo reads directly,
 /// and the holder's own implicit token while no child holds it. A child asking the pool's socket
 /// takes from the same count, in the order children ask: the head takes `min(want, free)` once
-/// one token is free, as one whole grant that never grows. Lending the implicit token is what
-/// lets a one-token pool admit the nested job its command waits on, instead of deadlocking on an
-/// empty fifo (05_gateway.md "Cargo reads its holder's jobserver").
+/// one token is free, as one whole grant. Lending the implicit token is what lets a one-token pool
+/// admit the nested job its command waits on, instead of deadlocking on an empty fifo
+/// (05_gateway.md "Cargo reads its holder's jobserver").
 #[derive(Clone)]
 struct FifoTokens {
     messages: tokio::sync::mpsc::UnboundedSender<FifoMessage>,
@@ -525,11 +509,6 @@ enum PoolRequest {
         want: std::num::NonZeroUsize,
         #[serde(default)]
         children: bool,
-        /// The child can use tokens handed to it after it starts: a host-ledger pool tells it
-        /// each new total, up to `want`, and puts each new token in its child pool's fifo. A lent
-        /// pool lends a fixed count and never grows.
-        #[serde(default)]
-        grow: bool,
     },
 }
 
@@ -547,11 +526,6 @@ enum PoolGrant<'a> {
         /// The child pool's make jobserver fifo, for the child's own command.
         #[serde(skip_serializing_if = "Option::is_none")]
         fifo: Option<&'a Path>,
-    },
-    /// A growing child now holds `tokens` in all.
-    Grown {
-        ok: bool,
-        tokens: usize,
     },
 }
 
@@ -571,7 +545,6 @@ enum Admission {
     Host {
         stake: crate::cpu_budget::Stake,
         granted: tokio::sync::oneshot::Receiver<usize>,
-        growth: Option<tokio::sync::mpsc::UnboundedReceiver<usize>>,
     },
 }
 
@@ -582,31 +555,17 @@ enum Held {
 }
 
 impl Admission {
-    /// The grant, its count, and where a growing one hears its new totals; `Err` when the
-    /// ledger that would grant it is gone.
-    async fn granted(
-        self,
-    ) -> Result<
-        (
-            Held,
-            usize,
-            Option<tokio::sync::mpsc::UnboundedReceiver<usize>>,
-        ),
-        (),
-    > {
+    /// The grant and its count; `Err` when the ledger that would grant it is gone.
+    async fn granted(self) -> Result<(Held, usize), ()> {
         match self {
             Self::Fifo(granted) => {
                 let grant = granted.await.map_err(|_| ())?;
                 let tokens = grant.tokens();
-                Ok((Held::Fifo { _grant: grant }, tokens, None))
+                Ok((Held::Fifo { _grant: grant }, tokens))
             }
-            Self::Host {
-                stake,
-                granted,
-                growth,
-            } => {
+            Self::Host { stake, granted } => {
                 let tokens = granted.await.map_err(|_| ())?;
-                Ok((Held::Host { _stake: stake }, tokens, growth))
+                Ok((Held::Host { _stake: stake }, tokens))
             }
         }
     }
@@ -638,11 +597,7 @@ async fn serve_pool(
             return;
         }
     };
-    let PoolRequest::Take {
-        want,
-        children,
-        grow,
-    } = match parsed {
+    let PoolRequest::Take { want, children } = match parsed {
         Ok(request) => request,
         Err(error) => {
             let _ = pool_reply(
@@ -661,21 +616,8 @@ async fn serve_pool(
             rank,
         } => {
             let claim = crate::disk_lease::Claim::new("child CPU pool", pid);
-            if grow {
-                let (stake, granted, growth) = budget.ask_growing(checkout, want, claim, rank);
-                Admission::Host {
-                    stake,
-                    granted,
-                    growth: Some(growth),
-                }
-            } else {
-                let (stake, granted) = budget.ask(checkout, want, claim, rank);
-                Admission::Host {
-                    stake,
-                    granted,
-                    growth: None,
-                }
-            }
+            let (stake, granted) = budget.ask(checkout, want, claim, rank);
+            Admission::Host { stake, granted }
         }
     };
     if pool_reply(reader.get_mut(), &PoolGrant::Queued { ok: true })
@@ -685,7 +627,7 @@ async fn serve_pool(
         return;
     }
     let mut byte = [0_u8; 1];
-    let (held, tokens, mut growth) = tokio::select! {
+    let (held, tokens) = tokio::select! {
         granted = admission.granted() => match granted {
             Ok(granted) => granted,
             Err(()) => {
@@ -695,7 +637,7 @@ async fn serve_pool(
         },
         _ = reader.read(&mut byte) => return,
     };
-    let mut pool = if children {
+    let pool = if children {
         let tokens = std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero");
         match CpuPool::start(directory, PoolSource::Lent(tokens)) {
             Ok(pool) => Some(pool),
@@ -723,35 +665,7 @@ async fn serve_pool(
     }
     // End of stream or post-request bytes end the local allocation; a child never releases the
     // parent's upstream grant and never takes a second host allocation while it is borrowed.
-    // Until then a growing child hears each new total its allocation reaches, and its child
-    // pool's fifo holds each new token.
-    let mut total = tokens;
-    loop {
-        let grown = async {
-            match growth.as_mut() {
-                Some(growth) => growth.recv().await,
-                None => std::future::pending().await,
-            }
-        };
-        tokio::select! {
-            _ = reader.read(&mut byte) => break,
-            grown = grown => match grown {
-                Some(to) => {
-                    if let Some(pool) = pool.as_mut()
-                        && let Err(error) = pool.fill(to - total)
-                    {
-                        eprintln!("cowshed: cannot hand {} grown token(s) to child CPU pool {}: {error}; they stay held until the child ends", to - total, pool.path().display());
-                    }
-                    total = to;
-                    if pool_reply(reader.get_mut(), &PoolGrant::Grown { ok: true, tokens: to }).await.is_err() {
-                        break;
-                    }
-                }
-                // The budget is gone: nothing more will grow, and the allocation stands.
-                None => growth = None,
-            },
-        }
-    }
+    let _ = reader.read(&mut byte).await;
     if let Some(pool) = pool
         && let Err(error) = pool.close().await
     {

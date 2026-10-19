@@ -561,8 +561,8 @@ export type CpuGateWaiter = {
 /**
  * One granted lease, as the ledger knows it: the client that holds it, what it said the tokens
  * are for, and since when. A lease is one connection, granted once; its age is the grant's, not
- * its process's, and a growth does not renew it. The ledger never scans processes: `pid` is the
- * socket's peer, and `ps -p <pid>` tells the rest.
+ * its process's. The ledger never scans processes: `pid` is the socket's peer, and `ps -p <pid>`
+ * tells the rest.
  */
 export type CpuHolder = {
   /**
@@ -574,7 +574,7 @@ export type CpuHolder = {
    */
   readonly command: string;
   /**
-   * The tokens it holds now, growth included.
+   * The tokens it was granted.
    */
   readonly tokens: number & tags.Type<'uint64'>;
   /**

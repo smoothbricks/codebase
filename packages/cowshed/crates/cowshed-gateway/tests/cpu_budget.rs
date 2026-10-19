@@ -4,7 +4,7 @@
 
 use std::io::{BufRead as _, BufReader as StdBufReader, Write as _};
 use std::num::NonZeroUsize;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -213,21 +213,6 @@ impl Asker {
         let answer = self.answer().await;
         assert_eq!(answer["lease"], "granted", "{answer}");
         answer["tokens"].as_u64().expect("a grant names its tokens")
-    }
-
-    /// Absence check: whether a growth arrives within `within`; load only makes `None` pass
-    /// vacuously.
-    async fn grown_within(&mut self, within: Duration) -> Option<u64> {
-        let answer = tokio::time::timeout(within, self.answer()).await.ok()?;
-        assert_eq!(answer["lease"], "grown", "{answer}");
-        Some(answer["tokens"].as_u64().expect("a growth names its total"))
-    }
-
-    /// The new total of the next growth, waiting for it.
-    async fn grown(&mut self) -> u64 {
-        let answer = self.answer().await;
-        assert_eq!(answer["lease"], "grown", "{answer}");
-        answer["tokens"].as_u64().expect("a growth names its total")
     }
 }
 
@@ -692,6 +677,32 @@ async fn jobserver_class_is_validated_and_a_wait_bound_is_an_unknown_field() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A grant never grows (05_gateway.md "All at once"): `grow` is an unknown field on a root
+/// `jobserver` request and on a child's `cpu-pool` ask alike, refused before anything is queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_jobserver_or_cpu_pool_request_naming_grow_is_an_invalid_request() {
+    let (gateway, root, socket) = gateway(4).await;
+    let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
+    for (target, request) in [
+        (
+            &socket,
+            serde_json::json!({ "op": "jobserver", "want": 3, "checkout": "/w/build",
+                "command": "cargo build", "grow": true }),
+        ),
+        (
+            &pool,
+            serde_json::json!({ "op": "cpu-pool", "want": 3, "grow": true }),
+        ),
+    ] {
+        let refused = one_shot(target, &format!("{request}\n")).await;
+        assert_eq!(refused["code"], "invalid-request", "{refused}");
+    }
+    assert_eq!(ledger(&socket).await.held, 1);
+    drop(gate);
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// One answer line off a lease connection, byte by byte, so nothing past it is read out of a
 /// connection that is handed on afterwards.
 async fn answer_line(stream: &mut UnixStream) -> Value {
@@ -808,68 +819,6 @@ async fn a_resident_holds_no_token_and_each_request_it_runs_asks_the_host() {
         }
     }
     assert_eq!(ledger(&socket).await.held, 0);
-    gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_land_build_granted_one_token_grows_through_its_gate_jobs_pool_up_to_its_want() {
-    let (gateway, root, socket) = gateway(4).await;
-    let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
-    let mut a = Asker::ask(&socket, 2, "/w/a").await;
-    assert_eq!(a.granted().await, 2);
-    // A land's Cargo build asks the gate job's pool for 3 while background holds its half: it
-    // starts at once on the one token left.
-    let mut build = Asker::send(
-        &pool,
-        serde_json::json!({ "op": "cpu-pool", "want": 3, "grow": true }),
-    )
-    .await;
-    assert_eq!(build.granted().await, 1);
-    // Two return: the build grows by two to its want of three, and never past it.
-    drop(a);
-    assert_eq!(build.grown().await, 3);
-    assert_eq!(build.grown_within(Duration::from_millis(50)).await, None);
-    let status = ledger(&socket).await;
-    assert_eq!(status.held, 4, "{status:?}");
-    drop((gate, build));
-    gateway.drain().await.expect("drain");
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_root_cargo_build_that_grows_is_handed_its_tokens_through_its_fifo() {
-    let (gateway, root, socket) = gateway(8).await;
-    let mut holder = Asker::ask(&socket, 3, "/w/x").await;
-    assert_eq!(holder.granted().await, 3);
-    let mut build = Asker::send(
-        &socket,
-        serde_json::json!({ "op": "jobserver", "want": 4, "checkout": "/w/build",
-            "command": "cargo build", "grow": true }),
-    )
-    .await;
-    let granted = build.answer().await;
-    assert_eq!(
-        (granted["lease"].as_str(), granted["tokens"].as_u64()),
-        (Some("granted"), Some(1))
-    );
-    let fifo = PathBuf::from(
-        granted["fifo"]
-            .as_str()
-            .expect("a jobserver grant names its fifo"),
-    );
-    drop(holder);
-    assert_eq!(build.grown().await, 4);
-    // The fifo now holds every token beyond the implicit first: none at the grant, three grown.
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(&fifo)
-        .expect("open the grant's fifo");
-    let mut bytes = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut file, &mut bytes);
-    assert_eq!(bytes, b"+++");
-    drop(build);
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }
