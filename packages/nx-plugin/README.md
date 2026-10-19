@@ -604,6 +604,35 @@ reviewer, who decide whether the variants share one walk:
 A separate case stays only for a distinct boundary or edge: its setup or path diverges, or it needs a state the walk's
 earlier steps destroy. Each diagnostic names the file, both cases, the shared statement count and that remedy.
 
+## Test Clock Policy
+
+A test's duration is a property of its work, not of the host ("Bounded Test Targets"). Consuming repositories enforce
+this in their root Nx lint with the `smoo-nx-test-clocks` bin, which refuses four kinds of site in test code with
+`error[TEST-CLOCK-ORACLE]`:
+
+- **runner-deadline:** a deadline handed to the test runner: a number or `{ timeout }` after a `test`/`it`/`test.each`
+  body, or `setDefaultTimeout`. Delete it and put nothing in its place.
+- **test-deadline:** a Rust test's own deadline: `recv_timeout`, `park_timeout` or `timeout` bounded by a literal
+  `Duration` below the no-progress backstop, whose expiry fails the case (`.expect`, `.unwrap`). A quiet window
+  (`timeout(d, f).await.is_err()`) is not a deadline.
+- **clock-delta:** an assertion that elapsed host time stays under a bound, such as
+  `expect(Date.now() - started).toBeLessThan(5_000)` or `assert!(started.elapsed() < d)`. Lower bounds, ordering against
+  a product timestamp, epoch stamps, CPU time and injected clocks pass.
+- **clocked-bound:** a literal product bound below the backstop in a case whose stand-in a timer or sleep ends
+  (`{ command: 'node -e "setTimeout(() => {}, 5000)"', timeoutMs: 50 }`). The bound races the stand-in's clock. A bound
+  that is the case's subject, with the event that would beat it held off by construction (a child that never answers),
+  passes. So does one that cannot decide: `0` (disabled) or at `BOUNDED_TEST_IDLE_TIMEOUT_MS`.
+
+A Rust fn on paused tokio time (`tokio::time::pause()`, `start_paused = true`) runs on virtual time and is not examined.
+Like `smoo-nx-test-walks`, the bin judges only what changed since `upstreamBase`, the same base the lint target's
+runtime input already prints. A site in a case that overlaps a change is judged; the whole case is read, so an edit
+cannot keep an old site. A site outside any case is judged when its own line changed. The check stops new sites and
+removes none, so existing sites need no allowance table. It cannot see: a bound passed positionally or held outside the
+case; a stand-in in another file; a bound below the backstop beside untimed real work; a clock read through a helper;
+`if (…) throw` and `while` deadline guards; Rust socket-option deadlines; timer waits themselves.
+`findClockOracles(root, files, changes)` and `formatClockOracle` are exported from
+`@smoothbricks/nx-plugin/test-clock-policy`.
+
 ## Nx Target Naming
 
 Target names are `{tool}-{output}` names. Use names like `tsc-js`, `tsdown-js`, and `cargo-wasm`; `build` and `lint` are

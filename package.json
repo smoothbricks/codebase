@@ -122,6 +122,10 @@
           "{workspaceRoot}/**/nx-it/**/*",
           "{workspaceRoot}/packages/nx-plugin/src/test-walk-policy.ts",
           "{workspaceRoot}/packages/nx-plugin/src/bin/smoo-nx-test-walks.ts",
+          "{workspaceRoot}/packages/nx-plugin/src/test-clock-policy.ts",
+          "{workspaceRoot}/packages/nx-plugin/src/bounded-test-policy.ts",
+          "{workspaceRoot}/packages/nx-plugin/src/bin/smoo-nx-test-clocks.ts",
+          "{workspaceRoot}/packages/validation/src/bun/preload.ts",
           {
             "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun packages/nx-plugin/src/bin/smoo-nx-test-walks.ts --base"
           }
@@ -129,7 +133,8 @@
         "options": {
           "commands": [
             "biome check --files-ignore-unknown=true {projectRoot}",
-            "bun packages/nx-plugin/src/bin/smoo-nx-test-walks.ts"
+            "bun packages/nx-plugin/src/bin/smoo-nx-test-walks.ts",
+            "bun --preload ./packages/validation/src/bun/preload.ts packages/nx-plugin/src/bin/smoo-nx-test-clocks.ts"
           ]
         }
       },
