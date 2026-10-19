@@ -1,7 +1,7 @@
 use super::*;
 
 /// A real directory controller job and gateway join never read sibling session authority.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_workspace_jobs_ignore_corrupt_and_missing_sibling_grants() {
     use cowshed_core::metadata::{DetachedWorkspaceMetadata, sidecar_path};
     use cowshed_core::storage::StorageLayout;
@@ -101,7 +101,7 @@ async fn directory_workspace_jobs_ignore_corrupt_and_missing_sibling_grants() {
     fixture.stop_gateway().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_egress_revoke_does_not_reconcile_an_absent_gateway() {
     let fixture = Fixture::directory();
     let mut service = fixture.open().await;

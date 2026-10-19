@@ -416,7 +416,7 @@ async fn adopt(fixture: &Fixture, service: &mut ActorBridge) {
 
 /// Persist grants across restarts before installing the gateway, then race the published port
 /// and reconcile a changed grant revision on the same adopted main.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_dispatch_grant_persists_across_runtime_restart() {
     let mut fixture = Fixture::directory();
     // Main's blocks must be ones no parallel test's store is also handed. Every store allocates
@@ -665,7 +665,7 @@ fn highest_free_port_blocks<const N: usize>(fixture: &Fixture) -> [PortBlock; N]
         .unwrap_or_else(|free: Vec<PortBlock>| panic!("{N} free macOS port blocks, not {free:?}"))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_adopt_initializes_mains_spotlight_marker() {
     let fixture = Fixture::with(Project::Plain);
     let mut service = fixture.open().await;
@@ -681,7 +681,7 @@ async fn real_apfs_adopt_initializes_mains_spotlight_marker() {
 /// intent's block handed out — are a `port-block-collision` doctor names with both, and
 /// `doctor --repair` moves the newer one to a free block: its grants publish the new block and
 /// its served `.cowshed/env` exports it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_doctor_repair_moves_the_newer_of_two_workspaces_sharing_a_port_block() {
     let mut fixture = Fixture::with(Project::Plain);
     let mut service = fixture.open().await;
@@ -800,7 +800,7 @@ async fn real_apfs_doctor_repair_moves_the_newer_of_two_workspaces_sharing_a_por
 /// the gateway is absent, then fast-forwards main once it is back (02_workspaces.md,
 /// "`cowshed land`"). Adopt, new, exec and land never create a shell hook (02_workspaces.md,
 /// "Workspace environment"; 15_capabilities.md, "Required evidence").
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without_shell_hooks() {
     let started = std::time::Instant::now();
     let phase = |name| {
@@ -1031,7 +1031,7 @@ async fn directory_plain_git_repository_adopts_clones_executes_and_lands_without
 /// ('Git metadata path is not a real directory'), and so every verb that runs work in such a
 /// workspace failed. The supervisor starts, writes the excludes into main's, and the
 /// workspace's runtime state and the volume's own bookkeeping stay out of its status.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_a_git_worktree_workspace_starts_its_supervisor_and_executes() {
     let mut fixture = Fixture::directory();
     let mut service = fixture.open().await;
@@ -1115,7 +1115,7 @@ async fn directory_a_git_worktree_workspace_starts_its_supervisor_and_executes()
 /// `rm` stops the checkout's Nx daemon as `detach` does. A daemon detaches from the job that
 /// started it, so stopping the supervisor leaves it running with its cwd on the checkout: the
 /// unmount was refused for its whole grace, then forced, and the daemon outlived the removal.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
     use std::os::unix::process::ExitStatusExt;
 
@@ -2006,7 +2006,7 @@ async fn directory_an_undeclared_nx_output_lands_as_a_land_adoption_commitment_s
 
 /// Checks run once before delivery. A non-Nx shell and an uncacheable Nx executor both leave
 /// witnesses only in the landing workspace; the cache-only adoption still restores a:build.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_adoption_never_reexecutes_shell_checks_or_uncacheable_tasks_substrate_lifecycle()
 {
     let (nx, node) = repository_nx();
@@ -2425,7 +2425,7 @@ fn seeds_of_main(layout: &BuildVolumeLayout) -> Vec<(BuildVolumeId, BuildVolumeR
 
 /// Review-gated delivery validates and preserves the head, but is not a land, even with
 /// retirement left at its default. The control then takes the ordinary landing path.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_push_only_preserves_the_validated_head_without_landing_or_retiring_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
@@ -2585,7 +2585,7 @@ impl Drop for Holder {
 /// every checkout"). The relocated host build starts with the agent harness's `CI=true` and
 /// sources the checkout's environment; the sandbox build must reuse those same units. Main's
 /// first seed was frozen empty at first touch; a land is what warms it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let rust = rust_toolchain();
@@ -2733,7 +2733,7 @@ async fn nx_statuses(
 /// from its volume before it clones the seed and hits main's run. No command does it by hand.
 /// A keeper-held workspace takes the separate busy-skip path:
 /// [`directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_substrate_lifecycle`].
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_it_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
@@ -2870,7 +2870,7 @@ async fn directory_what_main_runs_after_a_land_reaches_its_seed_and_a_fork_hits_
 /// both tasks again. The no-keeper main case above retains the warm-fork `LocalHit` oracle.
 /// Before either fork, doctor diagnoses main's displaced workspace-data link and an exec restores
 /// it, so the forks never inherit a real directory in place of the build-volume link.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_a_fork_of_a_keeper_held_workspace_keeps_its_existing_seed_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
@@ -3077,7 +3077,7 @@ async fn build_link_findings(service: &mut ActorBridge) -> Vec<String> {
 /// and changing nothing `a` hashes, lands next without running them. `b` catches up with plain
 /// git, since `cowshed rebase` would carry `a`'s entries into its volume first. Main then adopts
 /// `b`'s volume, which never held `a`'s entries, and a fork of main still hits both.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_substrate_lifecycle()
 {
     let (nx, node) = repository_nx();
@@ -3139,7 +3139,7 @@ async fn directory_a_land_carries_mains_nx_entries_into_the_volume_main_adopts_s
 // Admitted to the 60 s lifecycle class below its 3× rule: its one low-load sample (34.983 s) ran
 // with the daemon off, and its daemon-on samples are load-dependent (08_testing.md, Integration
 // tests).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
@@ -3248,7 +3248,7 @@ async fn directory_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
 /// `a/src.txt` built; `a` changes `a/src.txt` and lands; `b` rebases. A hash of `a:test` from the
 /// file on disk would be a key no run looks up, so the carry takes main's latest `a:test` entry by
 /// task instead, and `b`'s run of the landed check hits both tasks.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_a_rebase_carries_a_task_that_hashes_its_dependencys_stale_outputs_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
@@ -3362,7 +3362,7 @@ async fn rebase(service: &mut ActorBridge, workspace: &str) -> RebaseReport {
 /// Once the opener exits, a new commit on the same topic exercises a foreign database holder:
 /// the retiring land names that holder and freezes a new seed without swapping main's volume
 /// (16_build_volumes.md, "The adoption needs the target's Nx database closed").
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_argv_substrate_lifecycle()
  {
     let (nx, node) = repository_nx();
@@ -3508,7 +3508,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
 /// The land replaces main's previous seed while the reader remains alive, and a subsequent fork
 /// inherits the cache bytes without requiring that reader to close (16_build_volumes.md, Land
 /// step 5.6). The real-APFS runtime proof owns block-atomic image and SQLite consistency coverage.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substrate_lifecycle() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with_directory(Project::Build {
@@ -3609,7 +3609,7 @@ async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substra
 /// directory stays in main's previous volume, which therefore stays until the job exits. A job
 /// admitted afterwards resolves main's link to the adopted volume (16_build_volumes.md, "Process
 /// lifetime across a swap", "Garbage collection").
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_jobs_get_the_new_one()
  {
     let rust = rust_toolchain();
@@ -3754,7 +3754,7 @@ async fn assert_build_label(layout: &BuildVolumeLayout, checkout: &Path, name: &
 /// unlinked volumes before returning, without a gc (16_build_volumes.md, "Garbage collection").
 /// The same sibling retirement holds a host process in that build volume and proves its
 /// forced release names the exact pid and command; no second project is adopted for that proof.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mounts_are_reclaimed()
 {
     const CHILD: &str = "COWSHED_TEST_BUILD_VOLUME_HOLDER_CHILD";
@@ -3924,17 +3924,17 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
 ///   keeping the checkout's tracked and untracked bytes, its Git HEAD and status, its build
 ///   volume's identity, owner record and warm contents, and the original `.pre-cowshed` tree;
 /// - the replaced main and build images stay at their retained paths, in their own format.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_raw_re_adoption_preserves_build_identity_and_replays_published_build_loss() {
     prove_re_adoption(ReAdoptionProof::RawReplacement).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_re_adopt_resumes_an_interrupted_replacement_without_a_second_one() {
     prove_re_adoption(ReAdoptionProof::RawInterruptedRecovery).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_re_adopt_resumes_legacy_inputs_without_a_second_replacement() {
     prove_re_adoption(ReAdoptionProof::LegacyRecovery).await;
 }
@@ -4635,7 +4635,7 @@ async fn assert_re_adopt_refuses_own_build_file(
 /// One adopted fixture exercises the three missing-main transitions (02_workspaces.md,
 /// "Missing main image"): publish an empty build after loss, keep a surviving build under a
 /// new id after the next loss, then replay a refused copy after the user commits new work.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_missing_main_recovers_empty_and_surviving_builds_and_replays_live_work() {
     const REMOTE: &str = "https://github.com/fixture/dispatch.git";
     let mut fixture = Fixture::with(Project::Declared);
@@ -5136,7 +5136,7 @@ async fn prove_missing_main_replays_live_work(fixture: &mut Fixture) {
 /// 02_workspaces.md, "Re-adoption" step 3: an interrupted re-adoption whose retained build image
 /// is gone resumes from its retained main, publishes the recorded build volume empty under its
 /// id, and discards the staged build copy nothing can verify any more.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_a_resumed_re_adopt_whose_retained_build_is_gone_publishes_it_empty() {
     let mut fixture = Fixture::with(Project::Declared);
     let mut service = fixture.open().await;
@@ -5429,7 +5429,7 @@ async fn prove_published_build_loss(fixture: &mut Fixture) {
 /// observer waits for the canonical sidecar to turn `Active` (the publication the rename's
 /// preservation guard starts after), then writes the source. The rename must refuse with the
 /// `rm <destination> --force` cancel, keep both images, and keep the edits it raced.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
     let mut fixture = Fixture::with(Project::Plain);
     let mut service = fixture.open().await;
@@ -5610,7 +5610,7 @@ struct LandDaemonRecord {
 /// Land 4 (16_build_volumes.md): a landing daemon the job ledger does not prove the job's own is
 /// never signalled. A daemon started detached from the job, as stock Nx does, skips adoption as
 /// `LandingDaemonStayed` and is still running after the land.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_land_leaves_a_stock_detached_landing_daemon_running_and_skips_adoption() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
@@ -5725,7 +5725,7 @@ async fn real_apfs_land_leaves_a_stock_detached_landing_daemon_running_and_skips
 
 /// A default land cannot turn Land 4's unproven nominee into signal authority at retirement.
 /// A live socket makes the record-nominated close capable of signalling the foreign process.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_default_land_never_signals_a_foreign_nominee_during_retirement() {
     let (nx, node) = repository_nx();
     let mut fixture = Fixture::with(Project::Build {
@@ -5806,7 +5806,7 @@ async fn real_apfs_default_land_never_signals_a_foreign_nominee_during_retiremen
 }
 
 /// An unreadable or malformed landing daemon record cannot authorize retirement or adoption.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
     let (nx, node) = repository_nx();
     for unreadable in [false, true] {
@@ -5856,7 +5856,7 @@ async fn real_apfs_land_skips_an_unverifiable_daemon_record_before_quiesce() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans_absolute_bypass() {
     cowshed_core::runtime::shell_host::register(
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
@@ -6096,7 +6096,7 @@ async fn real_apfs_managed_install_restores_developer_links_before_nx_and_cleans
 /// A covered `bun install` that a real root postinstall displaces the developer links of and then
 /// stays alive in, killed through the public job API before it finishes: terminal cleanup must
 /// restore the links it removed, because the wrapper recorded the install, and leave no marker.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed() {
     cowshed_core::runtime::shell_host::register(
         cowshed_core::runtime::shell_host::ShellHostProgram::with_arguments(
