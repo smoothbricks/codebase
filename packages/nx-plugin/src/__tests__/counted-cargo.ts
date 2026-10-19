@@ -11,6 +11,7 @@ import { type QueryableSpan, querySpan } from '@smoothbricks/lmao/testing';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
 import { AggregateCreateNodesError } from 'nx/src/project-graph/error-types.js';
 import { CargoMetadataError } from '../cargo-source-hash.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../test-backstop.js';
 import { bindListener } from '../testing.js';
 import { BROKER_HOST, encodeOrder, type ProcessReport, parseReport, readLines } from './counted-cargo-process.js';
 
@@ -63,19 +64,6 @@ export function cargoMetadataRuns(events: readonly CargoMetadataEvent[]): CargoM
   return { spawned: pids.length, read, peak, pids, grandchildren };
 }
 
-/**
- * How long an awaited event may take before its guard says what is still open: inside the tests'
- * own 20 s budgets, so the report reaches the test before the runner's timeout does. A guard only
- * ever fails a wait; nothing advances on it.
- */
-const GUARD_MS = 15_000;
-
-/**
- * The guard over the real Cargo: above the slowest real resolution seen behind a contended package
- * cache (21 s), below Bun's 30 s default test timeout, which those tests run under or exceed.
- */
-const REAL_CARGO_GUARD_MS = 25_000;
-
 /** The test spans still open under `span`, itself included: the work a hung test is still inside. */
 function openSpans<T extends LogSchema>(span: QueryableSpan<T>, open: string[]): string[] {
   // Row 1 holds a span's completion; its timestamp stays 0 until the span ends.
@@ -88,14 +76,17 @@ function openSpans<T extends LogSchema>(span: QueryableSpan<T>, open: string[]):
  * `operation`, settling exactly as it does, unless no event settles it within `timeoutMs`: then it
  * rejects with `what`, the test spans still open and `diagnostics()`. The test span is taken now, so
  * call this from the test's own async context. `signal` disarms the guard; the result still follows
- * `operation`.
+ * `operation`. The default is the leg's no-progress backstop: a guard that fires sooner races a
+ * loaded host (a 15 s and a 30 s guard failed slow but healthy daemon and Cargo waits), so it only
+ * names what was still open when a wait truly hangs. A guard only ever fails a wait; nothing advances
+ * on it.
  */
 export function guardEvent<T>(
   operation: Promise<T>,
   what: string,
   diagnostics: () => string | Promise<string>,
   signal?: AbortSignal,
-  timeoutMs = GUARD_MS,
+  timeoutMs = BOUNDED_TEST_IDLE_TIMEOUT_MS,
 ): Promise<T> {
   let spans: () => string;
   try {
@@ -324,8 +315,6 @@ async function shim(
   root: string,
   forward: string,
   initial: string | null,
-  /** How long the fixture's waits may take: longer over the real Cargo. */
-  guardMs: number,
 ): Promise<{ cargo: CountedCargo; answer(text: string): void }> {
   const path = process.env.PATH ?? '';
   const real = Bun.which('cargo', { PATH: path });
@@ -542,8 +531,6 @@ async function shim(
         verdict(() => (connections.size === 0 ? true : null)),
         'releasing the counted Cargo',
         describe,
-        undefined,
-        guardMs,
       );
     } catch (error) {
       // A process still connected is still running, so its pid is still its own: kill it and, for a
@@ -616,8 +603,6 @@ async function shim(
         }),
         `waiting for ${what}`,
         describe,
-        undefined,
-        guardMs,
       ),
     waitForDisconnects: async (pids) => {
       await guardEvent(
@@ -634,8 +619,6 @@ async function shim(
         }),
         `waiting for ${pids.join(', ')} to die`,
         describe,
-        undefined,
-        guardMs,
       );
     },
     release: () => {
@@ -653,7 +636,7 @@ async function shim(
 
 /** The real Cargo, counted: `metadata` prints what the real `cargo metadata` prints. */
 export async function countedCargo(root: string): Promise<CountedCargo> {
-  const { cargo } = await shim(root, 'exec "$real" "$@"', null, REAL_CARGO_GUARD_MS);
+  const { cargo } = await shim(root, 'exec "$real" "$@"', null);
   return cargo;
 }
 
@@ -663,7 +646,7 @@ export async function countedCargo(root: string): Promise<CountedCargo> {
  * not depend on.
  */
 export async function cannedCargo(root: string): Promise<CannedCargo> {
-  const { cargo, answer } = await shim(root, 'exec env -u RUSTUP_TOOLCHAIN -u RUSTUP_HOME "$real" "$@"', '', GUARD_MS);
+  const { cargo, answer } = await shim(root, 'exec env -u RUSTUP_TOOLCHAIN -u RUSTUP_HOME "$real" "$@"', '');
   return {
     ...cargo,
     answerWith: async (document) => answer(JSON.stringify(document)),
