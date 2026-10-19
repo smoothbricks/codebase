@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
 import { CARGO_CLOSURE_INPUT } from '../cargo-closure-input.js';
 import { createNodesV2 } from '../index.js';
-import type { TestFileInstallation } from './owned-installation.js';
+import type { TestFileInstallation } from '../owned-installation.js';
 
 /**
  * An Nx workspace that is also the Cargo workspace. `app` reaches `leaf`
