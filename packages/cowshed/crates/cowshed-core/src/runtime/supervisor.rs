@@ -59,7 +59,7 @@ use crate::runtime::job_resources::{
     Boundary, JobSampler, Member, Observation, Sampling, StreamTally,
 };
 use crate::runtime::job_spans::{JobSpanEdge, JobSpanPublisher, TraceHealth};
-use crate::runtime::nx_daemon::{NxDaemonKeeper, PROBE_INTERVAL, Probe, Verdict};
+use crate::runtime::nx_daemon::{NxDaemonKeeper, Probe, Verdict};
 #[cfg(target_os = "macos")]
 use crate::runtime::process_monitor::ProcessMonitor;
 use crate::runtime::process_stream::JobProcessStream;
@@ -5692,9 +5692,11 @@ impl SupervisorActor {
     /// One probe of a shed's Nx daemon: observe the foreground keeper job independently of
     /// developer activity, report its terminal failure, then judge whether the shed still
     /// wants a daemon ([`NxDaemonKeeper::judge`]), stopping one it no longer wants; start the
-    /// daemon, inside the sandbox, when the shed wants one and the probe finds none live. Nobody
-    /// waits for the start, so a start that is refused is said where the supervisor's own
-    /// failures go, and the next probe tries again.
+    /// daemon, inside the sandbox, when the shed wants one, the probe finds none live and the
+    /// keeper is not halted. Nobody waits for the start, so a failure is said where the
+    /// supervisor's own failures go. A start that can never run is refused once, named, and
+    /// halts the keeper; one that failed otherwise is tried again at the next probe, up to
+    /// [`super::nx_daemon::START_ATTEMPTS`] in a row.
     async fn keep_nx_daemon(&mut self) {
         let Some(keeper) = &mut self.nx_daemon else {
             return;
@@ -5712,9 +5714,15 @@ impl SupervisorActor {
         let running = keeper
             .starting
             .is_some_and(|id| self.jobs.get(&id).is_some_and(|job| !job.terminal()));
+        keeper.observe(daemon);
         if !running && let Some(job_id) = keeper.starting.take() {
             let job = self.jobs.get(&job_id).map(|job| &job.info);
-            super::nx_daemon::report_start(job_id, job, &project_root, daemon);
+            keeper.start_ended(
+                job_id,
+                super::nx_daemon::start_ending(job),
+                &project_root,
+                daemon,
+            );
         }
         // The keeper's foreground job is maintenance, not use by the developer. It still belongs
         // to the ordinary job ledger and every lifecycle drain waits for its real conclusion.
@@ -5729,13 +5737,17 @@ impl SupervisorActor {
         if daemon == Probe::Live || running {
             return;
         }
+        let Some(request) = keeper.start(
+            &self.workspace_root,
+            &project_root,
+            &read_write.capabilities.contribution,
+        ) else {
+            return;
+        };
         let authority = self.authority.clone();
-        let started = match self.current_build_volume_grant().and_then(|grant| {
-            super::nx_daemon::start_request(&self.workspace_root, &project_root)
-                .map(|request| (grant, request))
-        }) {
+        let started = match self.current_build_volume_grant() {
             // The keeper is the supervisor's own coordinator-side work.
-            Ok((grant, request)) => {
+            Ok(grant) => {
                 // The keeper is a resident: it holds no token and has no requester's pool.
                 self.admit_exec(
                     authority,
@@ -5749,8 +5761,12 @@ impl SupervisorActor {
             }
             Err(error) => Err(error),
         };
+        let Some(keeper) = &mut self.nx_daemon else {
+            return;
+        };
         match started {
             Ok(job_id) => {
+                keeper.starting = Some(job_id);
                 // Nobody attaches to the keeper's job: it runs detached from its admission.
                 if let Err(error) = self.detach(job_id) {
                     eprintln!(
@@ -5760,16 +5776,12 @@ impl SupervisorActor {
                         error.message
                     );
                 }
-                if let Some(keeper) = &mut self.nx_daemon {
-                    keeper.starting = Some(job_id);
-                }
             }
-            Err(error) => eprintln!(
-                "cowshed: the Nx daemon of {} did not start in the sandbox: {}; the next probe in {}s tries again",
+            Err(error) => keeper.start_failed(format!(
+                "the Nx daemon of {} did not start in the sandbox: {}",
                 project_root.display(),
-                error.message,
-                PROBE_INTERVAL.as_secs()
-            ),
+                error.message
+            )),
         }
     }
 

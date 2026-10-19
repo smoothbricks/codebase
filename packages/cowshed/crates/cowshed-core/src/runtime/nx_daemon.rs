@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -36,7 +37,7 @@ use crate::api::dto::{
     CommandArg, ExecCommand, ExecRequest, ExitStatus, JobId, JobInfo, RunSandboxMode, StdinSource,
     WorkspacePath,
 };
-use crate::capabilities::nx;
+use crate::capabilities::{CapabilityContribution, nx};
 use crate::error::{CowshedError, Result};
 use crate::metadata::WorkspaceRole;
 use crate::sandbox::SandboxConfig;
@@ -47,6 +48,22 @@ use crate::sandbox::SandboxConfig;
 /// because a start job takes Nx's own startup, seconds, and no probe starts another while one
 /// runs.
 pub(crate) const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many start jobs in a row may end with no daemon live before the keeper starts no more.
+/// A start that can never run -- no `node` for it, or one that does not exist or cannot execute
+/// -- is refused before its first job ([`daemon_node`]), once. This bounds what no exit status
+/// classifies: `sandbox-exec` exits 71 both for an `execvp` it could not make and for a child that
+/// exited 71, a shell host's 127 is also a program's own, and Node's failures are the program's.
+/// Each failed start is one probe interval apart, so the bound is about 15 s of starts, never a
+/// run's lifetime. A slow start is never counted: no probe starts another while one runs.
+pub(crate) const START_ATTEMPTS: u32 = 3;
+
+/// How many stops of an idle shed's live daemon may fail in a row before no probe tries again
+/// while that daemon stays live. A failed stop is a daemon that outlived its `SIGTERM` hang guard
+/// or a task database that could not be read; a fourth try of either meets the same daemon. It
+/// costs a resident daemon, not a stalled job: the supervisor's retirement stops it once more,
+/// and a probe that finds it gone counts afresh.
+pub(crate) const STOP_ATTEMPTS: u32 = 3;
 
 /// How long a shed must show no use of Nx before its supervisor stops the daemon it keeps. Long
 /// enough that a gate's runs, an edit and the next run share one warm daemon (a cold one
@@ -320,11 +337,28 @@ pub(crate) fn kept_project(read_write: &SandboxConfig) -> Option<&Path> {
 }
 
 /// The read-write resident job that starts the daemon of the Nx project at `project_root`: the
-/// project's own `nx`, run from the project root inside the workspace at `workspace_root`. The
-/// daemon stays up to answer clients that hold their own tokens and is idle between them, so it
-/// holds none (05_gateway.md "A resident holds no token"): keeping it costs the shed none of
-/// its share of the host.
-pub(crate) fn start_request(workspace_root: &Path, project_root: &Path) -> Result<ExecRequest> {
+/// project's own `nx`, run by [`daemon_node`] from the project root inside the workspace at
+/// `workspace_root`. The daemon stays up to answer clients that hold their own tokens and is idle
+/// between them, so it holds none (05_gateway.md "A resident holds no token"): keeping it costs
+/// the shed none of its share of the host.
+///
+/// Every error is permanent for the supervisor's capabilities: a start that can never run is
+/// refused here, named, before any job exists.
+fn start_request(
+    workspace_root: &Path,
+    project_root: &Path,
+    capabilities: &CapabilityContribution,
+) -> Result<ExecRequest> {
+    let node = daemon_node(capabilities).map_err(|why| {
+        CowshedError::environment_missing(
+            format!(
+                "the Nx daemon of {} cannot start: {why}",
+                project_root.display()
+            ),
+            "give the shed a `node`: an `.envrc` whose shell puts one on PATH, or one installed \
+             where the javascript capability finds it, then restart the shed's supervisor",
+        )
+    })?;
     let relative = project_root.strip_prefix(workspace_root).map_err(|_| {
         CowshedError::integrity(
             format!(
@@ -347,7 +381,7 @@ pub(crate) fn start_request(workspace_root: &Path, project_root: &Path) -> Resul
     };
     Ok(ExecRequest {
         command: ExecCommand::Argv(vec![
-            CommandArg::from("node"),
+            node,
             CommandArg::new(project_root.join("node_modules/nx/dist/src/daemon/server/start.js")),
             // The keeper owns this daemon's restart: the patched daemon stops, rather than spawning a successor
             // outside this job, when its installation changes, and the next probe starts the owned one
@@ -368,34 +402,50 @@ pub(crate) fn start_request(workspace_root: &Path, project_root: &Path) -> Resul
     })
 }
 
-/// Say on the supervisor's stderr how the start job `job_id` went, `job` being its record, unless
-/// it exited 0 and left the daemon live. The next probe finding the daemon down starts another.
-pub(crate) fn report_start(
-    job_id: JobId,
-    job: Option<&JobInfo>,
-    project_root: &Path,
-    daemon: Probe,
-) {
-    let ending = match job.and_then(|info| info.exit.as_ref()) {
-        Some(ExitStatus::Exited { code: 0 }) if daemon == Probe::Live => return,
+/// The `node` a start job runs, or why none can run. A shed whose shell is activated runs the
+/// toolchain that shell declares (15_capabilities.md, "Bootstrap executables"), so `node` is
+/// whatever the activated PATH names and only the start job can tell. A shed without one reaches
+/// no `node` but the javascript capability's bootstrap program, so the job runs that program by
+/// its absolute path, and a program that is missing or cannot execute is named here -- its
+/// `ENOENT` or `EACCES` -- rather than met as `sandbox-exec`'s exit 71 at every probe.
+fn daemon_node(capabilities: &CapabilityContribution) -> std::result::Result<CommandArg, String> {
+    if capabilities.shell.is_some() {
+        return Ok(CommandArg::from("node"));
+    }
+    let Some(program) = capabilities
+        .bootstrap_programs
+        .iter()
+        .find(|program| program.name == "node")
+    else {
+        return Err(
+            "the shed activates no shell and no capability resolved a `node` program".to_owned(),
+        );
+    };
+    let target = &program.target;
+    match std::fs::metadata(target) {
+        Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
+            Ok(CommandArg::new(target.clone()))
+        }
+        Ok(_) => Err(format!(
+            "its `node` {} is not an executable file: {}",
+            target.display(),
+            io::Error::from_raw_os_error(libc::EACCES)
+        )),
+        Err(error) => Err(format!("its `node` {}: {error}", target.display())),
+    }
+}
+
+/// How the start job `job` ended, as the keeper says it; `None` for an exit 0.
+pub(crate) fn start_ending(job: Option<&JobInfo>) -> Option<String> {
+    Some(match job.and_then(|info| info.exit.as_ref()) {
+        Some(ExitStatus::Exited { code: 0 }) => return None,
         Some(ExitStatus::Exited { code }) => format!("exited {code}"),
         Some(ExitStatus::Signaled { signal, .. }) => format!("ended on signal {signal}"),
         None => match job {
             Some(info) => format!("ended {:?} with no exit status", info.state),
             None => "has no record in its supervisor".to_owned(),
         },
-    };
-    let next = match daemon {
-        Probe::Live => "",
-        Probe::Unrecorded | Probe::Unreadable | Probe::Dead | Probe::Refused => {
-            "; starting another"
-        }
-    };
-    eprintln!(
-        "cowshed: Nx daemon start job {} for {} {ending}, and the daemon is {daemon}{next}",
-        job_id.get(),
-        project_root.display()
-    );
+    })
 }
 
 /// A shed supervisor's keeper of its Nx daemon: when to probe next, the start job it waits on, and
@@ -415,6 +465,17 @@ pub(crate) struct NxDaemonKeeper {
     /// Whether the last probe found the shed unused for [`IDLE`] and no daemon live: nothing is
     /// left for the supervisor to wait for.
     pub(super) settled: bool,
+    /// Start jobs and admissions in a row that left no daemon live ([`START_ATTEMPTS`]).
+    failed_starts: u32,
+    /// Why the keeper starts no daemon although the shed may want one: a start that can never
+    /// run, or [`START_ATTEMPTS`] in a row that left none live. Said once, when it is set. A probe
+    /// that finds a daemon live -- one a client started -- lifts it, so the keeper keeps that one
+    /// and starts again only after it is gone; nothing else does before the supervisor restarts,
+    /// because nothing else changes what its start would meet.
+    halted: Option<String>,
+    /// Stops of the idle shed's live daemon in a row that failed ([`STOP_ATTEMPTS`]); a probe
+    /// that finds no daemon live clears it.
+    failed_stops: u32,
     // Process ownership belongs only to the admitted job's birth and ledger, never an Nx record.
 }
 
@@ -445,9 +506,95 @@ impl NxDaemonKeeper {
                     daemon_was_live: false,
                     last_look: None,
                     settled: false,
+                    failed_starts: 0,
+                    halted: None,
+                    failed_stops: 0,
                 })
             }
         }
+    }
+
+    /// The start job to admit for the Nx project at `project_root` in the workspace at
+    /// `workspace_root`, whose jobs have `capabilities`; none while the keeper is halted. A start
+    /// that can never run ([`start_request`]) halts it, named, so it is tried once.
+    pub(crate) fn start(
+        &mut self,
+        workspace_root: &Path,
+        project_root: &Path,
+        capabilities: &CapabilityContribution,
+    ) -> Option<ExecRequest> {
+        if self.halted.is_some() {
+            return None;
+        }
+        match start_request(workspace_root, project_root, capabilities) {
+            Ok(request) => Some(request),
+            Err(error) => {
+                self.halt(format!("{} (next: {})", error.message, error.hint));
+                None
+            }
+        }
+    }
+
+    /// A probe found the daemon `daemon`. A live one, whoever started it, proves a start can
+    /// succeed: the failures before it are forgiven and a halt is lifted.
+    pub(crate) fn observe(&mut self, daemon: Probe) {
+        if daemon == Probe::Live {
+            self.failed_starts = 0;
+            self.halted = None;
+        }
+    }
+
+    /// The start job `job_id` ended as `ending` (`None`: it exited 0), and the probe after it
+    /// found the daemon `daemon`. Said on the supervisor's stderr unless it exited 0 and left the
+    /// daemon live; one that left no daemon live is a failed start.
+    pub(crate) fn start_ended(
+        &mut self,
+        job_id: JobId,
+        ending: Option<String>,
+        project_root: &Path,
+        daemon: Probe,
+    ) {
+        let what = |ending: &str| {
+            format!(
+                "Nx daemon start job {} for {} {ending}, and the daemon is {daemon}",
+                job_id.get(),
+                project_root.display()
+            )
+        };
+        match (ending, daemon) {
+            (None, Probe::Live) => {}
+            (Some(ending), Probe::Live) => eprintln!("cowshed: {}", what(&ending)),
+            (ending, Probe::Unrecorded | Probe::Unreadable | Probe::Dead | Probe::Refused) => {
+                self.start_failed(what(ending.as_deref().unwrap_or("exited 0")));
+            }
+        }
+    }
+
+    /// A start that left no daemon live, `what` saying how: another follows at the next probe
+    /// until [`START_ATTEMPTS`] have failed in a row, and then none does.
+    pub(crate) fn start_failed(&mut self, what: String) {
+        self.failed_starts += 1;
+        if self.failed_starts < START_ATTEMPTS {
+            eprintln!(
+                "cowshed: {what}; starting another, {} of {START_ATTEMPTS}, in {}s",
+                self.failed_starts + 1,
+                PROBE_INTERVAL.as_secs()
+            );
+            return;
+        }
+        self.halt(format!(
+            "{what}; {START_ATTEMPTS} starts in a row left no daemon live"
+        ));
+    }
+
+    /// Start no daemon, for `why`, until a probe finds one live. Said once, here: an Nx client
+    /// that finds no daemon meanwhile starts its own, as Nx does without a keeper.
+    fn halt(&mut self, why: String) {
+        eprintln!(
+            "cowshed: {why}; the shed's supervisor starts no Nx daemon until it finds one live or \
+             restarts"
+        );
+        self.halted = Some(why);
     }
 
     /// Judge one probe of the Nx project at `project_root`, whose daemon the probe found
@@ -488,10 +635,14 @@ impl NxDaemonKeeper {
             return Verdict::Keep;
         }
         if !live {
+            self.failed_stops = 0;
             self.settled = true;
             return Verdict::Release;
         }
         self.settled = false;
+        if !self.may_stop() {
+            return Verdict::Release;
+        }
         let why = format!(
             "the shed ran nothing and held no Nx database for {}s",
             IDLE.as_secs()
@@ -503,16 +654,38 @@ impl NxDaemonKeeper {
                 Verdict::Keep
             }
             Stop::Failed(why) => {
-                eprintln!(
-                    "cowshed: the Nx daemon of {} has been idle for {}s and did not stop: {why}; \
-                     the next probe in {}s tries again",
-                    project_root.display(),
-                    IDLE.as_secs(),
-                    PROBE_INTERVAL.as_secs()
-                );
+                self.stop_failed(project_root, &why);
                 Verdict::Release
             }
         }
+    }
+
+    /// Whether a probe may try to stop the idle shed's live daemon: not once [`STOP_ATTEMPTS`]
+    /// stops of it failed in a row.
+    fn may_stop(&self) -> bool {
+        self.failed_stops < STOP_ATTEMPTS
+    }
+
+    /// A stop of the idle shed's live daemon failed for `why`: the next probe tries again until
+    /// [`STOP_ATTEMPTS`] have failed in a row, and then none does while that daemon stays live.
+    fn stop_failed(&mut self, project_root: &Path, why: &str) {
+        self.failed_stops += 1;
+        let next = if self.failed_stops < STOP_ATTEMPTS {
+            format!(
+                "the next probe in {}s tries again, {} of {STOP_ATTEMPTS}",
+                PROBE_INTERVAL.as_secs(),
+                self.failed_stops + 1
+            )
+        } else {
+            "no probe tries again while it stays live; its supervisor's retirement stops it once \
+             more"
+                .to_owned()
+        };
+        eprintln!(
+            "cowshed: the Nx daemon of {} has been idle for {}s and did not stop: {why}; {next}",
+            project_root.display(),
+            IDLE.as_secs(),
+        );
     }
 }
 
@@ -829,6 +1002,195 @@ mod tests {
             Verdict::Release
         );
         assert!(keeper.settled, "the next probe finds it gone");
+    }
+
+    fn scratch() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "cs-nxk-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(root.join("bin")).expect("scratch");
+        root
+    }
+
+    /// A shed with no shell activation whose javascript capability resolved `node` to `target`.
+    fn bootstrap_node(target: PathBuf) -> CapabilityContribution {
+        CapabilityContribution {
+            bootstrap_programs: vec![crate::capabilities::BootstrapProgram {
+                name: "node",
+                target,
+            }],
+            ..CapabilityContribution::default()
+        }
+    }
+
+    /// A shed whose shell is activated, which declares its own toolchain.
+    fn activated(directory: &Path) -> CapabilityContribution {
+        CapabilityContribution {
+            shell: Some(crate::capabilities::ShellActivation {
+                directory: directory.to_path_buf(),
+                script: "",
+                label: "test",
+            }),
+            ..CapabilityContribution::default()
+        }
+    }
+
+    fn program(request: &ExecRequest) -> &std::ffi::OsStr {
+        match &request.command {
+            ExecCommand::Argv(argv) => argv[0].as_os_str(),
+            ExecCommand::Script(_) => panic!("a start job is an argv"),
+        }
+    }
+
+    /// One probe as the supervisor makes it of a shed that wants a daemon and finds none: the
+    /// start job it would admit.
+    fn probe_and_start(
+        keeper: &mut NxDaemonKeeper,
+        root: &Path,
+        capabilities: &CapabilityContribution,
+    ) -> Option<ExecRequest> {
+        keeper.observe(Probe::Unrecorded);
+        keeper.start(root, root, capabilities)
+    }
+
+    /// The 2026-10-20 incident: no shell activates the shed, so its start runs the bootstrap
+    /// `node`, and that program does not exist. `sandbox-exec` met it as exit 71 at every probe,
+    /// 272 starts in 1,361 s. The keeper now names the `ENOENT` at its first probe and tries no
+    /// more: the program appearing afterwards is not seen, because nothing is attempted again
+    /// until a daemon is found live, whose start then runs that `node` by its absolute path.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_whose_node_is_missing_is_refused_once_with_its_enoent_named() {
+        let root = scratch();
+        let node = root.join("bin/node");
+        let capabilities = bootstrap_node(node.clone());
+        let mut keeper = keeper();
+
+        assert!(probe_and_start(&mut keeper, &root, &capabilities).is_none());
+        let halted = keeper
+            .halted
+            .clone()
+            .expect("the first probe halts the keeper");
+        assert!(halted.contains(&node.display().to_string()), "{halted}");
+        assert!(
+            halted.contains(&io::Error::from_raw_os_error(libc::ENOENT).to_string()),
+            "the refusal names ENOENT: {halted}"
+        );
+
+        // A keeper that tried again would now admit a start.
+        std::fs::write(&node, b"#!/bin/sh\n").expect("node");
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        for _ in 1..272 {
+            assert!(
+                probe_and_start(&mut keeper, &root, &capabilities).is_none(),
+                "a halted keeper attempts nothing"
+            );
+        }
+        assert_eq!(keeper.halted.as_deref(), Some(halted.as_str()));
+
+        keeper.observe(Probe::Live);
+        assert_eq!(keeper.halted, None, "a live daemon lifts the halt");
+        let request = keeper
+            .start(&root, &root, &capabilities)
+            .expect("a start once lifted");
+        assert_eq!(program(&request), node.as_os_str(), "never a bare `node`");
+        std::fs::remove_dir_all(&root).expect("remove scratch");
+    }
+
+    /// A `node` that exists but cannot execute is refused at once with its `EACCES` named.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_whose_node_cannot_execute_is_refused_once_with_its_eacces_named() {
+        let root = scratch();
+        let node = root.join("bin/node");
+        std::fs::write(&node, b"").expect("node");
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        let mut keeper = keeper();
+        assert!(probe_and_start(&mut keeper, &root, &bootstrap_node(node.clone())).is_none());
+        let halted = keeper.halted.clone().expect("halted");
+        assert!(halted.contains(&node.display().to_string()), "{halted}");
+        assert!(
+            halted.contains(&io::Error::from_raw_os_error(libc::EACCES).to_string()),
+            "the refusal names EACCES: {halted}"
+        );
+        std::fs::remove_dir_all(&root).expect("remove scratch");
+    }
+
+    /// A shed that activates no shell and resolved no `node` can never start a daemon, which is
+    /// said once. A shed whose shell is activated runs the `node` that shell declares
+    /// (15_capabilities.md), which only its start job can find.
+    #[tokio::test(start_paused = true)]
+    async fn a_shed_without_a_node_is_refused_once_and_an_activated_shell_names_its_own() {
+        let root = scratch();
+        let mut keeper = keeper();
+        assert!(probe_and_start(&mut keeper, &root, &CapabilityContribution::default()).is_none());
+        let halted = keeper.halted.clone().expect("halted");
+        assert!(
+            halted.contains("no capability resolved a `node`"),
+            "{halted}"
+        );
+
+        let request = super::NxDaemonKeeper::for_role(WorkspaceRole::Workspace)
+            .expect("a shed keeps a daemon")
+            .start(&root, &root, &activated(&root))
+            .expect("an activated shed starts");
+        assert_eq!(program(&request), "node");
+        std::fs::remove_dir_all(&root).expect("remove scratch");
+    }
+
+    /// A start that ran and left no daemon live is a failure no exit status classifies, so it is
+    /// tried again at the next probe up to [`START_ATTEMPTS`] in a row, and then not. A start that
+    /// left the daemon live, whatever its exit, is no failure, and a live daemon forgives the
+    /// failures before it.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_that_ran_and_failed_is_tried_again_up_to_its_bound() {
+        let root = Path::new(NO_PROJECT);
+        let capabilities = activated(root);
+        let job = JobId::new(1).expect("job id");
+        let mut keeper = keeper();
+        for _ in 1..START_ATTEMPTS {
+            keeper.start_ended(job, Some("exited 71".to_owned()), root, Probe::Dead);
+            assert!(
+                keeper.start(root, root, &capabilities).is_some(),
+                "below the bound"
+            );
+        }
+        keeper.observe(Probe::Live);
+        keeper.start_ended(job, Some("exited 1".to_owned()), root, Probe::Live);
+        for _ in 1..START_ATTEMPTS {
+            keeper.start_ended(job, Some("exited 1".to_owned()), root, Probe::Refused);
+        }
+        assert_eq!(keeper.halted, None, "the live daemon reset the count");
+
+        keeper.start_ended(job, None, root, Probe::Unrecorded);
+        let halted = keeper.halted.clone().expect("halted at the bound");
+        assert!(
+            halted.contains("exited 0") && halted.contains("3 starts in a row"),
+            "{halted}"
+        );
+        assert!(
+            keeper.start(root, root, &capabilities).is_none(),
+            "at the bound"
+        );
+    }
+
+    /// An idle shed's live daemon whose stop fails is stopped again at the next probe up to
+    /// [`STOP_ATTEMPTS`] in a row, and then not while it stays live; a probe that finds it gone
+    /// counts afresh.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_stop_is_tried_again_up_to_its_bound() {
+        let root = Path::new(NO_PROJECT);
+        let mut keeper = keeper();
+        for _ in 0..STOP_ATTEMPTS {
+            assert!(keeper.may_stop());
+            keeper.stop_failed(root, "the Nx daemon pid 1 did not exit");
+        }
+        assert!(!keeper.may_stop(), "at the bound");
+        tokio::time::advance(IDLE).await;
+        assert_eq!(
+            judge(&mut keeper, false, Probe::Dead).await,
+            Verdict::Release
+        );
+        assert!(keeper.may_stop(), "the daemon is gone");
     }
 
     #[cfg(target_os = "macos")]
