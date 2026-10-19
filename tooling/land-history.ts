@@ -10,9 +10,19 @@ export type HistoryVerdict =
   | { readonly kind: 'refused'; readonly why: string; readonly remedy: string }
   | { readonly kind: 'unavailable'; readonly why: string };
 
-/** Judge actual source ancestry without needing the forbidden object in a clean clone. */
-export function judgeHistory(checkout: string, newMain: string, forbiddenAncestor = PRE_REWRITE_MAIN): HistoryVerdict {
-  const history = spawnSync('git', ['-C', checkout, 'rev-list', 'HEAD'], { encoding: 'utf8' });
+/** What `git rev-list HEAD` reported, reduced to the fields the verdict reads. spawnSync's result satisfies it. */
+export interface RevListResult {
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly error?: { readonly message: string };
+}
+
+/**
+ * Judge a rev-list result against the forbidden ancestor. Pure: the git spawn stays with the caller, so every
+ * verdict, including a failed or signalled git, is a plain call.
+ */
+export function verdictFromRevList(history: RevListResult, newMain: string, forbiddenAncestor: string): HistoryVerdict {
   if (history.status !== 0) {
     return { kind: 'unavailable', why: history.error?.message ?? history.stderr.trim() };
   }
@@ -24,6 +34,15 @@ export function judgeHistory(checkout: string, newMain: string, forbiddenAncesto
     };
   }
   return { kind: 'clean' };
+}
+
+/** Judge actual source ancestry without needing the forbidden object in a clean clone. */
+export function judgeHistory(checkout: string, newMain: string, forbiddenAncestor = PRE_REWRITE_MAIN): HistoryVerdict {
+  return verdictFromRevList(
+    spawnSync('git', ['-C', checkout, 'rev-list', 'HEAD'], { encoding: 'utf8' }),
+    newMain,
+    forbiddenAncestor,
+  );
 }
 
 if (import.meta.main) {

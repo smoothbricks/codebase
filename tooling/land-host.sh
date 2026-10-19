@@ -20,16 +20,9 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here/.."
 
-[ "$#" -ge 1 ] || {
-  echo "usage: $0 <workspace> [cowshed land args...]" >&2
-  exit 64
-}
-workspace=$1
+# The first argument is the workspace; land-decide.ts refuses a missing one and main itself (a tested call).
+workspace=$(bun "$here/land-decide.ts" workspace "$@")
 shift
-[ "$workspace" != main ] || {
-  echo "land-host: main is not a workspace to land" >&2
-  exit 64
-}
 main=$(cowshed path main)
 checkout=$(cowshed path "$workspace")
 started=$(date +%s)
@@ -51,8 +44,9 @@ rebase_onto_main() {
       return 0
     fi
     printf '%s\n' "$outcome" >&2
-    case $outcome in
-    *'"reason":"ontoMoved"'*) say "main moved past $base before the rebase began; rebasing onto its new head" ;;
+    verdict=$(bun "$here/land-decide.ts" after-rebase "$outcome")
+    case $verdict in
+    retry) say "main moved past $base before the rebase began; rebasing onto its new head" ;;
     *) return 1 ;;
     esac
   done
@@ -62,12 +56,22 @@ rebase_onto_main() {
 # byte-identical. One that differs (a change to the .envrc) runs only when the operator has already approved it by
 # hand, so a gate never runs an environment nobody approved. direnv reports an approved .envrc as "Found RC allowed 0".
 allow_envrc() {
+  envrc_same=differs
+  envrc_status=
   if cmp -s "$main/.envrc" "$checkout/.envrc"; then
-    direnv allow "$checkout"
-  elif ! (cd "$checkout" && direnv status) | grep -qx 'Found RC allowed 0'; then
+    envrc_same=same
+  else
+    envrc_status=$(cd "$checkout" && direnv status) || envrc_status=
+  fi
+  verdict=$(bun "$here/land-decide.ts" envrc "$envrc_same" "$envrc_status")
+  case $verdict in
+  allow) direnv allow "$checkout" ;;
+  approved) ;;
+  *)
     say "$checkout/.envrc differs from main's approved .envrc; review it and run 'direnv allow $checkout', or rebase"
     exit 1
-  fi
+    ;;
+  esac
 }
 
 # `nx <args>` in <workspace>'s own devenv. A gate takes no input, and a task that reads stdin must not eat a loop's.
@@ -122,8 +126,9 @@ while :; do
     exit 0
   fi
   printf '%s\n' "$outcome" >&2
-  case $outcome in
-  *'"reason":"targetMoved"'*) ;;
+  verdict=$(bun "$here/land-decide.ts" after-land "$outcome")
+  case $verdict in
+  gateAgain) ;;
   *) exit 1 ;;
   esac
   say "main moved while the gate ran; rebasing onto its new head and gating again"
