@@ -2054,6 +2054,12 @@ export type RebaseOptions = {
   readonly expectedWorkspaceIncarnation?: WorkspaceIncarnation;
   readonly expectedSourceHead?: GitOid;
   readonly expectedOntoHead?: GitOid;
+  /**
+   * Run the rebase's own jobs — the carry's task hashes — as gate-class work. A land's rebase
+   * is on the land's critical path: its lander runs it under the land lock, and a land is a
+   * gate job (05_gateway.md, "A land is a gate job"). Any other rebase is background work.
+   */
+  readonly gate?: boolean;
 };
 
 /**

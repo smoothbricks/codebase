@@ -521,6 +521,7 @@ pub struct RebaseArgs {
     pub expected_workspace_incarnation: Option<OsString>,
     pub expected_source_head: Option<OsString>,
     pub expected_onto_head: Option<OsString>,
+    pub gate: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -898,6 +899,7 @@ fn cli_command() -> ClapCommand {
             value("expected-workspace-incarnation"),
             value("expected-source-head"),
             value("expected-onto-head"),
+            flag("gate"),
         ]))
         .subcommand(leaf("land").arg(positional("workspace", 0..=1)).args([
             value("into"),
@@ -3127,6 +3129,10 @@ const REBASE: CommandSpec = CommandSpec {
             spelling: "--expected-onto-head <oid>",
             meaning: "refuse unless the revision being rebased onto is still this commit",
         },
+        Opt {
+            spelling: "--gate",
+            meaning: "run the carry's jobs as gate-class work, ahead of background: a land's rebase, which its lander runs under the land lock",
+        },
     ],
 };
 
@@ -3144,6 +3150,7 @@ fn parse_rebase(matches: &ArgMatches) -> Result<Command, UsageError> {
         expected_workspace_incarnation: os(matches, "expected-workspace-incarnation"),
         expected_source_head: os(matches, "expected-source-head"),
         expected_onto_head: os(matches, "expected-onto-head"),
+        gate: flagged(matches, "gate"),
     }))
 }
 
@@ -4875,6 +4882,18 @@ mod tests {
             };
             assert_eq!(args.onto.unwrap().as_bytes(), opaque.as_bytes());
         }
+    }
+
+    #[test]
+    fn only_a_rebase_that_names_gate_runs_its_carry_as_gate_work() {
+        let rebase = |argv: &[&str]| {
+            let Command::Rebase(args) = parse_args(argv.iter().copied()).unwrap().command else {
+                panic!("expected rebase")
+            };
+            args.gate
+        };
+        assert!(!rebase(&["rebase", "raven"]));
+        assert!(rebase(&["rebase", "raven", "--gate"]));
     }
 
     #[test]

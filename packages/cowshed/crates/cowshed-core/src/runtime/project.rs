@@ -12218,13 +12218,19 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // The rebase has happened: a failed carry reads as such, never as a refused rebase.
         let build_volume = timed_async("rebase", "carry", async {
             // Only what the rebased tree will look up is carried, so the hashes come from it, as
-            // it is checked out now, through jobs admitted on its own build volume.
+            // it is checked out now, through jobs admitted on its own build volume, at the class
+            // the caller names: a land's rebase runs them as gate-class work.
             let (handle, grant) = self.admit_build_state(&workspace).await?;
             let mount = self.workspace_mount_path(&workspace)?;
+            let class = if options.gate {
+                crate::api::dto::JobserverClass::Gate
+            } else {
+                crate::api::dto::JobserverClass::Background
+            };
             let selections = timed_async(
                 "rebase",
                 "task-hashes",
-                rebased_task_hashes(&handle, grant, &mount),
+                rebased_task_hashes(&handle, grant, &mount, class),
             )
             .await?;
             self.build_volumes()?
@@ -16379,7 +16385,8 @@ async fn read_job_stdout(
 /// and before quiescence. Even a no-check land initializes every detected Nx root through that
 /// checkout's pinned Nx, without computing a project/task graph or copying another DB's history.
 /// A failure here is not a refused land: the caller records it as the carry's stop reason, and
-/// checks and the fast-forward still run.
+/// checks and the fast-forward still run. Its jobs are gate-class work: a land is a gate job and
+/// only its lander lands (05_gateway.md, "A land is a gate job").
 #[cfg(target_os = "macos")]
 async fn initialize_nx_caches(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
@@ -16394,6 +16401,7 @@ async fn initialize_nx_caches(
             mount,
             root,
             crate::build_volume::cache_adapter::initialize_script(),
+            crate::api::dto::JobserverClass::Gate,
         )?;
         let initialized = nx_probe_stdout(handle, build_volume.clone(), request)
             .await
@@ -16430,9 +16438,14 @@ fn nx_state_paths(
 
 /// The one `node -` job that runs `script` in the Nx root `root` of the workspace mounted at
 /// `mount`, as the root's own directory so its `.envrc` gives its toolchain. Read-write, as a
-/// run: stock Nx records task details in the root's database.
+/// run: stock Nx records task details in the root's database. It asks for one token at `class`.
 #[cfg(target_os = "macos")]
-fn nx_probe_request(mount: &Path, root: &Path, script: bytes::Bytes) -> Result<ExecRequest> {
+fn nx_probe_request(
+    mount: &Path,
+    root: &Path,
+    script: bytes::Bytes,
+    class: crate::api::dto::JobserverClass,
+) -> Result<ExecRequest> {
     let cwd = if root.as_os_str().is_empty() {
         None
     } else {
@@ -16456,7 +16469,7 @@ fn nx_probe_request(mount: &Path, root: &Path, script: bytes::Bytes) -> Result<E
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
-        class: crate::api::dto::JobserverClass::Background,
+        class,
         want: NonZeroUsize::MIN,
         scope: crate::api::dto::ExecScope::Workspace,
     })
@@ -16493,14 +16506,15 @@ async fn nx_probe_stdout(
 /// volume of `workspace` (mounted at `mount`) holds, keyed by its `.nx` relative to the checkout,
 /// the task hashes stock Nx computes up front for the tree now checked out at that state's root
 /// and the tasks it defers ([`crate::build_volume::nx::task_hashes_script`], run there as a job
-/// of the workspace). A root whose selection cannot be computed is the carry's skip, naming it:
-/// no root is ever given a selection it did not compute, so the carry never copies an entry the
-/// tree will not look up.
+/// of the workspace at `class`). A root whose selection cannot be computed is the carry's skip,
+/// naming it: no root is ever given a selection it did not compute, so the carry never copies an
+/// entry the tree will not look up.
 #[cfg(target_os = "macos")]
 async fn rebased_task_hashes(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
     build_volume: Option<PathBuf>,
     mount: &Path,
+    class: crate::api::dto::JobserverClass,
 ) -> Result<
     std::result::Result<
         std::collections::BTreeMap<PathBuf, crate::build_volume::nx::TaskSelection>,
@@ -16512,7 +16526,12 @@ async fn rebased_task_hashes(
     let mut selections = std::collections::BTreeMap::new();
     for parent in nx_state_paths(&state) {
         let root = parent.parent().unwrap_or(Path::new(""));
-        let request = nx_probe_request(mount, root, crate::build_volume::nx::task_hashes_script())?;
+        let request = nx_probe_request(
+            mount,
+            root,
+            crate::build_volume::nx::task_hashes_script(),
+            class,
+        )?;
         let selection = nx_probe_stdout(handle, build_volume.clone(), request)
             .await
             .and_then(|stdout| crate::build_volume::nx::task_selection(&stdout));

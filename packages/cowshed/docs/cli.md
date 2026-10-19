@@ -1121,7 +1121,7 @@ refs/cowshed/raven/heads/cowshed/raven	9b2e77d4c1…
 Stdout is the preserved ref and the commit it names. Nothing preserves a workspace's work but `push` and `land`: the
 store volume that holds the images is excluded from backup (durability = git).
 
-### `cowshed rebase [<name>] [--onto <rev> | --into <lane>]`
+### `cowshed rebase [<name>] [--onto <rev> | --into <lane>] [--gate]`
 
 Brings the workspace branch up to current main: cowshed points the workspace's `main` remote at main's checkout
 (`cowshed-main` in a workspace where something else already holds that name), fetches it, and runs
@@ -1147,7 +1147,9 @@ falls back to an unbounded copy. A bound or failed copy reports `carried.stopped
 the partial entry; the rebase stands. The new head prints on stdout and what was carried, by hash and by deferred task,
 on stderr; `--json` gives `RebaseReport { oid, buildVolume }` with `buildVolume.deferred` counting the entries carried
 by deferred task. The carry stops the idle Nx daemon of each side, which restarts on its next client. A side whose task
-database another process holds carries nothing and names that process.
+database another process holds carries nothing and names that process. The hash computation is a job of the workspace
+that asks for one CPU token at background class; `--gate` asks at gate class instead, for a land's rebase, which its
+lander runs under the land lock: queued behind background work, it would hold up every land waiting for that lock.
 
 ### `cowshed land <name> [--into <lane>] [--check <cmd>]`
 
