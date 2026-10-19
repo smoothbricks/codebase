@@ -38,7 +38,15 @@ export const DEVENV_CROSS_PROFILE = 'linux-cross';
  */
 export const CARGO_CROSS_LINT_TARGET = 'cargo-lint-cross';
 
-const CARGO_CROSS_LINT_GUARD = `[ -n "\${CC_x86_64_unknown_linux_gnu:-}" ] || [ "$(uname -s)" = Linux ] || { echo 'cargo-lint-cross needs the linux-cross C toolchain; run: bun run check:linux' >&2; exit 2; }`;
+/**
+ * What the cross lint prints when it refuses to compile outside the linux-cross
+ * toolchain: on a Darwin cache miss this line, and only this line, means the
+ * key missed. The managed pre-push hook reads its output for exactly this text
+ * to tell a miss from any other Nx failure.
+ */
+export const CARGO_CROSS_LINT_REFUSAL = 'cargo-lint-cross needs the linux-cross C toolchain; run: bun run check:linux';
+
+const CARGO_CROSS_LINT_GUARD = `[ -n "\${CC_x86_64_unknown_linux_gnu:-}" ] || [ "$(uname -s)" = Linux ] || { echo '${CARGO_CROSS_LINT_REFUSAL}' >&2; exit 2; }`;
 
 /**
  * The prefix `cargoFrozen` writes. Exported so target inference can recognize

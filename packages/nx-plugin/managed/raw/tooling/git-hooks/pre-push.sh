@@ -8,17 +8,21 @@
 # repository so the guard never publishes what it guards; with none
 # configured the check passes silently.
 #
-# 2. The macOS-only Linux cross-compile gate. It is a cache PROBE and nothing
-# else: it reads the nx cache and never compiles. A hit means a real
-# `cargo clippy --target x86_64-unknown-linux-gnu` already passed for exactly
-# this tree, so the push is safe with no toolchain present. Anything else
-# refuses the push and names the one command that fixes it.
+# 2. The macOS-only Linux cross-compile gate. It asks Nx for cargo-lint-cross,
+# whose hit means a real `cargo clippy --target x86_64-unknown-linux-gnu`
+# already passed for exactly this tree, so the push is safe with no toolchain
+# present. The cross target itself never compiles here: on a miss its guard
+# refuses. Its dependencies are ordinary Nx tasks whose outputs the cross key
+# reads, so Nx restores them from the cache or, for a tree no gate ran, builds
+# them. A refusal names the one command that fixes it; any other Nx failure is
+# said as that, never as a cache miss.
 #
-# Why probe-only. The cross-clippy needs the linux-cross C toolchain, which
-# lives in a devenv profile. A hook that entered that profile spent minutes
-# compiling on a push the user expected to take a second, and it did so in an
-# environment they never asked for. Pushing is not the place to discover that
-# the tree has not been compiled for Linux; `bun run check:linux` is.
+# Why the cross target never compiles here. The cross-clippy needs the
+# linux-cross C toolchain, which lives in a devenv profile. A hook that entered
+# that profile spent minutes compiling on a push the user expected to take a
+# second, and it did so in an environment they never asked for. Pushing is not
+# the place to discover that the tree has not been compiled for Linux: the land
+# gate, or `bun run check:linux`, is.
 #
 # CC_x86_64_unknown_linux_gnu is unset for the probe deliberately. The target's
 # own guard reads it to decide whether the toolchain is present, so leaving it
@@ -63,18 +67,33 @@ case "$(uname -s)" in
   *) exit 0 ;;
 esac
 
-if env -u CC_x86_64_unknown_linux_gnu nx run-many -t cargo-lint-cross --output-style=static; then
-  exit 0
-fi
+# The guard's refusal (nx-plugin cross-check-policy.ts CARGO_CROSS_LINT_REFUSAL)
+# is the one line that means the key missed. Nx exits 1 for every task failure,
+# so the hook reads the output for it rather than guessing from the status.
+output=$(mktemp "${TMPDIR:-/tmp}/pre-push-cross.XXXXXX") || exit 1
+trap 'rm -f "$output"' EXIT
+set -o pipefail
+env -u CC_x86_64_unknown_linux_gnu nx run-many -t cargo-lint-cross --output-style=static 2>&1 | tee "$output"
+status=$?
+[ "$status" -eq 0 ] && exit 0
 
-cat >&2 <<'EOF'
+if grep -qF 'cargo-lint-cross needs the linux-cross C toolchain; run: bun run check:linux' "$output"; then
+  cat >&2 <<'EOF'
 
 pre-push: the Linux cross-compile check is NOT cached for this tree, so this
-push would ship code that has never been compiled for Linux. This hook only
-reads the cache; it does not build. The "needs the linux-cross C toolchain"
-line above is the probe refusing to compile, not a broken toolchain.
+push would ship code that has never been compiled for Linux. The "needs the
+linux-cross C toolchain" line above is the cross target refusing to compile
+here, not a broken toolchain.
 
   Run:  bun run check:linux
   Wait for it to pass, then push again.
 EOF
+else
+  cat >&2 <<EOF
+
+pre-push: Nx failed (exit $status) before the Linux cross-compile check reached
+a cache verdict; the output above names why. This is not a cache miss, and
+bun run check:linux will not fix it.
+EOF
+fi
 exit 1
