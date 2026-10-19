@@ -16,6 +16,7 @@ import {
 import type { BoundedExecBounds } from './schema.js';
 import {
   type BoundedExecVerdict,
+  describeVerdict,
   failedTasksOfRun,
   JUNIT_FILE,
   judgeOperationalFailure,
@@ -183,8 +184,40 @@ describe('bounded-exec verdicts', () => {
         elapsedMs: 900,
         expiry: { kind: 'idle', limitMs: 400, tests: ['nt tests::hangs'] },
         report,
+        noSpace: null,
       }),
     ).toEqual({ outcome: 'wedged', idleMs: 400, elapsedMs: 900, tests: ['nt tests::hangs', 'nt tests::young'] });
+  });
+
+  it('records a failed run whose output said ENOSPC as out of space, ahead of the tests and the bound that followed', () => {
+    // From a downstream land gate: a 1 KB write into the task's RAM lease failed, and two tests failed on it.
+    const noSpace = {
+      line: 'ENOSPC: no space left on device, write',
+      volume: {
+        lease: '/Volumes/smoo-ram2-502/37738-AadRCN',
+        mountpoint: '/Volumes/smoo-ram2-502',
+        capacityBytes: 8 * 1024 ** 3,
+        freeBytes: 4096,
+      },
+    };
+    const report = { timedOut: [], cancelled: [], failed: ['lsp-differential hover'] };
+    const ran = { exitCode: 1, elapsedMs: 11_580, expiry: null, report, noSpace };
+    expect(judgeRun(ran)).toEqual({ outcome: 'no-space', exitCode: 1, tests: ['lsp-differential hover'], ...noSpace });
+    // A full disk that then hung the run is still the disk.
+    const idle = { kind: 'idle', limitMs: 400, tests: ['nt tests::writes'] } as const;
+    expect(judgeRun({ ...ran, exitCode: 143, expiry: idle, report: null })).toEqual({
+      outcome: 'no-space',
+      exitCode: 143,
+      tests: [],
+      ...noSpace,
+    });
+    // A passing run that printed it, as a test of ENOSPC handling does, passed.
+    expect(judgeRun({ ...ran, exitCode: 0, report: null })).toEqual({ outcome: 'passed' });
+    expect(describeVerdict(judgeRun(ran))).toBe(
+      'ENOSPC (no space left on device): the command printed "ENOSPC: no space left on device, write"; its TMPDIR ' +
+        '/Volumes/smoo-ram2-502/37738-AadRCN is on the RAM temp volume /Volumes/smoo-ram2-502, which had 0.0 MiB free ' +
+        'of 8192.0 MiB when that line arrived; the tests that then failed: lsp-differential hover',
+    );
   });
 
   it('records a failing command with no report as a failure, and a passing one as passed', async () => {
@@ -242,7 +275,7 @@ ${abort('t::crash', '11 (SIGSEGV)')}
   it('records a run its ceiling stopped as a bound when the only failures are the tests the stop aborted', () => {
     const total = { kind: 'total', limitMs: 120_000 } as const;
     const cut = { timedOut: [], cancelled: ['nt t::cut'], failed: [] };
-    expect(judgeRun({ exitCode: 143, elapsedMs: 120_850, expiry: total, report: cut })).toEqual({
+    expect(judgeRun({ exitCode: 143, elapsedMs: 120_850, expiry: total, report: cut, noSpace: null })).toEqual({
       outcome: 'bound',
       bound: 'total',
       limitMs: 120_000,
@@ -250,9 +283,15 @@ ${abort('t::crash', '11 (SIGSEGV)')}
     });
     // An assertion that failed before the ceiling is still a failure, and an abort nobody asked for is one too.
     expect(
-      judgeRun({ exitCode: 143, elapsedMs: 120_850, expiry: total, report: { ...cut, failed: ['nt t::assert'] } }),
+      judgeRun({
+        exitCode: 143,
+        elapsedMs: 120_850,
+        expiry: total,
+        report: { ...cut, failed: ['nt t::assert'] },
+        noSpace: null,
+      }),
     ).toEqual({ outcome: 'failed', exitCode: 143, tests: ['nt t::assert'] });
-    expect(judgeRun({ exitCode: 143, elapsedMs: 850, expiry: null, report: cut })).toEqual({
+    expect(judgeRun({ exitCode: 143, elapsedMs: 850, expiry: null, report: cut, noSpace: null })).toEqual({
       outcome: 'failed',
       exitCode: 143,
       tests: ['nt t::cut'],
@@ -263,7 +302,13 @@ ${abort('t::crash', '11 (SIGSEGV)')}
     const cancelled = ['nt t::cut'];
     // Exit 0 with an abort in the report: the abort is still not nothing.
     expect(
-      judgeRun({ exitCode: 0, elapsedMs: 850, expiry: null, report: { timedOut: [], cancelled, failed: [] } }),
+      judgeRun({
+        exitCode: 0,
+        elapsedMs: 850,
+        expiry: null,
+        report: { timedOut: [], cancelled, failed: [] },
+        noSpace: null,
+      }),
     ).toEqual({
       outcome: 'failed',
       exitCode: 0,
@@ -276,6 +321,7 @@ ${abort('t::crash', '11 (SIGSEGV)')}
         elapsedMs: 850,
         expiry: null,
         report: { timedOut: ['nt t::slow'], cancelled, failed: [] },
+        noSpace: null,
       }),
     ).toEqual({ outcome: 'failed', exitCode: 100, tests: cancelled });
     // With the total bound fired, the same report is the bound's own casualties.
@@ -285,6 +331,7 @@ ${abort('t::crash', '11 (SIGSEGV)')}
         elapsedMs: 120_850,
         expiry: { kind: 'total', limitMs: 120_000 },
         report: { timedOut: ['nt t::slow'], cancelled, failed: [] },
+        noSpace: null,
       }),
     ).toMatchObject({ outcome: 'bound', bound: 'total' });
   });

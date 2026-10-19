@@ -23,6 +23,7 @@ import {
 } from './cpu-tokens.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
+import { createNoSpaceWatch } from './no-space.js';
 import { createRunProgress, withProgressReport } from './progress.js';
 import {
   COWSHED_EXECUTABLE_ENV,
@@ -38,11 +39,13 @@ import {
   type BoundedExecRecord,
   type BoundedExecTask,
   clearTaskDirectory,
+  describeNoSpace,
   type ExpiredBound,
   JUNIT_FILE,
   JUNIT_REPORT_ENV,
   judgeOperationalFailure,
   judgeRun,
+  type NoSpaceSighting,
   readJunitReport,
   taskDirectory,
   withJunitReport,
@@ -92,6 +95,8 @@ interface RunState {
   forceKillNeeded: boolean;
   /** The sub-pool's close error when it did not close cleanly: the run fails. */
   poolCloseError: string | null;
+  /** The first output line that said ENOSPC, with the task's volume read when it arrived. */
+  noSpace: Promise<NoSpaceSighting> | null;
 }
 
 type GrantedTokens = Extract<TokenGrant, { granted: true }>;
@@ -101,7 +106,7 @@ export interface ProcessTreeKiller {
 }
 
 /** Where the command's TMPDIR comes from; `null` leaves the inherited one. */
-export type TempVolume = Pick<RamTempVolume, 'acquire' | 'release' | 'fullness' | 'reap'>;
+export type TempVolume = Pick<RamTempVolume, 'acquire' | 'release' | 'fullness' | 'space' | 'reap'>;
 
 /** Workspace-provided cowshed launchers, in the order a workspace that provides one names them. */
 const WORKSPACE_COWSHED_LAUNCHERS = [
@@ -248,6 +253,7 @@ export async function runBoundedExec(
     expiry: null,
     forceKillNeeded: false,
     poolCloseError: null,
+    noSpace: null,
   };
   const appendStdout = (chunk: Buffer | string): void => {
     const text = chunk.toString();
@@ -377,6 +383,7 @@ export async function runBoundedExec(
     expiry: ExpiredBound | null,
     elapsedMs: number,
     operational: boolean,
+    noSpace: NoSpaceSighting | null,
   ): Promise<void> => {
     if (context.record === undefined) {
       return;
@@ -385,7 +392,7 @@ export async function runBoundedExec(
     const report = await readJunitReport(recordDirectory);
     const verdict = operational
       ? judgeOperationalFailure(exitCode, report)
-      : judgeRun({ exitCode, elapsedMs, expiry, report });
+      : judgeRun({ exitCode, elapsedMs, expiry, report, noSpace });
     if (verdict.outcome === 'bound' && verdict.bound === 'test') {
       appendStderr(`Every failing test failed only on its per-test timeout: ${verdict.tests.join(', ')}\n`);
     }
@@ -396,7 +403,7 @@ export async function runBoundedExec(
     appendStderr(message);
     await releaseCpu();
     await releaseLease();
-    await recordRun(1, null, Date.now() - asked, false);
+    await recordRun(1, null, Date.now() - asked, false, null);
     return { success: false, terminalOutput: outputChunks.join('') };
   };
   if (parentRefusal !== null) {
@@ -461,6 +468,13 @@ export async function runBoundedExec(
 
   // Progress is a finished test, not output: a runner's SLOW warnings and a hung test's heartbeat keep printing.
   const progress = createRunProgress();
+  // A write that found no space is said once, in the output, by whatever made it; the volume is read when it is said,
+  // since the writer usually removes what it half-wrote before it exits and the volume no longer looks full by then.
+  const noSpace = createNoSpaceWatch();
+  const sight = async (line: string): Promise<NoSpaceSighting> => {
+    const held = lease;
+    return { line, volume: held === null ? null : ((await tempVolume?.space(held)) ?? null) };
+  };
   let idleTimer: NodeJS.Timeout | undefined;
   let captureTimer: NodeJS.Timeout | undefined;
   let idleCapture: { expiresAtMs: number; controller: AbortController; result: IdleDiagnosticResult } | undefined;
@@ -569,11 +583,15 @@ export async function runBoundedExec(
   child.stdout?.on('data', (chunk: Buffer | string) => {
     const text = chunk.toString();
     if (progress.scan('stdout', text)) armIdleTimer();
+    const said = noSpace.scan('stdout', text);
+    if (said !== null) state.noSpace = sight(said);
     appendStdout(text);
   });
   child.stderr?.on('data', (chunk: Buffer | string) => {
     const text = chunk.toString();
     if (progress.scan('stderr', text)) armIdleTimer();
+    const said = noSpace.scan('stderr', text);
+    if (said !== null) state.noSpace = sight(said);
     appendStderr(text);
   });
 
@@ -752,17 +770,24 @@ export async function runBoundedExec(
     appendStderr(`Timed out command exited after graceful termination: ${command}\n`);
   }
 
-  // A test that dies of ENOSPC rarely says where it was writing; the volume can.
-  const full = code !== 0 && lease !== null ? await tempVolume?.fullness(lease) : null;
-  if (full) {
-    appendStderr(`${describeRamTempError(full)}\n`);
+  // ENOSPC said in the output names the writer's volume as it stood then. Without it, a volume still (nearly) full now
+  // is the likely cause, and the volume is named.
+  const seen = state.noSpace === null ? null : await state.noSpace;
+  if (seen !== null && (code !== 0 || state.expiry !== null)) {
+    const writer = context.record?.task.id;
+    appendStderr(`${writer === undefined ? '' : `${writer}: `}${describeNoSpace(seen)}\n`);
+  } else {
+    const full = code !== 0 && lease !== null ? await tempVolume?.fullness(lease) : null;
+    if (full) {
+      appendStderr(`${describeRamTempError(full)}\n`);
+    }
   }
   await releaseLease();
 
   // A run whose sub-pool did not close cleanly fails even when the command exited 0, and whatever bound also fired:
   // its verdict is an ordinary failure, never a bound.
   const operationalFailure = state.poolCloseError !== null;
-  await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure);
+  await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen);
 
   return {
     success: !operationalFailure && state.expiry === null && code === 0,

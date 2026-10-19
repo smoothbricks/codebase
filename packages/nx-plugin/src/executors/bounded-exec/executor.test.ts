@@ -19,8 +19,9 @@ import {
   type TempVolume,
 } from './executor.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
+import { createNoSpaceWatch } from './no-space.js';
 import type { RamTempAcquisition, RamTempError, RamTempLease, Result } from './ram-temp.js';
-import { VERDICT_FILE } from './verdict.js';
+import { readRecord, type TempVolumeSpace, VERDICT_FILE } from './verdict.js';
 
 const workspaces: string[] = [];
 const ownedProcessGroups = new Set<number>();
@@ -870,6 +871,48 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(volume.released).toEqual([directory]);
   });
 
+  it('names ENOSPC, its writer and the volume as it stood when the output said so, not after the command exited', async () => {
+    // From a downstream land gate: a compiler test shard printed ENOSPC for a 1 KB write into its lease and failed two.
+    // By its exit the volume had space again (`fullness` answers null here), so a probe after exit named nothing and
+    // the run read as two failed tests.
+    const workspace = await createWorkspace();
+    const directory = join(workspace.root, 'lease');
+    await mkdir(directory);
+    const lease = leaseAt(directory);
+    const space = { lease: directory, mountpoint: workspace.root, capacityBytes: lease.capacityBytes, freeBytes: 4096 };
+    const volume = scriptedVolume(
+      { ok: true, value: { kind: 'leased', lease, held: [], reaped: [] } },
+      null,
+      [],
+      space,
+    );
+    const record = { task: { id: 'compiler:test-10', hash: 'h' }, directory: join(workspace.root, 'record') };
+    const line = 'ENOSPC: no space left on device, write';
+
+    const result = await runBoundedExec(
+      { command: `node -e "console.error('${line}'); process.exit(1)"`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+      { ...workspace.context, record },
+      createProcessTreeKiller(),
+      volume,
+      null,
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain(
+      `compiler:test-10: ENOSPC (no space left on device): the command printed "${line}"; its TMPDIR ` +
+        `${directory} is on the RAM temp volume ${workspace.root}, which had 0.0 MiB free of 1024.0 MiB when that ` +
+        'line arrived\n',
+    );
+    expect(result.terminalOutput).not.toContain('is full:');
+    expect(await readRecord(record.directory)).toEqual({
+      task: record.task.id,
+      hash: 'h',
+      verdict: { outcome: 'no-space', exitCode: 1, tests: [], line, volume: space },
+    });
+    // Read while the lease was still the task's, before it was reaped and released.
+    expect(volume.order).toEqual(['space', `reap ${directory}`, `release ${directory}`]);
+  });
+
   it('keeps inherited nextest and Cargo ceilings under oversized grants', async () => {
     const previousNextest = process.env.NEXTEST_TEST_THREADS;
     const previousCargo = process.env.CARGO_BUILD_JOBS;
@@ -1422,6 +1465,25 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
   });
 });
 
+describe('createNoSpaceWatch', () => {
+  it("finds nextest's ENOSPC split across chunks, past colour codes, and reports it once", () => {
+    // nextest's own report of a failed archive extraction into a full RAM lease, from a downstream land gate.
+    const watch = createNoSpaceWatch();
+    expect(watch.scan('stderr', 'Caused by:\n  No space left')).toBeNull();
+    expect(watch.scan('stdout', ' on device (os error 28)\n')).toBeNull();
+    expect(watch.scan('stderr', ' on device \u001b[1m(os error 28)\u001b[0m\nCommand exited')).toBe(
+      'No space left on device (os error 28)',
+    );
+    expect(watch.scan('stderr', 'ENOSPC: no space left on device, write\n')).toBeNull();
+  });
+
+  it("finds Bun's errno name, and not a word that merely contains it", () => {
+    const watch = createNoSpaceWatch();
+    expect(watch.scan('stdout', 'XENOSPCY is not an errno\n')).toBeNull();
+    expect(watch.scan('stdout', '    code: "ENOSPC"\n')).toBe('code: "ENOSPC"');
+  });
+});
+
 interface WorkspaceFixture {
   root: string;
   context: BoundedExecContext;
@@ -1518,11 +1580,12 @@ function leaseAt(directory: string): RamTempLease {
   return { directory, mountpoint: dirname(directory), capacityBytes: 1024 * 1024 * 1024 };
 }
 
-/** A temp volume whose answers are fixed, recording which leases were reaped and released, in order. */
+/** A temp volume whose answers are fixed, recording which leases were reaped and released, and when space was read. */
 function scriptedVolume(
   acquisition: Result<RamTempAcquisition, RamTempError>,
   full: RamTempError | null = null,
   leftovers: string[] = [],
+  space: TempVolumeSpace | null = null,
 ): TempVolume & { released: string[]; order: string[] } {
   const released: string[] = [];
   const order: string[] = [];
@@ -1540,6 +1603,10 @@ function scriptedVolume(
       return Promise.resolve({ ok: true, value: undefined });
     },
     fullness: () => Promise.resolve(full),
+    space() {
+      order.push('space');
+      return Promise.resolve(space);
+    },
   };
 }
 

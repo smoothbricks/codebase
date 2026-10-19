@@ -12,6 +12,9 @@ import { join } from 'node:path';
  *   tests, so this is a hang, not a slow host, and the fix is the opposite one, so it is never a `bound`. It names
  *   the tests still running: those the runner said were running and never said finished, and those its report says
  *   it aborted when the bound stopped it.
+ * - `no-space`: the run failed and its output said a write found no space (ENOSPC). Whatever its tests then reported,
+ *   they failed on the disk, not on their own: the verdict names the line that said so and, when the task held one,
+ *   its RAM temp volume as it stood when that line arrived.
  * - `failed`: anything else that did not pass. That includes an assertion named in the report,
  *   or a non-zero exit with no report to say why.
  */
@@ -25,7 +28,22 @@ export type BoundedExecVerdict =
       readonly elapsedMs: number;
       readonly tests: readonly string[];
     }
+  | ({ readonly outcome: 'no-space'; readonly exitCode: number; readonly tests: readonly string[] } & NoSpaceSighting)
   | { readonly outcome: 'failed'; readonly exitCode: number; readonly tests: readonly string[] };
+
+/** The task's RAM temp volume, read when a line saying ENOSPC arrived: the writer's own lease, and the space left. */
+export interface TempVolumeSpace {
+  readonly lease: string;
+  readonly mountpoint: string;
+  readonly capacityBytes: number;
+  readonly freeBytes: number;
+}
+
+/** The first output line that said a write found no space, and the task's RAM temp volume then; `null` without one. */
+export interface NoSpaceSighting {
+  readonly line: string;
+  readonly volume: TempVolumeSpace | null;
+}
 
 /** One task's verdict, keyed by the Nx task and the hash it ran at. */
 export interface BoundedExecRecord {
@@ -184,14 +202,23 @@ export interface RunEnd {
   readonly expiry: ExpiredBound | null;
   /** The run's report, or `null` when the command was asked for none or wrote none. */
   readonly report: JunitFailures | null;
+  /** The first output line that said ENOSPC, or `null` when none did. */
+  readonly noSpace: NoSpaceSighting | null;
 }
 
 /**
- * Judge a run. A test that failed on its own is a failure even when a bound fired too, and the no-progress bound is
- * never load: the report's assertions and the idle bound are read first. A test the runner aborted because the total
- * bound told its command to stop is not one that failed; one it aborted at the idle bound is a test still running.
+ * Judge a run. A run that failed after its output said ENOSPC failed on the disk: that is read first, ahead of the
+ * tests it then failed, a bound it then hit or a hang the full disk caused; a passing run that printed it (a test of
+ * its own ENOSPC handling) passed. A test that failed on its own is a failure even when a bound fired too, and the
+ * no-progress bound is never load: the report's assertions and the idle bound are read next. A test the runner aborted
+ * because the total bound told its command to stop is not one that failed; one it aborted at the idle bound is a test
+ * still running.
  */
 export function judgeRun(run: RunEnd): BoundedExecVerdict {
+  if (run.noSpace !== null && (run.exitCode !== 0 || run.expiry !== null)) {
+    const tests = run.report === null ? [] : [...run.report.failed, ...run.report.timedOut, ...run.report.cancelled];
+    return { outcome: 'no-space', exitCode: run.exitCode === 0 ? 1 : run.exitCode, tests, ...run.noSpace };
+  }
   if (run.expiry?.kind === 'idle') {
     const tests = [...new Set([...run.expiry.tests, ...(run.report?.cancelled ?? [])])];
     return { outcome: 'wedged', idleMs: run.expiry.limitMs, elapsedMs: run.elapsedMs, tests };
@@ -352,6 +379,19 @@ function parseVerdict(value: unknown): BoundedExecVerdict {
           return { outcome: 'wedged', idleMs: value.idleMs, elapsedMs: value.elapsedMs, tests: value.tests };
         }
         break;
+      case 'no-space': {
+        const volume = parseTempVolumeSpace(value.volume);
+        if (typeof value.exitCode === 'number' && isStrings(value.tests) && typeof value.line === 'string' && volume) {
+          return {
+            outcome: 'no-space',
+            exitCode: value.exitCode,
+            tests: value.tests,
+            line: value.line,
+            volume: volume.value,
+          };
+        }
+        break;
+      }
       case 'failed':
         if (typeof value.exitCode === 'number' && isStrings(value.tests)) {
           return { outcome: 'failed', exitCode: value.exitCode, tests: value.tests };
@@ -360,6 +400,24 @@ function parseVerdict(value: unknown): BoundedExecVerdict {
     }
   }
   throw new Error(`not a bounded-exec verdict: ${JSON.stringify(value)}`);
+}
+
+/** A recorded volume, wrapped so a well-formed `null` (no RAM volume) differs from a malformed one (`undefined`). */
+function parseTempVolumeSpace(value: unknown): { value: TempVolumeSpace | null } | undefined {
+  if (value === null) {
+    return { value: null };
+  }
+  if (
+    isObject(value) &&
+    typeof value.lease === 'string' &&
+    typeof value.mountpoint === 'string' &&
+    typeof value.capacityBytes === 'number' &&
+    typeof value.freeBytes === 'number'
+  ) {
+    const { lease, mountpoint, capacityBytes, freeBytes } = value;
+    return { value: { lease, mountpoint, capacityBytes, freeBytes } };
+  }
+  return undefined;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -425,9 +483,26 @@ export function describeVerdict(verdict: BoundedExecVerdict): string {
           ? `still running: ${verdict.tests.join(', ')}`
           : 'the runner named no test still running'
       }`;
+    case 'no-space':
+      return `${describeNoSpace(verdict)}${verdict.tests.length > 0 ? `; the tests that then failed: ${verdict.tests.join(', ')}` : ''}`;
     case 'failed':
       return verdict.tests.length > 0
         ? `failed: ${verdict.tests.join(', ')}`
         : `exited ${verdict.exitCode} with no report naming a timeout`;
   }
+}
+
+/**
+ * What a run's output said about a write that found no space, and where the run's temp files lived then. The free
+ * space is read when the line arrives, not after the command exits: by then a writer that failed has usually removed
+ * its half-written files and the volume no longer looks full.
+ */
+export function describeNoSpace(sighting: NoSpaceSighting): string {
+  const said = `ENOSPC (no space left on device): the command printed ${JSON.stringify(sighting.line)}`;
+  const volume = sighting.volume;
+  if (volume === null) {
+    return `${said}; it held no RAM temp volume, so the full disk is the one that line's writer wrote to`;
+  }
+  const mib = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
+  return `${said}; its TMPDIR ${volume.lease} is on the RAM temp volume ${volume.mountpoint}, which had ${mib(volume.freeBytes)} MiB free of ${mib(volume.capacityBytes)} MiB when that line arrived`;
 }
