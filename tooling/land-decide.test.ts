@@ -33,20 +33,22 @@ describe('workspaceArgument', () => {
 });
 
 describe('envrcVerdict', () => {
-  it('allows a byte-identical .envrc whatever direnv reports', () => {
-    expect(envrcVerdict(true, '')).toBe('allow');
-    expect(envrcVerdict(true, 'Found RC allowed 1')).toBe('allow');
-  });
+  // A byte-identical .envrc is allowed whatever direnv reports; a differing one is approved only when direnv reports
+  // it approved as a whole line, and refused otherwise.
+  const cases: readonly (readonly [sameBytes: boolean, direnvStatus: string, verdict: string])[] = [
+    [true, '', 'allow'],
+    [true, 'Found RC allowed 1', 'allow'],
+    [false, 'loading\nFound RC allowed 0\n', 'approved'],
+    [false, 'Found RC allowed 0', 'approved'],
+    [false, 'Found RC allowed 1', 'refuse'],
+    [false, 'xFound RC allowed 0', 'refuse'],
+    [false, '', 'refuse'],
+  ];
 
-  it('approves a differing .envrc only when direnv reports it approved as a whole line', () => {
-    expect(envrcVerdict(false, 'loading\nFound RC allowed 0\n')).toBe('approved');
-    expect(envrcVerdict(false, 'Found RC allowed 0')).toBe('approved');
-  });
-
-  it('refuses a differing .envrc that direnv has not approved', () => {
-    expect(envrcVerdict(false, 'Found RC allowed 1')).toBe('refuse');
-    expect(envrcVerdict(false, 'xFound RC allowed 0')).toBe('refuse');
-    expect(envrcVerdict(false, '')).toBe('refuse');
+  it('allows identical bytes, approves only a whole-line direnv approval, and refuses the rest', () => {
+    for (const [sameBytes, direnvStatus, verdict] of cases) {
+      expect(envrcVerdict(sameBytes, direnvStatus), JSON.stringify([sameBytes, direnvStatus])).toBe(verdict);
+    }
   });
 });
 
