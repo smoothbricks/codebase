@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'bun:test';
-import { afterLand, afterRebase, envrcVerdict, fenceReason, workspaceArgument } from './land-decide.ts';
+import {
+  afterLand,
+  afterRebase,
+  type EnvrcVerdict,
+  envrcVerdict,
+  fenceReason,
+  workspaceArgument,
+} from './land-decide.ts';
 import { PRE_REWRITE_MAIN, verdictFromRevList } from './land-history.ts';
 
 // These cases are the decisions land-host.test.ts reaches only through a spawned script. Each one is a plain call,
@@ -35,7 +42,7 @@ describe('workspaceArgument', () => {
 describe('envrcVerdict', () => {
   // A byte-identical .envrc is allowed whatever direnv reports; a differing one is approved only when direnv reports
   // it approved as a whole line, and refused otherwise.
-  const cases: readonly (readonly [sameBytes: boolean, direnvStatus: string, verdict: string])[] = [
+  const cases: readonly (readonly [sameBytes: boolean, direnvStatus: string, verdict: EnvrcVerdict])[] = [
     [true, '', 'allow'],
     [true, 'Found RC allowed 1', 'allow'],
     [false, 'loading\nFound RC allowed 0\n', 'approved'],
