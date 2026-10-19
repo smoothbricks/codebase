@@ -459,13 +459,13 @@ export type CpuBackgroundStake = {
    */
   readonly held: number & tags.Type<'uint64'>;
   /**
-   * Background runners waiting for a grant.
-   */
-  readonly waiting: number & tags.Type<'uint64'>;
-  /**
    * Its granted leases, one per background runner holding tokens, the oldest grant first.
    */
   readonly holders: ReadonlyArray<CpuHolder>;
+  /**
+   * Its background requests waiting for a grant, in the order it serves them.
+   */
+  readonly waiters: ReadonlyArray<CpuWaiter>;
 };
 
 /**
@@ -532,7 +532,7 @@ export type CpuGateJob = {
 };
 
 /**
- * One waiting gate-class request.
+ * One waiting gate-class request: the gate job it serves, and the request itself.
  */
 export type CpuGateWaiter = {
   readonly checkout: string;
@@ -541,9 +541,21 @@ export type CpuGateWaiter = {
    */
   readonly job: number & tags.Type<'uint64'>;
   /**
+   * The client process, when its socket named one.
+   */
+  readonly pid?: number & tags.Type<'int32'>;
+  /**
+   * What the client said the tokens are for.
+   */
+  readonly command: string;
+  /**
    * The tokens it asked for.
    */
   readonly want: number & tags.Type<'uint64'>;
+  /**
+   * Milliseconds since it asked.
+   */
+  readonly waitedMs: number & tags.Type<'uint64'>;
 };
 
 /**
@@ -602,6 +614,30 @@ export type CpuMillis = number & tags.Type<'uint64'> & tags.Maximum<900719925474
 export type CpuTotals = {
   readonly userUs: CpuMicros;
   readonly sysUs: CpuMicros;
+};
+
+/**
+ * One waiting request, as the ledger knows it: the client that asked, what for, how many
+ * tokens, and since when. Every entry is one connection: a gate job whose tasks all wait is one
+ * entry per task, told apart by pid, command and age.
+ */
+export type CpuWaiter = {
+  /**
+   * The client process, when its socket named one.
+   */
+  readonly pid?: number & tags.Type<'int32'>;
+  /**
+   * What the client said the tokens are for.
+   */
+  readonly command: string;
+  /**
+   * The tokens it asked for.
+   */
+  readonly want: number & tags.Type<'uint64'>;
+  /**
+   * Milliseconds since it asked.
+   */
+  readonly waitedMs: number & tags.Type<'uint64'>;
 };
 
 export type CredentialReport = {
@@ -1413,7 +1449,7 @@ export type JobVolumeUsage = {
 /**
  * Root jobserver admission class. Only a live grant, not an environment marker, admits a gate.
  */
-export type JobserverClass = 'background' | 'gate';
+export type JobserverClass = 'background' | 'gate' | 'resident';
 
 /**
  * One Nx task that missed the cache when a land re-ran its check in the target on the adopted

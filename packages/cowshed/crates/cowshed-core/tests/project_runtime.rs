@@ -2524,11 +2524,16 @@ impl cowshed_core::runtime::job_cpu::JobCpuAdmission for GrantingCpu {
         >,
     > {
         Box::pin(async move {
-            Ok(cowshed_core::runtime::job_cpu::JobCpuGrant::new(
-                ask.want,
-                PathBuf::from("/nonexistent/cowshed-test-cpu-pool.sock"),
-                Box::new(()),
-            ))
+            let pool = PathBuf::from("/nonexistent/cowshed-test-cpu-pool.sock");
+            Ok(match ask.class {
+                cowshed_core::api::JobserverClass::Resident => {
+                    cowshed_core::runtime::job_cpu::JobCpuGrant::resident(pool, Box::new(()))
+                }
+                cowshed_core::api::JobserverClass::Background
+                | cowshed_core::api::JobserverClass::Gate => {
+                    cowshed_core::runtime::job_cpu::JobCpuGrant::new(ask.want, pool, Box::new(()))
+                }
+            })
         })
     }
 }

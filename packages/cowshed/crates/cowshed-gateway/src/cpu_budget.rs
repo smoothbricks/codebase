@@ -34,11 +34,12 @@ use std::time::{Duration, Instant};
 
 use cowshed_gateway_types::{
     CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
-    JobserverClass,
+    CpuWaiter,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use crate::disk_lease::{Claim, Ticket};
+use crate::jobserver::JobserverAdmission;
 
 /// How many tokens the host has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,7 +99,7 @@ pub(crate) enum Effect {
 #[derive(Debug)]
 struct Waiter {
     ticket: Ticket,
-    class: JobserverClass,
+    class: JobserverAdmission,
     /// The job that ranks it: the gate job it serves, or its own ticket.
     job: Ticket,
     /// The count asked for, as asked.
@@ -119,7 +120,7 @@ impl Waiter {
 #[derive(Debug)]
 struct Holder {
     ticket: Ticket,
-    class: JobserverClass,
+    class: JobserverAdmission,
     job: Ticket,
     tokens: usize,
     want: usize,
@@ -330,7 +331,7 @@ impl Ledger {
                     .iter()
                     .enumerate()
                     .filter(|(_, holder)| {
-                        holder.class == JobserverClass::Background && holder.short()
+                        holder.class == JobserverAdmission::Background && holder.short()
                     })
                     .map(move |(index, holder)| (name, index, holder))
             })
@@ -362,7 +363,7 @@ impl Ledger {
                     .waiting
                     .iter()
                     .enumerate()
-                    .filter(|(_, waiter)| waiter.class == JobserverClass::Gate)
+                    .filter(|(_, waiter)| waiter.class == JobserverAdmission::Gate)
                     .map(move |(position, waiter)| {
                         let key = (waiter.job, GateStep::Start, waiter.ticket);
                         (key, name, position, waiter.want.min(free))
@@ -371,7 +372,9 @@ impl Ledger {
                     .running
                     .iter()
                     .enumerate()
-                    .filter(|(_, holder)| holder.class == JobserverClass::Gate && holder.short())
+                    .filter(|(_, holder)| {
+                        holder.class == JobserverAdmission::Gate && holder.short()
+                    })
                     .map(move |(index, holder)| {
                         let key = (holder.job, GateStep::Grow, holder.ticket);
                         (key, name, index, (holder.want - holder.tokens).min(free))
@@ -385,32 +388,31 @@ impl Ledger {
                 .flat_map(|checkout| &checkout.running)
         };
         let behind: usize = holders()
-            .filter(|holder| holder.class == JobserverClass::Background || holder.job > head)
+            .filter(|holder| holder.class == JobserverAdmission::Background || holder.job > head)
             .map(|holder| holder.tokens)
             .sum();
         let job_holds = &|job: Ticket| {
-            holders().any(|holder| holder.class == JobserverClass::Gate && holder.job == job)
+            holders().any(|holder| holder.class == JobserverAdmission::Gate && holder.job == job)
         };
         let starved = (2 * (behind + 1) < self.total)
             .then(|| {
                 self.checkouts
                     .iter()
                     .flat_map(|(name, checkout)| {
-                        let background =
-                            (checkout.held == 0)
-                                .then(|| {
-                                    checkout.waiting.iter().enumerate().find(|(_, waiter)| {
-                                        waiter.class == JobserverClass::Background
-                                    })
+                        let background = (checkout.held == 0)
+                            .then(|| {
+                                checkout.waiting.iter().enumerate().find(|(_, waiter)| {
+                                    waiter.class == JobserverAdmission::Background
                                 })
-                                .flatten();
+                            })
+                            .flatten();
                         let younger_gates =
                             checkout
                                 .waiting
                                 .iter()
                                 .enumerate()
                                 .filter(move |(_, waiter)| {
-                                    waiter.class == JobserverClass::Gate
+                                    waiter.class == JobserverAdmission::Gate
                                         && waiter.job > head
                                         && !job_holds(waiter.job)
                                 });
@@ -496,7 +498,7 @@ impl Ledger {
                 checkout
                     .waiting
                     .iter()
-                    .filter(|waiter| waiter.class == JobserverClass::Gate)
+                    .filter(|waiter| waiter.class == JobserverAdmission::Gate)
                     .map(move |waiter| (waiter, name))
             })
             .collect();
@@ -508,25 +510,31 @@ impl Ledger {
             let mut stake = Vec::new();
             for holder in &checkout.running {
                 match holder.class {
-                    JobserverClass::Gate => gate_jobs
+                    JobserverAdmission::Gate => gate_jobs
                         .entry((holder.job, name))
                         .or_default()
                         .push(holder),
-                    JobserverClass::Background => stake.push(holder),
+                    JobserverAdmission::Background => stake.push(holder),
                 }
             }
-            let waiting = checkout
+            let waiters: Vec<CpuWaiter> = checkout
                 .waiting
                 .iter()
-                .filter(|waiter| waiter.class == JobserverClass::Background)
-                .count();
-            if !stake.is_empty() || waiting > 0 {
+                .filter(|waiter| waiter.class == JobserverAdmission::Background)
+                .map(|waiter| CpuWaiter {
+                    pid: waiter.claim.pid,
+                    command: waiter.claim.command.to_string(),
+                    want: waiter.want,
+                    waited_ms: millis_since(waiter.asked, now),
+                })
+                .collect();
+            if !stake.is_empty() || !waiters.is_empty() {
                 let (held, holders) = leases(stake, now);
                 background.push(CpuBackgroundStake {
                     checkout: name.to_string(),
                     held,
-                    waiting,
                     holders,
+                    waiters,
                 });
             }
         }
@@ -552,7 +560,10 @@ impl Ledger {
                 .map(|(waiter, name)| CpuGateWaiter {
                     checkout: name.to_string(),
                     job: waiter.job,
+                    pid: waiter.claim.pid,
+                    command: waiter.claim.command.to_string(),
                     want: waiter.want,
+                    waited_ms: millis_since(waiter.asked, now),
                 })
                 .collect(),
             background,
@@ -572,11 +583,15 @@ fn leases(mut holders: Vec<&Holder>, now: Instant) -> (usize, Vec<CpuHolder>) {
             command: holder.claim.command.to_string(),
             tokens: holder.tokens,
             want: holder.want,
-            held_ms: u64::try_from(now.saturating_duration_since(holder.granted).as_millis())
-                .unwrap_or(u64::MAX),
+            held_ms: millis_since(holder.granted, now),
         })
         .collect();
     (held, holders)
+}
+
+/// Milliseconds from `since` to `now`, as the status reports an age.
+fn millis_since(since: Instant, now: Instant) -> u64 {
+    u64::try_from(now.saturating_duration_since(since).as_millis()).unwrap_or(u64::MAX)
 }
 
 enum Message {
@@ -585,7 +600,7 @@ enum Message {
         checkout: Arc<str>,
         want: NonZeroUsize,
         claim: Claim,
-        class: JobserverClass,
+        class: JobserverAdmission,
         /// The job whose age ranks it.
         job: Ticket,
         granted: oneshot::Sender<usize>,
@@ -682,9 +697,9 @@ impl CpuBudget {
     ) -> (Stake, oneshot::Receiver<usize>) {
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
         let (class, job) = match rank {
-            Rank::Background => (JobserverClass::Background, ticket),
-            Rank::Gate => (JobserverClass::Gate, ticket),
-            Rank::GateTask(JobAge(job)) => (JobserverClass::Gate, job),
+            Rank::Background => (JobserverAdmission::Background, ticket),
+            Rank::Gate => (JobserverAdmission::Gate, ticket),
+            Rank::GateTask(JobAge(job)) => (JobserverAdmission::Gate, job),
         };
         let (granted, receiver) = oneshot::channel();
         let _ = self.messages.send(Message::Ask {
@@ -837,7 +852,7 @@ mod tests {
                 ticket,
                 checkout,
                 want,
-                (JobserverClass::Background, ticket),
+                (JobserverAdmission::Background, ticket),
                 false,
             )
         }
@@ -855,7 +870,7 @@ mod tests {
                 ticket,
                 checkout,
                 want,
-                (JobserverClass::Gate, ticket),
+                (JobserverAdmission::Gate, ticket),
                 false,
             )
         }
@@ -874,7 +889,7 @@ mod tests {
                 ticket,
                 checkout,
                 want,
-                (JobserverClass::Gate, job),
+                (JobserverAdmission::Gate, job),
                 false,
             )
         }
@@ -894,7 +909,7 @@ mod tests {
                 ticket,
                 checkout,
                 want,
-                (JobserverClass::Gate, job),
+                (JobserverAdmission::Gate, job),
                 true,
             )
         }
@@ -912,7 +927,7 @@ mod tests {
                 ticket,
                 checkout,
                 want,
-                (JobserverClass::Background, ticket),
+                (JobserverAdmission::Background, ticket),
                 true,
             )
         }
@@ -923,7 +938,7 @@ mod tests {
             ticket: Ticket,
             checkout: &str,
             want: usize,
-            (class, job): (JobserverClass, Ticket),
+            (class, job): (JobserverAdmission, Ticket),
             grows: bool,
         ) -> Vec<(Ticket, usize)> {
             let now = self.origin + Duration::from_millis(ms);
@@ -996,7 +1011,8 @@ mod tests {
     /// without guessing from the checkout. Measured 2026-10-18: a ledger that said only
     /// `land-test-hang: held 15, running 1` read as an orphan, and a live 34-minute
     /// `cargo test … fleet_coder` was killed by hand. A growth does not renew a lease's age, and
-    /// a waiter is counted, never named as a holder.
+    /// a waiter is named as a waiter -- its pid, command, want and how long it has waited -- never
+    /// as a holder.
     #[test]
     fn the_status_names_each_lease_with_its_pid_command_and_the_age_of_its_grant() {
         let lease = |ticket: Ticket, tokens: usize, want: usize, held_ms: u64| CpuHolder {
@@ -1025,13 +1041,21 @@ mod tests {
             [CpuBackgroundStake {
                 checkout: "shed".into(),
                 held: 7,
-                waiting: 0,
+                waiters: Vec::new(),
                 holders: vec![lease(1, 4, 4, 3_000), lease(3, 3, 8, 1_000)],
             }]
         );
 
         assert_eq!(clock.ask(4_000, 4, "shed", 1), []);
-        assert_eq!(clock.status(4_000).background[0].waiting, 1);
+        assert_eq!(
+            clock.status(4_500).background[0].waiters,
+            [CpuWaiter {
+                pid: Some(7),
+                command: "t4".into(),
+                want: 1,
+                waited_ms: 500,
+            }]
+        );
         // The first lease returns: the waiter starts, then the build grows by what is left.
         assert_eq!(clock.leave(5_000, 1), [(4, 1), (3, 6)]);
         let status = clock.status(9_000);
@@ -1041,7 +1065,7 @@ mod tests {
             [CpuBackgroundStake {
                 checkout: "shed".into(),
                 held: 7,
-                waiting: 0,
+                waiters: Vec::new(),
                 holders: vec![lease(3, 6, 8, 7_000), lease(4, 1, 1, 4_000)],
             }]
         );

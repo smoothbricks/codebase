@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 /// The control operation that asks for CPU tokens.
 pub const CPU_TOKENS_OP: &str = "cpu-tokens";
 pub const JOBSERVER_OP: &str = "jobserver";
+/// The control operation a resident job asks with: a relay pool and no token of its own.
+pub const RESIDENT_POOL_OP: &str = "resident-pool";
 
 /// Root jobserver admission class. Only a live grant, not an environment marker, admits a gate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -32,6 +34,12 @@ pub enum JobserverClass {
     #[default]
     Background,
     Gate,
+    /// A process that stays up to serve requests -- the Nx daemon a shed's supervisor keeps, a
+    /// worker that runs each request it is sent -- and is idle between them. It holds no token
+    /// for its lifetime: its grant is a pool that holds none and asks the host ledger, at
+    /// background class for its checkout, for each descendant that asks it, so a resident costs
+    /// tokens only while a request of its runs (05_gateway.md "A resident holds no token").
+    Resident,
 }
 
 /// The trusted supervisor's existing immutable job identity; never an environment claim.
@@ -86,6 +94,29 @@ impl<'a> JobserverRequest<'a> {
             command,
             class: JobserverClass::Gate,
             pool: true,
+            job,
+        }
+    }
+}
+
+/// What a resident job's supervisor writes: the checkout its descendants' asks are for, what it
+/// runs, and the job identity its pool is scoped by. It names no `want`: a resident asks for no
+/// token. The gateway answers `queued` and then `granted` with `cpuPool` and no `tokens`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentPoolRequest<'a> {
+    op: &'static str,
+    checkout: &'a str,
+    command: &'a str,
+    job: JobserverJob<'a>,
+}
+
+impl<'a> ResidentPoolRequest<'a> {
+    pub const fn new(checkout: &'a str, command: &'a str, job: JobserverJob<'a>) -> Self {
+        Self {
+            op: RESIDENT_POOL_OP,
+            checkout,
+            command,
             job,
         }
     }
@@ -219,10 +250,27 @@ pub struct CpuBackgroundStake {
     pub checkout: String,
     /// Tokens its granted background runners hold: the sum of its holders' tokens.
     pub held: usize,
-    /// Background runners waiting for a grant.
-    pub waiting: usize,
     /// Its granted leases, one per background runner holding tokens, the oldest grant first.
     pub holders: Vec<CpuHolder>,
+    /// Its background requests waiting for a grant, in the order it serves them.
+    pub waiters: Vec<CpuWaiter>,
+}
+
+/// One waiting request, as the ledger knows it: the client that asked, what for, how many
+/// tokens, and since when. Every entry is one connection: a gate job whose tasks all wait is one
+/// entry per task, told apart by pid, command and age.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuWaiter {
+    /// The client process, when its socket named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// What the client said the tokens are for.
+    pub command: String,
+    /// The tokens it asked for.
+    pub want: usize,
+    /// Milliseconds since it asked.
+    pub waited_ms: u64,
 }
 
 /// One granted lease, as the ledger knows it: the client that holds it, what it said the tokens
@@ -245,15 +293,35 @@ pub struct CpuHolder {
     pub held_ms: u64,
 }
 
-/// One waiting gate-class request.
+/// The hold limit: a lease held this long is named first in the gateway's status, by its holder
+/// and age (05_gateway.md "The hold limit"). It is reported, never enforced: a lease is a ledger
+/// entry, not its work's owner, so ending it would return tokens while the work runs on over
+/// budget. What stops a runaway is its own bound.
+pub const HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+impl CpuHolder {
+    /// Whether this lease has been held past [`HOLD_LIMIT`].
+    pub fn past_hold_limit(&self) -> bool {
+        u128::from(self.held_ms) > HOLD_LIMIT.as_millis()
+    }
+}
+
+/// One waiting gate-class request: the gate job it serves, and the request itself.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CpuGateWaiter {
     pub checkout: String,
     /// The gate job it serves, as that job's admission number: the smaller is the older job.
     pub job: u64,
+    /// The client process, when its socket named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// What the client said the tokens are for.
+    pub command: String,
     /// The tokens it asked for.
     pub want: usize,
+    /// Milliseconds since it asked.
+    pub waited_ms: u64,
 }
 
 #[cfg(test)]

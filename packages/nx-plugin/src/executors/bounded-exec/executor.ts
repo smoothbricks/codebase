@@ -313,9 +313,9 @@ export async function runBoundedExec(
   const cores = availableParallelism();
   const demand = runnerDemand(requested, options.parallelism, cores, process.env, options.env);
   const asked = Date.now();
-  // A run a parent's CPU pool lent tokens to takes them there. Only an absent pool leaves the host budget to ask.
-  // A pool that answered and refused still holds tokens of its own: asking the host then would hold them while waiting
-  // on another budget, so the run fails instead.
+  // A run a parent's CPU pool serves takes its tokens there. Only an absent pool leaves the host budget to ask.
+  // A pool that answered and refused is a live budget of its own -- a lent grant, or a gate's or a resident's
+  // relay to the host -- so asking the host beside it would count the run twice; the run fails instead.
   let grant: GrantedTokens | null = null;
   let parentRefusal: string | null = null;
   if (inherited !== null) {

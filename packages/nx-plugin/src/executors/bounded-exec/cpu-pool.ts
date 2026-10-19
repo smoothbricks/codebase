@@ -25,6 +25,7 @@ export const CPU_POOL_ENV = 'BOUNDED_EXEC_CPU_POOL';
 /** An inherited pool descriptor; only a grant from its endpoint proves a live allocation. */
 export interface InheritedCpuPool {
   readonly socket: string;
+  /** The count the parent names beside its endpoint: 0 for a resident's relay pool, which holds no token. */
   readonly tokens: number;
 }
 
@@ -120,11 +121,16 @@ const frame = (reply: CpuPoolReply): string => `${stringifyReply(reply)}\n`;
 
 /**
  * The inherited descriptor, or null when malformed or absent. A missing or bare count, or an empty
- * or NUL-bearing endpoint, proves no allocation. A valid descriptor still needs a live endpoint grant.
+ * or NUL-bearing endpoint, proves no allocation. A resident's relay pool names a count of 0 beside its
+ * endpoint: it holds no token for its lifetime and asks the host for each child that asks it, so zero is
+ * valid only with the endpoint, and every other count is a positive whole number. A valid descriptor still
+ * needs a live endpoint grant (specs/cowshed/05_gateway.md, "Host CPU budget", "A resident holds no token").
  */
 export function readInheritedCpuPool(environment: Readonly<NodeJS.ProcessEnv>): InheritedCpuPool | null {
   const socket = environment[CPU_POOL_ENV];
-  const tokens = parseInheritedTokens(environment[CPU_TOKENS_ENV]);
+  const count = environment[CPU_TOKENS_ENV];
+  // Zero is valid only as the literal 0 a relay pool names; any other count must be a positive safe integer.
+  const tokens = count === '0' ? 0 : parseInheritedTokens(count);
   if (socket === undefined || socket.length === 0 || socket.includes('\0') || tokens === null) {
     return null;
   }
@@ -133,8 +139,8 @@ export function readInheritedCpuPool(environment: Readonly<NodeJS.ProcessEnv>): 
 
 /**
  * Ask the immediate parent pool for `want` tokens. Neither the inherited count nor the host's core count bounds the
- * ask: a lent pool grants at most what it holds, and a gate's relay pool asks the host for each child. A granted
- * lease is the child's local allocation: its connection is the grant, and closing it returns only
+ * ask: a lent pool grants at most what it holds, and a gate's or a resident's relay pool asks the host for each
+ * child. A granted lease is the child's local allocation: its connection is the grant, and closing it returns only
  * that allocation. An absent endpoint allows normal host acquisition; a connected endpoint's refusal
  * or protocol failure must fail admission rather than taking a second grant above its parent.
  */

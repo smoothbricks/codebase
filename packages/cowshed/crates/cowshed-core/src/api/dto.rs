@@ -1958,15 +1958,17 @@ pub struct JobInfo {
     /// cannot name.
     pub failure: Option<JobFailure>,
     /// The class the job was admitted under (05_gateway.md "Host CPU budget"): background unless a
-    /// trusted coordinator route admitted it as a gate.
+    /// trusted coordinator route admitted it as a gate, or it was admitted as a resident that
+    /// holds no token.
     pub class: JobserverClass,
     /// Where the job's command ran: the workspace sandbox, or a coordinator's host gate.
     pub scope: ExecScope,
     /// The nice the job's command was observed at right after its spawn set it: a gate runs at 0,
-    /// background at +10. Absent before the command exists and for a job whose command was never
-    /// observed; never inferred from the class.
+    /// background and a resident at +10. Absent before the command exists and for a job whose
+    /// command was never observed; never inferred from the class.
     pub nice: Option<i32>,
-    /// The CPU tokens the job's gateway grant held. Absent until a grant is held.
+    /// The CPU tokens the job's gateway grant held. Absent until a grant is held, and for a
+    /// resident, which holds none.
     pub cpu_tokens: Option<NonZeroUsize>,
 }
 
@@ -2601,6 +2603,7 @@ pub struct ExecRequest {
     /// trusted coordinator route asks for one.
     pub class: JobserverClass,
     /// The most CPU tokens the command can use at once; its grant is between one and this count.
+    /// A resident holds none and names only the default.
     pub want: NonZeroUsize,
     /// Where the command runs: the workspace sandbox, or a coordinator's host gate, which is a gate.
     pub scope: ExecScope,

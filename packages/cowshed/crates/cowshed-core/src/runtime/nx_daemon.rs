@@ -319,8 +319,11 @@ pub(crate) fn kept_project(read_write: &SandboxConfig) -> Option<&Path> {
     }
 }
 
-/// The read-write background job that starts the daemon of the Nx project at `project_root`:
-/// the project's own `nx`, run from the project root inside the workspace at `workspace_root`.
+/// The read-write resident job that starts the daemon of the Nx project at `project_root`: the
+/// project's own `nx`, run from the project root inside the workspace at `workspace_root`. The
+/// daemon stays up to answer clients that hold their own tokens and is idle between them, so it
+/// holds none (05_gateway.md "A resident holds no token"): keeping it costs the shed none of
+/// its share of the host.
 pub(crate) fn start_request(workspace_root: &Path, project_root: &Path) -> Result<ExecRequest> {
     let relative = project_root.strip_prefix(workspace_root).map_err(|_| {
         CowshedError::integrity(
@@ -355,7 +358,7 @@ pub(crate) fn start_request(workspace_root: &Path, project_root: &Path) -> Resul
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
-        class: crate::api::dto::JobserverClass::Background,
+        class: crate::api::dto::JobserverClass::Resident,
         want: std::num::NonZeroUsize::MIN,
         scope: crate::api::dto::ExecScope::Workspace,
     })
