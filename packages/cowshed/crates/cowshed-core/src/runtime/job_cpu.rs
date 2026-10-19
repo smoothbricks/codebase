@@ -29,6 +29,19 @@ pub struct JobCpuAsk {
     pub checkout: PathBuf,
     pub command: String,
     pub job: (RepoId, WorkspaceIncarnation, JobId),
+    /// The live CPU pool of the process that asked for the job, when it holds one: a
+    /// token-holding job takes its tokens there, never from the host ledger while its requester
+    /// holds a grant (05_gateway.md "Work a holder starts draws on its grant"). A resident holds
+    /// no token, so it asks the host through its own relay pool as before.
+    pub parent: Option<String>,
+}
+
+/// The live pool this process inherited, which the jobs it asks for draw on: the controller
+/// runs in the requester's process (in-process for the CLI and every embedder; `cowshed
+/// controller` inherits its embedder's environment), so its descriptor is the requester's.
+pub fn requester_cpu_pool() -> Option<String> {
+    cowshed_gateway_types::inherited_cpu_pool(|name| std::env::var(name).ok())
+        .and_then(|pool| pool.into_os_string().into_string().ok())
 }
 
 pub trait JobCpuAdmission: Send + Sync + fmt::Debug + 'static {
@@ -169,11 +182,13 @@ impl JobCpuAdmission for GatewayJobCpu {
             // asks as background, whose tokens it shares, and either resident asks for a pool alone.
             let frame = match ask.class {
                 ExecClass::Background | ExecClass::Interactive => serde_json::to_vec(
-                    &JobserverRequest::background(ask.want, &checkout, command, job),
+                    &JobserverRequest::background(ask.want, &checkout, command, job)
+                        .from_parent(ask.parent.as_deref()),
                 ),
-                ExecClass::Gate => {
-                    serde_json::to_vec(&JobserverRequest::gate(ask.want, &checkout, command, job))
-                }
+                ExecClass::Gate => serde_json::to_vec(
+                    &JobserverRequest::gate(ask.want, &checkout, command, job)
+                        .from_parent(ask.parent.as_deref()),
+                ),
                 ExecClass::Resident | ExecClass::InteractiveResident => {
                     serde_json::to_vec(&ResidentPoolRequest::new(&checkout, command, job))
                 }

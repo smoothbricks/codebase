@@ -2796,12 +2796,28 @@ impl WorkspaceSupervisorHandle {
         request: ExecRequest,
         source: AdmissionSource,
     ) -> Result<JobId> {
+        self.exec_from(session, build_volume, request, source, None)
+            .await
+    }
+
+    /// [`Self::exec`] for a requester that holds a live CPU pool: the job's tokens come from
+    /// `cpu_parent` rather than the host ledger (05_gateway.md "Work a holder starts draws on its
+    /// grant"). `None` asks the host as `exec` does.
+    pub async fn exec_from(
+        &self,
+        session: Option<&SessionToken>,
+        build_volume: Option<PathBuf>,
+        request: ExecRequest,
+        source: AdmissionSource,
+        cpu_parent: Option<String>,
+    ) -> Result<JobId> {
         self.call(|reply| Command::Exec {
             authority: self.authority.clone(),
             session: session.cloned(),
             build_volume,
             request: Box::new(request),
             source,
+            cpu_parent,
             reply,
         })
         .await
@@ -3259,6 +3275,8 @@ pub(super) enum Command {
         build_volume: Option<PathBuf>,
         request: Box<ExecRequest>,
         source: AdmissionSource,
+        /// The requester's live CPU pool, which the job's tokens come from ([`JobCpuAsk::parent`]).
+        cpu_parent: Option<String>,
         reply: oneshot::Sender<Result<JobId>>,
     },
     Detach {
@@ -4204,11 +4222,19 @@ impl SupervisorActor {
                 build_volume,
                 request,
                 source,
+                cpu_parent,
                 reply,
             } => {
                 // Answered at admission: the job is durable and queued, or refused.
                 let admitted = self
-                    .admit_exec(authority, session, build_volume, *request, source)
+                    .admit_exec(
+                        authority,
+                        session,
+                        build_volume,
+                        *request,
+                        source,
+                        cpu_parent,
+                    )
                     .await;
                 let _ = reply.send(admitted);
             }
@@ -4882,6 +4908,7 @@ impl SupervisorActor {
         build_volume: Option<PathBuf>,
         request: ExecRequest,
         source: AdmissionSource,
+        cpu_parent: Option<String>,
     ) -> Result<JobId> {
         self.validate_authority(&authority)
             .and_then(|()| {
@@ -5188,6 +5215,7 @@ impl SupervisorActor {
                     self.authority.workspace_incarnation.clone(),
                     job_id,
                 ),
+                parent: cpu_parent,
             });
             self.admissions.spawn(async move { (job_id, ask.await) })
         };
@@ -5527,12 +5555,14 @@ impl SupervisorActor {
         }) {
             // The keeper is the supervisor's own coordinator-side work.
             Ok((grant, request)) => {
+                // The keeper is a resident: it holds no token and has no requester's pool.
                 self.admit_exec(
                     authority,
                     None,
                     grant,
                     request,
                     AdmissionSource::Coordinator,
+                    None,
                 )
                 .await
             }

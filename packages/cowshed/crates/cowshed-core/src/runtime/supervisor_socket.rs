@@ -427,6 +427,10 @@ struct ExecWire {
     class: ExecClass,
     want: NonZeroUsize,
     scope: ExecScope,
+    /// The requester's live CPU pool ([`crate::runtime::job_cpu::JobCpuAsk::parent`]); absent
+    /// when the requester holds none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_parent: Option<String>,
 }
 
 /// The controller route that admitted an exec. The route is the authority for the gate class and
@@ -1327,7 +1331,13 @@ async fn answer(
             };
             let session = wire.map(session);
             let job_id = supervisor
-                .exec(session.as_ref(), build_volume, exec, source)
+                .exec_from(
+                    session.as_ref(),
+                    build_volume,
+                    exec,
+                    source,
+                    request.cpu_parent,
+                )
                 .await?;
             if let Some(writer) = writer {
                 lock(streams).insert(job_id, writer);
@@ -1950,6 +1960,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             build_volume,
             request,
             source,
+            cpu_parent,
             reply,
         } => {
             forward_exec(
@@ -1959,6 +1970,7 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 build_volume,
                 *request,
                 source,
+                cpu_parent,
                 reply,
             )
             .await;
@@ -2197,6 +2209,10 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the fields of one `Command::Exec`, forwarded as one supervisor call"
+)]
 async fn forward_exec(
     path: &Path,
     authority: WorkspaceAuthoritySnapshot,
@@ -2204,6 +2220,7 @@ async fn forward_exec(
     build_volume: Option<PathBuf>,
     request: ExecRequest,
     source: AdmissionSource,
+    cpu_parent: Option<String>,
     reply: oneshot::Sender<Result<JobId>>,
 ) {
     let (stdin, payload, stream) = match request.stdin {
@@ -2239,6 +2256,7 @@ async fn forward_exec(
             class: request.class,
             want: request.want,
             scope: request.scope,
+            cpu_parent,
         }),
     };
     let admitted = call::<JobId>(path, &authority, call_request, payload).await;

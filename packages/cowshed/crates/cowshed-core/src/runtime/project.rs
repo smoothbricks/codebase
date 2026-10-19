@@ -13376,8 +13376,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let (handle, build_volume) = self.admit_build_state(&workspace).await?;
         self.reconcile_gateway_for_work(&workspace, &incarnation, &handle)
             .await?;
+        // This controller runs in the requester's process, so a pool it inherited is the
+        // requester's: the job's tokens come from it, never from the host ledger while the
+        // requester holds a grant (05_gateway.md "Work a holder starts draws on its grant").
         handle
-            .exec(token.as_ref(), build_volume, request, source)
+            .exec_from(
+                token.as_ref(),
+                build_volume,
+                request,
+                source,
+                super::job_cpu::requester_cpu_pool(),
+            )
             .await
     }
 

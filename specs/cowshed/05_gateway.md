@@ -708,6 +708,34 @@ core count.
   file-descriptor exhaustion can also prevent connection to a live pool, so this classification does not yet prove that
   its parent has released the upstream grant. Distinguishing those cases before any host fallback remains an admission
   follow-up; connected refusals and protocol errors already fail without a second take.
+- **Work a holder starts draws on its grant** (2026-10-19). The rule above, that no holder waits for another grant from
+  an ancestor or the host, covers every way work starts under a holder, not only a nested runner. Two places are named
+  here, since each sits where a reader would not look for it:
+  - **A `cowshed exec` from a process holding a live pool** is admitted from that pool. The controller runs in the
+    requester's process (in-process for the CLI and every embedder; `cowshed controller` inherits its embedder's
+    environment), so it reads the requester's descriptor by the rule above and hands it to the workspace supervisor,
+    whose jobserver request names it as `parentPool`. The gateway asks that pool for the job's `want`
+    (`{"op":"cpu-pool","want":<n>}`), and on its grant serves the job its fifo and its own lent pool in the job's scope,
+    exactly as for a host grant; the host ledger takes no place for it, since the tokens are the requester's. The order
+    is `bounded-exec`'s: a pool that cannot be reached is absent, and the job asks the host (said on the gateway's
+    stderr); a pool that answers and refuses, falls silent or breaks protocol refuses the job, never a second, host
+    grant, because a host fallback is what would hide the next deadlock. The pool's end ends the job's accounting, never
+    its work: its own pool lends nothing more and the job runs on to its own exit. A resident holds no token, so it is
+    admitted through its own relay pool as before.
+  - **The `cargo` launcher's own host grant** ("Outside `bounded-exec`" below) publishes no pool: offering one beside
+    the fifo Cargo already reads would spend the same tokens twice ("The task server owns the live grant"). A `cargo`
+    started from a bare shell, under no holder, therefore leaves its descendants to the host, and a test it runs that
+    waits on its own scratch jobs can wait behind the build's own grant. Run such a test through its target, whose
+    `bounded-exec` pool its jobs draw on.
+
+  Measured 2026-10-19, the case it closes: a test case's own scratch job — a cowshed job of the scratch project's
+  supervisor, which the gateway starts and so is no descendant of the test — asked the host as background for its own
+  checkout and waited 26 minutes behind the test's runner, which held background's whole room, 9 of 18 tokens: the floor
+  grants only below that room. The same shape deadlocks at any demand: runners that together hold background's room
+  while each waits on a child queued at the host leave no child grantable, whether one nextest run of nine integration
+  cases at nine threads or nine one-token cases. Before "Room for a gate" capped background at half the host, that child
+  took the 18th token. A runner kind cannot close it; drawing on the holder's grant does.
+
 - **A run without a gateway budgets itself** (2026-10-19, Danny: "Runner should be able to handle whatever is being
   executed"). A host without a gateway — a CI runner, a machine without cowshed — had no budget at all: `bounded-exec`
   found the socket absent and ran every command exactly as configured, so under `NX_PARALLEL=100%` Nx started every
@@ -949,18 +977,20 @@ core count.
 - **The bounds start at the grant.** The executor's `timeoutMs` and `idleTimeoutMs` start when the command starts, after
   the grant: a wait for the host is not the command's time.
 - **A queued descendant is not idle** (2026-10-18, Danny: a job waiting for a CPU token is queued, not idle; "idle"
-  means nothing is happening while nothing is expected to happen). Work a command starts can queue for host tokens of
-  its own — a test's scratch project, whose cowshed jobs ask the host under that project's checkouts, holds no token of
-  the command's pool. A descendant that knows its work waits tells the run on the pool it inherited: it writes
-  `{"op":"host-wait"}` on `BOUNDED_EXEC_CPU_POOL`, is answered `{"ok":true,"wait":"held"}` at once, and holds the
-  connection for as long as the work waits. Every pool of the run, a sub-pool it served Cargo's launcher included,
-  counts to the run. While at least one is held the run's idle clock is stopped: the time left of its no-progress
-  interval is kept, nothing is spent, and stderr says `bounded-exec: idle clock stopped`. When the last closes — the
-  token arrived, the work was withdrawn, or the descendant died, which closes its socket — the clock runs on from what
-  was left and stderr says `bounded-exec: idle clock restarted` with the queued time. A finished test still sets the
-  interval back to `idleTimeoutMs`. An expiry names the queued time it did not count. Only a held wait stops the clock:
-  a run whose descendants say nothing keeps the bound exactly as before. `timeoutMs`, a ceiling, is never stopped. A
-  wait holds no token, so it changes neither the pool's count nor any grant.
+  means nothing is happening while nothing is expected to happen). Work a command starts draws on the command's pool
+  ("Work a holder starts draws on its grant"): a cowshed exec whose requester holds a live `BOUNDED_EXEC_CPU_POOL` is
+  admitted from that pool, never queued at the host while its requester holds a grant. A descendant can still wait — for
+  its requester's own pool, or at the host when its requester holds no pool. A descendant that knows its work waits
+  tells the run on the pool it inherited: it writes `{"op":"host-wait"}` on `BOUNDED_EXEC_CPU_POOL`, is answered
+  `{"ok":true,"wait":"held"}` at once, and holds the connection for as long as the work waits. Every pool of the run, a
+  sub-pool it served Cargo's launcher included, counts to the run. While at least one is held the run's idle clock is
+  stopped: the time left of its no-progress interval is kept, nothing is spent, and stderr says
+  `bounded-exec: idle clock stopped`. When the last closes — the token arrived, the work was withdrawn, or the
+  descendant died, which closes its socket — the clock runs on from what was left and stderr says
+  `bounded-exec: idle clock restarted` with the queued time. A finished test still sets the interval back to
+  `idleTimeoutMs`. An expiry names the queued time it did not count. Only a held wait stops the clock: a run whose
+  descendants say nothing keeps the bound exactly as before. `timeoutMs`, a ceiling, is never stopped. A wait holds no
+  token, so it changes neither the pool's count nor any grant.
 - **Wire.** The client writes
   `{"op":"cpu-tokens","want":<n>,"priority":<u32>,"checkout":"<workspace root>","command":"<command>"}` and does not
   half-close. An omitted priority is 0. A named job also carries its existing
@@ -1105,13 +1135,15 @@ before a younger land that asked first and both before a feature build that aske
 growing before a younger land's task starts, a short build growing to and never past its `want`, a new land task
 starting before a running one of the same land grows) and `tests/cpu_budget.rs` over a real socket (`SIGKILL` of a
 holding client returns its tokens to the waiter at once; checkouts share background's half; a gate job and its task
-granted the free half while a lone background grant still holds its own; refusals); the plugin's `cpu-tokens.test.ts`
-(each runner's `want` and sizing, a killed holder closing its grant) and `executor.test.ts` (a granted run sized and
-released, a refused one run as asked); a jobserver test in which a `SIGKILL`ed `cargo` mid-build leaves the ledger whole
-and its fifo unlinked; the launcher's tests (each of its four cases, the `want` it sends, and the variables it sets or
-leaves on each path); and the band tests: each class runs in its own band at its own nice whatever the host's state —
-interactive above gate above background — and gate work is served returned tokens ahead of interactive and background
-work.
+granted the free half while a lone background grant still holds its own; refusals; a holder at background's whole room
+whose child, queued at the saturated host, is granted at once when asked with the holder's pool, the host ledger
+unchanged, while a pool that answers and refuses refuses its child and an unreachable one leaves it to the host); the
+plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
+`executor.test.ts` (a granted run sized and released, a refused one run as asked); a jobserver test in which a
+`SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; the launcher's tests (each of its four
+cases, the `want` it sends, and the variables it sets or leaves on each path); and the band tests: each class runs in
+its own band at its own nice whatever the host's state — interactive above gate above background — and gate work is
+served returned tokens ahead of interactive and background work.
 
 ## The task server schedules work units
 

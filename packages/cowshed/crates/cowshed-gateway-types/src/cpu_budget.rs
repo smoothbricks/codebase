@@ -26,6 +26,20 @@ pub const CPU_TOKENS_OP: &str = "cpu-tokens";
 pub const JOBSERVER_OP: &str = "jobserver";
 /// The control operation a resident job asks with: a relay pool and no token of its own.
 pub const RESIDENT_POOL_OP: &str = "resident-pool";
+/// Where a holder publishes its live CPU pool to the processes it starts, beside its count.
+pub const CPU_POOL_ENV: &str = "BOUNDED_EXEC_CPU_POOL";
+pub const CPU_TOKENS_ENV: &str = "BOUNDED_EXEC_CPU_TOKENS";
+
+/// The live pool an inherited descriptor names: a nonempty endpoint without NUL beside a whole
+/// count, zero included, since a resident's relay pool names zero. A pool beside no count, or
+/// beside one that is no count, names nothing (05_gateway.md "Nested runners use a parent-held
+/// sub-ledger").
+pub fn inherited_cpu_pool(get: impl Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
+    let pool = get(CPU_POOL_ENV).filter(|pool| !pool.is_empty() && !pool.contains('\0'))?;
+    get(CPU_TOKENS_ENV)
+        .is_some_and(|count| count.parse::<usize>().is_ok())
+        .then(|| std::path::PathBuf::from(pool))
+}
 
 /// Root jobserver admission class: the ledger's wire class (05_gateway.md "Gate admission"), and
 /// the only classes that hold tokens. An exec's own class (cowshed-core `ExecClass`) maps onto it:
@@ -59,6 +73,11 @@ pub struct JobserverRequest<'a> {
     class: JobserverClass,
     pool: bool,
     job: JobserverJob<'a>,
+    /// The live CPU pool of the process that asked for the job, when it holds one: the job's
+    /// tokens come from that pool, never from the host ledger while its requester holds a grant
+    /// (05_gateway.md "Host CPU budget", "Work a holder starts draws on its grant").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_pool: Option<&'a str>,
 }
 
 impl<'a> JobserverRequest<'a> {
@@ -76,6 +95,7 @@ impl<'a> JobserverRequest<'a> {
             class: JobserverClass::Background,
             pool: true,
             job,
+            parent_pool: None,
         }
     }
     pub const fn gate(
@@ -92,6 +112,14 @@ impl<'a> JobserverRequest<'a> {
             class: JobserverClass::Gate,
             pool: true,
             job,
+            parent_pool: None,
+        }
+    }
+    /// Take the job's tokens from its requester's live pool, when it has one.
+    pub const fn from_parent(self, parent_pool: Option<&'a str>) -> Self {
+        Self {
+            parent_pool,
+            ..self
         }
     }
 }

@@ -493,12 +493,15 @@ struct JobserverIn {
     /// A Cargo build whose fifo may be given more tokens after it starts, up to `want`.
     #[serde(default)]
     grow: bool,
+    /// The requester's live CPU pool: the job's tokens come from it, not the host ledger.
+    parent_pool: Option<String>,
 }
 
 struct JobserverOptions {
     admission: crate::jobserver::JobserverAdmission,
     pool_job: Option<JobserverJobIn>,
     grow: bool,
+    parent_pool: Option<PathBuf>,
 }
 
 /// A `resident-pool` request's fields: the checkout its children's asks are for, what the
@@ -1005,6 +1008,35 @@ async fn serve<R, W>(
             command,
             options,
         }) => {
+            // A requester that holds a live pool lends its job the tokens; only a pool that
+            // cannot be reached leaves the job to the host ledger (05_gateway.md "Work a holder
+            // starts draws on its grant").
+            let parent = match options.parent_pool.as_deref() {
+                None => None,
+                Some(path) => match connect_parent(path).await {
+                    Ok(stream) => Some((path.to_path_buf(), stream)),
+                    Err(error) => {
+                        eprintln!(
+                            "cowshed: the requester's CPU pool {} does not answer ({error}); `{command}` asks the host budget",
+                            path.display()
+                        );
+                        None
+                    }
+                },
+            };
+            if let Some((path, stream)) = parent {
+                hold_parent_jobserver(
+                    reader,
+                    writer,
+                    stream,
+                    &path,
+                    want,
+                    services.jobserver.clone(),
+                    options.pool_job,
+                )
+                .await;
+                return;
+            }
             let checkout: Arc<str> = Arc::from(checkout);
             let claim = Claim::new(&command, pid);
             let rank = options.admission.rank();
@@ -1199,21 +1231,7 @@ async fn hold_jobserver<R, W>(
         },
         _ = reader.read(&mut discard) => return,
     };
-    let mut fifo = match fifos.create(tokens) {
-        Ok(fifo) => fifo,
-        Err(error) => {
-            let _ = write_response(
-                &mut writer,
-                &failure(
-                    ControlFailureCode::Rejected,
-                    format!("cannot create the jobserver fifo: {error}"),
-                ),
-            )
-            .await;
-            return;
-        }
-    };
-    let pool = if let Some(job) = options.pool_job {
+    let source = options.pool_job.as_ref().map(|job| {
         // A gate's children rank as the gate job does, by its age, at every return; background
         // children share the grant they were lent.
         let source = match options.admission {
@@ -1226,47 +1244,11 @@ async fn hold_jobserver<R, W>(
                 std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
             ),
         };
-        match fifos.create_pool(source, &job.workspace_incarnation) {
-            Ok(pool) => {
-                cowshed_os::timing::event("jobserver", || {
-                    format!(
-                        "pool {tokens} for {}/{} job {} at {}",
-                        job.repo_id,
-                        job.workspace_incarnation,
-                        job.job_id,
-                        pool.path().display()
-                    )
-                });
-                Some(pool)
-            }
-            Err(error) => {
-                let _ = write_response(
-                    &mut writer,
-                    &failure(
-                        ControlFailureCode::Rejected,
-                        format!("cannot serve the job's CPU pool: {error}"),
-                    ),
-                )
-                .await;
-                fifo.drain_and_unlink();
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    let answer = ControlResponse {
-        cpu_pool: pool
-            .as_ref()
-            .map(|pool| pool.path().to_string_lossy().into_owned()),
-        tokens: Some(tokens),
-        fifo: Some(fifo.path().to_string_lossy().into_owned()),
-        ..lease(LeaseState::Granted)
-    };
-    if write_response(&mut writer, &answer).await.is_err() {
-        fifo.drain_and_unlink();
+        (source, job)
+    });
+    let Some((mut fifo, pool)) = answer_grant(&mut writer, &fifos, tokens, source).await else {
         return;
-    }
+    };
     // Hold until the client closes. A growing grant writes each token it is given into the
     // fifo, where the running Cargo's jobserver takes it, and tells the client its new total.
     let mut held = tokens;
@@ -1305,6 +1287,230 @@ async fn hold_jobserver<R, W>(
     }
     fifo.drain_and_unlink();
     drop(stake);
+}
+
+/// Create a granted jobserver's fifo and, for a job, its private pool, and answer the grant.
+/// `None` once either cannot be made, which is answered, or the client is gone.
+async fn answer_grant<W>(
+    writer: &mut W,
+    fifos: &crate::jobserver::JobserverFifos,
+    tokens: usize,
+    pool: Option<(crate::jobserver::PoolSource, &JobserverJobIn)>,
+) -> Option<(
+    crate::jobserver::JobserverFifo,
+    Option<crate::jobserver::CpuPool>,
+)>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let fifo = match fifos.create(tokens) {
+        Ok(fifo) => fifo,
+        Err(error) => {
+            let _ = write_response(
+                writer,
+                &failure(
+                    ControlFailureCode::Rejected,
+                    format!("cannot create the jobserver fifo: {error}"),
+                ),
+            )
+            .await;
+            return None;
+        }
+    };
+    let pool = match pool {
+        None => None,
+        Some((source, job)) => match fifos.create_pool(source, &job.workspace_incarnation) {
+            Ok(pool) => {
+                cowshed_os::timing::event("jobserver", || {
+                    format!(
+                        "pool {tokens} for {}/{} job {} at {}",
+                        job.repo_id,
+                        job.workspace_incarnation,
+                        job.job_id,
+                        pool.path().display()
+                    )
+                });
+                Some(pool)
+            }
+            Err(error) => {
+                let _ = write_response(
+                    writer,
+                    &failure(
+                        ControlFailureCode::Rejected,
+                        format!("cannot serve the job's CPU pool: {error}"),
+                    ),
+                )
+                .await;
+                fifo.drain_and_unlink();
+                return None;
+            }
+        },
+    };
+    let answer = ControlResponse {
+        cpu_pool: pool
+            .as_ref()
+            .map(|pool| pool.path().to_string_lossy().into_owned()),
+        tokens: Some(tokens),
+        fifo: Some(fifo.path().to_string_lossy().into_owned()),
+        ..lease(LeaseState::Granted)
+    };
+    if write_response(writer, &answer).await.is_err() {
+        fifo.drain_and_unlink();
+        return None;
+    }
+    Some((fifo, pool))
+}
+
+/// Connect to a requester's live CPU pool. Only a pool that cannot be reached is absent.
+async fn connect_parent(path: &Path) -> std::io::Result<cowshed_os::fork_lock::Fenced<UnixStream>> {
+    let mut connect = std::pin::pin!(UnixStream::connect(path));
+    // Darwin creates a socket then sets CLOEXEC: fence each poll so no concurrently spawned
+    // child keeps this descriptor past exec.
+    let stream = std::future::poll_fn(|cx| {
+        cowshed_os::fork_lock::create(|| Ok(connect.as_mut().poll(cx)))
+            .expect("polling the connection runs an infallible closure")
+    })
+    .await?;
+    Ok(cowshed_os::fork_lock::Fenced::new(stream))
+}
+
+/// What a requester's pool granted: the first `granted` line after its `queued`, a whole count
+/// between one and `want`, or why it gave none. Its refusal is the job's refusal.
+async fn parent_grant<R>(parent: &mut R, want: NonZeroUsize) -> Result<usize, String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+    loop {
+        let mut line = String::new();
+        match parent.read_line(&mut line).await {
+            Ok(0) => return Err("closed without granting".to_owned()),
+            Ok(_) => {}
+            Err(error) => return Err(format!("stopped answering ({error})")),
+        }
+        let answer: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|error| format!("answered with no JSON line ({error})"))?;
+        if answer["ok"] != true {
+            let code = answer["code"].as_str().unwrap_or("refused");
+            let error = answer["error"].as_str().unwrap_or("no diagnostic");
+            return Err(format!("refused ({code}: {error})"));
+        }
+        match answer["lease"].as_str() {
+            Some("queued") => continue,
+            Some("granted") => {
+                return answer["tokens"]
+                    .as_u64()
+                    .and_then(|tokens| usize::try_from(tokens).ok())
+                    .filter(|tokens| (1..=want.get()).contains(tokens))
+                    .ok_or_else(|| format!("granted {} tokens for {want}", answer["tokens"]));
+            }
+            _ => return Err(format!("answered {}", line.trim_end())),
+        }
+    }
+}
+
+/// Hold one job's grant borrowed from its requester's live pool (05_gateway.md "Work a holder
+/// starts draws on its grant"): answer `queued` at once, ask the pool for `want` tokens, and on
+/// its grant serve the job its fifo and, for a job, its own lent pool, as a host grant is
+/// served. The host ledger takes no place for it: its tokens are the requester's. A pool that
+/// answers and refuses refuses the job, never a second, host grant. The pool's end ends the
+/// job's accounting, never its work: its own pool lends nothing more and the job runs on to its
+/// own exit, as across a gateway restart. The client's close returns the tokens to the pool.
+async fn hold_parent_jobserver<R, W>(
+    mut reader: R,
+    mut writer: W,
+    parent: cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
+    parent_path: &Path,
+    want: NonZeroUsize,
+    fifos: crate::jobserver::JobserverFifos,
+    pool_job: Option<JobserverJobIn>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
+    if write_response(&mut writer, &lease(LeaseState::Queued))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let refuse = |why: String| {
+        failure(
+            ControlFailureCode::Rejected,
+            format!(
+                "the requester's CPU pool {} {why}; no host grant is taken while the requester holds one",
+                parent_path.display()
+            ),
+        )
+    };
+    let mut parent = tokio::io::BufReader::new(parent);
+    let request = format!(
+        "{}\n",
+        serde_json::json!({ "op": "cpu-pool", "want": want })
+    );
+    if let Err(error) = parent.get_mut().write_all(request.as_bytes()).await {
+        let _ = write_response(&mut writer, &refuse(format!("cannot be asked ({error})"))).await;
+        return;
+    }
+    let mut discard = [0_u8; 64];
+    let tokens = tokio::select! {
+        biased;
+        granted = parent_grant(&mut parent, want) => match granted {
+            Ok(tokens) => tokens,
+            Err(why) => {
+                let _ = write_response(&mut writer, &refuse(why)).await;
+                return;
+            }
+        },
+        // The client withdrew: dropping the pool connection leaves the pool's queue.
+        _ = reader.read(&mut discard) => return,
+    };
+    cowshed_os::timing::event("jobserver", || {
+        format!(
+            "grant tokens={tokens}/{want} from the requester's pool {}",
+            parent_path.display()
+        )
+    });
+    let source = pool_job.as_ref().map(|job| {
+        (
+            crate::jobserver::PoolSource::Lent(
+                NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
+            ),
+            job,
+        )
+    });
+    let Some((fifo, mut pool)) = answer_grant(&mut writer, &fifos, tokens, source).await else {
+        return;
+    };
+    let mut parent_open = true;
+    let mut parent_byte = [0_u8; 1];
+    loop {
+        tokio::select! {
+            read = reader.read(&mut discard) => if !matches!(read, Ok(read) if read > 0) { break },
+            // A pool says nothing after a grant it was not asked to grow: any byte or end is the
+            // end of its grant.
+            _ = parent.read(&mut parent_byte), if parent_open => {
+                parent_open = false;
+                eprintln!(
+                    "cowshed: the requester's CPU pool {} ended its {tokens}-token grant; the job runs on over budget until it ends, and its own pool lends nothing more",
+                    parent_path.display()
+                );
+                if let Some(pool) = pool.take()
+                    && let Err(error) = pool.close().await
+                {
+                    eprintln!("cowshed: jobserver CPU pool did not close: {error}");
+                }
+            }
+        }
+    }
+    if let Some(pool) = pool
+        && let Err(error) = pool.close().await
+    {
+        eprintln!("cowshed: jobserver CPU pool did not close: {error}");
+    }
+    fifo.drain_and_unlink();
+    drop(parent);
 }
 
 /// Hold one resident job's pool: answer `queued`, then at once `granted` with the pool and no
@@ -1442,7 +1648,15 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         DISK_LEASE_OP => &["op", "class", "share", "command"],
         CPU_TOKENS_OP => &["op", "want", "checkout", "command"],
         JOBSERVER_OP => &[
-            "op", "want", "checkout", "command", "class", "pool", "job", "grow",
+            "op",
+            "want",
+            "checkout",
+            "command",
+            "class",
+            "pool",
+            "job",
+            "grow",
+            "parentPool",
         ],
         RESIDENT_POOL_OP => &["op", "checkout", "command", "job"],
         _ => {
@@ -1491,12 +1705,24 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                 pool,
                 job,
                 grow,
+                parent_pool,
             } = serde_json::from_value(value).map_err(encoding)?;
             if grow && pool {
                 return Err(ControlError::Encoding(
                     "a growing jobserver grant serves no CPU pool: a pool lends a fixed count"
                         .to_owned(),
                 ));
+            }
+            if let Some(parent) = &parent_pool
+                && (grow
+                    || !Path::new(parent).is_absolute()
+                    || parent.len() > MAX_CHECKOUT
+                    || parent.contains('\0'))
+            {
+                return Err(ControlError::Encoding(format!(
+                    "a parentPool is an absolute socket path of at most {MAX_CHECKOUT} bytes \
+                     without NUL, on a grant that does not grow"
+                )));
             }
             let pool_job = if pool {
                 let job = job.ok_or_else(|| {
@@ -1514,6 +1740,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                     admission: class,
                     pool_job,
                     grow,
+                    parent_pool: parent_pool.map(PathBuf::from),
                 },
             )
         } else {
@@ -1523,6 +1750,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                     admission: crate::jobserver::JobserverAdmission::Background,
                     pool_job: None,
                     grow: false,
+                    parent_pool: None,
                 },
             )
         };
