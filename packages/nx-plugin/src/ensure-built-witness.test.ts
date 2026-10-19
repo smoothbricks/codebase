@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { chmodSync, lstatSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import {
   chmod,
   mkdir,
@@ -23,6 +23,7 @@ import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory
 import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
 import typia from 'typia';
 import {
+  censusStart,
   type GraphWitness,
   graphInstallationIdentity,
   movedNodes,
@@ -30,7 +31,9 @@ import {
   nodeStamp,
   nodesUnchanged,
   readGraphWitness,
+  recordedStamp,
   reusableGraph,
+  SAME_TICK_NS,
   snapshotsEqual,
   stampMove,
   workspaceSnapshot,
@@ -150,6 +153,53 @@ describe('authoritative graph witness', () => {
     }
     await writeFile(path, JSON.stringify({ ...witness(), version: 2 }));
     expect(readGraphWitness(path)).toBeNull();
+  });
+});
+
+// A filesystem dates a change by the kernel's clock, and ZFS on Linux by its coarse tick (1 ms on CI's runner), so a
+// same-size rewrite in the tick a stamp was read in leaves the whole stamp as it was: git's racily clean entries. No
+// call sets a ctime, so the tick is constructed rather than raced for: each write is dated ahead with utimes, so every
+// census reads it inside its change's tick however long the census takes, and the rewrite keeps that date and size.
+// On a coarse clock the rewrite then leaves the stamp as recorded in most rounds, and a reader that trusts it reads
+// the node as unchanged; on a fine one (APFS, ext4) its ctime still moves, and only there would trusting it pass.
+describe('a stamp read in the tick its node changed in', () => {
+  const rounds = 16;
+  const source = 'packages/app/source.txt';
+
+  it('is re-hashed by the next capture, which a same-size rewrite in that tick would otherwise escape', () => {
+    const path = join(root, source);
+    const context = new WorkspaceContext(root, data());
+    const hashOf = ({ files }: GraphWitness['snapshot']) => files.find(({ file }) => file === source)?.hash;
+    for (let round = 0; round < rounds; round++) {
+      const ahead = new Date(Date.now() + 60_000);
+      writeFileSync(path, `before ${round}`);
+      utimesSync(path, ahead, ahead);
+      const recorded = workspaceSnapshot(root, context, undefined);
+      writeFileSync(path, `after! ${round}`);
+      utimesSync(path, ahead, ahead);
+      const current = workspaceSnapshot(root, context, recorded);
+      // Its own stability check compares what it read; only a later capture distrusts the stamp.
+      expect(recorded.stable).toBe(true);
+      expect(hashOf(current)).not.toBe(hashOf(recorded));
+    }
+  });
+
+  it('is recorded unproven, so a reader re-reads the node and finds the rewrite', () => {
+    const path = join(root, 'stamped');
+    const reread = (node: string) => readFileSync(node, 'utf8') === 'before';
+    for (let round = 0; round < rounds; round++) {
+      const ahead = new Date(Date.now() + 60_000);
+      writeFileSync(path, 'before');
+      utimesSync(path, ahead, ahead);
+      const recorded: NodeWitness[] = [
+        { path, stamp: recordedStamp(lstatSync(path, { bigint: true }), censusStart()) },
+      ];
+      expect(movedNodes(recorded, reread)).toBeNull();
+      writeFileSync(path, 'after!');
+      utimesSync(path, ahead, ahead);
+      expect(nodesUnchanged(recorded)).toBe(false);
+      expect(movedNodes(recorded, reread)).toBe(path);
+    }
   });
 });
 
@@ -561,6 +611,26 @@ describe('a stamp move is judged by the two stamps alone', () => {
       fc.property(fields, identity, u64, u64, (stats, field, value, ctimeNs) => {
         fc.pre(value !== stats[field]);
         return stampMove(nodeStamp(stats), nodeStamp({ ...stats, [field]: value, ctimeNs })) === 'moved';
+      }),
+    );
+  });
+
+  // The racily clean rule: a stamp read within SAME_TICK_NS of its node's change (the later of ctime and mtime) proves
+  // nothing, and only such a stamp costs a reader a re-read.
+  it('records a stamp as read exactly when its census started a full tick after its node changed', () => {
+    fc.assert(
+      fc.property(fields, u64, (stats, start) => {
+        const proven = start - (stats.ctimeNs > stats.mtimeNs ? stats.ctimeNs : stats.mtimeNs) >= SAME_TICK_NS;
+        return proven === (recordedStamp(stats, start) === nodeStamp(stats));
+      }),
+    );
+  });
+
+  it('makes every reader re-read an unproven stamp, whatever the ctime of the node it reads', () => {
+    fc.assert(
+      fc.property(fields, u64, u64, (stats, start, ctimeNs) => {
+        fc.pre(recordedStamp(stats, start) !== nodeStamp(stats));
+        return stampMove(recordedStamp(stats, start), nodeStamp({ ...stats, ctimeNs })) === 'ctime';
       }),
     );
   });

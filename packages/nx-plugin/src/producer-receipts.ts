@@ -34,7 +34,13 @@ import {
   type ReceiptEvidence,
   receiptNode,
 } from './ensure-built-receipt.js';
-import { graphInstallationIdentity, movedNodes, type NodeWitness, workspaceSnapshot } from './ensure-built-witness.js';
+import {
+  censusStart,
+  graphInstallationIdentity,
+  movedNodes,
+  type NodeWitness,
+  workspaceSnapshot,
+} from './ensure-built-witness.js';
 import { graphInputContractIdentity } from './graph-input-contract.js';
 
 export interface ProducerReceiptsOptions {
@@ -119,7 +125,8 @@ function same(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 /**
- * Whether a tool node whose ctime alone moved still reads as `tools` recorded it: the same bytes, link text,
+ * Whether a tool node whose stamp does not prove it (its ctime alone moved, or it was read in the tick it changed in,
+ * recordedStamp) still reads as `tools` recorded it: the same bytes, link text,
  * membership and mode. Bun's global store is shared by every checkout, and linking a package's bin on any of their
  * installs re-chmods the store file to the mode it already has; that moves the ctime of a node these tools witness
  * without changing it, and is no reason to refuse the run.
@@ -128,7 +135,7 @@ function recordedTool(tools: readonly EnsureBuiltProducerTool[]): (path: string)
   const recorded = new Map(tools.flatMap((tool) => tool.nodes.map((node) => [node.path, node] as const)));
   return (path) => {
     const node = recorded.get(path);
-    return node !== undefined && same(receiptNode(path, path, []), node);
+    return node !== undefined && same(receiptNode(path, path), node);
   };
 }
 function missing(paths: readonly string[]): boolean {
@@ -199,6 +206,7 @@ function toolsFor(
     const installation = typia.json.isParse<Installation>(identity);
     if (installation === null) return { ok: false, detail: 'Invalid installed module closure evidence' };
     const observed: NodeWitness[] = [];
+    const census = { start: censusStart(), observed };
     const paths = new Set(installation.nodes.map(({ path }) => path));
     const absent = new Set<string>();
     function namespace(path: string): void {
@@ -226,7 +234,7 @@ function toolsFor(
         else absent.add(candidate);
       }
     }
-    const nodes = [...paths].sort().map((path) => receiptNode(path, path, observed));
+    const nodes = [...paths].sort().map((path) => receiptNode(path, path, census));
     const module: EnsureBuiltProducerTool = {
       kind: 'module',
       name: 'installed-nx-plugin-closure',
@@ -258,7 +266,7 @@ function toolsFor(
       }
       if (path === undefined) return { ok: false, detail: `Unbound producer executable ${name}` };
       const physicalPath = realpathSync(path);
-      const entries = [...new Set([path, physicalPath])].map((entry) => receiptNode(entry, entry, observed));
+      const entries = [...new Set([path, physicalPath])].map((entry) => receiptNode(entry, entry, census));
       tools.push({
         kind: 'executable',
         name,
@@ -285,10 +293,11 @@ function toolsFor(
 function verifyTools(tools: readonly EnsureBuiltProducerTool[]): ReceiptEvidence<readonly NodeWitness[]> {
   try {
     const observed: NodeWitness[] = [];
+    const census = { start: censusStart(), observed };
     for (const tool of tools) {
       if (realpathSync(tool.path) !== tool.physicalPath || !missing(tool.missing))
         return { ok: false, detail: `Producer tool alias/namespace changed: ${tool.name}` };
-      const nodes = tool.nodes.map((node) => receiptNode(node.path, node.path, observed));
+      const nodes = tool.nodes.map((node) => receiptNode(node.path, node.path, census));
       if (!same(nodes, tool.nodes) || sha(nodes) !== tool.sha256)
         return { ok: false, detail: `Producer tool/module bytes changed: ${tool.name}` };
     }

@@ -29,7 +29,7 @@ interface InstalledPackageManifest {
 /** The stat fields a node's identity is read from. */
 export type StampFields = Pick<BigIntStats, 'dev' | 'ino' | 'mode' | 'size' | 'mtimeNs' | 'ctimeNs'>;
 
-/** Identity of a previously read node, not a timestamp freshness threshold. */
+/** The stamp a node reads as now: device, inode, mode, size, mtime and ctime. What a recorded stamp is compared with. */
 export function nodeStamp(stats: StampFields): string {
   return `${stats.dev}:${stats.ino}:${stats.mode}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
 }
@@ -37,13 +37,51 @@ export function nodeStamp(stats: StampFields): string {
 /**
  * How an observed stamp compares with the recorded one: `same`; `ctime` when device, inode, mode, size and mtime are
  * kept and only the ctime moved (a same-mode chmod, which Bun's bin linking does to a shared store file on any
- * checkout's install); otherwise `moved`. A function of the two stamps alone, so no filesystem or clock decides it.
+ * checkout's install) or was recorded `unproven` ({@link recordedStamp}); otherwise `moved`. A function of the two
+ * stamps alone, so no filesystem or clock decides it.
  */
 export function stampMove(recorded: string, observed: string): 'same' | 'ctime' | 'moved' {
   if (observed === recorded) return 'same';
   // nodeStamp ends with the ctime: everything before it is the identity a same-mode chmod keeps.
   const kept = observed.slice(0, observed.lastIndexOf(':')) === recorded.slice(0, recorded.lastIndexOf(':'));
   return kept ? 'ctime' : 'moved';
+}
+
+/**
+ * How long after a node's last change a stamp read of it proves nothing about the next change: git's racily clean
+ * rule (git's Documentation/technical/racy-git.txt), which the Nx archive repair already applies to Nx's own file
+ * hashes (patches/README.md). A filesystem dates a change by the kernel's clock. On Linux, on a filesystem without
+ * fine-grained timestamps such as ZFS, that is the coarse clock, which moves once a jiffy: 1 ms at CONFIG_HZ=1000, as
+ * on CI's runner, and 10 ms at CONFIG_HZ=100, the slowest. A same-size rewrite in the tick a stamp was read in leaves
+ * every field of it as it was. Node can read neither the jiffy nor a filesystem's granularity, and a shorter window
+ * reopens the gap on a slower kernel, so this is the slowest tick, and no option.
+ */
+export const SAME_TICK_NS = 10_000_000n;
+
+/** The time a census starts, read before its first stat: what {@link unproven} judges each node's change by. */
+export function censusStart(): bigint {
+  return BigInt(Date.now()) * 1_000_000n;
+}
+
+/**
+ * Whether a census that started at `start` read a node within {@link SAME_TICK_NS} of its last change (the later of
+ * its ctime and mtime, so a node dated ahead counts). Its stamp is then unproven, not unchanged: a rewrite in the same
+ * tick could leave it as it is.
+ */
+export function unproven(stats: StampFields, start: bigint): boolean {
+  return start - (stats.ctimeNs > stats.mtimeNs ? stats.ctimeNs : stats.mtimeNs) < SAME_TICK_NS;
+}
+
+/**
+ * The stamp a census that started at `start` records for a later reader: its {@link nodeStamp}, or, when that is
+ * {@link unproven}, the same with its ctime recorded as `unproven`. No stamp read later equals that, so the reader
+ * re-reads the node rather than trust the stamp, as it does a node whose ctime alone moved ({@link stampMove}), or
+ * counts it moved when it holds nothing to re-read it against. Only such a node costs a re-read.
+ */
+export function recordedStamp(stats: StampFields, start: bigint): string {
+  return unproven(stats, start)
+    ? `${stats.dev}:${stats.ino}:${stats.mode}:${stats.size}:${stats.mtimeNs}:unproven`
+    : nodeStamp(stats);
 }
 
 export interface NodeWitness {
@@ -90,36 +128,44 @@ export function writeWitness(path: string, value: GraphWitness | ArtifactWitness
  * Nx's Unix archive uses whole-second mtimes, so allFileData alone cannot
  * prove an immediate same-second rewrite. An unbound archive hash is never
  * admitted: on the first capture every file is rehashed through Nx itself.
+ * The nodes are recorded for later captures and readers (recordedStamp), so a
+ * node this capture read in the tick it changed in is rehashed by the next.
  */
 export function workspaceSnapshot(
   workspaceRoot: string,
   context: WorkspaceContext,
   previous: WorkspaceSnapshot | undefined,
 ): WorkspaceSnapshot {
+  const start = censusStart();
   const files = context.allFileData();
   const prior = new Map(previous?.nodes.map((node) => [node.path, node.stamp]));
   const nodes: NodeWitness[] = [];
+  // What this capture read of each node it records unproven: its own stability check compares what it read.
+  const read = new Map<string, string>();
   const changed: string[] = [];
   let complete = true;
+  function record(path: string, stats: BigIntStats): string {
+    const stamp = nodeStamp(stats);
+    if (unproven(stats, start)) read.set(path, stamp);
+    nodes.push({ path, stamp: read.has(path) ? recordedStamp(stats, start) : stamp });
+    return stamp;
+  }
   for (const { file } of files) {
     const path = join(workspaceRoot, file);
     const stats = lstatSync(path, { bigint: true });
-    const node = { path, stamp: nodeStamp(stats) };
-    nodes.push(node);
-    let moved = prior.get(path) !== node.stamp;
+    let moved = prior.get(path) !== record(path, stats);
     if (stats.isSymbolicLink()) {
       const physical = realpathSync(path);
       const targetStats = lstatSync(physical, { bigint: true });
-      const target = { path: physical, stamp: nodeStamp(targetStats) };
-      nodes.push(target);
-      moved ||= prior.get(physical) !== target.stamp;
+      moved ||= prior.get(physical) !== record(physical, targetStats);
       // A file table does not prove the membership of an external directory.
       if (!targetStats.isFile()) complete = false;
     }
     if (moved) changed.push(file);
   }
   if (changed.length > 0) context.incrementalUpdate(changed, []);
-  return { files: context.allFileData(), nodes, stable: complete && nodesUnchanged(nodes) };
+  const asRead = read.size === 0 ? nodes : nodes.map(({ path, stamp }) => ({ path, stamp: read.get(path) ?? stamp }));
+  return { files: context.allFileData(), nodes, stable: complete && nodesUnchanged(asRead) };
 }
 
 export function nodesUnchanged(nodes: readonly NodeWitness[]): boolean {
@@ -138,8 +184,8 @@ export function nodesUnchanged(nodes: readonly NodeWitness[]): boolean {
  * The witnessed nodes whose stamp is no longer the one read, named for a refusal (the first eight in witness order, a
  * gone one with its error code, and how many more), or null when none moved. A node whose device, inode, mode, size
  * and mtime are unchanged and only its ctime moved (a same-mode chmod, which Bun's bin linking does to a shared store
- * file on any checkout's install) asks for a comparison, not a verdict: `same` re-reads it, and one it finds as
- * recorded has not changed. Without `same` every move counts.
+ * file on any checkout's install), or whose ctime was recorded unproven ({@link recordedStamp}), asks for a comparison,
+ * not a verdict: `same` re-reads it, and one it finds as recorded has not changed. Without `same` every move counts.
  */
 export function movedNodes(
   nodes: readonly NodeWitness[],

@@ -1,7 +1,16 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, lstatSync, openSync, readdirSync, readlinkSync, readSync, realpathSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import {
+  closeSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  readSync,
+  realpathSync,
+} from 'node:fs';
+import { isAbsolute, join, relative } from 'node:path';
 import type { Task } from 'nx/src/config/task-graph';
 import type { expandOutputs, HashInputs } from 'nx/src/native';
 import { CARGO_TOOLCHAIN_PIN_INPUTS, cargoRuntimeInput } from './cargo-toolchain-policy.js';
@@ -12,7 +21,7 @@ import type {
   EnsureBuiltProducerReceipt,
   EnsureBuiltReceipt,
 } from './ensure-built.js';
-import { movedNodes, type NodeWitness, nodeStamp, nodesUnchanged } from './ensure-built-witness.js';
+import { censusStart, movedNodes, type NodeWitness, recordedStamp } from './ensure-built-witness.js';
 
 export type ReceiptEvidence<T> =
   | { readonly ok: true; readonly value: T }
@@ -130,10 +139,17 @@ function sourceFileDigests(
   }
   return { gitBlob: blob.digest('hex'), sha256: raw.digest('hex') };
 }
-/** One independently read node; absolute paths also serve tool/package closures. */
-export function receiptNode(path: string, name: string, observed: NodeWitness[]): EnsureBuiltOutputReceipt {
+/**
+ * One independently read node; absolute paths also serve tool/package closures. A census records the node's stamp as
+ * of its `start` (recordedStamp); a re-read against a record records none.
+ */
+export function receiptNode(
+  path: string,
+  name: string,
+  census?: { readonly start: bigint; readonly observed: NodeWitness[] },
+): EnsureBuiltOutputReceipt {
   const stats = lstatSync(path, { bigint: true });
-  observed.push({ path, stamp: nodeStamp(stats) });
+  census?.observed.push({ path, stamp: recordedStamp(stats, census.start) });
   const mode = Number(stats.mode & 0o7777n);
   if (stats.isFile())
     return { path: name, type: 'file', mode, sha256: hashFile(path, Number(stats.size), ['sha256'], false)[0] };
@@ -149,6 +165,18 @@ export function receiptNode(path: string, name: string, observed: NodeWitness[])
     };
   }
   throw new Error(`Unsupported receipt node ${path}`);
+}
+/**
+ * Whether a tracked source node whose stamp does not prove it (its ctime alone moved, or it was read in the tick it
+ * changed in) still holds the bytes or link text `files` recorded for it.
+ */
+function recordedSource(root: string, files: readonly EnsureBuiltProducerFileInput[]): (path: string) => boolean {
+  const recorded = new Map(files.map((file) => [join(root, file.path), file.sha256]));
+  return (path) =>
+    recorded.get(path) ===
+    createHash('sha256')
+      .update(lstatSync(path).isSymbolicLink() ? readlinkSync(path) : readFileSync(path))
+      .digest('hex');
 }
 /** Capture every tracked source byte at pre. Unrelated untracked files are not source basis. */
 export function captureProducerSource(
@@ -171,6 +199,7 @@ export function captureProducerSource(
     const excluded = new Set(outputs.filter((path) => !graphConfiguration(path)));
     const nodes: NodeWitness[] = [];
     const files: EnsureBuiltProducerFileInput[] = [];
+    const start = censusStart();
     for (const entry of listed.value.split('\0')) {
       if (entry === '') continue;
       const tab = entry.indexOf('\t');
@@ -182,7 +211,7 @@ export function captureProducerSource(
       if (excluded.has(file)) continue;
       const path = join(root, file);
       const stats = lstatSync(path, { bigint: true });
-      nodes.push({ path, stamp: nodeStamp(stats) });
+      nodes.push({ path, stamp: recordedStamp(stats, start) });
       const actualMode = stats.isSymbolicLink() ? '120000' : (stats.mode & 0o111n) !== 0n ? '100755' : '100644';
       if (actualMode !== mode) return { ok: false, detail: `Tracked source mode differs from HEAD: ${file}` };
       let gitBlob: string;
@@ -207,7 +236,7 @@ export function captureProducerSource(
     const dirty = dirtyProviderPaths(status.value).filter((path) => !excluded.has(path));
     if (dirty.length !== 0)
       return { ok: false, detail: `Tracked source/index differs from ${head}: ${dirty.join(', ')}` };
-    const moved = movedNodes(nodes);
+    const moved = movedNodes(nodes, recordedSource(root, files));
     if (moved !== null) return { ok: false, detail: `Tracked source moved during producer pre capture: ${moved}` };
     return { ok: true, value: { head, headTree: tree.value.trim(), files, nodes, outputs } };
   } catch (error) {
@@ -228,7 +257,7 @@ export function producerSourceUnchanged(root: string, before: ProducerSourceWitn
     return { ok: false, detail: `${changed}: HEAD's tree is ${tree.value.trim()}, not ${before.headTree}` };
   const dirty = dirtyProviderPaths(status.value).filter((path) => !outputs.has(path));
   if (dirty.length !== 0) return { ok: false, detail: `${changed}: ${dirty.join(', ')} differ from HEAD` };
-  const moved = movedNodes(before.nodes);
+  const moved = movedNodes(before.nodes, recordedSource(root, before.files));
   if (moved !== null) return { ok: false, detail: `${changed}: ${moved}` };
   return { ok: true, value: true };
 }
@@ -276,11 +305,13 @@ export function providerReceipt(
     if (!lstatSync(join(root, file)).isFile()) return failed(`Unbound linked/non-file Nx source: ${file}`);
   }
   const observed: NodeWitness[] = [];
+  const census = { start: censusStart(), observed };
+  const parents = new Set<string>();
   const outputs = new Map<string, EnsureBuiltOutputReceipt>();
   function visit(path: string): void {
     if (outputs.has(path)) return;
     const absolute = join(root, path);
-    let node = receiptNode(absolute, path, observed);
+    let node = receiptNode(absolute, path, census);
     if (node.type === 'directory') {
       for (const entry of node.entries) visit(join(path, entry));
       const children = node.entries.map((entry) => outputs.get(join(path, entry)));
@@ -300,7 +331,8 @@ export function providerReceipt(
         for (const segment of entry.split('/').slice(0, -1)) {
           parent = join(parent, segment);
           const stats = lstatSync(parent, { bigint: true });
-          observed.push({ path: parent, stamp: nodeStamp(stats) });
+          observed.push({ path: parent, stamp: recordedStamp(stats, census.start) });
+          parents.add(parent);
           if (!stats.isDirectory()) return failed(`Symlinked public output parent ${parent}`);
         }
         visit(entry);
@@ -315,8 +347,19 @@ export function providerReceipt(
       });
     }
     const final = producerSourceUnchanged(root, source);
-    if (!final.ok || !nodesUnchanged(observed))
-      return failed(final.ok ? 'Public outputs changed during independent census' : final.detail);
+    if (!final.ok) return failed(final.detail);
+    // An output whose stamp does not prove it (its ctime alone moved, or it was read in the tick it changed in, as a
+    // task's last writes are) is re-read against its record. A parent directory binds only the real directory the path
+    // runs through, which the device, inode and mode its kept stamp still show.
+    const moved = movedNodes(observed, (path) => {
+      const record = outputs.get(relative(root, path));
+      if (record === undefined) return parents.has(path);
+      const now = receiptNode(path, record.path);
+      return record.type === 'directory' && now.type === 'directory'
+        ? record.mode === now.mode && JSON.stringify(record.entries) === JSON.stringify(now.entries)
+        : JSON.stringify(record) === JSON.stringify(now);
+    });
+    if (moved !== null) return failed(`Public outputs changed during independent census: ${moved}`);
     const outputSha256 = createHash('sha256').update(JSON.stringify(receipts)).digest('hex');
     return {
       disposition: 'hit',
