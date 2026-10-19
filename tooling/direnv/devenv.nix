@@ -129,17 +129,14 @@ in {
     debugger = null;
   };
 
-  # The managed module supplies fleet-wide WASM and Linux targets. Add only the
-  # native release targets the current runner can actually build, so a laptop
-  # does not fetch Linux std it never links.
-  languages.rust.targets =
-    lib.optionals pkgs.stdenv.isDarwin [
-      "aarch64-apple-darwin"
-      "x86_64-apple-darwin"
-    ]
-    ++ lib.optionals pkgs.stdenv.isLinux [
-      "aarch64-unknown-linux-gnu"
-    ];
+  # The managed module supplies fleet-wide WASM and Linux targets, including
+  # every Linux artifact triple (its linux toolchain). Add only the macOS
+  # release targets a Mac runner builds, so a Linux runner does not fetch an
+  # Apple std it can never link.
+  languages.rust.targets = lib.optionals pkgs.stdenv.isDarwin [
+    "aarch64-apple-darwin"
+    "x86_64-apple-darwin"
+  ];
 
   # The managed prologue bootstraps dependencies first; this repo-owned extension
   # then rebuilds the local Nx plugin when its sources are newer than its output.

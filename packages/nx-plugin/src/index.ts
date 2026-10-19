@@ -58,12 +58,12 @@ import {
   CARGO_CROSS_LINT_TARGET,
   CARGO_FETCH_COMMAND,
   CARGO_FETCH_TARGET,
-  CARGO_FROZEN_PREFIX,
   CARGO_LINT_CLIPPY_COMMAND,
   cargoCrossTestArchiveFile,
   cargoCrossTestArchiveTargetName,
   cargoCrossTestTargetName,
   cargoFrozen,
+  runsFrozenCargo,
 } from './cross-check-policy.js';
 import type { EslintFileSet } from './eslint-file-set.js';
 import { closeRunCpuPool, serveRunCpuPool } from './executors/bounded-exec/run-cpu-pool.js';
@@ -1536,8 +1536,8 @@ async function createProjectTargets(
     // than a silent absence.
     //
     // Deliberately NOT pushed to validationTargets: joining the lint aggregate
-    // would make `bun run lint` — and CI's own Linux lint, already native — demand
-    // the 0.4 GiB cross toolchain that the devenv profile exists to keep opt-in.
+    // would make `bun run lint` — and CI's own Linux lint, already native — on a
+    // macOS host demand the zig toolchain that the devenv profile keeps opt-in.
     targets[CARGO_CROSS_LINT_TARGET] = {
       executor: 'nx:run-commands',
       cache: true,
@@ -1688,7 +1688,7 @@ async function createProjectTargets(
         continue;
       }
       const text = targetCommandText(target);
-      if (text.includes(CARGO_FROZEN_PREFIX)) {
+      if (runsFrozenCargo(text)) {
         target.dependsOn = [CARGO_FETCH_TARGET, ...(target.dependsOn ?? [])];
       }
     }
@@ -1699,7 +1699,7 @@ async function createProjectTargets(
     });
     for (const target of Object.values(targets)) {
       const text = targetCommandText(target);
-      if (text.includes(CARGO_FROZEN_PREFIX)) {
+      if (runsFrozenCargo(text)) {
         target.dependsOn = [rootFetch, ...(target.dependsOn ?? [])];
       }
     }
@@ -1711,7 +1711,7 @@ async function createProjectTargets(
   // the target already does.
   for (const [name, target] of Object.entries(targets)) {
     const text = targetCommandText(target);
-    if (!text.includes(CARGO_FROZEN_PREFIX)) continue;
+    if (!runsFrozenCargo(text)) continue;
     target.outputs ??= [];
     if (!target.cache) continue;
     const cwd: unknown = target.options?.cwd;

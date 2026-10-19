@@ -13,6 +13,7 @@ import {
   CROSS_CHECK_SCRIPT_NAME,
   cargoFrozen,
   DEVENV_CROSS_PROFILE,
+  runsFrozenCargo,
 } from './cross-check-policy.js';
 import { BUILD_OUTPUT_DEPENDENCIES, PLATFORM_TARGET_GLOBS } from './workspace-config-policy.js';
 
@@ -119,12 +120,20 @@ describe('Linux cross-check policy', () => {
     }
   });
 
-  it('fails closed on Darwin without the linux-cross compiler instead of compiling', () => {
-    // Without this guard a Darwin cache miss sits in ring's cc-rs looking for
-    // x86_64-linux-gnu-gcc. The linux-cross profile exports
-    // CC_x86_64_unknown_linux_gnu; Linux CI is already the target.
-    expect(CARGO_CROSS_LINT_COMMAND).toContain('CC_x86_64_unknown_linux_gnu');
-    expect(CARGO_CROSS_LINT_COMMAND).toContain('uname -s');
+  it('refuses to start without cargo-zigbuild instead of compiling', async () => {
+    // Without this guard a cache miss outside the linux-cross toolchain would
+    // start a compile that cannot finish. Run for real against a PATH with no
+    // cargo-zigbuild: it must refuse, name the fix, and never reach cargo.
+    const child = Bun.spawn(['/bin/sh', '-c', CARGO_CROSS_LINT_COMMAND], {
+      cwd: tmpdir(),
+      env: { PATH: '/usr/bin:/bin' },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    expect(exitCode).toBe(2);
+    expect(stderr).toContain('needs cargo-zigbuild');
+    expect(stderr).toContain('bun run check:linux');
   });
 
   it('carries the triple explicitly so a host lint cannot pass for a cross one', () => {
@@ -171,8 +180,16 @@ describe('Linux cross-check policy', () => {
 
   it('pins clippy to the committed lockfile and local cache', () => {
     expect(cargoFrozen('clippy --workspace')).toBe('cargo --frozen clippy --workspace');
-    expect(CARGO_CROSS_LINT_COMMAND).toContain('cargo --frozen clippy');
+    // cargo drops a global --frozen in front of an external subcommand, so the
+    // flag sits on cargo-zigbuild's own subcommand.
+    expect(CARGO_CROSS_LINT_COMMAND).toContain('cargo-zigbuild clippy --frozen ');
+    expect(CARGO_CROSS_LINT_COMMAND).not.toContain('cargo --frozen zigbuild');
     expect(CARGO_LINT_CLIPPY_COMMAND).toContain('cargo --frozen clippy');
+    // Inference recognizes both spellings, so both get the fetch prerequisite
+    // and the toolchain identity.
+    expect(runsFrozenCargo(CARGO_CROSS_LINT_COMMAND)).toBe(true);
+    expect(runsFrozenCargo(CARGO_LINT_CLIPPY_COMMAND)).toBe(true);
+    expect(runsFrozenCargo('cargo clippy --workspace')).toBe(false);
   });
 
   it('drives the Nx target through the cross profile from the root script', () => {
@@ -185,8 +202,8 @@ describe('Linux cross-check policy', () => {
     // discovery stay Nx's job.
     expect(CROSS_CHECK_SCRIPT_COMMAND).toContain(`nx run-many -t ${CARGO_CROSS_LINT_TARGET}`);
     // The probe-only pre-push gate never runs this, so a human does — and
-    // devenv's own progress has to reach them, or a 0.4 GiB closure and an
-    // unbounded clippy are indistinguishable from a hang.
+    // devenv's own progress has to reach them, or a 0.9 GiB toolchain closure
+    // and an unbounded clippy are indistinguishable from a hang.
     expect(CROSS_CHECK_SCRIPT_COMMAND).not.toContain('--quiet');
   });
 

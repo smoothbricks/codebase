@@ -861,18 +861,14 @@ pattern configured the check passes silently, which is what CI and every clone t
 with `git config --add smoothbricks.publicDenylist '<regex>'`; run the command bare to judge `HEAD` before pushing.
 
 The second gate runs only on macOS. Linux `nx lint` already compiles the Linux `cfg(target_os)` arm; Darwin does not.
-This gate is a probe: it runs `env -u CC_x86_64_unknown_linux_gnu nx run-many -t cargo-lint-cross` and nothing else. Nx
-caches that target on the Cargo inputs, so a hit is a prior real Linux clippy and the push proceeds. A miss refuses the
-push and names `bun run check:linux` — the hook never enters linux-cross and never starts a compile, so what it costs is
-one Nx graph construction rather than an unbounded clippy. `bun run check:linux` is
-`tooling/devenv -P linux-cross shell --` around that same Nx target; it is the only place the gate actually runs, so it
-is deliberately not quiet. `git push --no-verify` skips the hook.
-
-The toolchain variable is unset for the probe on purpose. The target's own command reads it to decide whether the cross
-toolchain is present, so a push made from inside an already-entered linux-cross shell would otherwise fall through into
-a real multi-minute compile — the thing the probe exists to avoid. It is not a declared input of the target, so
-unsetting it cannot change the task hash: a warm entry still hits. Measured both ways, including with the variable set
-to a nonexistent compiler.
+This gate is a probe: it runs `nx run-many -t cargo-lint-cross` and nothing else. Nx caches that target on the Cargo
+inputs, so a hit is a prior real Linux clippy and the push proceeds. On a miss the target's own guard refuses to start
+without `cargo-zigbuild` on PATH, which a macOS shell carries only inside the linux-cross profile, so the push is
+refused with `bun run check:linux` named — the hook never enters linux-cross and never starts a compile, so what it
+costs is one Nx graph construction rather than an unbounded clippy. `bun run check:linux` is
+`tooling/devenv -P linux-cross shell --` around that same Nx target; it is the only place the gate runs from a plain
+shell, so it is deliberately not quiet. A push made from an already-entered linux-cross shell passes the guard and runs
+the check itself. `git push --no-verify` skips the hook.
 
 Conventional commit scopes should use Nx project names. For packages in the same npm scope as the root package, smoo
 requires `package.json` `nx.name` to be the unscoped package name, such as `cli` for `@smoothbricks/cli`, so subjects

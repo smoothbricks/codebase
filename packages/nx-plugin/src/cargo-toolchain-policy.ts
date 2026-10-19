@@ -20,12 +20,12 @@ import { runtimeInput, shellWord } from './runtime-input.js';
  * two machines ever agree and no cargo target can share a cache entry with a
  * peer or with CI — a remote cache for Rust was dead on arrival. And the dump
  * differs between a bare shell and a devenv profile for the SAME sources: in
- * the `linux-cross` profile `AR` becomes `x86_64-unknown-linux-gnu-ar`,
- * `CARGO_INSTALL_ROOT` moves under `profiles/linux-cross/`, and
- * `CC_x86_64_unknown_linux_gnu` appears, so the entry `check:linux` writes
- * inside the profile could never be hit by the pre-push probe, which runs
- * bare. Measured on one repository-root archive target with the dump still in
- * place: bare 18197306115812424011, in-profile 12567954759860890767.
+ * the `linux-cross` profile `CARGO_INSTALL_ROOT` moves under
+ * `profiles/linux-cross/`, and every variable the profile's tools set appears,
+ * so the entry `check:linux` writes inside the profile could never be hit by
+ * the pre-push probe, which runs bare. Measured on one repository-root archive
+ * target with the dump still in place: bare 18197306115812424011, in-profile
+ * 12567954759860890767.
  *
  * A file input has neither defect. The lock's bytes are identical bare and
  * in-profile and on every machine holding the checkout, while the toolchain
