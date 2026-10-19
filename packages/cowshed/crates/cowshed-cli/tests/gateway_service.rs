@@ -1062,18 +1062,26 @@ fn a_debug_build_is_never_installed_as_the_supervised_binary() {
     )
     .expect("package.json is JSON");
     let target = &package["nx"]["targets"][RELEASE_CLI_TARGET];
-    let command = |configuration: &serde_json::Value| {
-        configuration["command"]
+    // Each platform's CLI target says "release" in its executor's own terms: the macOS targets
+    // run `napi build` through `nx:run-commands`, whose command carries `--release`; the Linux
+    // targets use the plugin's `cargo-zigbuild` executor, whose `release` option is the flag.
+    let executor = target["executor"].as_str().unwrap_or_default();
+    let release = |configuration: &serde_json::Value| match executor {
+        "nx:run-commands" => configuration["command"]
             .as_str()
             .unwrap_or_else(|| panic!("{RELEASE_CLI_TARGET} names its command: {target}"))
-            .to_owned()
+            .contains("--release"),
+        "@smoothbricks/nx-plugin:cargo-zigbuild" => configuration["release"] == true,
+        other => panic!(
+            "{RELEASE_CLI_TARGET} uses executor {other:?}, which this test cannot read: {target}"
+        ),
     };
     assert!(
-        command(&target["configurations"]["production"]).contains("--release"),
+        release(&target["configurations"]["production"]),
         "{RELEASE_CLI_TARGET}:production must be a release build: {target}"
     );
     assert!(
-        !command(&target["options"]).contains("--release"),
+        !release(&target["options"]),
         "{RELEASE_CLI_TARGET}'s default configuration is a debug build, as the hint says: {target}"
     );
     assert!(
