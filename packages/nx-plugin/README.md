@@ -1435,17 +1435,23 @@ callers use the CLI facade rather than introducing another disk-command runner.
 Without an inherited parent pool, a `bounded-exec` command takes CPU tokens from cowshed's host budget before it starts,
 when the gateway answers on the same socket (`specs/cowshed/05_gateway.md`, "Host CPU budget"), so concurrent gates on
 one host keep their runnable work near the core count instead of each sizing its runners to the whole machine. It asks
-for the runner's requested parallelism — nextest's `--test-threads` or one per core (one for `--no-capture`, which runs
-tests serially), `bun test --parallel=N` N, a cargo build one per core, anything else one, or the target's `parallelism`
-option — bounded by positive inherited `NEXTEST_TEST_THREADS`/`CARGO_BUILD_JOBS` ceilings. A configured count can lower
-an inherited ceiling, never raise it. The runner uses `min(bounded request, granted tokens)`: nextest's environment and
-named flag, Bun's parallel flag, and Cargo's jobs are sized to that limit. Cargo's `RUST_TEST_THREADS` retains its
-independent inherited/configured ceiling. `BOUNDED_EXEC_CPU_TOKENS`, the sub-ledger and telemetry still name the actual
-held grant. The gateway shares tokens fairly between checkouts (Nx workspace roots). `timeoutMs` and `idleTimeoutMs`
-start at the grant. The tokens go back when the command exits, or with the executor's socket when it is killed. The wait
-prints one `cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. With no gateway listening, the
-command runs exactly as configured and nothing is said; a gateway from before the budget runs it unbudgeted and stderr
-says so.
+for the runner's requested parallelism, read from the runner's own flag rather than the core count — nextest's
+`--test-threads` or one per core (one for `--no-capture`, which runs tests serially), `bun test --parallel=N` N,
+Stryker's `--concurrency` N or N% (default one per core less one past four cores), Vitest's `--maxWorkers` N or N%
+(default one per core less one), `go test -p` (default `GOMAXPROCS`), cargo-mutants' `--jobserver-tasks` (default one
+per core, whatever `--jobs` says), a cargo build one per core, anything else one, or the target's `parallelism` option —
+bounded by positive inherited `NEXTEST_TEST_THREADS`/`CARGO_BUILD_JOBS` ceilings. A configured count can lower an
+inherited ceiling, never raise it. The runner uses `min(bounded request, granted tokens)`: nextest's environment and
+named flag, Bun's parallel flag, Stryker's, Vitest's and go's worker flag (added when the command names none),
+cargo-mutants' jobserver tasks, `--jobs` and per-process test threads, and Cargo's jobs are sized to that limit. A
+runner that starts its own workers or jobserver (cargo-mutants, Stryker, Vitest, `go test`) ignores the `cargo`
+launcher's fifo, so it must run under `bounded-exec`; the inferred `mutation` target does. Cargo's `RUST_TEST_THREADS`
+retains its independent inherited/configured ceiling. `BOUNDED_EXEC_CPU_TOKENS`, the sub-ledger and telemetry still name
+the actual held grant. The gateway shares tokens fairly between checkouts (Nx workspace roots). `timeoutMs` and
+`idleTimeoutMs` start at the grant. The tokens go back when the command exits, or with the executor's socket when it is
+killed. The wait prints one `cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. With no gateway
+listening, the command runs exactly as configured and nothing is said; a gateway from before the budget runs it
+unbudgeted and stderr says so.
 
 A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual token count. A nested default executor asks
 that immediate parent pool for its own demand, instead of taking from the host while the parent holds its grant; the

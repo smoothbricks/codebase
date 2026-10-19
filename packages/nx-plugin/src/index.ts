@@ -522,6 +522,8 @@ const CARGO_INPUTS = [
 // build really reads is the package's `napi` block (binary name, targets) and
 // the `@napi-rs/cli` it runs; those are hashed as such by napiInputs().
 const CARGO_OUTPUT_INPUTS = CARGO_INPUTS;
+/** A full cargo-mutants sweep's wall-clock backstop: a sweep takes hours, and a hung one must still end. */
+const MUTATION_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 // The toolchain half of a cargo task's identity lives in its own module
 // because `smoo monorepo validate` reads the same two constants to refuse a
 // declaration that drops it. See cargo-toolchain-policy.ts for why it is the
@@ -1543,10 +1545,13 @@ async function createProjectTargets(
     };
     // Mutation runs are minutes-to-hours: never cached, never part of build/lint.
     // CI runs these per-PR via `cargo mutants --in-diff` (see mutants.toml docs).
+    // bounded-exec sizes cargo-mutants' own jobserver to its CPU grant (its `cargo-mutants` runner kind), which
+    // otherwise starts one task per core whatever else runs on the host. It reports no test bounded-exec can read as
+    // progress, so its bound is a wall-clock backstop, not a performance budget.
     targets.mutation = {
-      executor: 'nx:run-commands',
+      executor: '@smoothbricks/nx-plugin:bounded-exec',
       cache: false,
-      options: { command: cargoFrozen('mutants --workspace'), cwd: cargoWorkspaceRoot },
+      options: { command: cargoFrozen('mutants --workspace'), cwd: cargoWorkspaceRoot, timeoutMs: MUTATION_TIMEOUT_MS },
     };
     targets.bench = {
       executor: 'nx:run-commands',

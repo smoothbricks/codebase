@@ -980,7 +980,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       expect(targets.test?.executor).toBe('nx:noop');
       expect(targets.test?.dependsOn).toEqual(['cargo-test']);
       expect(targets.mutation?.cache).toBe(false);
-      expect(targets.mutation?.options).toMatchObject({ command: 'cargo --frozen mutants --workspace' });
+      // On bounded-exec, so cargo-mutants' own per-core jobserver is sized to a CPU grant.
+      expect(targets.mutation?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
+      expect(targets.mutation?.options).toMatchObject({
+        command: 'cargo --frozen mutants --workspace',
+        timeoutMs: 6 * 60 * 60 * 1000,
+      });
       expect(targets.bench?.options).toMatchObject({ command: 'cargo --frozen bench --workspace' });
       expectNoSchedulerThrottle(targets);
     } finally {
@@ -2698,7 +2703,12 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
 
       // `options` merges key by key, so a declared command overrides only itself.
       const mutation = resolveDeclaredOverInferred(targets, declared, 'mutation');
-      expect(mutation?.options).toEqual({ command: 'cargo mutants --in-diff', cwd: 'packages/ferris' });
+      expect(mutation?.options).toEqual({
+        command: 'cargo mutants --in-diff',
+        cwd: 'packages/ferris',
+        timeoutMs: 6 * 60 * 60 * 1000,
+      });
+      expect(mutation?.executor).toBe('@smoothbricks/nx-plugin:bounded-exec');
       expect(mutation?.cache).toBe(false);
 
       const bench = resolveDeclaredOverInferred(targets, declared, 'bench');

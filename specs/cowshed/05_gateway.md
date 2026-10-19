@@ -646,21 +646,37 @@ core count.
 - **The budget.** N tokens, one per core the host reports (`std::thread::available_parallelism`); one token is one
   runnable thread or process. The ledger keeps `free + Σ held = N`; it never infers a holder from a process scan.
 - **Who asks.** The `@smoothbricks/nx-plugin` `bounded-exec` executor, before it starts any command — the inferred
-  nextest runners, `bun test` targets, cargo commands it runs. Its requested parallelism is the command's runner's own:
-  a `nextest run` names `--test-threads` or defaults to one per core, and one with `--no-capture` (`--nocapture` past
-  `--`) runs its tests serially whatever count it names, so it asks for one; `bun test --parallel=N` names N workers, a
-  bare `--parallel` defaults to one per core; a cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`,
-  `napi build`) defaults to one job per core; anything else, one `bun test` process included, defaults to one. A
-  target's `parallelism` option selects that request, but positive inherited `NEXTEST_TEST_THREADS` and
-  `CARGO_BUILD_JOBS` are ceilings on their respective runners. A configured environment count may lower an inherited
-  ceiling, never raise it. `want` is the lesser of the request and its ceiling. `test.concurrent` inside one process is
-  not another CPU.
+  nextest runners, `bun test` targets, cargo commands it runs. Its requested parallelism is the command's runner's own,
+  read from the runner's own flag rather than assumed from the core count, since a runner's flag and its actual
+  concurrency can disagree: a `nextest run` names `--test-threads` or defaults to one per core, and one with
+  `--no-capture` (`--nocapture` past `--`) runs its tests serially whatever count it names, so it asks for one;
+  `bun test --parallel=N` names N workers, a bare `--parallel` defaults to one per core; `stryker run` names
+  `--concurrency`/`-c` N or N% of the cores and defaults to one worker per core less one past four cores (31 on a
+  32-core host); `vitest` names `--maxWorkers` N or N% and defaults to one per core less one, one with file parallelism
+  off; `go test` names `-p` and defaults to `GOMAXPROCS`, normally one per core; `cargo mutants` asks for its own
+  jobserver's tasks, `--jobserver-tasks` or one per core by default — its `--jobs` (default one) counts the cargo
+  processes that share those tasks, so it lowers nothing, and asks for more only when it exceeds them, since each
+  process runs at least one thread; a cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`, `napi build`)
+  defaults to one job per core; anything else, one `bun test` process included, defaults to one. A runner's flag counts
+  only in its own invocation's arguments, up to the next `;`, `&`, `|` or parenthesis outside quotes and `$(…)`, so
+  `ulimit -c 0 && bun stryker run` asks for Stryker's default; a value that is no count (`-p="$(nproc)"`) leaves the
+  default. Measured in nightly 477, `nx run-many -t mutation` under `NX_PARALLEL=100%` on a CI host without a gateway:
+  Stryker started 31 workers per package and cargo-mutants a jobserver of one task per core, side by side, and Stryker
+  for three packages and a fourth target were SIGKILLed within 20 seconds. A target's `parallelism` option selects that
+  request, but positive inherited `NEXTEST_TEST_THREADS` and `CARGO_BUILD_JOBS` are ceilings on their respective
+  runners. A configured environment count may lower an inherited ceiling, never raise it. `want` is the lesser of the
+  request and its ceiling. `test.concurrent` inside one process, and a Go package's `t.Parallel` tests inside one test
+  binary, are not another CPU.
 - **Sized to the grant.** A grant is between 1 and `want`; runner concurrency is at most `min(want, granted tokens)`,
   never raised above an inherited ceiling. The executor sets `NEXTEST_TEST_THREADS` and rewrites nextest's named
   `--test-threads=` count to that limit, rewrites Bun's `--parallel=` count, and sets `CARGO_BUILD_JOBS` for cargo.
-  Cargo's `RUST_TEST_THREADS` also retains its independent inherited/configured ceiling. Every command receives the
-  actual held grant as `BOUNDED_EXEC_CPU_TOKENS`; the sub-ledger and telemetry report held tokens, not a fabricated
-  runner count.
+  Stryker's `--concurrency=`, Vitest's `--maxWorkers=` and go's `-p=` are rewritten where named and otherwise added
+  right after the invocation, so a config file's count cannot outrank the grant. cargo-mutants gets `--jobserver-tasks=`
+  that limit, its named `--jobs` and `CARGO_MUTANTS_JOBS` lowered to at most it, and each of its cargo processes
+  `⌊limit / jobs⌋`, at least one, as `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS`; `--jobs` is
+  never added, since cargo-mutants refuses it beside `--in-place`. Cargo's `RUST_TEST_THREADS` also retains its
+  independent inherited/configured ceiling. Every command receives the actual held grant as `BOUNDED_EXEC_CPU_TOKENS`;
+  the sub-ledger and telemetry report held tokens, not a fabricated runner count.
 - **Nested runners use a parent-held sub-ledger.** A granted executor serves its T tokens on a private socket and
   publishes that endpoint as `BOUNDED_EXEC_CPU_POOL`, beside its `BOUNDED_EXEC_CPU_TOKENS` count. A default nested
   executor connects to its immediate parent's live pool, requests its own demand (the count is not a bound on the ask:
@@ -1016,6 +1032,13 @@ core count.
     request (fairness, all at once), refuses the same malformed requests and a growing request that also asks for a
     `pool` (a pool lends a fixed count), and answers `{"ok":true,"lease":"granted","tokens":<g>,"fifo":"<path>"}`. A
     growing grant's gateway writes each grown token into that fifo and then answers `grown` with the new total.
+- **A runner the launcher's grant cannot size.** The launcher's grant bounds what reads its fifo and its test variables,
+  nothing else. `cargo mutants` hands every cargo it starts a jobserver of its own, `--jobserver-tasks` tokens, one per
+  core by default, in place of the launcher's fifo, so a `cargo mutants` outside `bounded-exec` holds its grant and
+  still compiles one job per core; Stryker, Vitest and `go test` start their own workers and read no make jobserver at
+  all. Such a runner therefore runs under `bounded-exec`, whose runner kinds read and size its own flag ("Who asks",
+  "Sized to the grant"): the plugin's inferred `mutation` target runs `cargo mutants` there, and a repository's declared
+  Stryker, Vitest and `go test` targets do the same.
 - **The jobserver fifo.** On the grant the gateway creates that fifo in its private runtime directory, mode `0600` and
   owned by the client's user (from the socket's peer credentials). It opens the fifo `O_RDWR` and keeps that descriptor
   until the drain, so the bytes survive while no client has it open, and writes `g − 1` token bytes into it: the

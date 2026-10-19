@@ -106,6 +106,193 @@ describe('cowshed CPU budget client', () => {
     expect(runnerDemand('cargo nextest run --test-threads=4', 6, 18, {})).toEqual({ kind: 'nextest', want: 6 });
   });
 
+  it("asks for Stryker's --concurrency, else its own default of one worker per core less one past four cores", () => {
+    expect(runnerDemand('bun stryker run --concurrency 4', undefined, 18, {})).toEqual({ kind: 'stryker', want: 4 });
+    expect(runnerDemand('bun stryker run -c 6', undefined, 18, {})).toEqual({ kind: 'stryker', want: 6 });
+    expect(runnerDemand('npx stryker run --concurrency=3', undefined, 18, {})).toEqual({ kind: 'stryker', want: 3 });
+    expect(runnerDemand('../../node_modules/.bin/stryker run -c 2', undefined, 18, {})).toEqual({
+      kind: 'stryker',
+      want: 2,
+    });
+    // Stryker takes the last count it is given.
+    expect(runnerDemand('bun stryker run -c 8 --concurrency 5', undefined, 18, {})).toEqual({
+      kind: 'stryker',
+      want: 5,
+    });
+    // A share is of the cores, and never less than one worker.
+    expect(runnerDemand('bun stryker run --concurrency=50%', undefined, 18, {})).toEqual({ kind: 'stryker', want: 9 });
+    expect(runnerDemand('bun stryker run --concurrency 0%', undefined, 18, {})).toEqual({ kind: 'stryker', want: 1 });
+    // Stryker's default, which sized nightly 477's sweeps to the whole host: n - 1 past four cores, else n.
+    expect(runnerDemand('bun stryker run', undefined, 32, {})).toEqual({ kind: 'stryker', want: 31 });
+    expect(runnerDemand('bun stryker run', undefined, 18, {})).toEqual({ kind: 'stryker', want: 17 });
+    expect(runnerDemand('bun stryker run', undefined, 4, {})).toEqual({ kind: 'stryker', want: 4 });
+    // Another command's `-c` in the same line is not Stryker's.
+    expect(runnerDemand('ulimit -c 0 && bun stryker run', undefined, 18, {})).toEqual({ kind: 'stryker', want: 17 });
+    expect(runnerDemand('bun stryker run && nice -c 3 true', undefined, 18, {})).toEqual({ kind: 'stryker', want: 17 });
+    // A declared parallelism outranks the flag.
+    expect(runnerDemand('bun stryker run --concurrency 8', 2, 18, {})).toEqual({ kind: 'stryker', want: 2 });
+    // A test file named for Stryker is one bun process.
+    expect(runnerDemand('bun test stryker.test.ts', undefined, 18, {})).toEqual({ kind: 'process', want: 1 });
+  });
+
+  it("asks for Vitest's --maxWorkers and go test's -p, else each runner's own per-core default", () => {
+    // Vitest outside watch mode runs one worker per core less one.
+    expect(runnerDemand('bun vitest run', undefined, 18, {})).toEqual({ kind: 'vitest', want: 17 });
+    expect(runnerDemand('bun vitest run --config vitest.config.workers.ts', undefined, 18, {})).toEqual({
+      kind: 'vitest',
+      want: 17,
+    });
+    expect(runnerDemand('bun vitest run --maxWorkers=4', undefined, 18, {})).toEqual({ kind: 'vitest', want: 4 });
+    expect(runnerDemand('vitest run --max-workers 50%', undefined, 18, {})).toEqual({ kind: 'vitest', want: 9 });
+    expect(runnerDemand('bun vitest run --no-file-parallelism', undefined, 18, {})).toEqual({
+      kind: 'vitest',
+      want: 1,
+    });
+    // `go test -p` defaults to GOMAXPROCS, normally one per core.
+    expect(runnerDemand('go test -count=1 ./hts/... ./host/...', undefined, 18, {})).toEqual({
+      kind: 'go-test',
+      want: 18,
+    });
+    expect(runnerDemand('cd go/ttscwire && go test ./...', undefined, 18, { GOMAXPROCS: '4' })).toEqual({
+      kind: 'go-test',
+      want: 4,
+    });
+    expect(runnerDemand('go test -p 3 -parallel 8 ./...', undefined, 18, {})).toEqual({ kind: 'go-test', want: 3 });
+    // A shell word that is no count leaves the runner's default; it is still sized by the grant.
+    expect(runnerDemand('bun ../scripts/gen-go-work.mjs && go test ./... -p="$(nproc)"', undefined, 18, {})).toEqual({
+      kind: 'go-test',
+      want: 18,
+    });
+  });
+
+  it("asks for cargo-mutants' own jobserver, one task per core unless --jobserver-tasks names fewer", () => {
+    // The plugin's inferred `mutation` command, with no flag: `--jobs` defaults to one cargo process, but its
+    // jobserver defaults to one task per core (`n_tasks=<cores>`), shared by every cargo that process starts.
+    expect(runnerDemand('cargo --frozen mutants --workspace', undefined, 18, {})).toEqual({
+      kind: 'cargo-mutants',
+      want: 18,
+      jobs: 1,
+    });
+    // `--jobs` counts cargo processes, which still share that per-core jobserver.
+    expect(runnerDemand('cargo mutants --jobs 4', undefined, 18, {})).toEqual({
+      kind: 'cargo-mutants',
+      want: 18,
+      jobs: 4,
+    });
+    expect(runnerDemand('cargo mutants --jobserver-tasks 4', undefined, 18, {})).toEqual({
+      kind: 'cargo-mutants',
+      want: 4,
+      jobs: 1,
+    });
+    expect(runnerDemand('cargo mutants -j2 --jobserver-tasks=4', undefined, 18, {})).toEqual({
+      kind: 'cargo-mutants',
+      want: 4,
+      jobs: 2,
+    });
+    // Each cargo process runs at least one thread, whatever the jobserver allows.
+    expect(runnerDemand('cargo mutants --jobs=6 --jobserver-tasks 4', undefined, 18, {})).toEqual({
+      kind: 'cargo-mutants',
+      want: 6,
+      jobs: 6,
+    });
+    // `CARGO_MUTANTS_JOBS` as the command will see it: the target's own environment over the inherited one.
+    expect(runnerDemand('cargo mutants --jobserver-tasks 4', undefined, 18, { CARGO_MUTANTS_JOBS: '3' })).toEqual({
+      kind: 'cargo-mutants',
+      want: 4,
+      jobs: 3,
+    });
+    expect(
+      runnerDemand(
+        'cargo mutants --jobserver-tasks 4',
+        undefined,
+        18,
+        { CARGO_MUTANTS_JOBS: '3' },
+        { CARGO_MUTANTS_JOBS: '2' },
+      ),
+    ).toEqual({ kind: 'cargo-mutants', want: 4, jobs: 2 });
+    expect(runnerDemand('cargo-mutants mutants --in-diff pr.diff', undefined, 12, {})).toEqual({
+      kind: 'cargo-mutants',
+      want: 12,
+      jobs: 1,
+    });
+    // Another command's `-j` in the same line is not cargo-mutants'.
+    expect(runnerDemand('cargo mutants --jobserver-tasks 4 && make -j 9', undefined, 18, {})).toEqual({
+      kind: 'cargo-mutants',
+      want: 4,
+      jobs: 1,
+    });
+    expect(runnerDemand('cargo mutants', 3, 18, {})).toEqual({ kind: 'cargo-mutants', want: 3, jobs: 1 });
+    // A package named `mutants` is an ordinary cargo build.
+    expect(runnerDemand('cargo test -p mutants', undefined, 18, {})).toEqual({
+      kind: 'cargo',
+      want: 18,
+      testThreads: null,
+    });
+  });
+
+  it('sizes the worker-flag runners and cargo-mutants to their grant', () => {
+    expect(sizeRunner({ kind: 'stryker', want: 17 }, 'bun stryker run', 4)).toEqual({
+      command: 'bun stryker run --concurrency=4',
+      env: { [CPU_TOKENS_ENV]: '4' },
+    });
+    expect(sizeRunner({ kind: 'stryker', want: 8 }, 'bun stryker run -c 8 --fileLogLevel off', 3).command).toBe(
+      'bun stryker run --concurrency=3 --fileLogLevel off',
+    );
+    expect(
+      sizeRunner({ kind: 'stryker', want: 8 }, 'ulimit -c 0 && bun stryker run --concurrency 8 && echo done', 2)
+        .command,
+    ).toBe('ulimit -c 0 && bun stryker run --concurrency=2 && echo done');
+    // A grant larger than the ask sizes to the ask.
+    expect(sizeRunner({ kind: 'stryker', want: 4 }, 'bun stryker run --concurrency=4', 9).command).toBe(
+      'bun stryker run --concurrency=4',
+    );
+    expect(sizeRunner({ kind: 'cargo-mutants', want: 18, jobs: 1 }, 'cargo --frozen mutants --workspace', 5)).toEqual({
+      command: 'cargo --frozen mutants --jobserver-tasks=5 --workspace',
+      env: { [CPU_TOKENS_ENV]: '5', CARGO_BUILD_JOBS: '5', RUST_TEST_THREADS: '5', NEXTEST_TEST_THREADS: '5' },
+    });
+    // Its cargo processes share the grant: each tests on its share, and there are never more of them than tokens.
+    expect(
+      sizeRunner({ kind: 'cargo-mutants', want: 18, jobs: 4 }, 'cargo mutants --jobs 4 --jobserver-tasks 18', 8),
+    ).toEqual({
+      command: 'cargo mutants --jobs=4 --jobserver-tasks=8',
+      env: {
+        [CPU_TOKENS_ENV]: '8',
+        CARGO_MUTANTS_JOBS: '4',
+        CARGO_BUILD_JOBS: '2',
+        RUST_TEST_THREADS: '2',
+        NEXTEST_TEST_THREADS: '2',
+      },
+    });
+    expect(sizeRunner({ kind: 'cargo-mutants', want: 18, jobs: 4 }, 'cargo mutants -j4', 2)).toEqual({
+      command: 'cargo mutants --jobserver-tasks=2 --jobs=2',
+      env: {
+        [CPU_TOKENS_ENV]: '2',
+        CARGO_MUTANTS_JOBS: '2',
+        CARGO_BUILD_JOBS: '1',
+        RUST_TEST_THREADS: '1',
+        NEXTEST_TEST_THREADS: '1',
+      },
+    });
+    // `--jobs` is never added: cargo-mutants refuses it beside `--in-place`.
+    expect(sizeRunner({ kind: 'cargo-mutants', want: 18, jobs: 1 }, 'cargo mutants --in-place', 3).command).toBe(
+      'cargo mutants --jobserver-tasks=3 --in-place',
+    );
+    expect(sizeRunner({ kind: 'vitest', want: 17 }, 'bun vitest run --config vitest.config.workers.ts', 3)).toEqual({
+      command: 'bun vitest run --maxWorkers=3 --config vitest.config.workers.ts',
+      env: { [CPU_TOKENS_ENV]: '3' },
+    });
+    expect(sizeRunner({ kind: 'vitest', want: 4 }, 'bun vitest run --maxWorkers 4', 2).command).toBe(
+      'bun vitest run --maxWorkers=2',
+    );
+    expect(
+      sizeRunner({ kind: 'go-test', want: 18 }, 'bun ../scripts/gen-go-work.mjs && go test ./... -p="$(nproc)"', 4)
+        .command,
+    ).toBe('bun ../scripts/gen-go-work.mjs && go test ./... -p=4');
+    expect(sizeRunner({ kind: 'go-test', want: 18 }, 'cd go/ttscwire && go test ./...', 2).command).toBe(
+      'cd go/ttscwire && go test -p=2 ./...',
+    );
+  });
+
   it('sizes each runner to its grant', () => {
     expect(sizeRunner({ kind: 'nextest', want: 18 }, NEXTEST_PIECE, 5)).toEqual({
       command: NEXTEST_PIECE,

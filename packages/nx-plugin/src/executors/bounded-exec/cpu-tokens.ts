@@ -19,15 +19,23 @@ export type RunnerKind =
   | 'nextest'
   /** `bun test --parallel`: its worker processes. */
   | 'bun-parallel'
+  /** A runner whose worker count is one flag of its own (`WORKER_FLAGS`). */
+  | WorkerFlagKind
+  /** `cargo mutants`: its own jobserver's tasks, `--jobserver-tasks`, shared by the `--jobs` cargo processes it starts. */
+  | 'cargo-mutants'
   /** A cargo build (`cargo build`/`test`/`clippy`/…, `nextest archive`, `napi build`): its jobs. */
   | 'cargo'
   /** Anything else, one `bun test` process included: one process unless it declares more. */
   | 'process';
 
-/** What a runner asks the budget for; Cargo also carries its independent test-thread ceiling. */
+/**
+ * What a runner asks the budget for. Cargo also carries its independent test-thread ceiling; cargo-mutants carries
+ * how many cargo processes it runs at once, which share its grant.
+ */
 export type Demand =
   | { kind: 'cargo'; want: number; testThreads: number | null }
-  | { kind: Exclude<RunnerKind, 'cargo'>; want: number };
+  | { kind: 'cargo-mutants'; want: number; jobs: number }
+  | { kind: Exclude<RunnerKind, 'cargo' | 'cargo-mutants'>; want: number };
 
 /** Every budgeted command learns its grant here, so a script that starts a runner can size it. */
 export const CPU_TOKENS_ENV = 'BOUNDED_EXEC_CPU_TOKENS';
@@ -38,12 +46,69 @@ const TEST_THREADS = /--test-threads(?:=|\s+)(\d+)/g;
 /** nextest's `--no-capture` (`--nocapture` past `--`): it runs tests serially and ignores `--test-threads`. */
 const NO_CAPTURE = /(?<![\w-])--no-?capture(?![\w-])/;
 const BUN_PARALLEL = /--parallel(?:=(\d+))?(?=\s|$)/g;
+/** `cargo mutants`, cargo's global options allowed between, or the `cargo-mutants` binary itself. */
+const CARGO_MUTANTS = /(?<=^|[\s;&|()])(?:cargo(?:\s+-\S+)*|cargo-mutants)\s+mutants(?=\s|$)/;
+/** cargo-mutants' own jobserver, one per run, whose tasks every cargo it starts shares: `--jobserver-tasks N`. */
+const JOBSERVER_TASKS = /(?<![\w-])--jobserver-tasks(?:=|\s+)(\d+)(?![\w.])/g;
+/** cargo-mutants' cargo build/test processes at once: `--jobs N` or `-j N`. */
+const MUTANTS_JOBS = /(?<![\w-])(?:--jobs(?:=|\s+)|-j(?:=|\s*))(\d+)(?![\w.])/g;
+/** A count, or a share of the cores (`N%`), optionally quoted. Any other word (`"$(nproc)"`) names no count. */
+const WORKER_COUNT = /^(["']?)(\d+)(%?)\1$/;
 const INHERITED_COUNT = /^[1-9]\d*$/;
+
+type WorkerFlagKind = 'stryker' | 'vitest' | 'go-test';
+
+/**
+ * A runner that starts its own workers, one per core or close to it unless one flag of its own names a count or a
+ * share of the cores. The grant always sizes it through that flag, which outranks the runner's config file.
+ */
+interface WorkerFlag {
+  /** How the runner is started; the flag counts only in this invocation's own arguments. */
+  readonly invocation: RegExp;
+  /** The flag with its value, one shell word, captured. */
+  readonly flag: RegExp;
+  /** The flag naming `count`. */
+  readonly sized: (count: number) => string;
+  /** The runner's own count when the flag names none, from the cores and the environment the command will see. */
+  readonly ownDefault: (cores: number, env: Readonly<NodeJS.ProcessEnv>) => number;
+  /** A flag with which the runner runs one worker whatever count it names. */
+  readonly serial?: RegExp;
+}
+
+/** One shell word: quoted, a `$(…)` substitution, or bare. */
+const WORD = String.raw`("[^"]*"|'[^']*'|\$\([^)]*\)|[^\s;&|()'"]+)`;
+
+const WORKER_FLAGS: Readonly<Record<WorkerFlagKind, WorkerFlag>> = {
+  /** StrykerJS's `concurrency`: n - 1 workers past four cores, else n. */
+  stryker: {
+    invocation: /(?<=^|[\s;&|()/])stryker\s+run(?=\s|$)/,
+    flag: new RegExp(String.raw`(?<![\w-])(?:--concurrency|-c)(?:=|\s+)${WORD}`, 'g'),
+    sized: (count) => `--concurrency=${count}`,
+    ownDefault: (cores) => (cores > 4 ? cores - 1 : cores),
+  },
+  /** Vitest's `maxWorkers`: n - 1 workers outside watch mode, one with file parallelism off. */
+  vitest: {
+    invocation: /(?<=^|[\s;&|()/])vitest(?:\s+run)?(?=\s|$)/,
+    flag: new RegExp(String.raw`(?<![\w-])--max(?:W|-w)orkers(?:=|\s+)${WORD}`, 'g'),
+    sized: (count) => `--maxWorkers=${count}`,
+    ownDefault: (cores) => Math.max(cores - 1, 1),
+    serial: /(?<![\w-])(?:--no-file-parallelism|--file(?:P|-p)arallelism=false)(?![\w-])/,
+  },
+  /** `go test -p`: packages built and tested at once, `GOMAXPROCS` by default, normally one per core. */
+  'go-test': {
+    invocation: /(?<=^|[\s;&|()])go\s+test(?=\s|$)/,
+    flag: new RegExp(String.raw`(?<![\w-])-p(?:=|\s+)${WORD}`, 'g'),
+    sized: (count) => `-p=${count}`,
+    ownDefault: (cores, env) => parseInheritedTokens(env.GOMAXPROCS) ?? cores,
+  },
+};
 
 /**
  * What `command` asks for: its kind by invocation, and `declared` (the target's `parallelism`)
- * when it says, else the count the command names (`--test-threads=N`, `--parallel=N`), else the
- * runner's own default — one thread per core for nextest, a bare `--parallel` and cargo, one
+ * when it says, else the count the command names (`--test-threads=N`, `--parallel=N`, a worker
+ * flag's N or N%, `--jobserver-tasks=N`), else the runner's own default — one thread per core for
+ * nextest, a bare `--parallel` and cargo; a worker-flag runner's own (`WORKER_FLAGS`); one per core
+ * for cargo-mutants, whose own jobserver defaults to one task per core whatever `--jobs` says; one
  * process for anything else. A nextest run with `--no-capture` runs one test at a time whatever
  * thread count it names, so it asks for one. Positive inherited runner counts are ceilings;
  * configured counts may only lower them.
@@ -55,21 +120,15 @@ export function runnerDemand(
   inherited: Readonly<NodeJS.ProcessEnv>,
   configured?: Readonly<NodeJS.ProcessEnv>,
 ): Demand {
-  const kind: RunnerKind =
-    command.search(NEXTEST_RUN) !== -1
-      ? 'nextest'
-      : command.search(BUN_TEST) !== -1 && command.search(BUN_PARALLEL) !== -1
-        ? 'bun-parallel'
-        : command.search(CARGO_BUILD) !== -1
-          ? 'cargo'
-          : 'process';
-  const counted = kind === 'nextest' ? TEST_THREADS : kind === 'bun-parallel' ? BUN_PARALLEL : null;
-  const named =
-    counted === null
-      ? []
-      : [...command.matchAll(counted)].flatMap((match) => (match[1] === undefined ? [] : [Number(match[1])]));
-  const serial = kind === 'nextest' && NO_CAPTURE.test(command);
-  const requested = declared ?? (serial ? 1 : named.length > 0 ? Math.max(...named) : kind === 'process' ? 1 : cores);
+  const kind = runnerKind(command);
+  // cargo-mutants' cargo processes at once: `--jobs`, else `CARGO_MUTANTS_JOBS` as the command will see it, else one.
+  const jobs =
+    kind === 'cargo-mutants'
+      ? (namedCounts(invocationArgs(command, CARGO_MUTANTS), MUTANTS_JOBS).at(-1) ??
+        parseInheritedTokens(configured?.CARGO_MUTANTS_JOBS ?? inherited.CARGO_MUTANTS_JOBS) ??
+        1)
+      : 1;
+  const requested = declared ?? ownParallelism(kind, command, cores, jobs, { ...inherited, ...configured });
   const ceiling =
     kind === 'nextest'
       ? inheritedCeiling(inherited.NEXTEST_TEST_THREADS, configured?.NEXTEST_TEST_THREADS)
@@ -77,9 +136,126 @@ export function runnerDemand(
         ? inheritedCeiling(inherited.CARGO_BUILD_JOBS, configured?.CARGO_BUILD_JOBS)
         : null;
   const want = Math.max(1, Math.min(requested, ceiling ?? requested));
-  return kind === 'cargo'
-    ? { kind, want, testThreads: inheritedCeiling(inherited.RUST_TEST_THREADS, configured?.RUST_TEST_THREADS) }
-    : { kind, want };
+  switch (kind) {
+    case 'cargo':
+      return { kind, want, testThreads: inheritedCeiling(inherited.RUST_TEST_THREADS, configured?.RUST_TEST_THREADS) };
+    case 'cargo-mutants':
+      return { kind, want, jobs };
+    default:
+      return { kind, want };
+  }
+}
+
+function runnerKind(command: string): RunnerKind {
+  if (command.search(NEXTEST_RUN) !== -1) {
+    return 'nextest';
+  }
+  // Stryker before Vitest: its vitest runner is Stryker's workers, not a `vitest` invocation of the command.
+  for (const kind of ['stryker', 'vitest', 'go-test'] as const) {
+    if (WORKER_FLAGS[kind].invocation.test(command)) {
+      return kind;
+    }
+  }
+  if (CARGO_MUTANTS.test(command)) {
+    return 'cargo-mutants';
+  }
+  if (command.search(BUN_TEST) !== -1 && command.search(BUN_PARALLEL) !== -1) {
+    return 'bun-parallel';
+  }
+  return CARGO_BUILD.test(command) ? 'cargo' : 'process';
+}
+
+/** What the runner runs at once when the target declares nothing: the count it names, else its own default. */
+function ownParallelism(
+  kind: RunnerKind,
+  command: string,
+  cores: number,
+  jobs: number,
+  env: Readonly<NodeJS.ProcessEnv>,
+): number {
+  switch (kind) {
+    case 'nextest': {
+      const named = namedCounts(command, TEST_THREADS);
+      return NO_CAPTURE.test(command) ? 1 : named.length > 0 ? Math.max(...named) : cores;
+    }
+    case 'bun-parallel': {
+      const named = namedCounts(command, BUN_PARALLEL);
+      return named.length > 0 ? Math.max(...named) : cores;
+    }
+    case 'stryker':
+    case 'vitest':
+    case 'go-test': {
+      const runner = WORKER_FLAGS[kind];
+      const args = invocationArgs(command, runner.invocation);
+      if (runner.serial?.test(args)) {
+        return 1;
+      }
+      // The runner takes the last count it is given; a share is of the cores, between one worker and all of them.
+      const named = [...args.matchAll(runner.flag)].flatMap((match) => {
+        const count = WORKER_COUNT.exec(match[1] ?? '');
+        if (count === null) {
+          return [];
+        }
+        const value = Number(count[2]);
+        return [count[3] === '%' ? Math.max(1, Math.min(cores, Math.round((cores * value) / 100))) : value];
+      });
+      return named.at(-1) ?? runner.ownDefault(cores, env);
+    }
+    case 'cargo-mutants':
+      // Its compiles share its own jobserver (one task per core unless named); its `jobs` test runs need a thread each.
+      return Math.max(namedCounts(invocationArgs(command, CARGO_MUTANTS), JOBSERVER_TASKS).at(-1) ?? cores, jobs);
+    case 'cargo':
+      return cores;
+    case 'process':
+      return 1;
+  }
+}
+
+function namedCounts(text: string, flag: RegExp): number[] {
+  return [...text.matchAll(flag)].flatMap((match) => (match[1] === undefined ? [] : [Number(match[1])]));
+}
+
+/**
+ * Where `invocation` ends in `command`, and where its own arguments end: the next `;`, `&`, `|`, `(` or `)` outside
+ * quotes and `$(…)`.
+ */
+function invocationSpan(command: string, invocation: RegExp): { end: number; argsEnd: number } {
+  const found = invocation.exec(command);
+  const end = found === null ? command.length : found.index + found[0].length;
+  let quote: string | null = null;
+  let substitutions = 0;
+  for (let at = end; at < command.length; at += 1) {
+    const char = command[at];
+    if (quote !== null) {
+      quote = char === quote ? null : quote;
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === '$' && command[at + 1] === '(') {
+      substitutions += 1;
+      at += 1;
+    } else if (char === ')' && substitutions > 0) {
+      substitutions -= 1;
+    } else if (substitutions === 0 && (char === ';' || char === '&' || char === '|' || char === '(' || char === ')')) {
+      return { end, argsEnd: at };
+    }
+  }
+  return { end, argsEnd: command.length };
+}
+
+function invocationArgs(command: string, invocation: RegExp): string {
+  const { end, argsEnd } = invocationSpan(command, invocation);
+  return command.slice(end, argsEnd);
+}
+
+/**
+ * `command` with every `flag` in `invocation`'s own arguments replaced by `sized`; when it names none, `sized` is
+ * added right after the invocation if `add` says so.
+ */
+function withSizedFlag(command: string, invocation: RegExp, flag: RegExp, sized: string, add: boolean): string {
+  const { end, argsEnd } = invocationSpan(command, invocation);
+  const args = command.slice(end, argsEnd);
+  const sizedArgs = args.search(flag) === -1 && add ? ` ${sized}${args}` : args.replace(flag, sized);
+  return `${command.slice(0, end)}${sizedArgs}${command.slice(argsEnd)}`;
 }
 
 /**
@@ -111,6 +287,32 @@ export function sizeRunner(
           RUST_TEST_THREADS: String(Math.min(runnerCount, demand.testThreads ?? runnerCount)),
         },
       };
+    case 'stryker':
+    case 'vitest':
+    case 'go-test': {
+      const runner = WORKER_FLAGS[demand.kind];
+      return {
+        command: withSizedFlag(command, runner.invocation, runner.flag, runner.sized(runnerCount), true),
+        env: { [CPU_TOKENS_ENV]: held },
+      };
+    }
+    case 'cargo-mutants': {
+      // Its own jobserver bounds every compile it starts; each of its `jobs` cargo processes runs tests on its share.
+      // `--jobs` is lowered only where it was set: cargo-mutants refuses it beside `--in-place`.
+      const jobs = Math.min(demand.jobs, runnerCount);
+      const share = String(Math.max(1, Math.floor(runnerCount / jobs)));
+      const tasks = withSizedFlag(command, CARGO_MUTANTS, JOBSERVER_TASKS, `--jobserver-tasks=${count}`, true);
+      return {
+        command: withSizedFlag(tasks, CARGO_MUTANTS, MUTANTS_JOBS, `--jobs=${jobs}`, false),
+        env: {
+          [CPU_TOKENS_ENV]: held,
+          ...(demand.jobs > 1 ? { CARGO_MUTANTS_JOBS: String(jobs) } : {}),
+          CARGO_BUILD_JOBS: share,
+          RUST_TEST_THREADS: share,
+          NEXTEST_TEST_THREADS: share,
+        },
+      };
+    }
     case 'process':
       return { command, env: { [CPU_TOKENS_ENV]: held } };
   }
