@@ -762,7 +762,16 @@ impl JobArtifactRecord {
                 "only a terminal job record names its granted CPU tokens or its observed nice",
             ));
         }
-        if self.nice.is_some() && self.cpu_tokens.is_none() {
+        // A resident is granted no tokens (05_gateway.md, "A resident holds no token"), so its
+        // observed nice stands alone; every other class's nice is its grant's.
+        let resident = self.scheduling.class() == JobserverClass::Resident;
+        if resident && self.cpu_tokens.is_some() {
+            return Err(integrity(
+                0,
+                "a resident job record names no CPU tokens: a resident is granted none",
+            ));
+        }
+        if !resident && self.nice.is_some() && self.cpu_tokens.is_none() {
             return Err(integrity(
                 0,
                 "a job record names an observed nice only for a command its CPU grant admitted",
@@ -4772,6 +4781,11 @@ fn decode_cpu(
             uint64(batch, first + 3).and_then(|column| decode_tokens(column.value(0), "cpu_tokens"))
         })
         .transpose()?;
+    if class == JobserverClass::Resident && cpu_tokens.is_some() {
+        return Err(ArtifactError::Arrow(
+            "a resident job record names cpu_tokens, and a resident is granted none".into(),
+        ));
+    }
     let nice = (!batch.column(first + 4).is_null(0))
         .then(|| int32(batch, first + 4).map(|column| column.value(0)))
         .transpose()?;
@@ -7970,14 +7984,53 @@ mod tests {
             running.validate(),
             Err(ArtifactError::Integrity { .. })
         ));
-        let unexplained = JobArtifactRecord {
+        // A nice with no tokens is explained only by a resident, which is granted none: every
+        // class that takes a grant still refuses it, so admitting the resident widens nothing.
+        for (class, scheduling) in [("background", JobScheduling::default()), ("gate", gate(2))] {
+            let unexplained = JobArtifactRecord {
+                scheduling,
+                nice: Some(10),
+                ..valid_job_record(9)
+            };
+            assert!(
+                matches!(unexplained.validate(), Err(ArtifactError::Integrity { .. })),
+                "a {class} record that names a nice names its grant"
+            );
+        }
+        let resident = JobScheduling::new(
+            ExecScope::Workspace,
+            JobserverClass::Resident,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let ended_resident = JobArtifactRecord {
+            scheduling: resident,
             nice: Some(10),
             ..valid_job_record(9)
         };
+        let read = round_trip(&ended_resident);
+        assert_eq!(
+            (read.scheduling.class(), read.cpu_tokens, read.nice),
+            (JobserverClass::Resident, None, Some(10)),
+            "a sealed resident names the nice it ran at and no grant"
+        );
+        let granted_resident = JobArtifactRecord {
+            cpu_tokens: NonZeroUsize::new(2),
+            ..ended_resident.clone()
+        };
         assert!(matches!(
-            unexplained.validate(),
+            granted_resident.validate(),
             Err(ArtifactError::Integrity { .. })
         ));
+        let stored_granted_resident = replace_column(
+            &admitted(&ended_resident),
+            CPU_COLUMN + 3,
+            Arc::new(UInt64Array::from(vec![Some(2)])),
+        );
+        assert!(
+            batch_to_protected_record(&stored_granted_resident).is_err(),
+            "a stored resident that names tokens is damage"
+        );
 
         let base = admitted(&JobArtifactRecord {
             scheduling: gate(2),
@@ -8697,6 +8750,93 @@ mod tests {
         drop(store);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(foreign_root).unwrap();
+    }
+
+    /// An ended resident (a shed's Nx daemon, a scratch Nx worker) is sealed with the nice it
+    /// ran at and no tokens, since a resident is granted none, and the store reads its record
+    /// back: a refused seal made every later job list of its workspace fail. A job of a class
+    /// that takes a grant is still refused that shape, so admitting the resident widens nothing.
+    #[test]
+    fn an_ended_resident_seals_its_nice_without_tokens_and_reads_back() {
+        let root = temp_root("resident-seal");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let command = crate::api::dto::ExecCommand::Argv(vec!["nx-daemon".into()]);
+        let ended = |cpu_tokens| JobEnding {
+            state: JobState::Exited,
+            exit: Some(ExitStatus::Exited { code: 0 }),
+            duration_ms: Some(1),
+            resources: None,
+            failure: None,
+            cpu_tokens,
+            nice: Some(10),
+        };
+        let begin = |store: &mut ArtifactStore, scheduling| {
+            let job_id = store.next_job_id().unwrap();
+            let token = store
+                .begin_job(
+                    job_id,
+                    1,
+                    &command,
+                    None,
+                    scheduling,
+                    OutputTargets::default(),
+                )
+                .unwrap();
+            (job_id, token)
+        };
+        let resident = JobScheduling::new(
+            ExecScope::Workspace,
+            JobserverClass::Resident,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+
+        let (resident_id, token) = begin(&mut store, resident);
+        store
+            .finish(token, ended(None))
+            .expect("an ended resident seals with its nice and no tokens");
+        let sealed = store
+            .sealed(resident_id)
+            .unwrap()
+            .expect("the sealed resident reads back")
+            .clone();
+        assert_eq!(
+            (sealed.scheduling.class(), sealed.cpu_tokens, sealed.nice),
+            (JobserverClass::Resident, None, Some(10))
+        );
+        let (_, token) = begin(&mut store, resident);
+        assert!(
+            matches!(
+                store.finish(token, ended(NonZeroUsize::new(1))),
+                Err(ArtifactError::Integrity { .. })
+            ),
+            "a resident never names tokens"
+        );
+
+        for (class, scheduling) in [
+            ("background", JobScheduling::default()),
+            (
+                "gate",
+                JobScheduling::new(
+                    ExecScope::Workspace,
+                    JobserverClass::Gate,
+                    NonZeroUsize::MIN,
+                )
+                .unwrap(),
+            ),
+        ] {
+            let (_, token) = begin(&mut store, scheduling);
+            assert!(
+                matches!(
+                    store.finish(token, ended(None)),
+                    Err(ArtifactError::Integrity { .. })
+                ),
+                "a {class} job that names a nice names its grant"
+            );
+        }
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
