@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import fc from 'fast-check';
 
 import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
@@ -447,5 +448,50 @@ setInterval(() => console.log('running'), 10);
       { task: 'c:test', bound: false, reason: "its verdict is from hash old, not this run's new" },
       { task: 'd:lint', bound: false, reason: 'no bounded-exec verdict' },
     ]);
+  });
+
+  it('judges a run that exits inside its total bound by its exit alone, however far the injected clock moved', async () => {
+    // The clock is faked: it moves once, when the command reports, by a generated amount short of the total bound, and
+    // then the command exits. Below the bound the verdict is a function of the exit, never of how long a loaded host
+    // took to get there (a land gate measured 5243 ms for `node -e ""` under a 5000 ms bound). The step is at least
+    // 1 ms: Bun 1.4.3's `advanceTimersByTime(0)` moves the fake clock 1 ms, and a run that never moves it is the case
+    // above. The command prints its report through `printf`, so the line naming the command never matches it.
+    const reported = 'bounded-exec-property-reported';
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 2, max: 600_000 }).chain((timeoutMs) =>
+          fc.record({
+            timeoutMs: fc.constant(timeoutMs),
+            elapsedMs: fc.integer({ min: 1, max: timeoutMs - 1 }),
+            killAfterMs: fc.integer({ min: 0, max: timeoutMs }),
+            exitCode: fc.integer({ min: 0, max: 125 }),
+          }),
+        ),
+        async ({ timeoutMs, elapsedMs, killAfterMs, exitCode }) => {
+          const { context } = await workspace();
+          const { movedMs } = await onProgressClock(
+            (chunk) => chunk.includes(reported),
+            elapsedMs,
+            () =>
+              runBoundedExec(
+                {
+                  command: `printf '%s-%s\\n' bounded-exec property-reported; exit ${exitCode}`,
+                  timeoutMs,
+                  killAfterMs,
+                },
+                context,
+                createProcessTreeKiller(),
+                null,
+                null,
+              ),
+          );
+          expect(movedMs).toBe(elapsedMs);
+          expect((await readRecord(context.record?.directory ?? ''))?.verdict).toEqual(
+            exitCode === 0 ? { outcome: 'passed' } : { outcome: 'failed', exitCode, tests: [] },
+          );
+        },
+      ),
+      { numRuns: 40 },
+    );
   });
 });
