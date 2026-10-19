@@ -5,7 +5,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use cowshed_apfs::attach_budget;
 use cowshed_apfs::image::ImageCapacity;
@@ -22,7 +22,7 @@ use cowshed_core::metadata::{
     WorkspaceRole,
 };
 use cowshed_core::repository::RepoId;
-use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling};
+use cowshed_core::storage::apfs::extents::{count_extents, rewrite_sibling, shared_bytes};
 use cowshed_core::storage::apfs::native::{
     KernelMountSource, MacOsApfsExecutionHost, SystemKernelMountSource,
 };
@@ -267,14 +267,19 @@ fn run_lifecycle() -> Result<String, Box<dyn Error>> {
             .workspace;
         let fork_elapsed = fork_started.elapsed();
         churn.finish()?;
-        // Defends CoW-cheap fork lifecycle, not a benchmark: ~1s idle, but
-        // 5s and 10s budgets both flaked under real host contention (5.04s
-        // at load ~20, 12.8s at load ~59). The bound only needs to catch
-        // pathology — a copy-instead-of-clone or sync stall regression sits
-        // far beyond 30s — so it is deliberately generous.
+        // Defends the CoW-cheap fork: the fork's image is a clone of main's, so the kernel maps
+        // the stream main wrote before the fork to the very device blocks of main's image. A copy
+        // shares none. The witness is structural, so a loaded host cannot fail it; the time
+        // stays in the evidence line.
+        let layout = StorageLayout::new(&store, &repo)?;
+        let shared = shared_bytes(
+            layout.main_image()?.image(),
+            layout.canonical_image(fork.name())?.image(),
+        )?;
+        let stream_bytes = u64::try_from(STREAM_MEBIBYTES * 1024 * 1024)?;
         assert!(
-            fork_elapsed < Duration::from_secs(30),
-            "fork lifecycle exceeded 30 seconds: {fork_elapsed:?}"
+            shared >= stream_bytes,
+            "the fork shares {shared} bytes of main's image extents, fewer than the {stream_bytes}-byte stream: a copy, not a clone"
         );
         let fork_mount = substrate
             .ensure_mounted(&fork, MountIntent { browse: false })

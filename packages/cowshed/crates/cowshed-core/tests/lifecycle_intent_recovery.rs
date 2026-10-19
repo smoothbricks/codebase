@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cowshed_core::api::{AdoptOptions, RemoveOptions, RemoveReport};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
@@ -621,15 +621,10 @@ fn recovery_leaves_a_running_removal_to_its_process_and_takes_it_over_once_that_
         .env(LEASE_CHILD_ROOT, root.path())
         .spawn_locked()
         .expect("spawn removal child");
-    let deadline = Instant::now() + Duration::from_secs(30);
     while !root.path().join("ready").exists() {
         if let Some(status) = child.try_wait().expect("poll removal child") {
             panic!("the removal child ended before announcing itself: {status}");
         }
-        assert!(
-            Instant::now() < deadline,
-            "the removal child never announced itself"
-        );
         std::thread::sleep(Duration::from_millis(20));
     }
     let journal =

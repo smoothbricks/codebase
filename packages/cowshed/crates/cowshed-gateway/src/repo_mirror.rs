@@ -1543,7 +1543,7 @@ mod tests {
             credentials,
             transport,
             auditor,
-            Duration::from_secs(1),
+            cowshed_os::test_backstop::NO_PROGRESS,
             Duration::from_secs(60),
         )
         .expect("start");
@@ -1564,13 +1564,8 @@ mod tests {
         });
         // The transport says when the fetch has started; that notice is the event, not a clock.
         started_wait.await;
-        timeout(Duration::from_millis(100), handle.shutdown())
-            .await
-            .expect("shutdown signal");
-        timeout(Duration::from_millis(100), task)
-            .await
-            .expect("actor stopped")
-            .expect("actor joined");
+        handle.shutdown().await;
+        task.await.expect("actor joined");
         assert!(matches!(
             request.await.expect("request joined"),
             Err(RepoMirrorError::Cancelled | RepoMirrorError::Stopped)
@@ -1593,7 +1588,7 @@ mod tests {
             transport,
             auditor,
             Duration::from_millis(10),
-            Duration::from_secs(1),
+            cowshed_os::test_backstop::NO_PROGRESS,
         )
         .expect("start");
         handle
@@ -1624,8 +1619,8 @@ mod tests {
             Arc::new(RedirectConnector {
                 request: Arc::clone(&request),
             }),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
+            cowshed_os::test_backstop::NO_PROGRESS,
+            cowshed_os::test_backstop::NO_PROGRESS,
         );
         let outcome = transport
             .fetch(RepoFetchPlan::new(
@@ -1689,8 +1684,8 @@ mod tests {
             credentials.clone(),
             transport.clone(),
             auditor.clone(),
-            Duration::from_secs(1),
-            Duration::from_secs(5),
+            cowshed_os::test_backstop::NO_PROGRESS,
+            cowshed_os::test_backstop::NO_PROGRESS,
         )
         .expect("start");
         handle
@@ -1866,8 +1861,8 @@ mod tests {
             credentials.clone(),
             transport.clone(),
             auditor,
-            Duration::from_secs(1),
-            Duration::from_secs(5),
+            cowshed_os::test_backstop::NO_PROGRESS,
+            cowshed_os::test_backstop::NO_PROGRESS,
         )
         .expect("start");
         handle

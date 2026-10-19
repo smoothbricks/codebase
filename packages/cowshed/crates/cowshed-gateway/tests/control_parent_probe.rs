@@ -92,14 +92,16 @@ fn probe_config() -> (GatewayConfig, FixtureDir) {
         NEXT_CACHE.fetch_add(1, Ordering::Relaxed)
     ));
     let config = GatewayConfig {
+        // Product bounds no test asserts on sit at the run's no-progress backstop: a loaded host
+        // cannot race a fixture's answer. A test that asserts on a bound overrides that bound.
         timeouts: GatewayTimeouts {
-            request_headers: Duration::from_secs(2),
-            connect: Duration::from_secs(1),
-            tls_handshake: Duration::from_secs(2),
-            response_headers: Duration::from_secs(2),
-            body_idle: Duration::from_secs(2),
-            request_total: Duration::from_secs(5),
-            tunnel_total: Duration::from_secs(5),
+            request_headers: cowshed_os::test_backstop::NO_PROGRESS,
+            connect: cowshed_os::test_backstop::NO_PROGRESS,
+            tls_handshake: cowshed_os::test_backstop::NO_PROGRESS,
+            response_headers: cowshed_os::test_backstop::NO_PROGRESS,
+            body_idle: cowshed_os::test_backstop::NO_PROGRESS,
+            request_total: cowshed_os::test_backstop::NO_PROGRESS,
+            tunnel_total: cowshed_os::test_backstop::NO_PROGRESS,
             leaf_lifetime: Duration::from_secs(60 * 60),
         },
         mirror_cache: MirrorCacheConfig::new(cache.path().to_path_buf()),

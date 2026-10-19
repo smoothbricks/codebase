@@ -10,12 +10,10 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::ChildStdout;
-use tokio::time::timeout;
 
 const READY_PREFIX: &str = "NX_PROCESS_READY ";
 const CHILD_ENV: &str = "COWSHED_NX_PROCESS_ROOT";
@@ -294,17 +292,15 @@ async fn nx_backend_gateway_child() {
     gateway.drain().await.expect("drain nx gateway");
 }
 
-/// Wait for the kernel to report the registered process exit, bounded at five seconds.
+/// Wait for the kernel to report the registered process exit. A null timeout blocks until the
+/// event arrives, so the wait has no clock: a server that never exits is the test target's
+/// no-progress backstop to decide.
 async fn await_exit(kq: OwnedFd) -> bool {
     tokio::task::spawn_blocking(move || {
-        let deadline = libc::timespec {
-            tv_sec: 5,
-            tv_nsec: 0,
-        };
         // SAFETY: an all-zero kevent is a valid buffer for the kernel to overwrite.
         let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
-        // SAFETY: `kq` is a kqueue this closure owns, the event buffer holds one entry, and the
-        // timeout outlives the call.
+        // SAFETY: `kq` is a kqueue this closure owns, the event buffer holds one entry, and a
+        // null timeout is the documented block-until-an-event form of `kevent`.
         let count = unsafe {
             libc::kevent(
                 kq.as_raw_fd(),
@@ -312,7 +308,7 @@ async fn await_exit(kq: OwnedFd) -> bool {
                 0,
                 &mut event,
                 1,
-                &deadline,
+                std::ptr::null(),
             )
         };
         assert!(
@@ -347,7 +343,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
     let mut child_lines = BufReader::new(stdout.take(STREAM_LIMIT));
 
     // The harness may print its own "test ... " prefix on the same line, so match by position.
-    let ready: serde_json::Value = timeout(Duration::from_secs(60), async {
+    let ready: serde_json::Value = async {
         while let Some(line) = bounded_line(&mut child_lines).await {
             let text = String::from_utf8_lossy(&line);
             if let Some(index) = text.find(READY_PREFIX) {
@@ -356,9 +352,8 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
             }
         }
         panic!("gateway child ended before its ready frame")
-    })
-    .await
-    .expect("gateway child ready timeout");
+    }
+    .await;
     let gateway_pid = u32::try_from(ready["gatewayPid"].as_u64().expect("gateway pid"))
         .expect("gateway pid fits u32");
     let entries = PathBuf::from(ready["entries"].as_str().expect("entries path"));
@@ -436,10 +431,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let refused = timeout(Duration::from_secs(30), second.output_locked())
-        .await
-        .expect("refusing server timeout")
-        .expect("run second server");
+    let refused = second.output_locked().await.expect("run second server");
     assert_eq!(
         refused.status.code(),
         Some(1),
@@ -470,7 +462,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
     );
 
     // Kill the real gateway. Its death closes the server's stdin pipe, and the kernel must report
-    // the registered server exit within the deadline.
+    // the registered server exit.
     child.start_kill().expect("kill gateway child");
     child.wait().await.expect("reap gateway child");
     drop(child_stdin);
@@ -492,14 +484,13 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
     let mut fresh_stdin = fresh.stdin.take().expect("fresh server stdin");
     let fresh_stdout = fresh.stdout.take().expect("fresh server stdout");
     let mut fresh_lines = BufReader::new(fresh_stdout.take(STREAM_LIMIT));
-    let ready_frame: serde_json::Value = timeout(Duration::from_secs(30), async {
+    let ready_frame: serde_json::Value = async {
         let line = bounded_line(&mut fresh_lines)
             .await
             .expect("fresh server ready frame before EOF");
         serde_json::from_slice(&line).expect("typed fresh server frame")
-    })
-    .await
-    .expect("fresh server ready timeout");
+    }
+    .await;
     assert_eq!(ready_frame["kind"], "ready", "{ready_frame}");
 
     // Closing stdin is the drain request: the server exits cleanly.
@@ -508,10 +499,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
         .await
         .expect("close fresh server stdin");
     drop(fresh_stdin);
-    let status = timeout(Duration::from_secs(30), fresh.wait())
-        .await
-        .expect("fresh server drain timeout")
-        .expect("reap fresh server");
+    let status = fresh.wait().await.expect("reap fresh server");
     assert!(
         status.success(),
         "fresh server must drain to exit 0: {status:?}"

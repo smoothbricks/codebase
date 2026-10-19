@@ -8505,9 +8505,11 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
     /// outcome proves that Disk Arbitration is wedged.
     #[test]
     fn run_disk_tool_completes_when_the_child_answers() {
+        // The deadline is not the subject: it sits at the run's no-progress backstop, so a loaded
+        // host's slow child never races it.
         let output = run_disk_tool(
             &HostCommand::new("/bin/sleep", ["0.05"]),
-            Duration::from_secs(10),
+            cowshed_os::test_backstop::NO_PROGRESS,
         )
         .expect("fast child");
         assert!(output.succeeded());
@@ -8529,13 +8531,14 @@ UUID=CACHES /private/cowshed/caches apfs rw # cowshed created volume labelled co
 
     #[test]
     fn run_disk_tool_preserves_its_total_deadline_without_inventing_daemon_failure() {
-        let started = std::time::Instant::now();
+        // The child outlives the deadline, so the deadline's kill is the event: the report names
+        // the signalled group, which a runner that waited for the child to end could not.
         let error = run_disk_tool(
             &HostCommand::new("/bin/sleep", ["30"]),
             Duration::from_millis(250),
         )
         .expect_err("deadline");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(error.to_string().contains("was signalled"), "{error}");
         assert_eq!(error.kind, crate::storage::bootstrap::HostErrorKind::Other);
         let message = error.to_string();
         assert!(

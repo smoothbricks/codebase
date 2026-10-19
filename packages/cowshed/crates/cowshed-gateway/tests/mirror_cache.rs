@@ -51,8 +51,8 @@ impl TestRoot {
             root: self.0.clone(),
             high_water_bytes: 512 * 1024 * 1024,
             low_water_bytes: 256 * 1024 * 1024,
-            metadata_ttl: Duration::from_secs(300),
-            fill_wait_timeout: Duration::from_secs(1),
+            metadata_ttl: cowshed_os::test_backstop::NO_PROGRESS,
+            fill_wait_timeout: cowshed_os::test_backstop::NO_PROGRESS,
         }
     }
 }
@@ -974,8 +974,8 @@ async fn inactive_lru_eviction_respects_an_active_reader_pin() {
         root: root.path().to_owned(),
         high_water_bytes: 140_000,
         low_water_bytes: 131_200,
-        metadata_ttl: Duration::from_secs(300),
-        fill_wait_timeout: Duration::from_secs(1),
+        metadata_ttl: cowshed_os::test_backstop::NO_PROGRESS,
+        fill_wait_timeout: cowshed_os::test_backstop::NO_PROGRESS,
     };
     let service = MirrorService::new(Cache::open(config).await.expect("open small cache"));
     let upstream = QueueUpstream::new([
@@ -2569,7 +2569,7 @@ async fn conditional_manifest(
     let mut config = root.cache_config();
     config.metadata_ttl = match warmth {
         Warmth::Stale => Duration::from_millis(15),
-        Warmth::Cold | Warmth::Fresh => Duration::from_secs(300),
+        Warmth::Cold | Warmth::Fresh => cowshed_os::test_backstop::NO_PROGRESS,
     };
     let service = MirrorService::new(Cache::open(config).await.expect("open cache"));
     if !matches!(warmth, Warmth::Cold) {

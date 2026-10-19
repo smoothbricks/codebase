@@ -12,7 +12,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cowshed_core::build_volume::cache_adapter;
 use serde_json::{Value, json};
@@ -108,8 +108,8 @@ impl Server {
             origin: String::new(),
         };
         let frame = receiver
-            .recv_timeout(Duration::from_secs(30))
-            .expect("nx-cache-server readiness within 30 seconds")
+            .recv()
+            .expect("the readiness reader reports")
             .expect("read the readiness frame");
         let ready: Value = serde_json::from_str(&frame).expect("readiness frame is JSON");
         assert_eq!(ready["kind"], json!("ready"), "{frame}");

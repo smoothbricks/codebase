@@ -30,6 +30,7 @@ use cowshed_gateway::{
     ArrowAuditConfig, ArrowAuditSink, Gateway, GatewayConfig, KeychainCredentialProvider,
     MirrorCacheConfig, SystemConnector,
 };
+use cowshed_os::test_backstop::NO_PROGRESS;
 use std::ffi::OsString;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
@@ -180,8 +181,7 @@ impl Fixture {
             ..GatewayConfig::default()
         };
         let connector =
-            SystemConnector::new(config.timeouts.connect, config.timeouts.tls_handshake)
-                .expect("production upstream connector");
+            SystemConnector::new(NO_PROGRESS, NO_PROGRESS).expect("production upstream connector");
         let audit = ArrowAuditSink::start(ArrowAuditConfig::new(audit_root).expect("audit config"))
             .expect("durable gateway audit");
         self.gateway = Some(
@@ -1145,7 +1145,7 @@ async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
         .stderr(Stdio::null())
         .spawn()
         .expect("a listening stand-in daemon");
-    eventually("the stand-in daemon listens", || socket.exists()).await;
+    eventually(|| socket.exists()).await;
     let record = topic.join(".nx/workspace-data/d/server-process.json");
     fs::create_dir_all(record.parent().expect("record directory")).expect("record directory");
     fs::write(
@@ -1167,7 +1167,7 @@ async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
         String::from_utf8_lossy(&stderr)
     );
     let mut exited = None;
-    eventually("rm stops the checkout's daemon", || {
+    eventually(|| {
         exited = daemon.try_wait().expect("poll the stand-in daemon");
         exited.is_some()
     })
@@ -2147,10 +2147,6 @@ fn directory_a_failed_nx_test_leaves_no_daemon_under_its_root_substrate_lifecycl
     assert!(!root.exists(), "{} was removed", root.display());
 }
 
-/// How long any build-volume step may take before a test gives up on it: generous, because a
-/// loaded host slows every real build and detach, and a slow pass is not a failure.
-const PATIENCE: Duration = Duration::from_secs(300);
-
 /// The real Rust toolchain behind the installed Cargo launcher, resolved at run time like
 /// [`repository_nx`]. Follow the launcher's executable and canonical-identity PATH rules
 /// (03_caches.md, "The `cargo` jobserver launcher"), not the directory beside the wrapper.
@@ -2535,11 +2531,7 @@ async fn directory_push_only_preserves_the_validated_head_without_landing_or_ret
     assert_eq!(git_stdout(&main, &["rev-parse", "HEAD"]), source_head);
     assert!(landed.retired, "ordinary land still retires by default");
     // Logical retirement returns at step4; step5 reclaims the mountpoint in the background.
-    eventually(
-        "ordinary land reclaims the retired workspace mountpoint",
-        || !topic.exists(),
-    )
-    .await;
+    eventually(|| !topic.exists()).await;
     assert!(!topic.exists());
     assert_land_outcome(fixture.storage.telemetry(), &landed);
     service
@@ -2548,13 +2540,8 @@ async fn directory_push_only_preserves_the_validated_head_without_landing_or_ret
         .expect("stop the real directory project");
 }
 
-async fn eventually(what: &str, mut ready: impl FnMut() -> bool) {
-    let started = Instant::now();
+async fn eventually(mut ready: impl FnMut() -> bool) {
     while !ready() {
-        assert!(
-            started.elapsed() < PATIENCE,
-            "{what}: not within {PATIENCE:?}"
-        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -2567,9 +2554,8 @@ async fn job_holds_released(layout: &BuildVolumeLayout, id: &BuildVolumeId) {
     let hold = layout.hold_path(id);
     let released =
         tokio::task::spawn_blocking(move || fs::File::open(&hold).and_then(|file| file.lock()));
-    tokio::time::timeout(PATIENCE, released)
+    released
         .await
-        .unwrap_or_else(|_| panic!("a job hold on build volume {id} outlived {PATIENCE:?}"))
         .expect("the hold wait's thread")
         .expect("lock build volume's hold file");
 }
@@ -3215,7 +3201,7 @@ async fn directory_a_rebase_carries_mains_nx_entries_into_the_rebased_workspace_
             .expect("spawn a database holder"),
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
-    eventually("tail holds the task database open", || {
+    eventually(|| {
         nx::holders(database)
             .expect("query the database's holders")
             .iter()
@@ -3476,7 +3462,7 @@ async fn directory_a_foreign_database_opener_skips_adoption_with_its_pid_and_arg
             .expect("spawn a database holder"),
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
-    eventually("tail holds the task database open", || {
+    eventually(|| {
         nx::holders(database)
             .expect("query the database's holders")
             .iter()
@@ -3556,7 +3542,7 @@ async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substra
             .expect("spawn an index holder"),
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
-    eventually("tail holds the landing volume's index open", || {
+    eventually(|| {
         nx::holders(&index)
             .expect("query the index's holders")
             .iter()
@@ -3648,7 +3634,7 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     )
     .await;
     let ticks = old_mount.join("target/ticking/ticks");
-    eventually("the job ticks in main's volume", || file_len(&ticks) > 0).await;
+    eventually(|| file_len(&ticks) > 0).await;
 
     let workspace = new_workspace(&mut service, "w").await;
     fs::write(workspace.join("notes.txt"), b"notes\n").unwrap();
@@ -3665,10 +3651,7 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     let copied = new_mount.join("target/ticking/ticks");
     let copied_at_swap = file_len(&copied);
     let at_swap = file_len(&ticks);
-    eventually("the job keeps ticking in the previous volume", || {
-        file_len(&ticks) > at_swap
-    })
-    .await;
+    eventually(|| file_len(&ticks) > at_swap).await;
     assert_eq!(file_len(&copied), copied_at_swap);
     sh(&mut service, "main", "touch target/after").await;
     assert!(new_mount.join("target/after").is_file());
@@ -3757,10 +3740,9 @@ async fn assert_build_label(layout: &BuildVolumeLayout, checkout: &Path, name: &
         &RepoId::parse("fixture/dispatch").expect("repository identity"),
         &WorkspaceName::new(name).expect("checkout name"),
     );
-    eventually(
-        "the build volume has its checkout's descriptive label",
-        || cowshed_apfs::volume_name(&mount).expect("read build volume name") == expected.as_str(),
-    )
+    eventually(|| {
+        cowshed_apfs::volume_name(&mount).expect("read build volume name") == expected.as_str()
+    })
     .await;
 }
 
@@ -3884,7 +3866,7 @@ async fn real_apfs_build_volume_names_follow_checkout_ownership_and_unlinked_mou
     );
     let pid = i32::try_from(holder.0.id()).expect("a pid fits i32");
     println!("build-volume-holder-pid={pid}");
-    eventually("cat holds the build volume as its cwd", || {
+    eventually(|| {
         nx::volume_holders(&mount)
             .expect("query build volume holders")
             .iter()
@@ -5491,12 +5473,7 @@ async fn real_apfs_rename_keeps_edits_written_after_clone_publication() {
         let tracked = a_mount.join("tracked.txt");
         let untracked = a_mount.join("u");
         move || -> Instant {
-            let deadline = Instant::now() + Duration::from_secs(15);
             loop {
-                assert!(
-                    Instant::now() < deadline,
-                    "the destination's canonical clone never published"
-                );
                 match cowshed_core::metadata::read_json::<
                     cowshed_core::metadata::DetachedWorkspaceMetadata,
                 >(&sidecar_b)
@@ -5739,10 +5716,7 @@ async fn real_apfs_land_leaves_a_stock_detached_landing_daemon_running_and_skips
         "{}",
         String::from_utf8_lossy(&stopped.stderr)
     );
-    assert!(
-        exit.within(Duration::from_secs(10)).unwrap(),
-        "owned foreign cleanup completes"
-    );
+    exit.wait().expect("owned foreign cleanup completes");
     fs::remove_dir_all(socket.parent().expect("owned short socket root"))
         .expect("remove the standalone daemon socket namespace");
     service.shutdown().await.expect("stop the runtime");
@@ -6271,9 +6245,8 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
         .expect("start bun install as a covered job");
 
     let ready = topic.join("ready");
-    // The wait keeps the original deadline, but a job that ends before writing `ready` is reported
-    // with its actual state and stderr instead of a silent timeout.
-    let started = Instant::now();
+    // The wait ends at the sentinel or when the job ends, never at a clock. A job that ends
+    // before writing `ready` is reported with its actual state and stderr.
     while !fs::read_to_string(&ready).is_ok_and(|text| !text.is_empty()) {
         let status = job.status().await.expect("the covered job's status");
         if !matches!(status.state, cowshed_core::api::dto::JobState::Running) {
@@ -6292,10 +6265,6 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
                 String::from_utf8_lossy(&stderr)
             );
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(300),
-            "the postinstall never wrote its ready sentinel within 300s"
-        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(

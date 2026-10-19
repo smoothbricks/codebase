@@ -6496,19 +6496,15 @@ mod tests {
         // the deadline, and the queue continues; a disk-image command is never killed (the tests
         // below), only warned about. The child's identity comes from the runner that spawned and
         // reaped it, never from the child: a loaded host can kill the shell at 250 ms before it
-        // runs a single builtin, and a pid the child had to write itself was then empty.
-        let started = std::time::Instant::now();
+        // runs a single builtin, and a pid the child had to write itself was then empty. The spin
+        // never ends on its own, so the `Deadline` failure with its SIGKILL is the proof the
+        // deadline fired; a runner that never fired it would hang to the run's no-progress bound.
         let error = SystemCommandRunner
             .run_with_deadline(
                 &CommandRequest::new("/bin/sh", ["-c", "while true; do :; done"]),
                 Duration::from_millis(250),
             )
             .unwrap_err();
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "hung child held the store for {:?}; the deadline never fired",
-            started.elapsed()
-        );
         let CommandRunFailure::Deadline {
             deadline,
             pid,
@@ -7123,11 +7119,13 @@ mod tests {
     #[test]
     fn system_runner_verbose_child_output_is_drained_under_deadline() {
         // Pipes are pumped while the deadline poll runs: a child whose stdout exceeds the
-        // pipe buffer must complete with its output intact, never wedge on a full pipe.
+        // pipe buffer must complete with its output intact, never wedge on a full pipe. The
+        // deadline is not the subject, so it sits at the run's no-progress backstop: a wedged
+        // pipe still ends in the deadline error, and a loaded host never does.
         let output = SystemCommandRunner
             .run_with_deadline(
                 &CommandRequest::new("/bin/sh", ["-c", "seq 1 20000"]),
-                Duration::from_secs(30),
+                cowshed_os::test_backstop::NO_PROGRESS,
             )
             .unwrap();
         assert!(output.succeeded());
@@ -9220,9 +9218,7 @@ mod tests {
                 order.lock().expect("order").push("acquired");
                 lease
             });
-            waiting
-                .recv_timeout(DISK_CHILD_DEADLINE)
-                .expect("the contender started");
+            waiting.recv().expect("the contender started");
             order.lock().expect("order").push("released");
             drop(held);
             assert!(

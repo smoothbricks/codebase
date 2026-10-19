@@ -281,8 +281,8 @@ whole-HOME grant is introduced. Both CLI volume walks and the native-file-watchi
 watcher walk advances on the child's ready stdout and the allowed change's native callback, not a guessed
 subscription/debounce sleep or repeated flush polling. It publishes the denied private control first, then atomically
 renames the allowed source change into place, drains pending events and stops the watcher before retaining all privacy
-and notification assertions. Its 10-second deadline is only a hang fail-safe; it never retries or enables diagnostic
-flags to make the test pass.
+and notification assertions. It carries no deadline of its own: a callback or line that never comes is a hang the
+target's no-progress bound names, and the walk never retries or enables diagnostic flags to make the test pass.
 
 No outer sandbox installation or permission change is required for this target: the authority boundary is unchanged.
 Updating the checkout's sandbox source cannot change an already-running outer supervisor; separately testing a changed

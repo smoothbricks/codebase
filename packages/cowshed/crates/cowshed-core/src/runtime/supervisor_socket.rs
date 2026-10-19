@@ -2273,7 +2273,6 @@ async fn forward_exec(
 mod process_demand_tests {
     use super::*;
     use crate::api::process::ProcessCoverageGap;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn a_process_demand_delivers_a_canonical_gap_and_then_ends() {
@@ -2312,10 +2311,7 @@ mod process_demand_tests {
         let relay = tokio::spawn(relay_process_events(server, JobProcessStream::new(receive)));
         write_json(&mut client, &Demand::Next).await.unwrap();
         write_json(&mut client, &Demand::Close).await.unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(1), read_json(&mut client))
-            .await
-            .expect("close must not wait for a native event")
-            .unwrap();
+        let response = read_json(&mut client).await.unwrap();
         let Response::Ok { value, bytes: 0 } = response else {
             panic!("close must answer with the stream end");
         };
@@ -2331,11 +2327,7 @@ mod process_demand_tests {
         let relay = tokio::spawn(relay_process_events(server, JobProcessStream::new(receive)));
         write_json(&mut client, &Demand::Next).await.unwrap();
         write_json(&mut client, &Demand::Next).await.unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(1), relay)
-            .await
-            .expect("a duplicate demand is not queued")
-            .unwrap()
-            .unwrap_err();
+        let error = relay.await.unwrap().unwrap_err();
         assert_eq!(error.code, crate::ErrorCode::Integrity);
     }
 }
@@ -2555,12 +2547,10 @@ mod socket_ownership_tests {
             .spawn_locked()
             .unwrap();
         // Published last, once the owner holds the lease.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while Instance::at(&path).ok().flatten().is_none() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the owner never bound"
-            );
+            if let Some(status) = owner.try_wait().unwrap() {
+                panic!("the owner exited before it bound the socket: {status}");
+            }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let killed = inode(&path);
@@ -2653,12 +2643,7 @@ mod socket_ownership_tests {
         assert_eq!(entries(&path), ["s.sock", "s.sock.lock"]);
 
         drop(holder_input);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while !matches!(occupant(&path), Ok(Occupant::Stopped)) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the child never closed the listener"
-            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(hello_if_present(&path).await.unwrap(), None);

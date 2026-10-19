@@ -393,8 +393,9 @@ mod sweep_ownership_tests {
             drop(other);
             done.send(()).unwrap();
         });
-        let independent = finished.recv_timeout(std::time::Duration::from_secs(2));
-        // Always release and join the threads, including on RED: the assertion is not a hang.
+        // The other root's drop is the event: one that waited for the blocked sweep it did not
+        // start never returns, and the run's no-progress bound names this test.
+        let independent = finished.recv();
         release.send(()).unwrap();
         dropping.join().unwrap();
         drop(starter);

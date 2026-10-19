@@ -726,16 +726,11 @@ mod tests {
         monitor.clock(origin).unwrap();
         // A subscriber shortens the writer's ticks after its first.
         let _events = monitor.subscribe(Duration::from_millis(20)).await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
         let window = loop {
             let usage = monitor.tree().unwrap().processes[0].usage;
             if let Some(window) = usage.and_then(|usage| usage.cpu_window) {
                 break window;
             }
-            assert!(
-                Instant::now() < deadline,
-                "no tick closed a window: {usage:?}"
-            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         // The watch's own read came before the origin; the first window opened at a tick after it.

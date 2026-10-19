@@ -147,9 +147,7 @@ impl Asker {
         };
         let queued = asker.answer().await;
         assert_eq!(queued["lease"], "queued", "{queued}");
-        let granted = tokio::time::timeout(Duration::from_secs(10), asker.answer())
-            .await
-            .expect("gate job granted");
+        let granted = asker.answer().await;
         assert_eq!(granted["tokens"], 1, "{granted}");
         let pool = PathBuf::from(
             granted["cpuPool"]
@@ -202,11 +200,34 @@ impl Asker {
         serde_json::from_str(&line).expect("an answer is JSON")
     }
 
-    /// The tokens granted within `within`, or `None`.
-    async fn granted(&mut self, within: Duration) -> Option<u64> {
+    /// Absence check: whether a grant arrives within `within`; load only makes `None` pass
+    /// vacuously.
+    async fn granted_within(&mut self, within: Duration) -> Option<u64> {
         let answer = tokio::time::timeout(within, self.answer()).await.ok()?;
         assert_eq!(answer["lease"], "granted", "{answer}");
         Some(answer["tokens"].as_u64().expect("a grant names its tokens"))
+    }
+
+    /// The tokens of the next grant, waiting for it.
+    async fn granted(&mut self) -> u64 {
+        let answer = self.answer().await;
+        assert_eq!(answer["lease"], "granted", "{answer}");
+        answer["tokens"].as_u64().expect("a grant names its tokens")
+    }
+
+    /// Absence check: whether a growth arrives within `within`; load only makes `None` pass
+    /// vacuously.
+    async fn grown_within(&mut self, within: Duration) -> Option<u64> {
+        let answer = tokio::time::timeout(within, self.answer()).await.ok()?;
+        assert_eq!(answer["lease"], "grown", "{answer}");
+        Some(answer["tokens"].as_u64().expect("a growth names its total"))
+    }
+
+    /// The new total of the next growth, waiting for it.
+    async fn grown(&mut self) -> u64 {
+        let answer = self.answer().await;
+        assert_eq!(answer["lease"], "grown", "{answer}");
+        answer["tokens"].as_u64().expect("a growth names its total")
     }
 }
 
@@ -257,15 +278,18 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     assert!(answers.1.contains("\"tokens\":4"), "{}", answers.1);
 
     let mut waiter = Asker::ask(&socket, 2, "/w/waiting").await;
-    assert_eq!(waiter.granted(Duration::from_millis(300)).await, None);
+    assert_eq!(
+        waiter.granted_within(Duration::from_millis(300)).await,
+        None
+    );
     let held = ledger(&socket).await;
     assert_eq!((held.total, held.held), (4, 4));
 
     holder.kill().expect("SIGKILL the holder");
     holder.wait().expect("reap");
     assert_eq!(
-        waiter.granted(Duration::from_secs(10)).await,
-        Some(2),
+        waiter.granted().await,
+        2,
         "the killed holder's tokens go to the waiter"
     );
     let held = ledger(&socket).await;
@@ -289,16 +313,19 @@ async fn checkouts_share_the_host_and_a_lone_grant_fills_it() {
 
     // Alone, one grant fills the host; no half is reserved.
     let mut whole = Asker::ask(&socket, 64, "/w/a").await;
-    assert_eq!(whole.granted(Duration::from_secs(10)).await, Some(8));
+    assert_eq!(whole.granted().await, 8);
     let mut a_next = Asker::ask(&socket, 8, "/w/a").await;
-    assert_eq!(a_next.granted(Duration::from_millis(300)).await, None);
+    assert_eq!(
+        a_next.granted_within(Duration::from_millis(300)).await,
+        None
+    );
     let mut b = Asker::ask(&socket, 8, "/w/b").await;
-    assert_eq!(b.granted(Duration::from_millis(300)).await, None);
+    assert_eq!(b.granted_within(Duration::from_millis(300)).await, None);
 
     // The runner returns 8: each waiting checkout takes its share of 4.
     drop(whole);
-    assert_eq!(a_next.granted(Duration::from_secs(10)).await, Some(4));
-    assert_eq!(b.granted(Duration::from_secs(10)).await, Some(4));
+    assert_eq!(a_next.granted().await, 4);
+    assert_eq!(b.granted().await, 4);
     let held = ledger(&socket).await;
     assert_eq!(held.held, 8);
     assert_eq!(
@@ -360,12 +387,7 @@ async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
     std::io::Read::read_exact(&mut client, &mut taken).expect("take a token");
     drop(client);
     drop((writer, lines));
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while fifo.exists() || ledger(&socket).await.held != 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the fifo and its tokens outlive the close"
-        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
@@ -377,10 +399,10 @@ async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
 async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background_work() {
     let (gateway, root, socket) = gateway(4).await;
     let mut holder = Asker::ask(&socket, 4, "/w/background").await;
-    assert_eq!(holder.granted(Duration::from_secs(10)).await, Some(4));
+    assert_eq!(holder.granted().await, 4);
     let mut old_background = Asker::ask(&socket, 4, "/w/same").await;
     let mut gate = Asker::jobserver(&socket, 4, "/w/same").await;
-    assert_eq!(gate.granted(Duration::from_millis(50)).await, None);
+    assert_eq!(gate.granted_within(Duration::from_millis(50)).await, None);
     assert_eq!(
         ledger(&socket)
             .await
@@ -394,11 +416,8 @@ async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background
     );
     drop(holder);
     // The starved background checkout keeps one token; the gate takes the other three.
-    assert_eq!(gate.granted(Duration::from_secs(10)).await, Some(3));
-    assert_eq!(
-        old_background.granted(Duration::from_secs(10)).await,
-        Some(1)
-    );
+    assert_eq!(gate.granted().await, 3);
+    assert_eq!(old_background.granted().await, 1);
     let status = ledger(&socket).await;
     assert_eq!((status.total, status.held), (4, 4));
     drop((gate, old_background));
@@ -410,11 +429,11 @@ async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background
 async fn a_running_gate_holds_up_neither_background_nor_a_later_gate_while_tokens_are_free() {
     let (gateway, root, socket) = gateway(8).await;
     let mut gate = Asker::jobserver(&socket, 4, "/w/gate").await;
-    assert_eq!(gate.granted(Duration::from_secs(10)).await, Some(4));
+    assert_eq!(gate.granted().await, 4);
     let mut background = Asker::ask(&socket, 1, "/w/background").await;
-    assert_eq!(background.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(background.granted().await, 1);
     let mut next_gate = Asker::jobserver(&socket, 2, "/w/next-gate").await;
-    assert_eq!(next_gate.granted(Duration::from_secs(10)).await, Some(2));
+    assert_eq!(next_gate.granted().await, 2);
     assert_eq!(ledger(&socket).await.held, 7);
     drop((gate, background, next_gate));
     gateway.drain().await.expect("drain");
@@ -427,17 +446,17 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
     // The land's gate job holds only its orchestrator's token.
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     let mut a = Asker::ask(&socket, 2, "/w/a").await;
-    assert_eq!(a.granted(Duration::from_secs(10)).await, Some(2));
+    assert_eq!(a.granted().await, 2);
     let mut b = Asker::ask(&socket, 1, "/w/b").await;
-    assert_eq!(b.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(b.granted().await, 1);
     let mut queued = Asker::ask(&socket, 1, "/w/c").await;
     // A land task asks the gate job's pool after c queued. The pool lends nothing of its own: the
     // child waits for the host, not for the gate's single token.
     let mut task = Asker::child(&pool, 2).await;
-    assert_eq!(task.granted(Duration::from_millis(50)).await, None);
+    assert_eq!(task.granted_within(Duration::from_millis(50)).await, None);
     drop(b);
-    assert_eq!(task.granted(Duration::from_secs(10)).await, Some(1));
-    assert_eq!(queued.granted(Duration::from_millis(50)).await, None);
+    assert_eq!(task.granted().await, 1);
+    assert_eq!(queued.granted_within(Duration::from_millis(50)).await, None);
     let status = ledger(&socket).await;
     let land = status
         .checkouts
@@ -446,7 +465,7 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
         .expect("the land holds");
     assert_eq!((land.held, land.running), (2, 2), "{status:?}");
     drop(task);
-    assert_eq!(queued.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(queued.granted().await, 1);
     drop((gate, a, queued));
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
@@ -460,9 +479,9 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
     let (younger, younger_pool) = Asker::gate_job(&socket, "/w/younger").await;
     // A feature shed holds the rest of the host with two runners, and its next one waits first.
     let mut feature_one = Asker::ask(&socket, 1, "/w/feature").await;
-    assert_eq!(feature_one.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(feature_one.granted().await, 1);
     let mut feature_two = Asker::ask(&socket, 1, "/w/feature").await;
-    assert_eq!(feature_two.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(feature_two.granted().await, 1);
     let mut feature_next = Asker::ask(&socket, 1, "/w/feature").await;
     // Then the younger land's task asks through its pool, and the older land's task asks last.
     let mut younger_task = Asker::child(&younger_pool, 1).await;
@@ -555,7 +574,7 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
     assert!(queue[0].1 < queue[1].1, "{queue:?}");
     // Each returned token goes to the oldest land first, then the younger land, then the feature.
     drop(feature_one);
-    assert_eq!(older_task.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(older_task.granted().await, 1);
     // A task its pool relays is named too: by its own pid, the pool socket's peer.
     let status = ledger(&socket).await;
     assert_eq!(
@@ -566,12 +585,18 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
         ],
         "{status:?}"
     );
-    assert_eq!(younger_task.granted(Duration::from_millis(50)).await, None);
+    assert_eq!(
+        younger_task.granted_within(Duration::from_millis(50)).await,
+        None
+    );
     drop(older_task);
-    assert_eq!(younger_task.granted(Duration::from_secs(10)).await, Some(1));
-    assert_eq!(feature_next.granted(Duration::from_millis(50)).await, None);
+    assert_eq!(younger_task.granted().await, 1);
+    assert_eq!(
+        feature_next.granted_within(Duration::from_millis(50)).await,
+        None
+    );
     drop(feature_two);
-    assert_eq!(feature_next.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(feature_next.granted().await, 1);
     drop((older, younger, younger_task, feature_next));
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
@@ -587,18 +612,21 @@ async fn a_younger_land_is_served_its_floor_while_an_older_land_holds_most_of_th
     let (gateway, root, socket) = gateway(8).await;
     let (older, older_pool) = Asker::gate_job(&socket, "/w/older").await;
     let mut older_task = Asker::child(&older_pool, 5).await;
-    assert_eq!(older_task.granted(Duration::from_secs(10)).await, Some(5));
+    assert_eq!(older_task.granted().await, 5);
     let mut own = Asker::ask(&socket, 1, "/w/younger").await;
-    assert_eq!(own.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(own.granted().await, 1);
     let mut other = Asker::ask(&socket, 1, "/w/other").await;
-    assert_eq!(other.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(other.granted().await, 1);
     assert_eq!(ledger(&socket).await.held, 8);
     let mut older_next = Asker::child(&older_pool, 5).await;
     let mut younger = Asker::jobserver(&socket, 1, "/w/younger").await;
-    assert_eq!(younger.granted(Duration::from_millis(50)).await, None);
+    assert_eq!(
+        younger.granted_within(Duration::from_millis(50)).await,
+        None
+    );
     drop(older_task);
-    assert_eq!(younger.granted(Duration::from_secs(10)).await, Some(1));
-    assert_eq!(older_next.granted(Duration::from_secs(10)).await, Some(4));
+    assert_eq!(younger.granted().await, 1);
+    assert_eq!(older_next.granted().await, 4);
     drop((older, older_next, own, other, younger));
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
@@ -736,36 +764,27 @@ async fn a_resident_holds_no_token_and_each_request_it_runs_asks_the_host() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-impl Asker {
-    /// The new total of the next `grown` answer within `within`, or `None`.
-    async fn grown(&mut self, within: Duration) -> Option<u64> {
-        let answer = tokio::time::timeout(within, self.answer()).await.ok()?;
-        assert_eq!(answer["lease"], "grown", "{answer}");
-        Some(answer["tokens"].as_u64().expect("a growth names its total"))
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_land_build_granted_one_token_grows_through_its_gate_jobs_pool_up_to_its_want() {
     let (gateway, root, socket) = gateway(5).await;
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     let mut a = Asker::ask(&socket, 3, "/w/a").await;
-    assert_eq!(a.granted(Duration::from_secs(10)).await, Some(3));
+    assert_eq!(a.granted().await, 3);
     let mut b = Asker::ask(&socket, 1, "/w/b").await;
-    assert_eq!(b.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(b.granted().await, 1);
     // A land's Cargo build asks the gate job's pool for 3 on a full host.
     let mut build = Asker::send(
         &pool,
         serde_json::json!({ "op": "cpu-pool", "want": 3, "grow": true }),
     )
     .await;
-    assert_eq!(build.granted(Duration::from_millis(50)).await, None);
+    assert_eq!(build.granted_within(Duration::from_millis(50)).await, None);
     drop(b);
-    assert_eq!(build.granted(Duration::from_secs(10)).await, Some(1));
+    assert_eq!(build.granted().await, 1);
     // Three return: the build grows by two to its want of three, and never past it.
     drop(a);
-    assert_eq!(build.grown(Duration::from_secs(10)).await, Some(3));
-    assert_eq!(build.grown(Duration::from_millis(50)).await, None);
+    assert_eq!(build.grown().await, 3);
+    assert_eq!(build.grown_within(Duration::from_millis(50)).await, None);
     let status = ledger(&socket).await;
     assert_eq!(status.held, 4, "{status:?}");
     drop((gate, build));
@@ -777,16 +796,14 @@ async fn a_land_build_granted_one_token_grows_through_its_gate_jobs_pool_up_to_i
 async fn a_root_cargo_build_that_grows_is_handed_its_tokens_through_its_fifo() {
     let (gateway, root, socket) = gateway(4).await;
     let mut holder = Asker::ask(&socket, 3, "/w/x").await;
-    assert_eq!(holder.granted(Duration::from_secs(10)).await, Some(3));
+    assert_eq!(holder.granted().await, 3);
     let mut build = Asker::send(
         &socket,
         serde_json::json!({ "op": "jobserver", "want": 4, "checkout": "/w/build",
             "command": "cargo build", "grow": true }),
     )
     .await;
-    let granted = tokio::time::timeout(Duration::from_secs(10), build.answer())
-        .await
-        .expect("granted");
+    let granted = build.answer().await;
     assert_eq!(
         (granted["lease"].as_str(), granted["tokens"].as_u64()),
         (Some("granted"), Some(1))
@@ -797,7 +814,7 @@ async fn a_root_cargo_build_that_grows_is_handed_its_tokens_through_its_fifo() {
             .expect("a jobserver grant names its fifo"),
     );
     drop(holder);
-    assert_eq!(build.grown(Duration::from_secs(10)).await, Some(4));
+    assert_eq!(build.grown().await, 4);
     // The fifo now holds every token beyond the implicit first: none at the grant, three grown.
     let mut file = std::fs::OpenOptions::new()
         .read(true)

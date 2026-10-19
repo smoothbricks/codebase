@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cowshed_cli::jobserver_launcher::run_at;
@@ -216,12 +216,7 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
         shown.contains("CARGO_BUILD_JOBS=\n"),
         "no static job count under a jobserver: {shown}"
     );
-    let deadline = Instant::now() + Duration::from_secs(15);
     while Path::new(fifo).exists() || held(&socket) != 0 {
-        assert!(
-            Instant::now() < deadline,
-            "the finished build\'s grant outlives it"
-        );
         std::thread::sleep(Duration::from_millis(25));
     }
 
@@ -383,7 +378,6 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
     let sleeper_socket = socket.clone();
     std::fs::remove_file(&pid_file).expect("discard the previous child identity");
     let handle = std::thread::spawn(move || run_at(&arguments, &sleeper_socket));
-    let deadline = Instant::now() + Duration::from_secs(15);
     let pid = loop {
         if held(&socket) == u64::try_from(granted).expect("a grant fits u64")
             && let Ok(identity) = std::fs::read_to_string(&pid_file)
@@ -391,7 +385,11 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
         {
             break pid;
         }
-        assert!(Instant::now() < deadline, "the granted child never started");
+        // A launcher that ended before its child was seen is noticed by its end, never a clock.
+        assert!(
+            !handle.is_finished(),
+            "the launcher ended before its granted child started"
+        );
         std::thread::sleep(Duration::from_millis(25));
     };
     let shown = env_out();
@@ -413,12 +411,7 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
         128 + 9,
         "a cargo killed by SIGKILL ends the launcher likewise"
     );
-    let deadline = Instant::now() + Duration::from_secs(15);
     while Path::new(&fifo).exists() || held(&socket) != 0 {
-        assert!(
-            Instant::now() < deadline,
-            "the killed build's grant outlives it"
-        );
         std::thread::sleep(Duration::from_millis(25));
     }
     unset("FAKE_CARGO_SLEEP");
@@ -485,12 +478,7 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
             }
         }
     });
-    let deadline = Instant::now() + Duration::from_secs(15);
     while !pid_file.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the build never started under the job's pool"
-        );
         std::thread::sleep(Duration::from_millis(25));
     }
 
@@ -504,11 +492,7 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
 
     let mut said = Vec::new();
     loop {
-        let left = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_default()
-            .max(Duration::from_secs(5));
-        let line = heard.recv_timeout(left).unwrap_or_else(|error| {
+        let line = heard.recv().unwrap_or_else(|error| {
             panic!("the build never said its pool closed ({error}); it said: {said:#?}")
         });
         let closed = line.contains("runs on over budget until it ends");

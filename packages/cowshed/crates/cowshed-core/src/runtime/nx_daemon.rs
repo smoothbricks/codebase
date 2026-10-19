@@ -1525,7 +1525,7 @@ mod lifecycle_authority_tests {
             .expect("the workspace's own nx");
         let mut daemon = real_daemon(&root, &node, &nx);
         let record_path = root.join(".nx/workspace-data/d/server-process.json");
-        let started = std::time::Instant::now();
+        // The record is the event; a daemon that dies first is noticed by its exit.
         while !record_path.is_file() {
             if let Some(status) = daemon.try_wait().expect("poll the daemon") {
                 let mut stderr = String::new();
@@ -1534,10 +1534,6 @@ mod lifecycle_authority_tests {
                 }
                 panic!("the real daemon exited before publishing its record ({status}): {stderr}");
             }
-            assert!(
-                started.elapsed() < Duration::from_secs(120),
-                "the real daemon did not publish its record within 120s"
-            );
             std::thread::sleep(Duration::from_millis(100));
         }
         let leader = GroupLeader::observe(daemon.id()).expect("observe the daemon's group leader");

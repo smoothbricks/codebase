@@ -1542,11 +1542,13 @@ mod tests {
             .spawn_locked()
             .unwrap();
         let pid = child.id() as i32;
-        let started = std::time::Instant::now();
         let held = loop {
             let held = holders(&database).unwrap();
-            if !held.is_empty() || started.elapsed() > Duration::from_secs(10) {
+            if !held.is_empty() {
                 break held;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("the shell exited before it held the database: {status}");
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -1583,13 +1585,13 @@ mod tests {
             .spawn_locked()
             .unwrap();
         let pid = child.id() as i32;
-        let started = std::time::Instant::now();
         let held = loop {
             let held = volume_holders(&root).unwrap();
-            if held.iter().any(|holder| holder.pid == pid)
-                || started.elapsed() > Duration::from_secs(10)
-            {
+            if held.iter().any(|holder| holder.pid == pid) {
                 break held;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("the shell exited before its cwd showed as a holder: {status}");
             }
             std::thread::sleep(Duration::from_millis(10));
         };

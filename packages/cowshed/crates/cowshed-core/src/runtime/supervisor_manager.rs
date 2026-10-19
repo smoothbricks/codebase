@@ -1485,12 +1485,10 @@ mod tests {
                 .kill_on_drop(true)
                 .spawn_locked()
                 .expect("start the supervisor of another build");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while UnixStream::connect(&socket).await.is_err() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the helper never served"
-            );
+            if let Some(status) = supervisor.try_wait().expect("poll the supervisor") {
+                panic!("the supervisor of another build exited before serving: {status}");
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         // `sleep` from PATH: NixOS keeps nothing but `sh` and `env` in /bin and /usr/bin.

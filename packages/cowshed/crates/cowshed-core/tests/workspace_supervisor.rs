@@ -2249,11 +2249,9 @@ async fn a_supervisor_serves_and_carries_the_groups_its_predecessor_left_unresol
 
     // SAFETY: this test made the group; its id still names the test's own descendant.
     assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
     while !cowshed_core::runtime::job_groups::unresolved(&ledger)
         .unwrap()
         .is_empty()
-        && std::time::Instant::now() < deadline
     {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -4831,7 +4829,7 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
         std::process::id(),
         "drain answers at once with the serving pid"
     );
-    let refused = tokio::time::timeout(Duration::from_secs(5), async {
+    let refused = async {
         loop {
             match remote
                 .exec(
@@ -4851,9 +4849,8 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
                 }
             }
         }
-    })
-    .await
-    .expect("a draining supervisor refuses new work");
+    }
+    .await;
     assert_eq!(refused.code, ErrorCode::Conflict);
     assert!(!server.is_finished(), "the running job holds it serving");
 
@@ -4865,10 +4862,9 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
     tokio::time::sleep(Duration::from_millis(50)).await;
     complete(&spawned, b"done", b"", ExitStatus::Exited { code: 0 }).await;
     assert_eq!(waiting.await.unwrap().unwrap().state, JobState::Exited);
-    tokio::time::timeout(Duration::from_secs(5), server)
+    server
         .await
         .expect("it stops serving once its jobs ended")
-        .unwrap()
         .unwrap();
 }
 

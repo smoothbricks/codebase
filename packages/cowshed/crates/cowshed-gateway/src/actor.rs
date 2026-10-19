@@ -3676,10 +3676,7 @@ mod tests {
                     } => {
                         if process.try_wait().expect("fixture child status").is_none() {
                             process.start_kill().expect("kill fixture child");
-                            tokio::time::timeout(Duration::from_secs(2), process.wait())
-                                .await
-                                .expect("fixture reap deadline")
-                                .expect("reap fixture child");
+                            process.wait().await.expect("reap fixture child");
                         }
                     }
                     NxBackendState::Ready { process: None, .. } | NxBackendState::Failed { .. } => {
@@ -3921,10 +3918,8 @@ mod tests {
                 .is_cancelled()
         );
         assert!(
-            tokio::time::timeout(Duration::from_secs(2), closed)
-                .await
-                .expect("aborting the supervisor must abort its worker")
-                .is_err()
+            closed.await.is_err(),
+            "aborting the supervisor must abort its worker"
         );
     }
 
@@ -3943,9 +3938,11 @@ mod tests {
             "owner/nx-panic".to_owned(),
             NxBackendState::Starting { task },
         );
-        let command = tokio::time::timeout(Duration::from_secs(2), fixture.actor.receiver.recv())
+        let command = fixture
+            .actor
+            .receiver
+            .recv()
             .await
-            .expect("startup panic must report promptly")
             .expect("completion command");
         let Command::NxBackendStarted { repo_id, result } = command else {
             panic!("expected startup completion")

@@ -12,16 +12,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::time::{Duration, Instant};
 
 const SINCE_NOW: u64 = u64::MAX;
 const NO_DEFER: u32 = 0x2;
 const FILE_EVENTS: u32 = 0x10;
 const MOUNT: u32 = 0x40;
 const UNMOUNT: u32 = 0x80;
-/// How long an expected event may take. Only a failure waits it out: every wait ends on the
-/// event's own callback.
-const DELIVERY_BOUND: Duration = Duration::from_secs(10);
+/// One runloop pass in a wait: CoreFoundation's own "until stopped" interval, which
+/// `CFRunLoopRun` passes too. A pass returns after the first source it handles, so every wait
+/// ends on the event's own callback and no clock bounds it; a stream that never delivers is the
+/// harness's backstop.
+const RUN_UNTIL_DELIVERY: f64 = 1.0e10;
 
 type Callback =
     unsafe extern "C" fn(*const c_void, *mut c_void, usize, *mut c_void, *const u32, *const u64);
@@ -103,7 +104,6 @@ unsafe extern "C" fn changed(
 /// A live stream of file events under one directory, delivered on the creating thread's runloop
 /// while that thread waits in [`Watch::wait_until`].
 pub struct Watch {
-    root: PathBuf,
     raw: *mut c_void,
     seen: Box<Seen>,
 }
@@ -153,25 +153,17 @@ impl Watch {
             }
             FSEventStreamFlushSync(raw);
         }
-        Self { root, raw, seen }
+        Self { raw, seen }
     }
 
-    /// Run this thread's runloop until `done` holds for what the stream delivered, or fail
-    /// naming `what` and everything delivered instead.
-    pub fn wait_until(&mut self, what: &str, done: impl Fn(&Seen) -> bool) {
+    /// Run this thread's runloop until `done` holds for what the stream delivered. Each run
+    /// returns after the first source it handles, so the wait ends on delivery, not on a clock.
+    pub fn wait_until(&mut self, done: impl Fn(&Seen) -> bool) {
         // SAFETY: the stream is started and scheduled on this thread's runloop.
         unsafe { FSEventStreamFlushSync(self.raw) };
-        let deadline = Instant::now() + DELIVERY_BOUND;
         while !done(&self.seen) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "{what} not delivered under {} within {DELIVERY_BOUND:?}; delivered: {:x?}",
-                self.root.display(),
-                self.seen
-            );
             // SAFETY: the runloop and mode are valid; the callback does not escape this call.
-            unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, remaining.as_secs_f64(), 1) };
+            unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, RUN_UNTIL_DELIVERY, 1) };
         }
     }
 
@@ -184,7 +176,7 @@ impl Watch {
             Transition::Mounted => MOUNT,
             Transition::Unmounted => UNMOUNT,
         };
-        self.wait_until(&format!("{transition:?} at {}", mount.display()), |seen| {
+        self.wait_until(|seen| {
             seen.iter()
                 .rev()
                 .find(|(path, flags)| *path == mount && flags & (MOUNT | UNMOUNT) != 0)
