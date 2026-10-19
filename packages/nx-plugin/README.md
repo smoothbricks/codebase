@@ -837,6 +837,20 @@ without a file declaration it conservatively retains the whole package tree.
 Ancestor directories bind device/inode/type/mode path identity; files and symlinks retain their full stamps, and a
 directory is upgraded to a full nanosecond node/namespace stamp when its membership is actually read.
 
+**A stamp read in the tick its node changed in is unproven, not unchanged.** A filesystem dates a change by the kernel's
+clock. On Linux, on a filesystem without fine-grained timestamps such as ZFS, that clock moves once a jiffy: 1 ms at
+`CONFIG_HZ=1000`, as on CI's runner, and 10 ms at `CONFIG_HZ=100`, the slowest. A same-size rewrite in the tick a stamp
+was read in leaves every field of that stamp as it was. So a census reads the clock before its first stat, and records a
+node whose later of ctime and mtime is within 10 ms of that time with its ctime `unproven`, which no later read equals.
+This is git's racily clean rule (`Documentation/technical/racy-git.txt`), and the Nx archive repair below applies it to
+Nx's own file hashes. Node can read neither the jiffy nor a filesystem's granularity, and a shorter window reopens the
+gap on a slower kernel, so the window is the slowest tick and is not an option. A reader that meets an unproven stamp
+re-reads the node against its recorded bytes, link text or membership, as it does a node whose ctime alone moved; one
+that holds nothing to re-read it against counts it moved. A census whose stamps stand in for no bytes of their own (the
+installed-package census and the local plugin modules, which hash every byte on every read) records them as read. So
+does a workspace capture's own stability check, which compares the stamps it read: only the capture after it distrusts
+them.
+
 A physically missing required factory after the clean cutover is an invalid installation and fails loudly; it is not a
 proof miss that can fall back to the graph RPC. Consumers adopt the normal static import only after the public producer
 is available.
@@ -852,9 +866,10 @@ error, or a write observed during the comparison is a miss.
 A successful byte comparison may retain a cache-bound node inventory in that same Nx workspace-data directory. It binds
 the exact task hashes, declared outputs and artifact paths to every compared working-tree/cache node and both sets of
 real parent directories. Reuse requires the same device, inode, type/permission mode, length and nanosecond mtime/ctime
-for all those nodes. It is evidence of the same previously compared bytes, never source identity or an mtime freshness
-rule. Missing/unreadable evidence or moved nodes require a full comparison; mutations to either the cache or working
-tree, parent symlink replacement, and directory membership changes cannot borrow an old equality verdict.
+for all those nodes, and a node the comparison read in the tick it changed in is recorded unproven, so the next
+comparison is a full one. It is evidence of the same previously compared bytes, never source identity or an mtime
+freshness rule. Missing/unreadable evidence or moved nodes require a full comparison; mutations to either the cache or
+working tree, parent symlink replacement, and directory membership changes cannot borrow an old equality verdict.
 
 `probeBuilt({ target, cwd })` is the distinct typed read-only product operation. Its `hit` is an actual published
 `EnsureBuiltReceipt`, not a cache hit re-probed under the consumer's environment. The producer opts into publication in
@@ -878,12 +893,13 @@ stable through publication, and every refusal that one moved names the first nod
 node whose device, inode, mode, size and mtime are unchanged and only its ctime moved is re-read and compared with its
 recorded bytes, link text and membership, as any moved stamp requires a full comparison: under `globalStore` the closure
 lives in Bun's install cache, which every checkout on the machine shares, and linking a package's bin on any of their
-installs re-chmods the store file to the mode it already has. The command's stdout/stderr digest is not a product
-digest. The bound tool/module inputs are the installed closures of Nx, this plugin, TypeScript and local graph plugins,
-and the producer executables. A task's npm external inputs (`AllExternalDependencies` and the npm nodes of its project's
-dependency closure) are Nx's lockfile identities: the task's hash details and the committed `bun.lock` bind them, and no
-installed closure is resolved for them, since under Bun's isolated linker most of them do not resolve from the task's
-project.
+installs re-chmods the store file to the mode it already has. A source, tool or output node the census read in the tick
+it changed in, as a task's last writes are, is recorded unproven and re-read the same way. The command's stdout/stderr
+digest is not a product digest. The bound tool/module inputs are the installed closures of Nx, this plugin, TypeScript
+and local graph plugins, and the producer executables. A task's npm external inputs (`AllExternalDependencies` and the
+npm nodes of its project's dependency closure) are Nx's lockfile identities: the task's hash details and the committed
+`bun.lock` bind them, and no installed closure is resolved for them, since under Bun's isolated linker most of them do
+not resolve from the task's project.
 
 Validity compares the committed tree, not the current HEAD spelling. An empty commit with an identical tree keeps the
 receipt valid and its original basis SHA unchanged; the consumer never rewrites that provenance. A genuinely changed

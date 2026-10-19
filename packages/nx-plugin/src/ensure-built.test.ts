@@ -13,6 +13,7 @@ import { signalToCode } from 'nx/src/utils/exit-codes';
 import typia from 'typia';
 import { nxFixtureRoot, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
+import { pastTick } from './__tests__/past-tick.js';
 import type { EnsureBuiltProbeResult } from './ensure-built.js';
 import {
   assignEnvironment,
@@ -246,7 +247,9 @@ describe('unvouched', () => {
 });
 
 describe('compareWithArtifacts', () => {
-  it('reuses a verified two-tree inventory without expanding or rereading artifact bytes', () => {
+  it('reuses a verified two-tree inventory without expanding or rereading artifact bytes', async () => {
+    // An inventory recorded in the tick its fixture was written in is unproven, and the next comparison is a full one.
+    await pastTick();
     const path = join(root, 'verified.json');
     let walks = 0;
     const expand: typeof expandOutputs = (...args) => {

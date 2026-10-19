@@ -42,12 +42,15 @@ import type * as NxWorkspaceRoot from 'nx/src/utils/workspace-root';
 import { boundedReceiptRuntimes, type ProviderInputProof } from './ensure-built-receipt.js';
 import {
   type ArtifactWitness,
+  censusStart,
   type GraphWitness,
   graphInstallationIdentity,
+  movedNodes,
   nodeStamp,
   nodesUnchanged,
   readArtifactWitness,
   readGraphWitness,
+  recordedStamp,
   reusableGraph,
   snapshotsEqual,
   workspaceSnapshot,
@@ -1068,7 +1071,9 @@ async function currentProjectGraph(
     expandOutputs,
     graphInputContractIdentity(workspaceRoot, nxJson, after),
   );
-  const stableGeneration = snapshotsEqual(before, after) && nodesUnchanged(before.nodes);
+  // `after` re-hashed every node whose stamp does not prove it (its ctime alone moved, or `before` read it in the tick
+  // it changed in), and snapshotsEqual compares those hashes.
+  const stableGeneration = snapshotsEqual(before, after) && movedNodes(before.nodes, () => true) === null;
   if (installation !== null && installation === finalInstallation && stableGeneration) {
     const next: GraphWitness = { version: 1, workspaceRoot, environment, installation, snapshot: after, projectGraph };
     writeWitness(witnessPath, next);
@@ -1292,6 +1297,8 @@ export function compareWithArtifacts(
       if (!isSystemError(error)) throw error;
     }
   }
+  // Read before the comparison's first stat: a node it reads in the tick it changed in is recorded unproven.
+  const start = censusStart();
   const comparison: ArtifactComparison = {
     expandOutputs,
     left: Buffer.allocUnsafe(COMPARE_CHUNK_BYTES),
@@ -1312,7 +1319,11 @@ export function compareWithArtifacts(
       version: 1,
       workspaceRoot,
       claims: binding,
-      nodes: comparison.observed.map(({ taskId, path, stats }) => ({ taskId, path, stamp: nodeStamp(stats) })),
+      nodes: comparison.observed.map(({ taskId, path, stats }) => ({
+        taskId,
+        path,
+        stamp: recordedStamp(stats, start),
+      })),
     };
     writeWitness(witnessPath, next);
   }

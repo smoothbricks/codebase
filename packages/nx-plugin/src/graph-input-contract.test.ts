@@ -19,6 +19,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { expandOutputs, WorkspaceContext } from 'nx/src/native';
+import { pastTick } from './__tests__/past-tick.js';
 import { graphInstallationIdentity, workspaceSnapshot } from './ensure-built-witness.js';
 import {
   type GraphInputContract,
@@ -66,6 +67,8 @@ beforeEach(async () => {
   await writeFile(join(root, '.gitignore'), '.nx/\nnode_modules/\n');
   await writeFile(join(root, 'plugin.ts'), pure);
   await writeFile(join(external, 'base.json'), '{"include":["src"]}');
+  // A witness read in the tick its inputs changed in is unproven, and no reader trusts it.
+  await pastTick();
 });
 afterEach(async () => {
   if (inheritedData === undefined) delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
@@ -211,6 +214,7 @@ describe('owning-reader external input byproducts', () => {
     const path = join(first, 'base.json');
     await writeFile(path, '{}');
     await link(path, join(second, 'base.json'));
+    await pastTick();
     const probe = reader();
     probe.read(path, () => '{}');
     expect(probe.finish().status).toBe('complete');
@@ -258,6 +262,7 @@ describe('owning-reader external input byproducts', () => {
     await mkdir(packageRoot);
     await writeFile(join(packageRoot, 'package.json'), '{"name":"base-config","version":"1","exports":"./base.json"}');
     await writeFile(join(packageRoot, 'base.json'), '{}');
+    await pastTick();
     const probe = reader();
     const local = createRequire(join(root, 'package.json'));
     expect(probe.resolve(root, 'base-config', () => local.resolve('base-config'))).toBe(join(packageRoot, 'base.json'));
@@ -319,6 +324,7 @@ describe('owning-reader external input byproducts', () => {
     await writeFile(join(root, 'outside-native.ts'), 'export const value = 1;\n');
     execFileSync('git', ['add', '--', 'outside-native.ts'], { cwd: root });
     expect(snapshot().files.map(({ file }) => file)).not.toContain('outside-native.ts');
+    await pastTick();
     const probe = reader('reference-scan');
     probe.git(root, []);
     expect(probe.finish().status).toBe('complete');
@@ -341,6 +347,7 @@ describe('owning-reader external input byproducts', () => {
     const before = await stat(input);
     const physical = await realpath(input);
     const bytes = await readFile(input, 'utf8');
+    await pastTick();
     const probe = reader();
     expect(probe.read(input, () => bytes)).toBe(bytes);
     expect(probe.finish().status).toBe('complete');
@@ -356,6 +363,7 @@ describe('owning-reader external input byproducts', () => {
     execFileSync('git', ['init', '-q'], { cwd: root });
     execFileSync('git', ['config', 'include.path', join(external, 'gitconfig')], { cwd: root });
     await writeFile(join(external, 'gitconfig'), '[core]\n  ignorecase = true\n');
+    await pastTick();
     const probe = reader('reference-scan');
     probe.git(root, ['plugin.ts']);
     expect(probe.finish().status).toBe('complete');

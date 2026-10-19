@@ -24,7 +24,15 @@ import type * as NxCacheDirectory from 'nx/src/utils/cache-directory';
 import type * as TypeScript from 'typescript';
 import typia from 'typia';
 import type { NodeWitness, WorkspaceSnapshot } from './ensure-built-witness.js';
-import { nodeStamp, nodesUnchanged, workspaceSnapshot } from './ensure-built-witness.js';
+import {
+  censusStart,
+  movedNodes,
+  nodeStamp,
+  nodesUnchanged,
+  recordedStamp,
+  unproven,
+  workspaceSnapshot,
+} from './ensure-built-witness.js';
 
 /** An owner-approved contract, pinned to the reviewed module bytes, never an inferred approval. */
 export interface GraphInputContract {
@@ -175,6 +183,10 @@ export class GraphInputReadCollector {
   private readonly scanned = new Set<string>();
   private readonly gitScopes = new Set<string>();
   private detail: string | undefined;
+  /** Read before the first observation: what each node stamp this reader records is judged by (unproven). */
+  private readonly start = censusStart();
+  /** The witness's stamp of each node this reader read in the tick it changed in (recordedStamp), by path. */
+  private readonly unprovenStamps = new Map<string, string>();
   constructor(
     readonly workspaceRoot: string,
     readonly plugin: string,
@@ -234,7 +246,12 @@ export class GraphInputReadCollector {
     const stamp = scope === 'path' ? pathStamp(stats) : nodeStamp(stats);
     if (previous !== undefined && previous.stamp !== (previous.scope === scope ? stamp : pathStamp(stats)))
       this.refuse(`input changed during read: ${path}`);
-    if (previous === undefined || previous.scope !== scope) this.nodes.set(path, { path, scope, stamp });
+    if (previous === undefined || previous.scope !== scope) {
+      this.nodes.set(path, { path, scope, stamp });
+      // A path stamp holds no time; a node stamp read in its node's change tick is recorded unproven.
+      if (scope === 'node' && unproven(stats, this.start))
+        this.unprovenStamps.set(path, recordedStamp(stats, this.start));
+    }
     if (stats.isSymbolicLink()) this.observe(realpathSync(path), membership);
     else if (stats.isFile()) accessSync(path, constants.R_OK);
     else if (!stats.isDirectory()) this.refuse(`unproved filesystem node: ${path}`);
@@ -408,10 +425,12 @@ export class GraphInputReadCollector {
     this.protect(() => {
       if (this.before === undefined) return;
       const after = captureNative(this.workspaceRoot, this.before);
+      // `after` re-hashed every node whose stamp does not prove it (its ctime alone moved, or `before` read it in the
+      // tick it changed in), and its native identity must be `before`'s.
       if (
         !after.stable ||
         nativeIdentity(after.files) !== nativeIdentity(this.before.files) ||
-        !nodesUnchanged(this.before.nodes) ||
+        movedNodes(this.before.nodes, () => true) !== null ||
         !readNodesUnchanged([...this.nodes.values()])
       )
         this.refuse('graph inputs changed during the owning reader');
@@ -427,7 +446,10 @@ export class GraphInputReadCollector {
             status: 'complete',
             nativeIdentity: nativeIdentity(this.before.files),
             nativeNodes: this.before.nodes,
-            nodes: [...this.nodes.values()],
+            nodes: [...this.nodes.values()].map((node) => {
+              const stamp = this.unprovenStamps.get(node.path);
+              return stamp === undefined ? node : { ...node, stamp };
+            }),
             missing: [...this.missing].sort(),
             resolutions: this.resolutions,
             tools: [...this.tools.values()],
