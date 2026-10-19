@@ -697,7 +697,9 @@ A landing Nx root with no task database never ran Nx. After build-state admissio
 each detected Nx root is initialized through its checkout's own pinned Nx 23.2.1 `DbCache`, constructed with
 `{nxCloudRemoteCache: null, skipRemoteCache: true}`. Nx owns the complete schema initialization; the adapter never
 invokes remote initialization. An initialization failure or a different Nx version stops only Nx-entry carry, naming the
-failure or found version in `carried.stopped`; validation, fast-forward and adoption policy are unchanged.
+failure or found version in `carried.stopped`; validation, fast-forward and adoption policy are unchanged. The
+initialization runs as one gate-class job of the landing workspace: a land is a gate job (05_gateway.md, "A land is a
+gate job").
 
 Carry requires an existing Nx-initialized v3 database and refuses one it cannot recognize. It writes no DDL or `VACUUM`,
 and copies no schema, header, journal, version or task-history metadata from the target. Initialization is Nx-owned, not
@@ -715,7 +717,9 @@ target ran at that tree. So once a rebase has not conflicted, stock Nx computes 
 Only target entries with one of those current-tree hashes that the workspace lacks are eligible to carry; historical
 hashes are not copied merely because main still indexes them. Each Nx root is selected independently. An unavailable or
 failed hash computation skips the carry with the root and reason; it never falls back to copying all rows. The target's
-volume is the source and the workspace's is the destination.
+volume is the source and the workspace's is the destination. The hash computation runs as one job of the workspace per
+root, at background class, or at gate class when the rebase names `--gate`: a land's rebase, which its lander runs under
+the land lock, so that it is not queued behind the background work the land is served ahead of.
 
 Both volumes' shared build holds are acquired before staging and retained through commit, including while their Nx
 daemons stop. A reseed or release must not withdraw either filesystem in that interval: Nx open locks fence database

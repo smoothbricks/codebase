@@ -3068,6 +3068,11 @@ pub struct RebaseOptions {
     pub expected_source_head: Option<GitOid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_onto_head: Option<GitOid>,
+    /// Run the rebase's own jobs — the carry's task hashes — as gate-class work. A land's rebase
+    /// is on the land's critical path: its lander runs it under the land lock, and a land is a
+    /// gate job (05_gateway.md, "A land is a gate job"). Any other rebase is background work.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub gate: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

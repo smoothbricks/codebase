@@ -481,6 +481,7 @@ pub struct RebaseOptions {
     pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
     pub expected_source_head: Option<GitOid>,
     pub expected_onto_head: Option<GitOid>,
+    pub gate: bool,                      // a land's rebase: the carry's jobs run as gate-class work (05)
 }
 
 pub struct LandOptions {
