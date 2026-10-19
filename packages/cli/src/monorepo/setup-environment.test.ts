@@ -1,6 +1,15 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell fixture scripts are literal shell text. */
 import { describe, expect, it } from 'bun:test';
-import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  symlinkSync,
+  watch,
+} from 'node:fs';
 import { chmod, copyFile, cp, mkdir, mkdtemp, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -549,20 +558,32 @@ describe('what shell entry installs', () => {
       async ({ root, startShell, enterShell: enter }) => {
         const holder = startShell();
         const held = join(root, 'held');
-        // The holder is another process; the only signal that it is inside
-        // the install is the pid file its prepare script writes.
-        for (let waited = 0; !existsSync(held) || readFileSync(held, 'utf8') === ''; waited += 50) {
-          expect(waited).toBeLessThan(20_000);
-          await Bun.sleep(50);
+        // The holder is another process; the only signal that it is inside the install is the pid file its prepare
+        // script writes. A watch on the checkout wakes on that write and the file is checked once the watch is armed,
+        // so a write before it is seen; the holder's exit before writing it fails the wait. No clock decides it.
+        const written = Promise.withResolvers<void>();
+        const pidWritten = () => existsSync(held) && readFileSync(held, 'utf8').endsWith('\n');
+        const watcher = watch(root, () => {
+          if (pidWritten()) written.resolve();
+        });
+        void holder.exited.then(() => {
+          if (pidWritten()) written.resolve();
+          else written.reject(new Error(`the holder exited before it wrote ${held}`));
+        });
+        if (pidWritten()) written.resolve();
+        try {
+          await written.promise;
+        } finally {
+          watcher.close();
         }
         holder.kill('SIGKILL');
         await holder.exited;
         process.kill(Number(readFileSync(held, 'utf8').trim()), 'SIGKILL');
         await rm(join(root, 'hold'));
 
-        const started = performance.now();
+        // The entry prints its wait line the moment it finds the install lock held, and HEALTHY is empty stderr, so
+        // this proves the dead holder's lock was free at the entry's first attempt: the install ran at once.
         expect(await enter()).toEqual(HEALTHY);
-        expect(performance.now() - started).toBeLessThan(10_000);
         expect(readFileSync(join(root, 'installed'), 'utf8')).toBe('x\n');
       },
     );
