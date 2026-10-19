@@ -159,8 +159,9 @@ async fn one_shot(socket: &Path, line: &str) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn units_run_without_an_assignment_and_the_queue_names_what_waits_on_what() {
-    let (gateway, root, socket) = gateway(12).await;
-    // unit-a wants 8 tokens and runs; unit-b waits on unit-a and runs after its fact alone.
+    let (gateway, root, socket) = gateway(16).await;
+    // unit-a wants 8 tokens, background's half of 16, and runs; unit-b waits on unit-a and runs
+    // after its fact alone.
     let mut runner = Asker::ask(
         &socket,
         admit(
@@ -244,7 +245,7 @@ async fn one_unit_keeps_one_live_attempt_over_the_wire() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gate_band_units_share_cpu_without_exclusive_root_admission() {
-    let (gateway, root, socket) = gateway(2).await;
+    let (gateway, root, socket) = gateway(4).await;
     // Both requests retain TaskAdmitRequest's Gate class. Their grants must coexist:
     // a task band is not an exclusive JobserverClass::Gate root.
     let mut first = Asker::ask(&socket, admit("first", &[], 1, None)).await;

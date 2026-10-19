@@ -207,7 +207,7 @@ impl CpuPool {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let (budget, checkout, rank) = match source {
             PoolSource::Lent(tokens) => (
-                crate::cpu_budget::CpuBudget::start(crate::cpu_budget::CpuBudgetLimits { tokens }),
+                crate::cpu_budget::CpuBudget::lent(tokens),
                 std::sync::Arc::from("parent-pool"),
                 crate::cpu_budget::Rank::Background,
             ),

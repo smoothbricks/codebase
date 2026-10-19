@@ -1495,8 +1495,10 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
         }
     };
     let mut lines = vec![format!(
-        "gateway cpu budget: held {}/{} tokens",
-        ledger.held, ledger.total
+        "gateway cpu budget: held {}/{} tokens, background at most {}",
+        ledger.held,
+        ledger.total,
+        ledger.background_limit()
     )];
     let limit_minutes = cowshed_gateway_types::HOLD_LIMIT.as_secs() / 60;
     for (checkout, holder) in leases_past_the_hold_limit(ledger) {
@@ -3842,7 +3844,10 @@ mod tests {
             let ledger = ledger_with_background_lease(granted_ago(48, 18));
             let lines = cpu_budget_lines(&ledger);
 
-            assert_eq!(lines[0], "gateway cpu budget: held 18/18 tokens");
+            assert_eq!(
+                lines[0],
+                "gateway cpu budget: held 18/18 tokens, background at most 9"
+            );
             assert_eq!(
                 lines[1],
                 "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29272, 12/18 tokens, granted 48m18s ago: cargo --frozen test -p app_runtime"
@@ -3912,7 +3917,7 @@ mod tests {
             assert_eq!(
                 lines[..4],
                 [
-                    "gateway cpu budget: held 18/18 tokens",
+                    "gateway cpu budget: held 18/18 tokens, background at most 9",
                     "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29272, 12/18 tokens, granted 48m18s ago: cargo test",
                     "gateway cpu hold past 30m: /mnt/app/land: pid 31102, 4/18 tokens, granted 41m00s ago: nx run-many",
                     "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29301, 1/1 tokens, granted 31m05s ago: bun test",

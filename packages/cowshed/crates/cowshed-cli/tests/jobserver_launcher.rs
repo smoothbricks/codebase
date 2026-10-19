@@ -155,7 +155,7 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
     let out = root.join("env.txt");
     let pid_file = root.join("pid.txt");
 
-    let (gateway, socket) = start_gateway(&root, 4).await;
+    let (gateway, socket) = start_gateway(&root, 8).await;
 
     let original_path = std::env::var("PATH").unwrap_or_default();
     set("PATH", &format!("{}:{original_path}", bin.display()));
@@ -181,8 +181,8 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
     };
     let env_out = || std::fs::read_to_string(&out).expect("fake cargo ran");
 
-    // A build asks for one token per core and is granted min(cores, 4) on this budget of 4: a
-    // 3-core runner asks for, and runs with, 3. It runs under the fifo.
+    // A build asks for one token per core and is granted min(cores, 4) on this budget of 8, whose
+    // background half is 4: a 3-core runner asks for, and runs with, 3. It runs under the fifo.
     let granted = std::thread::available_parallelism()
         .map_or(1, usize::from)
         .min(4);
@@ -486,7 +486,7 @@ async fn the_launcher_sizes_each_case_and_a_killed_cargo_leaves_the_ledger_whole
         .drain()
         .await
         .expect("drain the gateway for its restart");
-    let (gateway, restarted) = start_gateway(&root, 4).await;
+    let (gateway, restarted) = start_gateway(&root, 8).await;
     assert_eq!(restarted, socket);
     assert_eq!(held(&socket), 0, "a restarted gateway forgets every grant");
 

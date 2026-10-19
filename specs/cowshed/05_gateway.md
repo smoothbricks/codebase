@@ -696,13 +696,14 @@ core count.
   gate or manufactures gate authority. A priority change re-keys pending work, never interrupts, resizes or restarts an
   already-running grant. Priority and the OS band are independent.
 - **Fair between checkouts within one priority.** The checkout is the Nx workspace root the request names. A checkout's
-  share is N divided among the checkouts holding or waiting (at least 1). The next grant goes to the highest-priority
-  eligible waiting request; within that priority, to the waiting checkout that holds the fewest tokens (the older head
-  request on a tie), to its oldest request. While another checkout waits, that grant is
-  `min(want, max(1, share − held))`; with nobody else waiting it is `min(want, free)`. A head request whose least grant
-  is not free yet waits for it, and so does everyone behind it within the same priority. A large request is never
-  starved by a stream of smaller requests at that priority; a gate with sixty runners queued cannot crowd out one with
-  three at the same priority.
+  share is the background limit `⌊N/2⌋` ("Room for a gate" below) divided among the checkouts holding or waiting (at
+  least 1). The next grant goes to the highest-priority eligible waiting request; within that priority, to the waiting
+  checkout that holds the fewest tokens (the older head request on a tie), to its oldest request. While another checkout
+  waits, that grant is `min(want, max(1, share − held))`; with nobody else waiting it is `min(want, free)`, and a
+  background grant draws only on its class's room ("Room for a gate" below). A head request whose least grant is not
+  free yet waits for it, and so does everyone behind it within the same priority. A large request is never starved by a
+  stream of smaller requests at that priority; a gate with sixty runners queued cannot crowd out one with three at the
+  same priority.
 - **All at once.** A request is granted once and never holds part of a grant while waiting for more, so no two requests
   can deadlock on each other's tokens. A compile-only Cargo build may grow after it starts ("A short build grows"
   below), but it runs from its first grant on and never waits for a growth.
@@ -725,9 +726,10 @@ core count.
   land stops wanting. Every grant is whole, so two younger gate jobs on their floor tokens wait on nothing the other
   holds. Measured without that floor: a younger land asking for its orchestrator's one token while the older land held
   13 of 18 tokens waited out the older land and failed. A running gate grant blocks nobody: with no gate-class work
-  wanting tokens, ordinary checkout fairness serves background from the free tokens. An in-flight background grant stays
-  exactly as it is until its child exits or its connection closes. This is priority on genuinely returned tokens, not a
-  reserved budget, budget increase, or stolen allocation. Conservation remains `free + Σ held = N`.
+  wanting tokens, ordinary checkout fairness serves background from the free tokens within background's limit ("Room for
+  a gate" below). An in-flight background grant stays exactly as it is until its child exits or its connection closes.
+  This is priority on genuinely returned tokens and on the half of the host background never holds, not a budget
+  increase or stolen allocation. Conservation remains `free + Σ held = N`.
 - **A land is a gate job, and its tasks are gate-class requests.** The selecting authority is the land queue holder:
   `~/Dev/.land-lock.sh` runs main's `tooling/land-host.sh`, the only path that gates a tree before `cowshed land`
   fast-forwards to it, and it runs that gate as `cowshed exec <workspace> --class gate --host -- …`. The trusted route
@@ -763,18 +765,32 @@ core count.
   in a fifo nobody reads. A growing holder that holds less than its `want` takes `min(want − held, free)` more from
   returned tokens that no waiter ahead of it takes: a gate-class build grows once no task of its own gate job or of an
   older one waits, ahead of a younger gate job's tasks and of background, under the same floor; a background build grows
-  only while no background request waits. It never passes its own `want`, so one task cannot starve the rest of its own
-  gate. Conservation is unchanged: growth moves tokens from `free` to that holder. The holder hears each new total as
-  `{"ok":true,"lease":"grown","tokens":<total>}` on its connection, and the launcher hands the difference to Cargo's
-  jobserver fifo and says `cowshed: cargo jobserver grew tokens=<from>/<want> -> <to>/<want>` on stderr, beside its
+  only while no background request waits, and only within background's limit ("Room for a gate" below). It never passes
+  its own `want`, so one task cannot starve the rest of its own gate. Conservation is unchanged: growth moves tokens
+  from `free` to that holder. The holder hears each new total as `{"ok":true,"lease":"grown","tokens":<total>}` on its
+  connection, and the launcher hands the difference to Cargo's jobserver fifo and says
+  `cowshed: cargo jobserver grew tokens=<from>/<want> -> <to>/<want>` on stderr, beside its
   `cowshed: cargo jobserver granted tokens=<g>/<want>`. Closing the connection still returns everything held.
-- **What gate priority does not guarantee.** A background test's CPU grant cannot be shrunk mid-run: Cargo's implicit
-  make token and libtest/nextest threads sized from the original grant do not return FIFO bytes. The gateway does not
-  resize a running FIFO, kill peer work, or use `SIGSTOP`/`SIGCONT`: wall and idle bounds would keep advancing during a
-  freeze. A gate-class request may have to wait for a returned token. It has guaranteed admission ahead of queued
-  background churn, but no fixed latency is promised while every token is genuinely held. Gate priority promises
-  admission order, not a fixed test duration. The supervisor's separate nice placement below ("Bands") orders the
-  classes by lowering nice, never by raising one above default.
+- **Room for a gate, since no grant shrinks** (2026-10-19, Danny: "avoid dumb waiting"). A running grant cannot be
+  shrunk: Cargo's implicit make token and libtest/nextest threads sized from the original grant do not return FIFO
+  bytes. The gateway does not resize a running FIFO, kill peer work, or use `SIGSTOP`/`SIGCONT`: wall and idle bounds
+  would keep advancing during a freeze, and a killed nextest run cannot resume, so its owner would rerun it whole and
+  read a failure it did not cause. Fairness that acts only when a grant is made cannot reach a grant made while nobody
+  waited, so the grant itself leaves the room: **background-class work as a whole never holds more than `⌊N/2⌋`
+  tokens**, and at least one (`background_limit`, 9 of 18). A background request takes only its room, the free tokens
+  within that limit; a short background build grows only within it; and the floor token "Gate admission" grants
+  background already keeps it under half. This is the host ledger's rule: a parent's lent pool ("Nested runners") serves
+  a grant the host already made, no gate asks it, and its children may hold all of it. The other `⌈N/2⌉` host tokens are
+  therefore free whenever no gate-class work holds them, so a gate's first request is granted at least
+  `min(want, ⌈N/2⌉)` in the ledger transition of its own ask: it waits for no departure, whatever background holds and
+  for however long. Its later wants take returned tokens ahead of background as above. Measured 2026-10-19: a background
+  `cargo nextest run` granted 17 of 18 tokens while it was the only waiter sat at 0% CPU for 50 minutes, and the land
+  gate that arrived after it ran on its one token for over 35 minutes against a usual 10 to 20. A cap on a lone grant
+  alone would not close this, since two background grants made one after another fill the host again; a floor smaller
+  than half would leave the gate running on that floor for the whole of the longest background run. Once gate-class work
+  — the gate's own tasks or an older land's — holds the gate half, a gate request waits for a returned token like any
+  other; gate priority then promises admission order, not a fixed test duration. The supervisor's separate nice
+  placement below ("Bands") orders the classes by lowering nice, never by raising one above default.
 - **No admission deadline, for any class** (Danny tg#6679, tg#6693). A gate is the highest-priority work there is, so it
   is never failed for waiting in the order that serves it: a gate jobserver request, like a background one, waits until
   it is granted or its client closes the connection, which leaves the queue. The operator request is
@@ -831,23 +847,28 @@ core count.
   resident's exit closes it. A different token class would leave the resident in the ledger holding something; exempting
   it from the budget would leave the requests it runs unbudgeted; acquiring per request through a relay pool is the gate
   job's existing mechanism and budgets exactly the work.
-- **Work-conserving.** No grant is capped below `want` for fairness' sake: with nobody else waiting, a grant is
-  `min(want, free)`, so a lone runner may hold all N tokens, because idle tokens help nobody and a gate's wall time is
-  what the budget buys. A lone waiter also takes the remaining free tokens when fewer than its fair share are free: on
-  an 18-token host, a runner holding 12 does not make the sole newcomer wait instead of taking the idle 6. What a
-  newcomer does not get a reserved half. Ordinary checkout fairness (the share rule above) still bounds a grant while
-  another ordinary checkout waits. Gate admission orders who is served first; it never leaves a token idle.
+- **Work-conserving but for the gate's room.** No grant is capped below `want` for fairness' sake: with nobody else
+  waiting, a gate-class grant is `min(want, free)`, so a lone gate runner may hold all N tokens, because a gate's wall
+  time is what the budget buys. A background grant is `min(want, room)`, the room being the free tokens within the
+  background limit: that limit is the one cap, and it is the trade. Up to `⌈N/2⌉` tokens (9 of 18) sit idle exactly
+  while no gate-class work holds or wants them and background work wants more than `⌊N/2⌋`; a gate that starts uses them
+  at once, and with no more than `⌊N/2⌋` wanted by background nothing idles. The idle half buys a gate that starts wide
+  at once instead of waiting out the longest background run, which nothing can shorten once granted. A lone waiter also
+  takes what its room holds when that is below its fair share: on an 18-token host, a background runner holding 6 does
+  not make the sole background newcomer wait instead of taking the 3 left of the limit. Ordinary checkout fairness (the
+  share rule above) still bounds a grant while another ordinary checkout waits. Gate admission orders who is served
+  first; it never leaves a token idle.
 - **Bands** (2026-10-17, Danny tg#6693: "The gate class is served FIFO at highest priority over all other execs. The
   interactive class has priority over gate and regular exec. Priority is handled by OS niceness. When gate runs it needs
   more tickets than background but not fully starve background"). A job's class fixes, at the job's birth, both its
   place in the token order and the band the host schedules it in. This table is the one statement of both; every other
   section names it.
 
-  | Class         | What runs in it                                                                                  | CPU tokens                                                                       | Band           | Nice |
-  | ------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- | -------------- | ---- |
-  | `interactive` | work a person or model is waiting on, declared by the requester that awaits its result           | behind gate, as background: checkout fairness and the floor token                | **foreground** | 0    |
-  | `gate`        | a land's gate job, every task its pool relays and the land turn's holder; the trusted route only | first: the oldest gate job FIFO, ahead of every other class ("Gate admission")   | **normal**     | +5   |
-  | `background`  | every other exec, the default, and each request a resident's pool relays                         | checkout fairness behind gate, never starved: the floor token ("Gate admission") | **background** | +10  |
+  | Class         | What runs in it                                                                                  | CPU tokens                                                                                             | Band           | Nice |
+  | ------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ | -------------- | ---- |
+  | `interactive` | work a person or model is waiting on, declared by the requester that awaits its result           | behind gate, as background: checkout fairness and the floor token                                      | **foreground** | 0    |
+  | `gate`        | a land's gate job, every task its pool relays and the land turn's holder; the trusted route only | first: the oldest gate job FIFO, ahead of every other class ("Gate admission")                         | **normal**     | +5   |
+  | `background`  | every other exec, the default, and each request a resident's pool relays                         | checkout fairness behind gate within half the host ("Room for a gate"), never starved: the floor token | **background** | +10  |
 
   Tokens decide which work runs at all; nice decides whose runnable threads win a core when more are runnable than there
   are cores. Those are the ruling's two priorities: gate work takes returned tokens first and, while it runs, more of
@@ -908,20 +929,24 @@ core count.
   `ps -p <pid>` gives the process's age. Measured 2026-10-18: a ledger that named only
   `land-test-hang: held 15, running 1` read as an orphan, and a live 34-minute `cargo test …` another unit was waiting
   on was killed by hand; its holder line would have said what it was and that it was live. `cowshed gateway status`
-  shows this ledger to the operator in the order it serves — the head gate job, the gate jobs behind it, the gate queue,
-  then background, each running gate job and background stake followed by its leases — in its human lines, and verbatim
-  as `cpuBudget` in `--json` (06_cli.md; 07_api.md `GatewayStatus`), so whether queued lands wait behind the head of the
-  queue without loading it, and who holds every token since when, is visible rather than inferred; a daemon that does
-  not answer `cpu-budget` is reported as such, never as an empty ledger.
+  shows this ledger to the operator in the order it serves — its count with the background limit
+  (`gateway cpu budget: held <h>/<N> tokens, background at most <⌊N/2⌋>`), the head gate job, the gate jobs behind it,
+  the gate queue, then background, each running gate job and background stake followed by its leases — in its human
+  lines, and verbatim as `cpuBudget` in `--json` (06_cli.md; 07_api.md `GatewayStatus`), whose limit is `⌊total/2⌋`, at
+  least one, so whether queued lands wait behind the head of the queue without loading it, why background waits beside
+  free tokens, and who holds every token since when, is visible rather than inferred; a daemon that does not answer
+  `cpu-budget` is reported as such, never as an empty ledger.
 - **The hold limit** (2026-10-19). A lease held past 30 minutes (`HOLD_LIMIT`) is named on the lines right after the
   ledger's count, oldest first, by checkout, pid, tokens, want, age and command
   (`gateway cpu hold past 30m: <checkout>: pid <pid>, <g>/<want> tokens, granted <age> ago: <command>`), so the first
   lines of `cowshed gateway status` answer who holds the host and since when. Measured 2026-10-19: a deployed-proof
   `cargo test … --ignored` integration test held 12 of 18 tokens for 48 minutes while a land's gate waited with 2, and
-  its holder was found with `ps`. The limit is reported, never enforced: a lease is a ledger entry, not its work's owner
-  ("Crash safety by connection"), so revoking it would return tokens while the work runs on over budget. What ends a
-  runaway is its own bound — bounded-exec's `timeoutMs`, a test harness's ceiling — and a wait for tokens is bounded the
-  same way: a queued run is not idle, but a ceiling no wait stops still ends it as starved.
+  its holder was found with `ps`. A background lease now holds at most `⌊N/2⌋` ("Room for a gate"), so a long hold costs
+  background its half, never a gate its start; what the line names is a run that may hold tokens without working, as the
+  50-minute nextest at 0% CPU of the same night did. The limit is reported, never enforced: a lease is a ledger entry,
+  not its work's owner ("Crash safety by connection"), so revoking it would return tokens while the work runs on over
+  budget. What ends a runaway is its own bound — bounded-exec's `timeoutMs`, a test harness's ceiling — and a wait for
+  tokens is bounded the same way: a queued run is not idle, but a ceiling no wait stops still ends it as starved.
 - **Priority updates.** `{"op":"job-qos","job":{…}|"lease":"<lease id>","priority":<u32>}` is one-shot and answers
   `{"ok":true}`, or `not-found` for an admission that is not live. It re-keys the selected admission only while queued;
   a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions. This
@@ -1007,17 +1032,20 @@ core count.
   unchanged; fixed test/nextest grants are never opted into cooperative FIFO reclaim. An inherited `CARGO_MAKEFLAGS`
   whose fifo is gone counts as no jobserver.
 
-Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave, the background floor, an
-older land served before a younger land that asked first and both before a feature build that asked before either, an
-older land's build growing before a younger land's task starts, a short build growing to and never past its `want`, a
-new land task starting before a running one of the same land grows) and `tests/cpu_budget.rs` over a real socket
-(`SIGKILL` of a holding client returns its tokens to the waiter at once; checkouts share the host; refusals); the
-plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
-`executor.test.ts` (a granted run sized and released, a refused one run as asked); a jobserver test in which a
-`SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; the launcher's tests (each of its four
-cases, the `want` it sends, and the variables it sets or leaves on each path); and the band tests: each class runs in
-its own band at its own nice whatever the host's state — interactive above gate above background — and gate work is
-served returned tokens ahead of interactive and background work.
+Tests: `cowshed-gateway`'s `cpu_budget` ledger unit tests (fairness, share, starvation, leave, the background floor, the
+background limit — a lone background request granted half the host, a second one finding no room, and a gate arriving 50
+minutes later granted the other half with a zero wait, in the ledger transition of its own ask — an older land served
+before a younger land that asked first and both before a feature build that asked before either, an older land's build
+growing before a younger land's task starts, a short build growing to and never past its `want`, a new land task
+starting before a running one of the same land grows) and `tests/cpu_budget.rs` over a real socket (`SIGKILL` of a
+holding client returns its tokens to the waiter at once; checkouts share background's half; a gate job and its task
+granted the free half while a lone background grant still holds its own; refusals); the plugin's `cpu-tokens.test.ts`
+(each runner's `want` and sizing, a killed holder closing its grant) and `executor.test.ts` (a granted run sized and
+released, a refused one run as asked); a jobserver test in which a `SIGKILL`ed `cargo` mid-build leaves the ledger whole
+and its fifo unlinked; the launcher's tests (each of its four cases, the `want` it sends, and the variables it sets or
+leaves on each path); and the band tests: each class runs in its own band at its own nice whatever the host's state —
+interactive above gate above background — and gate work is served returned tokens ahead of interactive and background
+work.
 
 ## The task server schedules work units
 

@@ -252,8 +252,8 @@ async fn ledger(socket: &Path) -> CpuBudgetStatus {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
-    let (gateway, root, socket) = gateway(4).await;
-    // No cap: the holder takes the whole host, so a second checkout queues whole.
+    let (gateway, root, socket) = gateway(8).await;
+    // The holder takes background's whole half, so a second background checkout queues whole.
     // The holder is another process, so SIGKILL is a real death: the kernel closes its socket.
     let mut holder = Command::new("/usr/bin/nc")
         .arg("-U")
@@ -283,7 +283,7 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
         None
     );
     let held = ledger(&socket).await;
-    assert_eq!((held.total, held.held), (4, 4));
+    assert_eq!((held.total, held.held), (8, 4));
 
     holder.kill().expect("SIGKILL the holder");
     holder.wait().expect("reap");
@@ -308,10 +308,10 @@ async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkouts_share_the_host_and_a_lone_grant_fills_it() {
-    let (gateway, root, socket) = gateway(8).await;
+async fn checkouts_share_the_background_half_and_a_lone_grant_fills_it() {
+    let (gateway, root, socket) = gateway(16).await;
 
-    // Alone, one grant fills the host; no half is reserved.
+    // Alone, one background grant fills background's half of the host, 8 of 16.
     let mut whole = Asker::ask(&socket, 64, "/w/a").await;
     assert_eq!(whole.granted().await, 8);
     let mut a_next = Asker::ask(&socket, 8, "/w/a").await;
@@ -352,7 +352,7 @@ async fn checkouts_share_the_host_and_a_lone_grant_fills_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, root, socket) = gateway(8).await;
     let stream = UnixStream::connect(&socket).await.expect("connect");
     let (reader, mut writer) = stream.into_split();
     writer
@@ -395,11 +395,14 @@ async fn a_jobserver_grant_names_a_fifo_and_close_returns_every_token() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// The gate's own half is held by an older gate, so it waits for a returned token like anyone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background_work() {
-    let (gateway, root, socket) = gateway(4).await;
-    let mut holder = Asker::ask(&socket, 4, "/w/background").await;
+    let (gateway, root, socket) = gateway(8).await;
+    let mut holder = Asker::ask(&socket, 8, "/w/background").await;
     assert_eq!(holder.granted().await, 4);
+    let mut first_gate = Asker::jobserver(&socket, 4, "/w/first-gate").await;
+    assert_eq!(first_gate.granted().await, 4);
     let mut old_background = Asker::ask(&socket, 4, "/w/same").await;
     let mut gate = Asker::jobserver(&socket, 4, "/w/same").await;
     assert_eq!(gate.granted_within(Duration::from_millis(50)).await, None);
@@ -419,8 +422,42 @@ async fn a_gate_takes_the_larger_part_of_returned_tokens_before_older_background
     assert_eq!(gate.granted().await, 3);
     assert_eq!(old_background.granted().await, 1);
     let status = ledger(&socket).await;
-    assert_eq!((status.total, status.held), (4, 4));
-    drop((gate, old_background));
+    assert_eq!((status.total, status.held), (8, 8));
+    drop((first_gate, gate, old_background));
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The measured hole, over the socket (05_gateway.md "Room for a gate"): a background run that
+/// asks for the whole host while nothing else asks is granted background's half; a second
+/// background request finds no room; and a land's gate job and then its task are granted the
+/// other half while that background grant is still held. Every grant here arrives without a token
+/// being returned, so the gate's wait is the ledger's own transition, not any run's length.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gate_is_granted_the_free_half_while_a_lone_background_grant_still_holds_its_own() {
+    let (gateway, root, socket) = gateway(8).await;
+    let mut smoke = Asker::ask(&socket, 8, "/w/smoke").await;
+    assert_eq!(smoke.granted().await, 4);
+    let mut other = Asker::ask(&socket, 8, "/w/other").await;
+    assert_eq!(other.granted_within(Duration::from_millis(50)).await, None);
+    let (gate, pool) = Asker::gate_job(&socket, "/w/train").await;
+    let mut task = Asker::child(&pool, 8).await;
+    assert_eq!(task.granted().await, 3);
+    let status = ledger(&socket).await;
+    assert_eq!((status.total, status.held), (8, 8), "{status:?}");
+    assert_eq!(
+        status
+            .background
+            .iter()
+            .map(|stake| (stake.checkout.as_str(), stake.held))
+            .collect::<Vec<_>>(),
+        [("/w/other", 0), ("/w/smoke", 4)],
+        "{status:?}"
+    );
+    // The background run ends: the waiting background request takes background's half.
+    drop(smoke);
+    assert_eq!(other.granted().await, 4);
+    drop((gate, task, other));
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }
@@ -447,14 +484,11 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
     let mut a = Asker::ask(&socket, 2, "/w/a").await;
     assert_eq!(a.granted().await, 2);
-    let mut b = Asker::ask(&socket, 1, "/w/b").await;
-    assert_eq!(b.granted().await, 1);
+    // Background holds its half, so c queues.
     let mut queued = Asker::ask(&socket, 1, "/w/c").await;
     // A land task asks the gate job's pool after c queued. The pool lends nothing of its own: the
-    // child waits for the host, not for the gate's single token.
+    // child is granted the host's free token, ahead of c, not a share of the gate's single token.
     let mut task = Asker::child(&pool, 2).await;
-    assert_eq!(task.granted_within(Duration::from_millis(50)).await, None);
-    drop(b);
     assert_eq!(task.granted().await, 1);
     assert_eq!(queued.granted_within(Duration::from_millis(50)).await, None);
     let status = ledger(&socket).await;
@@ -465,8 +499,11 @@ async fn a_gate_jobs_pool_admits_each_child_while_older_background_work_stays_qu
         .expect("the land holds");
     assert_eq!((land.held, land.running), (2, 2), "{status:?}");
     drop(task);
+    // Background still holds its half: c is served when background returns a token.
+    assert_eq!(queued.granted_within(Duration::from_millis(50)).await, None);
+    drop(a);
     assert_eq!(queued.granted().await, 1);
-    drop((gate, a, queued));
+    drop((gate, queued));
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }
@@ -722,8 +759,8 @@ async fn resident(socket: &Path, checkout: &str, job_id: u64) -> (tokio::process
 /// behind them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resident_holds_no_token_and_each_request_it_runs_asks_the_host() {
-    let (gateway, root, socket) = gateway(2).await;
-    // A resident in each of eight sheds, against a host of two tokens.
+    let (gateway, root, socket) = gateway(4).await;
+    // A resident in each of eight sheds, against a host of four tokens, two of them background's.
     let mut residents = Vec::new();
     for shed in 0..8_u64 {
         residents.push(resident(&socket, &format!("/w/shed-{shed}"), shed + 1).await);
@@ -731,9 +768,9 @@ async fn a_resident_holds_no_token_and_each_request_it_runs_asks_the_host() {
     let pool = residents[0].1.clone();
 
     let status = ledger(&socket).await;
-    assert_eq!((status.total, status.held), (2, 0), "{status:?}");
+    assert_eq!((status.total, status.held), (4, 0), "{status:?}");
     assert!(status.checkouts.is_empty(), "{status:?}");
-    // A shed's usable concurrency is the whole host, exactly as without any resident.
+    // A shed's usable concurrency is background's whole half, exactly as without any resident.
     let mut first = Asker::ask(&socket, 1, "/w/shed-0").await;
     let mut second = Asker::ask(&socket, 1, "/w/shed-0").await;
     assert_eq!(first.answer().await["tokens"], 1);
@@ -777,22 +814,19 @@ async fn a_resident_holds_no_token_and_each_request_it_runs_asks_the_host() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_land_build_granted_one_token_grows_through_its_gate_jobs_pool_up_to_its_want() {
-    let (gateway, root, socket) = gateway(5).await;
+    let (gateway, root, socket) = gateway(4).await;
     let (gate, pool) = Asker::gate_job(&socket, "/w/land").await;
-    let mut a = Asker::ask(&socket, 3, "/w/a").await;
-    assert_eq!(a.granted().await, 3);
-    let mut b = Asker::ask(&socket, 1, "/w/b").await;
-    assert_eq!(b.granted().await, 1);
-    // A land's Cargo build asks the gate job's pool for 3 on a full host.
+    let mut a = Asker::ask(&socket, 2, "/w/a").await;
+    assert_eq!(a.granted().await, 2);
+    // A land's Cargo build asks the gate job's pool for 3 while background holds its half: it
+    // starts at once on the one token left.
     let mut build = Asker::send(
         &pool,
         serde_json::json!({ "op": "cpu-pool", "want": 3, "grow": true }),
     )
     .await;
-    assert_eq!(build.granted_within(Duration::from_millis(50)).await, None);
-    drop(b);
     assert_eq!(build.granted().await, 1);
-    // Three return: the build grows by two to its want of three, and never past it.
+    // Two return: the build grows by two to its want of three, and never past it.
     drop(a);
     assert_eq!(build.grown().await, 3);
     assert_eq!(build.grown_within(Duration::from_millis(50)).await, None);
@@ -805,7 +839,7 @@ async fn a_land_build_granted_one_token_grows_through_its_gate_jobs_pool_up_to_i
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_root_cargo_build_that_grows_is_handed_its_tokens_through_its_fifo() {
-    let (gateway, root, socket) = gateway(4).await;
+    let (gateway, root, socket) = gateway(8).await;
     let mut holder = Asker::ask(&socket, 3, "/w/x").await;
     assert_eq!(holder.granted().await, 3);
     let mut build = Asker::send(
