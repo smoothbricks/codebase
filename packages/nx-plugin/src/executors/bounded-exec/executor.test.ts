@@ -5,6 +5,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { onProgressClock } from '../../__tests__/progress-clock.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readInheritedCpuPool } from './cpu-pool.js';
 import { CPU_TOKENS_ENV, type CpuBudget, parseInheritedTokens, type TokenGrant } from './cpu-tokens.js';
@@ -65,12 +66,14 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       'console.log(process.cwd()); console.log(process.env.BOUNDED_EXEC_VALUE);\n',
     );
 
+    // bounded-exec requires a ceiling; at the leg's backstop it cannot end a run whose `node` is slow to start
+    // under load.
     const result = await runBoundedExec(
       {
         command: 'node print.js',
         cwd: 'package',
         env: { BOUNDED_EXEC_VALUE: 'from-env' },
-        timeoutMs: 5_000,
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       },
       workspace.context,
       createProcessTreeKiller(),
@@ -87,7 +90,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const workspace = await createWorkspace();
 
     const result = await runBoundedExec(
-      { command: 'node -e "process.exit(7)"', timeoutMs: 5_000 },
+      { command: 'node -e "process.exit(7)"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -106,7 +109,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     process.stderr.write = captureWrite(stderr);
 
     const result = await runBoundedExec(
-      { command: "node -e \"console.log('out-value'); console.error('err-value')\"", timeoutMs: 5_000 },
+      {
+        command: "node -e \"console.log('out-value'); console.error('err-value')\"",
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+      },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -123,8 +129,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
   it('fails on timeout and reports bounded execution details', async () => {
     const workspace = await createWorkspace();
 
+    // The command never exits, so only the ceiling under test can end it.
     const result = await runBoundedExec(
-      { command: 'node -e "setTimeout(() => {}, 5000)"', timeoutMs: 50, killAfterMs: 0 },
+      { command: 'node -e "setInterval(() => {}, 1 << 30)"', timeoutMs: 50, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -140,8 +147,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
   it('kills a silent command on the progress bound, with no ceiling at all', async () => {
     const workspace = await createWorkspace();
 
+    // The command never exits and never speaks, so only the progress bound under test can end it.
     const result = await runBoundedExec(
-      { command: 'node -e "setTimeout(() => {}, 30000)"', idleTimeoutMs: 100, killAfterMs: 0 },
+      { command: 'node -e "setInterval(() => {}, 1 << 30)"', idleTimeoutMs: 100, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -435,7 +443,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     await workspace.write('runaway.js', ["setInterval(() => console.log('still here'), 10);", ''].join('\n'));
 
     const result = await runBoundedExec(
-      { command: 'node runaway.js', timeoutMs: 300, idleTimeoutMs: 30_000, killAfterMs: 0 },
+      { command: 'node runaway.js', timeoutMs: 300, idleTimeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, killAfterMs: 0 },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -452,7 +460,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const workspace = await createWorkspace();
 
     const result = await runBoundedExec(
-      { command: 'node -e "setTimeout(() => console.log(\'late\'), 400)"', timeoutMs: 30_000 },
+      { command: 'node -e "setTimeout(() => console.log(\'late\'), 400)"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -481,7 +489,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         '  process.exit(0);',
         '});',
         "fs.writeFileSync('cooperative-ready.fifo', 'ready pid=' + process.pid + '\\n');",
-        'setTimeout(() => {}, 5000);',
+        'setInterval(() => {}, 1 << 30);',
         '',
       ].join('\n'),
     );
@@ -491,8 +499,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       expect(handlerPid, `handler readiness must name the command leader pid=${pid}`).toBe(pid);
     });
 
+    // The ceiling is the subject; the grace after the graceful signal is the leg's backstop, so the command ends by its
+    // handler alone however slowly a loaded host runs it.
     const result = await runBoundedExec(
-      { command: 'exec node cooperative.js', timeoutMs: 50, killAfterMs: 500 },
+      { command: 'exec node cooperative.js', timeoutMs: 50, killAfterMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       termination.killer,
       null,
@@ -552,15 +562,18 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         leaked = pid;
       },
     };
-    const started = Date.now();
     const result = await runBoundedExec(
-      { command: 'node -e "setTimeout(() => {}, 30000)"', timeoutMs: 50, killAfterMs: 10 },
+      { command: 'node -e "setInterval(() => {}, 1 << 30)"', timeoutMs: 50, killAfterMs: 10 },
       workspace.context,
       killer,
       null,
       null,
     );
-    expect(Date.now() - started).toBeLessThan(5_000);
+    // The command never exits and the killer delivers nothing, so the run returned by giving up on the tree after its
+    // force-kill, not by the command ending: the command is still alive here.
+    if (leaked === undefined) throw new Error('the killer was never asked to kill the command');
+    const pid = leaked;
+    expect(() => process.kill(pid, 0)).not.toThrow();
     expect(result.success).toBe(false);
     expect(result.terminalOutput).toContain('Force-killing timed out command');
     if (leaked !== undefined) {
@@ -585,7 +598,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         command: 'node -e "console.log(process.argv.slice(1).join(\',\'))"',
         args: ['first'],
         __unparsed__: ['second'],
-        timeoutMs: 5_000,
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       },
       workspace.context,
       createProcessTreeKiller(),
@@ -598,7 +611,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         args: ['first'],
         __unparsed__: ['second'],
         forwardAllArgs: false,
-        timeoutMs: 5_000,
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
       },
       workspace.context,
       createProcessTreeKiller(),
@@ -619,7 +632,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     }
 
     const workspace = await createWorkspace();
-    const marker = join(workspace.root, 'marker.txt');
     const ready = join(workspace.root, 'descendant-ready.fifo');
     const lifetime = join(workspace.root, 'descendant-lifetime.fifo');
     expect(spawnSync('mkfifo', [ready, lifetime]).status).toBe(0);
@@ -629,7 +641,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         "const fs = require('node:fs');",
         "fs.openSync('descendant-lifetime.fifo', 'w');",
         "fs.writeFileSync('descendant-ready.fifo', 'ready pid=' + process.pid + '\\n');",
-        "setTimeout(() => fs.writeFileSync(process.argv[2], 'alive'), 700);",
+        'setInterval(() => {}, 1 << 30);',
         '',
       ].join('\n'),
     );
@@ -637,12 +649,12 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       'spawn-child.js',
       [
         "import { spawn } from 'node:child_process';",
-        "spawn(process.execPath, ['group-child.js', process.argv[2]], { stdio: 'ignore' });",
-        'setTimeout(() => {}, 5000);',
+        "spawn(process.execPath, ['group-child.js'], { stdio: 'ignore' });",
+        'setInterval(() => {}, 1 << 30);',
         '',
       ].join('\n'),
     );
-    // Only the descendant owns the writer; EOF observes its actual terminal closure, not a time horizon.
+    // Only the descendant owns the writer and it never exits on its own: EOF observes its kill, not a time horizon.
     const closed = readToEnd(lifetime);
     let descendantPid: number | undefined;
     const termination = armedKiller('process-group descendant', async (pid) => {
@@ -651,7 +663,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     });
 
     const result = await runBoundedExec(
-      { command: `exec node spawn-child.js ${marker}`, timeoutMs: 50, killAfterMs: 50 },
+      { command: 'exec node spawn-child.js', timeoutMs: 50, killAfterMs: 50 },
       workspace.context,
       termination.killer,
       null,
@@ -661,7 +673,6 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     await termination.armed();
     expect(await closed, `ready descendant pid=${descendantPid} must close its lifetime FIFO on exit`).toBe('');
     expect(result.success).toBe(false);
-    expect(await exists(marker)).toBe(false);
   });
 
   it('force-kills what outlives a timed-out command in its process group', async () => {
@@ -674,27 +685,26 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const ready = join(workspace.root, 'straggler-ready.fifo');
     expect(spawnSync('mkfifo', [fifo, ready]).status).toBe(0);
     // The leader exits on SIGTERM. The subshell beside it ignores SIGTERM, a disposition its
-    // `sleep` inherits, and announces itself only once it holds the FIFO: from then on the
+    // `tail` inherits, and announces itself only once it holds the FIFO: from then on the
     // graceful signal cannot end it. A process forked while that signal goes out is the same
     // case, without the trap.
     await workspace.write(
       'straggle.sh',
       [
-        '( trap "" TERM; exec 3>"$1"; echo ready; echo armed >"$2"; sleep 10; echo survived >&3 ) | {',
-        '  read -r line; echo "$line"; exec sleep 30',
+        '( trap "" TERM; exec 3>"$1"; echo ready; echo armed >"$2"; exec tail -f /dev/null ) | {',
+        '  read -r line; echo "$line"; exec tail -f /dev/null',
         '}',
         '',
       ].join('\n'),
     );
-    // The straggler is the FIFO's only writer, so the read ends when it is gone: with nothing
-    // written if it was killed, with "survived" if it lived to finish its sleep.
+    // The straggler is the FIFO's only writer and never ends on its own, so the read ends only when it is killed.
     const straggler = readToEnd(fifo);
     const termination = armedKiller('TERM-ignoring FIFO straggler', async (pid) => {
       expect(await readToEnd(ready), `straggler readiness pgid=${pid} must follow trap and FIFO open`).toBe('armed\n');
     });
 
     const result = await runBoundedExec(
-      { command: `sh straggle.sh ${fifo} ${ready}`, timeoutMs: 5_000, killAfterMs: 30_000 },
+      { command: `sh straggle.sh ${fifo} ${ready}`, timeoutMs: 5_000, killAfterMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       termination.killer,
       null,
@@ -719,7 +729,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     });
 
     const result = await runBoundedExec(
-      { command: 'node -e "console.log(process.env.TMPDIR)"', timeoutMs: 5_000 },
+      { command: 'node -e "console.log(process.env.TMPDIR)"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       createProcessTreeKiller(),
       volume,
@@ -746,7 +756,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     const result = await runBoundedExec(
-      { command: 'node -e "0"', timeoutMs: 5_000 },
+      { command: 'node -e "0"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       createProcessTreeKiller(),
       volume,
@@ -768,7 +778,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const volume = scriptedVolume({ ok: true, value: { kind: 'sandboxed', detail: 'lock: EPERM' } });
 
     const result = await runBoundedExec(
-      { command: `node -e 'console.log("tmp=" + process.env.TMPDIR)'`, timeoutMs: 5_000, env: { TMPDIR: '/shed/tmp' } },
+      {
+        command: `node -e 'console.log("tmp=" + process.env.TMPDIR)'`,
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        env: { TMPDIR: '/shed/tmp' },
+      },
       workspace.context,
       createProcessTreeKiller(),
       volume,
@@ -790,7 +804,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     });
 
     const result = await runBoundedExec(
-      { command: `touch ${marker}`, timeoutMs: 5_000 },
+      { command: `touch ${marker}`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       createProcessTreeKiller(),
       volume,
@@ -812,7 +826,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     const result = await runBoundedExec(
-      { command: 'node -e "process.exit(1)"', timeoutMs: 5_000 },
+      { command: 'node -e "process.exit(1)"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       createProcessTreeKiller(),
       volume,
@@ -850,7 +864,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
           const result = await runBoundedExec(
             {
               command,
-              timeoutMs: 5_000,
+              timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
               parallelism: 18,
               env: { NEXTEST_TEST_THREADS: '64', CARGO_BUILD_JOBS: '64', RUST_TEST_THREADS: '64' },
             },
@@ -890,7 +904,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       "node -e \"console.log('threads=' + process.env.NEXTEST_TEST_THREADS + ' tokens=' + process.env.BOUNDED_EXEC_CPU_TOKENS)\" # nextest run";
 
     const result = await runBoundedExec(
-      { command, timeoutMs: 5_000, parallelism: 8, env: { NEXTEST_TEST_THREADS: '64' } },
+      { command, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 8, env: { NEXTEST_TEST_THREADS: '64' } },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -921,7 +935,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const result = await runBoundedExec(
       {
         command: 'node -e "console.log(\'threads=\' + process.env.NEXTEST_TEST_THREADS)" # nextest run',
-        timeoutMs: 5_000,
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         env: { NEXTEST_TEST_THREADS: '64' },
       },
       workspace.context,
@@ -946,7 +960,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     };
 
     const result = await runBoundedExec(
-      { command: 'node -e "console.log(\'ran\')"', timeoutMs: 5_000 },
+      { command: 'node -e "console.log(\'ran\')"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -1019,7 +1033,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       runBoundedExec(
         {
           command: 'node -e "console.log(\'tokens=\' + process.env.BOUNDED_EXEC_CPU_TOKENS)" # nextest run',
-          timeoutMs: 5_000,
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
           parallelism: 8,
         },
         workspace.context,
@@ -1045,7 +1059,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       runBoundedExec(
         {
           command: 'node -e "console.log(\'threads=\' + process.env.NEXTEST_TEST_THREADS)" # nextest run',
-          timeoutMs: 5_000,
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
           parallelism: 2,
         },
         workspace.context,
@@ -1073,7 +1087,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     };
 
     const result = await runBoundedExec(
-      { command: 'node -e "console.log(1)" # nextest run', timeoutMs: 5_000, parallelism: 8 },
+      { command: 'node -e "console.log(1)" # nextest run', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 8 },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -1108,7 +1122,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     const borrowed = await withPool(3, (pool) =>
       runBoundedExec(
-        { command, timeoutMs: 5_000, parallelism: 8 },
+        { command, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 8 },
         { ...workspace.context, record: { task, directory: borrowedDir } },
         createProcessTreeKiller(),
         null,
@@ -1117,7 +1131,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       ),
     );
     const owned = await runBoundedExec(
-      { command, timeoutMs: 5_000, parallelism: 8 },
+      { command, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS, parallelism: 8 },
       { ...workspace.context, record: { task, directory: ownedDir } },
       createProcessTreeKiller(),
       null,
@@ -1155,7 +1169,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       const running = runBoundedExec(
         {
           command: `sh -c 'echo started > "$0"; read -r line < "$1"' '${started}' '${go}'`,
-          timeoutMs: 20_000,
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         },
         { ...workspace.context, record: { task: { id: 'outlives-its-grant', hash: null }, directory } },
         createProcessTreeKiller(),
@@ -1193,7 +1207,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const gone = { socket: join(workspace.root, 'gone.sock'), tokens: 3 };
 
     const result = await runBoundedExec(
-      { command: 'node -e "console.log(\'ran\')" # nextest run', timeoutMs: 5_000, parallelism: 8 },
+      {
+        command: 'node -e "console.log(\'ran\')" # nextest run',
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        parallelism: 8,
+      },
       workspace.context,
       createProcessTreeKiller(),
       null,
@@ -1215,7 +1233,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const result = await runBoundedExec(
       {
         command: 'node -e "console.log(\'tokens=\' + process.env.BOUNDED_EXEC_CPU_TOKENS)"',
-        timeoutMs: 5_000,
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         env: { BOUNDED_EXEC_CPU_TOKENS: '977' },
       },
       workspace.context,
@@ -1243,7 +1261,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const result = await runBoundedExec(
       {
         command: 'node -e "console.log(\'tokens=\' + process.env.BOUNDED_EXEC_CPU_TOKENS)" # nextest run',
-        timeoutMs: 5_000,
+        timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         parallelism: 8,
         env: { BOUNDED_EXEC_CPU_TOKENS: '977' },
       },
@@ -1280,7 +1298,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     };
     try {
       const result = await runBoundedExec(
-        { command: 'touch ran.marker', timeoutMs: 5_000 },
+        { command: 'touch ran.marker', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
         {
           ...workspace.context,
           record: { task: { id: 'refused', hash: null }, directory: join(workspace.root, 'refused') },
@@ -1318,7 +1336,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       };
       const unbudgeted = await withPool(3, (pool) =>
         runBoundedExec(
-          { command: 'node probe.js', timeoutMs: 10_000, env: { ...pool.environment, [CPU_TOKENS_ENV]: '9' } },
+          {
+            command: 'node probe.js',
+            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+            env: { ...pool.environment, [CPU_TOKENS_ENV]: '9' },
+          },
           workspace.context,
           createProcessTreeKiller(),
           null,
@@ -1332,7 +1354,11 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       const granted = await withPool(3, (pool) => {
         injected = inheritedFrom(pool).socket;
         return runBoundedExec(
-          { command: 'node probe.js', timeoutMs: 10_000, env: { ...pool.environment, [CPU_TOKENS_ENV]: '9' } },
+          {
+            command: 'node probe.js',
+            timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+            env: { ...pool.environment, [CPU_TOKENS_ENV]: '9' },
+          },
           workspace.context,
           createProcessTreeKiller(),
           null,
@@ -1424,17 +1450,18 @@ async function armedPid(path: string, pgid: number, subject: string): Promise<nu
 }
 
 /**
- * A command that ignores SIGTERM, a disposition its `sleep` inherits, and `armed`, which resolves once it does. A
- * killer that awaits `armed` before the graceful signal sends it to a command that cannot die of it: a bound that fires
- * before the command's shell has even run `trap` (a 250 ms timer lost that race in a loaded gate) ends it on the
- * default disposition, and the escalation under test never runs. The command's FIFO write waits for the reader, so
- * the announcement can neither precede the trap nor be missed.
+ * A command that ignores SIGTERM, a disposition its `tail` inherits, and never exits on its own, so only the escalation
+ * can end it; and `armed`, which resolves once it ignores SIGTERM. A killer that awaits `armed` before the graceful
+ * signal sends it to a command that cannot die of it: a bound that fires before the command's shell has even run
+ * `trap` (a 250 ms timer lost that race in a loaded gate) ends it on the default disposition, and the escalation under
+ * test never runs. The command's FIFO write waits for the reader, so the announcement can neither precede the trap nor
+ * be missed.
  */
 function ignoresTerm(root: string): { command: string; armed: () => Promise<void> } {
   const fifo = join(root, 'armed.fifo');
   expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
   return {
-    command: `sh -c 'trap "" TERM; echo armed > "$0"; exec sleep 5' '${fifo}'`,
+    command: `sh -c 'trap "" TERM; echo armed > "$0"; exec tail -f /dev/null' '${fifo}'`,
     armed: async () => {
       expect(await readToEnd(fifo)).toBe('armed\n');
     },

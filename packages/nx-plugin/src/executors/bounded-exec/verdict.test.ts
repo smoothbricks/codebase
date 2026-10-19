@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { onProgressClock } from '../../__tests__/progress-clock.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import {
   type BoundedExecContext,
   createProcessTreeKiller,
@@ -87,15 +88,20 @@ async function verdictOf(
   return record?.verdict;
 }
 
-// The fixtures run in child processes and must really outlive their runner's bound: the verdict
-// is about which real bound fired, so no fake clock can stand in for it.
-const SLOW_TEST = `import { test } from 'bun:test';\ntest('slow', async () => { await new Promise((r) => setTimeout(r, 5000)); });\n`;
+// The fixtures run in child processes and must really meet their runner's per-test bound: the verdict is about which
+// real bound fired. The slow test never finishes, so nothing can beat that bound; the parent's own required ceiling is
+// the leg's backstop, so it cannot end the run first however long `bun test` takes to start on a loaded host.
+const SLOW_TEST = `import { test } from 'bun:test';\ntest('slow', () => new Promise(() => {}));\n`;
 const FAILING_TEST = `import { expect, test } from 'bun:test';\ntest('wrong', () => { expect(1).toBe(2); });\n`;
 
 describe('bounded-exec verdicts', () => {
   it('records a bun run whose only failure is a per-test timeout as a bound', async () => {
     expect(
-      await verdictOf('bun test --timeout=100 ./slow.test.ts', { timeoutMs: 60_000 }, { 'slow.test.ts': SLOW_TEST }),
+      await verdictOf(
+        'bun test --timeout=100 ./slow.test.ts',
+        { timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        { 'slow.test.ts': SLOW_TEST },
+      ),
     ).toEqual({
       outcome: 'bound',
       bound: 'test',
@@ -107,7 +113,7 @@ describe('bounded-exec verdicts', () => {
     expect(
       await verdictOf(
         '.runtime/bun test --timeout=100 ./slow.test.ts',
-        { timeoutMs: 60_000 },
+        { timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
         { 'slow.test.ts': SLOW_TEST },
         { '.runtime/bun': process.execPath },
       ),
@@ -118,7 +124,7 @@ describe('bounded-exec verdicts', () => {
     expect(
       await verdictOf(
         'bun test --timeout=100 ./slow.test.ts ./failing.test.ts',
-        { timeoutMs: 60_000 },
+        { timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
         { 'slow.test.ts': SLOW_TEST, 'failing.test.ts': FAILING_TEST },
       ),
     ).toEqual({ outcome: 'failed', exitCode: 1, tests: ['wrong'] });
@@ -130,7 +136,8 @@ describe('bounded-exec verdicts', () => {
       bound: 'total',
       limitMs: 200,
     });
-    expect(await verdictOf('node -e "setTimeout(() => {}, 30000)"', { idleTimeoutMs: 100 })).toMatchObject({
+    // A command that never exits and never speaks: nothing but the progress bound can end it.
+    expect(await verdictOf('node -e "setInterval(() => {}, 1 << 30)"', { idleTimeoutMs: 100 })).toMatchObject({
       outcome: 'wedged',
       idleMs: 100,
       tests: [],
@@ -179,17 +186,14 @@ describe('bounded-exec verdicts', () => {
   });
 
   it('records a failing command with no report as a failure, and a passing one as passed', async () => {
-    // How an exit is classified, not how soon it comes: the clock is faked and nothing moves it, so the total bound
-    // cannot end a `node` still starting on a loaded host (a land gate measured 5243 ms for `node -e ""`). The run
-    // ends only by exiting.
-    const exiting = (command: string) =>
-      onProgressClock(
-        () => false,
-        0,
-        () => verdictOf(command, { timeoutMs: 5_000 }),
-      );
-    expect((await exiting('node -e "process.exit(3)"')).result).toEqual({ outcome: 'failed', exitCode: 3, tests: [] });
-    expect((await exiting('node -e ""')).result).toEqual({ outcome: 'passed' });
+    // How an exit is classified, not how soon it comes: the required ceiling is the leg's backstop, so it cannot end a
+    // `node` still starting on a loaded host (a land gate measured 5243 ms for `node -e ""` against 5000 ms).
+    expect(await verdictOf('node -e "process.exit(3)"', { timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS })).toEqual({
+      outcome: 'failed',
+      exitCode: 3,
+      tests: [],
+    });
+    expect(await verdictOf('node -e ""', { timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS })).toEqual({ outcome: 'passed' });
   });
 
   it("reads nextest's typed timeout from its JUnit report", () => {
@@ -317,7 +321,9 @@ setInterval(() => console.log('running'), 10);
     let report = '';
     const verdict = await verdictOf(
       'exec node runner.js',
-      { timeoutMs: 300, killAfterMs: 5_000 },
+      // The total bound is the subject; the grace after it is the leg's backstop, so the run ends by the runner's own
+      // exit on SIGTERM, never by a SIGKILL a loaded host's slow handler would have drawn.
+      { timeoutMs: 300, killAfterMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       { 'runner.js': runner },
       {},
       async (root) => {
