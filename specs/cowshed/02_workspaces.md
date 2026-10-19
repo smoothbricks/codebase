@@ -1164,11 +1164,21 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
 
 ## `cowshed rm <ws>` — perceived-instant deletion
 
-1. Refuse (exit 4) unless every local branch (HEAD included) is contained in live main by ancestry or patch equivalence:
-   the image takes every branch with it. A branch other than HEAD also passes when its tip equals or is an ancestor of
-   main's repository branch of the same name or of `refs/cowshed/<ws>/heads/<branch>`, where `push` preserves it. The
-   refusal names each branch that did not pass with its tip and unlanded count, and `ls --landed` applies the same
-   measurement. `--force` permits loss of dirty/in-progress state, not unlanded commits. Explicit `--abandon` requires a
+1. Refuse (exit 4) unless every local branch (HEAD included) is landed in live main: the image takes every branch with
+   it. Landed is judged by content, never by commit identity, in two questions. A tip main contains (an ancestor of
+   main, or main itself) is landed, cheaply and exactly. Otherwise, for each file the branch changed since its merge
+   base with main, main must already hold that change: main has the same entry, or merging the branch's change into
+   main's version (`git merge-file`, based at the merge base) reproduces main's version, where a region both changed is
+   held when main's lines there have dropped the lines the branch replaced and carry the lines it wrote, in order. A
+   cherry-pick, a squash, a history rewrite, or a pick whose conflict a lander resolved therefore lands the work under
+   other commits; an empty commit changes no file and carries nothing. A branch other than HEAD also passes when its tip
+   equals or is an ancestor of main's repository branch of the same name or of `refs/cowshed/<ws>/heads/<branch>`, where
+   `push` preserves it. The refusal names each branch that did not pass with its tip, how many of its commits change an
+   unheld file, and each such file with why main lacks its change (`missing`, `conflict`, `added`, `deleted`, `changed`
+   where main deleted the file, `mode`, or `unmergeable` with git's reason), ten files per branch and a count of the
+   rest; `ls --landed` applies the same measurement. This is not the install gate's question (05_gateway.md, "The
+   installed cowshed"), which asks whether a build holds the installed commits themselves, by ancestry or patch
+   identity. `--force` permits loss of dirty/in-progress state, not unlanded work. Explicit `--abandon` requires a
    verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and every branch that did not pass as
    refs, before retiring unlanded work. It is written beside that name and renamed into place once verified; a retried
    removal that finds a bundle verifying for the same range keeps it instead of writing another.

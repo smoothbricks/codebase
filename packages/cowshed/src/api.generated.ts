@@ -232,7 +232,7 @@ export type BranchLanding = {
  * What the workspace's local branches other than the checked-out one hold that the target does
  * not. A branch passes when its tip equals or is an ancestor of the target repository's branch of
  * the same name or of its `push` ref `refs/cowshed/<ws>/heads/<branch>`, or when the target
- * branch holds its commits by ancestry or patch equivalence; every other branch is listed.
+ * branch holds its content the way [`LandingCommits`] judges a head; every other branch is listed.
  */
 export type BranchLandings =
   | ({ readonly state: 'measured' } & {
@@ -1575,25 +1575,35 @@ export type LandedReport = {
  * A sum rather than a struct of optionals so that "measured" and "could not measure" cannot be
  * confused by a reader or a script: there is no shape in which a count is absent but a verdict is
  * still available, and none in which the absence of a count reads as zero.
+ *
+ * The verdict is content, not commit identity (02_workspaces.md, `rm` step 1): a head the target
+ * contains is landed, and otherwise every file the workspace changed since its merge base with the
+ * target must already carry that change in the target. A cherry-pick, a squash, or a pick whose
+ * conflict was resolved on the way in all land the content under other commits.
  */
 export type LandingCommits =
   | ({ readonly state: 'measured' } & {
       readonly targetBranch: string;
       readonly targetHead: GitOid;
       /**
-       * Commits whose content the target does not hold, by ancestry or by patch equivalence.
-       * Zero is the only value that authorizes removing the workspace without `--abandon`.
+       * Commits that change one of the files the unlanded paths name: zero exactly when they
+       * name none, and zero is the only value that authorizes removing the workspace without
+       * `--abandon`.
        */
       readonly unlanded: number & tags.Type<'uint64'>;
       /**
-       * Commits the target already holds the patch of, including ones that reached it by
-       * squash-merge, cherry-pick, or a history rewrite rather than by ancestry.
+       * Commits whose every change the target already holds, however it got there: by ancestry,
+       * cherry-pick, squash-merge, a history rewrite, or a conflict-resolved pick.
        */
       readonly landed: number & tags.Type<'uint64'>;
       /**
        * Commits the target has that the workspace does not.
        */
       readonly behind: number & tags.Type<'uint64'>;
+      /**
+       * Each file whose change the target does not hold, in path order, and why.
+       */
+      readonly unlandedPaths: ReadonlyArray<UnlandedPath>;
     })
   | ({ readonly state: 'indeterminate' } & {
       readonly reason: string;
@@ -2658,6 +2668,33 @@ export type UnattributedRun =
   | ({ readonly kind: 'uncovered' } & {
       readonly targets: ReadonlyArray<string>;
     });
+
+/**
+ * Why the target does not hold the workspace's change to one file. `base` is the file at the
+ * merge base, `here` at the workspace head, `target` at the target tip.
+ */
+export type UnlandedChange =
+  | { readonly kind: 'missing' }
+  | { readonly kind: 'conflict' }
+  | { readonly kind: 'added' }
+  | { readonly kind: 'deleted' }
+  | { readonly kind: 'deletedInTarget' }
+  | { readonly kind: 'mode' }
+  | ({ readonly kind: 'unmergeable' } & {
+      readonly reason: string;
+    });
+
+/**
+ * One file the workspace changed since its merge base with the target whose change the target
+ * does not hold.
+ */
+export type UnlandedPath = {
+  /**
+   * Repository-relative, as git names it; bytes that are not UTF-8 read as U+FFFD.
+   */
+  readonly path: string;
+  readonly change: UnlandedChange;
+};
 
 /**
  * How a job's independent totals compare with what its observed processes counted as their

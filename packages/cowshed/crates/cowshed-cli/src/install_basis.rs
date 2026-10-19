@@ -13,11 +13,11 @@
 //!   in the same line — held for the whole install. A second installer waits, and judges against
 //!   whatever was installed while it waited, because the judgement runs after the lock is taken.
 //! * **Contain what is installed.** [`judge`] admits a build only when an adopted project's own
-//!   `main` holds its commit, and that main shows the build holding every change of the installed
-//!   commit, by ancestry or patch identity — `cowshed rm`'s containment
-//!   (`GitRepository::commits_not_held`). Main is the authority because it is the one repository
-//!   that outlives every shed: the commit a shed built from may be rebased away when it lands,
-//!   and the shed itself removed, while main only moves forward.
+//!   `main` holds its commit, and that main shows the build holding every installed commit, by
+//!   ancestry or patch identity (`GitRepository::commits_not_held`) — an identity question, not
+//!   `cowshed rm`'s content one. Main is the authority because it is the one repository that
+//!   outlives every shed: the commit a shed built from may be rebased away when it lands, and the
+//!   shed itself removed, while main only moves forward.
 
 use crate::build_record::{BuildRecord, lost_commits_refusal, unproven_refusal};
 use cowshed_core::api::PendingInstall;

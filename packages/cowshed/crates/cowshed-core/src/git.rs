@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use tokio::process::Command;
 
-use crate::api::dto::GitOid;
 #[cfg(any(target_os = "macos", test))]
 use crate::api::dto::Sha256Digest;
+use crate::api::dto::{GitOid, UnlandedChange, UnlandedPath};
 use crate::error::{CowshedError, Result};
 use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
 use cowshed_os::timing::timed_async;
@@ -183,6 +183,41 @@ pub struct CommitSubject {
     pub oid: GitOid,
     pub subject: String,
 }
+
+/// What a head carries that a target does not hold, judged by content
+/// ([`GitRepository::content_not_held`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ContentNotHeld {
+    /// Each file whose change the target does not hold, in path order.
+    pub paths: Vec<UnlandedPath>,
+    /// Commits of `target..head` that change one of `paths`: zero exactly when `paths` is empty.
+    pub commits: u64,
+}
+
+/// One side of a `diff-tree --raw` change: the entry's mode and object.
+#[derive(Debug, Eq, PartialEq)]
+struct TreeEntry {
+    mode: u32,
+    oid: String,
+}
+
+impl TreeEntry {
+    /// `None` for a malformed field; `Some(None)` for the all-zero mode git gives an absent side.
+    fn parse(mode: &str, oid: &str) -> Option<Option<Self>> {
+        let mode = u32::from_str_radix(mode, 8).ok()?;
+        Some((mode != 0).then(|| Self {
+            mode,
+            oid: oid.to_owned(),
+        }))
+    }
+
+    const fn is_regular_file(&self) -> bool {
+        matches!(self.mode, 0o100644 | 0o100755)
+    }
+}
+
+/// Path to its entry on each side of a tree comparison, `(from, to)`, in path order.
+type TreeChanges = std::collections::BTreeMap<Vec<u8>, (Option<TreeEntry>, Option<TreeEntry>)>;
 
 #[derive(Clone, Debug)]
 pub struct GitRepository {
@@ -1573,7 +1608,14 @@ impl GitRepository {
     /// the target" into a plausible-looking count, which is the one failure mode a landing check
     /// must not have.
     pub async fn commits_ahead_of(&self, revision: &str, head: &str) -> Result<u64> {
-        for endpoint in [revision, head] {
+        self.require_commits([revision, head]).await?;
+        self.count_range(&format!("{revision}..{head}")).await
+    }
+
+    /// Refuse an endpoint this repository cannot see instead of letting git drop it from a range:
+    /// a commit nobody compared must not come back as a comparison.
+    async fn require_commits(&self, endpoints: [&str; 2]) -> Result<()> {
+        for endpoint in endpoints {
             if !self.has_commit(endpoint).await? {
                 return Err(CowshedError::conflict(
                     format!("{endpoint} is not a commit this repository can see"),
@@ -1581,11 +1623,248 @@ impl GitRepository {
                 ));
             }
         }
-        self.count_range(&format!("{revision}..{head}")).await
+        Ok(())
     }
 
-    /// How many of `revision..head`'s commits contribute no content `revision` does not already
-    /// hold.
+    /// What `head` changed since its merge base with `revision` that `revision` does not hold:
+    /// each such file with why, and how many commits of `revision..head` change one of them.
+    ///
+    /// Content, never commit identity, because the question is whether the work is in the target
+    /// (`cowshed rm`, 02_workspaces.md step 1), and work reaches a target under other commits: a
+    /// cherry-pick, a squash, a rewrite, or a pick whose conflict a lander resolved on the way in.
+    /// A file `head` changed is held when `revision` has the same entry, or when merging `head`'s
+    /// change into `revision`'s version (`git merge-file`, based at the merge base) shows the
+    /// target already holds it beside later edits of its own (`held_change`): a clean
+    /// merge that reproduces the target's version byte for byte, or conflicted regions in which
+    /// the target's lines carry every hunk the workspace made there. Every other file is named
+    /// with its [`UnlandedChange`].
+    ///
+    /// Nothing is written: `merge-file -p` prints its result rather than storing it. Strict on
+    /// both endpoints like [`Self::commits_ahead_of`]. Histories with no merge base are refused:
+    /// there is no change of `head`'s to judge, only two unrelated trees.
+    pub async fn content_not_held(&self, revision: &str, head: &str) -> Result<ContentNotHeld> {
+        self.require_commits([revision, head]).await?;
+        let base = self.merge_base(revision, head).await?;
+        let changed = self.tree_changes(&base, head).await?;
+        if changed.is_empty() {
+            return Ok(ContentNotHeld::default());
+        }
+        let differing = self.tree_changes(revision, head).await?;
+        let mut paths = Vec::new();
+        let mut unheld = Vec::new();
+        for (path, (target, here)) in &differing {
+            // A path only the target changed is the target's own work, not the workspace's.
+            let Some((base, _)) = changed.get(path) else {
+                continue;
+            };
+            if let Some(change) = self
+                .change_not_held(base.as_ref(), here.as_ref(), target.as_ref())
+                .await?
+            {
+                paths.push(UnlandedPath {
+                    path: String::from_utf8_lossy(path).into_owned(),
+                    change,
+                });
+                unheld.push(path.as_slice());
+            }
+        }
+        let commits = self.commits_changing(revision, head, &unheld).await?;
+        // Every unheld file differs from the merge base, so some commit of the range changed it.
+        // Git disagreeing with itself here must not read as "nothing unlanded".
+        if commits == 0 && !paths.is_empty() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "git reported {} files whose change {revision} does not hold, yet no commit \
+                     of {revision}..{head} changes them: refusing to guess which is right",
+                    paths.len()
+                ),
+                "repair the git repository",
+            ));
+        }
+        Ok(ContentNotHeld { paths, commits })
+    }
+
+    /// Why `revision` does not hold `head`'s change to one file, or `None` when it does. Each
+    /// side is the file's entry at the merge base, the head and the target, absent where the file
+    /// is.
+    async fn change_not_held(
+        &self,
+        base: Option<&TreeEntry>,
+        here: Option<&TreeEntry>,
+        target: Option<&TreeEntry>,
+    ) -> Result<Option<UnlandedChange>> {
+        let (base, here, target) = match (base, here, target) {
+            (_, None, None) => return Ok(None),
+            (_, None, Some(_)) => return Ok(Some(UnlandedChange::Deleted)),
+            (None, Some(_), None) => return Ok(Some(UnlandedChange::Added)),
+            (Some(_), Some(_), None) => return Ok(Some(UnlandedChange::DeletedInTarget)),
+            (None, Some(here), Some(target)) => {
+                return Ok(Some(if here.oid == target.oid {
+                    UnlandedChange::Mode
+                } else {
+                    UnlandedChange::Conflict
+                }));
+            }
+            (Some(base), Some(here), Some(target)) => (base, here, target),
+        };
+        let content = if here.oid == target.oid || here.oid == base.oid {
+            None
+        } else if target.oid == base.oid {
+            Some(UnlandedChange::Missing)
+        } else if [base, here, target]
+            .iter()
+            .all(|entry| entry.is_regular_file())
+        {
+            self.merged_change(base, here, target).await?
+        } else {
+            // A symlink or submodule both sides moved to different places has no lines to merge.
+            Some(UnlandedChange::Conflict)
+        };
+        Ok(content.or_else(|| {
+            (here.mode != target.mode && here.mode != base.mode).then_some(UnlandedChange::Mode)
+        }))
+    }
+
+    /// Merge the workspace's change (`base` to `here`) into the target's version of a file both
+    /// sides changed, and judge whether the target's version already holds it
+    /// ([`crate::held_change`]): a conflicted region is held when the target has the workspace's
+    /// hunks in it beside its own.
+    async fn merged_change(
+        &self,
+        base: &TreeEntry,
+        here: &TreeEntry,
+        target: &TreeEntry,
+    ) -> Result<Option<UnlandedChange>> {
+        let merged = self
+            .run([
+                "merge-file",
+                "-p",
+                "--diff3",
+                &format!("--marker-size={}", crate::held_change::MARKER_SIZE),
+                "--object-id",
+                target.oid.as_str(),
+                base.oid.as_str(),
+                here.oid.as_str(),
+            ])
+            .await?;
+        // `merge-file` exits with its conflict count, capped at 127, and with 255 when it cannot
+        // merge at all, as for binary content.
+        if !matches!(merged.status.code(), Some(0..=127)) {
+            return Ok(Some(UnlandedChange::Unmergeable {
+                reason: git_message("merge the workspace's change into the target's", &merged),
+            }));
+        }
+        let held = self.run(["cat-file", "blob", target.oid.as_str()]).await?;
+        if !held.status.success() {
+            return Err(git_internal("read the target's version of a file", &held));
+        }
+        Ok(
+            match crate::held_change::judge(&merged.stdout, &held.stdout) {
+                crate::held_change::Verdict::Held => None,
+                crate::held_change::Verdict::Missing => Some(UnlandedChange::Missing),
+                crate::held_change::Verdict::Conflict => Some(UnlandedChange::Conflict),
+            },
+        )
+    }
+
+    async fn merge_base(&self, revision: &str, head: &str) -> Result<String> {
+        let output = self.run(["merge-base", revision, head]).await?;
+        match output.status.code() {
+            Some(0) => parse_one_string(&output.stdout, "merge base"),
+            Some(1) => Err(CowshedError::conflict(
+                format!("{head} shares no history with {revision}: it has no change to compare"),
+                "inspect both histories; nothing shared means nothing can be proven held",
+            )),
+            _ => Err(git_internal("find the merge base", &output)),
+        }
+    }
+
+    /// Every file whose entry differs between the trees of `from` and `to`, each side absent
+    /// where the file is. Renames are a deletion and an addition, which is what they are to a
+    /// file's content.
+    async fn tree_changes(&self, from: &str, to: &str) -> Result<TreeChanges> {
+        let output = self
+            .run(["diff-tree", "-r", "-z", "--no-renames", from, to])
+            .await?;
+        if !output.status.success() {
+            return Err(git_internal("compare two trees", &output));
+        }
+        let unreadable = || {
+            CowshedError::integrity(
+                format!("git reported an unreadable tree change between {from} and {to}"),
+                "repair the git installation",
+            )
+        };
+        let mut changes = TreeChanges::new();
+        let mut fields = output.stdout.split(|byte| *byte == 0);
+        while let Some(meta) = fields.next() {
+            // The last record's terminator leaves one empty field behind.
+            if meta.is_empty() {
+                continue;
+            }
+            let path = fields.next().filter(|path| !path.is_empty());
+            let meta = std::str::from_utf8(meta)
+                .ok()
+                .and_then(|meta| meta.strip_prefix(':'));
+            let (Some(path), Some(meta)) = (path, meta) else {
+                return Err(unreadable());
+            };
+            let mut parts = meta.split(' ');
+            let (Some(old_mode), Some(new_mode), Some(old_oid), Some(new_oid), Some(_), None) = (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) else {
+                return Err(unreadable());
+            };
+            changes.insert(
+                path.to_vec(),
+                (
+                    TreeEntry::parse(old_mode, old_oid).ok_or_else(unreadable)?,
+                    TreeEntry::parse(new_mode, new_oid).ok_or_else(unreadable)?,
+                ),
+            );
+        }
+        Ok(changes)
+    }
+
+    /// How many commits of `revision..head` change one of `paths`, each taken literally.
+    async fn commits_changing(&self, revision: &str, head: &str, paths: &[&[u8]]) -> Result<u64> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let mut args: Vec<OsString> = vec![
+            "rev-list".into(),
+            "--count".into(),
+            format!("{revision}..{head}").into(),
+            "--".into(),
+        ];
+        args.extend(
+            paths
+                .iter()
+                .map(|path| OsString::from_vec([b":(literal)".as_slice(), path].concat())),
+        );
+        let count = self
+            .read_one(args, "count commits that change unheld files")
+            .await?;
+        count.parse().map_err(|_| {
+            CowshedError::integrity(
+                format!("git reported an unparseable commit count: {count}"),
+                "repair the git repository",
+            )
+        })
+    }
+
+    /// The commits of `revision..head` that `revision` does not hold by ancestry or patch
+    /// identity, oldest first, each with its subject: what `head` carries that replacing it with
+    /// `revision` would lose, as commits.
+    ///
+    /// This is the install gate's identity question (05_gateway.md, "The installed cowshed"), not
+    /// `rm`'s content one ([`Self::content_not_held`]): a build that lacks a commit lacks it,
+    /// whatever its tree says.
     ///
     /// `git cherry` semantics for ordinary commits, and the semantics matter: equivalence is decided
     /// by patch-id, so a commit that reached `revision` by cherry-pick, a history rewrite, or a
@@ -1593,52 +1872,27 @@ impl GitRepository {
     /// of several commits does not: its patch is the sum of theirs and matches none of them, so
     /// each squashed commit stays unheld. Measured: `d7d73bdf9`, `5f4a38df7` and `0461d3a41`
     /// reached published main as the single commit `ea73984d9`, and `git cherry` marks all three
-    /// `+`. A rebase that resolved a conflict produces a different patch and correctly does not
-    /// count.
+    /// `+`. A rebase that resolved a conflict produces a different patch and does not count.
     ///
-    /// Callers derive `unlanded` by subtracting this from the total ahead count, so anything this
-    /// does not count blocks a no-flag removal. Three kinds need care, because git treats them
-    /// differently and only one of them is safe to wave through:
+    /// Three kinds need care, because git treats them differently and only one of them is safe to
+    /// wave through:
     ///
     /// * **Merges with a non-empty combined diff** — *evil merges*, whose conflict resolution exists
     ///   in no parent. `git cherry` omits every merge from its output, so a check built on cherry
     ///   alone cannot see them at all: measured on one real workspace, three of its four merges
-    ///   carried 6, 5 and 2 files that neither parent had. That is unlanded work a naive count
-    ///   destroys, so it is never counted here.
-    /// * **Merges with an empty combined diff** are counted, because they author nothing. They are
-    ///   topology, and retiring the workspace loses no content. Refusing on them would mean a branch
-    ///   of already-landed commits joined by clean merges could never be reported landed — exactly
-    ///   the false positive the landed filter exists to remove.
-    /// * **Ordinary commits with an empty diff** are *not* counted, and this asymmetry is
-    ///   deliberate. Git does not omit them from `cherry`, and their patch-id is the identity of
-    ///   nothing, which matches the identity of any *other* empty commit — so git reports one
-    ///   workspace's marker commit as equivalent to an unrelated upstream one. A clean merge's
-    ///   emptiness is structural and means the same thing every time; an empty commit is a
-    ///   deliberate marker whose message is its whole content, and a false equivalence between two
-    ///   unrelated markers is not a proof of anything.
-    pub async fn commits_already_held(&self, revision: &str, head: &str) -> Result<u64> {
-        let held = self.held_commits(revision, head).await?;
-        u64::try_from(held.len()).map_err(|_| {
-            CowshedError::integrity("held commit count overflow", "repair the git repository")
-        })
-    }
-
-    /// The commits of `revision..head` that `revision` does not hold, oldest first, each with its
-    /// subject: what `head` carries that replacing it with `revision` would lose.
+    ///   carried 6, 5 and 2 files that neither parent had. They are never held here.
+    /// * **Merges with an empty combined diff** are held, because they author nothing. They are
+    ///   topology, and a branch of held commits joined by clean merges is held.
+    /// * **Ordinary commits with an empty diff** are *not* held, and this asymmetry is deliberate.
+    ///   Git does not omit them from `cherry`, and their patch-id is the identity of nothing, which
+    ///   matches the identity of any *other* empty commit — so git reports one marker commit as
+    ///   equivalent to an unrelated upstream one. A false equivalence between two unrelated
+    ///   markers is not a proof of anything.
     ///
-    /// The same proof as [`Self::commits_already_held`], read as a list rather than a count, so
-    /// the two can never disagree about what "held" means. Strict on both endpoints like
-    /// [`Self::commits_ahead_of`]: a commit this repository cannot see has not been compared, and
-    /// an empty list for it would read as "nothing is lost".
+    /// Strict on both endpoints like [`Self::commits_ahead_of`]: a commit this repository cannot
+    /// see has not been compared, and an empty list for it would read as "nothing is lost".
     pub async fn commits_not_held(&self, revision: &str, head: &str) -> Result<Vec<CommitSubject>> {
-        for endpoint in [revision, head] {
-            if !self.has_commit(endpoint).await? {
-                return Err(CowshedError::conflict(
-                    format!("{endpoint} is not a commit this repository can see"),
-                    "attach the object store that holds it, then retry",
-                ));
-            }
-        }
+        self.require_commits([revision, head]).await?;
         let held = self.held_commits(revision, head).await?;
         let output = self
             .run([
@@ -4804,10 +5058,10 @@ mod tests {
         let held = GitRepository::from_root(store.shared(), &workspace)
             .with_alternate_objects(objects)
             .expect("alternate objects")
-            .commits_already_held("HEAD", "HEAD")
+            .content_not_held("HEAD", "HEAD")
             .await
             .expect("an alternate-object read is not a fetch");
-        assert_eq!(held, 0);
+        assert_eq!(held, crate::git::ContentNotHeld::default());
     }
 
     /// A driver added after the command was built — by a job of this or a sibling workspace,

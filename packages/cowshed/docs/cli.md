@@ -115,12 +115,12 @@ Release builds record the commit they were built from. One install runs at a tim
 `~/Library/Application Support/dev.cowshed/install.lock`, for its whole run, and a second `setup` or `gateway start`
 waits for it, then judges its own build against whatever was installed meanwhile. Setup refuses to replace the installed
 cowshed with a build that does not contain it: the build's commit must be on an adopted project's `main`, and that main
-must show the build holding every installed commit, by ancestry or patch identity (the containment `cowshed rm`
-requires). The refusal names the binary, both builds and each commit the install would take off the host; a build that
-records no commit is refused too. Setup repairs everything else, prints the reason and the remedy, and exits non-zero
-with a `conflict`. An installed cowshed that records nothing — installed before builds recorded their commit — never
-blocks an install; an installed record that cannot be read is an `integrity` refusal. `--downgrade` installs the
-invoking build without judging it; it is refused with `--uninstall` and `--force`, which install nothing.
+must show the build holding every installed commit, by ancestry or patch identity (an identity check, unlike
+`cowshed rm`'s content one). The refusal names the binary, both builds and each commit the install would take off the
+host; a build that records no commit is refused too. Setup repairs everything else, prints the reason and the remedy,
+and exits non-zero with a `conflict`. An installed cowshed that records nothing — installed before builds recorded their
+commit — never blocks an install; an installed record that cannot be read is an `integrity` refusal. `--downgrade`
+installs the invoking build without judging it; it is refused with `--uninstall` and `--force`, which install nothing.
 
 The commands that change a workspace or run work in one — `adopt`, `fork`, `mv`, `checkpoint`, `restore`, `path`,
 `exec`, `grant`, `rm`, `forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`, `gc`, `push`, `rebase`,
@@ -617,7 +617,11 @@ the way `detach <name>` does — from the store, by its session name — and ref
 one holds it. The address is all that changes; the gate below is the same.
 
 Removing a workspace destroys its image, and the image is where its commits live — so `rm` refuses (exit 4) unless
-`main` already contains the workspace's `HEAD`. The refusal names main's tip and points at `cowshed land <ws>`.
+`main` already holds the workspace's work. Holding is judged by content: a `HEAD` main contains is landed, and otherwise
+every file the workspace changed since its merge base with main must already carry that change in main, beside whatever
+main changed since. Work main took by squash, cherry-pick, a rewrite or a conflict-resolved pick is landed. The refusal
+names main's tip, each file whose change main lacks with why (`missing`, `conflict`, `added`, `deleted`, `changed`,
+`mode`, `unmergeable`; ten, then a count), and points at `cowshed land <ws>`.
 
 The project-open `cowshed: info: leaving … unfinished lifecycle operations …` line concerns other workspaces outside
 this command's recovery scope. It explicitly says those operations do not block this command; `cowshed doctor` lists
@@ -626,10 +630,10 @@ them. A refusal is reported separately with its own `next:` hint and exit code. 
 
 The two overrides authorize different losses and neither substitutes for the other:
 
-| Flag        | Overrides                                                         | Does **not** override    |
-| ----------- | ----------------------------------------------------------------- | ------------------------ |
-| `--force`   | transient state: a dirty tree, an in-progress merge, a busy mount | the landed-ancestry gate |
-| `--abandon` | the landed-ancestry gate — commits `main` does not contain        | transient state          |
+| Flag        | Overrides                                                         | Does **not** override   |
+| ----------- | ----------------------------------------------------------------- | ----------------------- |
+| `--force`   | transient state: a dirty tree, an in-progress merge, a busy mount | the landed-content gate |
+| `--abandon` | the landed-content gate — changes `main` does not hold            | transient state         |
 
 `--force` stops that workspace's running jobs (TERM, then KILL after the grace period) before detaching; without it,
 removal lets the supervisor finish its active jobs. A leftover `.git/AUTO_MERGE` alone is not an in-progress operation
@@ -646,7 +650,7 @@ even a deliberate abandonment is recoverable:
 ```
 $ cowshed rm raven
 cowshed: info: leaving 4 unfinished lifecycle operations outside this command's recovery scope; these do not block this command; cowshed doctor lists each
-cowshed: workspace raven head 9b2e77d… is not contained by main (main is at 6f3a2c1…)
+cowshed: workspace raven head 9b2e77d… carries 9 commits changing 2 files whose change main does not hold (main is at 6f3a2c1…): src/gate.rs (conflict: main changed these lines too and lacks this change), docs/gate.md (added: main does not have it)
 next: land the workspace: cowshed land raven
 
 $ cowshed rm raven --abandon

@@ -792,7 +792,7 @@ impl WorkspaceLanding {
 /// What the workspace's local branches other than the checked-out one hold that the target does
 /// not. A branch passes when its tip equals or is an ancestor of the target repository's branch of
 /// the same name or of its `push` ref `refs/cowshed/<ws>/heads/<branch>`, or when the target
-/// branch holds its commits by ancestry or patch equivalence; every other branch is listed.
+/// branch holds its content the way [`LandingCommits`] judges a head; every other branch is listed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum BranchLandings {
@@ -828,6 +828,11 @@ pub struct BranchLanding {
 /// A sum rather than a struct of optionals so that "measured" and "could not measure" cannot be
 /// confused by a reader or a script: there is no shape in which a count is absent but a verdict is
 /// still available, and none in which the absence of a count reads as zero.
+///
+/// The verdict is content, not commit identity (02_workspaces.md, `rm` step 1): a head the target
+/// contains is landed, and otherwise every file the workspace changed since its merge base with the
+/// target must already carry that change in the target. A cherry-pick, a squash, or a pick whose
+/// conflict was resolved on the way in all land the content under other commits.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum LandingCommits {
@@ -837,14 +842,17 @@ pub enum LandingCommits {
     Measured {
         target_branch: String,
         target_head: GitOid,
-        /// Commits whose content the target does not hold, by ancestry or by patch equivalence.
-        /// Zero is the only value that authorizes removing the workspace without `--abandon`.
+        /// Commits that change one of the files the unlanded paths name: zero exactly when they
+        /// name none, and zero is the only value that authorizes removing the workspace without
+        /// `--abandon`.
         unlanded: u64,
-        /// Commits the target already holds the patch of, including ones that reached it by
-        /// squash-merge, cherry-pick, or a history rewrite rather than by ancestry.
+        /// Commits whose every change the target already holds, however it got there: by ancestry,
+        /// cherry-pick, squash-merge, a history rewrite, or a conflict-resolved pick.
         landed: u64,
         /// Commits the target has that the workspace does not.
         behind: u64,
+        /// Each file whose change the target does not hold, in path order, and why.
+        unlanded_paths: Vec<UnlandedPath>,
     },
     /// Nothing was compared and nothing may be inferred. This never means landed: every consumer
     /// treats it exactly as it treats unlanded work.
@@ -853,7 +861,7 @@ pub enum LandingCommits {
 }
 
 impl LandingCommits {
-    /// Whether every commit the workspace carries is already in the target branch.
+    /// Whether every change the workspace carries is already in the target branch.
     pub const fn fully_landed(&self) -> bool {
         matches!(self, Self::Measured { unlanded: 0, .. })
     }
@@ -865,6 +873,41 @@ impl LandingCommits {
             Self::Indeterminate { .. } => None,
         }
     }
+}
+
+/// One file the workspace changed since its merge base with the target whose change the target
+/// does not hold.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnlandedPath {
+    /// Repository-relative, as git names it; bytes that are not UTF-8 read as U+FFFD.
+    pub path: String,
+    pub change: UnlandedChange,
+}
+
+/// Why the target does not hold the workspace's change to one file. `base` is the file at the
+/// merge base, `here` at the workspace head, `target` at the target tip.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum UnlandedChange {
+    /// The workspace changed the file and the target's version lacks that change: merging `base`
+    /// to `here` into `target` would change it.
+    Missing,
+    /// The target changed the same or adjacent lines too, or both sides added the file, and the
+    /// target's version of those lines lacks the workspace's.
+    Conflict,
+    /// The workspace adds the file and the target does not have it.
+    Added,
+    /// The workspace deletes the file and the target still has it.
+    Deleted,
+    /// The workspace changes the file and the target deleted it.
+    DeletedInTarget,
+    /// The workspace changed the file's mode (executable bit, symlink, submodule) and the target's
+    /// mode is another.
+    Mode,
+    /// Git cannot merge the versions line by line (binary content), so nothing shows the target
+    /// holds the change. `reason` is git's own.
+    Unmergeable { reason: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

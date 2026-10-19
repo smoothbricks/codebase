@@ -3,8 +3,7 @@
 //!
 //! Every release build carries the commit it was made from and when that commit was committed
 //! (`build.rs`). The commit is what an install is judged by: a build may replace the installed
-//! one only when it holds every change the installed commit carries, by ancestry or patch
-//! identity — the containment `cowshed rm` already requires of a workspace
+//! one only when it holds every installed commit, by ancestry or patch identity
 //! (`GitRepository::commits_not_held`). The time only describes a build to a person. It never
 //! orders two builds: two sibling commits are ordered by clock, and the later one carries none of
 //! the earlier one's fixes. A build made without git, or made in the debug profile, records

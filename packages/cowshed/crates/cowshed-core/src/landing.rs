@@ -16,6 +16,9 @@
 //!   state of a real project — the target detached, its mount no longer a repository, no such
 //!   branch — so each one becomes [`LandingCommits::Indeterminate`] carrying the reason.
 //!   Consumers treat that exactly as they treat unlanded work.
+//! * **Landed is content, not commit identity.** Work reaches a target by cherry-pick, squash,
+//!   rewrite, or a pick whose conflict a lander resolved; the measurement names each file whose
+//!   change the target still lacks, and why, so a refusal says what would be lost.
 //!
 //! One reading here is not a verdict: [`published_holding`] measures the target repository's own
 //! tracking ref for its published branch, the same way, so a refusal can say when that ref already
@@ -26,7 +29,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::api::dto::{BranchLanding, BranchLandings, GitOid, LandingCommits, WorkspaceLanding};
-use crate::git::GitRepository;
+use crate::git::{ContentNotHeld, GitRepository};
 
 /// The branch a workspace's work has to reach, resolved live, with the object store that holds it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,9 +193,9 @@ pub async fn measure(
 /// A branch passes when its tip equals or is an ancestor of the target repository's branch of the
 /// same name or of `refs/cowshed/<workspace>/heads/<branch>`, where `cowshed push` preserves it -
 /// destroying the workspace's copy then loses nothing - or when the target branch holds its
-/// commits by ancestry or patch equivalence. Every other branch is named with its measurement. A
-/// tip equal to the target's same-named tip is decided without a process, which is what keeps a
-/// workspace carrying its source's branches cheap to list.
+/// content as it would a head's. Every other branch is named with its measurement. A tip equal to
+/// the target's same-named tip is decided without a process, which is what keeps a workspace
+/// carrying its source's branches cheap to list.
 pub async fn measure_branches(
     store_root: &std::sync::Arc<Path>,
     target: &std::result::Result<LandingTarget, String>,
@@ -302,6 +305,10 @@ pub async fn measure_commits(
     }
 }
 
+/// The two questions of `rm` step 1 (02_workspaces.md), in order: a head the target contains is
+/// landed, cheaply and exactly; otherwise every file the head changed since its merge base with
+/// the target must carry that change in the target ([`GitRepository::content_not_held`]), however
+/// the content got there.
 async fn counted(
     store_root: &std::sync::Arc<Path>,
     target: &LandingTarget,
@@ -322,24 +329,30 @@ async fn counted(
         .commits_ahead_of(head, tip)
         .await
         .map_err(|error| error.message)?;
-    let landed = workspace
-        .commits_already_held(tip, head)
-        .await
-        .map_err(|error| error.message)?;
-    // `landed` counts a subset of the same range `ahead` counts, so this cannot underflow unless
-    // git's own answers disagree with each other. If they ever do, say so rather than wrap into a
-    // huge `unlanded` or a zero one — the second would authorize a deletion.
-    let unlanded = ahead.checked_sub(landed).ok_or_else(|| {
+    let unheld = if ahead == 0 {
+        ContentNotHeld::default()
+    } else {
+        workspace
+            .content_not_held(tip, head)
+            .await
+            .map_err(|error| error.message)?
+    };
+    // The unheld commits are a subset of the same range `ahead` counts, so this cannot underflow
+    // unless git's own answers disagree with each other. If they ever do, say so rather than wrap
+    // into a huge `landed`.
+    let landed = ahead.checked_sub(unheld.commits).ok_or_else(|| {
         format!(
-            "git reported {landed} already-held commits in a range of {ahead}: refusing to guess \
-             which is right"
+            "git reported {} commits changing unheld files in a range of {ahead}: refusing to \
+             guess which is right",
+            unheld.commits
         )
     })?;
     Ok(LandingCommits::Measured {
         target_branch: target.branch.clone(),
         target_head: target.tip.clone(),
-        unlanded,
+        unlanded: unheld.commits,
         landed,
         behind,
+        unlanded_paths: unheld.paths,
     })
 }

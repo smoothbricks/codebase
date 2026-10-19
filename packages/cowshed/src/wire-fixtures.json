@@ -2639,7 +2639,22 @@
           "state": "measured",
           "targetBranch": "main",
           "targetHead": "89abcdef0123456789abcdef0123456789abcdef",
-          "unlanded": 3
+          "unlanded": 3,
+          "unlandedPaths": [
+            {
+              "change": {
+                "kind": "missing"
+              },
+              "path": "src/gate.rs"
+            },
+            {
+              "change": {
+                "kind": "unmergeable",
+                "reason": "Cannot merge binary files"
+              },
+              "path": "assets/logo.png"
+            }
+          ]
         },
         "dirtyFiles": 2
       },
@@ -2689,7 +2704,22 @@
             "state": "measured",
             "targetBranch": "main",
             "targetHead": "89abcdef0123456789abcdef0123456789abcdef",
-            "unlanded": 3
+            "unlanded": 3,
+            "unlandedPaths": [
+              {
+                "change": {
+                  "kind": "missing"
+                },
+                "path": "src/gate.rs"
+              },
+              {
+                "change": {
+                  "kind": "unmergeable",
+                  "reason": "Cannot merge binary files"
+                },
+                "path": "assets/logo.png"
+              }
+            ]
           },
           "dirtyFiles": 2
         },

@@ -34,9 +34,10 @@ use cowshed_core::{
         ProcessCoverageGap, ProtectedOutput, PushReport, RebaseBuildVolume, RebaseCarrySkip,
         RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult, ResizeVolume,
         Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamBytes, StreamInfo, StreamLines,
-        TraceContext, TraceId, UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage,
-        VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding,
-        WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
+        TraceContext, TraceId, UnlandedChange, UnlandedPath, UsageReconciliation, UtcTimestamp,
+        VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation,
+        WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole,
+        WorkspaceState,
     },
     repository::RepoId,
 };
@@ -678,6 +679,18 @@ fn workspace_infos() -> BTreeMap<&'static str, Value> {
                 unlanded: 3,
                 landed: 1,
                 behind: 5,
+                unlanded_paths: vec![
+                    UnlandedPath {
+                        path: "src/gate.rs".to_owned(),
+                        change: UnlandedChange::Missing,
+                    },
+                    UnlandedPath {
+                        path: "assets/logo.png".to_owned(),
+                        change: UnlandedChange::Unmergeable {
+                            reason: "Cannot merge binary files".to_owned(),
+                        },
+                    },
+                ],
             },
             branches: BranchLandings::Measured {
                 unlanded: Vec::new(),

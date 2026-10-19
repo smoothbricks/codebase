@@ -6158,10 +6158,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// target's object store attached read-only, so its commits are visible without fetching and
     /// without writing anything anywhere.
     ///
-    /// Containment is by patch identity, not only by ancestry. That is the correction this gate
-    /// needed: a workspace whose work reached main by squash-merge or a history rewrite is not an
-    /// ancestor of anything, and demanding `--abandon` to retire it taught callers to pass a
-    /// commit-destroying flag for a safe operation.
+    /// Containment is by content, not only by ancestry. That is the correction this gate needed:
+    /// a workspace whose work reached main by squash-merge, a history rewrite, or a pick whose
+    /// conflict was resolved on the way in is not an ancestor of anything, and demanding
+    /// `--abandon` to retire it taught callers to pass a commit-destroying flag for a safe
+    /// operation.
     async fn landed_state(
         &self,
         workspace: &WorkspaceName,
@@ -6262,7 +6263,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
     /// The live main tip is both the report's baseline and a positive revision in the bundle.
     /// Carrying both histories makes the bundle self-contained even after main was rewritten, and
     /// lets an empty recovery repository reconstruct the exact `main_tip..HEAD` range the report
-    /// counted. The landing gate keeps its patch-identity policy; this artifact count is the
+    /// counted. The landing gate keeps its content policy; this artifact count is the
     /// conservative oid range whose objects are actually being retired.
     async fn bundle_abandoned_work(
         &self,
@@ -9519,11 +9520,12 @@ mod rebase_recovery_tests {
                 .message;
         assert!(
             message.ends_with(&format!(
-                "(main is at {main_tip}); codebase/main (published, {published_tip}) holds it; \
-                 local main has diverged from it (1 ahead, 1 behind): reconcile main, do not \
-                 abandon; workspace shed holds 1 other branch that main does not hold, by \
-                 ancestry or by patch equivalence, and that no branch or push ref in main's \
-                 repository preserves: cowshed/forge at {published_tip} (1 commit)"
+                "(main is at {main_tip}): release.txt (added: main does not have it); \
+                 codebase/main (published, {published_tip}) holds it; local main has diverged \
+                 from it (1 ahead, 1 behind): reconcile main, do not abandon; workspace shed \
+                 holds 1 other branch whose changes main does not hold and that no branch or \
+                 push ref in main's repository preserves: cowshed/forge at {published_tip} (1 \
+                 commit: release.txt (added: main does not have it))"
             )),
             "{message}"
         );
@@ -9543,6 +9545,108 @@ mod rebase_recovery_tests {
             "{refused:?}"
         );
         assert_eq!(published_holding(head).await, None);
+    }
+
+    /// The pick a lander lands by hand: main edited the line beside the shed's, so the pick
+    /// conflicted and was resolved keeping both, and main then moved on in the same file. No
+    /// commit of main is the shed's by ancestry or patch identity, yet main holds every change the
+    /// shed made, so `rm`'s gate lets it go with no flag. A file main never took then refuses,
+    /// named with why, and the held file is not named.
+    #[tokio::test]
+    async fn a_conflict_resolved_pick_is_landed_by_content_and_a_real_difference_is_named() {
+        let lane = Lane::new("resolved-pick");
+        let store_root = lane.store.shared();
+        let commit = |root: &Path, file: &str, contents: &str, message: &str| {
+            std::fs::write(root.join(file), contents).expect("write fixture file");
+            run_git(root, &["add", file]);
+            run_git(root, &["commit", "-m", message]);
+        };
+        commit(
+            &lane.main,
+            "targets.txt",
+            "alpha\nbeta\ngamma\ndelta\nepsilon\n",
+            "targets",
+        );
+        let shed = Lane::clone_of(&lane.base, &lane.main, "shed");
+        commit(
+            &shed,
+            "targets.txt",
+            "alpha\nbeta\ngamma shed\ndelta\nepsilon\n",
+            "shed gate",
+        );
+        let shed_commit = git_oid(store_root, &shed).await.expect("shed head");
+        commit(
+            &lane.main,
+            "targets.txt",
+            "alpha\nbeta main\ngamma\ndelta\nepsilon\n",
+            "main beside it",
+        );
+        run_git(
+            &lane.main,
+            &[
+                "fetch",
+                "--quiet",
+                shed.to_str().expect("UTF-8 shed path"),
+                "cowshed/shed",
+            ],
+        );
+        let pick = git(&lane.main, &["cherry-pick", shed_commit.as_str()]);
+        assert!(
+            !pick.status.success(),
+            "the fixture depends on a conflicting pick"
+        );
+        std::fs::write(
+            lane.main.join("targets.txt"),
+            "alpha\nbeta main\ngamma shed\ndelta\nepsilon\n",
+        )
+        .expect("resolve the pick");
+        run_git(&lane.main, &["add", "targets.txt"]);
+        run_git(
+            &lane.main,
+            &["-c", "core.editor=true", "cherry-pick", "--continue"],
+        );
+        commit(
+            &lane.main,
+            "targets.txt",
+            "alpha main\nbeta main\ngamma shed\ndelta\nepsilon main\n",
+            "main moves on",
+        );
+        let main_tip = git_oid(store_root, &lane.main).await.expect("main tip");
+
+        // Identity disagrees: the resolution changed the pick's patch, so no commit of main is the
+        // shed's. That is the question the install gate asks, and the one `rm` no longer asks.
+        let main_objects = crate::git::GitRepository::from_root(store_root, &lane.main)
+            .object_directory()
+            .await
+            .expect("main objects");
+        let by_identity = crate::git::GitRepository::from_root(store_root, &shed)
+            .with_alternate_objects(main_objects)
+            .expect("attach main objects")
+            .commits_not_held(main_tip.as_str(), shed_commit.as_str())
+            .await
+            .expect("identity measurement");
+        assert_eq!(by_identity.len(), 1, "{by_identity:?}");
+
+        assert_eq!(
+            contained_in(store_root, &lane.main, "main", &shed).await,
+            RemovalLandedDecision::Landed,
+            "main holds the shed's change beside its own edits"
+        );
+
+        commit(&shed, "notes.txt", "never picked\n", "shed notes");
+        let head = git_oid(store_root, &shed).await.expect("shed head");
+        let RemovalLandedDecision::Refused(refused) =
+            contained_in(store_root, &lane.main, "main", &shed).await
+        else {
+            panic!("main never took notes.txt");
+        };
+        assert_eq!(
+            removal_unlanded_refusal(&Lane::name("shed"), &head, &refused, None).message,
+            format!(
+                "workspace shed head {head} carries 1 commit changing 1 file whose change main \
+                 does not hold (main is at {main_tip}): notes.txt (added: main does not have it)"
+            )
+        );
     }
 
     #[tokio::test]
@@ -14891,6 +14995,17 @@ mod removal_refusal_tests {
         }
     }
 
+    fn unheld(
+        path: &str,
+        change: crate::api::dto::UnlandedChange,
+    ) -> crate::api::dto::UnlandedPath {
+        crate::api::dto::UnlandedPath {
+            path: path.to_owned(),
+            change,
+        }
+    }
+
+    /// `unlanded` commits changing one file main lacks the change of, or none when zero.
     fn measured(unlanded: u64, landed: u64) -> NativeLandedState {
         state(LandingCommits::Measured {
             target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
@@ -14898,6 +15013,14 @@ mod removal_refusal_tests {
             unlanded,
             landed,
             behind: 0,
+            unlanded_paths: if unlanded == 0 {
+                Vec::new()
+            } else {
+                vec![unheld(
+                    "src/lib.rs",
+                    crate::api::dto::UnlandedChange::Missing,
+                )]
+            },
         })
     }
 
@@ -14978,15 +15101,16 @@ mod removal_refusal_tests {
     }
 
     /// The refusal has to be actionable on its own: it names the head that is at risk, how much of
-    /// it is unheld, the branch that does not hold it, and where that branch stands.
+    /// it is unheld, each file main lacks the change of and why, the branch that does not hold it,
+    /// and where that branch stands.
     #[test]
-    fn the_unlanded_refusal_names_the_head_the_count_the_branch_and_the_tip() {
+    fn the_unlanded_refusal_names_the_head_the_count_the_files_the_branch_and_the_tip() {
         let refusal = removal_unlanded_refusal(&workspace(), &oid('4'), &measured(3, 1), None);
         assert_eq!(
             refusal.message,
             format!(
-                "workspace raven head {} carries 3 commits that main does not hold, by ancestry or \
-                 by patch equivalence (main is at {})",
+                "workspace raven head {} carries 3 commits changing 1 file whose change main does \
+                 not hold (main is at {}): src/lib.rs (missing: main lacks this change)",
                 oid('4'),
                 oid('1')
             )
@@ -14997,7 +15121,7 @@ mod removal_refusal_tests {
         assert!(
             removal_unlanded_refusal(&workspace(), &oid('4'), &measured(1, 0), None)
                 .message
-                .contains("carries 1 commit that main"),
+                .contains("carries 1 commit changing 1 file whose change main"),
         );
 
         // No measurement names the unanswered question rather than printing an absence, because the
@@ -15011,6 +15135,63 @@ mod removal_refusal_tests {
                 oid('4')
             )
         );
+    }
+
+    /// Every reason a file is unheld reads as itself, and a wide change names ten files and
+    /// counts the rest rather than burying the sentence.
+    #[test]
+    fn the_unlanded_refusal_says_why_each_file_differs_and_caps_the_list() {
+        use crate::api::dto::UnlandedChange;
+
+        let reasons = vec![
+            unheld("a.rs", UnlandedChange::Missing),
+            unheld("b.rs", UnlandedChange::Conflict),
+            unheld("c.rs", UnlandedChange::Added),
+            unheld("d.rs", UnlandedChange::Deleted),
+            unheld("e.rs", UnlandedChange::DeletedInTarget),
+            unheld("f.sh", UnlandedChange::Mode),
+            unheld(
+                "g.png",
+                UnlandedChange::Unmergeable {
+                    reason: String::from("Cannot merge binary files"),
+                },
+            ),
+        ];
+        let with_paths = |unlanded_paths: Vec<crate::api::dto::UnlandedPath>| {
+            state(LandingCommits::Measured {
+                target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
+                target_head: oid('1'),
+                unlanded: 2,
+                landed: 0,
+                behind: 0,
+                unlanded_paths,
+            })
+        };
+        assert!(
+            removal_unlanded_refusal(&workspace(), &oid('4'), &with_paths(reasons), None)
+                .message
+                .ends_with(
+                    "changing 7 files whose change main does not hold (main is at \
+                     1111111111111111111111111111111111111111): a.rs (missing: main lacks this \
+                     change), b.rs (conflict: main changed these lines too and lacks this \
+                     change), c.rs \
+                     (added: main does not have it), d.rs (deleted: main still has it), e.rs \
+                     (changed: main deleted it), f.sh (mode: main's differs), g.png \
+                     (unmergeable: Cannot merge binary files)"
+                ),
+        );
+
+        let wide = (0..13)
+            .map(|index| unheld(&format!("src/{index:02}.rs"), UnlandedChange::Missing))
+            .collect();
+        let message =
+            removal_unlanded_refusal(&workspace(), &oid('4'), &with_paths(wide), None).message;
+        assert!(message.contains("changing 13 files"), "{message}");
+        assert!(
+            message.ends_with("src/09.rs (missing: main lacks this change), and 3 more"),
+            "{message}"
+        );
+        assert!(!message.contains("src/10.rs"), "{message}");
     }
 
     /// The refusal that read as missing work when the work was published: when main's tracking ref
@@ -15077,6 +15258,10 @@ mod removal_refusal_tests {
                     unlanded: 2,
                     landed: 0,
                     behind: 0,
+                    unlanded_paths: vec![unheld(
+                        "side.txt",
+                        crate::api::dto::UnlandedChange::Added,
+                    )],
                 },
             }],
         };
@@ -15111,17 +15296,18 @@ mod removal_refusal_tests {
         );
     }
 
-    /// The half of the gate this change exists to fix. Patch equivalence satisfies "landed", so a
-    /// workspace whose work reached main by squash-merge or a history rewrite retires with no flag
-    /// at all — while genuinely unheld work still requires the one flag that authorizes losing it.
+    /// The half of the gate this change exists to fix. Content satisfies "landed", so a workspace
+    /// whose work reached main by squash-merge, a history rewrite, or a conflict-resolved pick
+    /// retires with no flag at all — while genuinely unheld work still requires the one flag that
+    /// authorizes losing it.
     #[test]
-    fn the_landed_gate_accepts_patch_equivalence_and_still_refuses_unheld_work() {
-        // Landed by patch identity alone: nothing ahead is unheld, though one commit is not an
-        // ancestor of main. No flag, and nothing to bundle.
+    fn the_landed_gate_accepts_landed_content_and_still_refuses_unheld_work() {
+        // Landed by content alone: nothing ahead is unheld, though one commit is not an ancestor
+        // of main. No flag, and nothing to bundle.
         assert_eq!(
             removal_landed_decision(measured(0, 1), false),
             RemovalLandedDecision::Landed,
-            "patch-equivalent work needs no authorization"
+            "landed content needs no authorization"
         );
 
         // Nothing ahead at all — landed by ancestry — is the same answer by the same rule.
@@ -15180,6 +15366,7 @@ mod removal_refusal_tests {
                 unlanded: 2,
                 landed: 0,
                 behind: 0,
+                unlanded_paths: vec![unheld("side.txt", crate::api::dto::UnlandedChange::Added)],
             },
         };
         let unlanded = with_branches(BranchLandings::Measured {
@@ -15196,9 +15383,9 @@ mod removal_refusal_tests {
         assert_eq!(
             refusal.message,
             format!(
-                "workspace raven holds 1 other branch that main does not hold, by ancestry or by \
-                 patch equivalence, and that no branch or push ref in main's repository \
-                 preserves: side at {} (2 commits)",
+                "workspace raven holds 1 other branch whose changes main does not hold and that \
+                 no branch or push ref in main's repository preserves: side at {} (2 commits: \
+                 side.txt (added: main does not have it))",
                 oid('5')
             )
         );
@@ -18462,8 +18649,9 @@ fn removal_landed_decision(landed: NativeLandedState, abandon: bool) -> RemovalL
     }
 }
 
-/// Why the gate exists: these commits exist nowhere but the image about to be deleted. Names the
-/// head and every branch that did not pass, each with its tip and what it carries.
+/// Why the gate exists: these changes exist nowhere but the image about to be deleted. Names the
+/// head and every branch that did not pass, each with its tip, its commits and each file whose
+/// change the branch does not hold, with why.
 ///
 /// `published` is what the containment repository's own tracking ref of its published branch
 /// holds of the head, measured only once the decision has refused. When it holds every commit the
@@ -18485,12 +18673,16 @@ fn removal_unlanded_refusal(
         LandingCommits::Measured {
             target_head,
             unlanded,
+            unlanded_paths,
             ..
         } => {
             let mut finding = format!(
-                "workspace {workspace} head {head} carries {unlanded} commit{} that {branch} does \
-                 not hold, by ancestry or by patch equivalence ({branch} is at {target_head})",
-                if *unlanded == 1 { "" } else { "s" }
+                "workspace {workspace} head {head} carries {unlanded} commit{} changing {} \
+                 file{} whose change {branch} does not hold ({branch} is at {target_head}): {}",
+                if *unlanded == 1 { "" } else { "s" },
+                unlanded_paths.len(),
+                if unlanded_paths.len() == 1 { "" } else { "s" },
+                unlanded_paths_text(unlanded_paths, branch),
             );
             if let Some(published) = published {
                 let drift = match (published.target_ahead, published.target_behind) {
@@ -18523,11 +18715,16 @@ fn removal_unlanded_refusal(
             let named = unlanded
                 .iter()
                 .map(|other| match &other.commits {
-                    LandingCommits::Measured { unlanded, .. } => format!(
-                        "{} at {} ({unlanded} commit{})",
+                    LandingCommits::Measured {
+                        unlanded,
+                        unlanded_paths,
+                        ..
+                    } => format!(
+                        "{} at {} ({unlanded} commit{}: {})",
                         other.branch,
                         other.tip,
-                        if *unlanded == 1 { "" } else { "s" }
+                        if *unlanded == 1 { "" } else { "s" },
+                        unlanded_paths_text(unlanded_paths, branch),
                     ),
                     LandingCommits::Indeterminate { reason } => {
                         format!("{} at {} (unmeasured: {reason})", other.branch, other.tip)
@@ -18536,9 +18733,8 @@ fn removal_unlanded_refusal(
                 .collect::<Vec<_>>()
                 .join(", ");
             findings.push(format!(
-                "workspace {workspace} holds {} other branch{} that {branch} does not hold, by \
-                 ancestry or by patch equivalence, and that no branch or push ref in {branch}'s \
-                 repository preserves: {named}",
+                "workspace {workspace} holds {} other branch{} whose changes {branch} does not \
+                 hold and that no branch or push ref in {branch}'s repository preserves: {named}",
                 unlanded.len(),
                 if unlanded.len() == 1 { "" } else { "es" }
             ));
@@ -18555,6 +18751,40 @@ fn removal_unlanded_refusal(
         _ => format!("land the workspace: cowshed land {workspace}"),
     };
     CowshedError::conflict(findings.join("; "), hint)
+}
+
+/// A refusal names this many files; the rest are counted, so a wide change cannot bury the
+/// sentence that matters.
+#[cfg(target_os = "macos")]
+const REFUSAL_PATH_LIMIT: usize = 10;
+
+/// The files a refusal names, each with why `target` does not hold its change.
+#[cfg(target_os = "macos")]
+fn unlanded_paths_text(paths: &[crate::api::dto::UnlandedPath], target: &str) -> String {
+    use crate::api::dto::UnlandedChange;
+
+    let mut named = paths
+        .iter()
+        .take(REFUSAL_PATH_LIMIT)
+        .map(|unlanded| {
+            let why = match &unlanded.change {
+                UnlandedChange::Missing => format!("missing: {target} lacks this change"),
+                UnlandedChange::Conflict => {
+                    format!("conflict: {target} changed these lines too and lacks this change")
+                }
+                UnlandedChange::Added => format!("added: {target} does not have it"),
+                UnlandedChange::Deleted => format!("deleted: {target} still has it"),
+                UnlandedChange::DeletedInTarget => format!("changed: {target} deleted it"),
+                UnlandedChange::Mode => format!("mode: {target}'s differs"),
+                UnlandedChange::Unmergeable { reason } => format!("unmergeable: {reason}"),
+            };
+            format!("{} ({why})", unlanded.path)
+        })
+        .collect::<Vec<_>>();
+    if paths.len() > REFUSAL_PATH_LIMIT {
+        named.push(format!("and {} more", paths.len() - REFUSAL_PATH_LIMIT));
+    }
+    named.join(", ")
 }
 
 /// A refused slot binding is the caller's problem, not the store's: the slot is taken, or the

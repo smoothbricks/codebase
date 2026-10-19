@@ -386,6 +386,18 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
             unlanded: 4,
             landed: 541,
             behind: 673,
+            unlanded_paths: vec![
+                UnlandedPath {
+                    path: "src/gate.rs".into(),
+                    change: UnlandedChange::Conflict,
+                },
+                UnlandedPath {
+                    path: "assets/logo.png".into(),
+                    change: UnlandedChange::Unmergeable {
+                        reason: "Cannot merge binary files".into(),
+                    },
+                },
+            ],
         },
         branches: BranchLandings::Measured {
             unlanded: vec![BranchLanding {
@@ -397,6 +409,10 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
                     unlanded: 2,
                     landed: 0,
                     behind: 673,
+                    unlanded_paths: vec![UnlandedPath {
+                        path: "side.txt".into(),
+                        change: UnlandedChange::Added,
+                    }],
                 },
             }],
         },
@@ -411,7 +427,14 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
                 "targetHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "unlanded": 4,
                 "landed": 541,
-                "behind": 673
+                "behind": 673,
+                "unlandedPaths": [
+                    { "path": "src/gate.rs", "change": { "kind": "conflict" } },
+                    {
+                        "path": "assets/logo.png",
+                        "change": { "kind": "unmergeable", "reason": "Cannot merge binary files" }
+                    }
+                ]
             },
             "branches": {
                 "state": "measured",
@@ -424,7 +447,8 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
                         "targetHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                         "unlanded": 2,
                         "landed": 0,
-                        "behind": 673
+                        "behind": 673,
+                        "unlandedPaths": [{ "path": "side.txt", "change": { "kind": "added" } }]
                     }
                 }]
             }
@@ -471,6 +495,7 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
             unlanded: 0,
             landed: 1,
             behind: 1,
+            unlanded_paths: Vec::new(),
         },
         branches,
     };

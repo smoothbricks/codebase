@@ -248,12 +248,14 @@ commit to keep), when the bytes are the installed bytes, or when the candidate r
 installed record that exists but cannot be read is `Integrity` naming the file, never read as absent: it says a commit
 was installed and will not say which. Otherwise the candidate must record a commit, and that commit must be on the
 `main` branch of an adopted project's own checkout (the adopted-project registry, read live). That main judges it: every
-commit of `<candidate>..<installed>` must be held by the candidate, by ancestry or by patch identity — exactly the
-containment `cowshed rm` requires (`GitRepository::commits_not_held`, the list form of `commits_already_held`:
-`git cherry` equivalence for ordinary commits that change something, and merges that author nothing). Main is the
-authority because it outlives every workspace: a workspace's commit may be rebased away when it lands and the workspace
-removed, while main only moves forward. A rebased or cherry-picked commit, or a squash of one commit, is held by patch
-identity; a squash of several commits matches none of them, and is refused naming each.
+commit of `<candidate>..<installed>` must be held by the candidate, by ancestry or by patch identity
+(`GitRepository::commits_not_held`: `git cherry` equivalence for ordinary commits that change something, and merges that
+author nothing). This is an identity question, deliberately not `cowshed rm`'s content one (02_workspaces.md, `rm` step
+1): a build that lacks a commit lacks it whatever its tree says, while a workspace whose change main holds under another
+commit loses nothing when removed. Main is the authority because it outlives every workspace: a workspace's commit may
+be rebased away when it lands and the workspace removed, while main only moves forward. A rebased or cherry-picked
+commit, or a squash of one commit, is held by patch identity; a squash of several commits matches none of them, and is
+refused naming each.
 
 Every refusal is `Conflict` naming the binary it would have installed and both builds
 (`commit <12 hex>, committed <RFC 3339 UTC>`). A candidate that lacks installed commits names each one as

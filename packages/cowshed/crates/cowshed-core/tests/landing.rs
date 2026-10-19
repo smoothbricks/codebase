@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cowshed_core::api::{BranchLandings, LandingCommits, WorkspaceLanding};
+use cowshed_core::api::{BranchLandings, LandingCommits, UnlandedChange, WorkspaceLanding};
 use cowshed_core::landing::{measure, resolve_target};
 use cowshed_os::fork_lock::Run as _;
 
@@ -398,10 +398,10 @@ async fn a_clean_merge_does_not_block_a_workspace_whose_commits_are_all_held() {
     );
 }
 
-/// An empty commit has no patch-id either. Git reports it unmatched even when the target holds an
-/// equally empty commit, and that is the answer this check wants: unprovable, therefore unlanded.
+/// An empty commit changes no file, so it carries no content the target could lack: landed. Its
+/// message is all it holds, and a message is not work `rm` keeps a workspace alive for.
 #[tokio::test]
-async fn an_empty_commit_in_the_range_counts_as_unlanded() {
+async fn an_empty_commit_carries_no_content_and_is_landed() {
     let fixture = Fixture::new("empty-commit");
     let mount = fixture.clone_workspace("marker");
     let output = Command::new("git")
@@ -418,11 +418,40 @@ async fn an_empty_commit_in_the_range_counts_as_unlanded() {
         .expect("run git commit");
     assert!(output.status.success(), "empty commit");
 
-    // The target gets an empty commit too, so a naive "same patch" rule would match them.
-    let upstream = Command::new("git")
+    let landing = measured(&fixture, &mount).await;
+    assert_eq!(counts(&landing), (0, 1, 0));
+    assert!(landing.commits.fully_landed());
+}
+
+/// The files a measurement names, each with why the target does not hold its change.
+fn unlanded_paths(landing: &WorkspaceLanding) -> Vec<(&str, &UnlandedChange)> {
+    match &landing.commits {
+        LandingCommits::Measured { unlanded_paths, .. } => unlanded_paths
+            .iter()
+            .map(|unlanded| (unlanded.path.as_str(), &unlanded.change))
+            .collect(),
+        LandingCommits::Indeterminate { reason } => {
+            panic!("expected a measurement, got indeterminate: {reason}")
+        }
+    }
+}
+
+/// Pick the workspace commit `oid` into the parent, where it conflicts, and resolve `file` to
+/// `resolution`.
+fn pick_resolving(fixture: &Fixture, mount: &Path, oid: &str, file: &str, resolution: &str) {
+    git(
+        fixture.parent(),
+        [
+            OsStr::new("fetch"),
+            OsStr::new("-q"),
+            mount.as_os_str(),
+            OsStr::new("HEAD"),
+        ],
+    );
+    let pick = Command::new("git")
         .arg("-C")
         .arg(fixture.parent())
-        .args(["commit", "-q", "--allow-empty", "-m", "an upstream marker"])
+        .args(["cherry-pick", oid])
         .env("GIT_AUTHOR_NAME", "fixture")
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "fixture")
@@ -430,17 +459,130 @@ async fn an_empty_commit_in_the_range_counts_as_unlanded() {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output_locked()
-        .expect("run git commit");
-    assert!(upstream.status.success(), "upstream empty commit");
+        .expect("run git cherry-pick");
+    assert!(!pick.status.success(), "the fixture depends on a conflict");
+    fixture.write_parent(file, resolution);
+    git(fixture.parent(), ["add", "-A"]);
+    git(
+        fixture.parent(),
+        ["-c", "core.editor=true", "cherry-pick", "--continue"],
+    );
+}
+
+/// The pick a lander lands by hand. The target edited the line beside the workspace's, so the
+/// pick conflicted and was resolved keeping both; the target then edited the same file again. No
+/// target commit is the workspace's by ancestry or patch identity, and the file differs from the
+/// workspace's byte for byte, yet the target holds every change the workspace made: landed.
+#[tokio::test]
+async fn a_conflict_resolved_pick_the_target_moved_past_is_landed_by_content() {
+    let fixture = Fixture::new("resolved-pick");
+    fixture.parent_commit("gate.txt", "alpha\nbeta\ngamma\ndelta\nepsilon\n", "gate");
+    let mount = fixture.clone_workspace("gate-coverage");
+    workspace_commit(
+        &mount,
+        "gate.txt",
+        "alpha\nbeta\ngamma shed\ndelta\nepsilon\n",
+        "cover the gate",
+    );
+    let shed = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    fixture.parent_commit(
+        "gate.txt",
+        "alpha\nbeta main\ngamma\ndelta\nepsilon\n",
+        "beside it",
+    );
+    pick_resolving(
+        &fixture,
+        &mount,
+        &shed,
+        "gate.txt",
+        "alpha\nbeta main\ngamma shed\ndelta\nepsilon\n",
+    );
+    fixture.parent_commit(
+        "gate.txt",
+        "alpha main\nbeta main\ngamma shed\ndelta\nepsilon main\n",
+        "moved on",
+    );
 
     let landing = measured(&fixture, &mount).await;
-    assert_eq!(counts(&landing), (1, 0, 1));
+    assert_eq!(counts(&landing), (0, 1, 3));
+    assert!(landing.commits.fully_landed(), "{landing:?}");
+}
+
+/// The same pick, but the lander's resolution dropped the workspace's line for one of its own:
+/// the content differs, and the measurement names the file and why.
+#[tokio::test]
+async fn a_pick_resolved_without_the_workspace_line_names_the_file_as_a_conflict() {
+    let fixture = Fixture::new("dropped-pick");
+    fixture.parent_commit("gate.txt", "alpha\nbeta\ngamma\n", "gate");
+    let mount = fixture.clone_workspace("gate-coverage");
+    workspace_commit(
+        &mount,
+        "gate.txt",
+        "alpha\nbeta shed\ngamma\n",
+        "cover the gate",
+    );
+    workspace_commit(&mount, "kept.txt", "kept\n", "kept work");
+    let shed = git(&mount, ["rev-parse", "HEAD~1"]).trim().to_owned();
+    let kept = git(&mount, ["rev-parse", "HEAD"]).trim().to_owned();
+    fixture.parent_commit("gate.txt", "alpha\nbeta main\ngamma\n", "same line");
+    pick_resolving(
+        &fixture,
+        &mount,
+        &shed,
+        "gate.txt",
+        "alpha\nbeta main and more\ngamma\n",
+    );
+    git(fixture.parent(), ["cherry-pick", &kept]);
+
+    let landing = measured(&fixture, &mount).await;
+    assert_eq!(counts(&landing), (1, 1, 3));
+    assert_eq!(
+        unlanded_paths(&landing),
+        [("gate.txt", &UnlandedChange::Conflict)],
+        "kept.txt is held; only the file whose change the target lacks is named"
+    );
     assert!(!landing.commits.fully_landed());
 }
 
-/// A rebase that resolved a conflict produced content that exists nowhere upstream, and the patch-id
-/// rule must notice. This is the false-positive that would matter most: it touches only files the
-/// target already changed, so a file-level or branch-level heuristic would wave it through.
+/// Every way a file can differ reads as itself: an edit the target never took, a file the
+/// workspace added, one it deleted, one the target deleted under it, and a mode change.
+#[tokio::test]
+async fn each_unheld_file_is_named_with_why_the_target_lacks_its_change() {
+    let fixture = Fixture::new("reasons");
+    fixture.parent_commit("edited.txt", "edited\n", "edited");
+    fixture.parent_commit("doomed.txt", "doomed\n", "doomed");
+    fixture.parent_commit("orphaned.txt", "orphaned\n", "orphaned");
+    fixture.parent_commit("tool.sh", "echo\n", "tool");
+    let mount = fixture.clone_workspace("reasons");
+    fs::write(mount.join("edited.txt"), "edited here\n").expect("edit");
+    fs::write(mount.join("added.txt"), "added\n").expect("add");
+    fs::remove_file(mount.join("doomed.txt")).expect("delete");
+    fs::write(mount.join("orphaned.txt"), "changed here\n").expect("change");
+    git(&mount, ["add", "-A"]);
+    git(&mount, ["update-index", "--chmod=+x", "tool.sh"]);
+    commit(&mount, "every kind of change");
+    fs::remove_file(fixture.parent().join("orphaned.txt")).expect("delete upstream");
+    git(fixture.parent(), ["add", "-A"]);
+    commit(fixture.parent(), "drop orphaned");
+
+    let landing = measured(&fixture, &mount).await;
+    assert_eq!(counts(&landing), (1, 0, 1));
+    assert_eq!(
+        unlanded_paths(&landing),
+        [
+            ("added.txt", &UnlandedChange::Added),
+            ("doomed.txt", &UnlandedChange::Deleted),
+            ("edited.txt", &UnlandedChange::Missing),
+            ("orphaned.txt", &UnlandedChange::DeletedInTarget),
+            ("tool.sh", &UnlandedChange::Mode),
+        ]
+    );
+}
+
+/// A rebase that resolved a conflict produced content that exists nowhere upstream, and the
+/// content rule must notice. This is the false-positive that would matter most: it touches only
+/// files the target already changed, so a file-level or branch-level heuristic would wave it
+/// through.
 #[tokio::test]
 async fn a_conflict_resolution_is_unlanded_even_though_it_touches_only_landed_files() {
     let fixture = Fixture::new("conflict");

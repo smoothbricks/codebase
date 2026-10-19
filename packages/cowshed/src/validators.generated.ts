@@ -1366,6 +1366,18 @@ export const assertUnattributedRunList = typia.createAssertEquals<readonly Api.U
 export const parseUnattributedRunList = (json: string): readonly Api.UnattributedRun[] =>
   assertUnattributedRunList(JSON.parse(json));
 
+export const assertUnlandedChange = typia.createAssertEquals<Api.UnlandedChange>();
+export const parseUnlandedChange = (json: string): Api.UnlandedChange => assertUnlandedChange(JSON.parse(json));
+export const assertUnlandedChangeList = typia.createAssertEquals<readonly Api.UnlandedChange[]>();
+export const parseUnlandedChangeList = (json: string): readonly Api.UnlandedChange[] =>
+  assertUnlandedChangeList(JSON.parse(json));
+
+export const assertUnlandedPath = typia.createAssertEquals<Api.UnlandedPath>();
+export const parseUnlandedPath = (json: string): Api.UnlandedPath => assertUnlandedPath(JSON.parse(json));
+export const assertUnlandedPathList = typia.createAssertEquals<readonly Api.UnlandedPath[]>();
+export const parseUnlandedPathList = (json: string): readonly Api.UnlandedPath[] =>
+  assertUnlandedPathList(JSON.parse(json));
+
 export const assertUsageReconciliation = typia.createAssertEquals<Api.UsageReconciliation>();
 export const parseUsageReconciliation = (json: string): Api.UsageReconciliation =>
   assertUsageReconciliation(JSON.parse(json));

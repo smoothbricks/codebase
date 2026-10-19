@@ -1009,7 +1009,9 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
             .expect_err("unlanded commits require explicit abandonment");
         assert_eq!(refusal.code, cowshed_core::ErrorCode::Conflict);
         assert!(
-            refusal.message.contains("carries 1 commit that main"),
+            refusal
+                .message
+                .contains("carries 1 commit changing 1 file whose change main"),
             "{refusal:?}"
         );
         assert_eq!(head(&mount), original_head);
