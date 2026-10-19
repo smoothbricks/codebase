@@ -374,11 +374,9 @@ describe('Buffer Integration', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
       await trace('test', async (ctx) => {
-        // Log multiple entries with small delays
+        // Log several entries in one trace; the span boundaries are what this test orders
         ctx.log.info('first');
-        await new Promise((r) => setTimeout(r, 5));
         ctx.log.info('second');
-        await new Promise((r) => setTimeout(r, 5));
         ctx.log.info('third');
         // Access internal buffer for test verification
         const internalBuffer = Reflect.get(ctx, '_buffer');

@@ -215,15 +215,24 @@ describe('StdioTracer', () => {
       const tracer = new StdioTracer(ctx, { ...createTestTracerOptions(), out, err, colorEnabled: false });
       const { trace } = tracer;
 
+      // The Node trace root reads process.hrtime.bigint() through the global on every stamp, so the op's 10 ms is
+      // exact on the injected clock and the span-end line prints that duration on any host.
+      let hrtimeNow = 5_000_000_000n;
+      const originalHrtime = process.hrtime.bigint;
       const testOp = defineOp('test', async (ctx) => {
-        await new Promise((r) => setTimeout(r, 10)); // Small delay
+        hrtimeNow += 10_000_000n;
         return ctx.ok('done');
       });
 
-      await trace('duration-test', testOp);
+      try {
+        process.hrtime.bigint = () => hrtimeNow;
+        await trace('duration-test', testOp);
+      } finally {
+        process.hrtime.bigint = originalHrtime;
+      }
 
-      // Should have duration with unit (ms, µs, ns, or s)
-      expect(output.some((line) => /\(\d+\.\d+(?:s|ms|µs|ns)\)/.test(line))).toBe(true);
+      // The span took exactly 10 ms on the injected clock
+      expect(output.some((line) => line.includes('(10.00ms)'))).toBe(true);
     });
   });
 
@@ -236,7 +245,6 @@ describe('StdioTracer', () => {
       const { trace } = tracer;
 
       const childOp = defineOp('child', async (ctx) => {
-        await new Promise((r) => setTimeout(r, 5));
         return ctx.ok('c');
       });
 

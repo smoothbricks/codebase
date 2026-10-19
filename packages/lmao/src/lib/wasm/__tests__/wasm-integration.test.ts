@@ -596,21 +596,29 @@ describe('WASM Integration Tests', () => {
     });
 
     it('handles async functions correctly', async () => {
-      const result = await tracer.trace('async-op', async (ctx) => {
-        await new Promise((resolve) => setTimeout(resolve, 1));
-        ctx.tag.userId('async-user');
-        return ctx.ok({ async: true });
-      });
+      // performance.now is injected: the op advances it by exactly 1 ms, so the span-end stamp is exact
+      const originalPerformanceNow = performance.now;
+      let performanceNow = 1_000;
+      try {
+        Object.defineProperty(performance, 'now', { configurable: true, value: () => performanceNow });
+        const result = await tracer.trace('async-op', async (ctx) => {
+          performanceNow += 1;
+          ctx.tag.userId('async-user');
+          return ctx.ok({ async: true });
+        });
 
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.async).toBe(true);
+        expect(result.success).toBe(true);
+        if (result.success) {
+          expect(result.value.async).toBe(true);
+        }
+
+        const buffer = tracer.rootBuffers[0];
+        expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
+        // The span-end stamp is the span-start stamp plus the op's 1 ms on the injected clock
+        expect(buffer.timestamp[1] - buffer.timestamp[0]).toBe(1_000_000n);
+      } finally {
+        Object.defineProperty(performance, 'now', { configurable: true, value: originalPerformanceNow });
       }
-
-      const buffer = tracer.rootBuffers[0];
-      expect(resolveEntryType(buffer, 1)).toBe(ENTRY_TYPE_SPAN_OK);
-      // Timestamps should reflect the delay
-      expect(buffer.timestamp[1]).toBeGreaterThan(buffer.timestamp[0]);
     });
   });
 

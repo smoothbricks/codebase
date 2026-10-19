@@ -1,7 +1,7 @@
 // Configure Node.js timestamp implementation - MUST be first import
 import '../../__tests__/test-helpers.js';
 
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, jest } from 'bun:test';
 import { Err, Ok } from '../../result.js';
 import { COLLECTOR_ACK, FakeCollectorClient } from '../collectorClient.js';
 import type { TraceRow } from '../traceRows.js';
@@ -57,13 +57,24 @@ describe('CollectorClient contract (via FakeCollectorClient)', () => {
     });
 
     it('supports injected ack latency', async () => {
-      const client = new FakeCollectorClient();
-      client.setLatency(20);
+      // The fake's latency is a timer, so fake timers hold the ack for the injected 20 ms: nothing is acked at 19 ms,
+      // and the send resolves when the 20 ms timer fires.
+      jest.useFakeTimers();
+      try {
+        const client = new FakeCollectorClient();
+        client.setLatency(20);
 
-      const start = Date.now();
-      const result = await client.send(rows);
-      expect(result).toBeInstanceOf(Ok);
-      expect(Date.now() - start).toBeGreaterThanOrEqual(15);
+        const pending = client.send(rows);
+        jest.advanceTimersByTime(19);
+        expect(client.acked).toHaveLength(0);
+
+        jest.advanceTimersByTime(1);
+        const result = await pending;
+        expect(result).toBeInstanceOf(Ok);
+        expect(client.acked).toEqual([rows]);
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 
