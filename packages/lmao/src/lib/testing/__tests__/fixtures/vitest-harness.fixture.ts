@@ -40,17 +40,15 @@ wrapped.describe.skipIf(false)('wrapped suite', () => {
   wrapped.it.skipIf(true)('must remain skipped', () => {
     throw new Error('skipped body ran');
   });
-  wrapped.it.runIf(true)(
-    'enabled',
-    async () => {
-      await record('enabled');
-    },
-    1_000,
-  );
+  wrapped.it.runIf(true)('enabled', async () => {
+    await record('enabled');
+  });
+  // An options object still reaches the runner through `each`; it carries no per-test deadline (the leg's no-progress
+  // bound is the only one).
   wrapped.it.each`
     label       | count
     ${'tagged'} | ${3}
-  `('tagged $label', { timeout: 1_000 }, async ({ label, count }) => {
+  `('tagged $label', { retry: 0 }, async ({ label, count }) => {
     vitest.expect(count).toBe(3);
     await record(label);
   });

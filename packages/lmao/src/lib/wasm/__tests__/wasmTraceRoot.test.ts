@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
+import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { JsBufferStrategy } from '../../JsBufferStrategy.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
@@ -30,6 +31,25 @@ const mockTracer: TracerLifecycleHooks<typeof mockSchema> = {
   bufferStrategy: new JsBufferStrategy<typeof mockSchema>(),
 };
 
+type InjectedClock = { date: number; now: number };
+
+/**
+ * Run `run` with `Date.now()` and `performance.now()` answering from `clock`; the test may advance `clock.now`.
+ * The WASM module reads both through its `env` imports, which call the globals on every read.
+ */
+function withInjectedClock<T>(clock: InjectedClock, run: (clock: InjectedClock) => T): T {
+  const originalDateNow = Date.now;
+  const originalNow = performance.now;
+  Date.now = () => clock.date;
+  Object.defineProperty(performance, 'now', { configurable: true, value: () => clock.now });
+  try {
+    return run(clock);
+  } finally {
+    Date.now = originalDateNow;
+    Object.defineProperty(performance, 'now', { configurable: true, value: originalNow });
+  }
+}
+
 describe('WasmTraceRoot', () => {
   let allocator: WasmAllocator;
 
@@ -47,25 +67,21 @@ describe('WasmTraceRoot', () => {
       expect(traceRoot.allocator).toBe(allocator);
     });
 
-    it('initializes anchorEpochNanos to a valid timestamp', () => {
-      const before = Date.now();
-      const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const after = Date.now();
-
-      // anchorEpochNanos is in nanoseconds, Date.now() is in milliseconds
-      const anchorMs = Number(traceRoot.anchorEpochNanos / 1_000_000n);
-
-      expect(anchorMs).toBeGreaterThanOrEqual(before);
-      expect(anchorMs).toBeLessThanOrEqual(after + 1); // +1 for timing tolerance
+    it('initializes anchorEpochNanos to the wall-clock millisecond Date.now() reports', () => {
+      // The WASM module reads Date.now() through its dateNow import, so the anchor is exactly that millisecond.
+      const anchor = withInjectedClock(
+        { date: 1_700_000_000_123, now: 1_000 },
+        () => createWasmTraceRoot(allocator, 'test-trace-id', mockTracer).anchorEpochNanos,
+      );
+      expect(anchor).toBe(1_700_000_000_123n * 1_000_000n);
     });
 
-    it('initializes anchorPerfNow to a valid performance.now() value', () => {
-      const before = performance.now();
-      const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-      const after = performance.now();
-
-      expect(traceRoot.anchorPerfNow).toBeGreaterThanOrEqual(before);
-      expect(traceRoot.anchorPerfNow).toBeLessThanOrEqual(after);
+    it('initializes anchorPerfNow to the performance.now() value it reads', () => {
+      const perfNow = withInjectedClock(
+        { date: 1_700_000_000_123, now: 1_234.5 },
+        () => createWasmTraceRoot(allocator, 'test-trace-id', mockTracer).anchorPerfNow,
+      );
+      expect(perfNow).toBe(1_234.5);
     });
   });
 
@@ -80,26 +96,24 @@ describe('WasmTraceRoot', () => {
       expect(timestamp).toBeGreaterThan(0n);
     });
 
-    it('returns increasing timestamps', async () => {
-      const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-
-      const ts1 = traceRoot.getTimestampNanos();
-      // Small delay to ensure timestamp increases
-      await new Promise((resolve) => setTimeout(resolve, 1));
-      const ts2 = traceRoot.getTimestampNanos();
-
-      expect(ts2).toBeGreaterThan(ts1);
+    it('returns increasing timestamps', () => {
+      // The test owns performance.now(): the clock advances exactly 1 ms between the two reads.
+      withInjectedClock({ date: 1_700_000_000_123, now: 1_000 }, (clock) => {
+        const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
+        const ts1 = traceRoot.getTimestampNanos();
+        clock.now += 1;
+        const ts2 = traceRoot.getTimestampNanos();
+        expect(ts2 - ts1).toBe(1_000_000n);
+      });
     });
 
-    it('returns timestamp close to current time', () => {
-      const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
-
-      const now = Date.now();
-      const timestamp = traceRoot.getTimestampNanos();
-      const timestampMs = Number(timestamp / 1_000_000n);
-
-      // Should be within 100ms of Date.now()
-      expect(Math.abs(timestampMs - now)).toBeLessThan(100);
+    it('stamps elapsed performance.now() time from the wall-clock anchor', () => {
+      // Each stamp is the anchor plus the elapsed injected performance.now(): 5 ms later is exactly 5 ms later.
+      withInjectedClock({ date: 1_700_000_000_123, now: 1_000 }, (clock) => {
+        const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
+        clock.now += 5;
+        expect(traceRoot.getTimestampNanos()).toBe(Nanoseconds.unsafe(1_700_000_000_123n * 1_000_000n + 5_000_000n));
+      });
     });
   });
 

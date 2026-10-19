@@ -58,6 +58,20 @@ function withWallClock<T>(clock: { origin: number; now: number; date: () => numb
   }
 }
 
+/**
+ * Run `run` with `process.hrtime.bigint()` answering from `now`. The Node root reads it through the global on every
+ * call, so the substitution is the clock the stamps use.
+ */
+function withHrtime<T>(now: () => bigint, run: () => T): T {
+  const original = process.hrtime.bigint;
+  process.hrtime.bigint = now;
+  try {
+    return run();
+  } finally {
+    process.hrtime.bigint = original;
+  }
+}
+
 function appendLifecycle(root: NodeTraceRoot | EsTraceRoot, buffer: SpanBuffer<MockLogSchema>): void {
   root._writeSpanStart(root, buffer, 'timestamp-contract');
   root._appendLogEntry(root, buffer, ENTRY_TYPE_INFO);
@@ -75,59 +89,60 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
     expect(typeof ts).toBe('bigint');
   });
 
-  it('should return increasing timestamps', async () => {
-    const { createTraceRoot } = await import('../traceRoot.node.js');
+  it('should return increasing timestamps', () => {
     const mockTracer = createMockTracer();
-    const traceRoot = createTraceRoot('test-trace', mockTracer);
-
-    const ts1 = traceRoot.getTimestampNanos();
-    await new Promise((r) => setTimeout(r, 10));
-    const ts2 = traceRoot.getTimestampNanos();
-
-    expect(ts2).toBeGreaterThan(ts1);
-    // Should be roughly 10ms apart
-    const diff = ts2 - ts1;
-    expect(diff).toBeGreaterThan(5_000_000n); // > 5ms
-    expect(diff).toBeLessThan(50_000_000n); // < 50ms
+    // The test owns the monotonic clock: it advances exactly 10 ms between the two reads, so the delta is exact.
+    let monotonic = 1_000_000_000n;
+    withHrtime(
+      () => monotonic,
+      () => {
+        const traceRoot = createNodeTraceRoot('test-trace', mockTracer);
+        const ts1 = traceRoot.getTimestampNanos();
+        monotonic += 10_000_000n;
+        const ts2 = traceRoot.getTimestampNanos();
+        expect(ts2 - ts1).toBe(10_000_000n);
+      },
+    );
   });
 
-  it('should be within 1ms of Date.now()', async () => {
-    const { createTraceRoot } = await import('../traceRoot.node.js');
+  it('stamps the wall-clock millisecond that Date.now() reports', () => {
     const mockTracer = createMockTracer();
-
-    // Sample multiple times and check they're all close
+    const millisecond = 1_700_000_000_000;
+    // Date.now(), timeOrigin, performance.now() and hrtime are injected and advance together by one second per root,
+    // so the anchor is the platform estimate (origin + now) and the first stamp is that anchor exactly.
     for (let i = 0; i < 10; i++) {
-      const traceRoot = createTraceRoot('test-trace', mockTracer);
-      const dateNowMs = Date.now();
-      const ts = traceRoot.getTimestampNanos();
-      const tsMs = Nanoseconds.toMillis(ts);
-
-      const diffMs = Math.abs(tsMs - dateNowMs);
-      expect(diffMs).toBeLessThanOrEqual(1);
+      const wallMs = millisecond + i * 1_000;
+      const monotonic = BigInt(i) * 1_000_000_000n + 5_000_000n;
+      const ts = withHrtime(
+        () => monotonic,
+        () =>
+          withWallClock({ origin: millisecond - 1_000, now: 1_000.25 + i * 1_000, date: () => wallMs }, () =>
+            createNodeTraceRoot('test-trace', mockTracer).getTimestampNanos(),
+          ),
+      );
+      expect(ts).toBe(Nanoseconds.unsafe(BigInt(wallMs) * 1_000_000n + 250_000n));
     }
   });
 
-  it('should have sub-millisecond precision (true nanoseconds)', async () => {
-    const { createTraceRoot } = await import('../traceRoot.node.js');
+  it('should have sub-millisecond precision (true nanoseconds)', () => {
     const mockTracer = createMockTracer();
-    const traceRoot = createTraceRoot('test-trace', mockTracer);
-    const timestamps: bigint[] = [];
-
-    // Rapid-fire timestamps
-    for (let i = 0; i < 100; i++) {
-      timestamps.push(traceRoot.getTimestampNanos());
-    }
-
-    // Should see sub-millisecond differences (< 1_000_000 nanoseconds)
-    let hasSubMillisecond = false;
-    for (let i = 1; i < timestamps.length; i++) {
-      const diff = timestamps[i] - timestamps[i - 1];
-      if (diff > 0n && diff < 1_000_000n) {
-        hasSubMillisecond = true;
-        break;
-      }
-    }
-    expect(hasSubMillisecond).toBe(true);
+    // The test owns the monotonic clock and steps it 333_333 ns, a width no millisecond or microsecond grid divides:
+    // every delta is exact, so the stamps carry true nanoseconds rather than a coarsened clock.
+    let monotonic = 5_000_000n;
+    withHrtime(
+      () => monotonic,
+      () => {
+        const traceRoot = createNodeTraceRoot('test-trace', mockTracer);
+        const timestamps: bigint[] = [];
+        for (let i = 0; i < 100; i++) {
+          monotonic += 333_333n;
+          timestamps.push(traceRoot.getTimestampNanos());
+        }
+        for (let i = 1; i < timestamps.length; i++) {
+          expect(timestamps[i] - timestamps[i - 1]).toBe(333_333n);
+        }
+      },
+    );
   });
 
   it('should preserve nanosecond deltas in JS fallback above Number.MAX_SAFE_INTEGER', async () => {
@@ -163,54 +178,54 @@ describe('Browser TraceRoot Timestamps (performance.now)', () => {
     expect(typeof ts).toBe('bigint');
   });
 
-  it('should return increasing timestamps', async () => {
-    const { createTraceRoot } = await import('../traceRoot.es.js');
+  it('should return increasing timestamps', () => {
     const mockTracer = createMockTracer();
-    const traceRoot = createTraceRoot('test-trace', mockTracer);
-
-    const ts1 = traceRoot.getTimestampNanos();
-    await new Promise((r) => setTimeout(r, 10));
-    const ts2 = traceRoot.getTimestampNanos();
-
-    expect(ts2).toBeGreaterThan(ts1);
-    // Should be roughly 10ms apart
-    const diff = ts2 - ts1;
-    expect(diff).toBeGreaterThan(5_000_000n); // > 5ms
-    expect(diff).toBeLessThan(50_000_000n); // < 50ms
+    // The test owns performance.now(): it advances exactly 10 ms between the two reads, so the delta is exact.
+    let nowMs = 1_000;
+    withPerformanceNow(
+      () => nowMs,
+      () => {
+        const traceRoot = createEsTraceRoot('test-trace', mockTracer);
+        const ts1 = traceRoot.getTimestampNanos();
+        nowMs += 10;
+        const ts2 = traceRoot.getTimestampNanos();
+        expect(ts2 - ts1).toBe(10_000_000n);
+      },
+    );
   });
 
-  it('should be within 1ms of Date.now()', async () => {
-    const { createTraceRoot } = await import('../traceRoot.es.js');
+  it('stamps the wall-clock millisecond that Date.now() reports', () => {
     const mockTracer = createMockTracer();
-
-    // Sample multiple times and check they're all close
+    const millisecond = 1_700_000_000_000;
+    // Date.now(), timeOrigin and performance.now() are injected and advance together by one second per root, so the
+    // anchor is the platform estimate (origin + now) and the first stamp is that anchor exactly.
     for (let i = 0; i < 10; i++) {
-      const traceRoot = createTraceRoot('test-trace', mockTracer);
-      const dateNowMs = Date.now();
-      const ts = traceRoot.getTimestampNanos();
-      const tsMs = Nanoseconds.toMillis(ts);
-
-      const diffMs = Math.abs(tsMs - dateNowMs);
-      // Browser performance API should be very close to Date.now()
-      expect(diffMs).toBeLessThanOrEqual(1);
+      const wallMs = millisecond + i * 1_000;
+      const ts = withWallClock({ origin: millisecond - 1_000, now: 1_000.25 + i * 1_000, date: () => wallMs }, () =>
+        createEsTraceRoot('test-trace', mockTracer).getTimestampNanos(),
+      );
+      expect(ts).toBe(Nanoseconds.unsafe(BigInt(wallMs) * 1_000_000n + 250_000n));
     }
   });
 });
 
 describe('Platform timestamp append contract', () => {
-  it('anchors public Node and ES factories to the Unix epoch without exact wall-clock equality', () => {
-    const before = BigInt(Date.now()) * 1_000_000n;
-    const node = createNodeTraceRoot('node-epoch', createMockTracer());
-    const es = createEsTraceRoot('es-epoch', createMockTracer());
-    const after = BigInt(Date.now()) * 1_000_000n;
-    const tolerance = 50_000_000n;
-
-    for (const root of [node, es]) {
-      const buffer = createMockSpanBuffer();
-      root._writeSpanStart(root, buffer, 'epoch');
-      expect(buffer.timestamp[0]).toBeGreaterThanOrEqual(before - tolerance);
-      expect(buffer.timestamp[0]).toBeLessThanOrEqual(after + tolerance);
-    }
+  it('anchors public Node and ES factories to the injected Unix epoch wall clock', () => {
+    // Date.now(), timeOrigin, performance.now() and hrtime are held by the test, so each factory's anchor and its
+    // first stamp are the injected wall clock exactly: origin + now is the epoch millisecond plus 0.25 ms.
+    const millisecond = 1_700_000_000_000;
+    withHrtime(
+      () => 5_000_000n,
+      () =>
+        withWallClock({ origin: millisecond - 1_000, now: 1_000.25, date: () => millisecond }, () => {
+          for (const create of [createNodeTraceRoot, createEsTraceRoot]) {
+            const root = create('epoch', createMockTracer());
+            const buffer = createMockSpanBuffer();
+            root._writeSpanStart(root, buffer, 'epoch');
+            expect(buffer.timestamp[0]).toBe(BigInt(millisecond) * 1_000_000n + 250_000n);
+          }
+        }),
+    );
   });
 
   it('keeps lifecycle appends non-decreasing and boundaries strictly monotonic when the clock stalls or rolls back', () => {
@@ -506,18 +521,24 @@ describe('Trace root wall-clock anchor', () => {
     expect(anchored).toBeLessThan(BigInt(stepped + 1) * 1_000_000n);
   });
 
-  it('anchors real roots inside the wall-clock millisecond with sub-millisecond digits', () => {
-    const anchors: bigint[] = [];
+  it('anchors each root on the injected sub-millisecond wall clock, in every millisecond', () => {
+    // Date.now(), timeOrigin, performance.now() and hrtime are injected. Each root moves the wall clock and the
+    // monotonic clocks together by one millisecond, so the bounds stay consistent and the anchor is exactly the
+    // platform estimate (origin + now). The sub-millisecond digits k/16 ms are k * 62_500 ns.
     for (let i = 0; i < 64; i++) {
+      const wallMs = millisecond + i;
+      const k = i % 16;
+      const monotonic = BigInt(i) * 1_000_000n + 5_000_000n;
       for (const create of [createNodeTraceRoot, createEsTraceRoot]) {
-        const before = BigInt(Date.now()) * 1_000_000n;
-        const root = create('real-anchor', createMockTracer());
-        const after = BigInt(Date.now() + 1) * 1_000_000n;
-        expect(root.anchorEpochNanos).toBeGreaterThanOrEqual(before);
-        expect(root.anchorEpochNanos).toBeLessThan(after);
-        anchors.push(root.anchorEpochNanos);
+        const root = withHrtime(
+          () => monotonic,
+          () =>
+            withWallClock({ origin: millisecond - 1_000, now: 1_000 + i + k / 16, date: () => wallMs }, () =>
+              create('real-anchor', createMockTracer()),
+            ),
+        );
+        expect(root.anchorEpochNanos).toBe(BigInt(wallMs) * 1_000_000n + BigInt(k) * 62_500n);
       }
     }
-    expect(anchors.some((anchor) => anchor % 1_000_000n !== 0n)).toBe(true);
   });
 });

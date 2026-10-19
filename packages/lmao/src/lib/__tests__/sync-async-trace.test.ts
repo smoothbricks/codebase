@@ -28,6 +28,18 @@ const testSchema = defineLogSchema({
   requestId: S.category(),
 });
 
+/**
+ * Builds a promise an op awaits to stay pending: the test calls `open()` once it has asserted on the in-flight state,
+ * so those assertions run at a point the test picks instead of racing a timer.
+ */
+function holdOpen(): { held: Promise<void>; open: () => void } {
+  let open: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { held, open };
+}
+
 describe('Sync/Async Trace Execution', () => {
   describe('Sync trace execution', () => {
     it('should write span-ok immediately for sync function', () => {
@@ -110,6 +122,9 @@ describe('Sync/Async Trace Execution', () => {
 
       const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
+      // The op stays pending until the test releases it below
+      const { held, open } = holdOpen();
+
       // Execute async function - trace() returns Promise
       const resultPromise = tracer.trace('async-trace', async (ctx) => {
         capturedBuffer = ctx.buffer;
@@ -120,8 +135,8 @@ describe('Sync/Async Trace Execution', () => {
         // Row 1 not yet written (will be written after Promise resolves)
         // At this point, entry_type[1] may be 0 or pre-initialized
 
-        // Simulate async work
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        // Hold the op until the test releases it below
+        await held;
 
         promiseResolved = true;
 
@@ -134,7 +149,8 @@ describe('Sync/Async Trace Execution', () => {
       // Before awaiting, span-ok not yet written
       expect(promiseResolved).toBe(false);
 
-      // Await the Promise
+      // Release the op, then await the Promise
+      open();
       const result = await resultPromise;
 
       // Promise should have resolved
@@ -160,6 +176,9 @@ describe('Sync/Async Trace Execution', () => {
 
       const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
+      // The op stays pending until the test releases it below
+      const { held, open } = holdOpen();
+
       const testError = new Error('Async error');
 
       // Execute async function that throws
@@ -169,8 +188,8 @@ describe('Sync/Async Trace Execution', () => {
         // span-start written at row 0
         expect(resolveEntryType(ctx.buffer, 0)).toBe(ENTRY_TYPE_SPAN_START);
 
-        // Simulate async work before error
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        // Hold the op until the test releases it below
+        await held;
 
         promiseRejected = true;
 
@@ -183,7 +202,8 @@ describe('Sync/Async Trace Execution', () => {
       // Before awaiting, exception not yet thrown
       expect(promiseRejected).toBe(false);
 
-      // Await and expect rejection
+      // Release the op, then await and expect rejection
+      open();
       await expect(resultPromise).rejects.toThrow('Async error');
 
       // Promise should have rejected
@@ -244,18 +264,21 @@ describe('Sync/Async Trace Execution', () => {
 
       const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
+      // Both traces stay pending until the test releases them
+      const { held, open } = holdOpen();
+
       // Execute multiple async traces in parallel
       const promise1 = tracer.trace('async-1', async (ctx) => {
         buffers.push(ctx.buffer);
         ctx.tag.userId('user-1');
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        await held;
         return 'result-1';
       });
 
       const promise2 = tracer.trace('async-2', async (ctx) => {
         buffers.push(ctx.buffer);
         ctx.tag.userId('user-2');
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        await held;
         return 'result-2';
       });
 
@@ -263,7 +286,8 @@ describe('Sync/Async Trace Execution', () => {
       expect(promise1).toBeInstanceOf(Promise);
       expect(promise2).toBeInstanceOf(Promise);
 
-      // Await both
+      // Release both traces, then await them
+      open();
       const [result1, result2] = await Promise.all([promise1, promise2]);
 
       expect(result1).toBe('result-1');
@@ -287,6 +311,9 @@ describe('Sync/Async Trace Execution', () => {
 
       const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
+      // The async trace stays pending until the test releases it below
+      const { held, open } = holdOpen();
+
       // Sync trace
       const syncResult = tracer.trace('sync', (ctx) => {
         buffers.push(ctx.buffer);
@@ -296,7 +323,7 @@ describe('Sync/Async Trace Execution', () => {
       // Async trace
       const asyncPromise = tracer.trace('async', async (ctx) => {
         buffers.push(ctx.buffer);
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        await held;
         return 'async-done';
       });
 
@@ -310,7 +337,8 @@ describe('Sync/Async Trace Execution', () => {
       expect(syncResult).toBe('sync-done');
       expect(syncResult2).toBe('sync-done-2');
 
-      // Async result available after await
+      // Release the async trace, then await its result
+      open();
       const asyncResult = await asyncPromise;
       expect(asyncResult).toBe('async-done');
 
@@ -367,8 +395,6 @@ describe('Sync/Async Trace Execution', () => {
         ctx.tag.userId('user-123');
         ctx.tag.requestId('req-456');
 
-        await new Promise((resolve) => setTimeout(resolve, 5));
-
         return { id: 123 };
       });
 
@@ -419,8 +445,6 @@ describe('Sync/Async Trace Execution', () => {
 
         // Log events
         ctx.log.info('Starting async operation');
-
-        await new Promise((resolve) => setTimeout(resolve, 5));
 
         ctx.log.info('Completed async operation');
 
