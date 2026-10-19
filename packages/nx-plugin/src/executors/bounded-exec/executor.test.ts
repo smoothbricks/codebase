@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it, jest } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { access, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
@@ -11,6 +11,7 @@ import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readI
 import { CPU_TOKENS_ENV, type CpuBudget, parseInheritedTokens, type TokenGrant } from './cpu-tokens.js';
 import {
   type BoundedExecContext,
+  type BoundedExecResult,
   createProcessTreeKiller,
   type ProcessTreeKiller,
   resolveCowshedExecutable,
@@ -458,17 +459,47 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   it('imposes no progress bound when idleTimeoutMs is omitted', async () => {
     const workspace = await createWorkspace();
-
-    const result = await runBoundedExec(
-      { command: 'node -e "setTimeout(() => console.log(\'late\'), 400)"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
-      workspace.context,
-      createProcessTreeKiller(),
-      null,
-      null,
+    const go = join(workspace.root, 'go.fifo');
+    expect(spawnSync('mkfifo', [go]).status).toBe(0);
+    // Says `started`, then goes silent until the test writes `go.fifo`.
+    await workspace.write(
+      'silent.js',
+      [
+        "const fs = require('node:fs');",
+        "console.log('started');",
+        "fs.readFileSync('go.fifo');",
+        "console.log('late');",
+        '',
+      ].join('\n'),
     );
+    const { promise: started, resolve: sawStarted } = Promise.withResolvers<void>();
+    process.stdout.write = captureWrite([], (text) => {
+      if (text.includes('started')) sawStarted();
+    });
+    // Every bound is armed as the command spawns, before it can say `started`. The clock then moves to just short of
+    // the ceiling while the command is silent: any progress bound would have fired there, and the ceiling has not.
+    // Only then is the command released, so the run ends by its own exit.
+    jest.useFakeTimers();
+    let result: BoundedExecResult;
+    try {
+      const run = runBoundedExec(
+        { command: 'node silent.js', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        null,
+      );
+      await started;
+      jest.advanceTimersByTime(BOUNDED_TEST_IDLE_TIMEOUT_MS - 1);
+      await writeFile(go, 'go\n');
+      result = await run;
+    } finally {
+      jest.useRealTimers();
+    }
 
     expect(result.success).toBe(true);
     expect(result.terminalOutput).toContain('late');
+    expect(result.terminalOutput).not.toContain('made no progress');
   });
 
   it('uses graceful timeout termination before force-killing on POSIX', async () => {
