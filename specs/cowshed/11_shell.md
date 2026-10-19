@@ -710,7 +710,9 @@ admitted but never sealed. Two things put that right:
 
   Recovery proves that the recorded leader held its id throughout the membership snapshot. Only those proven members are
   signalled, through a kernel identity that cannot target a later process: the pid/version audit token on macOS, a pidfd
-  on Linux. It sends TERM, waits the existing grace, proves ownership again, then sends KILL to still-owned members. No
+  on Linux. It sends TERM, waits the existing grace, proves ownership again, then sends KILL to still-owned members. A
+  TERM that reaches none of a group's snapshot members is no proof the group ended -- a macOS member that execs after
+  the snapshot runs on under a new pid version -- so every group the snapshot found running gets the KILL pass. No
   ledger operation signals a numeric pid or group after an ownership check. A reused live leader is left alone. A reaped
   or never-identified leader with surviving members is unresolved, never signalled or silently dropped. A full
   membership buffer is not absence evidence; inspection and signal failures retain the ledger and report the operational
