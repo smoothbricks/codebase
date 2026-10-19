@@ -11,7 +11,8 @@
 //! Three rules do the work the operator keeps by hand today:
 //!
 //! - **Order.** Aged waiters first — the starvation bound, so no unit is outranked forever —
-//!   then the class band (gate-class work at parity, background demoted while the host is busy),
+//!   then the class order (gate-class work first; interactive and background work behind it
+//!   while the host is busy),
 //!   the coordinator's urgent override, leverage (the transitive dependents), the cache-domain
 //!   deadline, resource fit against the free capacity, and finally the stable unit id.
 //! - **Serialization.** A unit's run holds its lease classes from its selection until its
@@ -369,7 +370,7 @@ impl Ledger {
             };
             effects.push(Effect::Select {
                 ticket,
-                band: band_of(&entry.facts, host.busy),
+                band: entry.facts.class.band(),
                 attempt,
                 waited,
             });
@@ -559,7 +560,7 @@ impl Ledger {
                     unit: entry.facts.unit.to_string(),
                     owner: entry.facts.owner.to_string(),
                     class: entry.facts.class,
-                    band: band_of(&entry.facts, host.busy),
+                    band: entry.facts.class.band(),
                     priority: entry.facts.priority,
                     urgent: entry.facts.urgent,
                     leverage: leverage.get(&entry.facts.unit).copied().unwrap_or(0),
@@ -631,22 +632,13 @@ impl Ledger {
     }
 }
 
-/// The order's class band: gate-class work at parity, background-class work demoted behind it
-/// while the host is busy and run at parity when it is not.
+/// The order's class rank (05_gateway.md "Bands", Danny tg#6693: "the gate class is served FIFO
+/// at highest priority over all other execs"): gate-class work first, interactive and background
+/// work behind it while the host is busy and at parity when it is not.
 fn order_band(facts: &TaskFacts, busy: bool) -> u8 {
-    u8::from(facts.class == TaskClass::Background && busy)
-}
-
-/// The band a granted run is placed in: the server owns placement and no caller flag raises it.
-/// The land turn — the publication fence's holder — runs foreground, gate-class work normal, and
-/// demoted background work in the background band until the host quiets.
-fn band_of(facts: &TaskFacts, busy: bool) -> TaskBand {
-    if facts.leases.contains(&LeaseClass::LandPublication) {
-        TaskBand::Foreground
-    } else if facts.class == TaskClass::Background && busy {
-        TaskBand::Background
-    } else {
-        TaskBand::Normal
+    match facts.class {
+        TaskClass::Gate => 0,
+        TaskClass::Interactive | TaskClass::Background => u8::from(busy),
     }
 }
 
@@ -1086,6 +1078,56 @@ mod tests {
         busy.admit(0, 1, background).unwrap();
         busy.admit(0, 2, facts("z-gate")).unwrap();
         assert_eq!(busy.ready(0, BUSY), ["z-gate", "a-bg"]);
+    }
+
+    /// The band regression (05_gateway.md "Bands", Danny tg#6693: interactive above gate above
+    /// regular exec, the gate first for CPU). The wrong results it rules out: a background unit
+    /// reported in the gate's band on a quiet host, the land turn's holder reported foreground
+    /// above work a person or model is waiting on, and an interactive unit ordered for CPU ahead
+    /// of gate work on a busy host.
+    #[test]
+    fn every_unit_runs_in_its_class_band_and_gate_work_is_ordered_first() {
+        let mut clock = Clock::new(30_000);
+        let mut interactive = facts("a-interactive");
+        interactive.class = TaskClass::Interactive;
+        let mut background = facts("b-background");
+        background.class = TaskClass::Background;
+        let mut land = facts("z-land");
+        land.leases = vec![LeaseClass::LandPublication];
+        clock.admit(0, 1, interactive).unwrap();
+        clock.admit(0, 2, background).unwrap();
+        clock.admit(0, 3, facts("y-gate")).unwrap();
+        clock.admit(0, 4, land).unwrap();
+        for host in [IDLE, BUSY] {
+            let bands: Vec<(String, TaskBand)> = clock
+                .ledger
+                .status(clock.at(0), host, &clock.granted, None)
+                .ready
+                .into_iter()
+                .map(|ready| (ready.unit, ready.band))
+                .collect();
+            let band = |unit: &str| {
+                bands
+                    .iter()
+                    .find(|(name, _)| name == unit)
+                    .map(|(_, band)| *band)
+                    .expect("ready unit")
+            };
+            assert_eq!(band("a-interactive"), TaskBand::Foreground, "{host:?}");
+            assert_eq!(band("y-gate"), TaskBand::Normal, "{host:?}");
+            assert_eq!(band("z-land"), TaskBand::Normal, "{host:?}");
+            assert_eq!(band("b-background"), TaskBand::Background, "{host:?}");
+        }
+        // The land's own queue first, then gate work ahead of interactive and background work on
+        // a busy host; on a quiet host only the stable id orders the rest.
+        assert_eq!(
+            clock.ready(0, BUSY),
+            ["z-land", "y-gate", "a-interactive", "b-background"]
+        );
+        assert_eq!(
+            clock.ready(0, IDLE),
+            ["z-land", "a-interactive", "b-background", "y-gate"]
+        );
     }
 
     /// The determinism regression: the same facts produce the same order, however they arrive.

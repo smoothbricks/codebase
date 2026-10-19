@@ -77,6 +77,38 @@ done. They are independent of each other.
 - Acceptance: aborting a following read ends it promptly; aborting a non-following read rejects with an abort error; an
   unaborted read returns its full range.
 
+## The interactive exec class and the gate's nice (Danny tg#6693)
+
+- Spec: `specs/cowshed/05_gateway.md` "Bands", the one table of class, token order, band and nice, after Danny tg#6693:
+  "The gate class is served FIFO at highest priority over all other execs. The interactive class has priority over gate
+  and regular exec. Priority is handled by OS niceness. When gate runs it needs more tickets than background but not
+  fully starve background." Interactive runs at nice 0, gate at +5, background (and a resident) at +10; an interactive
+  job asks the ledger as background. "The task server owns the live grant and nice": a requester that awaits the result
+  asks Interactive, and a worker may. The task server's half is built: `TaskClass::Interactive`, and every band follows
+  its class (`cowshed-gateway-types/src/task_server.rs` `TaskClass::band`).
+- Code: `crates/cowshed-gateway-types/src/cpu_budget.rs:33` `JobserverClass` is Background, Gate and Resident, and is
+  both the exec class and the ledger's wire class. `crates/cowshed-core/src/runtime/supervisor.rs:607-612` `class_nice`
+  places Gate at 0 and Background and Resident at 10. `crates/cowshed-cli/src/args.rs:2338-2342` parses only
+  `background`, `gate` and `resident`. So a command a person or model waits on runs at +10, below a land's gate at 0:
+  the inverse of the ruling.
+- Work: one unit, because moving the gate to +5 alone would lower lands against unmanaged nice-0 processes while every
+  waited-on exec stays at +10, which buys nothing the ruling asks for.
+  - An exec class with Interactive beside Background, Gate and Resident, kept apart from the ledger's `JobserverClass`,
+    so an interactive class cannot reach the gateway's wire (05 "Gate admission": an unknown class is
+    `invalid-request`). `runtime/job_cpu.rs:170` sends an interactive job's root request as `background`.
+  - `cowshed exec --class interactive`, permitted to a worker; `--host` stays gate-only (`args.rs:2362`).
+  - `JobScheduling::new` (`storage/job_artifact.rs:466-473`) admits Workspace with Interactive, and the record's class
+    name and parse (`:4714-4743`) carry it under the record's existing version rules.
+  - `class_nice`: Interactive 0, Gate 5, Background and Resident 10.
+  - The napi wire contract (`cowshed-napi/src/wire_contract.rs`), the generated `JobserverClass` TS type
+    (`src/api.generated.ts:1452`) and `docs/cli.md` `--class`.
+  - A caller that awaits a command's result names it interactive, and nothing infers the class from the command.
+- Acceptance (`crates/cowshed-core/tests/workspace_supervisor.rs`, real spawns): an interactive job, a trusted gate job
+  and a default job record observed nice 0, 5 and 10. A worker's `--class interactive` is admitted and its
+  `--class gate` is still `class-not-permitted`. `cpu-budget` shows the interactive job's tokens under `background`, the
+  gate job's under `gateJobs`, and an interactive request waiting behind the gate job's next want. The wrong result
+  ruled out: a job a person or model waits on observed at a higher nice than a concurrent gate job.
+
 ## CPU budget through Cargo's jobserver
 
 - Spec: `specs/cowshed/05_gateway.md` "Host CPU budget" (Outside `bounded-exec`, The jobserver fifo, The jobserver run,
