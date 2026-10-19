@@ -1307,7 +1307,10 @@ started with lies in the lease. Most leftovers write there only through `TMPDIR`
 sources, a Bun or Node compile cache written at exit), and a working-directory census alone let them write into a lease
 while it was removed, failing the next task's lease with `ENOTEMPTY`. A target's own `env.TMPDIR` wins over the lease.
 Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task keeps its inherited `TMPDIR` and says
-so once. A failed task that left the volume nearly full names the volume.
+so once. A failed task whose output said ENOSPC (`ENOSPC`, or `strerror`'s `No space left on device`) names it, the
+writer's task and lease, and the volume's free space read when that line arrived, and records the `no-space` verdict:
+the writer usually removes what it half-wrote before it exits, so the volume no longer looks full by then. A failed task
+that printed no such line but left the volume nearly full names the volume.
 
 Outside macOS, the executor never provisions an APFS RAM disk: it keeps the inherited `TMPDIR`, or uses the target's
 `env.TMPDIR` override, without reclaiming either directory. The host temp-directory proof runs the real default executor
@@ -1483,6 +1486,10 @@ task id and the hash it ran at:
   this is a hang, never load. Its `tests` name the tests still running: those the runner said were running (nextest's
   `SLOW`, libtest's `has been running for over`) and never said finished, and those the JUnit report says it aborted
   when the bound stopped it.
+- `no-space`: the command failed after its output said a write found no space (`ENOSPC` or `No space left on device`).
+  Its tests failed on the disk, not on their own, whatever bound or hang followed: it records that line and, when the
+  task held a RAM lease, the lease, the volume and its free bytes when the line arrived. A passing run that printed such
+  a line passed.
 - `failed`: a test failed on its own, or the command exited non-zero with no report naming a timeout.
 - `passed`.
 

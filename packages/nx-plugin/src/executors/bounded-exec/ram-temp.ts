@@ -39,6 +39,7 @@ import {
   parseHeldVerdict,
   validateHeldVerdict,
 } from './ram-temp-held.js';
+import type { TempVolumeSpace } from './verdict.js';
 
 /**
  * One RAM-backed APFS volume per host user, shared by every test task that runs
@@ -856,12 +857,24 @@ export class RamTempVolume {
 
   /** After a failed task: whether the volume ran out of space, which is then the error to report. */
   async fullness(lease: RamTempLease): Promise<RamTempError | null> {
+    const space = await this.space(lease);
+    if (space === null || space.freeBytes >= FULL_FREE_BYTES) {
+      return null;
+    }
+    const { mountpoint, capacityBytes, freeBytes } = space;
+    return { kind: 'volume-full', mountpoint, capacityBytes, freeBytes };
+  }
+
+  /** The lease's volume and the space left on it now; `null` when the volume cannot be read. */
+  async space(lease: RamTempLease): Promise<TempVolumeSpace | null> {
     try {
       const fs = await statfs(lease.mountpoint);
-      const freeBytes = fs.bavail * fs.bsize;
-      return freeBytes < FULL_FREE_BYTES
-        ? { kind: 'volume-full', mountpoint: lease.mountpoint, capacityBytes: lease.capacityBytes, freeBytes }
-        : null;
+      return {
+        lease: lease.directory,
+        mountpoint: lease.mountpoint,
+        capacityBytes: lease.capacityBytes,
+        freeBytes: fs.bavail * fs.bsize,
+      };
     } catch {
       return null;
     }
