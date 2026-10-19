@@ -171,34 +171,29 @@ pub fn in_use(data: &Path) -> io::Result<Option<Busy>> {
     first_held(&task_databases_in(data)?, live_daemon(data))
 }
 
-/// The first of `databases` that a process other than `daemon` holds open, with its holders.
+/// The first of `databases` that a process other than `daemon` holds open, with its holders:
+/// one descriptor census for all of them ([`descriptor_holders`]).
 fn first_held(databases: &[PathBuf], daemon: Option<i32>) -> io::Result<Option<Busy>> {
-    for database in databases {
-        let holders: Vec<Holder> = holders(database)?
-            .into_iter()
-            .filter(|holder| Some(holder.pid) != daemon)
-            .collect();
-        if !holders.is_empty() {
-            return Ok(Some(Busy::Held {
+    Ok(databases
+        .iter()
+        .zip(descriptor_holders(databases)?)
+        .find_map(|(database, holders)| {
+            let holders: Vec<Holder> = holders
+                .into_iter()
+                .filter(|holder| Some(holder.pid) != daemon)
+                .collect();
+            (!holders.is_empty()).then(|| Busy::Held {
                 database: database.clone(),
                 holders,
-            }));
-        }
-    }
-    Ok(None)
+            })
+        }))
 }
 
 /// Whether any process holds one `workspace-data` directory's task databases open. This never
 /// reads a daemon record, connects to its socket or signals a process.
 #[cfg(target_os = "macos")]
 pub(crate) fn held_workspace_data(data: &Path) -> io::Result<Result<(), Busy>> {
-    for database in task_databases_in(data)? {
-        let holders = holders(&database)?;
-        if !holders.is_empty() {
-            return Ok(Err(Busy::Held { database, holders }));
-        }
-    }
-    Ok(Ok(()))
+    Ok(first_held(&task_databases_in(data)?, None)?.map_or(Ok(()), Err))
 }
 
 /// Whether any process holds one of the volume's task databases open, without stopping
@@ -467,6 +462,12 @@ pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
     })
 }
 
+/// [`holders`] of each of `files`, in order.
+#[cfg(target_os = "linux")]
+fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
+    files.iter().map(|file| holders(file)).collect()
+}
+
 /// Every process holding anything on the volume mounted at `mount` -- an open file, a mapped
 /// file, its working directory, its root, its executable -- which is what keeps `umount`
 /// answering `EBUSY`. From procfs, so a process of another user, or one that exited since the
@@ -562,11 +563,59 @@ fn command_line(pid: libc::pid_t) -> String {
     )
 }
 
-/// Every process that has `path` open: one open-file query (`proc_listpidspath`), the kernel's
-/// own answer, never a scan of `lsof` output.
+/// Every process with a descriptor open on the file at `path` ([`descriptor_holders`]). A missing
+/// file has none.
 #[cfg(target_os = "macos")]
 pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
-    listpidspath(path, 0)
+    Ok(descriptor_holders(&[path.to_owned()])?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+/// The processes with a descriptor open on each of `files`, in order, from one pass over the
+/// process table: each vnode descriptor's device and inode (`PROC_PIDFDVNODEINFO`) against each
+/// file's. Event-only opens hold nothing. A missing file has no holder. Not `proc_listpidspath`:
+/// it also walks every mapped region of every process, one call per region, so one query of one
+/// path cost 0.4-0.65 s on a loaded host, and its calls wait on each process's VM map while
+/// compilers and linkers remap it. A database or lock is only ever held through a descriptor.
+#[cfg(target_os = "macos")]
+fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut identities = Vec::with_capacity(files.len());
+    for file in files {
+        identities.push(match fs::metadata(file) {
+            Ok(metadata) => Some((metadata.dev(), metadata.ino())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        });
+    }
+    let mut held = vec![Vec::new(); files.len()];
+    if identities.iter().all(Option::is_none) {
+        return Ok(held);
+    }
+    let vinfo_size = c_size::<VnodeFdinfo>()?;
+    for pid in all_pids()? {
+        let mut holds = vec![false; files.len()];
+        for fd in vnode_descriptors(pid)? {
+            let Some(identity) = vnode_fd_identity(pid, fd, vinfo_size) else {
+                continue;
+            };
+            for (hold, file) in holds.iter_mut().zip(&identities) {
+                *hold |= *file == Some(identity);
+            }
+        }
+        if holds.contains(&true) {
+            let command = command_line(pid);
+            for (holders, _) in held.iter_mut().zip(holds).filter(|(_, hold)| *hold) {
+                holders.push(Holder {
+                    pid,
+                    command: command.clone(),
+                });
+            }
+        }
+    }
+    Ok(held)
 }
 
 /// Every process holding anything on the volume mounted at `mount` -- an open file, its working
@@ -645,16 +694,26 @@ fn directories(pid: libc::pid_t) -> io::Result<Vec<PathBuf>> {
     .collect())
 }
 
-/// The path of each open vnode descriptor of `pid`: one listing (`PROC_PIDLISTFDS`), then one
+/// The path of each open vnode descriptor of `pid` ([`vnode_descriptors`]), then one
 /// `PROC_PIDFDVNODEPATHINFO` call per vnode. A descriptor closed since the listing names none, and
 /// an event-only open (`O_EVTONLY`: FSEvents, Spotlight, a file watcher) holds nothing, as
 /// `volume_holders` leaves it out.
 #[cfg(target_os = "macos")]
 fn open_vnodes(pid: libc::pid_t) -> io::Result<Vec<PathBuf>> {
+    let vinfo_size = c_size::<VnodeFdinfoWithPath>()?;
+    Ok(vnode_descriptors(pid)?
+        .into_iter()
+        .filter_map(|fd| vnode_fd_path(pid, fd, vinfo_size))
+        .collect())
+}
+
+/// `pid`'s vnode descriptors: one listing (`PROC_PIDLISTFDS`). A process that exited or is
+/// withheld from this user has none.
+#[cfg(target_os = "macos")]
+fn vnode_descriptors(pid: libc::pid_t) -> io::Result<Vec<libc::c_int>> {
     // Descriptors opened between the sizing call and the listing still fit.
     const HEADROOM: usize = 32;
     let entry = size_of::<libc::proc_fdinfo>();
-    let vinfo_size = c_size::<VnodeFdinfoWithPath>()?;
     // SAFETY: a null buffer of zero bytes asks only how many bytes the listing needs.
     let needed =
         unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
@@ -698,9 +757,53 @@ fn open_vnodes(pid: libc::pid_t) -> io::Result<Vec<PathBuf>> {
                 libc::c_int::try_from(fd.proc_fdtype)
                     .is_ok_and(|kind| kind == libc::PROX_FDTYPE_VNODE)
             })
-            .filter_map(|fd| vnode_fd_path(pid, fd.proc_fd, vinfo_size))
+            .map(|fd| fd.proc_fd)
             .collect());
     }
+}
+
+/// The device and inode of vnode descriptor `fd` of `pid` (`PROC_PIDFDVNODEINFO`), or `None` if
+/// the descriptor closed since its listing or is an event-only open. `size` is `VnodeFdinfo`'s
+/// size: the kernel fills exactly that or nothing.
+#[cfg(target_os = "macos")]
+fn vnode_fd_identity(pid: libc::pid_t, fd: libc::c_int, size: libc::c_int) -> Option<(u64, u64)> {
+    // libc 0.2 binds neither this flavor nor `vnode_fdinfo`; `sys/proc_info.h` defines the
+    // flavor as 1.
+    const PROC_PIDFDVNODEINFO: libc::c_int = 1;
+    let mut info = VnodeFdinfo {
+        pfi_openflags: 0,
+        _pfi_rest: [0; 20],
+        // SAFETY: `vnode_info` is plain C data (integers), for which all zeros is a valid value;
+        // it is read only when the kernel fills all of it, as checked below.
+        pvi: unsafe { std::mem::zeroed() },
+    };
+    // SAFETY: `info` is writable for exactly `size` bytes, its whole size.
+    let filled = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            fd,
+            PROC_PIDFDVNODEINFO,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    if filled != size || info.pfi_openflags & O_EVTONLY != 0 {
+        return None;
+    }
+    Some((
+        u64::from(info.pvi.vi_stat.vst_dev),
+        info.pvi.vi_stat.vst_ino,
+    ))
+}
+
+/// `sys/proc_info.h`'s `struct vnode_fdinfo`, which libc 0.2 does not bind: the 24-byte
+/// `proc_fileinfo` head [`VnodeFdinfoWithPath`] also has, then the vnode's attributes.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VnodeFdinfo {
+    pfi_openflags: u32,
+    _pfi_rest: [u8; 20],
+    pvi: libc::vnode_info,
 }
 
 /// The path of vnode descriptor `fd` of `pid` (`PROC_PIDFDVNODEPATHINFO`), or `None` if the kernel
@@ -1564,6 +1667,54 @@ mod tests {
         drop(child.stdin.take());
         child.wait().unwrap();
         assert_eq!(close(&root, &state()).unwrap(), Ok(()));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// One census answers every database at once, each with its own holders: the shell holding
+    /// the second database is named for it alone, and a database that vanished has none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_census_names_each_databases_own_holders() {
+        let root = scratch("census");
+        let data = root.join("nx/workspace-data");
+        fs::create_dir_all(&data).unwrap();
+        let [idle, open, gone] = ["A-v3.db", "B-v3.db", "C-v3.db"].map(|name| data.join(name));
+        for database in [&idle, &open] {
+            fs::write(database, b"").unwrap();
+        }
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec 3<\"$0\"; read _")
+            .arg(&open)
+            .stdin(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap();
+        let pid = child.id() as i32;
+        let databases = [idle.clone(), open.clone(), gone];
+        let held = loop {
+            let held = descriptor_holders(&databases).unwrap();
+            if !held[1].is_empty() {
+                break held;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("the shell exited before it held the database: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let pids = |holders: &[Holder]| holders.iter().map(|holder| holder.pid).collect::<Vec<_>>();
+        assert_eq!(
+            held.iter().map(|holders| pids(holders)).collect::<Vec<_>>(),
+            [vec![], vec![pid], vec![]]
+        );
+        match held_workspace_data(&data).unwrap() {
+            Err(Busy::Held { database, holders }) => {
+                assert_eq!((database, pids(&holders)), (open, vec![pid]));
+            }
+            other => panic!("expected the open database to be named: {other:?}"),
+        }
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert_eq!(held_workspace_data(&data).unwrap(), Ok(()));
         fs::remove_dir_all(&root).unwrap();
     }
 
