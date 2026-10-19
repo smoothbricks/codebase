@@ -166,7 +166,7 @@ impl JobCpuAdmission for GatewayJobCpu {
                 job_id: NonZeroU64::new(ask.job.2.get()).expect("a validated JobId is nonzero"),
             };
             // The ledger knows two token-holding classes (05_gateway.md "Bands"): interactive
-            // asks as background, whose tokens it shares, and a resident asks for a pool alone.
+            // asks as background, whose tokens it shares, and either resident asks for a pool alone.
             let frame = match ask.class {
                 ExecClass::Background | ExecClass::Interactive => serde_json::to_vec(
                     &JobserverRequest::background(ask.want, &checkout, command, job),
@@ -174,7 +174,7 @@ impl JobCpuAdmission for GatewayJobCpu {
                 ExecClass::Gate => {
                     serde_json::to_vec(&JobserverRequest::gate(ask.want, &checkout, command, job))
                 }
-                ExecClass::Resident => {
+                ExecClass::Resident | ExecClass::InteractiveResident => {
                     serde_json::to_vec(&ResidentPoolRequest::new(&checkout, command, job))
                 }
             };
@@ -225,7 +225,9 @@ impl JobCpuAdmission for GatewayJobCpu {
                     Some(pool),
                     Some(_fifo),
                 ) => (Some(tokens), pool),
-                (ExecClass::Resident, None, Some(pool), None) => (None, pool),
+                (ExecClass::Resident | ExecClass::InteractiveResident, None, Some(pool), None) => {
+                    (None, pool)
+                }
                 (class, ..) => {
                     return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
                         detail: format!(

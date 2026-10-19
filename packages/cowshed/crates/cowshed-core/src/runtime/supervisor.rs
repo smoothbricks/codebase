@@ -353,7 +353,9 @@ impl JobCpuAdmission for ImmediateCpu {
         Box::pin(async move {
             let pool = PathBuf::from("/nonexistent/cowshed-cpu-pool.sock");
             Ok(match ask.class {
-                ExecClass::Resident => JobCpuGrant::resident(pool, Box::new(())),
+                ExecClass::Resident | ExecClass::InteractiveResident => {
+                    JobCpuGrant::resident(pool, Box::new(()))
+                }
                 ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
                     JobCpuGrant::new(ask.want, pool, Box::new(()))
                 }
@@ -603,13 +605,13 @@ impl CpuPlacement {
     }
 }
 
-/// The nice a class's command runs at, its row of 05_gateway.md "Bands": interactive at the
-/// supervisor's own, a gate five below it, background and a resident ten below it. Never
-/// negative: raising a priority takes a privilege no supervisor holds, so the order is made by
-/// lowering the others.
+/// The nice a class's command runs at, its row of 05_gateway.md "Bands": interactive and an
+/// interactive resident at the supervisor's own, a gate five below it, background and a resident
+/// ten below it. Never negative: raising a priority takes a privilege no supervisor holds, so the
+/// order is made by lowering the others. The two residents differ here and nowhere else.
 pub(super) const fn class_nice(class: ExecClass) -> i32 {
     match class {
-        ExecClass::Interactive => 0,
+        ExecClass::Interactive | ExecClass::InteractiveResident => 0,
         ExecClass::Gate => 5,
         ExecClass::Background | ExecClass::Resident => 10,
     }

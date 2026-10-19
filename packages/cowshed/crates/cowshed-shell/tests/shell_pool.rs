@@ -68,7 +68,9 @@ impl JobCpuAdmission for GrantingCpu {
         Box::pin(async move {
             let pool = PathBuf::from(TEST_POOL);
             Ok(match ask.class {
-                ExecClass::Resident => JobCpuGrant::resident(pool, Box::new(())),
+                ExecClass::Resident | ExecClass::InteractiveResident => {
+                    JobCpuGrant::resident(pool, Box::new(()))
+                }
                 ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
                     JobCpuGrant::new(ask.want, pool, Box::new(()))
                 }
@@ -1514,8 +1516,19 @@ async fn host_controller_owned_commands_run_under_their_grant_at_their_class_nic
                 AdmissionSource::Worker,
                 10,
             ),
+            (
+                ExecRequest {
+                    class: ExecClass::InteractiveResident,
+                    ..sh("read _")
+                },
+                AdmissionSource::Worker,
+                0,
+            ),
             (gate(sh("read _")), AdmissionSource::Coordinator, 5),
         ] {
+            // The two residents differ in their nice alone: each holds no token while it runs
+            // (05_gateway.md "A resident holds no token").
+            let resident = request.class.is_resident();
             if base <= nice {
                 let (observed, info) = held_nice(&handle, request, source).await;
                 assert_eq!(
@@ -1523,6 +1536,13 @@ async fn host_controller_owned_commands_run_under_their_grant_at_their_class_nic
                     (nice, Some(nice)),
                     "warm {warm}: the kernel and the record agree on the class nice"
                 );
+                if resident {
+                    assert_eq!(
+                        info.cpu_tokens, None,
+                        "warm {warm}: a running {:?} holds no token",
+                        info.class
+                    );
+                }
             } else {
                 // Answered at admission: the class nice is refused at spawn, so the job fails
                 // typed, its exit the refusal's wrapper code and the placement it asked for on

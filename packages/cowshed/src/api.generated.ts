@@ -716,7 +716,7 @@ export type ErrorCode =
  * asks the ledger as background and a resident asks with its own operation, so neither reaches
  * the ledger as a class of its own.
  */
-export type ExecClass = 'background' | 'interactive' | 'gate' | 'resident';
+export type ExecClass = 'background' | 'interactive' | 'gate' | 'resident' | 'interactive-resident';
 
 /**
  * What a job runs.

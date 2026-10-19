@@ -847,20 +847,20 @@ core count.
   coordinator/operator may request Gate or HostGate; a worker request is refused with typed class-not-permitted before
   job or spawn effects. Ordinary commands default Background, want1 and Workspace scope; producers that need parallel
   work supply their actual demand; a requester that awaits the result asks Interactive ("Bands"), which a worker may ask
-  for, since it buys a band and no token; a resident (below) is Resident, which a worker may ask for, and names no want.
-  The supervisor records Queued, asks the gateway off its actor path and spawns only after a real grant. **The exec
-  answers at that admission, never at the grant** (11_shell.md, "Server-owned CPU admission and nice placement"): a job
-  waiting in the queue has its id, reads `queued` with its class and no `cpuTokens`, and is cancellable, since a request
-  that waits for no deadline must stay reachable for as long as it waits. Measured 2026-10-19 with the answer at the
-  grant: a `cowshed exec --background` on a loaded host returned 25 s later, so the executor's sequential admission of
-  100 held jobs stopped at the first waiting one, which had no id to report or cancel. CPU admission uses the control
-  socket of the controller's validated host storage, the same store/gateway.sock authority its gateway reconciliation
-  uses, never an unrelated ambient store. A queued kill withdraws the request without spawning. Missing/refused
-  admission never causes an unbudgeted server spawn. The supervisor retains the allocation until the owned job
-  concludes. The gateway's existing CpuBudget ledger serves that exact allocation on a private workspace-scoped CPU-pool
-  endpoint; Nx bounded-exec and Cargo descendants borrow only from it, with sibling sums bounded by its actual count,
-  or, for a gate job, through it as gate-class host requests. The root FIFO is not offered alongside the pool: that
-  would spend the same tokens twice. Its canonical endpoint is
+  for, since it buys a band and no token; a resident (below) is Resident or InteractiveResident, which a worker may ask
+  for, and names no want. The supervisor records Queued, asks the gateway off its actor path and spawns only after a
+  real grant. **The exec answers at that admission, never at the grant** (11_shell.md, "Server-owned CPU admission and
+  nice placement"): a job waiting in the queue has its id, reads `queued` with its class and no `cpuTokens`, and is
+  cancellable, since a request that waits for no deadline must stay reachable for as long as it waits. Measured
+  2026-10-19 with the answer at the grant: a `cowshed exec --background` on a loaded host returned 25 s later, so the
+  executor's sequential admission of 100 held jobs stopped at the first waiting one, which had no id to report or
+  cancel. CPU admission uses the control socket of the controller's validated host storage, the same store/gateway.sock
+  authority its gateway reconciliation uses, never an unrelated ambient store. A queued kill withdraws the request
+  without spawning. Missing/refused admission never causes an unbudgeted server spawn. The supervisor retains the
+  allocation until the owned job concludes. The gateway's existing CpuBudget ledger serves that exact allocation on a
+  private workspace-scoped CPU-pool endpoint; Nx bounded-exec and Cargo descendants borrow only from it, with sibling
+  sums bounded by its actual count, or, for a gate job, through it as gate-class host requests. The root FIFO is not
+  offered alongside the pool: that would spend the same tokens twice. Its canonical endpoint is
   `<store>/run/cpu/<base64url-incarnation>/<opaque-endpoint>`: the unpadded 22-byte incarnation component losslessly
   encodes all 128 bits of the validated 32-lowercase-hex workspace incarnation, never a digest or truncated prefix. The
   opaque endpoint is an independent 22-byte unpadded base64url UUID. The gateway, sandbox builder and grant validator
@@ -889,10 +889,16 @@ core count.
   for the resident's checkout, exactly as a root background request does, so a resident's request takes its tokens when
   it starts and returns them when it ends. Its command receives that pool and `BOUNDED_EXEC_CPU_TOKENS=0`; a pool with a
   count of 0 is a valid descriptor (a bare 0 without a pool still proves nothing), and Nx bounded-exec and the Cargo
-  launcher ask it as any parent pool. The resident runs at background nice. The connection is the pool's life: the
-  resident's exit closes it. A different token class would leave the resident in the ledger holding something; exempting
-  it from the budget would leave the requests it runs unbudgeted; acquiring per request through a relay pool is the gate
-  job's existing mechanism and budgets exactly the work.
+  launcher ask it as any parent pool. The resident runs at background nice. **An interactive resident** (2026-10-19,
+  Danny tg#6693 with the paragraph above) is a resident whose requests a person or model waits on — an embedding
+  executor's feedback Nx worker, whose focused checks a session awaits: it is admitted as class InteractiveResident and
+  differs from a resident in its nice alone, running at nice 0, the interactive band. It writes the same `resident-pool`
+  request, holds no token, names no want, and its pool relays each child's request at background class exactly as a
+  resident's does, so neither residency buys tokens with its band; a task program it starts inherits nice 0, as a
+  resident's inherits +10. The connection is the pool's life: the resident's exit closes it. A different token class
+  would leave the resident in the ledger holding something; exempting it from the budget would leave the requests it
+  runs unbudgeted; acquiring per request through a relay pool is the gate job's existing mechanism and budgets exactly
+  the work.
 - **Work-conserving but for the gate's room.** No grant is capped below `want` for fairness' sake: with nobody else
   waiting, a gate-class grant is `min(want, free)`, so a lone gate runner may hold all N tokens, because a gate's wall
   time is what the budget buys. A background grant is `min(want, room)`, the room being the free tokens within the
@@ -910,11 +916,11 @@ core count.
   place in the token order and the band the host schedules it in. This table is the one statement of both; every other
   section names it.
 
-  | Class         | What runs in it                                                                                  | CPU tokens                                                                                             | Band           | Nice |
-  | ------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ | -------------- | ---- |
-  | `interactive` | work a person or model is waiting on, declared by the requester that awaits its result           | behind gate, as background: checkout fairness and the floor token                                      | **foreground** | 0    |
-  | `gate`        | a land's gate job, every task its pool relays and the land turn's holder; the trusted route only | first: the oldest gate job FIFO, ahead of every other class ("Gate admission")                         | **normal**     | +5   |
-  | `background`  | every other exec, the default, and each request a resident's pool relays                         | checkout fairness behind gate within half the host ("Room for a gate"), never starved: the floor token | **background** | +10  |
+  | Class         | What runs in it                                                                                                                                   | CPU tokens                                                                                                                                    | Band           | Nice |
+  | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | ---- |
+  | `interactive` | work a person or model is waiting on, declared by the requester that awaits its result, and an interactive resident ("A resident holds no token") | behind gate, as background: checkout fairness and the floor token; an interactive resident holds none and its pool relays at background class | **foreground** | 0    |
+  | `gate`        | a land's gate job, every task its pool relays and the land turn's holder; the trusted route only                                                  | first: the oldest gate job FIFO, ahead of every other class ("Gate admission")                                                                | **normal**     | +5   |
+  | `background`  | every other exec, the default, a resident, and each request either resident's pool relays                                                         | checkout fairness behind gate within half the host ("Room for a gate"), never starved: the floor token; a resident holds none                 | **background** | +10  |
 
   Tokens decide which work runs at all; nice decides whose runnable threads win a core when more are runnable than there
   are cores. Those are the ruling's two priorities: gate work takes returned tokens first and, while it runs, more of
@@ -926,11 +932,12 @@ core count.
   it: no live transition moves a running job between bands. An interactive job asks the gateway's ledger as background,
   whose tokens it shares; `interactive` is the supervisor's placement and the task server's class, never a third ledger
   class. A requester names its job's class in the exec request itself — `ExecClass`, one of `background`, `interactive`,
-  `gate` or `resident` (a resident, "A resident holds no token" above, runs at background nice and holds no token) — and
-  the CLI's `cowshed exec --class` and the API's `class` field are that one typed value (07_api.md, "CLI and API exec
-  parity"), so an embedding executor declares a class exactly as the CLI does. The ledger's wire class
-  (`JobserverClass`) is `background` or `gate` only: the supervisor sends interactive as background and a resident as
-  `resident-pool`, so neither reaches the ledger as a class of its own.
+  `gate`, `resident` or `interactive-resident` (a resident, "A resident holds no token" above, holds no token and runs
+  at background nice; an interactive resident is the same resident at nice 0) — and the CLI's `cowshed exec --class` and
+  the API's `class` field are that one typed value (07_api.md, "CLI and API exec parity"), so an embedding executor
+  declares a class exactly as the CLI does. The ledger's wire class (`JobserverClass`) is `background` or `gate` only:
+  the supervisor sends interactive as background and either resident as `resident-pool`, so neither reaches the ledger
+  as a class of its own.
 
 - **Crash safety by connection.** The grant is tied to the connection: on exit, `SIGKILL` included, the kernel closes
   the socket and the gateway returns the tokens at once. A request that closes while queued leaves the queue. A gateway

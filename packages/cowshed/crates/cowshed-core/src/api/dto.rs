@@ -50,6 +50,20 @@ pub enum ExecClass {
     /// tokens only while a request of its runs (05_gateway.md "A resident holds no token"). It
     /// runs at background nice and names no want.
     Resident,
+    /// A resident that serves work a person or model is waiting on -- a worker whose requests
+    /// are focused checks a session awaits. It differs from [`ExecClass::Resident`] in its nice
+    /// alone: it runs at nice 0, the interactive band, and holds no token, its pool asking the
+    /// host ledger at background class exactly as a resident's does (05_gateway.md "A resident
+    /// holds no token", "Bands"). A worker may ask for it, and it names no want.
+    InteractiveResident,
+}
+
+impl ExecClass {
+    /// Whether this class is admitted as a resident: with a pool that holds no token, whose
+    /// descendants each ask the host ledger (05_gateway.md "A resident holds no token").
+    pub const fn is_resident(self) -> bool {
+        matches!(self, Self::Resident | Self::InteractiveResident)
+    }
 }
 
 pub const MAX_JOB_ID: u64 = (1_u64 << 53) - 1;

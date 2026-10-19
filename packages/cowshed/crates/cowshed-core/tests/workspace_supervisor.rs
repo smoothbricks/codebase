@@ -479,7 +479,9 @@ impl JobCpuAdmission for ImmediateCpu {
         Box::pin(async move {
             let pool = PathBuf::from(TEST_POOL);
             Ok(match ask.class {
-                ExecClass::Resident => JobCpuGrant::resident(pool, Box::new(())),
+                ExecClass::Resident | ExecClass::InteractiveResident => {
+                    JobCpuGrant::resident(pool, Box::new(()))
+                }
                 ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
                     JobCpuGrant::new(ask.want, pool, Box::new(()))
                 }

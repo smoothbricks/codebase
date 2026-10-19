@@ -142,8 +142,10 @@ pub struct ExecRequest {
 
 /// The exec's own class: one row of 05_gateway.md "Bands" (token order and nice). Not the gateway
 /// ledger's wire class (`cowshed_gateway_types::JobserverClass` = Background | Gate): the
-/// supervisor asks the ledger as background for Interactive and with `resident-pool` for Resident.
-pub enum ExecClass { Background, Interactive, Gate, Resident } // wire: "background" | "interactive" | "gate" | "resident"
+/// supervisor asks the ledger as background for Interactive and with `resident-pool` for either
+/// resident; InteractiveResident is Resident at nice 0 and differs from it in nothing else.
+pub enum ExecClass { Background, Interactive, Gate, Resident, InteractiveResident }
+// wire: "background" | "interactive" | "gate" | "resident" | "interactive-resident"
 
 pub enum ExecCommand {
     Argv(Vec<CommandArg>),               // byte-exact, executed directly
@@ -1846,11 +1848,11 @@ completion, and normalized workspace-relative source where applicable, never inl
 ## Task server scheduling and trusted host gates
 
 `Coordinator::exec(worker, request)` is the trusted `coordinator.exec` upload route; the worker handle supplies only the
-immutable workspace/incarnation fence. Ordinary `worker.exec` admits Background, Interactive and Resident in Workspace
-scope: Interactive buys a band and no token, and a Resident holds none. Requesting Gate or HostGate there is typed
-class-not-permitted before snapshot, record, CPU request or spawn. Scope, class and want bind keyed admission just like
-command/env: changing one under the same key is keyConflict, never a new spawn. No class has an admission deadline
-(05_gateway.md, "No admission deadline, for any class").
+immutable workspace/incarnation fence. Ordinary `worker.exec` admits Background, Interactive, Resident and
+InteractiveResident in Workspace scope: Interactive buys a band and no token, and a resident of either nice holds none.
+Requesting Gate or HostGate there is typed class-not-permitted before snapshot, record, CPU request or spawn. Scope,
+class and want bind keyed admission just like command/env: changing one under the same key is keyConflict, never a new
+spawn. No class has an admission deadline (05_gateway.md, "No admission deadline, for any class").
 
 `ExecScope` is Workspace (default) or HostGate. HostGate requires Gate, argv, read-write mode and no session; it runs
 one host one-shot without ExecutedChild or shell activation, never a new wrapper. No worker gains host authority. The
@@ -1894,27 +1896,27 @@ available through the Rust API and the NAPI/Bun binding, so an embedding executo
 is one typed field of the same request, decoded by the same validation (`validate_scheduling`, `JobScheduling::new`,
 `AdmissionSource::admit`), so the two surfaces refuse the same pairings:
 
-| `cowshed exec` flag                                 | Rust `ExecRequest` (`WorkspaceHandle::exec`, `Coordinator::exec`) | NAPI `ExecRequest` (`worker.exec`, `coordinator.exec`)    |
-| --------------------------------------------------- | ----------------------------------------------------------------- | --------------------------------------------------------- |
-| `-- <cmd…>`                                         | `command: ExecCommand::Argv`                                      | `argv`                                                    |
-| `--stdin`                                           | `stdin: StdinSource::Stream`                                      | `stdin: { kind: 'open' }` and the job's attachment writes |
-| `--stdin-file <rel>`                                | `StdinSource::WorkspaceFile`                                      | `stdinWorkspacePath`                                      |
-| `--stdin-base64 <data>`                             | `StdinSource::Inline`                                             | `stdin: string \| Uint8Array`                             |
-| `--ro`                                              | `mode: RunSandboxMode::ReadOnly`                                  | `mode: 'readOnly'`                                        |
-| `--cwd <rel>`                                       | `cwd`                                                             | `cwd`                                                     |
-| `--session <name>`                                  | `WorkspaceHandle::shell(Some(name))`, then `Session::run`         | `shell(name)`, then `session.exec`                        |
-| `--stdout-copy`, `--stderr-copy`                    | `stdout_copy`, `stderr_copy`                                      | `stdoutCopy`, `stderrCopy`                                |
-| `--replace-output`                                  | `PublicationPolicy::Replace`                                      | `policy: 'replace'`                                       |
-| `--want <n>`                                        | `want: NonZeroUsize`                                              | `want`                                                    |
-| `--class <background\|interactive\|gate\|resident>` | `class: ExecClass`                                                | `class`                                                   |
-| `--host`                                            | `scope: ExecScope::HostGate`                                      | `scope: 'hostGate'`                                       |
-| `--background`                                      | every exec answers its `JobHandle` at admission                   | the same                                                  |
-| `--timeout <dur>`                                   | the caller's own deadline over `JobHandle::wait`                  | the same, over `wait()`                                   |
-| `rebase --gate`                                     | `RebaseOptions::gate`                                             | `RebaseOptions.gate`                                      |
+| `cowshed exec` flag                                                       | Rust `ExecRequest` (`WorkspaceHandle::exec`, `Coordinator::exec`) | NAPI `ExecRequest` (`worker.exec`, `coordinator.exec`)    |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------- | --------------------------------------------------------- |
+| `-- <cmd…>`                                                               | `command: ExecCommand::Argv`                                      | `argv`                                                    |
+| `--stdin`                                                                 | `stdin: StdinSource::Stream`                                      | `stdin: { kind: 'open' }` and the job's attachment writes |
+| `--stdin-file <rel>`                                                      | `StdinSource::WorkspaceFile`                                      | `stdinWorkspacePath`                                      |
+| `--stdin-base64 <data>`                                                   | `StdinSource::Inline`                                             | `stdin: string \| Uint8Array`                             |
+| `--ro`                                                                    | `mode: RunSandboxMode::ReadOnly`                                  | `mode: 'readOnly'`                                        |
+| `--cwd <rel>`                                                             | `cwd`                                                             | `cwd`                                                     |
+| `--session <name>`                                                        | `WorkspaceHandle::shell(Some(name))`, then `Session::run`         | `shell(name)`, then `session.exec`                        |
+| `--stdout-copy`, `--stderr-copy`                                          | `stdout_copy`, `stderr_copy`                                      | `stdoutCopy`, `stderrCopy`                                |
+| `--replace-output`                                                        | `PublicationPolicy::Replace`                                      | `policy: 'replace'`                                       |
+| `--want <n>`                                                              | `want: NonZeroUsize`                                              | `want`                                                    |
+| `--class <background\|interactive\|gate\|resident\|interactive-resident>` | `class: ExecClass`                                                | `class`                                                   |
+| `--host`                                                                  | `scope: ExecScope::HostGate`                                      | `scope: 'hostGate'`                                       |
+| `--background`                                                            | every exec answers its `JobHandle` at admission                   | the same                                                  |
+| `--timeout <dur>`                                                         | the caller's own deadline over `JobHandle::wait`                  | the same, over `wait()`                                   |
+| `rebase --gate`                                                           | `RebaseOptions::gate`                                             | `RebaseOptions.gate`                                      |
 
 The gate class and host scope are the coordinator route's alone on both surfaces (`coordinator.exec`; the CLI is that
-route); a worker capability asks for background, interactive and resident work in its own workspace. Queued priority
-(05_gateway.md, "Queued priority") is a field of neither: no exec request carries one.
+route); a worker capability asks for background, interactive and resident work, a resident at either nice, in its own
+workspace. Queued priority (05_gateway.md, "Queued priority") is a field of neither: no exec request carries one.
 
 The API also carries what a one-shot CLI process cannot use, none of which asks the scheduler for anything: script
 commands (`ExecCommand::Script`), open stdin written through the job's attachment, the request `env` and `trace`,

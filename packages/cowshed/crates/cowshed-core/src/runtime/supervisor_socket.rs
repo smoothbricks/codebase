@@ -445,16 +445,19 @@ pub enum AdmissionSource {
 
 impl AdmissionSource {
     /// Whether this route may admit an exec of class in scope. A worker admits background,
-    /// interactive and resident work in the workspace sandbox and nothing else -- interactive
-    /// buys a band and no token, and a resident holds no token, so neither claims anything a
-    /// worker may not -- and anything more is refused as the typed class-not-permitted error,
-    /// before any record, process or gateway request exists.
+    /// interactive and either resident's work in the workspace sandbox and nothing else --
+    /// interactive buys a band and no token, and a resident holds no token, so neither claims
+    /// anything a worker may not -- and anything more is refused as the typed class-not-permitted
+    /// error, before any record, process or gateway request exists.
     pub fn admit(self, class: ExecClass, scope: ExecScope) -> Result<()> {
         match (self, class, scope) {
             (Self::Coordinator, _, _)
             | (
                 Self::Worker,
-                ExecClass::Background | ExecClass::Interactive | ExecClass::Resident,
+                ExecClass::Background
+                | ExecClass::Interactive
+                | ExecClass::Resident
+                | ExecClass::InteractiveResident,
                 ExecScope::Workspace,
             ) => Ok(()),
             (Self::Worker, _, _) => Err(CowshedError::class_not_permitted(class, scope)),
@@ -2707,6 +2710,7 @@ mod admission_source_tests {
             ExecClass::Interactive,
             ExecClass::Gate,
             ExecClass::Resident,
+            ExecClass::InteractiveResident,
         ] {
             for scope in [ExecScope::Workspace, ExecScope::HostGate] {
                 let worker = AdmissionSource::Worker.admit(class, scope);

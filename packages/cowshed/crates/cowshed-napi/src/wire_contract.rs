@@ -592,6 +592,15 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ..exited.clone()
     };
 
+    // The same resident at interactive nice: it held no token either, and differs only in the
+    // nice it was observed at (05_gateway.md "A resident holds no token").
+    let interactive_resident = JobInfo {
+        job_id: JobId::new(13).expect("fixture job id"),
+        class: ExecClass::InteractiveResident,
+        nice: Some(0),
+        ..resident.clone()
+    };
+
     let list = vec![queued.clone(), running.clone()];
 
     BTreeMap::from([
@@ -614,6 +623,10 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ("priorityFailed", document("job status", &priority_failed)),
         ("interactive", document("job status", &interactive)),
         ("resident", document("job status", &resident)),
+        (
+            "interactiveResident",
+            document("job status", &interactive_resident),
+        ),
         ("list", document("job list", &list)),
     ])
 }
@@ -1595,7 +1608,14 @@ fn every_scheduling_fact_appears_in_the_corpus() {
     for (field, spellings) in [
         (
             "class",
-            ["background", "interactive", "gate", "resident"].as_slice(),
+            [
+                "background",
+                "interactive",
+                "gate",
+                "resident",
+                "interactive-resident",
+            ]
+            .as_slice(),
         ),
         ("scope", ["workspace", "hostGate"].as_slice()),
         (

@@ -470,12 +470,15 @@ impl JobScheduling {
                 ExecClass::Background | ExecClass::Interactive | ExecClass::Gate,
             )
             | (ExecScope::HostGate, ExecClass::Gate) => Some(Self { scope, class, want }),
-            (ExecScope::Workspace, ExecClass::Resident) => {
+            (ExecScope::Workspace, ExecClass::Resident | ExecClass::InteractiveResident) => {
                 (want == NonZeroUsize::MIN).then_some(Self { scope, class, want })
             }
             (
                 ExecScope::HostGate,
-                ExecClass::Background | ExecClass::Interactive | ExecClass::Resident,
+                ExecClass::Background
+                | ExecClass::Interactive
+                | ExecClass::Resident
+                | ExecClass::InteractiveResident,
             ) => None,
         }
     }
@@ -770,7 +773,7 @@ impl JobArtifactRecord {
         }
         // A resident is granted no tokens (05_gateway.md, "A resident holds no token"), so its
         // observed nice stands alone; every other class's nice is its grant's.
-        let resident = self.scheduling.class() == ExecClass::Resident;
+        let resident = self.scheduling.class().is_resident();
         if resident && self.cpu_tokens.is_some() {
             return Err(integrity(
                 0,
@@ -4732,6 +4735,7 @@ fn class_name(class: ExecClass) -> &'static str {
         ExecClass::Interactive => "interactive",
         ExecClass::Gate => "gate",
         ExecClass::Resident => "resident",
+        ExecClass::InteractiveResident => "interactive-resident",
     }
 }
 
@@ -4758,6 +4762,7 @@ fn parse_class(name: &str) -> Result<ExecClass, ArtifactError> {
         "interactive" => Ok(ExecClass::Interactive),
         "gate" => Ok(ExecClass::Gate),
         "resident" => Ok(ExecClass::Resident),
+        "interactive-resident" => Ok(ExecClass::InteractiveResident),
         other => Err(ArtifactError::Arrow(format!("unknown CPU class {other:?}"))),
     }
 }
@@ -4789,7 +4794,7 @@ fn decode_cpu(
             uint64(batch, first + 3).and_then(|column| decode_tokens(column.value(0), "cpu_tokens"))
         })
         .transpose()?;
-    if class == ExecClass::Resident && cpu_tokens.is_some() {
+    if class.is_resident() && cpu_tokens.is_some() {
         return Err(ArtifactError::Arrow(
             "a resident job record names cpu_tokens, and a resident is granted none".into(),
         ));
@@ -8018,6 +8023,34 @@ mod tests {
             (read.scheduling.class(), read.cpu_tokens, read.nice),
             (ExecClass::Resident, None, Some(10)),
             "a sealed resident names the nice it ran at and no grant"
+        );
+        // The interactive resident differs only in its nice: sealed at 0, still with no grant.
+        let interactive_resident = JobArtifactRecord {
+            scheduling: JobScheduling::new(
+                ExecScope::Workspace,
+                ExecClass::InteractiveResident,
+                NonZeroUsize::MIN,
+            )
+            .unwrap(),
+            nice: Some(0),
+            ..valid_job_record(9)
+        };
+        let read = round_trip(&interactive_resident);
+        assert_eq!(
+            (read.scheduling.class(), read.cpu_tokens, read.nice),
+            (ExecClass::InteractiveResident, None, Some(0)),
+            "a sealed interactive resident names the nice it ran at and no grant"
+        );
+        assert!(
+            matches!(
+                JobArtifactRecord {
+                    cpu_tokens: NonZeroUsize::new(2),
+                    ..interactive_resident
+                }
+                .validate(),
+                Err(ArtifactError::Integrity { .. })
+            ),
+            "an interactive resident record that names tokens is refused"
         );
         let granted_resident = JobArtifactRecord {
             cpu_tokens: NonZeroUsize::new(2),

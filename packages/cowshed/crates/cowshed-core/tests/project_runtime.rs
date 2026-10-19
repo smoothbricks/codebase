@@ -1928,6 +1928,10 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
             json!({"class": "resident"}),
             "a worker admits a resident that holds no token",
         ),
+        (
+            json!({"class": "interactive-resident"}),
+            "a worker admits a resident at interactive nice, which holds no token either",
+        ),
     ] {
         assert_eq!(
             route(
@@ -1972,6 +1976,12 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
             Admitted {
                 source: AdmissionSource::Worker,
                 class: ExecClass::Resident,
+                want: NonZeroUsize::MIN,
+                scope: ExecScope::Workspace,
+            },
+            Admitted {
+                source: AdmissionSource::Worker,
+                class: ExecClass::InteractiveResident,
                 want: NonZeroUsize::MIN,
                 scope: ExecScope::Workspace,
             },
@@ -2555,7 +2565,8 @@ impl cowshed_core::runtime::job_cpu::JobCpuAdmission for GrantingCpu {
         Box::pin(async move {
             let pool = PathBuf::from("/nonexistent/cowshed-test-cpu-pool.sock");
             Ok(match ask.class {
-                cowshed_core::api::ExecClass::Resident => {
+                cowshed_core::api::ExecClass::Resident
+                | cowshed_core::api::ExecClass::InteractiveResident => {
                     cowshed_core::runtime::job_cpu::JobCpuGrant::resident(pool, Box::new(()))
                 }
                 cowshed_core::api::ExecClass::Background
