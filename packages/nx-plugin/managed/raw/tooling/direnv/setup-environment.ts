@@ -253,6 +253,19 @@ try {
         current && !hasStaleDeveloperLinks(projectRoot, ['nx']) && danglingStoreLinks(projectRoot).length === 0 ? 0 : 1,
       );
     }
+    // Planning reads, apart from a snapshot it may capture, which seals by an atomic rename (linked-snapshots.ts),
+    // and applying a plan with no changes only says what this machine cannot honour. So an entry with nothing to
+    // write never takes the install lock, and the entries of one checkout do not queue behind each other's probe of
+    // a provider checkout: a declaration whose snapshot the provider refuses fails the status on every entry.
+    const plan = await planDeclaredLinks(projectRoot);
+    if (
+      plan.changes.length === 0 &&
+      danglingStoreLinks(projectRoot).length === 0 &&
+      !hasStaleDeveloperLinks(projectRoot, ['nx'])
+    ) {
+      applyDeclaredLinks(projectRoot, plan);
+      process.exit(0);
+    }
     await withInstallLock(async () => {
       // Recheck under the install lock: another shell may already have repaired
       // the aliases. Use the same installer as smoo:install, never a second linker.

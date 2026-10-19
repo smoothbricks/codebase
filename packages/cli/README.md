@@ -518,7 +518,11 @@ nothing when nothing changed:
   `node_modules/.smoo-install.lock`, so a second shell loading at the same moment waits (and says so), then finds the
   first entry's stamps current. The kernel releases the lock when its holder exits, so a killed shell entry leaves
   nothing behind. An existing lock file is opened read-only (flock needs no write access), so an entry whose installs
-  are current writes nothing in the checkout and enters a read-only view of it, such as a read-only cowshed job.
+  are current writes nothing in the checkout and enters a read-only view of it, such as a read-only cowshed job. The
+  `smoo:developer-links` task plans its declared links before it takes that lock, and takes it only when it has
+  something to write: a dangling store link, a stale developer link or a declared link to change. Entries whose links
+  are current, or whose declarations this machine cannot honour, say so without waiting on each other's probe of a
+  provider checkout.
 - The managed `.envrc` loads no parent directory's `.envrc`: the shell is built from the checkout's own inputs, so the
   same commit enters the same shell wherever it is checked out. An environment wanted from outside the checkout belongs
   in the gitignored `.envrc-local`.
