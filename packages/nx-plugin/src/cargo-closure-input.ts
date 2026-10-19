@@ -152,8 +152,8 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
   const { root, cargo, indexed } = source;
   const packageDirectories: string[] = [];
   const files: string[] = [];
-  const compiledIn: { readonly declaring: string; readonly file: string }[] = [];
-  const compiledFiles = new Set<string>();
+  const compiledIn: CompiledInclusion[] = [];
+  let compiledFiles: readonly string[] = [];
   let external = false;
   try {
     const members = await dependencyClosure(cargo, join(root, projectRoot));
@@ -187,9 +187,7 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
     if (unglobbable !== undefined) throw new Error(`${unglobbable} contains glob syntax, so no fileset can name it`);
     // Literal paths, so each matches exactly itself in the index.
     const held = new Set(compiledPaths.length === 0 ? [] : await globIndexedFiles(source.workspaceRoot, compiledPaths));
-    for (const { declaring, file } of compiledIn) {
-      if (held.has(declaring) && held.has(file)) compiledFiles.add(file);
-    }
+    compiledFiles = indexedCompiledFiles(compiledIn, held);
   } catch (error) {
     throw new CargoClosureInputError(projectRoot, error);
   }
@@ -233,10 +231,29 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
     ...packageGlobs.map((glob) => anchored(glob, PACKAGE_FILES)),
     ...packageGlobs.map((glob) => `!${anchored(glob, SKIPPED_TREES)}`),
     ...[...ancestors].sort().map((ancestor) => anchored(ancestor, ANCESTOR_FILES)),
-    ...[...compiledFiles].sort().map((file) => anchored(file)),
+    ...compiledFiles.map((file) => anchored(file)),
     ...[...loose].sort().map((file) => anchored(file)),
     ...(external ? [runtimeInput(`${CARGO_HASH_COMMAND} ${closureArguments}`)] : []),
   ];
+}
+
+/** A compiled-in file and the source whose `include_str!`/`include_bytes!` names it, relative to the workspace root. */
+export interface CompiledInclusion {
+  readonly declaring: string;
+  readonly file: string;
+}
+
+/**
+ * The compiled-in files a `cargoClosure` names, sorted: each one Nx's file index holds together with the source that
+ * includes it. `held` is the index's answer for exactly those paths. A file it does not hold is a build output or
+ * ignored, and naming it would key the graph on whatever last wrote it rather than on the tree.
+ */
+export function indexedCompiledFiles(compiledIn: readonly CompiledInclusion[], held: ReadonlySet<string>): string[] {
+  const named = new Set<string>();
+  for (const { declaring, file } of compiledIn) {
+    if (held.has(declaring) && held.has(file)) named.add(file);
+  }
+  return [...named].sort();
 }
 
 /**

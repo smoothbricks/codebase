@@ -9,6 +9,7 @@
     "src/graph-input-contract.test.ts": 16550,
     "src/executors/bounded-exec/executor.test.ts": 12975,
     "src/cargo-resolve-cache.test.ts": 11421,
+    "src/cargo-closure-input.property.test.ts": 10902,
     "src/executors/bounded-exec/ram-temp.test.ts": 10766,
     "src/producer-receipts.test.ts": 10581,
     "src/typescript-resolution.test.ts": 10482,
