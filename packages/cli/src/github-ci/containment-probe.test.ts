@@ -1,10 +1,24 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { expandNxTargetDependencyRuns, expandNxTargetRuns } from './index.js';
-import { applyCollectedOutputs, collectNxOutputs, resolveDeclaredOutput } from './outputs.js';
+import {
+  applyCollectedOutputs,
+  type CollectedTree,
+  collectNxOutputs,
+  judgeOutputFile,
+  type OutputClaim,
+  type OutputFileFact,
+  type OutputStage,
+  type Planned,
+  planOutputClaims,
+  planOverlays,
+  resolveDeclaredOutput,
+  type StagedObservation,
+  type StagedOutputFile,
+} from './outputs.js';
 
 const SOURCE_SHA = 'c'.repeat(40);
 
@@ -37,38 +51,67 @@ function cowshedShapedProject(): ProjectTargets {
   };
 }
 
-async function withProbeRepo(
-  run: (fixture: {
-    root: string;
-    buildArtifact: string;
-    linuxArtifact: string;
-    macosArmArtifact: string;
-  }) => Promise<void>,
-): Promise<void> {
-  const temp = await mkdtemp(join(tmpdir(), 'containment-probe-'));
-  const root = join(temp, 'repo');
-  try {
-    await mkdir(join(root, 'packages/cowshed/dist/ts'), { recursive: true });
-    await mkdir(join(root, 'packages/cowshed/dist/bin/linux-x64-gnu'), { recursive: true });
-    await mkdir(join(root, 'packages/cowshed/dist/bin/linux-arm64-gnu'), { recursive: true });
-    await mkdir(join(root, 'packages/cowshed/dist/bin/darwin-arm64'), { recursive: true });
-    await mkdir(join(root, 'packages/cowshed/dist/native/linux-x64-gnu'), { recursive: true });
-    await mkdir(join(root, 'packages/cowshed/dist/native/darwin-arm64'), { recursive: true });
-    await writeFile(join(root, 'packages/cowshed/dist/ts/cli.js'), 'ts entry');
-    await writeFile(join(root, 'packages/cowshed/dist/bin/linux-x64-gnu/cowshed'), 'linux-x64 cli');
-    await writeFile(join(root, 'packages/cowshed/dist/bin/linux-arm64-gnu/cowshed'), 'linux-arm64 cli');
-    await writeFile(join(root, 'packages/cowshed/dist/bin/darwin-arm64/cowshed'), 'darwin-arm64 cli');
-    await writeFile(join(root, 'packages/cowshed/dist/native/linux-x64-gnu/cowshed.node'), 'linux-x64 napi');
-    await writeFile(join(root, 'packages/cowshed/dist/native/darwin-arm64/cowshed.node'), 'darwin-arm64 napi');
-    await run({
-      root,
-      buildArtifact: join(temp, 'release-build-outputs'),
-      linuxArtifact: join(temp, 'linux-platform-outputs'),
-      macosArmArtifact: join(temp, 'macos-arm64-outputs'),
-    });
-  } finally {
-    await rm(temp, { recursive: true, force: true });
+const DIGEST = 'd'.repeat(64);
+const OTHER_DIGEST = 'e'.repeat(64);
+const PACKAGES = [{ name: 'cowshed', version: '1.0.0' }];
+const TS_ENTRY = 'packages/cowshed/dist/ts/cli.js';
+const LINUX_X64_BIN = 'packages/cowshed/dist/bin/linux-x64-gnu/cowshed';
+const LINUX_ARM64_BIN = 'packages/cowshed/dist/bin/linux-arm64-gnu/cowshed';
+const LINUX_X64_NAPI = 'packages/cowshed/dist/native/linux-x64-gnu/cowshed.node';
+const DARWIN_ARM64_BIN = 'packages/cowshed/dist/bin/darwin-arm64/cowshed';
+const DARWIN_ARM64_NAPI = 'packages/cowshed/dist/native/darwin-arm64/cowshed.node';
+const DARWIN_X64_BIN = 'packages/cowshed/dist/bin/darwin-x64/cowshed';
+
+/** The one claim `tsc-js` makes, exactly as the collect planner records it. */
+const TS_CLAIM: OutputClaim = {
+  project: 'cowshed',
+  target: 'tsc-js',
+  output: '{projectRoot}/dist/ts',
+  path: TS_ENTRY,
+  size: 4,
+  mode: 0o644,
+};
+
+/**
+ * A file fact as `lstat` would report it. Size and mode are fixed because the planner judges the facts it is handed;
+ * the on-disk tests are where real sizes, modes and links are exercised.
+ */
+function fileFact(path: string, kind: OutputFileFact['kind'] = 'file'): OutputFileFact {
+  return { path, kind, size: 4, mode: 0o644 };
+}
+
+/** A collect verdict the test expects to be a plan; a refusal fails the test with its reason. */
+function expectPlanned<T>(plan: Planned<T>): T {
+  if (!plan.ok) {
+    throw new Error(`Expected a plan, got a refusal: ${plan.reason}`);
   }
+  return plan.value;
+}
+
+/**
+ * A collected tree as `collectNxOutputs` stages it: every claim is present at its declared size and hashed to DIGEST,
+ * so the only judgement left to the planner is the one a test varies.
+ */
+function stagedTree(name: string, claims: readonly OutputClaim[]): CollectedTree {
+  const workspacePath = `/collected/${name}/workspace`;
+  return {
+    manifestPath: `/collected/${name}/manifest.json`,
+    manifest: { sourceSha: SOURCE_SHA, packageVersions: { cowshed: '1.0.0' } },
+    workspacePath,
+    files: claims.map(
+      (claim): StagedOutputFile => ({
+        entry: { ...claim, sha256: DIGEST },
+        source: `${workspacePath}/${claim.path}`,
+        observed: { kind: 'regular', size: claim.size, sha256: DIGEST },
+      }),
+    ),
+    workspace: { kind: 'directory', regularFiles: claims.map((claim) => claim.path) },
+  };
+}
+
+/** The same tree with every staged file observed as `observed`, so a test varies one on-disk fact at a time. */
+function observing(tree: CollectedTree, observed: StagedObservation): CollectedTree {
+  return { ...tree, files: tree.files.map((file): StagedOutputFile => ({ ...file, observed })) };
 }
 
 describe('publish collect containment probe', () => {
@@ -94,117 +137,333 @@ describe('publish collect containment probe', () => {
     expect(buildClosure.map((run) => run.target).sort()).toEqual(['tsc-js']);
   });
 
-  it('applies build and linux trees together once the aggregate claims no dist', async () => {
-    await withProbeRepo(async ({ root, buildArtifact, linuxArtifact }) => {
-      const project = cowshedShapedProject();
-      const buildRuns = expandNxTargetDependencyRuns(
-        expandNxTargetRuns([project], { targets: 'build', projects: 'cowshed' }).runs,
-      );
-      const linuxRuns = expandNxTargetDependencyRuns(
-        expandNxTargetRuns([project], { targets: '*-linux', projects: 'cowshed' }).runs,
-      );
+  it('applies build and linux trees together once the aggregate claims no dist', () => {
+    const project = cowshedShapedProject();
+    const buildClaims = expectPlanned(
+      planOutputClaims([
+        {
+          project,
+          target: 'tsc-js',
+          outputs: [{ declaredOutput: '{projectRoot}/dist/ts', files: [fileFact(TS_ENTRY)] }],
+        },
+      ]),
+    );
+    const linuxClaims = expectPlanned(
+      planOutputClaims([
+        {
+          project,
+          target: 'cli-x64-linux',
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64-gnu', files: [fileFact(LINUX_X64_BIN)] }],
+        },
+      ]),
+    );
 
-      const buildManifest = await collectNxOutputs(root, buildArtifact, buildRuns, SOURCE_SHA);
-      const linuxManifest = await collectNxOutputs(root, linuxArtifact, linuxRuns, SOURCE_SHA);
-
-      const linuxBin = 'packages/cowshed/dist/bin/linux-x64-gnu/cowshed';
-      expect(buildManifest.files.some((file) => file.target === 'build')).toBe(false);
-      expect(buildManifest.files.map((file) => `${file.target}:${file.path}`)).toEqual([
-        'tsc-js:packages/cowshed/dist/ts/cli.js',
-      ]);
-      expect(linuxManifest.files.some((file) => file.path === linuxBin && file.target === 'cli-x64-linux')).toBe(true);
-
-      await expect(
-        applyCollectedOutputs(root, [buildArtifact, linuxArtifact], SOURCE_SHA, [project]),
-      ).resolves.toBeUndefined();
+    const trees = [stagedTree('build', buildClaims), stagedTree('linux', linuxClaims)];
+    expect(planOverlays(trees, SOURCE_SHA, [project], PACKAGES)).toEqual({
+      ok: true,
+      value: [
+        { source: `/collected/build/workspace/${TS_ENTRY}`, destination: TS_ENTRY, mode: 0o644 },
+        { source: `/collected/linux/workspace/${LINUX_X64_BIN}`, destination: LINUX_X64_BIN, mode: 0o644 },
+      ],
     });
   });
 
-  it('still refuses apply when a leftover aggregate output swallows the platform binary', async () => {
-    await withProbeRepo(async ({ root, buildArtifact, linuxArtifact }) => {
-      const project = cowshedShapedProject();
-      project.targetOutputs?.set('build', ['{projectRoot}/dist']);
-      const buildRuns = expandNxTargetDependencyRuns(
-        expandNxTargetRuns([project], { targets: 'build', projects: 'cowshed' }).runs,
-      );
-      const linuxRuns = expandNxTargetDependencyRuns(
-        expandNxTargetRuns([project], { targets: '*-linux', projects: 'cowshed' }).runs,
-      );
+  it('still refuses apply when a leftover aggregate output swallows the platform binary', () => {
+    const project = cowshedShapedProject();
+    project.targetOutputs?.set('build', ['{projectRoot}/dist']);
+    const distFiles = [TS_ENTRY, LINUX_X64_BIN, LINUX_ARM64_BIN, DARWIN_ARM64_BIN, LINUX_X64_NAPI, DARWIN_ARM64_NAPI];
+    const buildClaims = expectPlanned(
+      planOutputClaims([
+        {
+          project,
+          target: 'build',
+          outputs: [{ declaredOutput: '{projectRoot}/dist', files: distFiles.map((path) => fileFact(path)) }],
+        },
+      ]),
+    );
+    const linuxClaims = expectPlanned(
+      planOutputClaims([
+        {
+          project,
+          target: 'cli-x64-linux',
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64-gnu', files: [fileFact(LINUX_X64_BIN)] }],
+        },
+      ]),
+    );
+    expect(buildClaims.map((claim) => claim.path)).toContain(LINUX_X64_BIN);
 
-      const buildManifest = await collectNxOutputs(root, buildArtifact, buildRuns, SOURCE_SHA);
-      const linuxManifest = await collectNxOutputs(root, linuxArtifact, linuxRuns, SOURCE_SHA);
-
-      const linuxBin = 'packages/cowshed/dist/bin/linux-x64-gnu/cowshed';
-      expect(buildManifest.files.some((file) => file.path === linuxBin)).toBe(true);
-      expect(linuxManifest.files.some((file) => file.path === linuxBin && file.target === 'cli-x64-linux')).toBe(true);
-
-      await expect(applyCollectedOutputs(root, [buildArtifact, linuxArtifact], SOURCE_SHA, [project])).rejects.toThrow(
-        'Output collision across collected trees',
-      );
+    const trees = [stagedTree('build', buildClaims), stagedTree('linux', linuxClaims)];
+    expect(planOverlays(trees, SOURCE_SHA, [project], PACKAGES)).toEqual({
+      ok: false,
+      reason: `Output collision across collected trees in /collected/linux/manifest.json: ${LINUX_X64_BIN}`,
     });
   });
 
-  it('keeps the linux platform binary in the *-linux collect tree', async () => {
-    await withProbeRepo(async ({ root, linuxArtifact }) => {
-      const project = cowshedShapedProject();
-      const linuxRuns = expandNxTargetDependencyRuns(
-        expandNxTargetRuns([project], { targets: '*-linux', projects: 'cowshed' }).runs,
-      );
-      const linuxManifest = await collectNxOutputs(root, linuxArtifact, linuxRuns, SOURCE_SHA);
-      expect(linuxManifest.files.map((file) => `${file.target}:${file.path}`)).toContain(
-        'cli-x64-linux:packages/cowshed/dist/bin/linux-x64-gnu/cowshed',
-      );
+  it('keeps the linux platform binary in the *-linux collect tree', () => {
+    const project = cowshedShapedProject();
+    expect(
+      planOutputClaims([
+        {
+          project,
+          target: 'cli-x64-linux',
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64-gnu', files: [fileFact(LINUX_X64_BIN)] }],
+        },
+      ]),
+    ).toEqual({
+      ok: true,
+      value: [
+        {
+          project: 'cowshed',
+          target: 'cli-x64-linux',
+          output: '{projectRoot}/dist/bin/linux-x64-gnu',
+          path: LINUX_X64_BIN,
+          size: 4,
+          mode: 0o644,
+        },
+      ],
     });
   });
 
-  it('still refuses a genuine two-producers-one-file collision', async () => {
-    await withProbeRepo(async ({ root, buildArtifact, linuxArtifact }) => {
-      const first: ProjectTargets = {
-        project: 'alpha',
-        root: 'packages/cowshed',
-        targets: ['cli-x64-linux'],
-        targetOutputs: new Map([['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']]]),
-      };
-      const second: ProjectTargets = {
-        project: 'beta',
-        root: 'packages/cowshed',
-        targets: ['other-x64-linux'],
-        targetOutputs: new Map([['other-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']]]),
-      };
-      await collectNxOutputs(root, buildArtifact, [{ target: 'cli-x64-linux', projects: [first] }], SOURCE_SHA);
-      await collectNxOutputs(root, linuxArtifact, [{ target: 'other-x64-linux', projects: [second] }], SOURCE_SHA);
-      await expect(
-        applyCollectedOutputs(root, [buildArtifact, linuxArtifact], SOURCE_SHA, [first, second]),
-      ).rejects.toThrow('Output collision across collected trees');
+  it('still refuses a genuine two-producers-one-file collision', () => {
+    const alpha: ProjectTargets = {
+      ...cowshedShapedProject(),
+      project: 'alpha',
+      targets: ['cli-x64-linux'],
+      targetOutputs: new Map([['cli-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']]]),
+    };
+    const beta: ProjectTargets = {
+      ...cowshedShapedProject(),
+      project: 'beta',
+      targets: ['other-x64-linux'],
+      targetOutputs: new Map([['other-x64-linux', ['{projectRoot}/dist/bin/linux-x64-gnu']]]),
+    };
+    const outputs = [{ declaredOutput: '{projectRoot}/dist/bin/linux-x64-gnu', files: [fileFact(LINUX_X64_BIN)] }];
+
+    expect(
+      planOutputClaims([
+        { project: alpha, target: 'cli-x64-linux', outputs },
+        { project: beta, target: 'other-x64-linux', outputs },
+      ]),
+    ).toEqual({
+      ok: false,
+      reason: `Output collision: ${LINUX_X64_BIN} is declared by more than one project target or output.`,
+    });
+
+    const alphaClaims = expectPlanned(planOutputClaims([{ project: alpha, target: 'cli-x64-linux', outputs }]));
+    const betaClaims = expectPlanned(planOutputClaims([{ project: beta, target: 'other-x64-linux', outputs }]));
+    const trees = [stagedTree('alpha', alphaClaims), stagedTree('linux', betaClaims)];
+    expect(planOverlays(trees, SOURCE_SHA, [alpha, beta], PACKAGES)).toEqual({
+      ok: false,
+      reason: `Output collision across collected trees in /collected/linux/manifest.json: ${LINUX_X64_BIN}`,
     });
   });
 
-  it('does not collide macos arm64 current against a disjoint x64 current tree', async () => {
-    await withProbeRepo(async ({ root, macosArmArtifact, linuxArtifact }) => {
-      const project = cowshedShapedProject();
-      project.targets = [...project.targets, 'cli-x64-macos'];
-      project.targetOutputs?.set('cli-x64-macos', ['{projectRoot}/dist/bin/darwin-x64']);
-      const macosRuns = expandNxTargetDependencyRuns(
-        expandNxTargetRuns([project], { targets: '*-arm64-macos', projects: 'cowshed' }).runs,
-      );
-      await mkdir(join(root, 'packages/cowshed/dist/bin/darwin-x64'), { recursive: true });
-      await writeFile(join(root, 'packages/cowshed/dist/bin/darwin-x64/cowshed'), 'darwin-x64 cli');
-      const macosManifest = await collectNxOutputs(root, macosArmArtifact, macosRuns, SOURCE_SHA);
-      const x64Manifest = await collectNxOutputs(
-        root,
-        linuxArtifact,
-        [{ target: 'cli-x64-macos', projects: [project] }],
-        SOURCE_SHA,
-      );
-      expect(macosManifest.files.map((file) => file.path)).toEqual([
-        'packages/cowshed/dist/bin/darwin-arm64/cowshed',
-        'packages/cowshed/dist/native/darwin-arm64/cowshed.node',
-      ]);
-      expect(x64Manifest.files.map((file) => file.path)).toEqual(['packages/cowshed/dist/bin/darwin-x64/cowshed']);
-      await expect(
-        applyCollectedOutputs(root, [macosArmArtifact, linuxArtifact], SOURCE_SHA, [project]),
-      ).resolves.toBeUndefined();
+  it('does not collide macos arm64 current against a disjoint x64 current tree', () => {
+    const project = cowshedShapedProject();
+    project.targets = [...project.targets, 'cli-x64-macos'];
+    project.targetOutputs?.set('cli-x64-macos', ['{projectRoot}/dist/bin/darwin-x64']);
+    const macosClaims = expectPlanned(
+      planOutputClaims([
+        {
+          project,
+          target: 'cli-arm64-macos',
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/darwin-arm64', files: [fileFact(DARWIN_ARM64_BIN)] }],
+        },
+        {
+          project,
+          target: 'napi-arm64-macos',
+          outputs: [{ declaredOutput: '{projectRoot}/dist/native/darwin-arm64', files: [fileFact(DARWIN_ARM64_NAPI)] }],
+        },
+      ]),
+    );
+    const x64Claims = expectPlanned(
+      planOutputClaims([
+        {
+          project,
+          target: 'cli-x64-macos',
+          outputs: [{ declaredOutput: '{projectRoot}/dist/bin/darwin-x64', files: [fileFact(DARWIN_X64_BIN)] }],
+        },
+      ]),
+    );
+
+    const trees = [stagedTree('macos-arm64', macosClaims), stagedTree('x64', x64Claims)];
+    expect(planOverlays(trees, SOURCE_SHA, [project], PACKAGES)).toEqual({
+      ok: true,
+      value: [
+        { source: `/collected/macos-arm64/workspace/${DARWIN_ARM64_BIN}`, destination: DARWIN_ARM64_BIN, mode: 0o644 },
+        {
+          source: `/collected/macos-arm64/workspace/${DARWIN_ARM64_NAPI}`,
+          destination: DARWIN_ARM64_NAPI,
+          mode: 0o644,
+        },
+        { source: `/collected/x64/workspace/${DARWIN_X64_BIN}`, destination: DARWIN_X64_BIN, mode: 0o644 },
+      ],
     });
+  });
+
+  it('refuses a collected target that declares no outputs', () => {
+    expect(planOutputClaims([{ project: cowshedShapedProject(), target: 'build', outputs: [] }])).toEqual({
+      ok: false,
+      reason: 'Nx target cowshed:build declares no outputs.',
+    });
+  });
+
+  it('refuses a declared output that matched no file', () => {
+    const outputs = [{ declaredOutput: '{projectRoot}/dist/ts', files: [] }];
+    expect(planOutputClaims([{ project: cowshedShapedProject(), target: 'tsc-js', outputs }])).toEqual({
+      ok: false,
+      reason: 'Declared output {projectRoot}/dist/ts for cowshed:tsc-js is missing.',
+    });
+  });
+
+  it('refuses an output file that is not a regular file', () => {
+    const outputs = [{ declaredOutput: '{projectRoot}/dist/ts', files: [fileFact(TS_ENTRY, 'symlink')] }];
+    expect(planOutputClaims([{ project: cowshedShapedProject(), target: 'tsc-js', outputs }])).toEqual({
+      ok: false,
+      reason: `Output file must be a regular file: ${TS_ENTRY}`,
+    });
+  });
+
+  it('reaches a dependency output through its aggregate without a second claim', () => {
+    const project = cowshedShapedProject();
+    expect(
+      planOutputClaims([
+        {
+          project,
+          target: 'tsc-js',
+          outputs: [{ declaredOutput: '{projectRoot}/dist/ts', files: [fileFact(TS_ENTRY)] }],
+        },
+        { project, target: 'build', outputs: [{ declaredOutput: '{projectRoot}/dist', files: [fileFact(TS_ENTRY)] }] },
+      ]),
+    ).toEqual({ ok: true, value: [TS_CLAIM] });
+  });
+
+  it('refuses a tree staged for another source SHA', () => {
+    const otherSha = 'f'.repeat(40);
+    const tree: CollectedTree = {
+      ...stagedTree('build', [TS_CLAIM]),
+      manifest: { sourceSha: otherSha, packageVersions: { cowshed: '1.0.0' } },
+    };
+    expect(planOverlays([tree], SOURCE_SHA, [cowshedShapedProject()], PACKAGES)).toEqual({
+      ok: false,
+      reason: `Source SHA mismatch in /collected/build/manifest.json: expected ${SOURCE_SHA}, received ${otherSha}.`,
+    });
+  });
+
+  it('refuses a tree whose package versions disagree with the workspace', () => {
+    const tree: CollectedTree = {
+      ...stagedTree('build', [TS_CLAIM]),
+      manifest: { sourceSha: SOURCE_SHA, packageVersions: { cowshed: '0.9.0' } },
+    };
+    expect(planOverlays([tree], SOURCE_SHA, [cowshedShapedProject()], PACKAGES)).toEqual({
+      ok: false,
+      reason: 'Package version mismatch in /collected/build/manifest.json for cowshed: expected 1.0.0, received 0.9.0.',
+    });
+  });
+
+  it('refuses a staged output file that is missing', () => {
+    const cause = new Error('ENOENT: no such file');
+    const tree = observing(stagedTree('build', [TS_CLAIM]), { kind: 'missing', cause });
+    expect(planOverlays([tree], SOURCE_SHA, [cowshedShapedProject()], PACKAGES)).toEqual({
+      ok: false,
+      reason: `Staged output file is missing: ${TS_ENTRY}: ENOENT: no such file`,
+      cause,
+    });
+  });
+
+  it('refuses a staged output that is not a regular file', () => {
+    const tree = observing(stagedTree('build', [TS_CLAIM]), { kind: 'not-regular' });
+    expect(planOverlays([tree], SOURCE_SHA, [cowshedShapedProject()], PACKAGES)).toEqual({
+      ok: false,
+      reason: `Staged output must be a regular file: ${TS_ENTRY}`,
+    });
+  });
+
+  it('refuses a staged output whose size differs from the manifest', () => {
+    const tree = observing(stagedTree('build', [TS_CLAIM]), { kind: 'regular', size: 9, sha256: DIGEST });
+    expect(planOverlays([tree], SOURCE_SHA, [cowshedShapedProject()], PACKAGES)).toEqual({
+      ok: false,
+      reason: `Size mismatch for staged output ${TS_ENTRY}: expected 4, received 9.`,
+    });
+  });
+
+  it('refuses a staged output whose bytes differ from the manifest', () => {
+    const tree = observing(stagedTree('build', [TS_CLAIM]), { kind: 'regular', size: 4, sha256: OTHER_DIGEST });
+    expect(planOverlays([tree], SOURCE_SHA, [cowshedShapedProject()], PACKAGES)).toEqual({
+      ok: false,
+      reason: `SHA-256 mismatch for staged output ${TS_ENTRY}: expected ${DIGEST}, received ${OTHER_DIGEST}.`,
+    });
+  });
+
+  it('accepts an empty tree whose workspace was never transferred', () => {
+    const cause = new Error('ENOENT');
+    const tree: CollectedTree = { ...stagedTree('build', []), workspace: { kind: 'absent', cause } };
+    expect(planOverlays([tree], SOURCE_SHA, [cowshedShapedProject()], PACKAGES)).toEqual({ ok: true, value: [] });
+  });
+
+  it('refuses a non-empty tree whose workspace is missing', () => {
+    const cause = new Error('ENOENT');
+    const tree: CollectedTree = { ...stagedTree('build', [TS_CLAIM]), workspace: { kind: 'absent', cause } };
+    expect(planOverlays([tree], SOURCE_SHA, [cowshedShapedProject()], PACKAGES)).toEqual({
+      ok: false,
+      reason: 'Collected output workspace is missing: /collected/build/workspace: ENOENT',
+      cause,
+    });
+  });
+
+  it('refuses a staged workspace that is not a real directory', () => {
+    const tree: CollectedTree = { ...stagedTree('build', [TS_CLAIM]), workspace: { kind: 'not-directory' } };
+    expect(planOverlays([tree], SOURCE_SHA, [cowshedShapedProject()], PACKAGES)).toEqual({
+      ok: false,
+      reason: 'Collected output workspace must be a real directory: /collected/build/workspace',
+    });
+  });
+
+  it('refuses an undeclared file in a staged workspace', () => {
+    const extra = 'packages/cowshed/dist/ts/extra.js';
+    const tree: CollectedTree = {
+      ...stagedTree('build', [TS_CLAIM]),
+      workspace: { kind: 'directory', regularFiles: [TS_ENTRY, extra] },
+    };
+    expect(planOverlays([tree], SOURCE_SHA, [cowshedShapedProject()], PACKAGES)).toEqual({
+      ok: false,
+      reason: `Undeclared staged output file in /collected/build/manifest.json: ${extra}`,
+    });
+  });
+
+  it('refuses to collect a declared output directory that holds a symbolic link', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'containment-probe-symlink-'));
+    const root = join(temp, 'repo');
+    try {
+      await mkdir(join(root, 'packages/cowshed/dist/ts'), { recursive: true });
+      await symlink('cli.js', join(root, 'packages/cowshed/dist/ts/cli.js'));
+      const runs = [{ target: 'tsc-js', projects: [cowshedShapedProject()] }];
+      await expect(collectNxOutputs(root, join(temp, 'release-build-outputs'), runs, SOURCE_SHA)).rejects.toThrow(
+        'Collected outputs must not contain symbolic links',
+      );
+    } finally {
+      await rm(temp, { recursive: true, force: true });
+    }
+  });
+
+  it('judges an applied file by the same rules as a staged one', () => {
+    const applied: OutputStage = { stage: 'applied', manifestPath: '/collected/build/manifest.json' };
+    const expected = { size: 4, sha256: DIGEST };
+    const cause = new Error('ENOENT');
+    expect(judgeOutputFile(applied, TS_ENTRY, expected, { kind: 'missing', cause })).toEqual({
+      reason: `Applied output file is missing: ${TS_ENTRY}: ENOENT`,
+      cause,
+    });
+    expect(judgeOutputFile(applied, TS_ENTRY, expected, { kind: 'not-regular' })).toEqual({
+      reason: `Applied output must be a regular file: ${TS_ENTRY}`,
+    });
+    expect(judgeOutputFile(applied, TS_ENTRY, expected, { kind: 'regular', size: 9, sha256: DIGEST })).toEqual({
+      reason: `Size mismatch for applied output ${TS_ENTRY}: expected 4, received 9.`,
+    });
+    expect(judgeOutputFile(applied, TS_ENTRY, expected, { kind: 'regular', size: 4, sha256: OTHER_DIGEST })).toEqual({
+      reason: `SHA-256 mismatch for applied output ${TS_ENTRY} from /collected/build/manifest.json: expected ${DIGEST}, received ${OTHER_DIGEST}.`,
+    });
+    expect(judgeOutputFile(applied, TS_ENTRY, expected, { kind: 'regular', size: 4, sha256: DIGEST })).toBeUndefined();
   });
 });
 
