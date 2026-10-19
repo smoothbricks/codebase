@@ -23,7 +23,8 @@
  *   names: the checkout's own build, never a consumer override;
  * - each such package's `node_modules` links. A link into the provider's own
  *   `node_modules/.bun` store copies that store entry whole; a link into Bun's
- *   global cache stays an absolute link to it. Any other target refuses.
+ *   global cache, as `bun pm cache` names it in the consumer checkout, stays an
+ *   absolute link to it. Any other target refuses.
  *
  * Provenance is the provider's own Nx producer receipt. Every declared target
  * must be a probe hit (the read-only `probeBuilt`, which runs and
@@ -156,6 +157,8 @@ type PlanNode =
 interface SnapshotPlan {
   readonly name: string;
   readonly root: string;
+  /** Bun's immutable install cache the plan's links were classified against (`bunCacheRoot`). */
+  readonly cache: string;
   readonly packagePath: string;
   readonly nodes: ReadonlyMap<string, PlanNode>;
 }
@@ -184,7 +187,7 @@ export async function snapshotBinding(
 ): Promise<SnapshotBinding> {
   try {
     const store = snapshotStore(root);
-    const plan = planSnapshot(source, name, declaration);
+    const plan = planSnapshot(source, name, declaration, bunCacheRoot(root));
     const id = await capture(store, plan, declaration, probe, fingerprintOf(plan));
     return { kind: 'snapshot', id, directory: path.join(store, id, plan.packagePath) };
   } catch (error) {
@@ -236,11 +239,10 @@ export function pluginProbe(from: string): ProducerProbe {
   };
 }
 
-/** What a snapshot of `source` would hold, read from the provider as it is now. */
-function planSnapshot(source: string, name: string, declaration: SnapshotDeclaration): SnapshotPlan {
+/** What a snapshot of `source` would hold, read from the provider as it is now, with `cache` as Bun's cache. */
+function planSnapshot(source: string, name: string, declaration: SnapshotDeclaration, cache: string): SnapshotPlan {
   const directory = realpathSync(source);
   const root = providerRoot(directory);
-  const cache = bunCacheRoot(root);
   const nodes = new Map<string, PlanNode>();
   const pending = [directory];
   const packages = new Map<string, Record<string, unknown>>();
@@ -307,7 +309,7 @@ function planSnapshot(source: string, name: string, declaration: SnapshotDeclara
   addFile(path.join(root, 'package.json'), 'provider');
   for (const specifier of declaration.artifactModules) addFile(nativeArtifact(specifier, directory), 'provider');
   for (const [at, manifest] of packages) assertExportsPublished(at, manifest, root, nodes);
-  return { name, root, packagePath: path.relative(root, directory), nodes };
+  return { name, root, cache, packagePath: path.relative(root, directory), nodes };
 }
 
 /**
@@ -356,7 +358,12 @@ function providerRoot(directory: string): string {
   }
 }
 
-/** Bun's immutable install cache as the provider's Bun names it. */
+/**
+ * Bun's immutable install cache as Bun names it in the consumer checkout `root`. Never in the provider: `bun pm`
+ * opens its root manifest for writing just to print a path, and a sandboxed consumer may only read its provider (a
+ * cowshed workspace's sibling grant). Every checkout reaches the cache through one literal path (smoothbricks
+ * specs/cowshed/03_caches.md, "Link-target caches"), so a provider link into another cache refuses as outside it.
+ */
 function bunCacheRoot(root: string): string {
   const run = spawnSync('bun', ['pm', 'cache'], { cwd: root, encoding: 'utf8' });
   if (run.error !== undefined || run.status !== 0) {
@@ -560,7 +567,10 @@ async function capture(
         attest(relative, bytes, digest, executable, tracked, outputs, plan, provenance);
       census.push({ path: relative, type: 'file', executable, sha256: digest });
     }
-    if (fingerprintOf(planSnapshot(path.join(plan.root, plan.packagePath), plan.name, declaration)) !== fingerprint) {
+    if (
+      fingerprintOf(planSnapshot(path.join(plan.root, plan.packagePath), plan.name, declaration, plan.cache)) !==
+      fingerprint
+    ) {
       throw new SnapshotRefusal(
         `${plan.root} changed while it was copied; nothing was published, so retry once it is quiet`,
       );

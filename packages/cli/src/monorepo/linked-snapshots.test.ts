@@ -419,6 +419,25 @@ describe('linked package snapshots', () => {
     expect(refusalOf(capture(checkout))).toContain("outside the provider checkout and Bun's cache");
   });
 
+  it("names Bun's cache as the consumer's Bun does, without opening the read-only provider's manifest", () => {
+    const checkout = fixture();
+    // The consumer's own Bun configuration names the cache, so only a lookup in the consumer root finds it. A
+    // `BUN_INSTALL_CACHE_DIR` (a managed shell exports one) outranks every bunfig, so the children run without it.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== 'BUN_INSTALL_CACHE_DIR'));
+    const cache = join(checkout.provider, '..', 'consumer-cache');
+    write(join(checkout.consumer, 'bunfig.toml'), `[install.cache]\ndir = ${JSON.stringify(cache)}\n`);
+    const printed = spawnSync(process.execPath, ['pm', 'cache'], { cwd: checkout.consumer, encoding: 'utf8', env });
+    expect(printed.status, printed.stderr).toBe(0);
+    expect(printed.stdout.trim()).toBe(cache);
+    const cached = join(cache, 'links/cached@1.0.0/node_modules/cached');
+    write(join(cached, 'package.json'), JSON.stringify({ name: 'cached', version: '1.0.0' }));
+    symlinkSync(cached, join(checkout.source, 'node_modules/cached'));
+    // A sandboxed consumer may only read its provider; `bun pm` refuses a manifest it cannot open for writing.
+    chmodSync(join(checkout.provider, 'package.json'), 0o444);
+    const snapshot = snapshotOf(capture(checkout, 'hit', null, env));
+    expect(readlinkSync(join(snapshot.directory, 'node_modules/cached'))).toBe(cached);
+  });
+
   it('refuses a cowshed store its refresh has not linked onto the build volume', () => {
     const checkout = fixture();
     mkdirSync(join(checkout.consumer, '.cowshed'), { recursive: true });
