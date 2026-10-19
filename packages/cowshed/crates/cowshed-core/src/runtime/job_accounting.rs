@@ -23,6 +23,12 @@
 //! difference; this source never guesses it. Nor does it count bytes: `ri_child_*` holds no disk
 //! I/O, so the job's storage I/O is unavailable, never zero.
 //!
+//! xnu does not keep each counter of a reading from falling below the last: one job leader's
+//! own user CPU read 239 us, then 222 us. CPU spent is never unspent, so a lower reading is the
+//! kernel's, not the job's: each counter holds the highest value read of it, and the job's total
+//! never falls. A dip is therefore never an error, and the total may exceed the leader's final
+//! reading by at most the deepest dip.
+//!
 //! [`ActivationEnded`]: super::supervisor::ProcessEvent::ActivationEnded
 
 use crate::api::resources::{CpuTotals, ResourceUnitError};
@@ -169,13 +175,6 @@ pub fn read_leader(leader: &Birth) -> Result<LeaderRusage, LeaderRusageError> {
 pub enum AccountingError {
     #[error(transparent)]
     Leader(#[from] LeaderRusageError),
-    #[error("job leader {pid}'s {counter} fell from {before} us to {after} us")]
-    Regressed {
-        pid: u32,
-        counter: &'static str,
-        before: u64,
-        after: u64,
-    },
     #[error("process {read} was read as the job's leader, but {charged} is charged")]
     OtherLeader { read: u32, charged: u32 },
     #[error("process {pid}'s interval ended while no leader of the job was charged")]
@@ -291,7 +290,8 @@ impl RusageChildren {
 }
 
 impl Charged {
-    /// `reading` if it is of this leader and no counter of it fell since the last.
+    /// `reading` if it is of this leader, each counter at the highest value read of it in this
+    /// interval: a counter read lower than before holds where it was (module docs).
     fn checked(&self, reading: LeaderRusage) -> Result<LeaderRusage, AccountingError> {
         let charged = self.leader.pid();
         if reading.pid != charged {
@@ -303,30 +303,15 @@ impl Charged {
         let Some(latest) = self.latest else {
             return Ok(reading);
         };
-        for (counter, before, after) in [
-            ("own user CPU", latest.own.user_us, reading.own.user_us),
-            ("own system CPU", latest.own.sys_us, reading.own.sys_us),
-            (
-                "children user CPU",
-                latest.children.user_us,
-                reading.children.user_us,
-            ),
-            (
-                "children system CPU",
-                latest.children.sys_us,
-                reading.children.sys_us,
-            ),
-        ] {
-            if after < before {
-                return Err(AccountingError::Regressed {
-                    pid: charged,
-                    counter,
-                    before: before.get(),
-                    after: after.get(),
-                });
-            }
-        }
-        Ok(reading)
+        let highest = |before: CpuTotals, after: CpuTotals| CpuTotals {
+            user_us: before.user_us.max(after.user_us),
+            sys_us: before.sys_us.max(after.sys_us),
+        };
+        Ok(LeaderRusage {
+            own: highest(latest.own, reading.own),
+            children: highest(latest.children, reading.children),
+            ..reading
+        })
     }
 }
 
@@ -446,10 +431,10 @@ mod tests {
         );
     }
 
-    /// A reading of another process, or one in which a counter fell, is refused and changes
-    /// nothing: the next sound reading still counts from the last accepted one.
+    /// A reading of another process is refused and changes nothing: the next sound reading still
+    /// counts from the last accepted one.
     #[test]
-    fn a_reading_of_another_leader_or_a_falling_counter_is_refused() {
+    fn a_reading_of_another_leader_is_refused() {
         let mut fold = RusageChildren::charging(leader(100));
         totals(fold.account(|_| Ok(reading(100, (10, 10), (500, 50)))));
         assert_eq!(
@@ -457,15 +442,6 @@ mod tests {
             Err(AccountingError::OtherLeader {
                 read: 101,
                 charged: 100
-            })
-        );
-        assert_eq!(
-            fold.account(|_| Ok(reading(100, (10, 10), (499, 50)))),
-            Err(AccountingError::Regressed {
-                pid: 100,
-                counter: "children user CPU",
-                before: 500,
-                after: 499,
             })
         );
         assert_eq!(
@@ -481,6 +457,35 @@ mod tests {
         assert_eq!(
             totals(fold.account(|_| Ok(reading(100, (11, 10), (500, 50))))),
             cpu(511, 60)
+        );
+    }
+
+    /// xnu does not keep each CPU counter of a live process from falling between two
+    /// `proc_pid_rusage` reads: a deployed job leader's own user CPU read 239 us, then 222 us.
+    /// The dip is the platform's, not the job's: it fails nothing, each counter holds the highest
+    /// value read, and the job's total never falls, through its interval's end.
+    #[test]
+    fn a_counter_read_lower_than_before_fails_nothing_and_the_total_never_falls() {
+        let mut fold = RusageChildren::charging(leader(100));
+        assert_eq!(
+            totals(fold.account(|_| Ok(reading(100, (239, 40), (500, 50))))),
+            cpu(739, 90)
+        );
+        assert_eq!(
+            totals(fold.account(|_| Ok(reading(100, (222, 41), (500, 50))))),
+            cpu(739, 91),
+            "the fallen own user CPU holds at 239 us; the risen system CPU counts"
+        );
+        assert_eq!(
+            totals(fold.account(|_| Ok(reading(100, (250, 41), (500, 50))))),
+            cpu(750, 91),
+            "growth past the high mark counts from it, once"
+        );
+        fold.end(Ok(reading(100, (245, 41), (499, 50))));
+        assert_eq!(
+            totals(fold.account(|_| panic!("nothing leads"))),
+            cpu(750, 91),
+            "an end read lower closes the interval at its high mark"
         );
     }
 

@@ -1270,7 +1270,11 @@ macOS observes the three kqueue event kinds best-effort, as above, and reconcile
 reaped-children rusage. That covers the activation interval and the command once each, but it is not a complete job
 total. Descendants still running, those exited and not yet reaped, and orphans reparented to another reaper are missing.
 An exited leader's held zombie keeps the rusage fixed at its exit, so orphans that run on after it add nothing. These
-limits are stated, never presented as exact.
+limits are stated, never presented as exact. xnu does not keep each `proc_pid_rusage` CPU counter from falling between
+two reads (a job leader's own user CPU has read 239 µs, then 222 µs). CPU spent is never unspent, so such a dip is the
+platform's, never an inconsistency of the job. The leader source and each process row hold every CPU counter at the
+highest value read of it, so a cumulative total never falls and no window counts negative CPU. A total may therefore
+exceed the final reading by at most the deepest dip.
 
 Reconciliation retains the difference between independent job totals and attributed process rows in named units.
 Unattributed CPU/storage-I/O emits an explicit typed row on the job span; event loss, unavailable comparison evidence,

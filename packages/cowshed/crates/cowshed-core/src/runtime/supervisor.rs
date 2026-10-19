@@ -6965,8 +6965,7 @@ fn unaccounted(leader: u32, error: super::job_accounting::AccountingError) -> Co
             format!("the CPU accounting of job group {leader} is unavailable: {error}"),
             "the job runs on; its CPU totals cannot be stated",
         ),
-        AccountingError::Regressed { .. }
-        | AccountingError::OtherLeader { .. }
+        AccountingError::OtherLeader { .. }
         | AccountingError::NoneCharged { .. }
         | AccountingError::Unclosed { .. }
         | AccountingError::Inexact(_) => CowshedError::internal(format!(

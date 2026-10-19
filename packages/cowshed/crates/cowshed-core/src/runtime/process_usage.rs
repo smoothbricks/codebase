@@ -277,16 +277,6 @@ impl Counted {
             _ => ((0, 0), (0, 0)),
         };
         for (counter, before, after) in [
-            (
-                "user CPU microseconds",
-                latest.cpu_user.get(),
-                reading.cpu_user.get(),
-            ),
-            (
-                "system CPU microseconds",
-                latest.cpu_sys.get(),
-                reading.cpu_sys.get(),
-            ),
             ("storage read bytes", read.0, read.1),
             ("storage write bytes", written.0, written.1),
         ] {
@@ -299,6 +289,14 @@ impl Counted {
                 });
             }
         }
+        // xnu does not keep a live process's CPU counters from falling between two reads
+        // (job_accounting's module docs): each holds the highest value read of it, so no window
+        // counts negative CPU.
+        let reading = UsageReading {
+            cpu_user: latest.cpu_user.max(reading.cpu_user),
+            cpu_sys: latest.cpu_sys.max(reading.cpu_sys),
+            ..reading
+        };
         let rss_peak = self.rss_peak.max(reading.resident);
         let (Some(origin), Some(window)) = (origin, self.window) else {
             // Off the clock a read judges nothing; the first read on it opens the first window.
@@ -1151,17 +1149,32 @@ mod tests {
             })
         );
         assert_eq!(
-            fold.apply(read(process, reading(later, 9, 10))),
-            Err(UsageFoldError::Regressed {
-                pid: 45,
-                counter: "user CPU microseconds",
-                before: 10,
-                after: 9,
-            })
-        );
-        assert_eq!(
             fold.apply(read(process, reading(start, 10, 10))),
             Err(UsageFoldError::Backwards { pid: 45 })
+        );
+    }
+
+    /// xnu does not keep a live process's CPU counters from falling between two reads. A dip
+    /// fails nothing: each counter holds its highest reading, so no window counts negative CPU.
+    #[test]
+    fn a_cpu_counter_read_lower_than_before_fails_nothing() {
+        let process = identity(46);
+        let start = Instant::now();
+        let second = |n| start + Duration::from_secs(n);
+        let mut fold = ProcessUsageFold::clocked(start);
+        let usage = |fold: &ProcessUsageFold| fold.usage(process).expect("a read life");
+        fold.apply(read(process, reading(start, 239, 40))).unwrap();
+        fold.apply(read(process, reading(second(1), 222, 41)))
+            .unwrap();
+        let dipped = usage(&fold);
+        assert_eq!((dipped.cpu_user_us, dipped.cpu_sys_us), (cpu(239), cpu(41)));
+        assert_eq!(dipped.cpu_window, Some(cpu_window(0, 1_000_000, 0)));
+        fold.apply(read(process, reading(second(2), 250_239, 41)))
+            .unwrap();
+        assert_eq!(
+            usage(&fold).cpu_window,
+            Some(cpu_window(1_000_000, 2_000_000, 250)),
+            "growth past the high mark counts from it"
         );
     }
 
