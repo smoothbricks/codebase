@@ -8,6 +8,9 @@
  * resolved the live directory would then read bytes no key of it describes. A
  * snapshot is copied from one provider state and never changes: a provider
  * change reaches the consumer only as another snapshot under another name.
+ * An explicit snapshot ID resolves only from the consumer's existing store;
+ * provider HEAD changes are informational and never select another snapshot.
+ * Only a capture declaration opts into the provider's current state.
  *
  * What a snapshot holds, laid out as in the provider checkout so relative
  * resolution means what it meant there (exports, tsconfig `paths`, and the
@@ -140,6 +143,8 @@ export interface SealedSnapshot {
   readonly kind: 'snapshot';
   readonly id: string;
   readonly directory: string;
+  /** Informational pin freshness only; never a request to recapture or refuse a verified pin. */
+  readonly report?: string;
 }
 
 export type SnapshotBinding = SealedSnapshot | { readonly kind: 'refused'; readonly reason: string };
@@ -174,18 +179,18 @@ type ProducerRecord = Extract<EnsureBuiltProbeResult, { readonly disposition: 'h
 const PRODUCER_VERSION = 1;
 
 /**
- * The snapshot `source` binds to now: its provider is probed, copied and attested every time, and the result is
- * the sealed snapshot of exactly that census and receipt, published now or verified when it already exists. A
- * refusal names its cause and leaves every binding as it was.
+ * A snapshot ID resolves only from the consumer's store. A capture declaration instead probes, copies and attests
+ * the provider's current state. A refusal names its cause and leaves every binding as it was.
  */
 export async function snapshotBinding(
   root: string,
   name: string,
   source: string,
-  declaration: SnapshotDeclaration,
+  declaration: SnapshotDeclaration | string,
   probe: ProducerProbe,
 ): Promise<SnapshotBinding> {
   try {
+    if (typeof declaration === 'string') return pinnedSnapshot(root, name, source, declaration);
     const store = snapshotStore(root);
     const plan = planSnapshot(source, name, declaration, bunCacheRoot(root));
     const id = await capture(store, plan, declaration, probe, fingerprintOf(plan));
@@ -197,6 +202,28 @@ export async function snapshotBinding(
     }
     throw error;
   }
+}
+
+/** Resolve an explicit content pin, never reading provider bytes or asking its producer to run. */
+export function pinnedSnapshot(root: string, name: string, source: string, id: string): SealedSnapshot {
+  if (!/^[0-9a-f]{64}$/.test(id)) throw new SnapshotRefusal(`snapshot pin ${id} must be 64 lowercase hex digits`);
+  const sealed = path.resolve(root, SNAPSHOT_STORE, id);
+  const receipt = verifySnapshot(sealed);
+  if (receipt.name !== name) throw new SnapshotRefusal(`snapshot ${id} contains ${receipt.name}, not ${name}`);
+  if (!contained(receipt.packagePath))
+    throw new SnapshotRefusal(`snapshot ${id} has an invalid package path ${receipt.packagePath}`);
+  const directory = path.join(sealed, receipt.packagePath);
+  const head = spawnSync('git', ['-C', source, 'rev-parse', '--verify', 'HEAD'], {
+    encoding: 'utf8',
+    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+  });
+  const report =
+    head.error !== undefined || head.status !== 0
+      ? `cannot inspect ${source} HEAD for snapshot pin ${id}: ${head.error?.message ?? head.stderr.trim()}; continuing with the pin`
+      : head.stdout.trim() !== receipt.provenance.head
+        ? `stale pin ${id}: captured HEAD ${receipt.provenance.head} differs from ${source} HEAD ${head.stdout.trim()}; continuing with the pin; move snapshot explicitly to select another build`
+        : undefined;
+  return { kind: 'snapshot', id, directory, ...(report === undefined ? {} : { report }) };
 }
 
 /**

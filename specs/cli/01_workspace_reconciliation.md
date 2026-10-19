@@ -31,6 +31,38 @@ conflict policy, and an update never discards user edits. The update records the
 network operation, and a failed install resumes with those versions rather than resolving a different release halfway
 through.
 
+## Declared developer link pins
+
+`smoo.developerLinks` selects the package code a local consumer executes. The stable form is
+`{ "directory": "../provider/packages/api", "snapshot": "<64 lowercase hex digits>" }`: the ID of a sealed snapshot in
+the consumer's `.cache/linked-snapshots` store, not a Git ref or a provider directory to materialize. The existing
+snapshot census and producer provenance pin source, outputs and dependencies together. Resolving a pin verifies that
+census and identity and requires the receipt's package name to match the declaration. It never captures, builds,
+fetches, or falls back to a live directory or the installed version.
+
+Capture must not fabricate outputs. A producer receipt records a target's actual successful completion, outputs and
+their hashes; a target that cannot prove its outputs refuses rather than inventing an empty output set. The provider's
+existing `producerReceipts.targets` list includes `cli:build` and `nx-plugin:build` so their real completions can vouch
+for these pins. The existing `lmao:rust-dist`, `lmao:cargo-wasm` and `lmao:cargo-thread-ffi` targets keep the same
+production and verification rules.
+
+The directory only locates the provider for an informational HEAD comparison. A changed HEAD reports the captured and
+current commits as a stale pin; an absent or unreadable provider reports that freshness cannot be inspected. Both
+continue successfully with the same verified snapshot. Shell entry's `smoo:developer-links` status reports freshness
+without requesting an install, and postinstall restores the same pin after Bun replaces the alias. Missing, corrupt,
+malformed and wrong-package pins refuse with a nonzero result before any alias changes.
+
+The consumer deliberately captures and reviews a new snapshot with the existing snapshot machinery, then changes the
+declared ID to move the pin. Moving the provider branch alone never moves it. The snapshot store travels with a cowshed
+build volume; a new consumer needs the named sealed snapshot in its own store. It does not reconstruct a missing pin
+from today's provider. Existing manual-link ownership and receipt rules still apply.
+
+The directory-string form remains an explicit live link. The existing
+`{ directory, snapshot: { targets, artifactModules } }` form remains an explicit capture of current, attested provider
+bytes on each entry. Both forms keep their existing behavior; neither is a fixed pin. CI still uses lockfile-published
+packages and does not apply developer links. Managed-file drift checks remain independent: pinning changes their input,
+not which differences they accept.
+
 ## Acceptance
 
 The fixtures run from published tarballs, not only workspace source imports, and cover: an old published CLI upgrading a

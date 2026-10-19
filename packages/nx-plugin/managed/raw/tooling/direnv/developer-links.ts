@@ -66,6 +66,11 @@
  * CI never applies them: it builds against the published packages the
  * lockfile names (setup-environment.ts `--links`).
  *
+ * A stable declaration names `{ "directory": …, "snapshot": "<64-hex ID>" }`:
+ * only the consumer's verified sealed snapshot resolves. Provider HEAD drift
+ * is reported and continues with the pin; a missing or invalid pin refuses.
+ * The directory is a freshness hint, never an input to pinned execution.
+ *
  * A declaration may also ask for a snapshot: `{ "directory": …, "snapshot":
  * { "targets": [...], "artifactModules": [...] } }` binds every alias to a
  * sealed copy of that checkout instead of the live directory, so the
@@ -118,7 +123,9 @@ import {
 import path from 'node:path';
 import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
 import {
+  pinnedSnapshot,
   pluginProbe,
+  type ProducerProbe,
   recordedSnapshot,
   type SealedSnapshot,
   type SnapshotDeclaration,
@@ -415,6 +422,8 @@ export type UnavailableDeclaredLink =
 export interface DeclaredLinksPlan {
   readonly changes: readonly DeclaredLinkChange[];
   readonly unavailable: readonly UnavailableDeclaredLink[];
+  /** Verified pins whose provider HEAD differs or cannot be inspected; linking still succeeds. */
+  readonly reports: readonly string[];
 }
 
 /**
@@ -435,22 +444,24 @@ export interface DeclaredLinksPlan {
 export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan> {
   const declared = readDeclaredLinks(root);
   if (declared.length === 0) {
-    return { changes: [], unavailable: [] };
+    return { changes: [], unavailable: [], reports: [] };
   }
   const anchor = linkAnchor(root);
   const canonicalRoot = realpathSync(root);
   const trees = nodeModulesTrees(root);
   const recorded = readDeclaredRecord(root);
-  const probe = pluginProbe(snapshotPluginRoot(root, anchor, declared));
+  const probe: ProducerProbe = (target, providerRoot) =>
+    pluginProbe(snapshotPluginRoot(root, anchor, declared))(target, providerRoot);
   const changes: DeclaredLinkChange[] = [];
   const unavailable: UnavailableDeclaredLink[] = [];
+  const reports: string[] = [];
   for (const { name, directory: relative, snapshot } of declared) {
     const source = declaredTarget(root, anchor, relative);
     const contained = containsPath(path.resolve(root), source);
-    if (contained) {
+    if (contained && typeof snapshot !== 'string') {
       assertOwnedPath(canonicalRoot, path.resolve(canonicalRoot, path.relative(path.resolve(root), source)));
     }
-    const reason = unavailableReason(source);
+    const reason = typeof snapshot === 'string' ? null : unavailableReason(source);
     if (reason !== null) {
       if (contained) assertNoInheritedBinding(root, anchor, name, relative, source);
       unavailable.push({ kind: 'absent', name, target: source, reason });
@@ -460,16 +471,20 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
     if (snapshot !== undefined) {
       const outcome = await snapshotBinding(root, name, source, snapshot, probe);
       if (outcome.kind === 'refused') {
+        if (typeof snapshot === 'string')
+          throw new Error(`smoo.developerLinks ${name}: cannot resolve pinned snapshot ${snapshot}: ${outcome.reason}`);
         const kept = keptSnapshots(root, trees, name, recorded);
         changes.push(...kept.changes);
         unavailable.push({ kind: 'snapshot-refused', name, source, reason: outcome.reason, ...kept.said });
         continue;
       }
       binding = { kind: 'snapshot', target: outcome.directory, id: outcome.id };
+      if (outcome.report !== undefined) reports.push(`! smoo.developerLinks ${name}: ${outcome.report}`);
     }
     const target = binding.target;
     // The live checkout a snapshot replaces, by physical identity: a link spelled through another path is the same one.
-    const sourcePhysical = binding.kind === 'snapshot' ? realpathSync(source) : undefined;
+    const sourcePhysical =
+      binding.kind === 'snapshot' && typeof snapshot !== 'string' ? realpathSync(source) : undefined;
     for (const tree of trees) {
       const entry = path.join(tree, name);
       const at = path.join(root, entry);
@@ -488,8 +503,13 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
         const inherited = inheritedContainedBinding(anchor, relative, current);
         const managed = recorded.get(entry)?.target === text;
         if (current === target && text === packageAliasTarget(root, at, target)) continue;
-        const physical = sourcePhysical === undefined ? undefined : realpathOrNull(current);
-        if (binding.kind === 'snapshot' && foreign && !inherited && !managed && physical === sourcePhysical) {
+        if (
+          sourcePhysical !== undefined &&
+          foreign &&
+          !inherited &&
+          !managed &&
+          realpathOrNull(current) === sourcePhysical
+        ) {
           unavailable.push({ kind: 'snapshot-unclaimed', name, path: entry, source });
           continue;
         }
@@ -498,7 +518,7 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
       changes.push({ path: entry, binding });
     }
   }
-  return { changes, unavailable };
+  return { changes, unavailable, reports };
 }
 
 /**
@@ -560,6 +580,7 @@ function snapshotPluginRoot(root: string, anchor: string, declared: readonly Dec
   const plugin = declared.find(({ name }) => name === '@smoothbricks/nx-plugin');
   if (plugin === undefined) return root;
   const source = declaredTarget(root, anchor, plugin.directory);
+  if (typeof plugin.snapshot === 'string') return pinnedSnapshot(root, plugin.name, source, plugin.snapshot).directory;
   return unavailableReason(source) === null ? source : root;
 }
 
@@ -586,6 +607,7 @@ function assertNoInheritedBinding(root: string, anchor: string, name: string, re
  * which declarations this machine cannot honour.
  */
 export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void {
+  for (const report of plan.reports) console.error(report);
   for (const unavailable of plan.unavailable) {
     switch (unavailable.kind) {
       case 'absent':
@@ -732,13 +754,13 @@ const TARGET = /^[^:\s]+:[^:\s]+(?::[^:\s]+)?$/;
 interface DeclaredLink {
   readonly name: string;
   readonly directory: string;
-  readonly snapshot: SnapshotDeclaration | undefined;
+  readonly snapshot: SnapshotDeclaration | string | undefined;
 }
 
 /**
  * `smoo.developerLinks` from the root manifest: each package name with its
  * checkout directory, relative, given alone or as `{ directory, snapshot }`
- * where `snapshot` names the provider targets that build it and its native
+ * where `snapshot` names a sealed snapshot ID or the provider targets that build it and its native
  * artifact modules (linked-snapshots.ts). Hand-validated, like
  * secret-references.ts validates `smoo.secrets`: this runs before anything is
  * installed. The shape is `PackageSmooConfig.developerLinks` in the
@@ -773,6 +795,11 @@ function readDeclaredLinks(root: string): DeclaredLink[] {
     }
     if (!object) return { name, directory, snapshot: undefined };
     const snapshot: unknown = Reflect.get(declaration, 'snapshot');
+    if (typeof snapshot === 'string') {
+      if (!/^[0-9a-f]{64}$/.test(snapshot))
+        throw new Error(`${manifestPath}: smoo.developerLinks ${name}.snapshot must be 64 lowercase hex digits`);
+      return { name, directory, snapshot };
+    }
     const targets: unknown =
       typeof snapshot === 'object' && snapshot !== null ? Reflect.get(snapshot, 'targets') : undefined;
     const artifactModules: unknown =

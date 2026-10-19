@@ -263,7 +263,8 @@ export interface DeveloperLinkSnapshot {
 /** A declared checkout whose aliases bind a snapshot of it instead of the live directory. */
 export interface DeveloperLinkSnapshotDeclaration {
   directory: DeveloperLinkDirectory;
-  snapshot: DeveloperLinkSnapshot;
+  /** A sealed content ID pins an existing snapshot; a target declaration opts into capture at each entry. */
+  snapshot: (string & typia.tags.Pattern<'^[0-9a-f]{64}$'>) | DeveloperLinkSnapshot;
 }
 
 export interface PackageSmooConfig {
@@ -280,10 +281,9 @@ export interface PackageSmooConfig {
    * every checkout gets it. Shell entry links each tree that installed the
    * package, a directory the machine lacks keeps the installed version, and CI
    * links nothing (tooling/direnv/developer-links.ts, which validates the same
-   * shape at runtime). A `{ directory, snapshot }` declaration binds a sealed,
-   * Nx-attested snapshot of that checkout instead, so the provider's own builds
-   * never change a file a running consumer task resolves. Nx is
-   * lockfile/patch-owned and cannot be declared here.
+   * shape at runtime). A `{ directory, snapshot: "<64-hex ID>" }` declaration pins a sealed,
+   * Nx-attested snapshot in the consumer store until explicitly moved, even when the provider changes or disappears.
+   * A snapshot object opts into capture from the current provider. Nx is lockfile/patch-owned and cannot be declared here.
    */
   developerLinks?: Record<string, DeveloperLinkDirectory | DeveloperLinkSnapshotDeclaration>;
 }

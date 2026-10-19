@@ -76,7 +76,11 @@
   "plugins": [
     {
       "plugin": "@smoothbricks/nx-plugin",
-      "options": { "producerReceipts": { "targets": ["lmao:rust-dist", "lmao:cargo-wasm", "lmao:cargo-thread-ffi"] } }
+      "options": {
+        "producerReceipts": {
+          "targets": ["lmao:rust-dist", "lmao:cargo-wasm", "lmao:cargo-thread-ffi", "cli:build", "nx-plugin:build"]
+        }
+      }
     }
   ],
   "release": {

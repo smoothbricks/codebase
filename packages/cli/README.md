@@ -670,27 +670,54 @@ cause without claiming the aliases are repaired, and the next unchanged entry in
 
 #### Declared Links
 
-A repository whose checkouts should all run against a local checkout of a package declares that checkout in the root
-`package.json`:
+A repository pins a developer package to a sealed snapshot in its own store, not to the provider's moving branch. The
+root `package.json` names the snapshot's 64-digit lowercase SHA-256 ID:
 
 ```json
 {
   "smoo": {
     "developerLinks": {
-      "@smoothbricks/lmao": "../smoothbricks/packages/lmao"
+      "@smoothbricks/lmao": {
+        "directory": "../smoothbricks/packages/lmao",
+        "snapshot": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      }
     }
   }
 }
 ```
 
-Each key is a package name, scoped or not. Each value is a package directory relative to the project checkout. A
-project-contained declaration resolves within the current checkout, including a cowshed workspace, and rejects symlink
-escapes even before the declared directory exists. A genuine sibling declaration stays anchored to the main checkout
-(`projectRoot` in `.cowshed/workspace.json`), so every workspace selects the same sibling. Every install refuses an
-absolute path, or a key that is not a package name, and fails naming it. In every `node_modules` tree that installed the
-package, the root's and each workspace member's, the entry becomes a link to that directory. A tree that does not depend
-on the package gains nothing, and an entry a developer pointed at a checkout of their own stays theirs. When the
-directory is missing on this machine, or a sandbox cannot read it, the installed version stays and stderr says so.
+Replace the example ID with the ID of an actual captured snapshot. The link resolves only from
+`.cache/linked-snapshots/<id>` in the consumer. The existing snapshot verifier checks its census, producer provenance,
+and package name before any alias changes. This pins source, built outputs and dependencies together; a Git commit alone
+does not identify the built outputs, and a tag can move. No second checkout materializer is involved.
+
+The `directory` is only the provider location for a freshness report. When its HEAD differs from the captured HEAD,
+`smoo:developer-links` reports a **stale pin**, names both commits, and continues successfully with the same snapshot.
+It neither recaptures nor requests an install. If the provider disappears or cannot be read, it reports that freshness
+cannot be inspected and still uses the verified pin. Missing, corrupt, malformed or wrong-package pins instead refuse
+with a nonzero result; there is no fallback to the moving checkout or the published package.
+
+To select a pin, use the capture form below once and retain the snapshot ID it prints and records in
+`node_modules/.smoo-declared-links`'s link target. Replace the capture object with that ID. To move it, deliberately
+capture and review another build, then change the declared ID. An already-running process retains the code it loaded;
+new resolutions use the selected snapshot. A new consumer needs the sealed snapshot in its own store, with its receipt,
+census and relative layout intact; a cowshed fork carries the store on its build volume. Pin resolution never fetches,
+builds or reconstructs a missing snapshot from today's provider.
+
+Existing forms keep working unchanged as explicit moving opt-ins. A directory string such as
+`"@smoothbricks/lmao": "../smoothbricks/packages/lmao"` links the live checkout. The capture object below selects a
+fresh attested snapshot at each install or shell entry, not a fixed pin. Managed-file drift checks keep their own rules:
+pinning fixes the bytes they inspect rather than accepting differences from a moving branch.
+
+Each key is a package name, scoped or not. Every directory is relative to the project checkout. For live links and
+capture, a project-contained declaration resolves within the current checkout, including a cowshed workspace, and
+rejects symlink escapes even before the declared directory exists. A genuine sibling declaration stays anchored to the
+main checkout (`projectRoot` in `.cowshed/workspace.json`), so every workspace selects the same sibling. Every install
+refuses an absolute path or a key that is not a package name, and fails naming it. In every `node_modules` tree that
+installed the package, the root's and each workspace member's, the entry becomes a link to the selected directory or
+snapshot. A tree that does not depend on the package gains nothing, and an entry a developer pointed at a checkout of
+their own stays theirs. A live or capture directory missing on this machine, or unreadable in its sandbox, leaves the
+installed version and reports it; an explicit snapshot pin does not require that directory.
 
 Links created by a declaration record their alias, declaration and exact symlink text in
 `node_modules/.smoo-declared-links`. Changing the declaration automatically updates a recorded link on shell entry;
@@ -710,8 +737,8 @@ A successful managed install reconciles recorded links to the current declaratio
 its postinstall result. A failed install restores the captured link and its provenance together. Restored manual
 overrides are not claimed by a receipt the install's postinstall temporarily created.
 
-A declaration can instead bind a sealed snapshot of the checkout, so that the provider's own builds, lands and installs
-never change a file a running consumer task resolves:
+The capture form selects a sealed snapshot of the current checkout at each entry. The provider's own builds, lands and
+installs never change a file a running task resolves, but the next entry can select another snapshot:
 
 ```json
 {
@@ -736,10 +763,10 @@ root manifest, each native library an artifact module's `nativeArtifactPath({})`
 `bun pm cache` prints in the consumer root, never in the provider, which a sandboxed consumer may only read (`bun pm`
 opens its root manifest for writing). It refuses any other link target. Each target's read-only `probeBuilt` hit is a
 published canonical producer completion receipt, not a cache re-probe under the consumer's environment. `probeBuilt` is
-loaded from the `@smoothbricks/nx-plugin` the declarations bind: the checkout a `@smoothbricks/nx-plugin` declaration
-names when this machine has it, else the root's install. Every `bun install` has put the lockfile's published plugin
-back at that alias when the postinstall runs, and a published plugin older than the provider cannot read its receipts.
-The provider enables `producerReceipts.targets` in its Nx plugin options, naming every target a consumer's
+loaded from the `@smoothbricks/nx-plugin` the declarations bind: its verified pin when declared, otherwise the checkout
+the declaration names when this machine has it, else the root's install. Every `bun install` has put the published
+plugin back at that alias when the postinstall runs, and a published plugin older than the provider cannot read its
+receipts. The provider enables `producerReceipts.targets` in its Nx plugin options, naming every target a consumer's
 `snapshot.targets` names: an unnamed target never gets a receipt, so that consumer's snapshot refuses. Actual pre/post
 task evidence binds committed HEAD/tree, clean tracked source, successful task identities including uncached
 prerequisites, argv, declared environment/tool identity, independent product output SHA-256 and wall time. The consumer

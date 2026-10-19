@@ -518,6 +518,200 @@ describe('snapshot declarations', () => {
     return join(consumer, 'node_modules/linked-api');
   }
 
+  function pin({ consumer }: Fixture, id: string): void {
+    write(
+      join(consumer, 'package.json'),
+      JSON.stringify({
+        name: 'consumer',
+        private: true,
+        smoo: { developerLinks: { 'linked-api': { directory: '../provider/packages/api', snapshot: id } } },
+      }),
+    );
+  }
+
+  it('keeps a sealed pin across provider commits and installs until the declaration moves', () => {
+    const checkout = fixture();
+    const alias = declare(checkout);
+    const first = snapshotOf(capture(checkout));
+    const basis = git(checkout.provider, 'rev-parse', 'HEAD');
+    pin(checkout, first.id);
+    const initial = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
+    expect(initial.status, initial.stderr).toBe(0);
+    const binding = readlinkSync(alias);
+    write(join(checkout.source, 'src/index.js'), 'export const leaf = "second";\n');
+    git(checkout.provider, 'add', '-A');
+    git(
+      checkout.provider,
+      '-c',
+      'user.email=fixture@example.invalid',
+      '-c',
+      'user.name=fixture',
+      'commit',
+      '-qm',
+      'advance',
+    );
+    const head = git(checkout.provider, 'rev-parse', 'HEAD');
+    const moved = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
+    expect(moved.status, moved.stderr).toBe(0);
+    expect(moved.stderr).toContain('stale pin');
+    expect(moved.stderr).toContain(basis);
+    expect(moved.stderr).toContain(head);
+    expect(moved.stderr).toContain('continuing with the pin');
+    expect(JSON.parse(moved.stdout).changes).toEqual([]);
+    expect(readlinkSync(alias)).toBe(binding);
+    const execute = 'process.stdout.write(JSON.stringify((await import(Bun.argv[1])).leaf));';
+    expect(run(execute, [join(alias, 'src/index.js')])).toBe('first');
+    reinstall(alias);
+    expect(spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer]).status).toBe(0);
+    expect(readlinkSync(alias)).toBe(binding);
+    const next = snapshotOf(capture(checkout));
+    pin(checkout, next.id);
+    expect(spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer]).status).toBe(0);
+    expect(realpathSync(alias)).toBe(next.directory);
+    expect(run(execute, [join(alias, 'src/index.js')])).toBe('second');
+  });
+
+  it('resolves a pin without its provider or an installed probe', () => {
+    const checkout = fixture();
+    const alias = declare(checkout);
+    const snapshot = snapshotOf(capture(checkout));
+    pin(checkout, snapshot.id);
+    rmSync(checkout.provider, { recursive: true });
+    const child = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
+    expect(child.status, child.stderr).toBe(0);
+    expect(child.stderr).toContain('cannot inspect');
+    expect(child.stderr).toContain('continuing with the pin');
+    expect(realpathSync(alias)).toBe(snapshot.directory);
+    expect(
+      run('process.stdout.write(JSON.stringify((await import(Bun.argv[1])).leaf));', [join(alias, 'src/index.js')]),
+    ).toBe('first');
+  });
+
+  for (const defect of ['missing', 'corrupt', 'wrong-package', 'malformed'] as const) {
+    it(`refuses a ${defect} pin without falling back to a moving checkout`, () => {
+      const checkout = fixture();
+      const alias = declare(checkout);
+      const snapshot = snapshotOf(capture(checkout));
+      pin(checkout, snapshot.id);
+      expect(spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer]).status).toBe(0);
+      const before = readlinkSync(alias);
+      pin(checkout, defect === 'missing' ? '0'.repeat(64) : defect === 'malformed' ? 'main' : snapshot.id);
+      if (defect === 'corrupt') {
+        const file = join(snapshot.directory, 'src/index.js');
+        chmodSync(file, 0o644);
+        writeFileSync(file, 'export const changed = true;\n');
+      }
+      if (defect === 'wrong-package') {
+        write(
+          join(checkout.consumer, 'package.json'),
+          JSON.stringify({
+            smoo: { developerLinks: { 'other-api': { directory: '../provider/packages/api', snapshot: snapshot.id } } },
+          }),
+        );
+      }
+      const child = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
+      expect(child.status).not.toBe(0);
+      expect(child.stderr).toContain(defect === 'malformed' ? '64 lowercase hex' : 'cannot resolve pinned snapshot');
+      expect(readlinkSync(alias)).toBe(before);
+    });
+  }
+
+  it('reports a stale pin from the shell status without requesting an install or changing it', () => {
+    const checkout = fixture();
+    const alias = declare(checkout);
+    const snapshot = snapshotOf(capture(checkout));
+    pin(checkout, snapshot.id);
+    expect(spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer]).status).toBe(0);
+    git(
+      checkout.provider,
+      '-c',
+      'user.email=fixture@example.invalid',
+      '-c',
+      'user.name=fixture',
+      'commit',
+      '--allow-empty',
+      '-qm',
+      'advance',
+    );
+    for (const file of ['setup-environment.ts', 'developer-links.ts', 'linked-snapshots.ts', 'secret-references.ts']) {
+      write(
+        join(checkout.consumer, 'tooling/direnv', file),
+        readFileSync(join(managedAssetsRoot, 'raw/tooling/direnv', file), 'utf8'),
+      );
+    }
+    git(checkout.consumer, 'init', '-q');
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !['DEVENV_ROOT', 'GITHUB_ACTIONS'].includes(key)),
+    );
+    for (const flags of [['--links', '--check'], ['--links']]) {
+      const child = spawnSync(process.execPath, ['tooling/direnv/setup-environment.ts', ...flags], {
+        cwd: checkout.consumer,
+        encoding: 'utf8',
+        env,
+      });
+      expect(child.status, child.stderr).toBe(0);
+      expect(child.stderr).toContain('stale pin');
+      expect(realpathSync(alias)).toBe(snapshot.directory);
+    }
+  });
+
+  it('loads the capture probe from a pinned plugin rather than its moving provider', () => {
+    const checkout = fixture();
+    const pluginName = '@smoothbricks/nx-plugin';
+    const plugin = join(checkout.provider, 'packages/plugin');
+    writePlugin(plugin, PROBE_BUILT);
+    write(
+      join(plugin, 'package.json'),
+      JSON.stringify({
+        name: pluginName,
+        version: '0.0.0',
+        type: 'module',
+        files: ['ensure-built.js'],
+        exports: { './ensure-built': './ensure-built.js' },
+      }),
+    );
+    git(checkout.provider, 'add', '-A');
+    git(
+      checkout.provider,
+      '-c',
+      'user.email=fixture@example.invalid',
+      '-c',
+      'user.name=fixture',
+      'commit',
+      '-qm',
+      'plugin',
+    );
+    const id = run(
+      `${PROBE}
+const snapshots = await import(Bun.argv[1]);
+const binding = await snapshots.snapshotBinding(Bun.argv[2], '@smoothbricks/nx-plugin', Bun.argv[3], { targets: ['plugin:build'], artifactModules: [] }, async (target, root) => ({ disposition: 'hit', receipt: receiptOf(root, target) }));
+if (binding.kind !== 'snapshot') throw new Error(binding.reason);
+process.stdout.write(JSON.stringify(binding.id));`,
+      [RAW, checkout.consumer, plugin],
+    );
+    const alias = declare(checkout);
+    installPlugin(checkout, REFUSED_PROBE);
+    write(
+      join(checkout.consumer, 'package.json'),
+      JSON.stringify({
+        smoo: {
+          developerLinks: {
+            'linked-api': { directory: '../provider/packages/api', snapshot: DECLARATION },
+            [pluginName]: { directory: '../provider/packages/plugin', snapshot: id },
+          },
+        },
+      }),
+    );
+    writePlugin(plugin, REFUSED_PROBE);
+    const child = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
+    expect(child.status, child.stderr).toBe(0);
+    expect(child.stderr).not.toContain('no snapshot');
+    expect(readlinkSync(alias)).toMatch(/linked-snapshots\/[0-9a-f]{64}\/packages\/api$/);
+    expect(realpathSync(join(checkout.consumer, 'node_modules', pluginName))).toContain(
+      `/linked-snapshots/${String(id)}/`,
+    );
+  });
+
   it('binds an installed alias to the snapshot and records it', () => {
     const checkout = fixture();
     installPlugin(checkout, PROBE_BUILT);
@@ -616,7 +810,7 @@ await links.keepDeveloperLinks(root, async () => {
     );
     const after = spawnSync(process.execPath, ['-e', PLAN, LINKS, checkout.consumer], { encoding: 'utf8' });
     expect(after.stderr).not.toContain('links the live checkout');
-    expect(JSON.parse(after.stdout)).toEqual({ changes: [], unavailable: [] });
+    expect(JSON.parse(after.stdout)).toEqual({ changes: [], unavailable: [], reports: [] });
   });
 
   it('keeps the recorded snapshot an install re-pointed when no new snapshot can be made', () => {

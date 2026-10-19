@@ -249,6 +249,8 @@ try {
       // A refused or unclaimed snapshot is current only when said: the exec that follows names its cause.
       const current =
         plan.changes.length === 0 && plan.unavailable.every((unavailable) => unavailable.kind === 'absent');
+      // A stale pin is informational, not a stale install: say it even when devenv skips the exec.
+      if (current && plan.reports.length > 0) applyDeclaredLinks(projectRoot, plan);
       process.exit(
         current && !hasStaleDeveloperLinks(projectRoot, ['nx']) && danglingStoreLinks(projectRoot).length === 0 ? 0 : 1,
       );
