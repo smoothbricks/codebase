@@ -223,8 +223,9 @@ it('the hook run reads the key the gate run wrote, after the gate rewrote compil
       const gate = await nx(GATE_RECEIPT);
       expect(gate.exitCode, gate.log).toBe(0);
       expect(await readFile(join(workspace, '.runs'), 'utf8')).toBe('1\n');
-      // The gate's own execution left a compiled-in file its graph never saw.
-      expect(await readdir(join(workspace, GENERATED))).toEqual(['chunk-1.js', 'vocabulary.rs']);
+      // The gate's own execution left a compiled-in file its graph never saw. readdir's order is the filesystem's
+      // (hash order on Linux), so the listing is compared as a set.
+      expect((await readdir(join(workspace, GENERATED))).sort()).toEqual(['chunk-1.js', 'vocabulary.rs']);
 
       const hook = await nx(HOOK_RECEIPT);
       expect(hook.exitCode, hook.log).toBe(0);
