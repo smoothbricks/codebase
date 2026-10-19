@@ -5,11 +5,12 @@
  * compiles is invisible to every check a macOS host can run: a full local lint
  * passes and CI still goes red on unused imports, unresolved names and dead code
  * inside the `not(target_os = "macos")` branch. Closing that needs three pieces
- * to agree — a devenv profile carrying the cross C toolchain, an Nx target per
- * Cargo workspace that asks for the triple, and a root script that runs the
- * second inside the first. They live here together because the plugin infers the
- * target while the CLI installs the script and reports a project missing it; kept
- * apart, the three spellings drift and the gate silently stops gating.
+ * to agree — a devenv profile carrying the Linux toolchain (zig, cargo-zigbuild
+ * and the Linux rust-std set), an Nx target per Cargo workspace that asks for
+ * the triple, and a root script that runs the second inside the first. They
+ * live here together because the plugin infers the target while the CLI
+ * installs the script and reports a project missing it; kept apart, the three
+ * spellings drift and the gate silently stops gating.
  */
 
 /**
@@ -19,9 +20,10 @@
 export const CARGO_LINUX_TRIPLE = 'x86_64-unknown-linux-gnu';
 
 /**
- * The devenv profile carrying the cross C compiler, defined in the managed
- * `tooling/direnv/devenv.smoo.nix`. Opt-in because its closure is 0.4 GiB and
- * nothing on Darwin links a Linux object.
+ * The devenv profile carrying the Linux toolchain — zig, cargo-zigbuild and the
+ * Linux rust-std set — defined in the managed `tooling/direnv/devenv.smoo.nix`.
+ * Opt-in on macOS because zig alone is a 380 MiB closure that nothing but a
+ * Linux artifact or this check uses.
  */
 export const DEVENV_CROSS_PROFILE = 'linux-cross';
 
@@ -39,14 +41,15 @@ export const DEVENV_CROSS_PROFILE = 'linux-cross';
 export const CARGO_CROSS_LINT_TARGET = 'cargo-lint-cross';
 
 /**
- * What the cross lint prints when it refuses to compile outside the linux-cross
- * toolchain: on a Darwin cache miss this line, and only this line, means the
+ * What the cross lint prints when it refuses to compile without cargo-zigbuild
+ * on PATH: on a Darwin cache miss this line, and only this line, means the
  * key missed. The managed pre-push hook reads its output for exactly this text
  * to tell a miss from any other Nx failure.
  */
-export const CARGO_CROSS_LINT_REFUSAL = 'cargo-lint-cross needs the linux-cross C toolchain; run: bun run check:linux';
+export const CARGO_CROSS_LINT_REFUSAL =
+  'cargo-lint-cross needs cargo-zigbuild from the linux-cross toolchain; run: bun run check:linux';
 
-const CARGO_CROSS_LINT_GUARD = `[ -n "\${CC_x86_64_unknown_linux_gnu:-}" ] || [ "$(uname -s)" = Linux ] || { echo '${CARGO_CROSS_LINT_REFUSAL}' >&2; exit 2; }`;
+const CARGO_CROSS_LINT_GUARD = `command -v cargo-zigbuild >/dev/null || { echo '${CARGO_CROSS_LINT_REFUSAL}' >&2; exit 2; }`;
 
 /**
  * The prefix `cargoFrozen` writes. Exported so target inference can recognize
@@ -54,6 +57,21 @@ const CARGO_CROSS_LINT_GUARD = `[ -n "\${CC_x86_64_unknown_linux_gnu:-}" ] || [ 
  * re-spelling the flag; a second copy would silently stop matching.
  */
 export const CARGO_FROZEN_PREFIX = 'cargo --frozen ';
+
+/**
+ * cargo-zigbuild's spelling of frozen clippy. The flag sits on the subcommand
+ * because cargo does not forward a global `--frozen` to an external one:
+ * `cargo --frozen zigbuild` resolves and writes Cargo.lock as if unflagged
+ * (measured). And `cargo-zigbuild` is run directly rather than as
+ * `cargo zigbuild`, so its inner `cargo` is the one on PATH rather than the
+ * real binary cargo would hand it through `CARGO`.
+ */
+const CARGO_ZIGBUILD_CLIPPY_FROZEN_PREFIX = 'cargo-zigbuild clippy --frozen ';
+
+/** Does this command text run frozen cargo, directly or through cargo-zigbuild? */
+export function runsFrozenCargo(text: string): boolean {
+  return text.includes(CARGO_FROZEN_PREFIX) || text.includes(CARGO_ZIGBUILD_CLIPPY_FROZEN_PREFIX);
+}
 
 /**
  * `--frozen` is cargo's `--locked` + `--offline`. Cargo.lock and the registry
@@ -130,8 +148,13 @@ export const CARGO_DENY_WARNINGS = `--config 'build.warnings="deny"'`;
  * must then refuse to launch.
  *
  * `--target` is explicit rather than inherited from a CARGO_BUILD_TARGET exported
- * by the profile, so running this outside the cross shell fails loudly on a
- * missing tool instead of quietly linting the host and reporting green.
+ * by the profile, so running this outside the cross shell fails loudly on the
+ * missing cargo-zigbuild instead of quietly linting the host and reporting green.
+ *
+ * cargo-zigbuild rather than plain cargo because ring compiles C for the target
+ * from its build script, and build scripts run even under clippy: zig is the
+ * C compiler for every Linux triple on every host, the same one the Linux
+ * artifacts build with, so the check needs no per-triple cross gcc.
  *
  * `cargo fmt` is absent on purpose: formatting is target-independent and already
  * covered by `cargo-lint`, so repeating it here would only cost time.
@@ -147,9 +170,7 @@ export const CARGO_DENY_WARNINGS = `--config 'build.warnings="deny"'`;
  * are distinct anyway, and its own lock keeps the cross check from queueing
  * behind host builds.
  */
-export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${cargoFrozen(
-  `clippy --workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross ${CARGO_DENY_WARNINGS}`,
-)}`;
+export const CARGO_CROSS_LINT_COMMAND = `${CARGO_CROSS_LINT_GUARD}; ${CARGO_ZIGBUILD_CLIPPY_FROZEN_PREFIX}--workspace --all-targets --target ${CARGO_LINUX_TRIPLE} --target-dir target/cargo-lint-cross ${CARGO_DENY_WARNINGS}`;
 
 /**
  * No `--target-dir`: clippy writes the workspace's own `target/`, beside every
@@ -176,9 +197,10 @@ export const CROSS_CHECK_SCRIPT_NAME = 'check:linux';
  * cache and refuses a push that has no hit, never entering a profile or starting
  * a compile of its own. That makes this script the only place the gate ever
  * runs, and a human watching it needs devenv's progress too — the cross profile
- * is a 0.4 GiB closure and the clippy behind it is unbounded, so a silent
- * terminal is indistinguishable from a hang. Suppressing that output only paid
- * while a hook ran this for you and nobody read it.
+ * adds about 0.9 GiB (zig plus three rust-std targets) and the clippy behind it
+ * is unbounded, so a silent terminal is indistinguishable from a hang.
+ * Suppressing that output only paid while a hook ran this for you and nobody
+ * read it.
  */
 export const CROSS_CHECK_SCRIPT_COMMAND = `tooling/devenv -P ${DEVENV_CROSS_PROFILE} shell -- nx run-many -t ${CARGO_CROSS_LINT_TARGET}`;
 

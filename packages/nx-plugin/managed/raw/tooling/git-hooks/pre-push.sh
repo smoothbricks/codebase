@@ -9,27 +9,26 @@
 # configured the check passes silently.
 #
 # 2. The macOS-only Linux cross-compile gate. It asks Nx for cargo-lint-cross,
-# whose hit means a real `cargo clippy --target x86_64-unknown-linux-gnu`
+# whose hit means a real `cargo-zigbuild clippy --target x86_64-unknown-linux-gnu`
 # already passed for exactly this tree, so the push is safe with no toolchain
-# present. The cross target itself never compiles here: on a miss its guard
-# refuses. Its dependencies are ordinary Nx tasks whose outputs the cross key
-# reads, so Nx restores them from the cache or, for a tree no gate ran, builds
-# them. A refusal names the one command that fixes it; any other Nx failure is
-# said as that, never as a cache miss.
+# present. From a plain shell the cross target itself never compiles here: on
+# a miss its guard refuses. Its dependencies are ordinary Nx tasks whose outputs
+# the cross key reads, so Nx restores them from the cache or, for a tree no gate
+# ran, builds them. A refusal names the one command that fixes it; any other Nx
+# failure is said as that, never as a cache miss.
 #
-# Why the cross target never compiles here. The cross-clippy needs the
-# linux-cross C toolchain, which lives in a devenv profile. A hook that entered
-# that profile spent minutes compiling on a push the user expected to take a
-# second, and it did so in an environment they never asked for. Pushing is not
-# the place to discover that the tree has not been compiled for Linux: the land
-# gate, or `bun run check:linux`, is.
+# Why the cross target never compiles here. The cross-clippy needs zig and
+# cargo-zigbuild, which a macOS host carries only in the linux-cross devenv
+# profile. A hook that entered that profile spent minutes compiling on a push
+# the user expected to take a second, and it did so in an environment they
+# never asked for. Pushing is not the place to discover that the tree has not
+# been compiled for Linux: the land gate, or `bun run check:linux`, is.
 #
-# CC_x86_64_unknown_linux_gnu is unset for the probe deliberately. The target's
-# own guard reads it to decide whether the toolchain is present, so leaving it
-# set would let a push made from inside an already-entered linux-cross shell
-# fall through into a real multi-minute compile. It is not a declared input of
-# the target, so unsetting it cannot change the task hash — a warm entry still
-# hits.
+# The target's own guard refuses to start when cargo-zigbuild is not on PATH,
+# which is what turns a miss into a refusal here. A push made from a shell that
+# already carries cargo-zigbuild — an entered linux-cross shell — passes that
+# guard, so there a miss runs the check itself: the same clippy `check:linux`
+# runs, in the toolchain the user entered for it.
 #
 # Everything in tooling depends only on devenv.nix packages, so this hook also
 # works with no devenv on PATH. It must never pretend a check ran that did not.
@@ -73,17 +72,17 @@ esac
 output=$(mktemp "${TMPDIR:-/tmp}/pre-push-cross.XXXXXX") || exit 1
 trap 'rm -f "$output"' EXIT
 set -o pipefail
-env -u CC_x86_64_unknown_linux_gnu nx run-many -t cargo-lint-cross --output-style=static 2>&1 | tee "$output"
+nx run-many -t cargo-lint-cross --output-style=static 2>&1 | tee "$output"
 status=$?
 [ "$status" -eq 0 ] && exit 0
 
-if grep -qF 'cargo-lint-cross needs the linux-cross C toolchain; run: bun run check:linux' "$output"; then
+if grep -qF 'cargo-lint-cross needs cargo-zigbuild from the linux-cross toolchain; run: bun run check:linux' "$output"; then
   cat >&2 <<'EOF'
 
 pre-push: the Linux cross-compile check is NOT cached for this tree, so this
-push would ship code that has never been compiled for Linux. The "needs the
-linux-cross C toolchain" line above is the cross target refusing to compile
-here, not a broken toolchain.
+push would ship code that has never been compiled for Linux. The "needs
+cargo-zigbuild" line above is the cross target refusing to compile here, not a
+broken toolchain.
 
   Run:  bun run check:linux
   Wait for it to pass, then push again.
