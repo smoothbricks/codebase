@@ -421,7 +421,11 @@ requests for that repository are refused as in the outage above, without startin
 are unaffected. If the child exits, the next request replaces it immediately within the same call. A startup worker's
 task failure is reported through the same failed-start transition; it cannot leave an unreported `Starting` state.
 Cancelling the reporting task also aborts its owned worker. A host-configured backend cannot replace a gateway-managed
-live child. Readiness logs the project, address and reclaimed staging-file count, never credentials.
+live child. Readiness logs the project, address and reclaimed staging-file count, never credentials. A backend lives
+with its project's sessions: when the last session of a repository leaves the gateway, the gateway stops the child it
+started for it (a start in flight is aborted) and forgets its state, so the next session's first request starts a new
+one; a host-configured backend owns no child and stays. Measured 2026-10-19: seven of the gateway's nine servers served
+scratch projects that tests had adopted and discarded hours earlier, each running until the gateway restarted.
 
 **Outage before and after the response head.** The statuses above apply only before the response head. Once the upstream
 commits a success head, the gateway keeps `200` and cannot change it. A body that then fails, times out, or is dropped

@@ -1406,6 +1406,7 @@ impl Actor {
             .sessions
             .remove(workspace_id)
             .expect("session was checked");
+        let repo_id = session.repo_id.clone();
         session.stop().await;
         self.repo_mirror
             .unbind_session(workspace_id.to_owned())
@@ -1415,7 +1416,38 @@ impl Actor {
             .await?;
         self.leaf_cache.drop_workspace(workspace_id);
         self.cancel_queued(workspace_id).await;
+        self.release_nx_backend(&repo_id).await;
         Ok(())
+    }
+
+    /// Stops the Nx cache server the gateway started for `repo_id` once no session of that
+    /// project is left: the server exists for the project's workspaces, so it ends with the last
+    /// of them (05_gateway.md "`/nx/v1/cache/{hash}`"). A backend still starting is aborted; a
+    /// running one's child is killed as it drops. A backend the gateway was handed, not started,
+    /// owns no process and stays. Measured 2026-10-19: every scratch project a test adopted and
+    /// discarded left its server running until the gateway restarted, seven of nine at once.
+    async fn release_nx_backend(&mut self, repo_id: &str) {
+        if self
+            .sessions
+            .values()
+            .any(|session| session.repo_id == repo_id)
+        {
+            return;
+        }
+        match self.nx_backends.get(repo_id) {
+            Some(NxBackendState::Starting { task }) => task.abort(),
+            Some(
+                NxBackendState::Ready {
+                    process: Some(_), ..
+                }
+                | NxBackendState::Failed { .. },
+            ) => {}
+            Some(NxBackendState::Ready { process: None, .. }) | None => return,
+        }
+        eprintln!(
+            "cowshed: Nx cache backend for {repo_id} stopped: its project has no session left"
+        );
+        self.drop_nx_backend(repo_id).await;
     }
 
     fn spawn_listener(
@@ -1570,7 +1602,8 @@ impl Actor {
         }
     }
 
-    /// Removes a backend whose child is gone, revokes its writers, and cancels queued writes to it.
+    /// Removes a backend -- its child gone, or its project's last session -- revokes its writers,
+    /// and cancels queued writes to it. A child it still owns is killed as it drops.
     async fn drop_nx_backend(&mut self, repo_id: &str) {
         self.nx_backends.remove(repo_id);
         let revoked: Vec<String> = self
