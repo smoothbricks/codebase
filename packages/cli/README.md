@@ -697,7 +697,10 @@ receipts needs an explicit owner-directed relink once. No pin-directory naming c
 
 Dropping a declaration removes its recorded external links before the next managed install, only while the live symlink
 text still matches its receipt. A successful install keeps the lockfile's version and drops the receipt; a failed
-install restores both the link and its receipt. Unrecorded links and manual retargets stay the developer's own links.
+install restores both the link and its receipt. Unrecorded links and manual retargets stay the developer's own links. A
+covered install in a cowshed job applies the same ownership: neither its snapshot nor the job's terminal cleanup puts
+back a recorded link whose package the declaration dropped, so a plain `bun install` there leaves the lockfile's version
+too.
 
 A successful managed install reconciles recorded links to the current declaration instead of restoring the old pin over
 its postinstall result. A failed install restores the captured link and its provenance together. Restored manual
