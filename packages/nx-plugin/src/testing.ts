@@ -138,9 +138,10 @@ export async function awaitExit(
   owner: string,
   timeoutMs = EXIT_TIMEOUT_MS,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  // The monotonic clock: a wall-clock step (NTP, sleep and wake) must not move the deadline.
+  const deadline = performance.now() + timeoutMs;
   for (let waiting = processes.filter((entry) => isRunning(entry.pid)); waiting.length > 0; ) {
-    if (Date.now() > deadline) {
+    if (performance.now() > deadline) {
       // A signal probe also answers for a zombie, which has already exited.
       const live = new Set(
         (await processTable()).filter((entry) => !entry.stat.startsWith('Z')).map((entry) => entry.pid),
