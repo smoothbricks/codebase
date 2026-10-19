@@ -17,6 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::api::dto::ExecClass;
 use crate::api::dto::{
     AdmissionKey, BinaryData, CommandArg, ExecCommand, ExecRequest, ExecScope, ExitStatus,
     JobFailure, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobState, JobTail,
@@ -48,7 +49,7 @@ use crate::sandbox::{
 use crate::storage::apfs::Labelled;
 use crate::storage::audit::AuditSinkError;
 use crate::workspace_environment::{PORT_BASE_ENV, PORT_BLOCK_SIZE_ENV, WORKSPACE_TOKEN_ENV};
-use cowshed_gateway_types::{JobserverClass, WorkspaceToken};
+use cowshed_gateway_types::WorkspaceToken;
 use cowshed_os::fork_lock::Spawn as _;
 use cowshed_os::fsio::AnchoredDirectory;
 
@@ -352,8 +353,8 @@ impl JobCpuAdmission for ImmediateCpu {
         Box::pin(async move {
             let pool = PathBuf::from("/nonexistent/cowshed-cpu-pool.sock");
             Ok(match ask.class {
-                JobserverClass::Resident => JobCpuGrant::resident(pool, Box::new(())),
-                JobserverClass::Background | JobserverClass::Gate => {
+                ExecClass::Resident => JobCpuGrant::resident(pool, Box::new(())),
+                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
                     JobCpuGrant::new(ask.want, pool, Box::new(()))
                 }
             })
@@ -602,12 +603,15 @@ impl CpuPlacement {
     }
 }
 
-/// The nice a class's command runs at: a gate at the supervisor's own, background and a resident
-/// ten below it. Never negative: raising a priority takes a privilege no supervisor holds.
-pub(super) const fn class_nice(class: JobserverClass) -> i32 {
+/// The nice a class's command runs at, its row of 05_gateway.md "Bands": interactive at the
+/// supervisor's own, a gate five below it, background and a resident ten below it. Never
+/// negative: raising a priority takes a privilege no supervisor holds, so the order is made by
+/// lowering the others.
+pub(super) const fn class_nice(class: ExecClass) -> i32 {
     match class {
-        JobserverClass::Gate => 0,
-        JobserverClass::Background | JobserverClass::Resident => 10,
+        ExecClass::Interactive => 0,
+        ExecClass::Gate => 5,
+        ExecClass::Background | ExecClass::Resident => 10,
     }
 }
 

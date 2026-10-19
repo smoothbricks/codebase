@@ -969,7 +969,7 @@ impl CliService for ActorBridge {
         )
         .await?;
         let submit = cowshed_os::timing::span("exec", "submit");
-        let gate = command.request.class == cowshed_core::api::JobserverClass::Gate;
+        let gate = command.request.class == cowshed_core::api::ExecClass::Gate;
         // The gate class is the operator's: it travels the coordinator route, which a worker
         // capability cannot take. The parser refused a gate with a session.
         let job = if gate {
@@ -5613,7 +5613,7 @@ mod tests {
                     stdout_copy: None,
                     stderr_copy: None,
                     admission_key: None,
-                    class: cowshed_core::api::JobserverClass::Background,
+                    class: cowshed_core::api::ExecClass::Background,
                     want: std::num::NonZeroUsize::MIN,
                     scope: cowshed_core::api::ExecScope::Workspace,
                 })

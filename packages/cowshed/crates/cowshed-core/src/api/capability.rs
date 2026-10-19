@@ -2639,7 +2639,7 @@ mod tests {
     use super::*;
     use crate::api::call::{Arguments, Serves, call};
     use crate::api::dto::RunSandboxMode;
-    use crate::api::dto::{ExecScope, JobserverClass};
+    use crate::api::dto::{ExecClass, ExecScope};
     use crate::api::operations::{self, OPERATIONS, Scope};
     use serde_json::json;
     use std::future::{self, Future};
@@ -3058,7 +3058,7 @@ mod tests {
             stdout_copy: None,
             stderr_copy: None,
             admission_key: None,
-            class: JobserverClass::Background,
+            class: ExecClass::Background,
             want: NonZeroUsize::MIN,
             scope: ExecScope::Workspace,
         }
@@ -4073,7 +4073,7 @@ mod tests {
         let handle = workspace_handle(runtime);
         for scope in [ExecScope::Workspace, ExecScope::HostGate] {
             let mut request = exec_request(StdinSource::Empty);
-            request.class = JobserverClass::Gate;
+            request.class = ExecClass::Gate;
             request.scope = scope;
             let error = handle
                 .exec(request)
@@ -4083,7 +4083,7 @@ mod tests {
             assert_eq!(
                 error.cpu_admission_source(),
                 Some(&CpuAdmissionRefusal::ClassNotPermitted {
-                    class: JobserverClass::Gate,
+                    class: ExecClass::Gate,
                     scope,
                 })
             );
@@ -4127,7 +4127,7 @@ mod tests {
         let worker = workspace_handle(Arc::clone(&runtime));
         let coordinator = coordinator(runtime);
         let mut request = exec_request(StdinSource::Empty);
-        request.class = JobserverClass::Gate;
+        request.class = ExecClass::Gate;
         request.want = NonZeroUsize::new(8).unwrap();
         request.scope = ExecScope::HostGate;
         request.env = [
@@ -4148,7 +4148,7 @@ mod tests {
         let (runtime, mut server) = actor_pair();
         let worker = workspace_handle(Arc::clone(&runtime));
         let mut request = exec_request(StdinSource::Empty);
-        request.class = JobserverClass::Gate;
+        request.class = ExecClass::Gate;
         request.scope = ExecScope::HostGate;
         request.env = [("PROJECT_SETTING".to_owned(), "custom-value".to_owned())].into();
         let error = runtime
@@ -4176,7 +4176,7 @@ mod tests {
         let worker = workspace_handle(Arc::clone(&runtime));
         let coordinator = coordinator(runtime);
         let mut request = exec_request(StdinSource::Empty);
-        request.class = JobserverClass::Background;
+        request.class = ExecClass::Background;
         request.scope = ExecScope::HostGate;
         let error = coordinator
             .exec(&worker, request)

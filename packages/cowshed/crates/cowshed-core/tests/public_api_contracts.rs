@@ -134,7 +134,7 @@ fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
             complete: true,
         },
         failure: None,
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: Some(10),
         cpu_tokens: NonZeroUsize::new(1),
@@ -1667,7 +1667,7 @@ fn job_info_reports_admitted_scheduling_and_observations_exactly() {
 
     // A gate's observed nice is what the supervisor set: zero is a real observation.
     let mut gate = info;
-    gate.class = JobserverClass::Gate;
+    gate.class = ExecClass::Gate;
     gate.nice = Some(0);
     gate.cpu_tokens = NonZeroUsize::new(12);
     let value = serde_json::to_value(&gate).expect("gate job JSON");
@@ -1714,7 +1714,7 @@ fn job_info_requires_its_class_and_scope_and_refuses_impossible_scheduling() {
         host.validate().is_err(),
         "a background job does not run as the host gate"
     );
-    host.class = JobserverClass::Gate;
+    host.class = ExecClass::Gate;
     host.validate().expect("a gate runs as the host gate");
 
     let mut queued = info;
@@ -1747,7 +1747,7 @@ fn sealed_job_and_cpu_failures_keep_their_exact_wire_spellings() {
         output_limit: None,
         stdout: stream(".cowshed/job/7/out", 0, ""),
         stderr: stream(".cowshed/job/7/err", 0, ""),
-        class: JobserverClass::Gate,
+        class: ExecClass::Gate,
         scope: ExecScope::HostGate,
         nice: None,
         cpu_tokens: NonZeroUsize::new(12),
@@ -1782,10 +1782,10 @@ fn sealed_job_and_cpu_failures_keep_their_exact_wire_spellings() {
 #[test]
 fn exec_scheduling_pairs_class_and_scope() {
     for (class, scope, valid) in [
-        (JobserverClass::Background, ExecScope::Workspace, true),
-        (JobserverClass::Gate, ExecScope::Workspace, true),
-        (JobserverClass::Gate, ExecScope::HostGate, true),
-        (JobserverClass::Background, ExecScope::HostGate, false),
+        (ExecClass::Background, ExecScope::Workspace, true),
+        (ExecClass::Gate, ExecScope::Workspace, true),
+        (ExecClass::Gate, ExecScope::HostGate, true),
+        (ExecClass::Background, ExecScope::HostGate, false),
     ] {
         assert_eq!(
             validate_scheduling(class, scope).is_ok(),

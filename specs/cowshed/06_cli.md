@@ -440,7 +440,11 @@ first, however it ends — a caller's timeout killing it included — leaves a j
 kills it (05_gateway.md, "A job lives with its requester"). `--timeout` releases the hold before it leaves the job
 running; `--background` takes none. A `--class resident` command — a daemon or worker that stays up and is idle between
 requests — holds no CPU token and starts at once; its descendants ask its pool for their own (05_gateway.md, "A resident
-holds no token"). It takes no `--want` and no `--host`.
+holds no token"). It takes no `--want` and no `--host`. A `--class interactive` command is one its caller waits on: it
+takes its tokens as background work does and runs at nice 0, above a gate at +5 and background at +10 (05_gateway.md,
+"Bands"); a workspace may ask for it, and it takes no `--host`. Every `exec` flag that asks the scheduler for something
+is a typed field of the API's exec request (07_api.md, "CLI and API exec parity"), so an embedding process can ask for
+everything this command can.
 
 `--register` (on `cowshed fork`) additionally adds a `cowshed/<ws>` remote in the **main** workspace pointing at the new
 workspace's canonical mount, so a human in main can fetch and review the workspace's branch in place. Off by default

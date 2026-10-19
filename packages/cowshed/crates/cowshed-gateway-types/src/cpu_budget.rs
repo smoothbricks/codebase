@@ -27,19 +27,16 @@ pub const JOBSERVER_OP: &str = "jobserver";
 /// The control operation a resident job asks with: a relay pool and no token of its own.
 pub const RESIDENT_POOL_OP: &str = "resident-pool";
 
-/// Root jobserver admission class. Only a live grant, not an environment marker, admits a gate.
+/// Root jobserver admission class: the ledger's wire class (05_gateway.md "Gate admission"), and
+/// the only classes that hold tokens. An exec's own class (cowshed-core `ExecClass`) maps onto it:
+/// interactive asks as background, and a resident asks with [`RESIDENT_POOL_OP`] instead, so
+/// neither can reach this wire. Only a live grant, not an environment marker, admits a gate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum JobserverClass {
     #[default]
     Background,
     Gate,
-    /// A process that stays up to serve requests -- the Nx daemon a shed's supervisor keeps, a
-    /// worker that runs each request it is sent -- and is idle between them. It holds no token
-    /// for its lifetime: its grant is a pool that holds none and asks the host ledger, at
-    /// background class for its checkout, for each descendant that asks it, so a resident costs
-    /// tokens only while a request of its runs (05_gateway.md "A resident holds no token").
-    Resident,
 }
 
 /// The trusted supervisor's existing immutable job identity; never an environment claim.

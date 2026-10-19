@@ -726,7 +726,7 @@ impl Serves<CoordinatorExec> for Coordinator {
             #[serde(default)]
             admission_key: Option<AdmissionKey>,
             #[serde(default)]
-            class: JobserverClass,
+            class: ExecClass,
             #[serde(default = "minimum_want")]
             want: NonZeroUsize,
             #[serde(default)]
@@ -816,7 +816,7 @@ impl Serves<WorkerExec> for WorkspaceHandle {
             #[serde(default)]
             admission_key: Option<AdmissionKey>,
             #[serde(default)]
-            class: JobserverClass,
+            class: ExecClass,
             #[serde(default = "minimum_want")]
             want: NonZeroUsize,
             #[serde(default)]

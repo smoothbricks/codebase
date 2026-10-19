@@ -30,9 +30,9 @@ use super::supervisor::{
     WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use crate::api::dto::{
-    AdmissionKey, CommandArg, ExecCommand, ExecRequest, ExecScope, JobId, JobJournalCursor,
-    JobTailLimits, JobserverClass, OutputPublication, RunSandboxMode, ScriptCommand, Sha256Digest,
-    StdinSource, TraceContext, WorkspacePath,
+    AdmissionKey, CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobId,
+    JobJournalCursor, JobTailLimits, OutputPublication, RunSandboxMode, ScriptCommand,
+    Sha256Digest, StdinSource, TraceContext, WorkspacePath,
 };
 use crate::api::process::JobProcessEvent;
 use crate::api::resources::SampleInterval;
@@ -420,7 +420,7 @@ struct ExecWire {
     stdout_copy: Option<OutputPublication>,
     stderr_copy: Option<OutputPublication>,
     admission_key: Option<AdmissionKey>,
-    class: JobserverClass,
+    class: ExecClass,
     want: NonZeroUsize,
     scope: ExecScope,
 }
@@ -431,8 +431,8 @@ struct ExecWire {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AdmissionSource {
-    /// worker.exec: a workspace's own capability, which admits background and resident work in
-    /// its workspace sandbox only.
+    /// worker.exec: a workspace's own capability, which admits background, interactive and
+    /// resident work in its workspace sandbox only.
     Worker,
     /// coordinator.exec and the controller's own execs: the trusted coordinator, which may also
     /// admit the gate class and the host-gate scope.
@@ -440,16 +440,17 @@ pub enum AdmissionSource {
 }
 
 impl AdmissionSource {
-    /// Whether this route may admit an exec of class in scope. A worker admits background and
-    /// resident work in the workspace sandbox and nothing else -- a resident holds no token, so
-    /// it claims nothing a worker may not -- and anything more is refused as the typed
-    /// class-not-permitted error, before any record, process or gateway request exists.
-    pub fn admit(self, class: JobserverClass, scope: ExecScope) -> Result<()> {
+    /// Whether this route may admit an exec of class in scope. A worker admits background,
+    /// interactive and resident work in the workspace sandbox and nothing else -- interactive
+    /// buys a band and no token, and a resident holds no token, so neither claims anything a
+    /// worker may not -- and anything more is refused as the typed class-not-permitted error,
+    /// before any record, process or gateway request exists.
+    pub fn admit(self, class: ExecClass, scope: ExecScope) -> Result<()> {
         match (self, class, scope) {
             (Self::Coordinator, _, _)
             | (
                 Self::Worker,
-                JobserverClass::Background | JobserverClass::Resident,
+                ExecClass::Background | ExecClass::Interactive | ExecClass::Resident,
                 ExecScope::Workspace,
             ) => Ok(()),
             (Self::Worker, _, _) => Err(CowshedError::class_not_permitted(class, scope)),
@@ -2696,16 +2697,21 @@ mod admission_source_tests {
     use super::*;
     use crate::error::{CpuAdmissionRefusal, ErrorCode};
 
-    /// The route is the authority: a worker admits background work in the workspace sandbox and
-    /// nothing else, the refusal is the typed class-not-permitted error naming both, and the
-    /// coordinator admits every pairing.
+    /// The route is the authority: a worker admits background, interactive and resident work in
+    /// the workspace sandbox and nothing else, the refusal is the typed class-not-permitted error
+    /// naming both, and the coordinator admits every pairing.
     #[test]
-    fn a_worker_admits_only_background_workspace_work() {
-        for class in [JobserverClass::Background, JobserverClass::Gate] {
+    fn a_worker_admits_its_workspaces_work_but_no_gate() {
+        for class in [
+            ExecClass::Background,
+            ExecClass::Interactive,
+            ExecClass::Gate,
+            ExecClass::Resident,
+        ] {
             for scope in [ExecScope::Workspace, ExecScope::HostGate] {
                 let worker = AdmissionSource::Worker.admit(class, scope);
-                if (class, scope) == (JobserverClass::Background, ExecScope::Workspace) {
-                    worker.expect("a worker admits ordinary background work");
+                if scope == ExecScope::Workspace && class != ExecClass::Gate {
+                    worker.expect("a worker admits its workspace's non-gate work");
                 } else {
                     let error = worker.expect_err("a worker admits nothing else");
                     assert_eq!(error.code, ErrorCode::SandboxDenied);
@@ -2769,7 +2775,7 @@ mod admission_source_tests {
             panic!("decoded another call");
         };
         assert_eq!(source, AdmissionSource::Coordinator);
-        assert_eq!(request.class, JobserverClass::Gate);
+        assert_eq!(request.class, ExecClass::Gate);
         assert_eq!(request.want.get(), 8);
         assert_eq!(request.scope, ExecScope::HostGate);
 

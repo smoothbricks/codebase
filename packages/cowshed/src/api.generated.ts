@@ -431,7 +431,7 @@ export type CowshedError = {
  */
 export type CpuAdmissionRefusal =
   | ({ readonly reason: 'classNotPermitted' } & {
-      readonly class: JobserverClass;
+      readonly class: ExecClass;
       readonly scope: ExecScope;
     })
   | ({ readonly reason: 'invalidRequest' } & {
@@ -710,6 +710,15 @@ export type ErrorCode =
   | 'integrity';
 
 /**
+ * The class an exec is admitted under: one row of 05_gateway.md "Bands", fixing at the job's
+ * birth both its place in the token order and the nice it runs at. It is the exec's own axis,
+ * apart from the ledger's wire class ([`cowshed_gateway_types::JobserverClass`]): interactive
+ * asks the ledger as background and a resident asks with its own operation, so neither reaches
+ * the ledger as a class of its own.
+ */
+export type ExecClass = 'background' | 'interactive' | 'gate' | 'resident';
+
+/**
  * What a job runs.
  */
 export type ExecCommand = { readonly argv: ReadonlyArray<CommandArg> } | { readonly script: ScriptCommand };
@@ -734,10 +743,12 @@ export type ExecParams = {
   readonly stderrCopy: OutputPublication | null;
   readonly admissionKey?: AdmissionKey;
   /**
-   * The host CPU admission class, omitted for background, which is what ordinary exec asks for.
-   * Only the coordinator.exec route admits the gate class.
+   * The class the job is admitted under (05_gateway.md "Bands"), omitted for background, which
+   * is what ordinary exec asks for: `interactive` for a command its requester awaits, and
+   * `resident` for one that serves requests and holds no token, which a worker may ask for;
+   * only the coordinator.exec route admits the gate class.
    */
-  readonly class?: JobserverClass;
+  readonly class?: ExecClass;
   /**
    * The most CPU tokens the command can use at once; omitted for one.
    */
@@ -1151,7 +1162,7 @@ export type JobInfoRef = {
   readonly outputLimit?: OutputLimitInfo;
   readonly stdin: StdinInfo;
   readonly failure?: JobFailure;
-  readonly class: JobserverClass;
+  readonly class: ExecClass;
   readonly scope: ExecScope;
   readonly nice?: number & tags.Type<'int32'>;
   readonly cpuTokens?: number & tags.Type<'uint64'> & tags.Minimum<1>;
@@ -1445,11 +1456,6 @@ export type JobVolumeUsage = {
   readonly workspace: VolumeUsage;
   readonly build?: VolumeUsage;
 };
-
-/**
- * Root jobserver admission class. Only a live grant, not an environment marker, admits a gate.
- */
-export type JobserverClass = 'background' | 'gate' | 'resident';
 
 /**
  * One Nx task that missed the cache when a land re-ran its check in the target on the adopted
@@ -2336,7 +2342,7 @@ export type SealedJob = {
   /**
    * The class the job was admitted under, as JobInfo.class.
    */
-  readonly class: JobserverClass;
+  readonly class: ExecClass;
   /**
    * Where the job's command ran, as JobInfo.scope.
    */

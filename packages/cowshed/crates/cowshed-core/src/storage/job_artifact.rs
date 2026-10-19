@@ -9,6 +9,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
+use crate::api::dto::ExecClass;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, ListArray, RecordBatch,
     StringArray, StructArray, UInt16Array, UInt32Array, UInt64Array, new_null_array,
@@ -17,7 +18,6 @@ use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Fields, Schema};
-use cowshed_gateway_types::JobserverClass;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -456,21 +456,27 @@ pub struct JobAdmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobScheduling {
     scope: ExecScope,
-    class: JobserverClass,
+    class: ExecClass,
     want: NonZeroUsize,
 }
 
 impl JobScheduling {
     /// `None` for a host gate scope with work that is not a gate, and for a resident that names
     /// a want above the default.
-    pub fn new(scope: ExecScope, class: JobserverClass, want: NonZeroUsize) -> Option<Self> {
+    pub fn new(scope: ExecScope, class: ExecClass, want: NonZeroUsize) -> Option<Self> {
         match (scope, class) {
-            (ExecScope::Workspace, JobserverClass::Background | JobserverClass::Gate)
-            | (ExecScope::HostGate, JobserverClass::Gate) => Some(Self { scope, class, want }),
-            (ExecScope::Workspace, JobserverClass::Resident) => {
+            (
+                ExecScope::Workspace,
+                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate,
+            )
+            | (ExecScope::HostGate, ExecClass::Gate) => Some(Self { scope, class, want }),
+            (ExecScope::Workspace, ExecClass::Resident) => {
                 (want == NonZeroUsize::MIN).then_some(Self { scope, class, want })
             }
-            (ExecScope::HostGate, JobserverClass::Background | JobserverClass::Resident) => None,
+            (
+                ExecScope::HostGate,
+                ExecClass::Background | ExecClass::Interactive | ExecClass::Resident,
+            ) => None,
         }
     }
 
@@ -478,7 +484,7 @@ impl JobScheduling {
         self.scope
     }
 
-    pub fn class(self) -> JobserverClass {
+    pub fn class(self) -> ExecClass {
         self.class
     }
 
@@ -492,7 +498,7 @@ impl Default for JobScheduling {
     fn default() -> Self {
         Self {
             scope: ExecScope::Workspace,
-            class: JobserverClass::Background,
+            class: ExecClass::Background,
             want: NonZeroUsize::MIN,
         }
     }
@@ -764,7 +770,7 @@ impl JobArtifactRecord {
         }
         // A resident is granted no tokens (05_gateway.md, "A resident holds no token"), so its
         // observed nice stands alone; every other class's nice is its grant's.
-        let resident = self.scheduling.class() == JobserverClass::Resident;
+        let resident = self.scheduling.class() == ExecClass::Resident;
         if resident && self.cpu_tokens.is_some() {
             return Err(integrity(
                 0,
@@ -4720,11 +4726,12 @@ fn decode_tokens(value: u64, what: &str) -> Result<NonZeroUsize, ArtifactError> 
         })
 }
 
-fn class_name(class: JobserverClass) -> &'static str {
+fn class_name(class: ExecClass) -> &'static str {
     match class {
-        JobserverClass::Background => "background",
-        JobserverClass::Gate => "gate",
-        JobserverClass::Resident => "resident",
+        ExecClass::Background => "background",
+        ExecClass::Interactive => "interactive",
+        ExecClass::Gate => "gate",
+        ExecClass::Resident => "resident",
     }
 }
 
@@ -4745,11 +4752,12 @@ fn parse_scope(name: &str) -> Result<ExecScope, ArtifactError> {
     }
 }
 
-fn parse_class(name: &str) -> Result<JobserverClass, ArtifactError> {
+fn parse_class(name: &str) -> Result<ExecClass, ArtifactError> {
     match name {
-        "background" => Ok(JobserverClass::Background),
-        "gate" => Ok(JobserverClass::Gate),
-        "resident" => Ok(JobserverClass::Resident),
+        "background" => Ok(ExecClass::Background),
+        "interactive" => Ok(ExecClass::Interactive),
+        "gate" => Ok(ExecClass::Gate),
+        "resident" => Ok(ExecClass::Resident),
         other => Err(ArtifactError::Arrow(format!("unknown CPU class {other:?}"))),
     }
 }
@@ -4781,7 +4789,7 @@ fn decode_cpu(
             uint64(batch, first + 3).and_then(|column| decode_tokens(column.value(0), "cpu_tokens"))
         })
         .transpose()?;
-    if class == JobserverClass::Resident && cpu_tokens.is_some() {
+    if class == ExecClass::Resident && cpu_tokens.is_some() {
         return Err(ArtifactError::Arrow(
             "a resident job record names cpu_tokens, and a resident is granted none".into(),
         ));
@@ -7698,7 +7706,7 @@ mod tests {
     fn gate(want: usize) -> JobScheduling {
         JobScheduling::new(
             ExecScope::Workspace,
-            JobserverClass::Gate,
+            ExecClass::Gate,
             NonZeroUsize::new(want).unwrap(),
         )
         .unwrap()
@@ -7997,12 +8005,9 @@ mod tests {
                 "a {class} record that names a nice names its grant"
             );
         }
-        let resident = JobScheduling::new(
-            ExecScope::Workspace,
-            JobserverClass::Resident,
-            NonZeroUsize::MIN,
-        )
-        .unwrap();
+        let resident =
+            JobScheduling::new(ExecScope::Workspace, ExecClass::Resident, NonZeroUsize::MIN)
+                .unwrap();
         let ended_resident = JobArtifactRecord {
             scheduling: resident,
             nice: Some(10),
@@ -8011,7 +8016,7 @@ mod tests {
         let read = round_trip(&ended_resident);
         assert_eq!(
             (read.scheduling.class(), read.cpu_tokens, read.nice),
-            (JobserverClass::Resident, None, Some(10)),
+            (ExecClass::Resident, None, Some(10)),
             "a sealed resident names the nice it ran at and no grant"
         );
         let granted_resident = JobArtifactRecord {
@@ -8076,20 +8081,20 @@ mod tests {
         let want = NonZeroUsize::new(3).unwrap();
         let workspace = ExecScope::Workspace;
         assert!(
-            JobScheduling::new(ExecScope::HostGate, JobserverClass::Background, want).is_none(),
+            JobScheduling::new(ExecScope::HostGate, ExecClass::Background, want).is_none(),
             "only a gate runs at the host boundary"
         );
-        let gate = JobScheduling::new(workspace, JobserverClass::Gate, want).unwrap();
+        let gate = JobScheduling::new(workspace, ExecClass::Gate, want).unwrap();
         assert_eq!(
             (gate.scope(), gate.class(), gate.want()),
-            (workspace, JobserverClass::Gate, want)
+            (workspace, ExecClass::Gate, want)
         );
-        let host = JobScheduling::new(ExecScope::HostGate, JobserverClass::Gate, want).unwrap();
+        let host = JobScheduling::new(ExecScope::HostGate, ExecClass::Gate, want).unwrap();
         assert_eq!(host.scope(), ExecScope::HostGate);
         let ordinary = JobScheduling::default();
         assert_eq!(
             (ordinary.scope(), ordinary.class(), ordinary.want()),
-            (workspace, JobserverClass::Background, NonZeroUsize::MIN)
+            (workspace, ExecClass::Background, NonZeroUsize::MIN)
         );
         let host_record = JobArtifactRecord {
             scheduling: host,
@@ -8784,12 +8789,9 @@ mod tests {
                 .unwrap();
             (job_id, token)
         };
-        let resident = JobScheduling::new(
-            ExecScope::Workspace,
-            JobserverClass::Resident,
-            NonZeroUsize::MIN,
-        )
-        .unwrap();
+        let resident =
+            JobScheduling::new(ExecScope::Workspace, ExecClass::Resident, NonZeroUsize::MIN)
+                .unwrap();
 
         let (resident_id, token) = begin(&mut store, resident);
         store
@@ -8802,7 +8804,7 @@ mod tests {
             .clone();
         assert_eq!(
             (sealed.scheduling.class(), sealed.cpu_tokens, sealed.nice),
-            (JobserverClass::Resident, None, Some(10))
+            (ExecClass::Resident, None, Some(10))
         );
         let (_, token) = begin(&mut store, resident);
         assert!(
@@ -8817,12 +8819,8 @@ mod tests {
             ("background", JobScheduling::default()),
             (
                 "gate",
-                JobScheduling::new(
-                    ExecScope::Workspace,
-                    JobserverClass::Gate,
-                    NonZeroUsize::MIN,
-                )
-                .unwrap(),
+                JobScheduling::new(ExecScope::Workspace, ExecClass::Gate, NonZeroUsize::MIN)
+                    .unwrap(),
             ),
         ] {
             let (_, token) = begin(&mut store, scheduling);

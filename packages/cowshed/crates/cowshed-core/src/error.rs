@@ -172,7 +172,7 @@ where
 )]
 pub enum CpuAdmissionRefusal {
     ClassNotPermitted {
-        class: cowshed_gateway_types::JobserverClass,
+        class: crate::api::dto::ExecClass,
         scope: crate::api::dto::ExecScope,
     },
     InvalidRequest {
@@ -394,7 +394,7 @@ impl FenceRefusal {
 
 impl CowshedError {
     pub fn class_not_permitted(
-        class: cowshed_gateway_types::JobserverClass,
+        class: crate::api::dto::ExecClass,
         scope: crate::api::dto::ExecScope,
     ) -> Self {
         Self::cpu_admission(CpuAdmissionRefusal::ClassNotPermitted { class, scope })
@@ -404,7 +404,7 @@ impl CowshedError {
         let error = match &refusal {
             CpuAdmissionRefusal::ClassNotPermitted { class, scope } => Self::sandbox_denied(
                 format!("class-not-permitted: worker exec cannot request {class:?} / {scope:?}"),
-                "use the trusted coordinator/operator gate path; workers admit only background workspace work",
+                "use the trusted coordinator/operator gate path; workers admit background, interactive and resident workspace work",
             ),
             CpuAdmissionRefusal::InvalidRequest { detail } => {
                 Self::usage(detail, "the host gate scope requires the gate class")
@@ -439,7 +439,7 @@ impl CowshedError {
                 "cannot place owned job pid {} at nice {}: observed {:?}, errno {:?}",
                 failure.pid, failure.requested, failure.observed, failure.errno
             ),
-            "gate runs at default nice 0; lower only background jobs, never request elevated gate priority",
+            "interactive runs at the supervisor's own nice and every other class only lower (05_gateway.md \"Bands\"); never request an elevated priority",
         );
         Self {
             execution: Some(Box::new(ExecutionRefusal::Priority { priority: failure })),

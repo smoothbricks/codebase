@@ -873,3 +873,84 @@ async fn a_root_cargo_build_that_grows_is_handed_its_tokens_through_its_fifo() {
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// The class an API caller names on its exec request reaches the real ledger through the
+/// supervisor's own admission (`GatewayJobCpu`), the boundary where a requester's `ExecClass`
+/// becomes the ledger's wire class (05_gateway.md "Bands"; 07_api.md "CLI and API exec parity"):
+/// a gate is admitted as a gate job, ahead of background; interactive work is admitted as
+/// background tokens for its checkout; and a resident is granted its pool and holds no token
+/// while its grant lives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_exec_class_takes_its_own_ledger_place_through_the_supervisors_admission() {
+    use cowshed_core::api::{ExecClass, JobId};
+    use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _, JobCpuAsk};
+
+    let (gateway, root, socket) = gateway(4).await;
+    let admission = GatewayJobCpu::new(socket.clone());
+    let ask = |class: ExecClass, want: usize, checkout: &str, job: u64| JobCpuAsk {
+        class,
+        want: NonZeroUsize::new(want).unwrap(),
+        checkout: PathBuf::from(checkout),
+        command: format!("{class:?} job"),
+        job: (
+            cowshed_core::repository::RepoId::parse("owner/repo").unwrap(),
+            cowshed_core::metadata::WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef")
+                .unwrap(),
+            JobId::new(job).unwrap(),
+        ),
+    };
+    let gate = admission
+        .admit(ask(ExecClass::Gate, 2, "/w/land", 1))
+        .await
+        .expect("a gate is granted");
+    let interactive = admission
+        .admit(ask(ExecClass::Interactive, 1, "/w/feedback", 2))
+        .await
+        .expect("interactive work is granted");
+    let resident = admission
+        .admit(ask(ExecClass::Resident, 1, "/w/worker", 3))
+        .await
+        .expect("a resident is granted its pool");
+    assert_eq!(
+        (gate.tokens(), interactive.tokens(), resident.tokens()),
+        (NonZeroUsize::new(2), NonZeroUsize::new(1), None),
+        "the gate and interactive grants hold tokens; the resident's holds none"
+    );
+
+    let status = ledger(&socket).await;
+    assert_eq!(status.held, 3, "{status:?}");
+    assert_eq!(
+        status
+            .gate_jobs
+            .iter()
+            .map(|job| (job.checkout.as_str(), job.held))
+            .collect::<Vec<_>>(),
+        [("/w/land", 2)],
+        "the gate is admitted as a gate job: {status:?}"
+    );
+    assert_eq!(
+        status
+            .background
+            .iter()
+            .map(|stake| (stake.checkout.as_str(), stake.held))
+            .collect::<Vec<_>>(),
+        [("/w/feedback", 1)],
+        "interactive work holds background tokens, and the resident holds none: {status:?}"
+    );
+    assert!(
+        status
+            .checkouts
+            .iter()
+            .all(|checkout| checkout.checkout != "/w/worker"),
+        "a live resident has no ledger place: {status:?}"
+    );
+
+    drop((gate, interactive, resident));
+    // The ledger sends no change notification: read it until the returns show. A return that
+    // never comes is a hang, which the leg's no-progress backstop decides, never a count here.
+    while ledger(&socket).await.held != 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}

@@ -358,7 +358,7 @@ pub(crate) fn start_request(workspace_root: &Path, project_root: &Path) -> Resul
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
-        class: crate::api::dto::JobserverClass::Resident,
+        class: crate::api::dto::ExecClass::Resident,
         want: std::num::NonZeroUsize::MIN,
         scope: crate::api::dto::ExecScope::Workspace,
     })

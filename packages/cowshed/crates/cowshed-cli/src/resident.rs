@@ -190,7 +190,7 @@ async fn run(
     let incarnation = resident.authority().workspace_incarnation.clone();
     let link = JobLink::new(resident);
     // The operator's gate is the coordinator's route, as it is through the controller.
-    let gate = request.class == cowshed_core::api::JobserverClass::Gate;
+    let gate = request.class == cowshed_core::api::ExecClass::Gate;
     let source = if gate {
         cowshed_core::runtime::supervisor_socket::AdmissionSource::Coordinator
     } else {
