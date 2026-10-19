@@ -95,16 +95,35 @@ const TIMED_STAND_IN = new RegExp(
   `${TIMER_CALL.source}|${/(?:^|[;&|\n"'`(]|\bexec)\s*sleep\s+(?:\d|["'$])|["'`]sleep["'`]/u.source}`,
   'gu',
 );
+/** A span written as a number or one constant operation on two (`5000`, `1 << 30`, `2 ** 31`, `60 * 1000`). */
+function spanValue(text: string): number | undefined {
+  const operation = /^\s*(\d[\d_]*(?:\.\d+)?)\s*(?:(<<|\*\*|\*)\s*(\d[\d_]*(?:\.\d+)?))?\s*$/u.exec(text);
+  if (operation === null) return undefined;
+  const left = Number((operation[1] ?? '').replaceAll('_', ''));
+  const right = Number((operation[3] ?? '').replaceAll('_', ''));
+  switch (operation[2]) {
+    case '<<':
+      return left * 2 ** right;
+    case '**':
+      return left ** right;
+    case '*':
+      return left * right;
+    default:
+      return left;
+  }
+}
 /** The span of the timer or sleep starting `text`, in milliseconds, when its source states one. */
 function timerSpanMs(text: string): number | undefined {
   const shell = /^(?:[;&|\n"'`(]|exec)?\s*sleep\s+(\d+(?:\.\d+)?)([smhd]?)(?![\w.])/u.exec(text);
   if (shell !== null) return Number(shell[1]) * 1000 * ({ m: 60, h: 3600, d: 86_400 }[shell[2] ?? ''] ?? 1);
   const argv = /^["'`]sleep["'`]\s*(?:,|\)\s*\.arg\()\s*["'`](\d+(?:\.\d+)?)["'`]/u.exec(text);
   if (argv !== null) return Number(argv[1]) * 1000;
-  const timeout = /^(?:(?:globalThis|window)\.)?setTimeout\s*\([^;]*?,\s*(\d[\d_]*)\s*\)/u.exec(text.slice(0, 400));
-  if (timeout !== null) return Number((timeout[1] ?? '').replaceAll('_', ''));
-  const bun = /^Bun\.sleep(?:Sync)?\s*\(\s*(\d[\d_]*)\s*\)/u.exec(text);
-  if (bun !== null) return Number((bun[1] ?? '').replaceAll('_', ''));
+  const timer = /^(?:(?:globalThis|window)\.)?set(?:Timeout|Interval)\s*\([^;]*?,\s*([^,()]+?)\s*\)/u.exec(
+    text.slice(0, 400),
+  );
+  if (timer !== null) return spanValue(timer[1] ?? '');
+  const bun = /^Bun\.sleep(?:Sync)?\s*\(([^()]+)\)/u.exec(text);
+  if (bun !== null) return spanValue(bun[1] ?? '');
   const seconds = /^(?:asyncio|time)\.sleep\s*\(\s*(\d+(?:\.\d+)?)\s*\)/u.exec(text);
   if (seconds !== null) return Number(seconds[1]) * 1000;
   const rust =
@@ -115,13 +134,19 @@ function timerSpanMs(text: string): number | undefined {
   return undefined;
 }
 /**
- * Whether source text holds a stand-in that a timer or sleep ends while the leg still runs. One held at or past the
- * backstop (`exec sleep 3600`) outlasts the leg, so it is held off as surely as a child that never answers; a
- * repeating timer or an unstated span may end or progress at any time, so it counts.
+ * Whether source text holds a stand-in whose timer can beat a bound before the leg's backstop. A one-shot timer or
+ * sleep ends or advances its stand-in when it fires. A repeating timer never ends one, so it races only a progress
+ * (idle) bound, and only when its callback does something. A span at or past the backstop (`exec sleep 3600`,
+ * `setInterval(() => {}, 1 << 30)`) outlasts the leg, so its stand-in is held off as surely as a child that never
+ * answers; an unstated span races.
  */
-function endsByTimer(text: string): boolean {
+function racesBound(text: string, idle: boolean): boolean {
   for (const match of text.matchAll(TIMED_STAND_IN)) {
-    const ms = timerSpanMs(text.slice(match.index));
+    const at = text.slice(match.index);
+    const repeating = /^(?:(?:globalThis|window)\.)?setInterval\s*\(/u.exec(at);
+    if (repeating !== null && (!idle || /^\s*\(\s*\)\s*=>\s*\{\s*\}\s*,/u.test(at.slice(repeating[0].length))))
+      continue;
+    const ms = timerSpanMs(at);
     if (ms === undefined || ms < TEST_CLOCK_ORACLE.backstopMs) return true;
   }
   return false;
@@ -194,6 +219,8 @@ const COMPARISON: Partial<Record<ts.SyntaxKind, 'below' | 'above'>> = {
 const ORDER_MATCHER = /^toBe(Less|Greater)Than(?:OrEqual)?$/u;
 const TRUTH_MATCHER = /^to(?:Be|Equal|StrictEqual)$/u;
 const CASE_CALLEE = /^(?:test|it)(?:\.\w+)*$/u;
+/** A harness that runs its callback on faked timers: `onProgressClock`, `withFakeClock`, `underMemoryTimer`. */
+const VIRTUAL_CLOCK_CALL = /^(?:on|with|under)\w*(?:Clock|Timers?)$/u;
 
 /** Class A and class D sites of one TypeScript/JavaScript test file. */
 function jsClockSites(parsed: ts.SourceFile): Site[] {
@@ -332,24 +359,25 @@ function jsClockSites(parsed: ts.SourceFile): Site[] {
         constants.set(declaration.name.text, value.getText(parsed));
     }
   }
-  const timed = new Map<ts.Node, boolean>();
-  const timedStandIn = (scope: ts.Node): boolean => {
-    const known = timed.get(scope);
-    if (known !== undefined) return known;
+  // What the stand-ins under `scope` do to a bound: none is there, every one is held off, or one races it.
+  const standIns = (scope: ts.Node, idle: boolean): 'none' | 'held' | 'races' => {
+    let found = false;
     const visit = (node: ts.Node): boolean => {
-      if (ts.isStringLiteralLike(node) || ts.isTemplateExpression(node)) {
-        if (endsByTimer(node.getText(parsed))) return true;
-      } else if (ts.isCallExpression(node)) {
-        if (TIMER_CALL.test(`${node.expression.getText(parsed)}(`) && endsByTimer(node.getText(parsed))) return true;
-      } else if (ts.isIdentifier(node)) {
-        const source = constants.get(node.text);
-        if (source !== undefined && endsByTimer(source)) return true;
+      const text =
+        ts.isStringLiteralLike(node) || ts.isTemplateExpression(node)
+          ? node.getText(parsed)
+          : ts.isCallExpression(node) && TIMER_CALL.test(`${node.expression.getText(parsed)}(`)
+            ? node.getText(parsed)
+            : ts.isIdentifier(node)
+              ? constants.get(node.text)
+              : undefined;
+      if (text !== undefined && text.search(TIMED_STAND_IN) !== -1) {
+        found = true;
+        if (racesBound(text, idle)) return true;
       }
       return ts.forEachChild(node, (child) => visit(child) || undefined) ?? false;
     };
-    const answer = visit(scope);
-    timed.set(scope, answer);
-    return answer;
+    return visit(scope) ? 'races' : found ? 'held' : 'none';
   };
   // The case a bound belongs to: its enclosing `test`/`it` call, else its function, else the file.
   const owner = (node: ts.Node): ts.Node => {
@@ -360,7 +388,7 @@ function jsClockSites(parsed: ts.SourceFile): Site[] {
     }
     return fn ?? parsed;
   };
-  const bounds: ts.Node[] = [];
+  const bounds: { readonly node: ts.Node; readonly idle: boolean }[] = [];
   const runnerOptions = new Set<ts.Node>();
 
   const visit = (node: ts.Node): void => {
@@ -394,12 +422,13 @@ function jsClockSites(parsed: ts.SourceFile): Site[] {
       const name =
         ts.isIdentifier(node.name) || ts.isStringLiteral(node.name) ? node.name.text : node.name.getText(parsed);
       const value = node.initializer === undefined ? undefined : literalNumber(node.initializer);
-      if (boundName(name) && value !== undefined && decides(name, value)) bounds.push(node);
+      if (boundName(name) && value !== undefined && decides(name, value))
+        bounds.push({ node, idle: /idle/iu.test(name) });
     }
     if (ts.isStringLiteralLike(node) || ts.isTemplateExpression(node)) {
       for (const flag of node.getText(parsed).matchAll(FLAG_BOUND)) {
         const value = Number((flag[1] ?? '').replaceAll('_', ''));
-        if (decides(flag[2] === 's' ? 'seconds' : 'ms', value)) bounds.push(node);
+        if (decides(flag[2] === 's' ? 'seconds' : 'ms', value)) bounds.push({ node, idle: /idle/iu.test(flag[0]) });
       }
     }
     ts.forEachChild(node, visit);
@@ -423,7 +452,30 @@ function jsClockSites(parsed: ts.SourceFile): Site[] {
     if (opens) scopes.pop();
   };
   visit(parsed);
-  for (const bound of new Set(bounds)) if (timedStandIn(owner(bound))) site(bound, 'clocked-bound');
+  // A bound is judged against the stand-ins of the call it configures when that call names any (`verdictOf(command,
+  // { idleTimeoutMs })`), else against its case's: one case may hold a talking child under a ceiling and a silent one
+  // under a progress bound. A value an assertion expects (`toMatchObject({ idleMs: 400 })`) configures nothing, and a
+  // bound run under faked timers (`jest.useFakeTimers()` in its case, or inside a clock harness such as
+  // `onProgressClock(moves, step, run)`) expires only when the test moves the clock.
+  const reported = new Set<ts.Node>();
+  for (const { node, idle } of bounds) {
+    if (reported.has(node)) continue;
+    let call: ts.CallExpression | undefined;
+    let virtual = false;
+    for (let up = node.parent; up !== undefined; up = up.parent) {
+      if (!ts.isCallExpression(up)) continue;
+      call ??= up;
+      const callee = up.expression.getText(parsed);
+      if (VIRTUAL_CLOCK_CALL.test(callee.slice(callee.lastIndexOf('.') + 1))) virtual = true;
+    }
+    const scope = owner(node);
+    if (virtual || /\buseFakeTimers\s*\(/u.test(scope.getText(parsed))) continue;
+    if (call !== undefined && /^expect\s*\(/u.test(call.expression.getText(parsed))) continue;
+    const near = call === undefined ? 'none' : standIns(call, idle);
+    if ((near === 'none' ? standIns(scope, idle) : near) !== 'races') continue;
+    reported.add(node);
+    site(node, 'clocked-bound');
+  }
   return sites;
 }
 
@@ -585,7 +637,8 @@ function rustClockSites(source: string, file: string): Site[] {
           text: source.slice(open + assertion.index, closing + 1),
         });
     }
-    if (!endsByTimer(commentless.slice(open, end + 1))) continue;
+    const fnText = commentless.slice(open, end + 1);
+    if (fnText.search(TIMED_STAND_IN) === -1) continue;
     for (const bound of body.matchAll(
       /\b([a-z_]\w*)\s*(?::(?!:)|=(?![=>])|\()\s*(?:Duration::from_(secs|millis|micros|nanos)(?:_f32|_f64)?\s*\(\s*)?(\d[\d_]*(?:\.\d+)?)/giu,
     )) {
@@ -593,7 +646,12 @@ function rustClockSites(source: string, file: string): Site[] {
       const value = Number((bound[3] ?? '').replaceAll('_', ''));
       const unit = bound[2];
       const decided = unit === undefined ? decides(name, value) : decides('ms', value * (DURATION_MS[unit] ?? 1));
-      if (!boundName(name) || !decided) continue;
+      // A `timeout(d, f)` / `recv_timeout(d)` call is the test's own wait, judged above as a test-deadline (a quiet
+      // window passes there); only a bound handed to the product is a clocked-bound.
+      const deadlineCall =
+        /^(?:recv_timeout|park_timeout|timeout)$/u.test(name) &&
+        bound[0].slice(name.length).trimStart().startsWith('(');
+      if (deadlineCall || !boundName(name) || !decided || !racesBound(fnText, /idle/iu.test(name))) continue;
       const offset = open + bound.index;
       sites.push({ kind: 'clocked-bound', offset, text: source.slice(offset, offset + bound[0].length) });
     }

@@ -115,6 +115,11 @@ describe('test-clock-policy', () => {
         ],
         [
           'clocked-bound',
+          'tests/a.test.ts',
+          `test('talking child under a progress bound', async () => { await verdictOf('node -e "setInterval(() => console.log(1), 10)"', { idleTimeoutMs: 100 }); });`,
+        ],
+        [
+          'clocked-bound',
           'tests/bound.rs',
           lines(
             '#[test]',
@@ -191,6 +196,28 @@ describe('test-clock-policy', () => {
         [
           'tests/c.test.ts',
           "test('stand-in outlasts the leg', async () => { const path = await fakeChild('exec sleep 3600'); await openService({ path, lspQueryTimeoutMs: 1_000 }); });",
+        ],
+        [
+          'tests/c.test.ts',
+          `test('silent child held past the backstop', async () => { await runBoundedExec({ command: 'node -e "setInterval(() => {}, 1 << 30)"', timeoutMs: 50, killAfterMs: 10 }); });`,
+        ],
+        [
+          'tests/c.test.ts',
+          `test('a ceiling and a progress bound', async () => { await verdictOf('node -e "setInterval(() => console.log(1), 10)"', { timeoutMs: 200 }); await verdictOf('node -e "setInterval(() => {}, 1 << 30)"', { idleTimeoutMs: 100 }); });`,
+        ],
+        [
+          'tests/c.test.ts',
+          `test('virtual progress clock', async () => { const script = "setInterval(() => console.error('SLOW'), 50);"; await onProgressClock((chunk) => chunk.includes('SLOW'), 400, () => runBoundedExec({ command: 'node runner.js', idleTimeoutMs: 400 })); expect(verdict).toMatchObject({ outcome: 'wedged', idleMs: 400 }); });`,
+        ],
+        [
+          'tests/c.rs',
+          lines(
+            '#[tokio::test]',
+            'async fn parked() {',
+            '    let child = Command::new("sleep").arg("1");',
+            '    assert!(tokio::time::timeout(Duration::from_millis(500), &mut parked).await.is_err());',
+            '}',
+          ),
         ],
         [
           'tests/c.test.ts',
