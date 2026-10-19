@@ -236,10 +236,11 @@ so every task it hashed afterwards was keyed on a project configuration no fresh
 gate keyed `cargo-lint-cross` on the configuration this plugin inferred before a mid-gate land, and the push that
 followed missed. The same baseline captures, before watch/scan, every file such a plugin's manifest publishes (`files`,
 negations ignored; the whole package when the list is absent or a glob) and the lockfiles of the nearest directory above
-it that holds one. A request stats the files already known and re-hashes only one whose stat moved; the full census,
-which finds a file added beside them, runs at most once per safety interval. Only changed bytes restart the daemon
-(`LINKED_PLUGIN_CHANGED`), so a rebuild that rewrites identical files keeps it. A package inside the workspace changes
-only with its lockfile and is not watched this way.
+it that holds one, keyed by plugin and package-relative path. A request resolves each plugin's link, stats the files
+already known and re-hashes only one whose stat moved; a moved link, and at most once per safety interval anyway, takes
+the full census, which finds a file added beside them. Only changed bytes restart the daemon (`LINKED_PLUGIN_CHANGED`),
+so a rebuild that rewrites identical files, or a link moved to a copy with the same bytes, keeps it. A package inside
+the workspace changes only with its lockfile and is not watched this way.
 
 The existing ignore-file content snapshot, watch-before-scan ordering, exclusive daemon claim and five-minute inactivity
 policy remain unchanged. This follows `specs/cowshed/04_sandbox.md`'s fixture ownership and one-state-per- checkout

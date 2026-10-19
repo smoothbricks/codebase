@@ -800,64 +800,66 @@ it('stops a daemon once the workspace nx link points at a different version', as
   );
 });
 
-it('restarts a daemon once a plugin linked from outside the workspace changes its bytes, and not on a same-bytes rewrite', async () => {
+it('restarts a daemon once a plugin linked from outside the workspace changes its bytes, in place or by a moved link, and only then', async () => {
   await withNxFixture(
     'nx-daemon-validity-plugin-',
     async ({ root, socketDirectory, workspace }) => {
-      // A developer link: the plugin is a package of another checkout, which has its own lockfile.
-      const checkout = join(root, 'plugin-checkout');
-      const plugin = join(checkout, 'plugin');
-      await mkdir(join(plugin, 'dist'), { recursive: true });
-      const checkoutLock = join(checkout, 'bun.lock');
-      await writeFile(checkoutLock, 'checkout lock one\n');
-      await writeFile(
-        join(plugin, 'package.json'),
-        JSON.stringify({ name: 'linked-plugin', version: '1.0.0', main: 'dist/index.js', files: ['dist'] }),
-      );
-      const entry = join(plugin, 'dist', 'index.js');
       const inference = (version: string) =>
         `// inference ${version}\nmodule.exports = { name: 'linked-plugin', createNodesV2: ['**/never.json', () => []] };\n`;
-      await writeFile(entry, inference('one'));
+      // A developer link: the plugin is a package of another checkout, which has its own lockfile.
+      const checkout = async (name: string) => {
+        const plugin = join(root, name, 'plugin');
+        await mkdir(join(plugin, 'dist'), { recursive: true });
+        await writeFile(join(root, name, 'bun.lock'), 'checkout lock one\n');
+        await writeFile(
+          join(plugin, 'package.json'),
+          JSON.stringify({ name: 'linked-plugin', version: '1.0.0', main: 'dist/index.js', files: ['dist'] }),
+        );
+        await writeFile(join(plugin, 'dist', 'index.js'), inference('one'));
+        return { plugin, entry: join(plugin, 'dist', 'index.js'), lock: join(root, name, 'bun.lock') };
+      };
+      const first = await checkout('checkout-a');
+      const copy = await checkout('checkout-b');
+      const link = join(workspace, 'node_modules', 'linked-plugin');
+      const relink = async (target: string) => {
+        await unlink(link);
+        await symlink(target, link, 'dir');
+      };
       await fixtureWorkspace(workspace, join(repositoryRoot, 'node_modules', 'nx'));
-      await symlink(plugin, join(workspace, 'node_modules', 'linked-plugin'), 'dir');
+      await symlink(first.plugin, link, 'dir');
       await writeFile(join(workspace, 'nx.json'), JSON.stringify({ plugins: ['linked-plugin'] }));
       const env = fixtureNxEnv(workspace, socketDirectory);
-      const daemon = await startDaemon(workspace, env);
       // Nothing in the workspace changes, so no watcher event reaches the daemon: each request judges the link.
-      await writeFile(entry, inference('one'));
-      expect(
-        await requestOnce(daemon.record.socketPath, ping(workspace), 'a PING after a same-bytes plugin rewrite'),
-        'a same-bytes rewrite of the linked plugin was refused',
-      ).toEqual({ answered: true, message: true });
-      expect(await recordedPid(workspace), 'a same-bytes rewrite replaced the daemon').toBe(daemon.record.processId);
-      await writeFile(entry, inference('two'));
-      assertNotServed(
-        await requestOnce(daemon.record.socketPath, ping(workspace), 'a PING sent after the linked plugin changed'),
-        'a PING sent after the linked plugin changed',
-      );
-      await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after the linked plugin changed`);
-      const successor = await readyDaemon(
-        workspace,
-        await replacementAfter({
+      const serves = async (daemon: Daemon, what: string) => {
+        expect(
+          await requestOnce(daemon.record.socketPath, ping(workspace), `a PING after ${what}`),
+          `${what} was refused`,
+        ).toEqual({ answered: true, message: true });
+        expect(await recordedPid(workspace), `${what} replaced the daemon`).toBe(daemon.record.processId);
+      };
+      const replaced = async (daemon: Daemon, what: string) => {
+        assertNotServed(
+          await requestOnce(daemon.record.socketPath, ping(workspace), `a PING sent after ${what}`),
+          `a PING sent after ${what}`,
+        );
+        await awaitExit([daemon.entry], `daemon ${daemon.record.processId} after ${what}`);
+        return readyDaemon(
           workspace,
-          previous: daemon.record.processId,
-          what: 'the daemon to restart after the linked plugin changed',
-        }),
-      );
-      // The checkout's lockfile selects the plugin's dependencies, so its change restarts the successor as well.
-      await writeFile(checkoutLock, 'checkout lock two\n');
-      assertNotServed(
-        await requestOnce(
-          successor.record.socketPath,
-          ping(workspace),
-          "a PING sent after the linked plugin checkout's lockfile changed",
-        ),
-        "a PING sent after the linked plugin checkout's lockfile changed",
-      );
-      await awaitExit(
-        [successor.entry],
-        `successor ${successor.record.processId} after the linked plugin checkout's lockfile changed`,
-      );
+          await replacementAfter({ workspace, previous: daemon.record.processId, what: `a successor after ${what}` }),
+        );
+      };
+      let daemon = await startDaemon(workspace, env);
+      await writeFile(first.entry, inference('one'));
+      await serves(daemon, 'a same-bytes rewrite of the linked plugin');
+      await relink(copy.plugin);
+      await serves(daemon, 'the link moving to a copy with the same bytes');
+      await writeFile(copy.entry, inference('two'));
+      daemon = await replaced(daemon, 'the linked plugin changing in place');
+      await relink(first.plugin);
+      daemon = await replaced(daemon, 'the link moving to a plugin with other bytes');
+      // The checkout's lockfile selects the plugin's dependencies, so its change restarts the daemon as well.
+      await writeFile(first.lock, 'checkout lock two\n');
+      await replaced(daemon, "the linked plugin checkout's lockfile changing");
     },
     FIXTURE_WORKSPACE,
   );

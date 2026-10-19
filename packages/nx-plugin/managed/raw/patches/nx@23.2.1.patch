@@ -694,10 +694,10 @@ index 0000000000000000000000000000000000000000..28f263f82b7b698ec1bf88943924696b
 +export declare function stopDaemonIfWorkspaceGone(): boolean;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..5ecc6f91803c9029fc4880a71ee63c49f427c08d
+index 0000000000000000000000000000000000000000..5f7aa0aa874dfe389388169c8acb0c0ab45f5180
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.js
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,295 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
 +exports.relativeServerProcess = exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS = void 0;
@@ -744,7 +744,9 @@ index 0000000000000000000000000000000000000000..5ecc6f91803c9029fc4880a71ee63c49
 +// lockfiles and the linked plugins below.
 +function recordInstallationBaseline() {
 +    lockFileHash = hashLockFiles();
-+    linkedPluginFiles = hashCensus(linkedPluginCensus() ?? new Map(), new Map());
++    const roots = linkedPluginRoots() ?? [];
++    linkedPluginRootKey = JSON.stringify(roots);
++    linkedPluginFiles = hashCensus(linkedPluginCensus(roots), new Map());
 +    linkedPluginCensusAt = Date.now();
 +}
 +function lockFileHashChanged() {
@@ -763,10 +765,13 @@ index 0000000000000000000000000000000000000000..5ecc6f91803c9029fc4880a71ee63c49
 +// inferred, so every task hashed after the change was keyed on a configuration
 +// no fresh process computes. Its published files and the lockfiles of the
 +// checkout it lives in are judged like the root lockfiles: a file whose stat
-+// moved is hashed again, and only changed bytes restart the daemon. A request
-+// stats the files already known; a file added beside them is found by the full
-+// census, taken at most once per safety interval. A package inside the
++// moved is hashed again, and only changed bytes restart the daemon. Files are
++// keyed by plugin and package-relative path, so a link moved to a copy with the
++// same bytes keeps the daemon. A request resolves each link and stats the files
++// already known; a moved link, and at most once per safety interval anyway, takes
++// the full census, which finds a file added beside them. A package inside the
 +// workspace changes only with its lockfile.
++let linkedPluginRootKey;
 +let linkedPluginFiles;
 +let linkedPluginCensusAt = 0;
 +const PACKAGE_GLOB = /[*?[{]/;
@@ -783,8 +788,32 @@ index 0000000000000000000000000000000000000000..5ecc6f91803c9029fc4880a71ee63c49
 +        .map((entry) => (typeof entry === 'string' ? entry : entry?.plugin))
 +        .filter((name) => typeof name === 'string' && !name.startsWith('.') && !(0, path_1.isAbsolute)(name));
 +}
-+// Adds every file under `path` (following links, each directory once) to `census` with its stat.
-+function addFiles(census, path, seen = new Set()) {
++// Each nx.json plugin whose package resolves outside the workspace, as
++// [specifier, real package root]; null when nx.json cannot say which plugins there are.
++function linkedPluginRoots() {
++    const specifiers = pluginSpecifiers();
++    if (specifiers === null) return null;
++    const workspace = (0, fs_1.realpathSync)(workspace_root_1.workspaceRoot);
++    const roots = [];
++    for (const name of specifiers) {
++        let root;
++        try {
++            root = (0, fs_1.realpathSync)((0, path_1.join)(workspace_root_1.workspaceRoot, 'node_modules', name));
++        }
++        catch (error) {
++            if (error.code === 'ENOENT') continue;
++            throw error;
++        }
++        if (root !== workspace && !root.startsWith(workspace + path_1.sep)) roots.push([name, root]);
++    }
++    return roots;
++}
++function statKey(stat) {
++    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
++}
++// Adds every file under `path` (following links, each directory once) to
++// `census`, keyed by `prefix` and its path relative to `base`, with its stat.
++function addFiles(census, prefix, base, path, seen = new Set()) {
 +    let stat;
 +    try {
 +        stat = (0, fs_1.statSync)(path, { bigint: true });
@@ -798,32 +827,19 @@ index 0000000000000000000000000000000000000000..5ecc6f91803c9029fc4880a71ee63c49
 +        if (seen.has(directory)) return;
 +        seen.add(directory);
 +        for (const entry of (0, fs_1.readdirSync)(path)) {
-+            if (entry !== 'node_modules') addFiles(census, (0, path_1.join)(path, entry), seen);
++            if (entry !== 'node_modules') addFiles(census, prefix, base, (0, path_1.join)(path, entry), seen);
 +        }
 +    }
 +    else if (stat.isFile()) {
-+        census.set(path, `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`);
++        census.set(`${prefix}${(0, path_1.relative)(base, path)}`, { path, stat: statKey(stat) });
 +    }
 +}
-+// Every file a linked plugin publishes and its checkout's lockfiles, each with
-+// its stat; null when nx.json cannot say which plugins there are.
-+function linkedPluginCensus() {
-+    const specifiers = pluginSpecifiers();
-+    if (specifiers === null) return null;
-+    const workspace = (0, fs_1.realpathSync)(workspace_root_1.workspaceRoot);
++// Every file each linked plugin publishes and its checkout's lockfiles.
++function linkedPluginCensus(roots) {
 +    const census = new Map();
-+    for (const name of specifiers) {
-+        let root;
-+        try {
-+            root = (0, fs_1.realpathSync)((0, path_1.join)(workspace_root_1.workspaceRoot, 'node_modules', name));
-+        }
-+        catch (error) {
-+            if (error.code === 'ENOENT') continue;
-+            throw error;
-+        }
-+        if (root === workspace || root.startsWith(workspace + path_1.sep)) continue;
++    for (const [name, root] of roots) {
 +        const manifest = (0, path_1.join)(root, 'package.json');
-+        addFiles(census, manifest);
++        addFiles(census, `${name}\0`, root, manifest);
 +        // A manifest with no plain `files` list (absent, a glob, or bytes that do
 +        // not parse, which the census holds too) publishes the whole package.
 +        let files;
@@ -835,49 +851,66 @@ index 0000000000000000000000000000000000000000..5ecc6f91803c9029fc4880a71ee63c49
 +        }
 +        const listed = Array.isArray(files) ? files.filter((file) => typeof file !== 'string' || !file.startsWith('!')) : [];
 +        const published = listed.length > 0 && listed.every((file) => typeof file === 'string' && !PACKAGE_GLOB.test(file));
-+        for (const file of published ? listed : ['.']) addFiles(census, (0, path_1.join)(root, file));
++        for (const file of published ? listed : ['.']) addFiles(census, `${name}\0`, root, (0, path_1.join)(root, file));
 +        for (let directory = root; ; directory = (0, path_1.dirname)(directory)) {
 +            const locks = LOCK_FILE_NAMES.map((lock) => (0, path_1.join)(directory, lock)).filter((lock) => (0, fs_1.existsSync)(lock));
 +            if (locks.length > 0 || (0, path_1.dirname)(directory) === directory) {
-+                for (const lock of locks) addFiles(census, lock);
++                for (const lock of locks) addFiles(census, `${name}\0lock\0`, directory, lock);
 +                break;
 +            }
 +        }
 +    }
 +    return census;
 +}
-+// The census with each file's hash, reusing `recorded`'s for a file whose stat
-+// has not moved.
++// The census with each file's hash, reusing `recorded`'s for a file whose path
++// and stat have not moved.
 +function hashCensus(census, recorded) {
 +    const files = new Map();
-+    for (const [path, stat] of census) {
-+        const previous = recorded.get(path);
-+        files.set(path, previous !== undefined && previous.stat === stat ? previous : { stat, hash: (0, native_1.hashFile)(path) });
++    for (const [key, { path, stat }] of census) {
++        const previous = recorded.get(key);
++        files.set(key, previous !== undefined && previous.path === path && previous.stat === stat
++            ? previous
++            : { path, stat, hash: (0, native_1.hashFile)(path) });
 +    }
 +    return files;
 +}
 +// The known files' stats, a vanished one left out.
 +function knownFileStats() {
 +    const census = new Map();
-+    for (const path of linkedPluginFiles.keys()) addFiles(census, path);
++    for (const [key, { path }] of linkedPluginFiles) {
++        let stat;
++        try {
++            stat = (0, fs_1.statSync)(path, { bigint: true });
++        }
++        catch (error) {
++            if (error.code === 'ENOENT') continue;
++            throw error;
++        }
++        census.set(key, { path, stat: statKey(stat) });
++    }
 +    return census;
 +}
 +function linkedPluginsChanged() {
 +    if (linkedPluginFiles === undefined) return false;
++    const roots = linkedPluginRoots();
++    if (roots === null) return false;
++    const rootKey = JSON.stringify(roots);
 +    const now = Date.now();
-+    const full = now - linkedPluginCensusAt >= exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS;
-+    const census = full ? linkedPluginCensus() : knownFileStats();
-+    if (census === null) return false;
-+    if (full) linkedPluginCensusAt = now;
++    const full = rootKey !== linkedPluginRootKey || now - linkedPluginCensusAt >= exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS;
++    const census = full ? linkedPluginCensus(roots) : knownFileStats();
++    if (full) {
++        linkedPluginRootKey = rootKey;
++        linkedPluginCensusAt = now;
++    }
 +    const files = hashCensus(census, linkedPluginFiles);
 +    let change = null;
-+    for (const [path, { hash }] of files) {
-+        const previous = linkedPluginFiles.get(path);
++    for (const [key, { path, hash }] of files) {
++        const previous = linkedPluginFiles.get(key);
 +        if (previous === undefined) change ??= `${path} appeared`;
 +        else if (previous.hash !== hash) change ??= `${path} changed`;
 +    }
-+    for (const path of linkedPluginFiles.keys()) {
-+        if (!files.has(path)) change ??= `${path} disappeared`;
++    for (const [key, { path }] of linkedPluginFiles) {
++        if (!files.has(key)) change ??= `${path} disappeared`;
 +    }
 +    linkedPluginFiles = files;
 +    if (change === null) return false;
