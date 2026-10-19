@@ -263,10 +263,12 @@ it('replaces a record whose pid now belongs to an unrelated live process', async
       const crashed = new Date(Date.now() - 10 * 60_000);
       await utimes(record, crashed, crashed);
 
-      const started = Date.now();
       expect(JSON.parse(nx(workspace, env, 'show', 'projects', '--json'))).toEqual(['p']);
-      // Well inside the minute a client waits for a daemon, which a deferral to the stale record would use up.
-      expect(Date.now() - started).toBeLessThan(30_000);
+      // A deferral to the stale record would wait out the client's whole budget for a daemon that never answers, and the
+      // client logs that exhaustion. A client that started its own daemon instead never logs it.
+      const clientLog = await readFile(join(workspace, '.nx/workspace-data/d/daemon.log'), 'utf8');
+      expect(clientLog).toContain('[Client] Starting new daemon server in background');
+      expect(clientLog).not.toContain('[Client] Server not available after');
       expect((await daemonRecord(workspace))?.processId).not.toBe(unrelated.pid);
       expect(isRunning(unrelated.pid)).toBe(true);
     } finally {

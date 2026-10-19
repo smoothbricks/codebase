@@ -1,10 +1,9 @@
 import { expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { watch as fsWatch, readFileSync } from 'node:fs';
 import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { nxDaemonProcesses } from './testing.js';
 
@@ -19,8 +18,6 @@ exports.createNodesV2 = ['**/project.json', async () => {
 `;
 // The daemon logs its open connection count on every connect and close.
 const OPEN_CONNECTIONS = /Number of open connections: (\d+)$/;
-// How long the daemon may take to see a closed connection: the aftermath of a reply, not an idle interval.
-const CLOSE_SEEN_MS = 10_000;
 
 it('serves real daemon requests with the installed five-minute inactivity policy', async () => {
   const require = createRequire(import.meta.url);
@@ -69,22 +66,29 @@ it('lets a resident plugin worker ask its daemon for files without holding the d
     expect(requested.status, requested.stdout + requested.stderr).toBe(0);
     expect(JSON.parse(requested.stdout)).toEqual(['p']);
     const logPath = join(workspace, '.nx/workspace-data/d/daemon.log');
-    const deadline = Date.now() + CLOSE_SEEN_MS;
+    // The daemon logs its open connection count on every connect and close, so the wait ends on that log. A connection
+    // the worker kept would keep the daemon from its five-minute idle stop for as long as the worker lives, and the daemon
+    // keeps a worker with graph hooks for as long as it lives.
     let open: string | undefined;
-    for (;;) {
-      const log = await readFile(logPath, 'utf8');
-      expect(log).toContain('Handled json message GLOB');
-      open = log
-        .split('\n')
-        .map((line) => OPEN_CONNECTIONS.exec(line)?.[1])
-        .filter((count) => count !== undefined)
-        .at(-1);
-      if (open === '0' || Date.now() > deadline) break;
-      await sleep(50);
+    let notify: (() => void) | undefined;
+    const watcher = fsWatch(dirname(logPath), () => notify?.());
+    try {
+      while (open !== '0') {
+        // Armed before the read, so a count written while the read is in flight still wakes the next wait.
+        const changed = Promise.withResolvers<void>();
+        notify = () => changed.resolve();
+        const log = await readFile(logPath, 'utf8');
+        expect(log).toContain('Handled json message GLOB');
+        open = log
+          .split('\n')
+          .map((line) => OPEN_CONNECTIONS.exec(line)?.[1])
+          .filter((count) => count !== undefined)
+          .at(-1);
+        if (open !== '0') await changed.promise;
+      }
+    } finally {
+      watcher.close();
     }
-    // A connection the worker kept would keep the daemon from its five-minute idle stop for as long as the worker
-    // lives, and the daemon keeps a worker with graph hooks for as long as it lives.
-    expect(open, `open daemon connections ${CLOSE_SEEN_MS}ms after the only client exited`).toBe('0');
     const workers = (await nxDaemonProcesses(workspace)).filter(({ command }) => command.includes('plugin-worker'));
     expect(workers.length, 'the resident plugin worker that asked the daemon for files').toBeGreaterThan(0);
   });

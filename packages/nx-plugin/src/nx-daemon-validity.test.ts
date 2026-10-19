@@ -900,7 +900,7 @@ it('stops a daemon whose workspace files are all deleted before it reads the emp
     },
     FIXTURE_WORKSPACE,
   );
-}, 180_000);
+});
 
 it('keeps an idle daemon off the lockfiles, record, and socket between its safety polls', async () => {
   await withNxFixture(
