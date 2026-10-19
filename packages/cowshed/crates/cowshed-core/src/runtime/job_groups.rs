@@ -425,41 +425,69 @@ enum Ownership {
 /// or signal, or a group still running after every KILL round, is an error and leaves the
 /// caller's original ledger available for retry.
 fn end_groups(groups: &[Group], grace: Duration) -> io::Result<(Vec<u64>, Vec<Group>)> {
-    let mut signalled = Vec::with_capacity(groups.len());
+    let mut running = Vec::with_capacity(groups.len());
     let mut unresolved = Vec::new();
     for group in groups {
         match ownership(group)? {
-            Ownership::Owned(members) => {
-                let mut reached = false;
-                for member in &members {
-                    reached |= member.signal(libc::SIGTERM)?;
-                }
-                if reached {
-                    signalled.push(group.job_id);
-                }
-            }
+            Ownership::Owned(members) if members.is_empty() => {}
+            Ownership::Owned(members) => running.push((*group, members)),
             Ownership::NotOwned => {}
             Ownership::Unidentified => unresolved.push(*group),
         }
     }
-    if !signalled.is_empty() {
-        std::thread::sleep(grace);
-        for group in groups
-            .iter()
-            .filter(|group| signalled.contains(&group.job_id))
-        {
-            if kill_owned(group)? == Killed::Unidentified {
-                // The leader died and was reaped while processes held on.
-                unresolved.push(*group);
-            }
+    let (signalled, lost) = end_running(&running, grace)?;
+    unresolved.extend(lost);
+    Ok((signalled, unresolved))
+}
+
+/// TERM each group's processes as they were read, wait `grace` once for them all, then KILL
+/// whatever of each group still runs as the job's. A TERM that reached none of a group's
+/// processes does not spare it the KILL: on macOS a process that execs takes a new pid version,
+/// so one read just before its exec is not reached under the identity read, while it still runs
+/// as the job's. Returns the jobs a TERM or a KILL reached and the groups whose leader went
+/// while processes held on.
+fn end_running(
+    running: &[(Group, Vec<Process>)],
+    grace: Duration,
+) -> io::Result<(Vec<u64>, Vec<Group>)> {
+    let mut termed = Vec::with_capacity(running.len());
+    for (_, members) in running {
+        let mut reached = false;
+        for member in members {
+            reached |= member.signal(libc::SIGTERM)?;
+        }
+        termed.push(reached);
+    }
+    let mut signalled = Vec::with_capacity(running.len());
+    let mut unresolved = Vec::new();
+    if running.is_empty() {
+        return Ok((signalled, unresolved));
+    }
+    std::thread::sleep(grace);
+    for ((group, _), termed) in running.iter().zip(termed) {
+        let killed = kill_owned(group)?;
+        if termed || killed.reached {
+            signalled.push(group.job_id);
+        }
+        if killed.end == KillEnd::Unidentified {
+            // The leader died and was reaped while processes held on.
+            unresolved.push(*group);
         }
     }
     Ok((signalled, unresolved))
 }
 
-/// What KILLing a group's processes until none runs ended with.
+/// What KILLing a group's processes until none runs did.
+#[derive(Debug)]
+struct Killed {
+    /// A KILL reached at least one of the job's processes.
+    reached: bool,
+    end: KillEnd,
+}
+
+/// How KILLing a group's processes until none runs ended.
 #[derive(Debug, Eq, PartialEq)]
-enum Killed {
+enum KillEnd {
     /// Nothing of the job's runs in the group any more.
     Ended,
     /// The recorded leader is gone while processes hold the id: they are not signalled.
@@ -467,18 +495,21 @@ enum Killed {
 }
 
 fn kill_owned(group: &Group) -> io::Result<Killed> {
+    let mut reached = false;
     for _ in 0..KILL_ROUNDS {
-        match ownership(group)? {
-            Ownership::Owned(members) if members.is_empty() => return Ok(Killed::Ended),
+        let end = match ownership(group)? {
+            Ownership::Owned(members) if members.is_empty() => KillEnd::Ended,
             Ownership::Owned(members) => {
                 for member in &members {
-                    member.signal(libc::SIGKILL)?;
+                    reached |= member.signal(libc::SIGKILL)?;
                 }
                 std::thread::sleep(KILL_SETTLE);
+                continue;
             }
-            Ownership::NotOwned => return Ok(Killed::Ended),
-            Ownership::Unidentified => return Ok(Killed::Unidentified),
-        }
+            Ownership::NotOwned => KillEnd::Ended,
+            Ownership::Unidentified => KillEnd::Unidentified,
+        };
+        return Ok(Killed { reached, end });
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
@@ -1990,6 +2021,66 @@ mod tests {
         );
         // SAFETY: the test's own group; its backgrounded sleep may still hold the id.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+
+    /// A process that execs takes a new pid version, so a TERM sent under the identity read just
+    /// before the exec reaches nothing while the process still runs as the job's. Its group is
+    /// ended all the same: the KILL that follows the grace reads the group again. Here the group
+    /// is read, its leader then execs, and the membership read before the exec is what TERM goes
+    /// to -- the window a loaded host opens between a recovery's read and its TERM.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_group_whose_member_execed_after_it_was_read_is_still_ended() {
+        use std::io::{BufRead as _, Write as _};
+
+        let child = Command::new("/bin/sh")
+            .args(["-c", "echo READY; read line; exec /bin/sleep 300"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn_locked()
+            .expect("spawn a job group");
+        let mut job = OwnedGroup(child);
+        let pgid = i32::try_from(job.0.id()).unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(job.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "READY");
+        let group = super::Group {
+            job_id: 6,
+            pgid,
+            leader_start: super::start_time(pgid).unwrap(),
+            leader_birth: None,
+        };
+        let super::Ownership::Owned(read) = super::ownership(&group).unwrap() else {
+            panic!("the running leader proves its group");
+        };
+        let [leader] = read.as_slice() else {
+            panic!("the leader alone runs in the group: {read:?}");
+        };
+        let stale = leader.version;
+
+        writeln!(job.0.stdin.as_mut().unwrap(), "go").unwrap();
+        while super::Process::observe(pgid)
+            .unwrap()
+            .is_some_and(|now| now.version == stale)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            super::group_has_live_members(pgid).unwrap(),
+            "the leader runs on as `sleep` under a new version"
+        );
+
+        assert_eq!(
+            super::end_running(&[(group, read)], Duration::ZERO).unwrap(),
+            (vec![6], Vec::new())
+        );
+        assert!(
+            !super::group_has_live_members(pgid).unwrap(),
+            "the exec'd leader was left running"
+        );
     }
 
     /// A member's record is read only through the identity it was found with: under any other
