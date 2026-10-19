@@ -1449,9 +1449,13 @@ launcher's fifo, so it must run under `bounded-exec`; the inferred `mutation` ta
 retains its independent inherited/configured ceiling. `BOUNDED_EXEC_CPU_TOKENS`, the sub-ledger and telemetry still name
 the actual held grant. The gateway shares tokens fairly between checkouts (Nx workspace roots). `timeoutMs` and
 `idleTimeoutMs` start at the grant. The tokens go back when the command exits, or with the executor's socket when it is
-killed. The wait prints one `cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. With no gateway
-listening, the command runs exactly as configured and nothing is said; a gateway from before the budget runs it
-unbudgeted and stderr says so.
+killed. The wait prints one `cowshed: cpu-tokens wait done elapsed=… tokens=<granted>/<asked>` line. On a host whose
+gateway socket does not exist (a CI runner, a machine without cowshed), the plugin's `preTasksExecution` serves each Nx
+run that inherits no pool its own `BOUNDED_EXEC_CPU_POOL` of one token per core, and `postTasksExecution` closes it: the
+run's targets, started side by side under `NX_PARALLEL=100%`, queue for its cores instead of each sizing its runner to
+the whole host (`specs/cowshed/05_gateway.md`, "A run without a gateway budgets itself"). Its scope is one run. A
+command no pool and no gateway answers runs exactly as configured and nothing is said; a gateway from before the budget
+runs it unbudgeted and stderr says so.
 
 A granted executor serves a private `BOUNDED_EXEC_CPU_POOL` with its actual token count. A nested default executor asks
 that immediate parent pool for its own demand, instead of taking from the host while the parent holds its grant; the

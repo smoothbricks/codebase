@@ -314,8 +314,9 @@ export async function runBoundedExec(
     }
   };
 
-  // The wait is one span line, as cowshed's own spans read. With no gateway listening, as on any
-  // host without cowshed, the command runs exactly as asked and nothing is said.
+  // The wait is one span line, as cowshed's own spans read. On a host without a gateway the Nx run serves its own
+  // pool (`run-cpu-pool.ts`), taken below as a parent's; a command no pool and no gateway answers runs exactly as
+  // asked and nothing is said.
   const cores = availableParallelism();
   const demand = runnerDemand(requested, options.parallelism, cores, process.env, options.env);
   const asked = Date.now();

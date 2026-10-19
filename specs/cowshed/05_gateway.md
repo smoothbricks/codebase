@@ -708,6 +708,25 @@ core count.
   file-descriptor exhaustion can also prevent connection to a live pool, so this classification does not yet prove that
   its parent has released the upstream grant. Distinguishing those cases before any host fallback remains an admission
   follow-up; connected refusals and protocol errors already fail without a second take.
+- **A run without a gateway budgets itself** (2026-10-19, Danny: "Runner should be able to handle whatever is being
+  executed"). A host without a gateway — a CI runner, a machine without cowshed — had no budget at all: `bounded-exec`
+  found the socket absent and ran every command exactly as configured, so under `NX_PARALLEL=100%` Nx started every
+  target side by side and each runner sized itself to the whole host (nightly 477, "Who asks"). Leaving the count to
+  each command is the absence of a mechanism, not a policy. So the plugin's `preTasksExecution` serves the Nx run its
+  own CPU pool when nothing else budgets it: the run inherits no `BOUNDED_EXEC_CPU_POOL`, and the gateway's control
+  socket path does not exist. Only `ENOENT` proves the gateway absent, as for the `cargo` launcher ("Managed Cargo
+  admission" below); a socket that exists but does not answer may be a live, saturated gateway, and a run budgeting
+  itself beside it would count the host twice. The pool is the sub-ledger above with one token per core
+  (`availableParallelism`), published as `BOUNDED_EXEC_CPU_POOL` and `BOUNDED_EXEC_CPU_TOKENS` in the environment every
+  task inherits, so `bounded-exec` and the `cargo` launcher take from it as from any parent pool: FIFO, the head taking
+  `min(want, free)` once one token is free, every grant whole. Nx still starts the run's targets side by side; their
+  runners now queue for the run's cores instead of each taking the host, and a queued runner's bounds start at its grant
+  ("The bounds start at the grant"). The plugin's `run-cpu-pool.test.ts` holds that shape over a real socket: two sweeps
+  each asking 31 of a 4-token run pool, the first granted 4 and the second queued until the first returned them. The
+  run's `postTasksExecution` closes the pool; a run that dies first takes it with its process. Its scope is one Nx run,
+  not the host: two concurrent runs on one host without a gateway hold one budget each. A runner that asks nobody — an
+  `nx:run-commands` Stryker — is not sized by it, which is why such runners run under `bounded-exec` ("A runner the
+  launcher's grant cannot size"). A pool that cannot be made is said on stderr and leaves the run unbudgeted, as before.
 - **Queued priority** (2026-10-11). The coordinator supplies each job's priority, an unsigned 32-bit integer, higher
   first, default 0. It orders queued bulk work and queued lands within their own queues; no value outranks the active
   gate or manufactures gate authority. A priority change re-keys pending work, never interrupts, resizes or restarts an
@@ -977,10 +996,11 @@ core count.
   the in-image `.cowshed/workspace.json` marker. Its presence only tightens admission and grants no authority; an
   inspection error refuses. A managed checkout starts no payload without a live grant: absent gateway, refusal, unknown
   operation, malformed protocol and premature close all fail with their actual reason. Only a positively nonmanaged
-  host/CI checkout may run unbudgeted only when NotFound proves gateway absence. ConnectionRefused can come from a live
-  saturated listener, so it and every other connect error refuse. A connected refusal or protocol error is never
-  absence, in any checkout. Noncompiling discovery and inherited grants keep their existing precedence. No grant, gate
-  or background, has an admission deadline.
+  host/CI checkout may run unbudgeted only when NotFound proves gateway absence, and under an Nx run there it has the
+  run's own pool ("A run without a gateway budgets itself") and takes from it as a parent pool. ConnectionRefused can
+  come from a live saturated listener, so it and every other connect error refuse. A connected refusal or protocol error
+  is never absence, in any checkout. Noncompiling discovery and inherited grants keep their existing precedence. No
+  grant, gate or background, has an admission deadline.
 - **Spans.** The executor prints
   `cowshed: cpu-tokens wait done elapsed=<ms>ms status=ok tokens=<g>/<want> runner=<kind>` before the command's own
   output (`status=err … runs unbudgeted: <reason>` without a grant), so a slow or failing task says how long it waited

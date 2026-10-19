@@ -66,6 +66,7 @@ import {
   cargoFrozen,
 } from './cross-check-policy.js';
 import type { EslintFileSet } from './eslint-file-set.js';
+import { closeRunCpuPool, serveRunCpuPool } from './executors/bounded-exec/run-cpu-pool.js';
 import { hashVersionlessCrateManifests } from './manifest-hash.js';
 import {
   EXTRACTED_BINARIES_METADATA,
@@ -1089,15 +1090,19 @@ function isBuildOutputPackageJson(packageJsonPath: string): boolean {
 /**
  * Nx accepts one pre/post task-hook pair per plugin. Two independent observers share it: the controller's task-results
  * hint and the opt-in producer completion receipts. Each sees the same options and run context; neither reads the
- * other's output. The hint is recorded first so a producer-receipt bug cannot cost the controller its evidence.
+ * other's output. The hint is recorded first so a producer-receipt bug cannot cost the controller its evidence. The
+ * pair also serves a run on a host without a gateway its own CPU pool, which every task inherits
+ * (`run-cpu-pool.ts`), and closes it when the run ends.
  */
 export const preTasksExecution: PreTasksExecution<ProducerReceiptsOptions> = async (options, context) => {
   preTaskResults(options, context);
   await preProducerReceipts(options, context);
+  await serveRunCpuPool(context);
 };
 export const postTasksExecution: PostTasksExecution<ProducerReceiptsOptions> = async (options, context) => {
   await postTaskResults(options, context);
   await postProducerReceipts(options, context);
+  await closeRunCpuPool(context);
 };
 
 export default { createNodesV2, postTasksExecution, preTasksExecution };
