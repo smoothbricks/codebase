@@ -8,9 +8,8 @@ pub(super) fn try_fast_clone(
     parent: &mut Parent,
     source: &File,
 ) -> Result<Option<File>, ArtifactError> {
-    const FICLONE: libc::c_ulong = 0x4004_9409;
     let file = parent.create_temporary()?;
-    if unsafe { libc::ioctl(file.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
+    if unsafe { libc::ioctl(file.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
         return Ok(Some(file));
     }
     let error = io::Error::last_os_error();

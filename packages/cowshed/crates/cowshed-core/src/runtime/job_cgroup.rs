@@ -62,8 +62,9 @@ pub const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 /// The leaf of the delegated cgroup that holds the controller process itself.
 pub const CONTROLLER_LEAF: &str = "controller";
 
-/// `CGROUP2_SUPER_MAGIC` from `include/uapi/linux/magic.h`.
-const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+/// `CGROUP2_SUPER_MAGIC` from `include/uapi/linux/magic.h`. A 32-bit kernel constant: glibc types
+/// `statfs.f_type` as signed `__fsword_t` and musl as `c_ulong`, so it is compared by value.
+const CGROUP2_SUPER_MAGIC: u32 = 0x6367_7270;
 
 const INCARNATION_PREFIX: &str = "ws-";
 const JOB_PREFIX: &str = "job-";
@@ -110,7 +111,7 @@ pub enum CgroupError {
         source: io::Error,
     },
     #[error("{path} is not a cgroup v2 mount (statfs f_type {f_type:#x})")]
-    NotUnified { path: PathBuf, f_type: libc::c_long },
+    NotUnified { path: PathBuf, f_type: i128 },
     #[error("/proc/self/cgroup names no cgroup v2 membership: {content:?}")]
     NoUnifiedMembership { content: String },
     #[error(
@@ -368,10 +369,10 @@ impl CgroupAuthority {
                 source: io::Error::last_os_error(),
             });
         }
-        if statfs.f_type != CGROUP2_SUPER_MAGIC {
+        if u32::try_from(statfs.f_type) != Ok(CGROUP2_SUPER_MAGIC) {
             return Err(CgroupError::NotUnified {
                 path: mount.to_path_buf(),
-                f_type: statfs.f_type,
+                f_type: i128::from(statfs.f_type),
             });
         }
         let membership = fs::read_to_string("/proc/self/cgroup")

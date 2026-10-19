@@ -6,8 +6,6 @@ use std::path::Path;
 
 use super::{LeafMaterialization, clone_fallback_error};
 
-const FICLONE: libc::c_ulong = 0x4004_9409;
-
 fn set_times(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
@@ -55,7 +53,14 @@ fn reflink(source: &Path, destination: &Path) -> io::Result<bool> {
     let destination_file = destination_options.open(destination)?;
     // SAFETY: both descriptors are live regular files for the duration of the ioctl; FICLONE does
     // not retain either descriptor and atomically shares the source extents with the destination.
-    if unsafe { libc::ioctl(destination_file.as_raw_fd(), FICLONE, source.as_raw_fd()) } == 0 {
+    if unsafe {
+        libc::ioctl(
+            destination_file.as_raw_fd(),
+            libc::FICLONE,
+            source.as_raw_fd(),
+        )
+    } == 0
+    {
         return Ok(true);
     }
     let error = io::Error::last_os_error();
