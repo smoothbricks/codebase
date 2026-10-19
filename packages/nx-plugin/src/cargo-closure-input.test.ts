@@ -1,6 +1,6 @@
 import { afterAll, expect, it } from 'bun:test';
 import { execFile, execFileSync } from 'node:child_process';
-import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import type { CreateNodesResultV2 } from 'nx/src/devkit-exports.js';
 import { Watcher, WorkspaceContext } from 'nx/src/native/index.js';
 import { globWithWorkspaceContextSync, resetWorkspaceContext } from 'nx/src/utils/workspace-context.js';
+import { byFile, closureFixture, closureOf, graphComputation } from './__tests__/cargo-closure-fixture.js';
 import {
   aggregateOf,
   type CountedCargo,
@@ -33,89 +34,10 @@ useFixtureCargoHome();
 const installation = testFileInstallation('cargo-closure-installation-');
 afterAll(() => installation.retire());
 
-/**
- * An Nx workspace that is also the Cargo workspace. `app` reaches `leaf`
- * through `bridge`, and `external` — outside the Nx workspace — through
- * `bridge` too. `unrelated` is a member nothing depends on. `app` declares a
- * custom cached target keyed on its closure.
- * `extraFiles` (paths relative to `root`) are written with the rest, last.
- */
-async function closureFixture(
-  root: string,
-  gitignore = 'node_modules/\ntarget/\ndist/\n.nx/\n',
-  extraFiles: Record<string, string> = {},
-) {
-  const workspace = join(root, 'workspace');
-  const files: Record<string, string> = {
-    'workspace/.gitignore': gitignore,
-    'workspace/package.json':
-      '{"name":"cargo-closure-fixture","private":true,"workspaces":["packages/*","crates/*"]}\n',
-    'workspace/nx.json': JSON.stringify({
-      plugins: ['@smoothbricks/nx-plugin'],
-      namedInputs: { externalRustCrates: [] },
-    }),
-    'workspace/Cargo.toml':
-      '[workspace]\nmembers=["packages/app","crates/bridge","crates/leaf","crates/unrelated"]\nresolver="2"\n',
-    'workspace/packages/app/package.json': JSON.stringify({
-      name: 'app',
-      private: true,
-      nx: {
-        targets: {
-          compile: {
-            executor: 'nx:run-commands',
-            cache: true,
-            inputs: [CARGO_CLOSURE_INPUT],
-            options: { command: 'cargo build --quiet --locked --offline --manifest-path packages/app/Cargo.toml' },
-          },
-        },
-      },
-    }),
-    'workspace/packages/app/Cargo.toml':
-      '[package]\nname="app"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nbridge={path="../../crates/bridge"}\n',
-    'workspace/packages/app/src/main.rs': 'fn main() { println!("{}", bridge::answer()); }\n',
-    'workspace/crates/bridge/Cargo.toml':
-      '[package]\nname="bridge"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nleaf={path="../leaf"}\nexternal={path="../../../external"}\n',
-    'workspace/crates/bridge/src/lib.rs': 'pub fn answer() -> u8 { leaf::answer() + external::answer() }\n',
-    'workspace/crates/leaf/package.json': '{"name":"leaf","private":true}\n',
-    'workspace/crates/leaf/Cargo.toml': '[package]\nname="leaf"\nversion="0.1.0"\nedition="2021"\n',
-    'workspace/crates/leaf/src/lib.rs': 'pub fn answer() -> u8 { 1 }\n',
-    'workspace/crates/unrelated/Cargo.toml': '[package]\nname="unrelated"\nversion="0.1.0"\nedition="2021"\n',
-    'workspace/crates/unrelated/src/lib.rs': 'pub fn unrelated() -> u8 { 3 }\n',
-    'external/Cargo.toml': '[package]\nname="external"\nversion="0.1.0"\nedition="2021"\n[workspace]\n',
-    'external/src/lib.rs': 'pub fn answer() -> u8 { 10 }\n',
-    ...extraFiles,
-  };
-  for (const [path, text] of Object.entries(files)) {
-    await mkdir(dirname(join(root, path)), { recursive: true });
-    await writeFile(join(root, path), text);
-  }
-  execFileSync('git', ['init', '--quiet', workspace], { stdio: 'pipe' });
-  await symlink(await installation.nodeModules(), join(workspace, 'node_modules'), 'dir');
-  execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', join(workspace, 'Cargo.toml')], {
-    stdio: 'pipe',
-  });
-
-  /**
-   * Rewrite a fixture file as an edit Nx can see. Nx keeps each file's hash
-   * beside its mtime in whole seconds and reuses the hash until that second
-   * changes, so a rewrite inside the second the file was last hashed in is
-   * invisible to every fileset input. A fast host runs this whole fixture in
-   * about a second; the edit is dated at least a second past the old mtime.
-   */
-  async function edit(path: string, text: string): Promise<void> {
-    const file = join(root, path);
-    const { mtimeMs } = await stat(file);
-    await writeFile(file, text);
-    const edited = new Date(Math.max(Date.now(), mtimeMs + 1000));
-    await utimes(file, edited, edited);
-  }
-  return { workspace, edit };
-}
-
 it('keys a custom target on exactly its Cargo closure, inside the workspace and out', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-')));
   try {
-    const { workspace, edit } = await closureFixture(root);
+    const { workspace, edit } = await closureFixture(installation, root);
     resetWorkspaceContext();
     const closure = closureOf(byFile(await graphComputation(workspace)()), 'packages/app');
     const filesets = closure.flatMap((input) => (typeof input === 'string' ? [input] : []));
@@ -160,7 +82,7 @@ it('keys a custom target on exactly its Cargo closure, inside the workspace and 
 it('keys literal compiled-in data inside and outside crate directories without keying comments or unrelated crates', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-compiled-data-')));
   try {
-    const { workspace, edit } = await closureFixture(root, undefined, {
+    const { workspace, edit } = await closureFixture(installation, root, undefined, {
       'workspace/packages/app/src/main.rs':
         'const LOCAL: &str = include_str!("data/local.txt");\nfn main() { println!("{}", bridge::answer()); }\n',
       'workspace/packages/app/src/data/local.txt': 'local-one',
@@ -219,6 +141,7 @@ it('names no compiled-in build output, so a producer run leaves the closure it w
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-compiled-output-')));
   try {
     const { workspace } = await closureFixture(
+      installation,
       root,
       'node_modules/\ntarget/\ndist/\n.nx/\ncrates/leaf/src/generated/\n',
       {
@@ -262,7 +185,11 @@ it('names no compiled-in build output, so a producer run leaves the closure it w
 it('refuses a closure member in an ignored directory, which no fileset can see, instead of hashing the whole workspace', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-ignored-')));
   try {
-    const { workspace } = await closureFixture(root, 'node_modules/\ntarget/\ndist/\n.nx/\ncrates/leaf/\n');
+    const { workspace } = await closureFixture(
+      installation,
+      root,
+      'node_modules/\ntarget/\ndist/\n.nx/\ncrates/leaf/\n',
+    );
     resetWorkspaceContext();
     const failure = aggregateOf(await rejectionOf(graphComputation(workspace)()));
     const refusals = failure.errors.flatMap(([, error]) => (error.name === 'CargoClosureInputError' ? [error] : []));
@@ -280,7 +207,7 @@ it('refuses a closure member in an ignored directory, which no fileset can see, 
 it('leaves a closure inside the workspace to Nx: no process runs when its tasks are hashed', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-inferred-')));
   try {
-    const { workspace } = await closureFixture(root);
+    const { workspace } = await closureFixture(installation, root);
     resetWorkspaceContext();
     const [, infer] = createNodesV2;
     const inferred = await infer(['package.json', 'packages/app/package.json', 'crates/leaf/package.json'], undefined, {
@@ -316,30 +243,6 @@ const LEAF_LINK = '[dependencies]\nunrelated={path="../unrelated"}\n';
 const crateFiles = (crates: string) =>
   `{workspaceRoot}/crates/${crates}/**/{*.rs,Cargo.toml,.cargo/config,.cargo/config.toml}`;
 
-/** One project-graph computation over the fixture: the plugin's `createNodes`, as Nx runs it for each recomputation. */
-function graphComputation(workspace: string) {
-  const [, infer] = createNodesV2;
-  return async () =>
-    infer(['package.json', 'packages/app/package.json', 'crates/leaf/package.json'], undefined, {
-      workspaceRoot: workspace,
-      nxJsonConfiguration: { namedInputs: { externalRustCrates: [] } },
-    });
-}
-
-/** The computation's nodes in file order: the plugin pushes them as their projects finish. */
-function byFile(graph: CreateNodesResultV2): CreateNodesResultV2 {
-  return [...graph].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
-}
-
-/** The `cargoClosure` definition the computation gave the project at `projectRoot`. */
-function closureOf(graph: CreateNodesResultV2, projectRoot: string) {
-  return (
-    graph.find(([file]) => dirname(file) === projectRoot)?.[1].projects?.[projectRoot]?.namedInputs?.[
-      CARGO_CLOSURE_INPUT
-    ] ?? []
-  );
-}
-
 /** Turn `leaf`'s dependency on `unrelated` on or off, and bring Cargo.lock in line with the manifests. */
 function leafControls(workspace: string, edit: (path: string, text: string) => Promise<void>) {
   return {
@@ -355,7 +258,7 @@ it('delegates counted Cargo through the caller launcher without re-entering its 
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-counted-delegate-')));
   let fixtureCargo: CountedCargo | undefined;
   try {
-    const { workspace } = await closureFixture(root);
+    const { workspace } = await closureFixture(installation, root);
     const manifest = join(workspace, 'Cargo.toml');
     const args = ['metadata', '--format-version', '1', '--locked', '--offline', '--manifest-path', manifest];
     const expected = execFileSync('cargo', args, { encoding: 'utf8' });
@@ -388,7 +291,7 @@ it('shares one Cargo child among overlapping graph computations, and an unchange
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-overlap-')));
   let fixtureCargo: CountedCargo | undefined;
   try {
-    const { workspace, edit } = await closureFixture(root);
+    const { workspace, edit } = await closureFixture(installation, root);
     const { linkLeaf, relock } = leafControls(workspace, edit);
     const cargo = await countedCargo(root);
     fixtureCargo = cargo;
@@ -443,7 +346,7 @@ it('refuses with a typed error what Cargo refuses, and follows an edit made whil
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-pending-')));
   let fixtureCargo: CountedCargo | undefined;
   try {
-    const { workspace, edit } = await closureFixture(root);
+    const { workspace, edit } = await closureFixture(installation, root);
     const { linkLeaf, relock } = leafControls(workspace, edit);
     const cargo = await countedCargo(root);
     fixtureCargo = cargo;
@@ -508,7 +411,7 @@ it('refuses with a typed error what Cargo refuses, and follows an edit made whil
 it("indexes a source tree's Cargo manifests and none of the runtime state a cowshed keeps in it", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-closure-runtime-state-')));
   try {
-    const { workspace } = await closureFixture(root, undefined, {
+    const { workspace } = await closureFixture(installation, root, undefined, {
       'workspace/.nxignore': await readFile(join(repositoryRoot, '.nxignore'), 'utf8'),
       'workspace/.cowshed/cache/nx/workspace-data/d/daemon.log': 'daemon log\n',
       'workspace/.cowshed/job/1/stdout.log': 'job output\n',
