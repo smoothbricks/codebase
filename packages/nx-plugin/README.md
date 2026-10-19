@@ -672,8 +672,12 @@ Concrete targets come from concrete files:
   `cargo metadata` reports for the runner's Cargo workspace, so a `build.target-dir` setting moves the extractions with
   the build tree. An extraction is per-checkout tool state like the rest of that tree, never an Nx output: it lives in
   Cargo's build tree, which a checkout with a build volume keeps off its source tree, and it never sits under a declared
-  output such as `.cache/nextest`. `cargo clean` removes it. `--workspace-remap` is required — an archive records the
-  producing tree's absolute paths, and without it a restored archive hands tests another checkout's
+  output such as `.cache/nextest`. `cargo clean` removes it. A repository's own target that runs tests from the
+  workspace archive calls the same helper and passes the same reuse flags: `nextest run --archive-file` unpacks the
+  whole archive into a fresh directory under its `TMPDIR`, which for a `bounded-exec` task on macOS is a lease on the
+  shared RAM volume (measured: a 548 MB archive unpacks to 1.97 GiB, and four such tasks filled the 8 GiB volume). The
+  RAM lease holds what tests write, never the binaries they run. `--workspace-remap` is required — an archive records
+  the producing tree's absolute paths, and without it a restored archive hands tests another checkout's
   `CARGO_MANIFEST_DIR`. With it the archive is relocatable, so one cache entry serves every checkout of the same commit;
   nextest re-points `CARGO_BIN_EXE_<name>`/`NEXTEST_BIN_EXE_<name>` at the extracted binaries at runtime, but a test
   that reads them through the compile-time `env!` macro keeps the producing tree's path. Per-crate runners accept an

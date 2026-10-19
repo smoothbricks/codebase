@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, jest } from 'bun:test';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdir, mkdtemp, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +8,7 @@ import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './bounded-test-policy.js';
 import {
   EXTRACTED_BINARIES_METADATA,
   EXTRACTED_CARGO_METADATA,
+  EXTRACTED_TARGET_DIR,
   ensureNextestArchiveExtracted,
   NEXTEST_EXTRACTION_DIRECTORY,
   type NextestArchiveExtractor,
@@ -111,6 +113,99 @@ describe('nextestExtractionRoot', () => {
       await mkdir(join(root, '.cargo'));
       await writeFile(join(root, '.cargo/config.toml'), '[build]\ntarget-dir = "out/cargo"\n');
       expect(await nextestExtractionRoot(root)).toBe(join(root, 'out/cargo', NEXTEST_EXTRACTION_DIRECTORY));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('smoo-nx-nextest-extract', () => {
+  /** One shard's run of the real helper, as a runner's `$(...)` makes it: own TMPDIR, the archive in the checkout. */
+  async function shard(root: string, n: number) {
+    const tmp = join(root, `tmp-${n}`);
+    await mkdir(tmp);
+    const child = spawn(
+      process.execPath,
+      [join(import.meta.dir, 'bin/smoo-nx-nextest-extract.ts'), 'archive.tar.zst'],
+      {
+        cwd: root,
+        env: { ...process.env, TMPDIR: tmp },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    const [code]: unknown[] = await once(child, 'close');
+    return { code, stdout, stderr, tmp };
+  }
+
+  it('unpacks an archive once for four concurrent shards, in the build tree and in none of their temp directories', async () => {
+    // A downstream land gate: shards that each ran `nextest run --archive-file` unpacked the whole 1.97 GiB archive into
+    // their own TMPDIR, a lease on one 8 GiB RAM volume, and four of them filled it.
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'nextest-extract-shards-')));
+    try {
+      await writeFile(
+        join(root, 'Cargo.toml'),
+        '[package]\nname = "shard-probe"\nversion = "0.1.0"\nedition = "2021"\n',
+      );
+      await mkdir(join(root, 'src'));
+      await writeFile(join(root, 'src/lib.rs'), '#[test]\nfn adds() {\n    assert_eq!(1 + 1, 2);\n}\n');
+      expect(spawnSync('cargo', ['generate-lockfile', '--offline'], { cwd: root }).status).toBe(0);
+      const archived = spawnSync(
+        'cargo',
+        ['--frozen', 'nextest', 'archive', '--archive-file', 'archive.tar.zst', '--user-config-file', 'none'],
+        { cwd: root, encoding: 'utf8' },
+      );
+      expect({ status: archived.status, stderr: archived.status === 0 ? '' : archived.stderr }).toEqual({
+        status: 0,
+        stderr: '',
+      });
+
+      const shards = await Promise.all([1, 2, 3, 4].map((n) => shard(root, n)));
+
+      const extractions = join(root, 'target', NEXTEST_EXTRACTION_DIRECTORY);
+      const key = await nextestArchiveKey(join(root, 'archive.tar.zst'));
+      const directory = join(extractions, key);
+      expect(shards.map(({ code, stdout }) => ({ code, stdout }))).toEqual(
+        Array.from({ length: 4 }, () => ({ code: 0, stdout: `${directory}\n` })),
+      );
+      // One shard unpacked it; the others waited on it or found it done.
+      expect(shards.filter(({ stderr }) => stderr.includes(': extracted archive.tar.zst ')).length).toBe(1);
+      // One extraction under the archive's hash, nothing staged or locked beside it, and no shard's TMPDIR touched.
+      expect(await readdir(extractions)).toEqual([key]);
+      for (const { tmp } of shards) {
+        expect({ tmp, entries: await readdir(tmp) }).toEqual({ tmp, entries: [] });
+      }
+      // A shard runs its tests from that one extraction.
+      const ran = spawnSync(
+        'cargo',
+        [
+          '--frozen',
+          'nextest',
+          'run',
+          '--binaries-metadata',
+          join(directory, EXTRACTED_BINARIES_METADATA),
+          '--cargo-metadata',
+          join(directory, EXTRACTED_CARGO_METADATA),
+          '--target-dir-remap',
+          join(directory, EXTRACTED_TARGET_DIR),
+          '--workspace-remap',
+          '.',
+          '--user-config-file',
+          'none',
+        ],
+        { cwd: root, encoding: 'utf8' },
+      );
+      expect({ status: ran.status, passed: ran.stderr.includes('1 test run: 1 passed') }).toEqual({
+        status: 0,
+        passed: true,
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
