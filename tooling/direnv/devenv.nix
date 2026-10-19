@@ -85,11 +85,8 @@ in {
         (builtins.readFile ../../packages/cowshed/scripts/macos-linker.sh))
     ]
     # GARM/Linux CI: rustc needs host linker `cc` (-Zbuild-std, native crates).
-    # N-API cross targets need raw Clang: Nix's cc-wrapper injects host include
-    # paths ahead of the downloaded target sysroot.
     ++ lib.optionals pkgs.stdenv.isLinux [
       pkgs.stdenv.cc
-      (lib.hiPrio pkgs.llvmPackages.clang-unwrapped)
       pkgs.rsync
       # openssl-src (vendored-openssl / git2) configure needs perl + make.
       pkgs.perl
@@ -106,7 +103,8 @@ in {
   # cc-rs with bare clang and therefore no Nix libc include path.
   # cc-rs probes target-specific names before generic ones, so pin
   # the native Linux target to the wrapper at the precedence point it honors.
-  # N-API cross targets use their own target-specific compiler variables.
+  # Linux artifacts build with zig through cargo-zigbuild, whose Nx executor
+  # drops this pin for the triple it builds.
   env = lib.optionalAttrs pkgs.stdenv.isLinux {
     CC_x86_64_unknown_linux_gnu = "${pkgs.stdenv.cc}/bin/cc";
     CXX_x86_64_unknown_linux_gnu = "${pkgs.stdenv.cc}/bin/c++";
