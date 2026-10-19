@@ -35,8 +35,8 @@ import { tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
-import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './bounded-test-policy.js';
 import { findNxWorkspaceRoot } from './ensure-built.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './test-backstop.js';
 
 const run = promisify(execFile);
 /**

@@ -10,17 +10,11 @@ import {
 } from './cargo-workspace.js';
 import { writeJsonFile } from './managed-files/managed-format.js';
 import type { PackageTargetPolicyOptions, ResolvedProjectTargets } from './package-target-policy.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './test-backstop.js';
 import { isTestRunnerTargetName } from './workspace-config-policy.js';
 
+export { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './test-backstop.js';
 export const BOUNDED_TEST_EXECUTOR = '@smoothbricks/nx-plugin:bounded-exec';
-/**
- * A test target's one bound: the `idleTimeoutMs` with which no test may go unfinished, the hang backstop of
- * specs/cowshed/08_testing.md. It is no wall-clock ceiling: a suite that keeps finishing tests runs as long as it
- * needs. It is the longest any single test may run, so it stays above every slow-timeout class in the plugin's
- * nextest.toml; a bun leg has no per-test deadline of its own (`BUN_TEST_TIMEOUT_FLAG`).
- */
-export const BOUNDED_TEST_IDLE_TIMEOUT_MS = 180_000;
-export const BOUNDED_TEST_KILL_AFTER_MS = 10_000;
 /**
  * Deletes Bun's per-test deadline: 5000 ms unless the command sets one, and Bun ignores a bunfig `[test] timeout`, so
  * the flag is the one place to set it. `0` means no deadline (measured on the pinned Bun 1.4.2: a test blocked 12 s in
