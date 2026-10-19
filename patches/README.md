@@ -230,6 +230,17 @@ realpaths across package-link swaps even after `Module._pathCache` is cleared. O
 back to the existing detached, cache-shielded resolver. Invalid metadata does not fall through to a different installed
 copy.
 
+A plugin `nx.json` names whose package resolves outside the workspace, a developer link into another checkout, changes
+behind that link with no workspace lockfile change. The daemon then kept serving the graph the old plugin code inferred,
+so every task it hashed afterwards was keyed on a project configuration no fresh process computes: a consumer's land
+gate keyed `cargo-lint-cross` on the configuration this plugin inferred before a mid-gate land, and the push that
+followed missed. The same baseline captures, before watch/scan, every file such a plugin's manifest publishes (`files`,
+negations ignored; the whole package when the list is absent or a glob) and the lockfiles of the nearest directory above
+it that holds one. A request stats the files already known and re-hashes only one whose stat moved; the full census,
+which finds a file added beside them, runs at most once per safety interval. Only changed bytes restart the daemon
+(`LINKED_PLUGIN_CHANGED`), so a rebuild that rewrites identical files keeps it. A package inside the workspace changes
+only with its lockfile and is not watched this way.
+
 The existing ignore-file content snapshot, watch-before-scan ordering, exclusive daemon claim and five-minute inactivity
 policy remain unchanged. This follows `specs/cowshed/04_sandbox.md`'s fixture ownership and one-state-per- checkout
 contract and `packages/nx-plugin/README.md`'s runtime-state exclusions and daemon policy. `nx-daemon-validity.test.ts`

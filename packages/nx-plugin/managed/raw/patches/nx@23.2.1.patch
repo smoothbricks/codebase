@@ -678,7 +678,7 @@ index c2a2f8f70fe71940e47c97931c5925bac1fbd480..39582a8fc342ae59decd3d4ca25179f2
          // Bump generation synchronously so any in-flight compute fails its
 diff --git a/dist/src/daemon/server/restart-checks.d.ts b/dist/src/daemon/server/restart-checks.d.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..2a76dce933112854e34d61a44aa90b7c4e1d34e9
+index 0000000000000000000000000000000000000000..28f263f82b7b698ec1bf88943924696b3d9a91e7
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.d.ts
 @@ -0,0 +1,10 @@
@@ -687,22 +687,22 @@ index 0000000000000000000000000000000000000000..2a76dce933112854e34d61a44aa90b7c
 +export declare const DAEMON_VALIDITY_SAFETY_INTERVAL_MS = 5000;
 +export declare const relativeServerProcess: string;
 +export declare function registerDaemonForRestartChecks(server: Server, sockets: Iterable<Socket>, socketPath: string): void;
-+export declare function recordLockFileHash(): void;
++export declare function recordInstallationBaseline(): void;
 +export declare function restartDaemonIfLockFilesChanged(paths: string[]): boolean;
 +export declare function stopDaemonIfReplaced(events: WatchEvent[]): boolean;
 +export declare function stopDaemonIfOutdated(): boolean;
 +export declare function stopDaemonIfWorkspaceGone(): boolean;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..6adb712340b154dcabb7570bc1b4c586f3416cdf
+index 0000000000000000000000000000000000000000..5ecc6f91803c9029fc4880a71ee63c49f427c08d
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.js
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,262 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
 +exports.relativeServerProcess = exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS = void 0;
 +exports.registerDaemonForRestartChecks = registerDaemonForRestartChecks;
-+exports.recordLockFileHash = recordLockFileHash;
++exports.recordInstallationBaseline = recordInstallationBaseline;
 +exports.restartDaemonIfLockFilesChanged = restartDaemonIfLockFilesChanged;
 +exports.stopDaemonIfReplaced = stopDaemonIfReplaced;
 +exports.stopDaemonIfOutdated = stopDaemonIfOutdated;
@@ -740,8 +740,12 @@ index 0000000000000000000000000000000000000000..6adb712340b154dcabb7570bc1b4c586
 +    }
 +    return (0, file_hasher_1.hashArray)(hashes);
 +}
-+function recordLockFileHash() {
++// The startup baseline of everything a restart judges by bytes: the root
++// lockfiles and the linked plugins below.
++function recordInstallationBaseline() {
 +    lockFileHash = hashLockFiles();
++    linkedPluginFiles = hashCensus(linkedPluginCensus() ?? new Map(), new Map());
++    linkedPluginCensusAt = Date.now();
 +}
 +function lockFileHashChanged() {
 +    const newHash = hashLockFiles();
@@ -752,6 +756,133 @@ index 0000000000000000000000000000000000000000..6adb712340b154dcabb7570bc1b4c586
 +    }
 +    lockFileHash = newHash;
 +    return false;
++}
++// A plugin nx.json names whose package resolves outside the workspace (a
++// developer link into another checkout) changes behind that link with no
++// lockfile change here. The daemon kept serving the graph the old plugin code
++// inferred, so every task hashed after the change was keyed on a configuration
++// no fresh process computes. Its published files and the lockfiles of the
++// checkout it lives in are judged like the root lockfiles: a file whose stat
++// moved is hashed again, and only changed bytes restart the daemon. A request
++// stats the files already known; a file added beside them is found by the full
++// census, taken at most once per safety interval. A package inside the
++// workspace changes only with its lockfile.
++let linkedPluginFiles;
++let linkedPluginCensusAt = 0;
++const PACKAGE_GLOB = /[*?[{]/;
++function pluginSpecifiers() {
++    let plugins;
++    try {
++        plugins = JSON.parse((0, fs_1.readFileSync)(nxJson, 'utf8')).plugins;
++    }
++    catch (error) {
++        logger_1.serverLogger.log(`[Server] linked plugins not judged: nx.json unreadable: ${error.message}`);
++        return null;
++    }
++    return (Array.isArray(plugins) ? plugins : [])
++        .map((entry) => (typeof entry === 'string' ? entry : entry?.plugin))
++        .filter((name) => typeof name === 'string' && !name.startsWith('.') && !(0, path_1.isAbsolute)(name));
++}
++// Adds every file under `path` (following links, each directory once) to `census` with its stat.
++function addFiles(census, path, seen = new Set()) {
++    let stat;
++    try {
++        stat = (0, fs_1.statSync)(path, { bigint: true });
++    }
++    catch (error) {
++        if (error.code === 'ENOENT') return;
++        throw error;
++    }
++    if (stat.isDirectory()) {
++        const directory = `${stat.dev}:${stat.ino}`;
++        if (seen.has(directory)) return;
++        seen.add(directory);
++        for (const entry of (0, fs_1.readdirSync)(path)) {
++            if (entry !== 'node_modules') addFiles(census, (0, path_1.join)(path, entry), seen);
++        }
++    }
++    else if (stat.isFile()) {
++        census.set(path, `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`);
++    }
++}
++// Every file a linked plugin publishes and its checkout's lockfiles, each with
++// its stat; null when nx.json cannot say which plugins there are.
++function linkedPluginCensus() {
++    const specifiers = pluginSpecifiers();
++    if (specifiers === null) return null;
++    const workspace = (0, fs_1.realpathSync)(workspace_root_1.workspaceRoot);
++    const census = new Map();
++    for (const name of specifiers) {
++        let root;
++        try {
++            root = (0, fs_1.realpathSync)((0, path_1.join)(workspace_root_1.workspaceRoot, 'node_modules', name));
++        }
++        catch (error) {
++            if (error.code === 'ENOENT') continue;
++            throw error;
++        }
++        if (root === workspace || root.startsWith(workspace + path_1.sep)) continue;
++        const manifest = (0, path_1.join)(root, 'package.json');
++        addFiles(census, manifest);
++        // A manifest with no plain `files` list (absent, a glob, or bytes that do
++        // not parse, which the census holds too) publishes the whole package.
++        let files;
++        try {
++            files = JSON.parse((0, fs_1.readFileSync)(manifest, 'utf8')).files;
++        }
++        catch {
++            files = undefined;
++        }
++        const listed = Array.isArray(files) ? files.filter((file) => typeof file !== 'string' || !file.startsWith('!')) : [];
++        const published = listed.length > 0 && listed.every((file) => typeof file === 'string' && !PACKAGE_GLOB.test(file));
++        for (const file of published ? listed : ['.']) addFiles(census, (0, path_1.join)(root, file));
++        for (let directory = root; ; directory = (0, path_1.dirname)(directory)) {
++            const locks = LOCK_FILE_NAMES.map((lock) => (0, path_1.join)(directory, lock)).filter((lock) => (0, fs_1.existsSync)(lock));
++            if (locks.length > 0 || (0, path_1.dirname)(directory) === directory) {
++                for (const lock of locks) addFiles(census, lock);
++                break;
++            }
++        }
++    }
++    return census;
++}
++// The census with each file's hash, reusing `recorded`'s for a file whose stat
++// has not moved.
++function hashCensus(census, recorded) {
++    const files = new Map();
++    for (const [path, stat] of census) {
++        const previous = recorded.get(path);
++        files.set(path, previous !== undefined && previous.stat === stat ? previous : { stat, hash: (0, native_1.hashFile)(path) });
++    }
++    return files;
++}
++// The known files' stats, a vanished one left out.
++function knownFileStats() {
++    const census = new Map();
++    for (const path of linkedPluginFiles.keys()) addFiles(census, path);
++    return census;
++}
++function linkedPluginsChanged() {
++    if (linkedPluginFiles === undefined) return false;
++    const now = Date.now();
++    const full = now - linkedPluginCensusAt >= exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS;
++    const census = full ? linkedPluginCensus() : knownFileStats();
++    if (census === null) return false;
++    if (full) linkedPluginCensusAt = now;
++    const files = hashCensus(census, linkedPluginFiles);
++    let change = null;
++    for (const [path, { hash }] of files) {
++        const previous = linkedPluginFiles.get(path);
++        if (previous === undefined) change ??= `${path} appeared`;
++        else if (previous.hash !== hash) change ??= `${path} changed`;
++    }
++    for (const path of linkedPluginFiles.keys()) {
++        if (!files.has(path)) change ??= `${path} disappeared`;
++    }
++    linkedPluginFiles = files;
++    if (change === null) return false;
++    logger_1.serverLogger.log(`[Server] linked plugin file ${change}`);
++    return true;
 +}
 +// Applied paths have been hashed by the native workspace context; same-byte
 +// rewrites were dropped already. No lockfile is read on this watcher path.
@@ -806,6 +937,10 @@ index 0000000000000000000000000000000000000000..6adb712340b154dcabb7570bc1b4c586
 +        restartDaemon('LOCK_FILES_CHANGED');
 +        return true;
 +    }
++    if (linkedPluginsChanged()) {
++        restartDaemon('LINKED_PLUGIN_CHANGED');
++        return true;
++    }
 +    return false;
 +}
 +function isReplaced() {
@@ -826,7 +961,7 @@ index 0000000000000000000000000000000000000000..6adb712340b154dcabb7570bc1b4c586
 +    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets });
 +}
 diff --git a/dist/src/daemon/server/server.js b/dist/src/daemon/server/server.js
-index b1c143e244efd435b28642ed86e999d6c86f7d94..5f1157fd3e37afc8ef739a8adce78a2b472e08af 100644
+index b1c143e244efd435b28642ed86e999d6c86f7d94..c68bcacb9bc46babaa86ea0ac212e79de1b47244 100644
 --- a/dist/src/daemon/server/server.js
 +++ b/dist/src/daemon/server/server.js
 @@ -7,17 +7,13 @@ const fs_1 = require("fs");
@@ -1011,8 +1146,8 @@ index b1c143e244efd435b28642ed86e999d6c86f7d94..5f1157fd3e37afc8ef739a8adce78a2b
 +        process.exit(0);
 +    }
 +    (0, restart_checks_1.registerDaemonForRestartChecks)(server, exports.openSockets, socketPath);
-+    // Record before watch/scan so a lockfile changed during boot is not lost.
-+    (0, restart_checks_1.recordLockFileHash)();
++    // Record before watch/scan so a lockfile or linked plugin changed during boot is not lost.
++    (0, restart_checks_1.recordInstallationBaseline)();
      // Watch before scan: a file written during boot must be visible to the
      // watcher or the scan below. Scan-first left a blind window where such
      // files stayed invisible to both until an unrelated change arrived.
