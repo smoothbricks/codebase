@@ -1,4 +1,4 @@
-import { afterAll, expect, it } from 'bun:test';
+import { afterAll, expect, it, jest } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import {
   appendFile,
@@ -35,6 +35,7 @@ import {
 } from './__tests__/counted-cargo.js';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './bounded-test-policy.js';
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
 import {
   acquireCargoResolveLock,
@@ -1104,8 +1105,18 @@ it('a Cargo child that never answers is killed and named at the resolve bound', 
     await answer('before');
     await cargo.beforeAnswer.close();
     try {
-      const refused = await rejectionOf(readCargoResolve(manifest, workspace, undefined, 100));
-      expect(String(refused)).toContain('did not finish within 100ms');
+      // The resolve bound is a timer in this process, started only once the lock is held and Cargo is spawned. The
+      // clock stays stopped until the canned Cargo reports that it read the workspace and is held at the closed
+      // answer latch; only then is the bound advanced, so it expires on a child that can never answer.
+      jest.useFakeTimers();
+      try {
+        const refusal = rejectionOf(readCargoResolve(manifest, workspace, undefined, 100));
+        await cargo.waitForRuns((runs) => runs.read >= 1, 'the canned Cargo to read the workspace and be held');
+        jest.advanceTimersByTime(100);
+        expect(String(await refusal)).toContain('did not finish within 100ms');
+      } finally {
+        jest.useRealTimers();
+      }
     } finally {
       await cargo.beforeAnswer.open();
     }
@@ -1119,15 +1130,24 @@ it('a held resolve lock times out with its name and elapsed wait and leaves no l
     const holder = new FileLock(lockFile);
     holder.lock();
     try {
-      const started = performance.now();
-      const refused = await rejectionOf(acquireCargoResolveLock(lockFile, 100));
+      // The lock's bound is a timer in this process, and the waiter cannot take the lock while the holder keeps it.
+      // The clock stays stopped while the waiter queues; advancing it by the bound is what ends the wait, and the
+      // refusal must then name the lock, the wait and the reaped waiter while the holder still holds the lock.
+      jest.useFakeTimers();
+      let refused: unknown;
+      try {
+        const attempt = rejectionOf(acquireCargoResolveLock(lockFile, 100));
+        jest.advanceTimersByTime(100);
+        refused = await attempt;
+      } finally {
+        jest.useRealTimers();
+      }
       if (!(refused instanceof CargoResolveLockError)) throw new Error(`unexpected lock refusal: ${refused}`);
       expect(refused.name).toBe('CargoResolveLockError');
       expect(refused.message).toContain(lockFile);
       expect(refused.message).toContain(`waited ${refused.waitedMs}ms`);
       expect(refused.message).toContain('bound 100ms');
       expect(refused.waitedMs).toBeGreaterThanOrEqual(100);
-      expect(performance.now() - started).toBeLessThan(1_100);
       if (refused.waiterPid === undefined) throw new Error('the lock refusal named no spawned waiter');
       expect(refused.message).toContain(`reaped lock waiter pid ${refused.waiterPid}`);
       expect(alive(refused.waiterPid)).toBe(false);
@@ -1144,7 +1164,9 @@ it('a successful resolve lock lease holds the kernel lock until its child is rel
   const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-resolve-lease-')));
   try {
     const lockFile = join(root, 'resolve.lock');
-    const lease = await acquireCargoResolveLock(lockFile, 5_000);
+    // The lock is granted by the child's `locked` line and released by the child's exit, so I/O decides this case; the
+    // bound is the leg backstop, which an uncontended lock never reaches.
+    const lease = await acquireCargoResolveLock(lockFile, BOUNDED_TEST_IDLE_TIMEOUT_MS);
     try {
       expect(alive(lease.pid)).toBe(true);
       expect(new FileLock(lockFile).check()).toBe(true);

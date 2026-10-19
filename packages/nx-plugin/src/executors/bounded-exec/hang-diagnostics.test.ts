@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, jest } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import {
   captureHangDiagnostics,
   type HangCaptureRequest,
@@ -23,8 +24,8 @@ const exited = (stdout: string, code = 0, stderr = ''): HangProbeResult => ({ st
 const request = (): HangCaptureRequest => ({
   pid: ROOT,
   pgid: ROOT,
-  expiresAtMs: Date.now() + 5_000,
-  deadlineMs: 5_000,
+  expiresAtMs: Date.now() + BOUNDED_TEST_IDLE_TIMEOUT_MS,
+  deadlineMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
 });
 
 function scriptedHost(results: readonly HangProbeResult[]) {
@@ -140,6 +141,7 @@ describe('pre-expiry hang diagnostics', () => {
         return new Promise<HangProbeResult>(() => {});
       },
     };
+    // The probe is held off by construction, so the 1 ms deadline timer is the only event that can end this capture.
     const capture = await captureHangDiagnostics({ ...request(), deadlineMs: 1 }, unresponsive);
     expect(capture.outcome).toBe('incomplete');
     expect(capture.text).toContain('1ms deadline reached during ps before');
@@ -228,12 +230,11 @@ describe('pre-expiry hang diagnostics', () => {
     let descendant: number | undefined;
     const failures: unknown[] = [];
     try {
-      const reader = child.stdout
-        .pipeThrough(new TextDecoderStream(), { signal: AbortSignal.timeout(10_000) })
-        .getReader();
+      const reader = child.stdout.pipeThrough(new TextDecoderStream()).getReader();
       let text = '';
       try {
-        // Real OS-pipe readiness cannot advance a fake test clock; abort only bounds a missing line.
+        // The first complete line is the readiness event; a child that exits first ends the stream instead. No timer
+        // ends this loop.
         for (;;) {
           const chunk = await reader.read();
           if (chunk.done) throw new Error('child stdout ended before a complete PID line');
@@ -252,7 +253,12 @@ describe('pre-expiry hang diagnostics', () => {
         Number.isSafeInteger(descendant) && descendant > 0,
         `expected a tagged PID line, observed ${JSON.stringify(line)}`,
       ).toBe(true);
-      const capture = await captureHangDiagnostics({ ...request(), pid: child.pid, pgid: null });
+      // The capture budget (`HANG_CAPTURE_MS`) and probe limits are product constants this test cannot set, so the
+      // clock is stopped while the real `ps` and `lsof` run: each ends when it exits; no timer cuts it short.
+      jest.useFakeTimers();
+      const capture = await captureHangDiagnostics({ ...request(), pid: child.pid, pgid: null }).finally(() =>
+        jest.useRealTimers(),
+      );
       expect(capture.outcome).toBe('holders');
       expect(capture.text).toContain(String(child.pid));
       expect(capture.text).toContain(String(descendant));
