@@ -189,7 +189,7 @@ function fixture(replayFails = false): Land {
   mkdirSync(join(main, 'tooling'), { recursive: true });
   mkdirSync(state);
   mkdirSync(bin);
-  for (const file of ['land-host.sh', 'land-history.ts', 'land-summary.ts']) {
+  for (const file of ['land-host.sh', 'land-decide.ts', 'land-history.ts', 'land-summary.ts']) {
     cpSync(join(tooling, file), join(main, 'tooling', file));
   }
   symlinkSync(join(repo, 'node_modules'), join(main, 'node_modules'));
