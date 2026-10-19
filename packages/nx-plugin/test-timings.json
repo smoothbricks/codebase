@@ -7,6 +7,7 @@
     "src/cargo-closure-key.test.ts": 22410,
     "src/ensure-built.test.ts": 18391,
     "src/graph-input-contract.test.ts": 16550,
+    "src/executors/bounded-exec/run-cpu-pool.test.ts": 15709,
     "src/executors/bounded-exec/executor.test.ts": 12975,
     "src/cargo-resolve-cache.test.ts": 11421,
     "src/cargo-closure-input.property.test.ts": 10902,
