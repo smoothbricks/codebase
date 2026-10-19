@@ -81,7 +81,6 @@ interface Replacement {
   /** Runs once the directory watch is open. */
   readonly action?: () => Promise<void>;
   readonly what: string;
-  readonly timeoutMs?: number;
 }
 
 /** One line per event the watch client saw: its kind, then the tab-separated details. */
@@ -322,7 +321,6 @@ async function watchUntil<T>(
   what: string,
   check: () => Promise<T | null>,
   action?: () => Promise<void>,
-  timeoutMs = 30_000,
 ): Promise<T> {
   await mkdir(directory, { recursive: true });
   let notify: (() => void) | undefined;
@@ -334,7 +332,7 @@ async function watchUntil<T>(
       notify = () => changed.resolve();
       const found = await check();
       if (found !== null) return found;
-      await guardEvent(changed.promise, what, () => `no change in ${directory}`, undefined, timeoutMs);
+      await guardEvent(changed.promise, what, () => `no change in ${directory}`);
     }
   } finally {
     watcher.close();
@@ -381,12 +379,8 @@ async function untilServing(record: DaemonRecord, workspace: string): Promise<vo
     }
   };
   try {
-    await guardEvent(
-      serving(),
-      `the daemon on ${socketPath} to answer PING`,
-      () => daemonDiagnostics(workspace, record.processId),
-      undefined,
-      30_000,
+    await guardEvent(serving(), `the daemon on ${socketPath} to answer PING`, () =>
+      daemonDiagnostics(workspace, record.processId),
     );
   } finally {
     waiting.abort();
@@ -409,7 +403,7 @@ async function startDaemon(workspace: string, env: Record<string, string>): Prom
  * Runs `action`, then resolves with the record that names a process other than `previous`. The record directory is
  * watched before `action` runs, so a record written at any point is seen.
  */
-function replacementAfter({ workspace, previous, action, what, timeoutMs }: Replacement): Promise<DaemonRecord> {
+function replacementAfter({ workspace, previous, action, what }: Replacement): Promise<DaemonRecord> {
   return watchUntil(
     dirname(recordPath(workspace)),
     what,
@@ -418,7 +412,6 @@ function replacementAfter({ workspace, previous, action, what, timeoutMs }: Repl
       return record !== null && record.processId !== previous ? record : null;
     },
     action,
-    timeoutMs,
   );
 }
 
@@ -744,7 +737,6 @@ it('stops a daemon at the next request after an ignored lockfile changes, then i
         previous: successor.record.processId,
         action: () => writeFile(lock, 'lock three\n'),
         what: 'a replacement of the successor within the 5 s safety poll after an ignored lockfile change',
-        timeoutMs: 20_000,
       });
       await awaitExit(
         [successor.entry],
