@@ -24,6 +24,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use uuid::Uuid;
@@ -508,13 +509,12 @@ struct SystemEnvironment;
 
 impl AuditSinkEnvironment for SystemEnvironment {
     fn utc_date(&self) -> io::Result<TelemetryDate> {
-        let mut timestamp: libc::time_t = 0;
-        if unsafe { libc::time(&mut timestamp) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let seconds = u64::try_from(timestamp)
+        // std's clock, not `libc::time`: `time_t` is deprecated on musl targets, and the
+        // seconds since the epoch are all a calendar date needs.
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map_err(|_| io::Error::other("UTC timestamp is before the epoch"))?;
-        Ok(TelemetryDate::from_unix_seconds(seconds))
+        Ok(TelemetryDate::from_unix_seconds(since_epoch.as_secs()))
     }
 }
 
