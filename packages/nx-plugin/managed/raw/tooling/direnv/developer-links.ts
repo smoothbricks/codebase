@@ -257,7 +257,7 @@ export function unreadableDeveloperLinks(root: string): string[] {
 }
 
 /** The package a link stands for in its tree: `name` or `@scope/name`. */
-function packageName(link: DeveloperLink): string {
+function packageName(link: { readonly path: string }): string {
   return link.path.slice(link.path.lastIndexOf('node_modules/') + 'node_modules/'.length);
 }
 
@@ -635,13 +635,6 @@ export function applyDeclaredLinks(root: string, plan: DeclaredLinksPlan): void 
   if (counts.size > 0) {
     const entries = [...counts].map(([named, count]) => (count === 1 ? named : `${named} (${count} links)`));
     console.error(`linked declared packages to local checkouts: ${entries.join(', ')}`);
-  }
-}
-
-/** One stderr line per declaration this machine cannot honour; the installed version stays. */
-export function reportUnavailableDeclaredLinks(unavailable: readonly UnavailableDeclaredLink[]): void {
-  for (const { name, target, reason } of unavailable) {
-    console.error(`! smoo.developerLinks ${name}: ${target} ${reason}; the installed version stays`);
   }
 }
 

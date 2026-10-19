@@ -32,7 +32,6 @@ import {
   keepDeveloperLinks,
   planDeclaredLinks,
   reportDeveloperLinks,
-  reportUnavailableDeclaredLinks,
   unreadableDeveloperLinks,
 } from './developer-links.ts';
 import {
