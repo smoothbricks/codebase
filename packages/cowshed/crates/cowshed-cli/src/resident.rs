@@ -30,7 +30,7 @@ use crate::gateway_service::{
 use crate::output::Output;
 use crate::runtime::{
     DispatchExit, ExecEnd, ExecPresentation, ExecResult, ForegroundJob, emit_mount_path,
-    exec_command, exec_presentation, hold_gate, output_error, relay_foreground, report_exec,
+    exec_command, exec_presentation, hold_foreground, output_error, relay_foreground, report_exec,
     success,
 };
 
@@ -213,13 +213,11 @@ async fn run(
         });
     }
     let job = ResidentJob { link, job };
-    let hold = if gate {
-        Some(hold_gate(&job, &job.link.socket, &incarnation, job.job).await?)
-    } else {
-        None
-    };
+    // Held for as long as this process lives, as through the controller (05_gateway.md, "A job
+    // lives with its requester").
+    let hold = hold_foreground(&job, &job.link.socket, &incarnation, job.job).await?;
     let _relay = span("resident", "relay");
-    relay_foreground(&job, hold, timeout, presentation, stdout, stderr).await
+    relay_foreground(&job, Some(hold), timeout, presentation, stdout, stderr).await
 }
 
 /// A job of the resident workspace, reached through its supervisor's socket.

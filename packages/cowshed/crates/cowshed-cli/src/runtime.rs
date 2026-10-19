@@ -993,33 +993,38 @@ impl CliService for ActorBridge {
                 end: ExecEnd::Backgrounded,
             });
         }
-        let hold = if gate {
-            let descriptor = self
-                .runtime
-                .as_ref()
-                .ok_or_else(|| {
-                    CowshedError::internal("the CLI project runtime has already been shut down")
-                })?
-                .descriptor();
-            let socket = cowshed_core::runtime::supervisor_socket::socket_path(
-                descriptor.storage.store(),
-                &descriptor.repo_id,
-                worker.name(),
-            );
-            Some(
-                hold_gate(
-                    &job,
-                    &socket,
-                    &worker.info().workspace_incarnation,
-                    job.id(),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
+        // Every foreground job is held for as long as this process lives, so a client that dies
+        // -- a caller's timeout killing it, `SIGKILL` included -- takes its job and its tokens
+        // with it (05_gateway.md "A job lives with its requester").
+        let descriptor = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| {
+                CowshedError::internal("the CLI project runtime has already been shut down")
+            })?
+            .descriptor();
+        let socket = cowshed_core::runtime::supervisor_socket::socket_path(
+            descriptor.storage.store(),
+            &descriptor.repo_id,
+            worker.name(),
+        );
+        let hold = hold_foreground(
+            &job,
+            &socket,
+            &worker.info().workspace_incarnation,
+            job.id(),
+        )
+        .await?;
         let _relay = cowshed_os::timing::span("exec", "relay");
-        relay_foreground(&job, hold, command.timeout, presentation, stdout, stderr).await
+        relay_foreground(
+            &job,
+            Some(hold),
+            command.timeout,
+            presentation,
+            stdout,
+            stderr,
+        )
+        .await
     }
 
     async fn reconcile_gateway(&mut self) -> Result<()> {
@@ -1093,10 +1098,11 @@ impl ForegroundJob for JobHandle {
     }
 }
 
-/// Hold a foreground gate job for as long as this process lives (05_gateway.md, "A gate lives
-/// with its operator"): a gate nobody waits for any more would keep its place at the head of the
-/// gate queue. A gate that cannot be held is killed rather than left running for nobody.
-pub(crate) async fn hold_gate(
+/// Hold a foreground job for as long as this process lives (05_gateway.md, "A job lives with its
+/// requester"): a job nobody waits for any more would keep its tokens, and a gate its place at
+/// the head of the gate queue. A job that cannot be held is killed rather than left running for
+/// nobody.
+pub(crate) async fn hold_foreground(
     job: &impl ForegroundJob,
     socket: &Path,
     incarnation: &cowshed_core::metadata::WorkspaceIncarnation,
@@ -1115,7 +1121,8 @@ pub(crate) async fn hold_gate(
 /// running is released from `hold`, detached and reported still running; a job that ended
 /// meanwhile has nothing to reattach to, so its output is drained to EOF and its end is the
 /// command's. A `hold` dropped before the job ends — a failed relay, or this process ending —
-/// kills the job.
+/// kills the job. Every CLI foreground exec passes one; only relay tests without a supervisor
+/// pass none.
 pub(crate) async fn relay_foreground(
     job: &impl ForegroundJob,
     hold: Option<JobHold>,

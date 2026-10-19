@@ -4580,8 +4580,8 @@ async fn the_manager_moves_a_running_supervisor_to_a_newer_grant_revision() {
     remote.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
-/// The served supervisor for a running job, as `cowshed exec --class gate` reaches it: the job,
-/// its spawn, and the socket a hold names.
+/// The served supervisor for a running ordinary background job, as every foreground `cowshed
+/// exec` reaches it whatever its class: the job, its spawn, and the socket a hold names.
 async fn held_job_fixture(h: &mut Harness) -> (JobId, Spawned, PathBuf) {
     use cowshed_core::runtime::supervisor_socket;
     let job = h
@@ -4614,7 +4614,7 @@ async fn held_job_fixture(h: &mut Harness) -> (JobId, Spawned, PathBuf) {
     (job, spawned, path)
 }
 
-/// A gate whose operator is gone is killed (05_gateway.md, "A gate lives with its operator"):
+/// A job whose requester is gone is killed (05_gateway.md, "A job lives with its requester"):
 /// the holder's connection closing while the job runs — its process ending, `SIGKILL` included —
 /// signals the job's group, and the job ends Killed.
 #[tokio::test]
