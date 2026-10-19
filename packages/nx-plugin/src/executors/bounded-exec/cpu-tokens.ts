@@ -35,6 +35,8 @@ export const CPU_TOKENS_ENV = 'BOUNDED_EXEC_CPU_TOKENS';
 const CARGO_BUILD =
   /(?<=^|[\s;&|()])(?:cargo(?:\s+-\S+)*\s+(?:build|test|check|clippy|rustc|doc|run|nextest\s+archive)|napi\s+build)(?=\s|$)/;
 const TEST_THREADS = /--test-threads(?:=|\s+)(\d+)/g;
+/** nextest's `--no-capture` (`--nocapture` past `--`): it runs tests serially and ignores `--test-threads`. */
+const NO_CAPTURE = /(?<![\w-])--no-?capture(?![\w-])/;
 const BUN_PARALLEL = /--parallel(?:=(\d+))?(?=\s|$)/g;
 const INHERITED_COUNT = /^[1-9]\d*$/;
 
@@ -42,7 +44,9 @@ const INHERITED_COUNT = /^[1-9]\d*$/;
  * What `command` asks for: its kind by invocation, and `declared` (the target's `parallelism`)
  * when it says, else the count the command names (`--test-threads=N`, `--parallel=N`), else the
  * runner's own default — one thread per core for nextest, a bare `--parallel` and cargo, one
- * process for anything else. Positive inherited runner counts are ceilings; configured counts may only lower them.
+ * process for anything else. A nextest run with `--no-capture` runs one test at a time whatever
+ * thread count it names, so it asks for one. Positive inherited runner counts are ceilings;
+ * configured counts may only lower them.
  */
 export function runnerDemand(
   command: string,
@@ -64,7 +68,8 @@ export function runnerDemand(
     counted === null
       ? []
       : [...command.matchAll(counted)].flatMap((match) => (match[1] === undefined ? [] : [Number(match[1])]));
-  const requested = declared ?? (named.length > 0 ? Math.max(...named) : kind === 'process' ? 1 : cores);
+  const serial = kind === 'nextest' && NO_CAPTURE.test(command);
+  const requested = declared ?? (serial ? 1 : named.length > 0 ? Math.max(...named) : kind === 'process' ? 1 : cores);
   const ceiling =
     kind === 'nextest'
       ? inheritedCeiling(inherited.NEXTEST_TEST_THREADS, configured?.NEXTEST_TEST_THREADS)
