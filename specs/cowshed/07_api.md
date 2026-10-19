@@ -132,8 +132,10 @@ pub struct ExecRequest {
     pub stderr_copy: Option<OutputPublication>,
     pub admission_key: Option<AdmissionKey>, // idempotent admission within the exact workspace incarnation
 
-    pub class: JobserverClass,            // Background by default; Gate requires trusted coordinator
-    pub want: NonZeroUsize,               // default1; actual command demand, bounded to granted tokens
+    pub class: JobserverClass,            // Background by default; Gate requires trusted coordinator; Resident
+                                          // holds no token, its pool asks the host per child (05_gateway.md)
+    pub want: NonZeroUsize,               // default1; actual command demand, bounded to granted tokens; a
+                                          // Resident names only the default
     pub scope: ExecScope,                 // Workspace default; HostGate requires trusted Gate
 }
 

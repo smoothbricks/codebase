@@ -431,8 +431,8 @@ struct ExecWire {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AdmissionSource {
-    /// worker.exec: a workspace's own capability, which admits background work in its workspace
-    /// sandbox only.
+    /// worker.exec: a workspace's own capability, which admits background and resident work in
+    /// its workspace sandbox only.
     Worker,
     /// coordinator.exec and the controller's own execs: the trusted coordinator, which may also
     /// admit the gate class and the host-gate scope.
@@ -440,13 +440,18 @@ pub enum AdmissionSource {
 }
 
 impl AdmissionSource {
-    /// Whether this route may admit an exec of class in scope. A worker admits background work
-    /// in the workspace sandbox and nothing else; anything more is refused as the typed
+    /// Whether this route may admit an exec of class in scope. A worker admits background and
+    /// resident work in the workspace sandbox and nothing else -- a resident holds no token, so
+    /// it claims nothing a worker may not -- and anything more is refused as the typed
     /// class-not-permitted error, before any record, process or gateway request exists.
     pub fn admit(self, class: JobserverClass, scope: ExecScope) -> Result<()> {
         match (self, class, scope) {
             (Self::Coordinator, _, _)
-            | (Self::Worker, JobserverClass::Background, ExecScope::Workspace) => Ok(()),
+            | (
+                Self::Worker,
+                JobserverClass::Background | JobserverClass::Resident,
+                ExecScope::Workspace,
+            ) => Ok(()),
             (Self::Worker, _, _) => Err(CowshedError::class_not_permitted(class, scope)),
         }
     }

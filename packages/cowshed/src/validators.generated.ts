@@ -290,6 +290,11 @@ export const parseCpuTotals = (json: string): Api.CpuTotals => assertCpuTotals(J
 export const assertCpuTotalsList = typia.createAssertEquals<readonly Api.CpuTotals[]>();
 export const parseCpuTotalsList = (json: string): readonly Api.CpuTotals[] => assertCpuTotalsList(JSON.parse(json));
 
+export const assertCpuWaiter = typia.createAssertEquals<Api.CpuWaiter>();
+export const parseCpuWaiter = (json: string): Api.CpuWaiter => assertCpuWaiter(JSON.parse(json));
+export const assertCpuWaiterList = typia.createAssertEquals<readonly Api.CpuWaiter[]>();
+export const parseCpuWaiterList = (json: string): readonly Api.CpuWaiter[] => assertCpuWaiterList(JSON.parse(json));
+
 export const assertCredentialReport = typia.createAssertEquals<Api.CredentialReport>();
 export const parseCredentialReport = (json: string): Api.CredentialReport => assertCredentialReport(JSON.parse(json));
 export const assertCredentialReportList = typia.createAssertEquals<readonly Api.CredentialReport[]>();

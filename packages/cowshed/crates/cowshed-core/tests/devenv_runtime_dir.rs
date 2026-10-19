@@ -1135,7 +1135,7 @@ fn spawn_request(sandbox: &SandboxConfig, cwd: &Path, argv: Vec<OsString>) -> Pr
         mode: cowshed_core::api::RunSandboxMode::ReadWrite,
         scope: cowshed_core::api::ExecScope::Workspace,
         cpu: cowshed_core::runtime::supervisor::CpuPlacement {
-            tokens: std::num::NonZeroUsize::MIN,
+            tokens: Some(std::num::NonZeroUsize::MIN),
             pool: std::path::PathBuf::from("/nonexistent/cowshed-test-cpu-pool.sock"),
             nice: 10,
         },

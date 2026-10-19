@@ -114,7 +114,8 @@ enum Plan {
     Sized(usize),
     /// Ask the gateway for a jobserver grant of this many tokens.
     Ask { want: usize },
-    /// A live immediate parent owns the upstream grant; borrow only its local allocation.
+    /// A live immediate parent pool serves this build: a lent pool from its own grant, or a gate's
+    /// or a resident's relay that asks the host; borrow only the local allocation it answers.
     Parent { socket: PathBuf, want: usize },
 }
 
@@ -194,21 +195,23 @@ fn plan(get: &impl Fn(&str) -> Option<String>, arguments: &[OsString]) -> Plan {
 
     if let Some(socket) =
         get("BOUNDED_EXEC_CPU_POOL").filter(|value| !value.is_empty() && !value.contains('\0'))
-        && get("BOUNDED_EXEC_CPU_TOKENS")
-            .and_then(|value| value.parse::<usize>().ok())
-            .is_some_and(|value| value > 0)
+        && get("BOUNDED_EXEC_CPU_TOKENS").is_some_and(|value| value.parse::<usize>().is_ok())
     {
         if compiles_nothing(arguments) {
             return Plan::Direct;
         }
-        // The count proves a whole descriptor; neither it nor half the host bounds the ask, as
-        // for a root build, one per core. A lent pool grants at most what it holds, and a gate's
-        // relay pool asks the host for each child at gate class.
+        // The count proves a whole descriptor, zero included: a resident's relay pool holds no
+        // token for its lifetime, so it names none. Neither the count nor half the host bounds
+        // the ask, as for a root build, one per core. A lent pool grants at most what it holds,
+        // and a relay pool asks the host for each child: a gate's at gate class, a resident's at
+        // background class (05_gateway.md "Host CPU budget", "A resident holds no token").
         return Plan::Parent {
             socket: PathBuf::from(socket),
             want: std::thread::available_parallelism().map_or(1, usize::from),
         };
     }
+    // Without a pool, a count sizes cargo only when positive: a bare zero names no allocation,
+    // so the build asks for a grant as it does with no count at all.
     if let Some(tokens) = get("BOUNDED_EXEC_CPU_TOKENS")
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|tokens| *tokens > 0)
@@ -926,6 +929,44 @@ mod parent_pool_tests {
             }
         );
         assert_eq!(plan(&get, &[OsString::from("metadata")]), Plan::Direct);
+    }
+
+    #[test]
+    fn a_resident_relay_pool_names_zero_beside_its_endpoint_and_a_bare_zero_names_nothing() {
+        let arguments = vec![OsString::from("build")];
+        // A resident holds no token for its lifetime: its relay pool names zero, and a compiling
+        // cargo asks that pool for its children as it asks any parent's.
+        let relay = environment(&[
+            ("BOUNDED_EXEC_CPU_POOL", "/private/live-parent.sock"),
+            ("BOUNDED_EXEC_CPU_TOKENS", "0"),
+        ]);
+        assert_eq!(
+            plan(&relay, &arguments),
+            Plan::Parent {
+                socket: PathBuf::from("/private/live-parent.sock"),
+                want: std::thread::available_parallelism().map_or(1, usize::from),
+            }
+        );
+        assert_eq!(plan(&relay, &[OsString::from("metadata")]), Plan::Direct);
+        // Zero proves nothing without a pool: it is no grant to size cargo to and no parent to
+        // ask, so the build asks the gateway as it does with no count at all.
+        let bare = environment(&[("BOUNDED_EXEC_CPU_TOKENS", "0")]);
+        assert!(matches!(plan(&bare, &arguments), Plan::Ask { .. }));
+        assert_eq!(plan(&bare, &[OsString::from("metadata")]), Plan::Direct);
+        // A pool beside no count, or beside one that is no count, is no descriptor either.
+        let uncounted = environment(&[("BOUNDED_EXEC_CPU_POOL", "/private/live-parent.sock")]);
+        assert!(matches!(plan(&uncounted, &arguments), Plan::Ask { .. }));
+        for count in ["-1", "many", ""] {
+            let pairs = [
+                ("BOUNDED_EXEC_CPU_POOL", "/private/live-parent.sock"),
+                ("BOUNDED_EXEC_CPU_TOKENS", count),
+            ];
+            let malformed = environment(&pairs);
+            assert!(
+                matches!(plan(&malformed, &arguments), Plan::Ask { .. }),
+                "{count:?}"
+            );
+        }
     }
 
     fn words(arguments: &[&str]) -> Vec<OsString> {

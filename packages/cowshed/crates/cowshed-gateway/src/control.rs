@@ -21,8 +21,8 @@ use zeroize::{Zeroize, Zeroizing};
 use cowshed_gateway_types::{
     CPU_TOKENS_OP, CpuBudgetStatus, DISK_LEASE_OP, DaemonStatus, DiskClass, EgressGrant,
     EgressMode, HostPattern, JOBSERVER_OP, LeaseClass, LeaseState, MirrorRoute, PhaseShare,
-    TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus, TaskRunCaps, WorkspaceCa,
-    WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
+    RESIDENT_POOL_OP, TASK_ADMIT_OP, TaskClass, TaskGrant, TaskOutcome, TaskQueueStatus,
+    TaskRunCaps, WorkspaceCa, WorkspaceEndpoint, WorkspacePolicy, WorkspaceSession, WorkspaceToken,
 };
 
 use crate::{
@@ -409,6 +409,12 @@ enum Incoming {
         command: String,
         options: JobserverOptions,
     },
+    /// A resident job's pool: no token, no queue place; each child it serves asks the host.
+    ResidentPool {
+        checkout: String,
+        command: String,
+        job: JobserverJobIn,
+    },
     TaskAdmit {
         unit: String,
         owner: String,
@@ -480,7 +486,7 @@ struct JobserverIn {
     #[serde(flatten)]
     tokens: CpuTokensIn,
     #[serde(default)]
-    class: cowshed_gateway_types::JobserverClass,
+    class: crate::jobserver::JobserverAdmission,
     #[serde(default)]
     pool: bool,
     job: Option<JobserverJobIn>,
@@ -493,6 +499,16 @@ struct JobserverOptions {
     admission: crate::jobserver::JobserverAdmission,
     pool_job: Option<JobserverJobIn>,
     grow: bool,
+}
+
+/// A `resident-pool` request's fields: the checkout its children's asks are for, what the
+/// resident runs, and the trusted job identity that scopes its pool. It names no `want`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResidentPoolIn {
+    checkout: String,
+    command: String,
+    job: JobserverJobIn,
 }
 
 #[derive(Deserialize)]
@@ -1016,6 +1032,22 @@ async fn serve<R, W>(
             )
             .await;
         }
+        Ok(Incoming::ResidentPool {
+            checkout,
+            command,
+            job,
+        }) => {
+            hold_resident_pool(
+                reader,
+                writer,
+                &services.jobserver,
+                services.cpu_budget.clone(),
+                Arc::from(checkout),
+                &command,
+                &job,
+            )
+            .await;
+        }
         Ok(Incoming::TaskAdmit {
             unit,
             owner,
@@ -1275,6 +1307,95 @@ async fn hold_jobserver<R, W>(
     drop(stake);
 }
 
+/// Hold one resident job's pool: answer `queued`, then at once `granted` with the pool and no
+/// tokens, since a resident takes no place in the ledger; serve it until the client closes. Each
+/// child that asks the pool asks the host budget itself, at background class, for `checkout`
+/// (05_gateway.md "A resident holds no token"), so the resident costs tokens only while a
+/// request of its runs, and closing the pool ends every child's local grant with it.
+async fn hold_resident_pool<R, W>(
+    mut reader: R,
+    mut writer: W,
+    fifos: &crate::jobserver::JobserverFifos,
+    budget: CpuBudget,
+    checkout: Arc<str>,
+    command: &str,
+    job: &JobserverJobIn,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // The same two answers every held CPU request gets, so a supervisor reads one protocol.
+    if write_response(&mut writer, &lease(LeaseState::Queued))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let source = crate::jobserver::PoolSource::Resident {
+        host: budget,
+        checkout,
+    };
+    let pool = match fifos.create_pool(source, &job.workspace_incarnation) {
+        Ok(pool) => pool,
+        Err(error) => {
+            let _ = write_response(
+                &mut writer,
+                &failure(
+                    ControlFailureCode::Rejected,
+                    format!("cannot serve the resident job's CPU pool: {error}"),
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    cowshed_os::timing::event("jobserver", || {
+        format!(
+            "resident pool for {}/{} job {} at {}: {command}",
+            job.repo_id,
+            job.workspace_incarnation,
+            job.job_id,
+            pool.path().display()
+        )
+    });
+    let answer = ControlResponse {
+        cpu_pool: Some(pool.path().to_string_lossy().into_owned()),
+        ..lease(LeaseState::Granted)
+    };
+    if write_response(&mut writer, &answer).await.is_ok() {
+        let mut discard = [0_u8; 64];
+        while let Ok(read) = reader.read(&mut discard).await
+            && read > 0
+        {}
+    }
+    if let Err(error) = pool.close().await {
+        eprintln!("cowshed: resident CPU pool did not close: {error}");
+    }
+}
+
+/// A checkout a CPU request names: a path of 1 to [`MAX_CHECKOUT`] bytes.
+fn checked_checkout(checkout: &str) -> Result<(), ControlError> {
+    if checkout.is_empty() || checkout.len() > MAX_CHECKOUT {
+        return Err(ControlError::Encoding(format!(
+            "a cpu-tokens checkout must name a path of 1 to {MAX_CHECKOUT} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// The trusted job identity a private CPU pool is scoped by: a JavaScript-safe job id and a
+/// workspace incarnation the pool directory layout accepts.
+fn checked_job(job: JobserverJobIn) -> Result<JobserverJobIn, ControlError> {
+    if job.job_id.get() > 9_007_199_254_740_991 {
+        return Err(ControlError::Encoding(
+            "jobId must be a positive JavaScript-safe integer".to_owned(),
+        ));
+    }
+    cowshed_gateway_types::cpu_pool_directory(Path::new("."), &job.workspace_incarnation)
+        .map_err(|error| ControlError::Encoding(error.to_string()))?;
+    Ok(job)
+}
+
 fn parse_control_request(bytes: &[u8]) -> Result<Incoming, ControlError> {
     let value =
         serde_json::from_slice(bytes).map_err(|error| ControlError::Encoding(error.to_string()))?;
@@ -1323,6 +1444,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         JOBSERVER_OP => &[
             "op", "want", "checkout", "command", "class", "pool", "job", "grow",
         ],
+        RESIDENT_POOL_OP => &["op", "checkout", "command", "job"],
         _ => {
             return Err(ControlError::Encoding(
                 "unknown gateway control operation".to_owned(),
@@ -1347,6 +1469,19 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             command,
         });
     }
+    if op == RESIDENT_POOL_OP {
+        let ResidentPoolIn {
+            checkout,
+            command,
+            job,
+        } = serde_json::from_value(value).map_err(encoding)?;
+        checked_checkout(&checkout)?;
+        return Ok(Incoming::ResidentPool {
+            checkout,
+            command,
+            job: checked_job(job)?,
+        });
+    }
     let jobserver = op == JOBSERVER_OP;
     if op == CPU_TOKENS_OP || jobserver {
         let (tokens, options) = if jobserver {
@@ -1363,38 +1498,20 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
                         .to_owned(),
                 ));
             }
-            let admission = match class {
-                cowshed_gateway_types::JobserverClass::Background => {
-                    crate::jobserver::JobserverAdmission::Background
-                }
-                cowshed_gateway_types::JobserverClass::Gate => {
-                    crate::jobserver::JobserverAdmission::Gate
-                }
-            };
             let pool_job = if pool {
                 let job = job.ok_or_else(|| {
                     ControlError::Encoding(
                         "a private CPU pool requires the trusted job identity".to_owned(),
                     )
                 })?;
-                if job.job_id.get() > 9_007_199_254_740_991 {
-                    return Err(ControlError::Encoding(
-                        "jobId must be a positive JavaScript-safe integer".to_owned(),
-                    ));
-                }
-                cowshed_gateway_types::cpu_pool_directory(
-                    Path::new("."),
-                    &job.workspace_incarnation,
-                )
-                .map_err(|error| ControlError::Encoding(error.to_string()))?;
-                Some(job)
+                Some(checked_job(job)?)
             } else {
                 None
             };
             (
                 tokens,
                 JobserverOptions {
-                    admission,
+                    admission: class,
                     pool_job,
                     grow,
                 },
@@ -1414,11 +1531,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             checkout,
             command,
         } = tokens;
-        if checkout.is_empty() || checkout.len() > MAX_CHECKOUT {
-            return Err(ControlError::Encoding(format!(
-                "a cpu-tokens checkout must name a path of 1 to {MAX_CHECKOUT} bytes"
-            )));
-        }
+        checked_checkout(&checkout)?;
         return Ok(if jobserver {
             Incoming::Jobserver {
                 want,

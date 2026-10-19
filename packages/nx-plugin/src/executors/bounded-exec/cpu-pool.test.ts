@@ -365,6 +365,23 @@ describe('the parent-held CPU pool', () => {
     expect(readInheritedCpuPool({ [CPU_TOKENS_ENV]: '4' })).toBeNull();
   });
 
+  it("reads a resident's relay pool: zero beside its endpoint, never bare or malformed", () => {
+    const relay = '/tmp/relay.sock';
+    // The relay pool holds no token for its lifetime and asks the host for each child, so it names 0.
+    expect(readInheritedCpuPool({ [CPU_POOL_ENV]: relay, [CPU_TOKENS_ENV]: '0' })).toEqual({
+      socket: relay,
+      tokens: 0,
+    });
+    // A bare zero proves nothing, as any bare count does, and zero does not relax the endpoint's rules.
+    expect(readInheritedCpuPool({ [CPU_TOKENS_ENV]: '0' })).toBeNull();
+    expect(readInheritedCpuPool({ [CPU_POOL_ENV]: '', [CPU_TOKENS_ENV]: '0' })).toBeNull();
+    expect(readInheritedCpuPool({ [CPU_POOL_ENV]: 'a\0b', [CPU_TOKENS_ENV]: '0' })).toBeNull();
+    // Zero is the one non-positive count: its other spellings, negatives and unsafe integers stay malformed.
+    for (const malformed of ['-1', '-0', '+0', '00', '0.0', ' 0', '0 ', '', '9007199254740993']) {
+      expect(readInheritedCpuPool({ [CPU_POOL_ENV]: relay, [CPU_TOKENS_ENV]: malformed })).toBeNull();
+    }
+  });
+
   it('names the endpoint and count it holds, in private owned paths, and removes them on close', async () => {
     const made = await createCpuPool(3, NEVER, countedWaits());
     if (!made.ok) {
@@ -489,6 +506,7 @@ describe('the parent-held CPU pool', () => {
       { want: 8, inherited: 2, tokens: 8 },
       { want: 8, inherited: 8, tokens: 8 },
       { want: 3, inherited: 1, tokens: 3 },
+      { want: 4, inherited: 0, tokens: 4 }, // a resident's relay pool names 0: the count bounds no ask
     ];
     for (const check of cases) {
       // A fresh full pool isolates each ask from delivery of the previous client's close event.

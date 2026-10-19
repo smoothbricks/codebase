@@ -336,8 +336,9 @@ impl Default for WorkspaceSupervisorConfig {
     }
 }
 
-/// A CPU budget that grants each request its whole want at once: in-crate tests' stand-in for the
-/// gateway. Its pool names no live socket; nothing in these tests asks it for tokens.
+/// A CPU budget that grants each request its whole want at once, and a resident its pool alone:
+/// in-crate tests' stand-in for the gateway. Its pool names no live socket; nothing in these
+/// tests asks it for tokens.
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct ImmediateCpu;
@@ -349,11 +350,13 @@ impl JobCpuAdmission for ImmediateCpu {
         ask: JobCpuAsk,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobCpuGrant>> + Send>> {
         Box::pin(async move {
-            Ok(JobCpuGrant::new(
-                ask.want,
-                PathBuf::from("/nonexistent/cowshed-cpu-pool.sock"),
-                Box::new(()),
-            ))
+            let pool = PathBuf::from("/nonexistent/cowshed-cpu-pool.sock");
+            Ok(match ask.class {
+                JobserverClass::Resident => JobCpuGrant::resident(pool, Box::new(())),
+                JobserverClass::Background | JobserverClass::Gate => {
+                    JobCpuGrant::new(ask.want, pool, Box::new(()))
+                }
+            })
         })
     }
 }
@@ -571,10 +574,12 @@ pub struct ProcessSpawnRequest {
 
 /// What a spawn places a job's owned command under: its CPU grant, served to the command as the
 /// live pool and count every nested runner borrows from (05_gateway.md "Nested runners use a
-/// parent-held sub-ledger"), and the nice its class runs at.
+/// parent-held sub-ledger"), and the nice its class runs at. A resident holds no tokens: its
+/// count is 0 and its pool asks the host for each child (05_gateway.md "A resident holds no
+/// token").
 #[derive(Clone, Debug)]
 pub struct CpuPlacement {
-    pub tokens: NonZeroUsize,
+    pub tokens: Option<NonZeroUsize>,
     pub pool: PathBuf,
     pub nice: i32,
 }
@@ -591,18 +596,18 @@ impl CpuPlacement {
             ),
             (
                 OsString::from("BOUNDED_EXEC_CPU_TOKENS"),
-                OsString::from(self.tokens.get().to_string()),
+                OsString::from(self.tokens.map_or(0, NonZeroUsize::get).to_string()),
             ),
         ]
     }
 }
 
-/// The nice a class's command runs at: a gate at the supervisor's own, background ten below it.
-/// Never negative: raising a priority takes a privilege no supervisor holds.
+/// The nice a class's command runs at: a gate at the supervisor's own, background and a resident
+/// ten below it. Never negative: raising a priority takes a privilege no supervisor holds.
 pub(super) const fn class_nice(class: JobserverClass) -> i32 {
     match class {
         JobserverClass::Gate => 0,
-        JobserverClass::Background => 10,
+        JobserverClass::Background | JobserverClass::Resident => 10,
     }
 }
 
@@ -4918,11 +4923,16 @@ impl SupervisorActor {
         // not restrict execution; the public-name projection is applied only when recording.
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
         let scheduling = JobScheduling::new(request.scope, request.class, request.want)
-            .ok_or_else(|| {
-                CowshedError::usage(
+            .ok_or_else(|| match request.scope {
+                ExecScope::HostGate => CowshedError::usage(
                     "the host-gate scope requires the gate class",
                     "pass --class gate with the host-gate scope",
-                )
+                ),
+                ExecScope::Workspace => CowshedError::usage(
+                    "a resident holds no CPU token, so it wants none: its descendants ask its \
+                     pool for their own",
+                    "drop --want from a resident exec",
+                ),
             })?;
         // The host boundary has no sandbox to narrow and no exec host to interpret a script.
         if scheduling.scope() == ExecScope::HostGate {
@@ -5309,7 +5319,7 @@ impl SupervisorActor {
             pool: grant.pool().to_path_buf(),
             nice: class_nice(job.info.class),
         };
-        job.info.cpu_tokens = Some(grant.tokens());
+        job.info.cpu_tokens = grant.tokens();
         job.info.state = JobState::Running;
         job.cpu = CpuStanding::Granted { _grant: grant };
         // Read before the job's first process is dispatched, so nothing it writes precedes its

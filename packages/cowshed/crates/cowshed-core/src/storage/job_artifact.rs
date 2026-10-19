@@ -450,8 +450,9 @@ pub struct JobAdmission {
 }
 
 /// The host CPU admission a job asked for (05_gateway.md "Host CPU budget"): the scope it runs
-/// in, its class and the tokens it wants. Only a gate runs at the host boundary, so [`Self::new`]
-/// is the only way to one.
+/// in, its class and the tokens it wants. Only a gate runs at the host boundary, and a resident
+/// asks for no token, so its want is the default one it cannot raise; [`Self::new`] is the only
+/// way to one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobScheduling {
     scope: ExecScope,
@@ -460,13 +461,16 @@ pub struct JobScheduling {
 }
 
 impl JobScheduling {
-    /// `None` for a host gate scope with background work.
+    /// `None` for a host gate scope with work that is not a gate, and for a resident that names
+    /// a want above the default.
     pub fn new(scope: ExecScope, class: JobserverClass, want: NonZeroUsize) -> Option<Self> {
         match (scope, class) {
-            (ExecScope::Workspace, _) | (ExecScope::HostGate, JobserverClass::Gate) => {
-                Some(Self { scope, class, want })
+            (ExecScope::Workspace, JobserverClass::Background | JobserverClass::Gate)
+            | (ExecScope::HostGate, JobserverClass::Gate) => Some(Self { scope, class, want }),
+            (ExecScope::Workspace, JobserverClass::Resident) => {
+                (want == NonZeroUsize::MIN).then_some(Self { scope, class, want })
             }
-            (ExecScope::HostGate, JobserverClass::Background) => None,
+            (ExecScope::HostGate, JobserverClass::Background | JobserverClass::Resident) => None,
         }
     }
 
@@ -4711,6 +4715,7 @@ fn class_name(class: JobserverClass) -> &'static str {
     match class {
         JobserverClass::Background => "background",
         JobserverClass::Gate => "gate",
+        JobserverClass::Resident => "resident",
     }
 }
 
@@ -4735,6 +4740,7 @@ fn parse_class(name: &str) -> Result<JobserverClass, ArtifactError> {
     match name {
         "background" => Ok(JobserverClass::Background),
         "gate" => Ok(JobserverClass::Gate),
+        "resident" => Ok(JobserverClass::Resident),
         other => Err(ArtifactError::Arrow(format!("unknown CPU class {other:?}"))),
     }
 }

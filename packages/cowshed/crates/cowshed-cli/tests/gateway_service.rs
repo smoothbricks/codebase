@@ -17,6 +17,7 @@ use cowshed_core::api::{
 use cowshed_core::{CowshedError, Result};
 use cowshed_gateway_types::{
     CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuGateWaiter, CpuHolder,
+    CpuWaiter,
 };
 
 use std::collections::VecDeque;
@@ -451,7 +452,10 @@ fn gateway_status_says_an_install_is_pending_and_which_gates_it_waits_for() {
 /// the head gate job, the gate jobs behind it, the gate queue, then background — as the daemon's
 /// `cpu-budget` ledger says (05_gateway.md "Host CPU budget", Wire), in both the human lines and
 /// the JSON result. Every lease is named by its pid, its tokens of its want, the age of its grant
-/// and its command, so a live holder is never taken for an orphan by its checkout's name.
+/// and its command, so a live holder is never taken for an orphan by its checkout's name; every
+/// waiting request by its pid, its want, the age of its wait and its command; and the leases held
+/// past the hold limit are named again right after the count, oldest first (05_gateway.md "The
+/// hold limit").
 #[test]
 fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
     let ledger = CpuBudgetStatus {
@@ -510,24 +514,33 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
             CpuGateWaiter {
                 checkout: "/w/older-land".into(),
                 job: 3,
+                pid: Some(103),
+                command: "cargo nextest run -p app".into(),
                 want: 6,
+                waited_ms: 187_000,
             },
             CpuGateWaiter {
                 checkout: "/w/older-land".into(),
                 job: 3,
+                pid: Some(104),
+                command: "bun test".into(),
                 want: 2,
+                waited_ms: 42_000,
             },
             CpuGateWaiter {
                 checkout: "/w/younger-land".into(),
                 job: 5,
+                pid: None,
+                command: "nx run-many -t test".into(),
                 want: 18,
+                waited_ms: 9_000,
             },
         ],
         background: vec![
             CpuBackgroundStake {
                 checkout: "/w/older-land".into(),
                 held: 1,
-                waiting: 0,
+                waiters: Vec::new(),
                 holders: vec![CpuHolder {
                     pid: Some(9),
                     command: "bun test".into(),
@@ -539,7 +552,7 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
             CpuBackgroundStake {
                 checkout: "/w/younger-land".into(),
                 held: 3,
-                waiting: 0,
+                waiters: Vec::new(),
                 holders: vec![CpuHolder {
                     pid: Some(71437),
                     command: "cargo --frozen test -p app".into(),
@@ -569,15 +582,17 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
         ledger_lines,
         [
             "cowshed: gateway cpu budget: held 17/18 tokens",
+            "cowshed: gateway cpu hold past 30m: /w/older-land: pid 9, 1/1 tokens, granted 1h02m05s ago: bun test",
+            "cowshed: gateway cpu hold past 30m: /w/younger-land: pid 71437, 3/18 tokens, granted 34m07s ago: cargo --frozen test -p app",
             "cowshed: gateway gate head: /w/older-land gate job 3: held 12, running 2",
             "cowshed: gateway gate lease: /w/older-land gate job 3: pid 101, 10/18 tokens, granted 2m05s ago: nx run-many -t test",
             "cowshed: gateway gate lease: /w/older-land gate job 3: pid 102, 2/4 tokens, granted 3s ago: child CPU pool",
             "cowshed: gateway gate job behind the head: /w/younger-land gate job 5: held 1, running 1",
             "cowshed: gateway gate lease: /w/younger-land gate job 5: pid unknown, 1/1 tokens, granted 1m01s ago: child CPU pool",
             "cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them",
-            "cowshed: gateway gate queue 1: /w/older-land gate job 3 want 6",
-            "cowshed: gateway gate queue 2: /w/older-land gate job 3 want 2",
-            "cowshed: gateway gate queue 3: /w/younger-land gate job 5 want 18",
+            "cowshed: gateway gate queue 1: /w/older-land gate job 3: pid 103, want 6, waiting 3m07s: cargo nextest run -p app",
+            "cowshed: gateway gate queue 2: /w/older-land gate job 3: pid 104, want 2, waiting 42s: bun test",
+            "cowshed: gateway gate queue 3: /w/younger-land gate job 5: pid unknown, want 18, waiting 9s: nx run-many -t test",
             "cowshed: gateway background: /w/older-land: held 1, running 1, waiting 0",
             "cowshed: gateway background lease: /w/older-land: pid 9, 1/1 tokens, granted 1h02m05s ago: bun test",
             "cowshed: gateway background: /w/younger-land: held 3, running 1, waiting 0",
@@ -615,19 +630,191 @@ fn gateway_status_shows_the_cpu_ledger_and_the_gate_queue_in_serving_order() {
                 ]}
             ],
             "gateQueue": [
-                {"checkout": "/w/older-land", "job": 3, "want": 6},
-                {"checkout": "/w/older-land", "job": 3, "want": 2},
-                {"checkout": "/w/younger-land", "job": 5, "want": 18}
+                {"checkout": "/w/older-land", "job": 3, "pid": 103, "command": "cargo nextest run -p app", "want": 6, "waitedMs": 187000},
+                {"checkout": "/w/older-land", "job": 3, "pid": 104, "command": "bun test", "want": 2, "waitedMs": 42000},
+                {"checkout": "/w/younger-land", "job": 5, "command": "nx run-many -t test", "want": 18, "waitedMs": 9000}
             ],
             "background": [
-                {"checkout": "/w/older-land", "held": 1, "waiting": 0, "holders": [
+                {"checkout": "/w/older-land", "held": 1, "waiters": [], "holders": [
                     {"pid": 9, "command": "bun test", "tokens": 1, "want": 1, "heldMs": 3725000}
                 ]},
-                {"checkout": "/w/younger-land", "held": 3, "waiting": 0, "holders": [
+                {"checkout": "/w/younger-land", "held": 3, "waiters": [], "holders": [
                     {"pid": 71437, "command": "cargo --frozen test -p app", "tokens": 3, "want": 18, "heldMs": 2047999}
                 ]}
             ]
         }})
+    );
+}
+
+/// One gate job's tasks wait as one queue entry each, all under the job's one number: measured
+/// 2026-10-19, fifteen `batch-7 gate job 603 want 1` entries were fifteen of that gate's
+/// tasks and read as duplicates because they named nothing else. Each entry carries its own pid,
+/// wait and command (05_gateway.md "Host CPU budget", Wire), in the order returned tokens go to
+/// them.
+#[test]
+fn gateway_status_tells_apart_the_tasks_of_one_gate_job_waiting_for_tokens() {
+    let waiter = |pid: i32, command: &str, waited_ms: u64| CpuGateWaiter {
+        checkout: "/mnt/app/batch-7".into(),
+        job: 603,
+        pid: Some(pid),
+        command: command.into(),
+        want: 1,
+        waited_ms,
+    };
+    let ledger = CpuBudgetStatus {
+        total: 18,
+        held: 18,
+        checkouts: vec![
+            CpuCheckoutStatus {
+                checkout: "/mnt/app/batch-7".into(),
+                held: 1,
+                running: 1,
+                waiting: 3,
+            },
+            CpuCheckoutStatus {
+                checkout: "/mnt/app/account-placement".into(),
+                held: 17,
+                running: 1,
+                waiting: 0,
+            },
+        ],
+        gate_jobs: vec![CpuGateJob {
+            checkout: "/mnt/app/batch-7".into(),
+            job: 603,
+            held: 1,
+            holders: vec![CpuHolder {
+                pid: Some(40100),
+                command: "nx run-many -t test".into(),
+                tokens: 1,
+                want: 1,
+                held_ms: 730_000,
+            }],
+        }],
+        gate_queue: vec![
+            waiter(40118, "bun test packages/core", 723_000),
+            waiter(40127, "bun test packages/tooling", 241_000),
+            waiter(40133, "tsc --noEmit -p packages/core", 7_000),
+        ],
+        background: vec![CpuBackgroundStake {
+            checkout: "/mnt/app/account-placement".into(),
+            held: 17,
+            holders: vec![CpuHolder {
+                pid: Some(29272),
+                command: "cargo --frozen test -p app_runtime".into(),
+                tokens: 17,
+                want: 18,
+                held_ms: 570_000,
+            }],
+            waiters: Vec::new(),
+        }],
+    };
+
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    emit_gateway_status(
+        &mut output,
+        false,
+        answering_status(GatewayCpuBudget::Ledger(ledger)),
+    )
+    .expect("status emits");
+    let stderr = String::from_utf8(output.into_inner().1).expect("utf8 status");
+    let entries: Vec<&str> = stderr
+        .lines()
+        .skip_while(|line| !line.contains("gateway gate queue: 3 waiting"))
+        .skip(1)
+        .take(3)
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            "cowshed: gateway gate queue 1: /mnt/app/batch-7 gate job 603: pid 40118, want 1, waiting 12m03s: bun test packages/core",
+            "cowshed: gateway gate queue 2: /mnt/app/batch-7 gate job 603: pid 40127, want 1, waiting 4m01s: bun test packages/tooling",
+            "cowshed: gateway gate queue 3: /mnt/app/batch-7 gate job 603: pid 40133, want 1, waiting 7s: tsc --noEmit -p packages/core",
+        ],
+        "{stderr}"
+    );
+}
+
+/// A background stake's waiting requests follow its leases, each named as a gate's are — by its
+/// pid, its want, the age of its wait and its command — and the stake's `waiting` count is how
+/// many there are; the JSON carries them as `waiters` (05_gateway.md "Host CPU budget", Wire).
+#[test]
+fn gateway_status_names_the_requests_a_background_stake_has_waiting() {
+    let ledger = CpuBudgetStatus {
+        total: 18,
+        held: 3,
+        checkouts: vec![CpuCheckoutStatus {
+            checkout: "/w/land".into(),
+            held: 3,
+            running: 1,
+            waiting: 2,
+        }],
+        gate_jobs: Vec::new(),
+        gate_queue: Vec::new(),
+        background: vec![CpuBackgroundStake {
+            checkout: "/w/land".into(),
+            held: 3,
+            holders: vec![CpuHolder {
+                pid: Some(71437),
+                command: "cargo --frozen test -p app".into(),
+                tokens: 3,
+                want: 18,
+                held_ms: 300_000,
+            }],
+            waiters: vec![
+                CpuWaiter {
+                    pid: Some(71502),
+                    command: "cargo nextest run".into(),
+                    want: 18,
+                    waited_ms: 250_000,
+                },
+                CpuWaiter {
+                    pid: None,
+                    command: "bun test".into(),
+                    want: 4,
+                    waited_ms: 9_000,
+                },
+            ],
+        }],
+    };
+
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    emit_gateway_status(
+        &mut output,
+        false,
+        answering_status(GatewayCpuBudget::Ledger(ledger.clone())),
+    )
+    .expect("status emits");
+    let stderr = String::from_utf8(output.into_inner().1).expect("utf8 status");
+    let background: Vec<&str> = stderr
+        .lines()
+        .skip_while(|line| !line.contains("gateway background:"))
+        .collect();
+    assert_eq!(
+        background,
+        [
+            "cowshed: gateway background: /w/land: held 3, running 1, waiting 2",
+            "cowshed: gateway background lease: /w/land: pid 71437, 3/18 tokens, granted 5m00s ago: cargo --frozen test -p app",
+            "cowshed: gateway background queue 1: /w/land: pid 71502, want 18, waiting 4m10s: cargo nextest run",
+            "cowshed: gateway background queue 2: /w/land: pid unknown, want 4, waiting 9s: bun test",
+        ],
+        "{stderr}"
+    );
+
+    let mut output = Output::new(Vec::new(), Vec::new(), false);
+    emit_gateway_status(
+        &mut output,
+        true,
+        answering_status(GatewayCpuBudget::Ledger(ledger)),
+    )
+    .expect("status emits");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.into_inner().0).expect("one JSON line");
+    assert_eq!(
+        json["result"]["cpuBudget"]["ledger"]["background"][0]["waiters"],
+        serde_json::json!([
+            {"pid": 71502, "command": "cargo nextest run", "want": 18, "waitedMs": 250000},
+            {"command": "bun test", "want": 4, "waitedMs": 9000}
+        ])
     );
 }
 

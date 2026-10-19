@@ -470,18 +470,21 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
 const TEST_POOL: &str = "/nonexistent/cowshed-test-cpu-pool.sock";
 
 /// The gateway's CPU budget for these tests: each request is granted its whole want at once, so
-/// a job spawns as soon as it is admitted.
+/// a job spawns as soon as it is admitted; a resident is granted its pool alone, as the gateway
+/// answers one.
 #[derive(Debug)]
 struct ImmediateCpu;
 
 impl JobCpuAdmission for ImmediateCpu {
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
         Box::pin(async move {
-            Ok(JobCpuGrant::new(
-                ask.want,
-                PathBuf::from(TEST_POOL),
-                Box::new(()),
-            ))
+            let pool = PathBuf::from(TEST_POOL);
+            Ok(match ask.class {
+                JobserverClass::Resident => JobCpuGrant::resident(pool, Box::new(())),
+                JobserverClass::Background | JobserverClass::Gate => {
+                    JobCpuGrant::new(ask.want, pool, Box::new(()))
+                }
+            })
         })
     }
 }
@@ -6511,9 +6514,10 @@ fn nx_daemon_start(project: &Path) -> Vec<OsString> {
 const NX_PROBES: Duration = Duration::from_secs(60);
 
 /// A shed's code is unsigned and Nx's daemon runs it, so the daemon a host client connects to is
-/// one the shed's supervisor keeps alive inside the sandbox: a read-write background job of the
+/// one the shed's supervisor keeps alive inside the sandbox: a read-write resident job of the
 /// project's own `nx`, started with the supervisor, never a second while one runs, and again
-/// once the daemon it started is gone.
+/// once the daemon it started is gone. A resident holds no CPU token, so keeping the daemon
+/// leaves the shed's share of the host whole (05_gateway.md "A resident holds no token").
 #[tokio::test(start_paused = true)]
 async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     let (supervisor_config, _root) = nx_project("raven");
@@ -6526,6 +6530,16 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     };
     assert_eq!(argv, &nx_daemon_start(&project));
     assert_eq!(first.request.mode, RunSandboxMode::ReadWrite);
+    assert_eq!(
+        (first.request.cpu.tokens, first.request.cpu.nice),
+        (None, 10),
+        "the daemon holds no token and runs at background nice"
+    );
+    let started = h.handle.info(first.request.job_id).await.unwrap();
+    assert_eq!(
+        (started.class, started.cpu_tokens),
+        (JobserverClass::Resident, None)
+    );
     assert!(
         first.request.cwd.as_os_str().is_empty(),
         "run from the project root"
@@ -7889,7 +7903,7 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
             spawned.request.scope,
         ),
         (
-            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(4),
             Path::new(TEST_POOL),
             10,
             ExecScope::Workspace

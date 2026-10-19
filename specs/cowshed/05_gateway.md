@@ -551,7 +551,8 @@ read a newer snapshot; that decision stands, and the write counts as superseded 
 the reconcile.
 
 Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a
-`disk-lease`, `cpu-tokens` or `jobserver` request is held for as long as its client keeps the connection open.
+`disk-lease`, `cpu-tokens`, `jobserver` or `resident-pool` request is held for as long as its client keeps the
+connection open.
 
 ## Disk-lifecycle lease
 
@@ -706,23 +707,23 @@ core count.
   gate class is served FIFO at highest priority over all other execs … When gate runs it needs more tickets than
   background but not fully starve background"; tg#7019, of two concurrent lands: "first should be full priority and
   second almost background until first completes"). A jobserver root request carries a typed
-  `class: "background" | "gate"`; omission is background. Gate-class work is ranked by the gate job it serves, by that
-  job's own admission: a gate root request is its own job, and every task its pool relays ranks by the root's admission,
-  not by when the task asked. While any gate-class work wants tokens, the oldest gate job's next want is served once a
-  token is free, wherever its requests sit in their checkouts' queues: a waiting task takes `min(want, free)`, in the
-  order that job's tasks asked, before a running task of that job grows ("A short build grows" below). All of it comes
-  ahead of every queued background request (both jobserver and `cpu-tokens`). The work behind the gate job being served
-  — background and every younger gate job — is not starved meanwhile: a background checkout, or a younger gate job, that
-  waits holding nothing is granted one token first, oldest request first, as long as that work as a whole then still
-  holds less than half of N, so the job being served and the older ones hold the larger part. A younger land is thereby
-  "almost background" (tg#7019): its orchestrator starts on its floor token, and its tasks queue behind the older land's
-  until the older land stops wanting. Every grant is whole, so two younger gate jobs on their floor tokens wait on
-  nothing the other holds. Measured without that floor: a younger land asking for its orchestrator's one token while the
-  older land held 13 of 18 tokens waited out the older land and failed. A running gate grant blocks nobody: with no
-  gate-class work wanting tokens, ordinary checkout fairness serves background from the free tokens. An in-flight
-  background grant stays exactly as it is until its child exits or its connection closes. This is priority on genuinely
-  returned tokens, not a reserved budget, budget increase, or stolen allocation. Conservation remains
-  `free + Σ held = N`.
+  `class: "background" | "gate"`; omission is background, and any other class is `invalid-request` (a resident asks with
+  `resident-pool`, below). Gate-class work is ranked by the gate job it serves, by that job's own admission: a gate root
+  request is its own job, and every task its pool relays ranks by the root's admission, not by when the task asked.
+  While any gate-class work wants tokens, the oldest gate job's next want is served once a token is free, wherever its
+  requests sit in their checkouts' queues: a waiting task takes `min(want, free)`, in the order that job's tasks asked,
+  before a running task of that job grows ("A short build grows" below). All of it comes ahead of every queued
+  background request (both jobserver and `cpu-tokens`). The work behind the gate job being served — background and every
+  younger gate job — is not starved meanwhile: a background checkout, or a younger gate job, that waits holding nothing
+  is granted one token first, oldest request first, as long as that work as a whole then still holds less than half of
+  N, so the job being served and the older ones hold the larger part. A younger land is thereby "almost background"
+  (tg#7019): its orchestrator starts on its floor token, and its tasks queue behind the older land's until the older
+  land stops wanting. Every grant is whole, so two younger gate jobs on their floor tokens wait on nothing the other
+  holds. Measured without that floor: a younger land asking for its orchestrator's one token while the older land held
+  13 of 18 tokens waited out the older land and failed. A running gate grant blocks nobody: with no gate-class work
+  wanting tokens, ordinary checkout fairness serves background from the free tokens. An in-flight background grant stays
+  exactly as it is until its child exits or its connection closes. This is priority on genuinely returned tokens, not a
+  reserved budget, budget increase, or stolen allocation. Conservation remains `free + Σ held = N`.
 - **A land is a gate job, and its tasks are gate-class requests.** The selecting authority is the land queue holder:
   `~/Dev/.land-lock.sh` runs main's `tooling/land-host.sh`, the only path that gates a tree before `cowshed land`
   fast-forwards to it, and it runs that gate as `cowshed exec <workspace> --class gate --host -- …`. The trusted route
@@ -781,14 +782,15 @@ core count.
   a gate-host or taskpolicy wrapper. Its typed request carries class, want and scope. Only a trusted
   coordinator/operator may request Gate or HostGate; a worker request is refused with typed class-not-permitted before
   job or spawn effects. Ordinary commands default Background, want1 and Workspace scope; producers that need parallel
-  work supply their actual demand. The supervisor records Queued, asks the gateway off its actor path and spawns only
-  after a real grant. CPU admission uses the control socket of the controller's validated host storage, the same
-  store/gateway.sock authority its gateway reconciliation uses, never an unrelated ambient store. A queued kill
-  withdraws the request without spawning. Missing/refused admission never causes an unbudgeted server spawn. The
-  supervisor retains the allocation until the owned job concludes. The gateway's existing CpuBudget ledger serves that
-  exact allocation on a private workspace-scoped CPU-pool endpoint; Nx bounded-exec and Cargo descendants borrow only
-  from it, with sibling sums bounded by its actual count, or, for a gate job, through it as gate-class host requests.
-  The root FIFO is not offered alongside the pool: that would spend the same tokens twice. Its canonical endpoint is
+  work supply their actual demand; a resident (below) is Resident, which a worker may ask for, and names no want. The
+  supervisor records Queued, asks the gateway off its actor path and spawns only after a real grant. CPU admission uses
+  the control socket of the controller's validated host storage, the same store/gateway.sock authority its gateway
+  reconciliation uses, never an unrelated ambient store. A queued kill withdraws the request without spawning.
+  Missing/refused admission never causes an unbudgeted server spawn. The supervisor retains the allocation until the
+  owned job concludes. The gateway's existing CpuBudget ledger serves that exact allocation on a private
+  workspace-scoped CPU-pool endpoint; Nx bounded-exec and Cargo descendants borrow only from it, with sibling sums
+  bounded by its actual count, or, for a gate job, through it as gate-class host requests. The root FIFO is not offered
+  alongside the pool: that would spend the same tokens twice. Its canonical endpoint is
   `<store>/run/cpu/<base64url-incarnation>/<opaque-endpoint>`: the unpadded 22-byte incarnation component losslessly
   encodes all 128 bits of the validated 32-lowercase-hex workspace incarnation, never a digest or truncated prefix. The
   opaque endpoint is an independent 22-byte unpadded base64url UUID. The gateway, sandbox builder and grant validator
@@ -803,6 +805,24 @@ core count.
   preserving the real-APFS gate's host authority; no ordinary workspace sandbox is loosened. Controller discovery uses
   only `cargo locate-project` and `cargo metadata --no-deps --offline`, which retain their noncompiling exemption: no
   grant, class nice or job record is claimed for that discovery.
+- **A resident holds no token** (2026-10-19). A token is a runnable thread the holder is using now, so a process that
+  stays up to serve requests and is idle between them — the Nx daemon a shed's supervisor keeps (04_sandbox.md), a
+  worker that runs each request it is sent — must not hold one for its lifetime: starting a resident must not reduce its
+  checkout's usable concurrency. Measured 2026-10-19: every shed's Nx daemon held its shed's one background token for
+  its whole life (46 minutes in `batch-7`, 3 jobs waiting behind it), and a test's scratch Nx worker held its
+  workspace's token for 28 minutes while that test's worktree snapshot waited for it; and because the next grant goes to
+  the waiting checkout that holds the fewest tokens, a checkout whose daemon held one token was served after every
+  checkout that held none. A resident is admitted as class Resident: its supervisor writes
+  `{"op":"resident-pool","checkout":"<workspace root>","command":"<command>","job":{…}}`, which names no `want`; the
+  gateway takes no ledger place for it and answers `queued` and then at once `granted` with `cpuPool` and no `tokens` or
+  `fifo`. That pool lends nothing of its own: each child that asks it asks the host ledger itself, at background class
+  for the resident's checkout, exactly as a root background request does, so a resident's request takes its tokens when
+  it starts and returns them when it ends. Its command receives that pool and `BOUNDED_EXEC_CPU_TOKENS=0`; a pool with a
+  count of 0 is a valid descriptor (a bare 0 without a pool still proves nothing), and Nx bounded-exec and the Cargo
+  launcher ask it as any parent pool. The resident runs at background nice. The connection is the pool's life: the
+  resident's exit closes it. A different token class would leave the resident in the ledger holding something; exempting
+  it from the budget would leave the requests it runs unbudgeted; acquiring per request through a relay pool is the gate
+  job's existing mechanism and budgets exactly the work.
 - **Work-conserving.** No grant is capped below `want` for fairness' sake: with nobody else waiting, a grant is
   `min(want, free)`, so a lone runner may hold all N tokens, because idle tokens help nobody and a gate's wall time is
   what the budget buys. A lone waiter also takes the remaining free tokens when fewer than its fair share are free: on
@@ -855,21 +875,35 @@ core count.
   checkout `held`, `running` and `waiting` (every class together); `gateJobs`: the gate jobs whose runners hold tokens,
   oldest job first — the first is the head of the gate queue — each with its `checkout`, its gate `job` (the job's
   admission number; the smaller is the older job), the tokens it `held` and its `holders`; `gateQueue`: the waiting
-  gate-class requests in the order returned tokens go to them, each with its `checkout`, gate `job` and `want`; and
-  `background`: each checkout's background-class stake alone (`held`, `waiting`, `holders`), for the checkouts that have
-  one. `holders` are the granted leases, one per runner holding tokens, oldest grant first, each with the client's `pid`
-  (the socket's peer; absent when the socket names none — a pool-relayed task is named by its own connection to the
-  pool), the `command` it named, the `tokens` it holds now, its `want`, and `heldMs`, the milliseconds since its grant.
-  The age is the lease's, never the process's: a lease is one connection granted once, a growth does not renew it, and a
-  process that asks again holds a new lease with its own age; the ledger never scans processes, and `ps -p <pid>` gives
-  the process's age. Measured 2026-10-18: a ledger that named only `land-test-hang: held 15, running 1` read as an
-  orphan, and a live 34-minute `cargo test … fleet_coder` another unit was waiting on was killed by hand; its holder
-  line would have said what it was and that it was live. `cowshed gateway status` shows this ledger to the operator in
-  the order it serves — the head gate job, the gate jobs behind it, the gate queue, then background, each running gate
-  job and background stake followed by its leases — in its human lines, and verbatim as `cpuBudget` in `--json`
-  (06_cli.md; 07_api.md `GatewayStatus`), so whether queued lands wait behind the head of the queue without loading it,
-  and who holds every token since when, is visible rather than inferred; a daemon that does not answer `cpu-budget` is
-  reported as such, never as an empty ledger.
+  gate-class requests in the order returned tokens go to them, each with its `checkout`, gate `job`, the client's `pid`,
+  the `command` it named, its `want` and `waitedMs`, the milliseconds since it asked; and `background`: each checkout's
+  background-class stake alone (`held`, `holders`, and its waiting requests as `waiters`, each with `pid`, `command`,
+  `want` and `waitedMs`), for the checkouts that have one. Every waiting entry is one request: a gate job whose tasks
+  wait is one entry per task — the job identity is the gate `job` number and each entry is a distinct connection — so
+  the queue is never collapsed per job; its pid, command and age tell the entries apart (measured 2026-10-19: fifteen
+  `batch-7 gate job 603 want 1` entries were fifteen of that gate's tasks, and read as duplicates because they named
+  nothing else). `holders` are the granted leases, one per runner holding tokens, oldest grant first, each with the
+  client's `pid` (the socket's peer; absent when the socket names none — a pool-relayed task is named by its own
+  connection to the pool), the `command` it named, the `tokens` it holds now, its `want`, and `heldMs`, the milliseconds
+  since its grant. The age is the lease's, never the process's: a lease is one connection granted once, a growth does
+  not renew it, and a process that asks again holds a new lease with its own age; the ledger never scans processes, and
+  `ps -p <pid>` gives the process's age. Measured 2026-10-18: a ledger that named only
+  `land-test-hang: held 15, running 1` read as an orphan, and a live 34-minute `cargo test …` another unit was waiting
+  on was killed by hand; its holder line would have said what it was and that it was live. `cowshed gateway status`
+  shows this ledger to the operator in the order it serves — the head gate job, the gate jobs behind it, the gate queue,
+  then background, each running gate job and background stake followed by its leases — in its human lines, and verbatim
+  as `cpuBudget` in `--json` (06_cli.md; 07_api.md `GatewayStatus`), so whether queued lands wait behind the head of the
+  queue without loading it, and who holds every token since when, is visible rather than inferred; a daemon that does
+  not answer `cpu-budget` is reported as such, never as an empty ledger.
+- **The hold limit** (2026-10-19). A lease held past 30 minutes (`HOLD_LIMIT`) is named on the lines right after the
+  ledger's count, oldest first, by checkout, pid, tokens, want, age and command
+  (`gateway cpu hold past 30m: <checkout>: pid <pid>, <g>/<want> tokens, granted <age> ago: <command>`), so the first
+  lines of `cowshed gateway status` answer who holds the host and since when. Measured 2026-10-19: a deployed-proof
+  `cargo test … --ignored` integration test held 12 of 18 tokens for 48 minutes while a land's gate waited with 2, and
+  its holder was found with `ps`. The limit is reported, never enforced: a lease is a ledger entry, not its work's owner
+  ("Crash safety by connection"), so revoking it would return tokens while the work runs on over budget. What ends a
+  runaway is its own bound — bounded-exec's `timeoutMs`, a test harness's ceiling — and a wait for tokens is bounded the
+  same way: a queued run is not idle, but a ceiling no wait stops still ends it as starved.
 - **Priority updates.** `{"op":"job-qos","job":{…}|"lease":"<lease id>","priority":<u32>}` is one-shot and answers
   `{"ok":true}`, or `not-found` for an admission that is not live. It re-keys the selected admission only while queued;
   a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions. This
@@ -894,8 +928,8 @@ core count.
   - **An inherited jobserver** (`CARGO_MAKEFLAGS` names a live one; for a `fifo:` one, its path exists), as for a
     `cargo` a build script starts: it runs `cargo` as asked, since that jobserver already counts it.
 
-  - **A live parent CPU pool** (`BOUNDED_EXEC_CPU_POOL` plus its positive count): a compiling Cargo asks that pool for
-    one token per core, as a root build does, never a second host grant. It requests
+  - **A live parent CPU pool** (`BOUNDED_EXEC_CPU_POOL` plus its count, positive or a resident's 0): a compiling Cargo
+    asks that pool for one token per core, as a root build does, never a second host grant. It requests
     `{"op":"cpu-pool","want":<n>,"children":true,"grow":<compiles only>}`; the existing pool accounts for this holder
     and serves its actual grant as a private child pool, named by `pool` in the granted reply. Cargo's test variables
     and inherited count are set to the actual local grant, and descendants receive that child pool, not the occupied

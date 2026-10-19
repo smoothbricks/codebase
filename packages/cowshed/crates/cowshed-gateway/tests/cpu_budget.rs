@@ -514,7 +514,11 @@ async fn an_older_land_task_is_served_before_a_younger_lands_and_a_feature_build
         panic!("one background stake: {status:?}");
     };
     assert_eq!(
-        (feature.checkout.as_str(), feature.held, feature.waiting),
+        (
+            feature.checkout.as_str(),
+            feature.held,
+            feature.waiters.len()
+        ),
         ("/w/feature", 2, 1),
         "{status:?}"
     );
@@ -607,6 +611,8 @@ async fn jobserver_class_is_validated_and_a_wait_bound_is_an_unknown_field() {
         serde_json::json!({"class":"pretend-gate"}),
         serde_json::json!({"class":"gate","waitMs":120_000}),
         serde_json::json!({"class":"background","waitMs":100}),
+        // A resident asks with its own operation, never as a token-holding jobserver class.
+        serde_json::json!({"class":"resident"}),
     ] {
         let mut request = serde_json::json!({"op":"jobserver","want":4,"checkout":"/w/refused","command":"cargo test"});
         request
@@ -615,6 +621,115 @@ async fn jobserver_class_is_validated_and_a_wait_bound_is_an_unknown_field() {
             .extend(fields.as_object().unwrap().clone());
         let refused = one_shot(&socket, &format!("{request}\n")).await;
         assert_eq!(refused["code"], "invalid-request", "{refused}");
+    }
+    assert_eq!(ledger(&socket).await.held, 0);
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// One resident: a real `sleep` that holds its `resident-pool` lease connection as its stdin, the
+/// shape of the Nx daemon a shed's supervisor keeps, and the pool its grant names. The grant
+/// names the pool alone: no tokens, no fifo.
+async fn resident(socket: &Path, checkout: &str, job_id: u64) -> (std::process::Child, PathBuf) {
+    let request = serde_json::json!({ "op": "resident-pool", "checkout": checkout,
+        "command": "node nx/dist/src/daemon/server/start.js",
+        "job": { "repoId": "owner/repo", "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+            "jobId": job_id } });
+    let held_socket = socket.to_path_buf();
+    let (stream, queued, granted) = tokio::task::spawn_blocking(move || {
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&held_socket).expect("connect resident");
+        stream
+            .write_all(format!("{request}\n").as_bytes())
+            .expect("ask resident pool");
+        let mut answers = StdBufReader::new(stream.try_clone().expect("clone")).lines();
+        let queued = answers.next().expect("queued").expect("read");
+        let granted = answers.next().expect("granted").expect("read");
+        (stream, queued, granted)
+    })
+    .await
+    .expect("resident answers");
+    let queued: Value = serde_json::from_str(&queued).expect("JSON");
+    let granted: Value = serde_json::from_str(&granted).expect("JSON");
+    assert_eq!(queued["lease"], "queued", "{queued}");
+    assert_eq!(granted["lease"], "granted", "{granted}");
+    assert!(
+        granted.get("tokens").is_none(),
+        "a resident holds no token: {granted}"
+    );
+    assert!(
+        granted.get("fifo").is_none(),
+        "a resident has no fifo: {granted}"
+    );
+    let pool = PathBuf::from(
+        granted["cpuPool"]
+            .as_str()
+            .expect("a resident names its pool"),
+    );
+    // The resident process itself holds the lease from here on, as the daemon's job does.
+    let child = Command::new("/bin/sleep")
+        .arg("600")
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(stream)))
+        .spawn()
+        .expect("spawn the resident sleep");
+    (child, pool)
+}
+
+/// Residents take no token and leave every shed's share of the host whole; each request one runs
+/// asks the host through its pool and returns its tokens when it ends. Measured 2026-10-19: 25
+/// sheds' Nx daemons, idle, held 15 of 18 tokens, one per shed for each daemon's lifetime (46
+/// minutes in `batch-7`, 3 jobs waiting behind it), and a `bun install` waited ~15 minutes
+/// behind them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resident_holds_no_token_and_each_request_it_runs_asks_the_host() {
+    let (gateway, root, socket) = gateway(2).await;
+    // A resident in each of eight sheds, against a host of two tokens.
+    let mut residents = Vec::new();
+    for shed in 0..8_u64 {
+        residents.push(resident(&socket, &format!("/w/shed-{shed}"), shed + 1).await);
+    }
+    let pool = residents[0].1.clone();
+
+    let status = ledger(&socket).await;
+    assert_eq!((status.total, status.held), (2, 0), "{status:?}");
+    assert!(status.checkouts.is_empty(), "{status:?}");
+    // A shed's usable concurrency is the whole host, exactly as without any resident.
+    let mut first = Asker::ask(&socket, 1, "/w/shed-0").await;
+    let mut second = Asker::ask(&socket, 1, "/w/shed-0").await;
+    assert_eq!(first.answer().await["tokens"], 1);
+    assert_eq!(second.answer().await["tokens"], 1);
+    drop((first, second));
+    // The ledger sends no change notification: read it until the returns show. A return that
+    // never comes is a hang, which the leg's no-progress backstop decides, never a count here.
+    while ledger(&socket).await.held != 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A request a resident runs asks its pool, which asks the host for that resident's shed.
+    let mut request = Asker::child(&pool, 2).await;
+    assert_eq!(request.answer().await["tokens"], 2);
+    let status = ledger(&socket).await;
+    assert_eq!(status.held, 2, "{status:?}");
+    assert_eq!(
+        status
+            .background
+            .iter()
+            .map(|stake| (stake.checkout.as_str(), stake.held))
+            .collect::<Vec<_>>(),
+        [("/w/shed-0", 2)]
+    );
+    drop(request);
+    while ledger(&socket).await.held != 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A resident's death closes its pool, and the ledger is as it was without any resident.
+    for (mut child, pool) in residents {
+        child.kill().expect("SIGKILL the resident");
+        child.wait().expect("reap");
+        while UnixStream::connect(&pool).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
     assert_eq!(ledger(&socket).await.held, 0);
     gateway.drain().await.expect("drain");

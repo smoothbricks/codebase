@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use cowshed_gateway_types::{
     JobserverAnswer, JobserverClass, JobserverJob, JobserverRequest, LeaseState,
+    ResidentPoolRequest,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
@@ -52,8 +53,11 @@ enum Holder {
     Injected { _owner: Box<dyn Send + Sync> },
 }
 
+/// A job's standing with the host budget: the tokens it holds, or none for a resident, and the
+/// live pool its descendants borrow from -- the grant's own tokens, a gate's relay, or a
+/// resident's relay that asks the host for each child.
 pub struct JobCpuGrant {
-    tokens: NonZeroUsize,
+    tokens: Option<NonZeroUsize>,
     pool: PathBuf,
     _holder: Holder,
 }
@@ -71,12 +75,21 @@ impl JobCpuGrant {
     /// supply their own owning allocation without pretending an environment count is a grant.
     pub fn new(tokens: NonZeroUsize, pool: PathBuf, holder: Box<dyn Send + Sync>) -> Self {
         Self {
-            tokens,
+            tokens: Some(tokens),
             pool,
             _holder: Holder::Injected { _owner: holder },
         }
     }
-    pub fn tokens(&self) -> NonZeroUsize {
+    /// An injected resident standing: a pool and no tokens.
+    pub fn resident(pool: PathBuf, holder: Box<dyn Send + Sync>) -> Self {
+        Self {
+            tokens: None,
+            pool,
+            _holder: Holder::Injected { _owner: holder },
+        }
+    }
+    /// The tokens the job holds; `None` for a resident, which holds none.
+    pub fn tokens(&self) -> Option<NonZeroUsize> {
         self.tokens
     }
     pub fn pool(&self) -> &Path {
@@ -153,13 +166,18 @@ impl JobCpuAdmission for GatewayJobCpu {
                 workspace_incarnation: ask.job.1.as_str(),
                 job_id: NonZeroU64::new(ask.job.2.get()).expect("a validated JobId is nonzero"),
             };
-            let request = match ask.class {
-                JobserverClass::Background => {
-                    JobserverRequest::background(ask.want, &checkout, command, job)
+            let frame = match ask.class {
+                JobserverClass::Background => serde_json::to_vec(&JobserverRequest::background(
+                    ask.want, &checkout, command, job,
+                )),
+                JobserverClass::Gate => {
+                    serde_json::to_vec(&JobserverRequest::gate(ask.want, &checkout, command, job))
                 }
-                JobserverClass::Gate => JobserverRequest::gate(ask.want, &checkout, command, job),
+                JobserverClass::Resident => {
+                    serde_json::to_vec(&ResidentPoolRequest::new(&checkout, command, job))
+                }
             };
-            let mut frame = serde_json::to_vec(&request).map_err(|error| {
+            let mut frame = frame.map_err(|error| {
                 CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
                     detail: error.to_string(),
                 })
@@ -197,13 +215,25 @@ impl JobCpuAdmission for GatewayJobCpu {
                     detail: "expected a jobserver grant after queued".to_owned(),
                 }));
             }
-            let (Some(tokens), Some(pool), Some(_fifo)) =
-                (granted.tokens, granted.cpu_pool, granted.fifo)
-            else {
-                return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-                    detail: "jobserver grant omitted its tokens, FIFO or live child pool"
-                        .to_owned(),
-                }));
+            // A token-holding grant names its tokens, its fifo and its pool; a resident's names
+            // only its pool, since it holds no token and its children ask the host through it.
+            let (tokens, pool) = match (ask.class, granted.tokens, granted.cpu_pool, granted.fifo) {
+                (
+                    JobserverClass::Background | JobserverClass::Gate,
+                    Some(tokens),
+                    Some(pool),
+                    Some(_fifo),
+                ) => (Some(tokens), pool),
+                (JobserverClass::Resident, None, Some(pool), None) => (None, pool),
+                (class, ..) => {
+                    return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+                        detail: format!(
+                            "the {class:?} grant does not have its class's shape: tokens, FIFO \
+                             and live child pool for a token-holding class, the pool alone for \
+                             a resident"
+                        ),
+                    }));
+                }
             };
             let store = socket.parent().ok_or_else(|| {
                 CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
@@ -216,7 +246,9 @@ impl JobCpuAdmission for GatewayJobCpu {
                         detail: error.to_string(),
                     })
                 })?;
-            if tokens > ask.want || pool.parent() != Some(scope.as_path()) {
+            if tokens.is_some_and(|tokens| tokens > ask.want)
+                || pool.parent() != Some(scope.as_path())
+            {
                 return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
                     detail:
                         "the gateway grant exceeds its request or escapes its workspace pool scope"
@@ -228,7 +260,7 @@ impl JobCpuAdmission for GatewayJobCpu {
                 format!(
                     "grant class={:?} tokens={}/{} pool={} checkout={}",
                     ask.class,
-                    tokens,
+                    tokens.map_or(0, NonZeroUsize::get),
                     ask.want,
                     pool.display(),
                     ask.checkout.display()

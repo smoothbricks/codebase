@@ -1236,28 +1236,34 @@ idempotent, and a `--purge` with nothing installed says so rather than failing.
 running other bytes is reported with the remedy `cowshed setup`, run from the cowshed you mean to use.
 
 `status` reports health without starting the service, then the host CPU ledger the daemon serves (05 Gateway, "Host CPU
-budget") in the order it serves it: tokens held of the total; the running gate jobs, the head — the oldest land — first;
-the gate queue in the order returned tokens go to it; then each checkout's background work. A gate job is named by its
-admission number (the smaller is the older land). Each running gate job and background stake is followed by its leases,
-oldest grant first: the client's pid (the socket's peer), its tokens of its want, the age of its grant — the lease's,
-not the process's; `ps -p <pid>` gives that — and the command it named:
+budget") in the order it serves it: tokens held of the total; every lease held past the 30-minute hold limit, oldest
+first, so the first lines say who holds the host and since when (05 Gateway, "The hold limit"); the running gate jobs,
+the head — the oldest land — first; the gate queue in the order returned tokens go to it; then each checkout's
+background work. A gate job is named by its admission number (the smaller is the older land). Each running gate job and
+background stake is followed by its leases, oldest grant first: the client's pid (the socket's peer), its tokens of its
+want, the age of its grant — the lease's, not the process's; `ps -p <pid>` gives that — and the command it named. Every
+waiting request is named the same way, with how long it has waited: one gate job's tasks wait as one entry each, and
+their pids, commands and ages tell them apart. A resident (`exec --class resident`, a kept Nx daemon) holds no token, so
+it is in no line; a request it runs is.
 
 ```
 $ cowshed gateway status
 cowshed: gateway is healthy: launchd loaded; control socket answers at /private/cowshed/store/gateway.sock
 cowshed: gateway versions: cli 0.1.0; daemon 0.1.0
 cowshed: gateway cpu budget: held 18/18 tokens
+cowshed: gateway cpu hold past 30m: /Users/me/Dev/app: pid 3977, 2/18 tokens, granted 34m07s ago: cargo --frozen test -p app
 cowshed: gateway gate head: /Users/me/Dev/app gate job 4: held 15, running 2
 cowshed: gateway gate lease: /Users/me/Dev/app gate job 4: pid 4120, 1/1 tokens, granted 12m30s ago: nx run-many -t gate
 cowshed: gateway gate lease: /Users/me/Dev/app gate job 4: pid 4388, 14/18 tokens, granted 2m05s ago: child CPU pool
 cowshed: gateway gate job behind the head: /Users/me/Dev/lib gate job 9: held 1, running 1
 cowshed: gateway gate lease: /Users/me/Dev/lib gate job 9: pid 5012, 1/1 tokens, granted 40s ago: nx run-many -t gate
 cowshed: gateway gate queue: 3 waiting, in the order returned tokens go to them
-cowshed: gateway gate queue 1: /Users/me/Dev/app gate job 4 want 6
-cowshed: gateway gate queue 2: /Users/me/Dev/app gate job 4 want 2
-cowshed: gateway gate queue 3: /Users/me/Dev/lib gate job 9 want 18
-cowshed: gateway background: /Users/me/Dev/app: held 2, running 1, waiting 0
+cowshed: gateway gate queue 1: /Users/me/Dev/app gate job 4: pid 4402, want 6, waiting 1m12s: child CPU pool
+cowshed: gateway gate queue 2: /Users/me/Dev/app gate job 4: pid 4417, want 2, waiting 48s: child CPU pool
+cowshed: gateway gate queue 3: /Users/me/Dev/lib gate job 9: pid 5020, want 18, waiting 35s: child CPU pool
+cowshed: gateway background: /Users/me/Dev/app: held 2, running 1, waiting 1
 cowshed: gateway background lease: /Users/me/Dev/app: pid 3977, 2/18 tokens, granted 34m07s ago: cargo --frozen test -p app
+cowshed: gateway background queue 1: /Users/me/Dev/app: pid 3990, want 1, waiting 2m30s: bun install
 ```
 
 A daemon that answers but does not know `cpu-budget` (one from before it) is reported as not answering it, never as an
@@ -1280,7 +1286,7 @@ has no `pid`:
         "total": 18,
         "held": 18,
         "checkouts": [
-          { "checkout": "/Users/me/Dev/app", "held": 17, "running": 3, "waiting": 2 },
+          { "checkout": "/Users/me/Dev/app", "held": 17, "running": 3, "waiting": 3 },
           { "checkout": "/Users/me/Dev/lib", "held": 1, "running": 1, "waiting": 1 }
         ],
         "gateJobs": [
@@ -1301,18 +1307,39 @@ has no `pid`:
           }
         ],
         "gateQueue": [
-          { "checkout": "/Users/me/Dev/app", "job": 4, "want": 6 },
-          { "checkout": "/Users/me/Dev/app", "job": 4, "want": 2 },
-          { "checkout": "/Users/me/Dev/lib", "job": 9, "want": 18 }
+          {
+            "checkout": "/Users/me/Dev/app",
+            "job": 4,
+            "pid": 4402,
+            "command": "child CPU pool",
+            "want": 6,
+            "waitedMs": 72000
+          },
+          {
+            "checkout": "/Users/me/Dev/app",
+            "job": 4,
+            "pid": 4417,
+            "command": "child CPU pool",
+            "want": 2,
+            "waitedMs": 48000
+          },
+          {
+            "checkout": "/Users/me/Dev/lib",
+            "job": 9,
+            "pid": 5020,
+            "command": "child CPU pool",
+            "want": 18,
+            "waitedMs": 35000
+          }
         ],
         "background": [
           {
             "checkout": "/Users/me/Dev/app",
             "held": 2,
-            "waiting": 0,
             "holders": [
               { "pid": 3977, "command": "cargo --frozen test -p app", "tokens": 2, "want": 18, "heldMs": 2047000 }
-            ]
+            ],
+            "waiters": [{ "pid": 3990, "command": "bun install", "want": 1, "waitedMs": 150000 }]
           }
         ]
       }

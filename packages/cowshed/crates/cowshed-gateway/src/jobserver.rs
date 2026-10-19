@@ -21,8 +21,12 @@ const TOKEN_BYTE: u8 = b'+';
 
 /// Whole-grant admission, never a request to resize a live FIFO. Neither class has an admission
 /// deadline: a request waits in the ledger's order until it is granted or its client leaves.
-#[derive(Clone, Copy, Debug)]
+/// These are the classes that hold tokens, so they are the ledger's; a resident holds none and
+/// asks with its own operation (`resident-pool`), never as a jobserver class.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum JobserverAdmission {
+    #[default]
     Background,
     Gate,
 }
@@ -169,6 +173,14 @@ pub(crate) enum PoolSource {
         checkout: std::sync::Arc<str>,
         job: crate::cpu_budget::JobAge,
     },
+    /// A resident job, which holds no token: each child asks the host budget itself, at
+    /// background class, for the resident's checkout, exactly as a root background request
+    /// does. A daemon idle between requests therefore holds nothing, and each request it runs
+    /// takes its tokens when it starts and returns them when it ends.
+    Resident {
+        host: crate::cpu_budget::CpuBudget,
+        checkout: std::sync::Arc<str>,
+    },
 }
 
 /// One pool endpoint serving a granted job's children.
@@ -204,6 +216,9 @@ impl CpuPool {
                 checkout,
                 job,
             } => (host, checkout, crate::cpu_budget::Rank::GateTask(job)),
+            PoolSource::Resident { host, checkout } => {
+                (host, checkout, crate::cpu_budget::Rank::Background)
+            }
         };
         let task = tokio::spawn(async move {
             let mut children = tokio::task::JoinSet::new();

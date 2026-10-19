@@ -437,7 +437,10 @@ or status of the command's to give. `--background` asks not to wait at all: the 
 lazy protected files so later reads and checkpoints are durable; it does not imply every terminal job has stream paths.
 A `--class gate` command is held for as long as `cowshed exec` runs (11_shell.md, `hold`): an exec process that ends
 first, however it ends, leaves a gate nobody waits for, and the supervisor kills it (05_gateway.md, "A gate lives with
-its operator"). `--timeout` releases the hold before it leaves the gate running; `--background` takes none.
+its operator"). `--timeout` releases the hold before it leaves the gate running; `--background` takes none. A
+`--class resident` command — a daemon or worker that stays up and is idle between requests — holds no CPU token and
+starts at once; its descendants ask its pool for their own (05_gateway.md, "A resident holds no token"). It takes no
+`--want` and no `--host`.
 
 `--register` (on `cowshed fork`) additionally adds a `cowshed/<ws>` remote in the **main** workspace pointing at the new
 workspace's canonical mount, so a human in main can fetch and review the workspace's branch in place. Off by default

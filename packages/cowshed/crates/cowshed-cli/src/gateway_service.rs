@@ -1475,11 +1475,16 @@ fn pending_install_line(pending: &PendingInstall) -> String {
 }
 
 /// The host CPU ledger in the operator's words (05_gateway.md "Host CPU budget"), in the order the
-/// ledger serves it: tokens held of the total; the running gate jobs, the head — the oldest — first;
-/// the waiting gate-class requests in the order returned tokens go to them; then each checkout's
-/// background stake, served behind them. Each running gate job and background stake is followed
-/// by its leases, oldest grant first, so the reader sees who holds the tokens and since when
-/// rather than guessing from the checkout. Or why the daemon gave no ledger.
+/// ledger serves it: tokens held of the total; the leases held past the hold limit, oldest first,
+/// so the first lines answer who holds the host and since when (05_gateway.md "The hold limit"),
+/// each listed again under its own gate job or stake; the running gate jobs, the head — the
+/// oldest — first; the waiting gate-class requests in the order returned tokens go to them; then
+/// each checkout's background stake, served behind them. Each running gate job and background
+/// stake is followed by its leases, oldest grant first, so the reader sees who holds the tokens
+/// and since when rather than guessing from the checkout, and a background stake by its waiting
+/// requests. A queue entry is named by its process and wait age as a lease is by its grant's: one
+/// gate job's tasks are one entry each, and the job's number alone cannot tell them apart. Or why
+/// the daemon gave no ledger.
 fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
     let ledger = match budget {
         GatewayCpuBudget::Ledger(ledger) => ledger,
@@ -1493,6 +1498,13 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
         "gateway cpu budget: held {}/{} tokens",
         ledger.held, ledger.total
     )];
+    let limit_minutes = cowshed_gateway_types::HOLD_LIMIT.as_secs() / 60;
+    for (checkout, holder) in leases_past_the_hold_limit(ledger) {
+        lines.push(format!(
+            "gateway cpu hold past {limit_minutes}m: {checkout}: {}",
+            lease_words(holder)
+        ));
+    }
     if ledger.gate_jobs.is_empty() {
         lines.push("gateway gate head: no gate job is running".to_owned());
     }
@@ -1527,11 +1539,11 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
         ));
         lines.extend(ledger.gate_queue.iter().enumerate().map(|(place, waiter)| {
             format!(
-                "gateway gate queue {}: {} gate job {} want {}",
+                "gateway gate queue {}: {} gate job {}: {}",
                 place + 1,
                 waiter.checkout,
                 waiter.job,
-                waiter.want
+                waiter_words(waiter.pid, waiter.want, waiter.waited_ms, &waiter.command)
             )
         }));
     }
@@ -1544,7 +1556,7 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
             stake.checkout,
             stake.held,
             stake.holders.len(),
-            stake.waiting
+            stake.waiters.len()
         ));
         lines.extend(stake.holders.iter().map(|holder| {
             format!(
@@ -1553,29 +1565,77 @@ fn cpu_budget_lines(budget: &GatewayCpuBudget) -> Vec<String> {
                 lease_words(holder)
             )
         }));
+        lines.extend(stake.waiters.iter().enumerate().map(|(place, waiter)| {
+            format!(
+                "gateway background queue {}: {}: {}",
+                place + 1,
+                stake.checkout,
+                waiter_words(waiter.pid, waiter.want, waiter.waited_ms, &waiter.command)
+            )
+        }));
     }
     lines
+}
+
+/// Every lease held past the hold limit (05_gateway.md "The hold limit"), a gate job's or a
+/// background stake's, with the checkout it holds for, the oldest grant first.
+fn leases_past_the_hold_limit(
+    ledger: &cowshed_gateway_types::CpuBudgetStatus,
+) -> Vec<(&str, &cowshed_gateway_types::CpuHolder)> {
+    let mut leases = Vec::new();
+    for job in &ledger.gate_jobs {
+        for holder in &job.holders {
+            if holder.past_hold_limit() {
+                leases.push((job.checkout.as_str(), holder));
+            }
+        }
+    }
+    for stake in &ledger.background {
+        for holder in &stake.holders {
+            if holder.past_hold_limit() {
+                leases.push((stake.checkout.as_str(), holder));
+            }
+        }
+    }
+    leases.sort_by_key(|(_, holder)| std::cmp::Reverse(holder.held_ms));
+    leases
 }
 
 /// `pid 71437, 15/18 tokens, granted 34m07s ago: cargo test …`: one lease as the operator reads
 /// it. The age is the grant's; `ps -p <pid>` gives the process's.
 fn lease_words(holder: &cowshed_gateway_types::CpuHolder) -> String {
-    let pid = holder
-        .pid
-        .map_or_else(|| "pid unknown".to_owned(), |pid| format!("pid {pid}"));
-    let seconds = holder.held_ms / 1000;
+    let pid = pid_words(holder.pid);
+    let age = age_words(holder.held_ms);
+    format!(
+        "{pid}, {}/{} tokens, granted {age} ago: {}",
+        holder.tokens, holder.want, holder.command
+    )
+}
+
+/// `pid 71437, want 18, waiting 4m10s: cargo test …`: one waiting request as the operator reads
+/// it. It holds nothing yet; the age is since it asked.
+fn waiter_words(pid: Option<i32>, want: usize, waited_ms: u64, command: &str) -> String {
+    let pid = pid_words(pid);
+    let age = age_words(waited_ms);
+    format!("{pid}, want {want}, waiting {age}: {command}")
+}
+
+/// `pid 71437`, or `pid unknown` when the client's socket named none.
+fn pid_words(pid: Option<i32>) -> String {
+    pid.map_or_else(|| "pid unknown".to_owned(), |pid| format!("pid {pid}"))
+}
+
+/// An age to the second, as the operator reads it: `3s`, `34m07s`, `1h02m05s`.
+fn age_words(ms: u64) -> String {
+    let seconds = ms / 1000;
     let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
-    let age = if hours > 0 {
+    if hours > 0 {
         format!("{hours}h{minutes:02}m{seconds:02}s")
     } else if minutes > 0 {
         format!("{minutes}m{seconds:02}s")
     } else {
         format!("{seconds}s")
-    };
-    format!(
-        "{pid}, {}/{} tokens, granted {age} ago: {}",
-        holder.tokens, holder.want, holder.command
-    )
+    }
 }
 
 /// The build an install would put in place: its bytes, what they hash to, and what the build
@@ -3693,6 +3753,173 @@ mod tests {
             )
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The leases `gateway status` names right after the CPU ledger's count: those held past the
+    /// hold limit (05_gateway.md "The hold limit").
+    mod hold_limit {
+        use cowshed_gateway_types::{
+            CpuBackgroundStake, CpuBudgetStatus, CpuCheckoutStatus, CpuGateJob, CpuHolder,
+        };
+
+        use super::*;
+
+        /// The `heldMs` of a lease whose line reads `granted {minutes}m{seconds:02}s ago`.
+        fn granted_ago(minutes: u64, seconds: u64) -> u64 {
+            (minutes * 60 + seconds) * 1_000
+        }
+
+        /// A lease held by `pid` for `command`, granted `held_ms` ago.
+        fn lease(pid: i32, command: &str, tokens: usize, want: usize, held_ms: u64) -> CpuHolder {
+            CpuHolder {
+                pid: Some(pid),
+                command: command.into(),
+                tokens,
+                want,
+                held_ms,
+            }
+        }
+
+        /// An 18-token host held whole by a gate job's lease of two minutes and a background
+        /// `cargo test` lease of 12 tokens granted `background_held_ms` ago.
+        fn ledger_with_background_lease(background_held_ms: u64) -> GatewayCpuBudget {
+            let gate_lease = lease(31102, "nx run-many -t test", 6, 18, granted_ago(2, 0));
+            let background_lease = lease(
+                29272,
+                "cargo --frozen test -p app_runtime",
+                12,
+                18,
+                background_held_ms,
+            );
+            GatewayCpuBudget::Ledger(CpuBudgetStatus {
+                total: 18,
+                held: 18,
+                checkouts: vec![
+                    CpuCheckoutStatus {
+                        checkout: "/mnt/app/land".into(),
+                        held: 6,
+                        running: 1,
+                        waiting: 0,
+                    },
+                    CpuCheckoutStatus {
+                        checkout: "/mnt/app/account-placement".into(),
+                        held: 12,
+                        running: 1,
+                        waiting: 0,
+                    },
+                ],
+                gate_jobs: vec![CpuGateJob {
+                    checkout: "/mnt/app/land".into(),
+                    job: 7,
+                    held: 6,
+                    holders: vec![gate_lease],
+                }],
+                gate_queue: Vec::new(),
+                background: vec![CpuBackgroundStake {
+                    checkout: "/mnt/app/account-placement".into(),
+                    held: 12,
+                    holders: vec![background_lease],
+                    waiters: Vec::new(),
+                }],
+            })
+        }
+
+        /// The lines that name a lease past the limit.
+        fn hold_lines(lines: &[String]) -> Vec<&str> {
+            lines
+                .iter()
+                .map(String::as_str)
+                .filter(|line| line.starts_with("gateway cpu hold past"))
+                .collect()
+        }
+
+        /// A lease held past the hold limit is named right after the count, so the first lines of
+        /// `gateway status` answer who holds the host and since when. Measured 2026-10-19: a
+        /// runaway `cargo test` held 12 of 18 tokens for 48 minutes while the status gave only the
+        /// count. The gate job's lease of two minutes is within the limit and is not named.
+        #[test]
+        fn a_lease_held_past_the_limit_is_named_right_after_the_count() {
+            let ledger = ledger_with_background_lease(granted_ago(48, 18));
+            let lines = cpu_budget_lines(&ledger);
+
+            assert_eq!(lines[0], "gateway cpu budget: held 18/18 tokens");
+            assert_eq!(
+                lines[1],
+                "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29272, 12/18 tokens, granted 48m18s ago: cargo --frozen test -p app_runtime"
+            );
+            assert_eq!(hold_lines(&lines).len(), 1, "{lines:#?}");
+        }
+
+        /// A lease a second inside the limit is not named: with every lease within it the count is
+        /// followed by the gate head, as it was before the limit existed.
+        #[test]
+        fn a_ledger_with_every_lease_within_the_limit_names_none() {
+            let ledger = ledger_with_background_lease(granted_ago(29, 59));
+            let lines = cpu_budget_lines(&ledger);
+
+            assert!(hold_lines(&lines).is_empty(), "{lines:#?}");
+            assert_eq!(
+                lines[1],
+                "gateway gate head: /mnt/app/land gate job 7: held 6, running 1"
+            );
+        }
+
+        /// A gate job's lease and a background stake's, both past the limit, are named together,
+        /// the oldest first and each under the checkout it holds for. The background leases are
+        /// older and younger than the gate's, so neither source's own order is the answer; a lease
+        /// within the limit stays out.
+        #[test]
+        fn leases_past_the_limit_are_named_oldest_first_whether_gate_or_background() {
+            let ledger = GatewayCpuBudget::Ledger(CpuBudgetStatus {
+                total: 18,
+                held: 18,
+                checkouts: vec![
+                    CpuCheckoutStatus {
+                        checkout: "/mnt/app/land".into(),
+                        held: 5,
+                        running: 2,
+                        waiting: 0,
+                    },
+                    CpuCheckoutStatus {
+                        checkout: "/mnt/app/account-placement".into(),
+                        held: 13,
+                        running: 2,
+                        waiting: 0,
+                    },
+                ],
+                gate_jobs: vec![CpuGateJob {
+                    checkout: "/mnt/app/land".into(),
+                    job: 4,
+                    held: 5,
+                    holders: vec![
+                        lease(31102, "nx run-many", 4, 18, granted_ago(41, 0)),
+                        lease(31105, "cargo check", 1, 1, granted_ago(2, 0)),
+                    ],
+                }],
+                gate_queue: Vec::new(),
+                background: vec![CpuBackgroundStake {
+                    checkout: "/mnt/app/account-placement".into(),
+                    held: 13,
+                    holders: vec![
+                        lease(29272, "cargo test", 12, 18, granted_ago(48, 18)),
+                        lease(29301, "bun test", 1, 1, granted_ago(31, 5)),
+                    ],
+                    waiters: Vec::new(),
+                }],
+            });
+            let lines = cpu_budget_lines(&ledger);
+
+            assert_eq!(
+                lines[..4],
+                [
+                    "gateway cpu budget: held 18/18 tokens",
+                    "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29272, 12/18 tokens, granted 48m18s ago: cargo test",
+                    "gateway cpu hold past 30m: /mnt/app/land: pid 31102, 4/18 tokens, granted 41m00s ago: nx run-many",
+                    "gateway cpu hold past 30m: /mnt/app/account-placement: pid 29301, 1/1 tokens, granted 31m05s ago: bun test",
+                ]
+            );
+            assert_eq!(hold_lines(&lines).len(), 3, "{lines:#?}");
+        }
     }
 
     /// The daemon's control socket and the startup pass it reports — mounts still healing,
