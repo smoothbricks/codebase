@@ -694,7 +694,7 @@ core count.
 - **Queued priority** (2026-10-11). The coordinator supplies each job's priority, an unsigned 32-bit integer, higher
   first, default 0. It orders queued bulk work and queued lands within their own queues; no value outranks the active
   gate or manufactures gate authority. A priority change re-keys pending work, never interrupts, resizes or restarts an
-  already-running grant. Priority and the current OS band are independent.
+  already-running grant. Priority and the OS band are independent.
 - **Fair between checkouts within one priority.** The checkout is the Nx workspace root the request names. A checkout's
   share is N divided among the checkouts holding or waiting (at least 1). The next grant goes to the highest-priority
   eligible waiting request; within that priority, to the waiting checkout that holds the fewest tokens (the older head
@@ -773,8 +773,8 @@ core count.
   resize a running FIFO, kill peer work, or use `SIGSTOP`/`SIGCONT`: wall and idle bounds would keep advancing during a
   freeze. A gate-class request may have to wait for a returned token. It has guaranteed admission ahead of queued
   background churn, but no fixed latency is promised while every token is genuinely held. Gate priority promises
-  admission order, not a fixed test duration. The supervisor's separate nice placement below lowers background
-  scheduling weight without raising a gate above default.
+  admission order, not a fixed test duration. The supervisor's separate nice placement below ("Bands") orders the
+  classes by lowering nice, never by raising one above default.
 - **No admission deadline, for any class** (Danny tg#6679, tg#6693). A gate is the highest-priority work there is, so it
   is never failed for waiting in the order that serves it: a gate jobserver request, like a background one, waits until
   it is granted or its client closes the connection, which leaves the queue. The operator request is
@@ -789,9 +789,10 @@ core count.
   a gate-host or taskpolicy wrapper. Its typed request carries class, want and scope. Only a trusted
   coordinator/operator may request Gate or HostGate; a worker request is refused with typed class-not-permitted before
   job or spawn effects. Ordinary commands default Background, want1 and Workspace scope; producers that need parallel
-  work supply their actual demand; a resident (below) is Resident, which a worker may ask for, and names no want. The
-  supervisor records Queued, asks the gateway off its actor path and spawns only after a real grant. CPU admission uses
-  the control socket of the controller's validated host storage, the same store/gateway.sock authority its gateway
+  work supply their actual demand; a requester that awaits the result asks Interactive ("Bands"), which a worker may ask
+  for, since it buys a band and no token; a resident (below) is Resident, which a worker may ask for, and names no want.
+  The supervisor records Queued, asks the gateway off its actor path and spawns only after a real grant. CPU admission
+  uses the control socket of the controller's validated host storage, the same store/gateway.sock authority its gateway
   reconciliation uses, never an unrelated ambient store. A queued kill withdraws the request without spawning.
   Missing/refused admission never causes an unbudgeted server spawn. The supervisor retains the allocation until the
   owned job concludes. The gateway's existing CpuBudget ledger serves that exact allocation on a private
@@ -804,10 +805,10 @@ core count.
   derive this one layout through the same helper; there is no runtime alias or fallback. This adds 54 bytes to the store
   prefix, giving a 98-byte socket path for the existing 44-byte fixture store, within Darwin's 103-byte usable limit.
   Arbitrarily long store paths do not acquire a new short-link lifecycle. A bare count/class is no gate role. The owned
-  command is placed at **nice0 for Gate, nice+10 for Background**, never the shared warm host or supervisor. Raising a
-  gate above default requires root and is not attempted; priority lowers background nice instead. Nice is applied and
-  read back before command execution, using the held-child fence on macOS and a private report pipe on Linux. Refusal is
-  typed PriorityFailure, not an unobserved run. Class, scope, actual tokens and observed nice are recorded; nice remains
+  command is placed at its class's nice ("Bands"), never the shared warm host or supervisor. No class is raised above
+  default, which requires root; the order lowers the other classes' nice instead. Nice is applied and read back before
+  command execution, using the held-child fence on macOS and a private report pipe on Linux. Refusal is typed
+  PriorityFailure, not an unobserved run. Class, scope, actual tokens and observed nice are recorded; nice remains
   absent when never observed. A HostGate is a coordinator-only argv one-shot on the host, outside ExecutedChild,
   preserving the real-APFS gate's host authority; no ordinary workspace sandbox is loosened. Controller discovery uses
   only `cargo locate-project` and `cargo metadata --no-deps --offline`, which retain their noncompiling exemption: no
@@ -836,19 +837,29 @@ core count.
   an 18-token host, a runner holding 12 does not make the sole newcomer wait instead of taking the idle 6. What a
   newcomer does not get a reserved half. Ordinary checkout fairness (the share rule above) still bounds a grant while
   another ordinary checkout waits. Gate admission orders who is served first; it never leaves a token idle.
-- **Dynamic QoS.** A job's class states what it is; its band states how the host schedules it now, and the two move
-  independently. Four bands, in scheduler order: **foreground**, **normal**, **utility**, **background**. The land turn
-  — its holder and the gate lineage that follows it — and any job a model is waiting on run **foreground**. Ordinary
-  development work (builds and suites) starts **normal**. Opportunistic work — research models, prefetch and warmers an
-  operator names as such, never inferred from unattended, detached or long-running work — runs **background** from
-  admission. While a foreground job is starved (admitted or queued and not runnable at its grant), running normal jobs
-  are demoted to **utility**: their tokens and grants do not change, only their scheduling weight drops, so the
-  foreground job's threads win the cores its grant names. When no foreground job is starved, utility jobs are promoted
-  back to normal. A band change is a live transition on the job's retained process identities (the Darwin and Linux
-  placements of "Bands"); one that cannot cover a forked tree whole reports `IncompleteCoverage` and claims no
-  transition. Bands never admit, queue or size a job — the token ledger alone does that. Demotion does not reclaim
-  tokens from a live background test grant: the token ledger's gate order, not an OS band, serves that wait. An idle
-  host leaves every band's work at full speed.
+- **Bands** (2026-10-17, Danny tg#6693: "The gate class is served FIFO at highest priority over all other execs. The
+  interactive class has priority over gate and regular exec. Priority is handled by OS niceness. When gate runs it needs
+  more tickets than background but not fully starve background"). A job's class fixes, at the job's birth, both its
+  place in the token order and the band the host schedules it in. This table is the one statement of both; every other
+  section names it.
+
+  | Class         | What runs in it                                                                                  | CPU tokens                                                                       | Band           | Nice |
+  | ------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------- | -------------- | ---- |
+  | `interactive` | work a person or model is waiting on, declared by the requester that awaits its result           | behind gate, as background: checkout fairness and the floor token                | **foreground** | 0    |
+  | `gate`        | a land's gate job, every task its pool relays and the land turn's holder; the trusted route only | first: the oldest gate job FIFO, ahead of every other class ("Gate admission")   | **normal**     | +5   |
+  | `background`  | every other exec, the default, and each request a resident's pool relays                         | checkout fairness behind gate, never starved: the floor token ("Gate admission") | **background** | +10  |
+
+  Tokens decide which work runs at all; nice decides whose runnable threads win a core when more are runnable than there
+  are cores. Those are the ruling's two priorities: gate work takes returned tokens first and, while it runs, more of
+  them than the rest without starving it, and on a contended core an interactive thread runs before a gate thread and a
+  gate thread before a background one. Nice is never negative, because raising a priority above the supervisor's own
+  takes a privilege no supervisor holds, so the order is made by lowering it: interactive at the supervisor's own nice,
+  gate five below it, background ten below it. A band never admits, queues or sizes a job — the token ledger alone does
+  that — and an idle host leaves every band's work at full speed. A class is fixed at the job's birth and its band with
+  it: no live transition moves a running job between bands. An interactive job asks the gateway's ledger as background,
+  whose tokens it shares; `interactive` is the supervisor's placement and the task server's class, never a third ledger
+  class.
+
 - **Crash safety by connection.** The grant is tied to the connection: on exit, `SIGKILL` included, the kernel closes
   the socket and the gateway returns the tokens at once. A request that closes while queued leaves the queue. A gateway
   restart forgets every grant, so runners started under the old one overshoot until they finish. The gateway does not
@@ -914,7 +925,7 @@ core count.
 - **Priority updates.** `{"op":"job-qos","job":{…}|"lease":"<lease id>","priority":<u32>}` is one-shot and answers
   `{"ok":true}`, or `not-found` for an admission that is not live. It re-keys the selected admission only while queued;
   a granted job keeps its grant and band. The caller supplies the same coordinator priority on later admissions. This
-  control changes neither the token budget nor the dynamic-band rules and creates no separate resource ledger.
+  control changes neither the token budget nor the band rules ("Bands") and creates no separate resource ledger.
 - **Managed Cargo admission is fail-closed.** For a root request, the CLI launcher scans cwd ancestors with lstat for
   the in-image `.cowshed/workspace.json` marker. Its presence only tightens admission and grants no authority; an
   inspection error refuses. A managed checkout starts no payload without a live grant: absent gateway, refusal, unknown
@@ -1004,9 +1015,9 @@ new land task starting before a running one of the same land grows) and `tests/c
 plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
 `executor.test.ts` (a granted run sized and released, a refused one run as asked); a jobserver test in which a
 `SIGKILL`ed `cargo` mid-build leaves the ledger whole and its fifo unlinked; the launcher's tests (each of its four
-cases, the `want` it sends, and the variables it sets or leaves on each path); and the dynamic-band tests: a starved
-foreground grant demotes a running normal job's band and restores it when the foreground job leaves, and an
-opportunistic job admitted in the background band never holds a foreground job's cores.
+cases, the `want` it sends, and the variables it sets or leaves on each path); and the band tests: each class runs in
+its own band at its own nice whatever the host's state — interactive above gate above background — and gate work is
+served returned tokens ahead of interactive and background work.
 
 ## The task server schedules work units
 
@@ -1017,12 +1028,12 @@ chooses which ready unit acquires a lease. Strong models propose task boundaries
 
 - **The order.** Aged waiters first: a unit that has waited the configured age bound outranks fresh priority and runs
   among the aged in the order they waited, so a stream of fresh urgent work can never starve a queued unit. Then the
-  class band — gate-class work at parity, background-class work demoted behind it while the host is busy (gate work live
-  or no free CPU token) and run at parity when it is not — then the coordinator's `urgent` override, the unit's leverage
-  (the distinct units transitively depending on it), the cache-domain deadline (known deadlines first, soonest first; an
-  unknown deadline sorts behind known ones and is never invented), resource fit (the predicted cost against the free CPU
-  tokens, unknown last), and finally the stable unit id. The schedule is recomputed at every event and at the oldest
-  waiter's age bound; the same facts always produce the same order.
+  class's token order ("Bands") — gate-class work first, interactive and background work behind it while the host is
+  busy (gate work live or no free CPU token) and at parity when it is not — then the coordinator's `urgent` override,
+  the unit's leverage (the distinct units transitively depending on it), the cache-domain deadline (known deadlines
+  first, soonest first; an unknown deadline sorts behind known ones and is never invented), resource fit (the predicted
+  cost against the free CPU tokens, unknown last), and finally the stable unit id. The schedule is recomputed at every
+  event and at the oldest waiter's age bound; the same facts always produce the same order.
 - **Ownership.** A unit keeps exactly one live attempt: its admission connection is the attempt, held like a CPU-token
   stake. A second admission of a live unit is refused. A connection that closes without a terminal outcome abandons its
   attempt, and a delayed holder of a settled attempt can never advance a newer one.
@@ -1037,9 +1048,10 @@ chooses which ready unit acquires a lease. Strong models propose task boundaries
 - **Caps and bands.** A unit may declare its own parallelism ceiling — the caps its run kind applies to itself
   (`nx parallel`, `CARGO_BUILD_JOBS`, `--test-threads`) — and the grant reports that ceiling clamped to the CPU tokens
   it holds, so a run's own parallelism never exceeds its grant. The grant is the only allocation authority and leaf
-  controls derive from it, never from a static profile. The grant also names the run's band: the land turn's holder
-  foreground, gate-class work normal, and demoted background work in the background band until the host quiets.
-  Placement is server-owned; no caller flag raises a band or widens a ceiling.
+  controls derive from it, never from a static profile. The grant also names the run's band, its class's row of "Bands":
+  interactive work foreground, gate-class work normal — the land turn's holder included — and background work
+  background, whether or not the host is busy. Placement is server-owned: the band follows the class alone, and no other
+  caller field raises a band or widens a ceiling.
 - **The CPU budget stays the only allocator.** On selection the scheduler submits the unit's CPU ask to the budget
   above, in selection order, and the grant reports the tokens the budget gave it. The scheduler holds no token counter:
   its capacity view folds the budget's own ledger, a capacity observation never mints a grant, and what cannot be
@@ -1063,9 +1075,10 @@ chooses which ready unit acquires a lease. Strong models propose task boundaries
 Tests: the scheduler's own regressions pin the policy without an agent in the loop — the exact order over a crafted fact
 set, the same order from the same facts however they arrive, a low-priority unit selected at its age bound under a
 stream of fresher urgent arrivals, the serial classes with the urgent land behind a turn in progress, one live attempt
-per unit, and the caps applied and clamped to the grant — plus `tests/task_server.rs` over a real control socket: units
-admitted and advanced by their terminal facts alone, with the caps and the queue view read off the wire. Gate-band units
-with spare CPU capacity retain concurrent grants; a work-unit class never creates exclusive root-gate admission.
+per unit, the caps applied and clamped to the grant, and every class in its own band on a quiet host and a busy one with
+gate work ordered first — plus `tests/task_server.rs` over a real control socket: units admitted and advanced by their
+terminal facts alone, with the caps and the queue view read off the wire. Gate-band units with spare CPU capacity retain
+concurrent grants; a work-unit class never creates exclusive root-gate admission.
 
 ## Credentials
 

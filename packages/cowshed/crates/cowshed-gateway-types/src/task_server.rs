@@ -23,20 +23,35 @@ pub const TASK_TERMINAL_OP: &str = "task-terminal";
 /// The control operation that reports the scheduler's queue.
 pub const TASK_QUEUE_OP: &str = "task-queue";
 
-/// What a work unit runs as. Gate class is the critical path — gates, lands and work a model is
-/// waiting on — and runs at normal priority. Background class is off-critical-path work, which
-/// the scheduler deprioritizes while the host is busy and runs at parity when it is not.
+/// What a work unit runs as: one row of specs/cowshed/05_gateway.md "Bands" (Danny tg#6693).
+/// Interactive is work a person or model is waiting on; gate is the land's gate job and the work
+/// it relays, the land turn's holder included; background is every other unit. Gate-class work is
+/// ordered first for CPU; interactive and background work wait behind it while the host is busy
+/// and run at parity when it is not.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskClass {
     #[default]
     Gate,
+    Interactive,
     Background,
 }
 
-/// The band a granted run is placed in. The server owns placement and no caller flag raises it:
-/// the land turn runs foreground, gate-class work normal, and demoted background work runs in the
-/// background band until the host quiets.
+impl TaskClass {
+    /// The band this class runs in, its row of "Bands": interactive foreground, gate normal,
+    /// background background. The band follows the class alone, whatever the host's state.
+    pub const fn band(self) -> TaskBand {
+        match self {
+            Self::Interactive => TaskBand::Foreground,
+            Self::Gate => TaskBand::Normal,
+            Self::Background => TaskBand::Background,
+        }
+    }
+}
+
+/// The band a granted run is placed in, fixed by its class (`TaskClass::band`): foreground above
+/// normal above background, as the nice each band runs at orders them (05_gateway.md "Bands").
+/// The server owns placement, and no caller field but the class chooses it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskBand {
