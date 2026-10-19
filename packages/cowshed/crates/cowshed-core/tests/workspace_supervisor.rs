@@ -7870,6 +7870,125 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
     handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
 }
 
+/// Real background jobs under seatbelt, with the production artifact, commitment and span
+/// writers. CPU admission is immediate so scheduler queueing is not mistaken for setup cost.
+/// Run explicitly on the host with COWSHED_TIMING=1 and --test-threads=1; never part of a gate.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "manual host-controller performance measurement"]
+async fn per_job_fixed_cost_measurement() {
+    use cowshed_core::capabilities::BootstrapProgram;
+    use cowshed_core::runtime::supervisor::CommitmentPublisher;
+    use cowshed_core::storage::audit::ArrowAuditSink;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    const TOOLS: [&str; 32] = [
+        "git",
+        "node",
+        "direnv",
+        "devenv",
+        "nix",
+        "nix-store",
+        "nix-shell",
+        "nix-env",
+        "cargo",
+        "rustc",
+        "rustdoc",
+        "rustup",
+        "go",
+        "gofmt",
+        "python",
+        "uv",
+        "java",
+        "javac",
+        "gradle",
+        "mvn",
+        "cc",
+        "c++",
+        "clang",
+        "clang++",
+        "cmake",
+        "make",
+        "ninja",
+        "sccache",
+        "ruby",
+        "bundle",
+        "php",
+        "composer",
+    ];
+    for count in [1, 8, 32] {
+        let (mut config, root) = isolated_config("fixed-cost");
+        config.default_cwd = None;
+        config.group_ledger = Some(root.join("groups.json"));
+        config.telemetry_root = Some(root.join("telemetry"));
+        config.sandbox.capabilities.contribution.bootstrap_programs = TOOLS[..count]
+            .iter()
+            .map(|name| BootstrapProgram {
+                name,
+                target: PathBuf::from("/usr/bin/true"),
+            })
+            .collect();
+        let mount = &config.workspace_root;
+        std::fs::create_dir_all(&config.sandbox.home).unwrap();
+        std::fs::create_dir_all(&config.sandbox.exec_temp_dir).unwrap();
+        std::fs::create_dir_all(mount.join(".cowshed/bin")).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(mount.join(cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH))
+            .unwrap()
+            .write_all(
+                cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32])
+                    .encode()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let commitments = CommitmentPublisher::start(
+            Box::new(ArrowAuditSink::open(root.join("telemetry")).unwrap()),
+            8,
+        )
+        .unwrap();
+        let handle = WorkspaceSupervisor::start(config, commitments).unwrap();
+        let mut samples = Vec::new();
+        for iteration in 0..25 {
+            let started = Instant::now();
+            let job = handle
+                .exec(
+                    None,
+                    None,
+                    ExecRequest {
+                        command: ExecCommand::Argv(vec!["/usr/bin/true".into()]),
+                        cwd: None,
+                        ..request(StdinSource::Empty)
+                    },
+                    AdmissionSource::Worker,
+                )
+                .await
+                .unwrap();
+            let ended = handle.wait(job).await.unwrap();
+            assert_eq!(ended.exit, Some(ExitStatus::Exited { code: 0 }));
+            assert_eq!(ended.state, JobState::Exited);
+            assert!(ended.resources.is_some(), "{ended:?}");
+            if iteration != 0 {
+                samples.push(started.elapsed().as_secs_f64());
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        println!(
+            "fixed-cost tools={count} jobs={} mean_ms={:.3} median_ms={:.3} seconds_per_1000={:.3}",
+            samples.len(),
+            mean * 1e3,
+            samples[samples.len() / 2] * 1e3,
+            mean * 1e3,
+        );
+        assert_eq!(handle.trace_health().await.unwrap().failed, 0);
+        handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+    }
+}
+
 /// A job is durable and queued before the gateway grants it anything; the actor answers status
 /// meanwhile and spawns nothing. The command spawns under the actual grant -- its count, its live
 /// pool, its class's nice -- and the grant is held until the job concludes, then returned.

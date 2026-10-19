@@ -147,6 +147,15 @@ Each detector returns data through one `CapabilityContribution`:
   the program name; a conflicting detector contribution returns a typed conflict naming core and the detector, never a
   missing-owner panic.
 
+  Reconciliation reads the owned-name manifest and checks every requested link; it never scans unrelated entries. A
+  clean manifest and matching links require no write or durability barrier. Before repairing a set, preparation durably
+  publishes the union of old and requested names as pending, then repairs the links, syncs their directory, and only
+  then durably publishes the clean requested set. An interrupted repair therefore remains pending even when every link
+  already matches on the next call; that call completes the barrier before declaring the set clean. Existing unmarked
+  manifests take this repair path once. The private NUL-separated manifest uses one leading empty field for pending and
+  two for clean; no job can write these bootstrap directories. Link replacement remains atomic and anchored to the held
+  parent, and all mutations retain their power-loss barriers.
+
   When the registered `cowshed` multicall executable owns the exec host, detected `bun`, `npm` and `pnpm` entries use
   that same staged executable as their install wrapper, linked in the mode's private `tools/manager-bin` rather than
   `tools/bin`. Their actual capability-resolved executables stay under the reconciled `tools/real-bin`; no route is

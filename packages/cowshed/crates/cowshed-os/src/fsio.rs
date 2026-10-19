@@ -383,11 +383,12 @@ impl AnchoredDirectory {
     /// removed. The owned names are recorded in the private file `manifest`, so nothing else in
     /// the directory is enumerated or touched.
     ///
-    /// The manifest never under-records: it is widened to the union of the old and new names
-    /// before any link changes and narrowed to the new names only after every link is in place,
-    /// so a crash at any point leaves a manifest the next call can reconcile from. A manifest
-    /// naming anything but a plain leaf, or an entry that is a directory, is an error; nothing
-    /// is guessed.
+    /// The manifest never under-records: before changing links, publish the old/new name union
+    /// with one leading NUL (pending). Sync the repaired directory before publishing the requested
+    /// names with two leading NULs (clean). Only a clean manifest and matching links skip writes
+    /// and syncs. Pending or older unmarked manifests complete the barrier even if the links
+    /// already match, so an interrupted repair cannot pass as durable. A name that is not a plain
+    /// leaf, or a directory standing at a link name, is an error.
     pub fn reconcile_links<N: AsRef<CStr>>(
         &self,
         manifest: &CStr,
@@ -410,7 +411,33 @@ impl AnchoredDirectory {
             }
             current.push(name);
         }
+        let encode = |names: &mut Vec<&[u8]>, prefix: &[u8]| {
+            names.sort_unstable();
+            names.dedup();
+            let mut bytes = Vec::with_capacity(
+                prefix.len() + names.iter().map(|name| name.len() + 1).sum::<usize>(),
+            );
+            bytes.extend_from_slice(prefix);
+            for name in names {
+                bytes.extend_from_slice(name);
+                bytes.push(0);
+            }
+            bytes
+        };
+        let clean = encode(&mut current, b"\0\0");
         let recorded = self.read_regular_file(manifest)?.unwrap_or_default();
+        if recorded == clean {
+            let mut matching = true;
+            for (name, target) in links {
+                if !self.symlink_matches(name.as_ref(), target)? {
+                    matching = false;
+                    break;
+                }
+            }
+            if matching {
+                return Ok(());
+            }
+        }
         let mut prior: Vec<CString> = Vec::new();
         for entry in recorded
             .split(|byte| *byte == 0)
@@ -428,17 +455,9 @@ impl AnchoredDirectory {
             })?;
             prior.push(name);
         }
-        let encode = |names: &mut Vec<&[u8]>| {
-            names.sort_unstable();
-            names.dedup();
-            names
-                .iter()
-                .flat_map(|name| name.iter().copied().chain([0]))
-                .collect::<Vec<u8>>()
-        };
         let mut union: Vec<&[u8]> = prior.iter().map(|name| name.to_bytes()).collect();
         union.extend(current.iter().copied());
-        self.publish_file(manifest, &encode(&mut union))?;
+        self.publish_file(manifest, &encode(&mut union, b"\0"))?;
         for name in &prior {
             if !current.contains(&name.to_bytes()) {
                 self.unlink_entry(name)?;
@@ -447,8 +466,10 @@ impl AnchoredDirectory {
         for (name, target) in links {
             self.exact_symlink(name.as_ref(), target)?;
         }
-        self.publish_file(manifest, &encode(&mut current))?;
-        self.sync()
+        // This barrier precedes the clean receipt. A failed or interrupted publication leaves
+        // pending evidence, and the next call repeats the barrier rather than trusting the links.
+        self.sync()?;
+        self.publish_file(manifest, &clean)
     }
 
     /// Read the target of the symlink `name` through the held directory into `buffer`, returning
@@ -478,21 +499,26 @@ impl AnchoredDirectory {
         Ok(&buffer[..count])
     }
 
+    fn symlink_matches(&self, name: &CStr, target: &Path) -> io::Result<bool> {
+        let mut buffer = [0u8; 4096];
+        match self.read_link(name, &mut buffer) {
+            Ok(bytes) => Ok(bytes == target.as_os_str().as_bytes()),
+            // Absent, or not a link at all (a regular file the rename replaces).
+            Err(error) => match error.raw_os_error() {
+                Some(libc::ENOENT | libc::EINVAL) => Ok(false),
+                _ => Err(error),
+            },
+        }
+    }
+
     /// `name` as a symlink to exactly `target`. A matching link is kept and nothing is written.
     /// Anything else is replaced atomically: the new link is made under a unique temp leaf and
     /// renamed over `name`, so the old entry is never removed first. A directory at `name`
     /// refuses the rename. The rename is not synced here: a caller that changed links in this
     /// directory issues one [`Self::sync`] after its last change, before any durable write.
     pub fn exact_symlink(&self, name: &CStr, target: &Path) -> io::Result<bool> {
-        let mut buffer = [0u8; 4096];
-        match self.read_link(name, &mut buffer) {
-            Ok(bytes) if bytes == target.as_os_str().as_bytes() => return Ok(false),
-            Ok(_) => {}
-            // Absent, or not a link at all (a regular file the rename replaces).
-            Err(error) => match error.raw_os_error() {
-                Some(libc::ENOENT | libc::EINVAL) => {}
-                _ => return Err(error),
-            },
+        if self.symlink_matches(name, target)? {
+            return Ok(false);
         }
         // The NUL checks run before any entry is created, so a refused target mutates nothing.
         let target = CString::new(target.as_os_str().as_bytes())
@@ -1463,7 +1489,7 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read_link(bin.join("npm")).unwrap(), npm);
         assert_eq!(fs::read_link(bin.join("node")).unwrap(), node);
-        assert_eq!(fs::read(bin.join(".links")).unwrap(), b"node\0npm\0");
+        assert_eq!(fs::read(bin.join(".links")).unwrap(), b"\0\0node\0npm\0");
 
         directory
             .reconcile_links(c".links", &[(c"node", &node)])
@@ -1473,12 +1499,123 @@ mod tests {
             "a stale link stays on PATH"
         );
         assert_eq!(fs::read_link(bin.join("node")).unwrap(), node);
-        assert_eq!(fs::read(bin.join(".links")).unwrap(), b"node\0");
+        assert_eq!(fs::read(bin.join(".links")).unwrap(), b"\0\0node\0");
         assert_eq!(fs::read(bin.join("unowned")).unwrap(), b"someone else's");
 
         directory.reconcile_links::<&CStr>(c".links", &[]).unwrap();
         assert!(fs::symlink_metadata(bin.join("node")).is_err());
-        assert_eq!(fs::read(bin.join(".links")).unwrap(), b"");
+        assert_eq!(fs::read(bin.join(".links")).unwrap(), b"\0\0");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_reconciliation_checks_links_without_writes_or_syncs() {
+        use std::os::unix::fs::MetadataExt;
+        let (root, bin, directory) = reconcile_fixture("clean");
+        let target = root.join("node");
+        let links = [(c"node", target.as_path())];
+        directory.reconcile_links(c".links", &links).unwrap();
+        let manifest_inode = fs::metadata(bin.join(".links")).unwrap().ino();
+        let link_inode = fs::symlink_metadata(bin.join("node")).unwrap().ino();
+        take_syncs();
+        directory.reconcile_links(c".links", &links).unwrap();
+        assert_eq!(take_syncs(), Syncs::default());
+        assert_eq!(
+            fs::metadata(bin.join(".links")).unwrap().ino(),
+            manifest_inode
+        );
+        assert_eq!(
+            fs::symlink_metadata(bin.join("node")).unwrap().ino(),
+            link_inode
+        );
+
+        // The receipt never stands in for inspecting the current links.
+        fs::remove_file(bin.join("node")).unwrap();
+        std::os::unix::fs::symlink(root.join("wrong"), bin.join("node")).unwrap();
+        directory.reconcile_links(c".links", &links).unwrap();
+        assert_eq!(fs::read_link(bin.join("node")).unwrap(), target);
+        assert_eq!(
+            take_syncs().full,
+            3,
+            "pending, repaired links, clean receipt"
+        );
+        directory.reconcile_links::<&CStr>(c".links", &[]).unwrap();
+        take_syncs();
+        directory.reconcile_links::<&CStr>(c".links", &[]).unwrap();
+        assert_eq!(
+            take_syncs(),
+            Syncs::default(),
+            "an empty clean set is stable too"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_and_unmarked_reconciliations_sync_even_when_every_link_matches() {
+        let (root, bin, directory) = reconcile_fixture("pending");
+        let target = root.join("node");
+        directory.exact_symlink(c"node", &target).unwrap();
+        for receipt in [b"node\0".as_slice(), b"\0node\0"] {
+            // Model an older writer, or death after the last link rename but before its barrier.
+            directory.publish_file(c".links", receipt).unwrap();
+            take_syncs();
+            directory
+                .reconcile_links(c".links", &[(c"node", &target)])
+                .unwrap();
+            assert!(take_syncs().full >= 2, "links sync before publishing clean");
+            assert_eq!(fs::read(bin.join(".links")).unwrap(), b"\0\0node\0");
+            directory
+                .reconcile_links(c".links", &[(c"node", &target)])
+                .unwrap();
+            assert_eq!(take_syncs(), Syncs::default());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_repair_keeps_pending_ownership_until_the_retry_finishes() {
+        let (root, bin, directory) = reconcile_fixture("interrupted");
+        let target = root.join("program");
+        directory
+            .reconcile_links(c".links", &[(c"stale", &target)])
+            .unwrap();
+        fs::create_dir(bin.join("blocked")).unwrap();
+        let links = [(c"first", target.as_path()), (c"blocked", target.as_path())];
+        assert!(directory.reconcile_links(c".links", &links).is_err());
+        assert_eq!(
+            fs::read(bin.join(".links")).unwrap(),
+            b"\0blocked\0first\0stale\0",
+            "failed repairs retain the durable union, not a clean receipt"
+        );
+        assert_eq!(fs::read_link(bin.join("first")).unwrap(), target);
+        assert!(fs::symlink_metadata(bin.join("stale")).is_err());
+        fs::remove_dir(bin.join("blocked")).unwrap();
+        take_syncs();
+        directory.reconcile_links(c".links", &links).unwrap();
+        assert_eq!(
+            take_syncs().full,
+            2,
+            "resume pending, sync links, publish clean"
+        );
+        assert_eq!(
+            fs::read(bin.join(".links")).unwrap(),
+            b"\0\0blocked\0first\0"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_refused_pending_manifest_leaves_links_untouched() {
+        let (root, bin, directory) = reconcile_fixture("pending-refusal");
+        let old = root.join("old");
+        directory.exact_symlink(c"node", &old).unwrap();
+        fs::create_dir(bin.join(".links")).unwrap();
+        assert!(
+            directory
+                .reconcile_links(c".links", &[(c"node", &root.join("new"))])
+                .is_err()
+        );
+        assert_eq!(fs::read_link(bin.join("node")).unwrap(), old);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1663,5 +1800,51 @@ mod tests {
             Syncs { fsync: 0, full: 1 },
             "the held directory is synced once"
         );
+    }
+
+    /// Three bootstrap directories are reconciled before every sandboxed spawn. Run explicitly
+    /// on the host with `taskpolicy -b cargo test -p cowshed-os bootstrap_reconciliation_cost
+    /// -- --ignored --nocapture --test-threads=1`; timings are observations, not assertions.
+    #[test]
+    #[ignore = "manual filesystem performance measurement"]
+    fn bootstrap_reconciliation_cost() {
+        for count in [1, 8, 32] {
+            let scratch = TempRoot::new_in(&canonical_parent(), "fsio-bootstrap-cost");
+            let directories: Vec<_> = ["bin", "manager-bin", "real-bin"]
+                .map(|name| AnchoredDirectory::create(&scratch.join(name)).unwrap())
+                .into_iter()
+                .collect();
+            let names: Vec<_> = (0..count)
+                .map(|index| CString::new(format!("tool-{index}")).unwrap())
+                .collect();
+            let links: Vec<_> = names
+                .iter()
+                .map(|name| (name.as_c_str(), Path::new("/usr/bin/true")))
+                .collect();
+            let reconcile = || {
+                for directory in &directories {
+                    directory.reconcile_links(c".links", &links).unwrap();
+                }
+            };
+            take_syncs();
+            let started = std::time::Instant::now();
+            reconcile();
+            let cold = started.elapsed();
+            let cold_syncs = take_syncs();
+            let started = std::time::Instant::now();
+            for _ in 0..24 {
+                reconcile();
+            }
+            let warm = started.elapsed();
+            let warm_syncs = take_syncs();
+            println!(
+                "bootstrap-cost links_per_directory={count} jobs=24 cold_us={} cold_full={} warm_us_per_job={:.3} warm_ms_per_1000={:.3} warm_full={}",
+                cold.as_micros(),
+                cold_syncs.full,
+                warm.as_secs_f64() * 1e6 / 24.0,
+                warm.as_secs_f64() * 1e6 / 24.0,
+                warm_syncs.full,
+            );
+        }
     }
 }
