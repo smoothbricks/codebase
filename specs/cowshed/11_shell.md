@@ -248,8 +248,8 @@ subscription before acknowledging it. The client then sends the stream-lane dema
 canonical process event, an end, or an error; `close` remains readable while a demand awaits an event. Disconnecting or
 closing drops only that subscription, never the job. No public cursor or long-poll operation is exposed.
 
-`hold` holds its own connection too, and is the one call whose disconnection reaches a job (05_gateway.md, "A gate lives
-with its operator"). The client reads the served authority from `hello` and refuses a supervisor serving another
+`hold` holds its own connection too, and is the one call whose disconnection reaches a job (05_gateway.md, "A job lives
+with its requester"). The client reads the served authority from `hello` and refuses a supervisor serving another
 incarnation than its job's before anything is held, so a grant advance between admission and hold changes nothing. The
 supervisor validates the authority and the job and acknowledges with `null`. It then answers the job's terminal
 `JobInfo` when the job ends, or `null` again when the client sends the demand `release`, which lets the job outlive the

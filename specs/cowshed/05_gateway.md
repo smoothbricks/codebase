@@ -735,18 +735,21 @@ core count.
   orchestrator starts on its floor token, the older land's tasks take every returned token they want, the younger land's
   tasks take what the older one does not ask for, and the younger takes the older one's place when it completes. Neither
   is preempted: a running task of either keeps its grant.
-- **A gate lives with its operator** (2026-10-18, Danny tg#7386: "cowshed gateway is supposed to background every
-  landing queued and not cause load that slows down the head of the queue"). A gate job's only consumer is the operator
-  that admitted it: its verdict moves main only through the `cowshed land` its lander runs next. A gate whose lander is
-  gone — killed, or stopped under the one-lander rule — authorizes nothing, yet it keeps its admission, so it stays the
-  oldest gate job and takes every returned token ahead of the land that holds a land lock. Measured 2026-10-18: a land
-  of another repository stopped while gating left `nx run-many --parallel=18` running at gate class with no lander and
-  that repository's land lock free; it headed `gateQueue` and held 13 of 18 tokens against the locked smoothbricks land.
-  So `cowshed exec --class gate` holds its job for as long as the exec process lives (11_shell.md, `hold`): when that
-  process ends before its job — `SIGKILL` included, since the kernel closes its connection — the supervisor kills the
-  job, and the gate's tokens and its place in the gate order pass to the next gate at once. `--timeout` releases the
-  hold before it leaves the job running, and `--background` takes none: an operator who asks for an unattended gate
-  keeps it. A gate that cannot be held is killed and its exec fails, rather than run for nobody.
+- **A job lives with its requester** (2026-10-18, Danny tg#7386: "cowshed gateway is supposed to background every
+  landing queued and not cause load that slows down the head of the queue"). A foreground job's only consumer is the
+  process that asked for it, so when that process is gone the job stops and its tokens return. A gate job's verdict
+  moves main only through the `cowshed land` its lander runs next. A gate whose lander is gone — killed, or stopped
+  under the one-lander rule — authorizes nothing, yet it keeps its admission, so it stays the oldest gate job and takes
+  every returned token ahead of the land that holds a land lock. Measured 2026-10-18: a land of another repository
+  stopped while gating left `nx run-many --parallel=18` running at gate class with no lander and that repository's land
+  lock free; it headed `gateQueue` and held 13 of 18 tokens against the locked smoothbricks land. The same holds for
+  background work. Measured 2026-10-19: an agent's tool timeout killed three `cowshed exec` clients, and their sandboxed
+  jobs ran on under the supervisor for 1h04, 61 and 33 minutes, holding a quarter of the host and reading as work. So
+  every foreground `cowshed exec`, whatever its class, holds its job for as long as the exec process lives (11_shell.md,
+  `hold`): when that process ends before its job — `SIGKILL` included, since the kernel closes its connection — the
+  supervisor kills the job, and its tokens (and a gate's place in the gate order) pass on at once. `--timeout` releases
+  the hold before it leaves the job running, and `--background` takes none: a caller who asks for an unattended job
+  keeps it. A job that cannot be held is killed and its exec fails, rather than run for nobody.
 - **A short build grows** (2026-10-17, Danny chose option C of tg#6761). A grant taken at the first returned token can
   be far below its `want`: measured, a land task's nextest asked for 18 tokens on a host another shed held whole, waited
   32 s and ran its whole suite with 1 (`tokens=1/18`). A runner whose parallelism is a make jobserver can use tokens

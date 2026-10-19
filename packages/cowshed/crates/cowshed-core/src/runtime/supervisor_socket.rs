@@ -1104,7 +1104,7 @@ async fn serve_process_events(
 /// terminal `JobInfo` when it ends, or `null` again when the holder releases it. A holder that
 /// closes the connection first — it exited, or was killed, `SIGKILL` included, since the kernel
 /// closes its socket — has left a job nobody waits for, and the job is killed
-/// (05_gateway.md, "A gate lives with its operator").
+/// (05_gateway.md, "A job lives with its requester").
 async fn serve_hold(
     mut stream: UnixStream,
     supervisor: &WorkspaceSupervisorHandle,
