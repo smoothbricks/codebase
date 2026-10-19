@@ -45,11 +45,14 @@ import {
   censusStart,
   type GraphWitness,
   graphInstallationIdentity,
+  installationIdentityOf,
   movedNodes,
   nodeStamp,
   nodesUnchanged,
+  provenInstallationCensus,
   readArtifactWitness,
   readGraphWitness,
+  recordedInstallationCensus,
   recordedStamp,
   reusableGraph,
   snapshotsEqual,
@@ -1065,31 +1068,50 @@ async function currentProjectGraph(
     await daemonClient.updateWorkspaceContext(created, updated, deleted);
   }
   performance.measure('ensureBuilt:inputs', 'ensureBuilt:inputs:start');
-  const installation = graphInstallationIdentity(
+  // The witness's census is a hash source: a file whose proven stamp has not moved since it was read is not read again.
+  const recorded =
+    witness === null ? undefined : recordedInstallationCensus(witness.installation, witness.installationUnproven);
+  const localInputs = graphInputContractIdentity(workspaceRoot, nxJson, before);
+  const census = provenInstallationCensus(
     workspaceRoot,
     nxJson,
     packageResolution.readModulePackageJson,
     expandOutputs,
-    graphInputContractIdentity(workspaceRoot, nxJson, before),
+    localInputs,
+    undefined,
+    recorded,
   );
+  const installation = census === null ? null : installationIdentityOf(census, localInputs);
   const cached = nodesUnchanged(before.nodes)
     ? reusableGraph(witness, workspaceRoot, environment, installation, before)
     : null;
   if (!forceGraphRpc && cached !== null) return cached;
   const { projectGraph } = await daemonClient.getProjectGraphAndSourceMaps();
   const after = workspaceSnapshot(workspaceRoot, new WorkspaceContext(workspaceRoot, data), before);
-  const finalInstallation = graphInstallationIdentity(
+  const finalInputs = graphInputContractIdentity(workspaceRoot, nxJson, after);
+  const finalCensus = provenInstallationCensus(
     workspaceRoot,
     nxJson,
     packageResolution.readModulePackageJson,
     expandOutputs,
-    graphInputContractIdentity(workspaceRoot, nxJson, after),
+    finalInputs,
+    undefined,
+    census ?? recorded,
   );
+  const finalInstallation = finalCensus === null ? null : installationIdentityOf(finalCensus, finalInputs);
   // `after` re-hashed every node whose stamp does not prove it (its ctime alone moved, or `before` read it in the tick
   // it changed in), and snapshotsEqual compares those hashes.
   const stableGeneration = snapshotsEqual(before, after) && movedNodes(before.nodes, () => true) === null;
-  if (installation !== null && installation === finalInstallation && stableGeneration) {
-    const next: GraphWitness = { version: 1, workspaceRoot, environment, installation, snapshot: after, projectGraph };
+  if (installation !== null && finalCensus !== null && installation === finalInstallation && stableGeneration) {
+    const next: GraphWitness = {
+      version: 2,
+      workspaceRoot,
+      environment,
+      installation,
+      installationUnproven: finalCensus.unproven,
+      snapshot: after,
+      projectGraph,
+    };
     writeWitness(witnessPath, next);
   }
   // A write during the await cannot authorize a saved graph. Feed the final

@@ -14,7 +14,7 @@ import { testFileInstallation } from './__tests__/owned-installation.js';
 import { managedAssetsRoot } from './managed-assets.js';
 
 /** The Nx and the plugin product the provider and the consumer link, one copy this file owns; none may write into it. */
-const installation = testFileInstallation('linked-snapshot-installation-');
+const installation = testFileInstallation('linked-snapshot-installation');
 const SNAPSHOTS = join(managedAssetsRoot, 'raw/tooling/direnv/linked-snapshots.ts');
 const DECLARATION = { targets: ['linked-api:build'], artifactModules: [] };
 

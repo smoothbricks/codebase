@@ -34,6 +34,11 @@ export function nodeStamp(stats: StampFields): string {
   return `${stats.dev}:${stats.ino}:${stats.mode}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
 }
 
+/** The file type and permission bits a {@link nodeStamp} records: what a copy of the node keeps of its stamp. */
+export function stampMode(stamp: string): string {
+  return stamp.split(':')[2];
+}
+
 /**
  * How an observed stamp compares with the recorded one: `same`; `ctime` when device, inode, mode, size and mtime are
  * kept and only the ctime moved (a same-mode chmod, which Bun's bin linking does to a shared store file on any
@@ -96,10 +101,12 @@ export interface WorkspaceSnapshot {
 }
 
 export interface GraphWitness {
-  readonly version: 1;
+  readonly version: 2;
   readonly workspaceRoot: string;
   readonly environment: string;
   readonly installation: string;
+  /** The census behind `installation` read these files in the tick they changed in: {@link GraphInstallationCensus}. */
+  readonly installationUnproven: readonly string[];
   readonly snapshot: WorkspaceSnapshot;
   readonly projectGraph: ProjectGraph;
 }
@@ -223,7 +230,7 @@ export function reusableGraph(
   snapshot: WorkspaceSnapshot,
 ): ProjectGraph | null {
   return witness !== null &&
-    witness.version === 1 &&
+    witness.version === 2 &&
     witness.workspaceRoot === workspaceRoot &&
     installation !== null &&
     witness.installation === installation &&
@@ -233,13 +240,15 @@ export function reusableGraph(
     : null;
 }
 
-/** What {@link graphInstallationIdentity} binds: resolution edges `[from, name, physical manifest]`, node stamps and
- * file hashes, read once.
+/** What {@link graphInstallationIdentity} binds: resolution edges `[from, name, physical manifest]`, node stamps as
+ * read and file hashes, read once. `unproven` names the files this census read in the tick they changed in
+ * ({@link unproven}); it is not part of the identity, only what a later census that reuses these hashes must re-read.
  */
 export interface GraphInstallationCensus {
   readonly resolutions: readonly (readonly [string, string, string | null])[];
   readonly nodes: readonly NodeWitness[];
   readonly files: readonly { readonly path: string; readonly sha256: string }[];
+  readonly unproven: readonly string[];
 }
 
 /** Plugins with opaque external graph inputs cannot borrow this proof.
@@ -257,7 +266,59 @@ export function graphInstallationIdentity(
   localInputs: GraphInputContractProof | null,
   onUnproved?: (detail: string) => void,
 ): string | null {
-  const census = graphInstallationCensus(workspaceRoot, nxJson, resolvePackage, expand, localInputs, onUnproved);
+  const census = provenInstallationCensus(workspaceRoot, nxJson, resolvePackage, expand, localInputs, onUnproved);
+  return census === null ? null : installationIdentityOf(census, localInputs);
+}
+
+/** The identity {@link graphInstallationIdentity} names for a proven census: what it read, never what it reused. */
+export function installationIdentityOf(
+  { resolutions, nodes, files }: GraphInstallationCensus,
+  localInputs: GraphInputContractProof | null,
+): string {
+  return JSON.stringify({ resolutions, nodes, files, localInputs: localInputs?.identity ?? null });
+}
+
+/** The census behind a recorded identity ({@link installationIdentityOf}) and its unproven files, or `undefined` for
+ * one that does not parse: a hash source for {@link graphInstallationCensus}, never a proof.
+ */
+export function recordedInstallationCensus(
+  identity: string,
+  unproven: readonly string[],
+): GraphInstallationCensus | undefined {
+  try {
+    const recorded = typia.json.isParse<Omit<GraphInstallationCensus, 'unproven'>>(identity);
+    return recorded === null
+      ? undefined
+      : { resolutions: recorded.resolutions, nodes: recorded.nodes, files: recorded.files, unproven };
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * A {@link graphInstallationCensus} that no node moved during: every node is read again after the census, and one
+ * whose stamp moved fails it, unless only its ctime moved and its bytes are the ones hashed. `previous` is what the
+ * census may take hashes from. `null`, with `onUnproved` told why, for a closure that cannot be read or that moved.
+ */
+export function provenInstallationCensus(
+  workspaceRoot: string,
+  nxJson: NxJsonConfiguration,
+  resolvePackage: typeof readModulePackageJsonWithoutFallbacks,
+  expand: typeof expandOutputs,
+  localInputs: GraphInputContractProof | null,
+  onUnproved?: (detail: string) => void,
+  previous?: GraphInstallationCensus,
+): GraphInstallationCensus | null {
+  const census = graphInstallationCensus(
+    workspaceRoot,
+    nxJson,
+    resolvePackage,
+    expand,
+    localInputs,
+    onUnproved,
+    previous,
+  );
   if (census === null) return null;
   try {
     // A file whose ctime alone moved is re-hashed: Bun's bin linking on any checkout's install re-chmods a shared
@@ -279,12 +340,22 @@ export function graphInstallationIdentity(
     }
     throw error;
   }
-  return JSON.stringify({ ...census, localInputs: localInputs?.identity ?? null });
+  return census;
 }
 
-/** One read of the installation closure {@link graphInstallationIdentity} binds, without its final check that no node
+/**
+ * One read of the installation closure {@link graphInstallationIdentity} binds, without its final check that no node
  * moved while it was read: what a caller that needs the closure, not a proof of it, reads. `null`, with `onUnproved`
  * told why, for a closure that cannot be read.
+ *
+ * Every census resolves every edge, lists every directory and stats every node; only file bytes are reused. A file
+ * takes its hash from `previous` when its stamp (device, inode, mode, size, and mtime and ctime in nanoseconds) is
+ * the one `previous` read and `previous` did not read it in the tick it changed in. A write moves a file's ctime to
+ * the tick it happens in, so a file written since `previous` stat-ed it, even between that stat and its read, one
+ * whose stamp `previous` lacks, and one `previous` recorded unproven are read again; `previous` need not be proven.
+ * The key is the stamp, not a cheaper generation (a resolution, a manifest, an install marker): a rebuild of a
+ * developer-linked package, this plugin's own `dist`, rewrites its files in place and moves none of those, so a census
+ * keyed on them would describe a tree that is no longer there.
  */
 export function graphInstallationCensus(
   workspaceRoot: string,
@@ -293,6 +364,7 @@ export function graphInstallationCensus(
   expand: typeof expandOutputs,
   localInputs: GraphInputContractProof | null,
   onUnproved?: (detail: string) => void,
+  previous?: GraphInstallationCensus,
 ): GraphInstallationCensus | null {
   const plugins = (nxJson.plugins ?? []).map((plugin) => (typeof plugin === 'string' ? plugin : plugin.plugin));
   const unproved = plugins.filter(
@@ -302,8 +374,15 @@ export function graphInstallationCensus(
     onUnproved?.(`Unproved configured graph plugins: ${unproved.join(', ')}`);
     return null;
   }
+  const start = censusStart();
   const nodes: NodeWitness[] = [];
   const files: { path: string; sha256: string }[] = [];
+  const unprovenFiles: string[] = [];
+  // The stamps `previous` read its files at, those it read in their change tick left out, and the hashes it read.
+  const recordedUnproven = new Set(previous?.unproven);
+  const recordedStamps = new Map<string, string>();
+  for (const { path, stamp } of previous?.nodes ?? []) if (!recordedUnproven.has(path)) recordedStamps.set(path, stamp);
+  const recordedHashes = new Map(previous?.files.map(({ path, sha256 }) => [path, sha256]));
   const buffer = Buffer.allocUnsafe(64 * 1024);
   const resolutions: [string, string, string | null][] = [];
   const visited = new Set<string>();
@@ -311,7 +390,8 @@ export function graphInstallationCensus(
   const expandedRoots = new Set<string>();
   function walk(path: string, selected?: ReadonlySet<string>): void {
     const stats = lstatSync(path, { bigint: true });
-    nodes.push({ path, stamp: nodeStamp(stats) });
+    const stamp = nodeStamp(stats);
+    nodes.push({ path, stamp });
     if (stats.isSymbolicLink()) {
       const physical = realpathSync(path);
       if (lstatSync(physical).isDirectory() && !declaredDirectoryLinks.has(path)) {
@@ -333,17 +413,22 @@ export function graphInstallationCensus(
     } else if (!stats.isFile()) {
       throw new Error(`Unproved graph package node: ${path}`);
     } else {
-      const hash = createHash('sha256');
-      const fd = openSync(path, 'r');
-      try {
-        for (let count = readSync(fd, buffer); count > 0; count = readSync(fd, buffer)) {
-          hash.update(buffer.subarray(0, count));
-        }
-      } finally {
-        closeSync(fd);
-      }
-      files.push({ path, sha256: hash.digest('hex') });
+      if (unproven(stats, start)) unprovenFiles.push(path);
+      const recorded = recordedStamps.get(path) === stamp ? recordedHashes.get(path) : undefined;
+      files.push({ path, sha256: recorded ?? fileHash(path) });
     }
+  }
+  function fileHash(path: string): string {
+    const hash = createHash('sha256');
+    const fd = openSync(path, 'r');
+    try {
+      for (let count = readSync(fd, buffer); count > 0; count = readSync(fd, buffer)) {
+        hash.update(buffer.subarray(0, count));
+      }
+    } finally {
+      closeSync(fd);
+    }
+    return hash.digest('hex');
   }
   function installedManifest(name: string, from: string): InstalledPackageManifest {
     try {
@@ -449,7 +534,7 @@ export function graphInstallationCensus(
       visit(name, workspaceRoot, false);
     for (const input of localInputs?.packages ?? []) visit(input.name, input.from, false);
     visit('typescript', workspaceRoot, true);
-    return { resolutions, nodes, files };
+    return { resolutions, nodes, files, unproven: unprovenFiles };
   } catch (error) {
     if (systemError(error) && ['EACCES', 'EPERM', 'EIO'].includes(error.code)) throw error;
     // Installation uncertainty disables only graph reuse. Nx's authoritative

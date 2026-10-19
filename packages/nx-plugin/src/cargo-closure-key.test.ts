@@ -30,7 +30,7 @@ import { isRecord } from './type-guards.js';
 useFixtureCargoHome();
 
 /** The Nx installation this file's fixtures share; none may write into it. */
-const installation = testFileInstallation('cargo-closure-key-installation-');
+const installation = testFileInstallation('cargo-closure-key-installation');
 afterAll(() => installation.retire());
 
 /** The ignored directory the producer owns, inside `leaf`, which every closure of `app` reaches. */

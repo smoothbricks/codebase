@@ -31,7 +31,7 @@ const repositoryRoot = join(import.meta.dir, '../../..');
 useFixtureCargoHome();
 
 /** The Nx installation this file's fixtures share; none may write into it. */
-const installation = testFileInstallation('cargo-closure-installation-');
+const installation = testFileInstallation('cargo-closure-installation');
 afterAll(() => installation.retire());
 
 it('keys a custom target on exactly its Cargo closure, inside the workspace and out', async () => {

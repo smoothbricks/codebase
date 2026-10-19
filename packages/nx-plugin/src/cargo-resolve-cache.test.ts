@@ -48,7 +48,7 @@ import { createNodesV2 } from './index.js';
 useFixtureCargoHome();
 
 /** The Nx installation this file's graph fixtures share; none may write into it. */
-const installation = testFileInstallation('cargo-resolve-installation-');
+const installation = testFileInstallation('cargo-resolve-installation');
 afterAll(() => installation.retire());
 
 /*

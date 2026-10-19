@@ -22,15 +22,20 @@ import { expandOutputs, WorkspaceContext } from 'nx/src/native';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory';
 import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
 import typia from 'typia';
+import { pastTick } from './__tests__/past-tick.js';
 import {
   censusStart,
+  type GraphInstallationCensus,
   type GraphWitness,
   graphInstallationIdentity,
+  installationIdentityOf,
   movedNodes,
   type NodeWitness,
   nodeStamp,
   nodesUnchanged,
+  provenInstallationCensus,
   readGraphWitness,
+  recordedInstallationCensus,
   recordedStamp,
   reusableGraph,
   SAME_TICK_NS,
@@ -68,10 +73,11 @@ afterEach(async () => {
 
 function witness(): GraphWitness {
   return {
-    version: 1,
+    version: 2,
     workspaceRoot: root,
     environment: 'env',
     installation: 'installed',
+    installationUnproven: [],
     snapshot: snapshot(),
     projectGraph: graph,
   };
@@ -151,7 +157,7 @@ describe('authoritative graph witness', () => {
     } finally {
       await chmod(path, 0o600);
     }
-    await writeFile(path, JSON.stringify({ ...witness(), version: 2 }));
+    await writeFile(path, JSON.stringify({ ...witness(), version: 1 }));
     expect(readGraphWitness(path)).toBeNull();
   });
 });
@@ -338,6 +344,51 @@ describe('installed graph input identity', () => {
     expect(changed.files.find(({ path }) => path === output)?.sha256).not.toBe(
       original.files.find(({ path }) => path === output)?.sha256,
     );
+  });
+
+  it('takes only a proven, unmoved file’s hash from a previous census and reads every other file again', async () => {
+    const { plugin, resolver } = await packages();
+    const output = join(plugin, 'dist', 'index.js');
+    const census = (previous?: GraphInstallationCensus) =>
+      typia.assert<GraphInstallationCensus>(
+        provenInstallationCensus(
+          root,
+          { plugins: ['@smoothbricks/nx-plugin'] },
+          resolver,
+          expandOutputs,
+          null,
+          undefined,
+          previous,
+        ),
+      );
+    const hashOf = ({ files }: GraphInstallationCensus) => files.find(({ path }) => path === output)?.sha256;
+    const bytes = (text: string) => createHash('sha256').update(text).digest('hex');
+    await pastTick();
+    const first = census();
+    expect(first.unproven).toEqual([]);
+    // A recorded hash that is not the file's: a census that takes it did not read the file.
+    const recorded = {
+      ...first,
+      files: first.files.map((file) => (file.path === output ? { ...file, sha256: 'recorded' } : file)),
+    };
+    expect(hashOf(census(recorded))).toBe('recorded');
+    // The witness keeps the census as its identity and its unproven files beside it.
+    expect(recordedInstallationCensus(installationIdentityOf(recorded, null), [])).toEqual(recorded);
+    expect(hashOf(census({ ...recorded, unproven: [output] }))).toBe(bytes('exports.value = 1;'));
+    // Only its ctime moved: a same-mode chmod, as Bun's bin linking makes.
+    chmodSync(output, lstatSync(output).mode & 0o7777);
+    expect(hashOf(census(recorded))).toBe(bytes('exports.value = 1;'));
+    // A same-size rewrite that keeps its mtime moves its ctime: read again.
+    const before = await stat(output);
+    await writeFile(output, 'exports.value = 2;');
+    await utimes(output, before.atime, before.mtime);
+    expect(hashOf(census(recorded))).toBe(bytes('exports.value = 2;'));
+    // Dated ahead of the census, as a change in its tick is: recorded unproven, and read again by the next census.
+    const ahead = new Date(Date.now() + 60_000);
+    await utimes(output, ahead, ahead);
+    const dated = census();
+    expect(dated.unproven).toEqual([output]);
+    expect(hashOf(census({ ...dated, files: recorded.files }))).toBe(bytes('exports.value = 2;'));
   });
   it('proves a declared dist link by its physical output tree and rejects changed public bytes', async () => {
     const { plugin, resolver } = await packages();

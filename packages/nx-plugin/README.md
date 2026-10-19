@@ -884,6 +884,17 @@ The installed-package census expands each declared `files` set and relative expo
 native output authority, always retaining the manifest, directory/alias namespace evidence and every resolution edge;
 without a file declaration it conservatively retains the whole package tree.
 
+**Every call censuses the installed closure again; only file bytes are reused.** Each census resolves every edge, lists
+every directory and stats every node. A file takes its SHA-256 from the census the witness records (or, after the graph
+RPC, from the same call's earlier census) only when its stamp (device, inode, mode, size, and mtime and ctime in
+nanoseconds) is the one that census read and that census did not read it in the tick it changed in; the witness records
+those unproven files beside the identity, which binds what was read and never what was reused. Any write moves a file's
+ctime to the tick it happens in, so a file written since, one the recorded census lacks, and one it recorded unproven
+are read again. The key is the stamp and not a cheaper installation generation (a resolution, a manifest, an install
+marker): a rebuild of a developer-linked package, this plugin's own `dist`, rewrites its files in place and moves none
+of those. Measured on a 23,789-node closure (21,069 files): a census that reads every file takes 5–9 s on a loaded host,
+its lstat pass alone 1.3–1.8 s.
+
 Ancestor directories bind device/inode/type/mode path identity; files and symlinks retain their full stamps, and a
 directory is upgraded to a full nanosecond node/namespace stamp when its membership is actually read.
 
@@ -896,10 +907,11 @@ This is git's racily clean rule (`Documentation/technical/racy-git.txt`), and th
 Nx's own file hashes. Node can read neither the jiffy nor a filesystem's granularity, and a shorter window reopens the
 gap on a slower kernel, so the window is the slowest tick and is not an option. A reader that meets an unproven stamp
 re-reads the node against its recorded bytes, link text or membership, as it does a node whose ctime alone moved; one
-that holds nothing to re-read it against counts it moved. A census whose stamps stand in for no bytes of their own (the
-installed-package census and the local plugin modules, which hash every byte on every read) records them as read. So
-does a workspace capture's own stability check, which compares the stamps it read: only the capture after it distrusts
-them.
+that holds nothing to re-read it against counts it moved. The local plugin modules, which hash every byte on every read,
+record their stamps as read. So does a workspace capture's own stability check, which compares the stamps it read: only
+the capture after it distrusts them. The installed-package census records its stamps as read too, since its identity
+binds what it read, and names beside them the files it read in their change tick, which the census that takes its hashes
+reads again.
 
 A physically missing required factory after the clean cutover is an invalid installation and fails loudly; it is not a
 proof miss that can fall back to the graph RPC. Consumers adopt the normal static import only after the public producer
@@ -1646,14 +1658,25 @@ A fixture retires on every exit path, a throwing body included: stop its daemon,
 its root. A daemon that outlives the stop keeps the alias and the root, so the next run's sweep still finds both.
 
 A fixture workspace that runs real Nx with this plugin links an installation it owns, never the host's.
-`@smoothbricks/nx-plugin/owned-installation`'s `ownedInstallation(censusRoot, makeRoot)` copies the closure the graph
+`@smoothbricks/nx-plugin/owned-installation`'s `ownedInstallation(censusRoot, name)` copies the closure the graph
 witness's installation census resolves from `censusRoot` (Nx, this plugin and TypeScript, each package with its
-dependency edges relinked beside it and the top-level bins in `.bin`) into the empty directory `makeRoot` creates, on
-the first `nodeModules()`, and proves the copy. `retire()` fails, naming the changed nodes, if a fixture wrote into it,
-then deletes it. The host's closure moves under a fixture that reads it: a shared Bun store relinked by another install,
-or, in a workspace that developer-links this plugin, the checkout its author is editing and rebuilding. Either fails the
-producer receipt's installation proof for work that is not the test's. This package's tests bind `censusRoot` to this
-repository; a consumer binds it to its own workspace root.
+dependency edges relinked beside it and the top-level bins in `.bin`), and keeps the copy as `name` in `censusRoot`'s
+tool cache, `node_modules/.cache/smoothbricks-nx-plugin/owned-installations/<name>`. Nothing sweeps that directory: a
+cowshed fork clones it with the build volume and main adopts it at land (specs/cowshed/16_build_volumes.md), so it is
+cold only after `node_modules` is reinstalled or the build volume reseeded. Making the copy is most of what a test file
+costs (about 21,000 files: a 59 s copy and a 31–119 s removal per run on a loaded host), and clonefile cannot share it,
+since Bun's global store and every directory a cowshed job may write lie on different volumes. On the first
+`nodeModules()` of a run the census of the host closure and the proven census of the copy are compared package by
+package, by what each holds: resolution edges, node types and modes, and file bytes. A package whose copy no longer
+holds what the host's holds is copied again, and every package when the edges moved or the copy is unproved; a copy that
+was there and failed its proof is named on stderr with the reason. Both censuses take unmoved files' hashes from the
+ones recorded beside the copy, so a run that changes nothing reads no file bytes. `retire()` fails, naming the changed
+nodes, if a fixture wrote into the copy, and leaves it for the next run to prove. The host's closure moves under a
+fixture that reads it: a shared Bun store relinked by another install, or, in a workspace that developer-links this
+plugin, the checkout its author is editing and rebuilding. Either fails the producer receipt's installation proof for
+work that is not the test's. Each test file names its own copy; two runs of one file at once share it, and a copy one of
+them makes again fails the other. This package's tests bind `censusRoot` to this repository; a consumer binds it to its
+own workspace root.
 
 ## Managed workspace files
 

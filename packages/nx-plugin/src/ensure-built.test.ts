@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -727,8 +727,8 @@ const FIXTURE_NX_JSON = {
   plugins: ['@smoothbricks/nx-plugin'],
 };
 
-/** The Nx installation this file's fixtures share: one copy per run of the file, not one per fixture. */
-const installation = testFileInstallation('ensure-built-installation-');
+/** The Nx installation this file's fixtures share: one copy kept for this file, not one per fixture. */
+const installation = testFileInstallation('ensure-built-installation');
 
 /**
  * Two projects, `app:build` reading `lib:build`'s outputs through
@@ -834,6 +834,17 @@ describe('smoo-nx-exec with a fresh daemon', () => {
       async ({ root, workspace, socketDirectory }) => {
         const builds = join(root, 'lib-builds.log');
         await writeTwoProjectWorkspace(workspace, builds);
+        // The workspace takes its own copy of TypeScript, which the census resolves from the workspace root, so the
+        // installation the script below writes into is the fixture's, not the copy this file's fixtures share.
+        const shared = await realpath(join(workspace, 'node_modules'));
+        await rm(join(workspace, 'node_modules'));
+        await mkdir(join(workspace, 'node_modules'));
+        for (const entry of await readdir(shared)) {
+          if (entry !== 'typescript') await symlink(join(shared, entry), join(workspace, 'node_modules', entry));
+        }
+        await cp(await realpath(join(shared, 'typescript')), join(workspace, 'node_modules', 'typescript'), {
+          recursive: true,
+        });
         const built = await run(
           'node',
           nxEntry(workspace),
@@ -850,7 +861,7 @@ describe('smoo-nx-exec with a fresh daemon', () => {
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { chmod, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureBuilt } from ${JSON.stringify(join(packageRoot, 'dist', 'ensure-built.js'))};
 const requireNx = createRequire(process.cwd() + '/package.json');
@@ -894,6 +905,17 @@ await writeFile(project, JSON.stringify(config));
 await check('dependency');
 await writeFile(project, original);
 await check('dependency-restored');
+// Every call censuses the installation again, taking the hashes of files whose stamps have not moved from the
+// witness. A same-size rewrite that keeps its file's mtime moves its ctime: the next call reads it and sees the
+// changed installation, and the call after that reuses the graph the changed installation was proved with.
+const installed = join(process.cwd(), 'node_modules/typescript/README.md');
+const readme = await readFile(installed);
+const { atime, mtime } = await stat(installed);
+readme[0] ^= 1;
+await writeFile(installed, readme);
+await utimes(installed, atime, mtime);
+await check('installation');
+await check('installation-reuse');
 // Save only evidence the real daemon generation actually authorized, outside
 // the workspace: the later missing-witness RPC is not obliged to replace it.
 const authoritativeWitness = await readFile(witness, 'utf8');
@@ -937,7 +959,14 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
           disposition: 'hit',
           witnessExists: true,
         });
-        for (const label of ['created', 'deleted', 'dependency', 'dependency-restored', 'unreadable-witness']) {
+        for (const label of [
+          'created',
+          'deleted',
+          'dependency',
+          'dependency-restored',
+          'installation',
+          'unreadable-witness',
+        ]) {
           expect(graphChecks.find((check) => check.label === label)?.requests, label).toBeGreaterThan(0);
         }
         expect(graphChecks.find(({ label }) => label === 'missing-witness')).toEqual({
@@ -945,6 +974,12 @@ await writeFile(${JSON.stringify(resultsPath)}, JSON.stringify(results));
           requests: 2,
           disposition: 'hit',
           witnessExists: false,
+        });
+        expect(graphChecks.find(({ label }) => label === 'installation-reuse')).toEqual({
+          label: 'installation-reuse',
+          requests: 0,
+          disposition: 'hit',
+          witnessExists: true,
         });
         expect(graphChecks.find(({ label }) => label === 'unreadable-witness')?.disposition).toBe('hit');
         expect(await readFile(builds, 'utf8')).toBe('lib\n');

@@ -20,7 +20,7 @@ const nxEntry = (workspace: string) => join(workspace, 'node_modules', '.bin', '
 const HINTS = join('.nx', 'cache', '.cowshed-task-results');
 
 /** The Nx and the plugin under test, one copy this file's fixtures share; none may write into it. */
-const installation = testFileInstallation('task-results-installation-');
+const installation = testFileInstallation('task-results-installation');
 afterAll(() => installation.retire());
 
 /** A fixture workspace: `app:build` caches its copy of `source.txt`; `app:fail` always exits 3. */
