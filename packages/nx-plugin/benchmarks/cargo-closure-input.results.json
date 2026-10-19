@@ -1,0 +1,195 @@
+{
+  "machine": { "cpu": "Apple M5 Max", "platform": "darwin", "arch": "arm64", "runtime": "v26.3.0" },
+  "method": "taskpolicy -b; one caller; three warmups; median of nine batches; real cargoClosureInputs with cached resolution and source scans; one source target per sibling crate plus shared.rs; six output inputs at every size",
+  "baselineRevision": "3c171b48a6b2c2d2e6b801816c3e7a4c232fc1fb",
+  "pairedMethod": "Same process imports the exact baseline git blob beside the candidate; three warmups of each; seven batches in alternating before/after order; max(1, floor(4096 / packages)) calls per batch. Temporary baseline module and runner removed after measurement. Larger small-input batches reduce timer and scheduling noise; shared-host variance remains.",
+  "verification": {
+    "differentialTests": "cargo-closure-filesets.test.ts: 3 pass, 0 fail, 263 assertions; complete ordered inputs compared against the old reduction",
+    "lint": "Production source, test, and oracle helper passed ESLint; the two benchmark scripts are outside the current ESLint configuration",
+    "integrationBoundary": "The existing cargo-closure-input.test.ts test 'keys a custom target on exactly its Cargo closure' reached the 300-second command deadline before any test file or new trace-run entry appeared. No integration pass is claimed.",
+    "notRun": "No Nx gate, full plugin suite, build/typecheck, or land. The abandoned bitmosaic existing-benchmark attempt failed before execution because its Cargo child could not find smoothbricks-macos-linker."
+  },
+  "paired": [
+    {
+      "packages": 1,
+      "beforeUs": 39.48950195312501,
+      "afterUs": 40.37448120117182,
+      "beforeRangeUs": [35.67835498046878, 116.36599731445312],
+      "afterRangeUs": [32.38920068359374, 49.64892578125002],
+      "eliminatedPrefixCopies": 0
+    },
+    {
+      "packages": 4,
+      "beforeUs": 70.36669921874994,
+      "afterUs": 69.36494921875003,
+      "beforeRangeUs": [46.5753583984374, 121.16206835937504],
+      "afterRangeUs": [43.39103222656249, 95.60009765625033],
+      "eliminatedPrefixCopies": 12
+    },
+    {
+      "packages": 16,
+      "beforeUs": 215.0218085937503,
+      "afterUs": 210.6385117187486,
+      "beforeRangeUs": [100.43196484375017, 373.30142968750124],
+      "afterRangeUs": [80.0620117187485, 289.85449218749795],
+      "eliminatedPrefixCopies": 240
+    },
+    {
+      "packages": 25,
+      "beforeUs": 317.55623312883637,
+      "afterUs": 460.36017177914135,
+      "beforeRangeUs": [180.0828220858906, 577.0355337423276],
+      "afterRangeUs": [276.24539877300765, 652.5224907975496],
+      "eliminatedPrefixCopies": 600
+    },
+    {
+      "packages": 64,
+      "beforeUs": 967.8854218749962,
+      "afterUs": 354.61001562499916,
+      "beforeRangeUs": [516.7285156249903, 14964.346343750009],
+      "afterRangeUs": [275.3749999999968, 2348.7675781250064],
+      "eliminatedPrefixCopies": 4032
+    },
+    {
+      "packages": 256,
+      "beforeUs": 5570.351562500036,
+      "afterUs": 828.8645625000299,
+      "beforeRangeUs": [4382.687500000088, 9037.552062500026],
+      "afterRangeUs": [784.9296875000391, 1094.9453124999309],
+      "eliminatedPrefixCopies": 65280
+    },
+    {
+      "packages": 1024,
+      "beforeUs": 99880.02075000032,
+      "afterUs": 4351.999999999862,
+      "beforeRangeUs": [91047.77074999992, 140468.8645000001],
+      "afterRangeUs": [3518.4479999998075, 24132.76050000013],
+      "eliminatedPrefixCopies": 1047552
+    },
+    {
+      "packages": 4096,
+      "beforeUs": 5306559.125,
+      "afterUs": 84817.33299999905,
+      "beforeRangeUs": [2039221.2080000027, 7106012.291999999],
+      "afterRangeUs": [15833.040999998047, 219954.00000000518],
+      "eliminatedPrefixCopies": 16773120
+    }
+  ],
+  "baseline": [
+    {
+      "packages": 1,
+      "iterationsPerBatch": 128,
+      "medianUs": 46.42935937499715,
+      "minUs": 27.419921875001307,
+      "maxUs": 64.30435937500079
+    },
+    {
+      "packages": 4,
+      "iterationsPerBatch": 64,
+      "medianUs": 64.15820312498965,
+      "minUs": 32.61978125000553,
+      "maxUs": 86.73698437500832
+    },
+    {
+      "packages": 16,
+      "iterationsPerBatch": 32,
+      "medianUs": 110.8619687500152,
+      "minUs": 78.01562500000614,
+      "maxUs": 125.8489375000238
+    },
+    {
+      "packages": 64,
+      "iterationsPerBatch": 16,
+      "medianUs": 624.4791874999578,
+      "minUs": 372.6823124999896,
+      "maxUs": 801.7369374999817
+    },
+    {
+      "packages": 256,
+      "iterationsPerBatch": 8,
+      "medianUs": 5734.380249999958,
+      "minUs": 4567.770874999951,
+      "maxUs": 6358.708374999992
+    },
+    {
+      "packages": 1024,
+      "iterationsPerBatch": 4,
+      "medianUs": 97045.55225000012,
+      "minUs": 79478.64600000002,
+      "maxUs": 109359.80199999994
+    },
+    {
+      "packages": 4096,
+      "iterationsPerBatch": 2,
+      "medianUs": 1836914.5209999988,
+      "minUs": 1297723.3125000002,
+      "maxUs": 24556673.812500004
+    }
+  ],
+  "direct": [
+    {
+      "packages": 1,
+      "iterationsPerBatch": 128,
+      "medianUs": 55.68033593749533,
+      "minUs": 37.930992187497736,
+      "maxUs": 91.66633593748941
+    },
+    {
+      "packages": 4,
+      "iterationsPerBatch": 64,
+      "medianUs": 49.49153124999839,
+      "minUs": 42.0729062499845,
+      "maxUs": 89.1178437500173
+    },
+    {
+      "packages": 16,
+      "iterationsPerBatch": 32,
+      "medianUs": 188.7148437500059,
+      "minUs": 98.18490624996912,
+      "maxUs": 545.0091249999787
+    },
+    {
+      "packages": 64,
+      "iterationsPerBatch": 16,
+      "medianUs": 377.20312499993724,
+      "minUs": 256.0078125000018,
+      "maxUs": 404.25262500002646
+    },
+    {
+      "packages": 256,
+      "iterationsPerBatch": 8,
+      "medianUs": 1139.8957500000506,
+      "minUs": 749.5624999999109,
+      "maxUs": 1390.354125000158
+    },
+    {
+      "packages": 1024,
+      "iterationsPerBatch": 4,
+      "medianUs": 5426.041749999968,
+      "minUs": 3114.520999999968,
+      "maxUs": 24565.427250000084
+    },
+    {
+      "packages": 4096,
+      "iterationsPerBatch": 2,
+      "medianUs": 21904.29200000017,
+      "minUs": 13576.833000000079,
+      "maxUs": 25821.22900000013
+    }
+  ],
+  "unchangedCandidates": {
+    "cleanOutputsSiblingDirectories": [
+      { "inputs": 16, "medianUs": 63.36456250000033 },
+      { "inputs": 64, "medianUs": 1145.1772500000034 },
+      { "inputs": 256, "medianUs": 17019.666999999914 },
+      { "inputs": 1024, "medianUs": 358022.5419999997 }
+    ],
+    "dependencyClosureConvergingDiamonds": [
+      { "nodes": 16, "edges": 29, "medianUs": 34.718749999996135 },
+      { "nodes": 64, "edges": 125, "medianUs": 35.822906250018605 },
+      { "nodes": 256, "edges": 509, "medianUs": 64.62762500001418 },
+      { "nodes": 1024, "edges": 2045, "medianUs": 125.98437500000159 }
+    ]
+  },
+  "interpretation": "The sustained measured crossover is 64 packages in both separate and paired runs. In the larger-batch paired run, one package regressed by 0.885 us (2.24%) and 25 packages by 142.804 us (44.97%); small inputs are not uniformly faster. Initial unpaired runs also had a 16-package regression. Shared-host scheduling variance is substantial; ranges are retained, and no gate-wide or cold-resolution speedup is claimed. Neither algorithm owns persistent scratch after returning; peak heap was not measured. eliminatedPrefixCopies counts directory-prefix and sibling-prefix reference slots in the old oracle; those explicit copies are absent in the new path, not a measurement of total allocator bytes."
+}

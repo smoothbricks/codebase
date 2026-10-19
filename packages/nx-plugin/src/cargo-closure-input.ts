@@ -150,8 +150,8 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
   const closureArguments = `--closure ${shellWord(projectRoot)} ${shellWord(source.manifest)}`;
 
   const { root, cargo, indexed } = source;
-  const packageDirectories: string[] = [];
-  const files: string[] = [];
+  const packageDirectories = new Set<string>();
+  const files = new Set<string>();
   const compiledIn: CompiledInclusion[] = [];
   let compiledFiles: readonly string[] = [];
   let external = false;
@@ -175,11 +175,11 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
         if (declaring === null) throw new Error(`${compiled.source} was scanned outside ${directory}`);
         compiledIn.push({ declaring, file });
       }
-      packageDirectories.push(directory);
+      packageDirectories.add(directory);
       for (const file of [...pkg.sources, pkg.governingManifest]) {
         const path = indexablePath(root, file);
         if (path === null) throw new Error(`${directory} compiles ${file}, which Nx's file index cannot hold`);
-        files.push(path);
+        files.add(path);
       }
     }
     const compiledPaths = [...new Set(compiledIn.flatMap(({ declaring, file }) => [declaring, file]))];
@@ -192,23 +192,25 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
     throw new CargoClosureInputError(projectRoot, error);
   }
 
-  // A package nested in another member's directory is already covered by it.
-  const directories = [...new Set(packageDirectories)]
+  // Query the directory set by path ancestors, not by expanding all pairs.
+  // Removing nested members leaves an antichain with the same covered files.
+  const directories = [...packageDirectories]
     .sort()
-    .filter((directory, index, sorted) => !sorted.slice(0, index).some((outer) => contains(outer, directory)));
+    .filter((directory) => !covered(packageDirectories, parent(directory)));
   const ancestors = new Set<string>();
   for (const directory of directories) {
-    for (let ancestor = parent(directory); ancestor !== null; ancestor = parent(ancestor)) {
-      const candidate = ancestor;
-      if (!directories.some((outer) => contains(outer, candidate))) ancestors.add(candidate);
+    // An ancestor of an outermost member cannot be inside another member.
+    // Once this walk joins an earlier walk, all remaining ancestors are held.
+    for (let ancestor = parent(directory); ancestor !== null && !ancestors.has(ancestor); ancestor = parent(ancestor)) {
+      ancestors.add(ancestor);
     }
   }
   // Target sources outside every package directory, and governing manifests
   // that are not already one of the ancestors' manifests.
   const loose = new Set(
-    files.filter(
+    [...files].filter(
       (file) =>
-        !directories.some((directory) => contains(directory, file)) &&
+        !covered(packageDirectories, file) &&
         !(posix.basename(file) === 'Cargo.toml' && ancestors.has(parent(file) ?? '')),
     ),
   );
@@ -218,7 +220,9 @@ async function workspaceClosureInputs(projectRoot: string, source: CargoClosureS
   for (const directory of directories) {
     const key = parent(directory);
     if (key === null) continue;
-    siblings.set(key, [...(siblings.get(key) ?? []), posix.basename(directory)]);
+    const names = siblings.get(key);
+    if (names === undefined) siblings.set(key, [posix.basename(directory)]);
+    else names.push(posix.basename(directory));
   }
   const packageGlobs = directories.includes('')
     ? ['']
@@ -275,6 +279,10 @@ function parent(path: string): string | null {
   return directory === '.' ? '' : directory;
 }
 
-function contains(directory: string, path: string): boolean {
-  return directory === '' || path === directory || path.startsWith(`${directory}/`);
+/** Membership in the union of package subtrees, bounded by path depth rather than package count. */
+function covered(directories: ReadonlySet<string>, path: string | null): boolean {
+  for (let candidate = path; candidate !== null; candidate = parent(candidate)) {
+    if (directories.has(candidate)) return true;
+  }
+  return false;
 }

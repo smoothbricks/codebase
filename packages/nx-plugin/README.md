@@ -400,6 +400,19 @@ the other directories the hash command skips), target sources outside it, its go
 `Cargo.lock`. Nx hashes those from the file hashes it already keeps, so hashing these inputs starts no process. A graph
 with unchanged resolution inputs starts no Cargo process either.
 
+Fileset reduction works from the set of package directories: a path is covered exactly when it or one of its ancestors
+is a member. Nested packages therefore need no extra subtree pattern, and shared ancestors are visited once. Sibling
+names accumulate into the same brace pattern without copying each growing prefix. The ordered filesets are unchanged; no
+new cache or retained index is introduced. For `P` packages and `F` distinct source paths of bounded depth, with `L`
+loose files, reduction costs `O(P log P + F + L log L)` rather than enumerating package pairs and rebuilding sibling
+prefixes.
+
+`bun packages/nx-plugin/benchmarks/cargo-closure-input.bench.ts` measures the real async inference entry with cached
+Cargo resolution/source scans at 1–4,096 packages, including a one-package overhead row. Its expansion oracle checks
+complete ordered input equality before timing; filesystem scanning and Cargo resolution are not part of this
+measurement. `bun packages/nx-plugin/benchmarks/compact-candidates.bench.ts` measures the unchanged output-directory
+reduction and converging dependency-graph traversal separately, without invoking an executor or gate.
+
 Literal `include_str!` and `include_bytes!` files also belong to the closure, including data inside a crate and tracked
 files outside its directory (such as a shipped Markdown skill). One Rust lexer excludes comments and example strings;
 computed paths and arbitrary build-script reads still need explicit inputs. A compiled-in file is named only when Nx's
