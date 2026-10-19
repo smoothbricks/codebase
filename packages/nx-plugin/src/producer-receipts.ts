@@ -46,6 +46,16 @@ import { graphInputContractIdentity } from './graph-input-contract.js';
 export interface ProducerReceiptsOptions {
   readonly producerReceipts?: { readonly targets: readonly string[] };
 }
+/**
+ * Where a checkout keeps its producer records, relative to its root: in its own source tree, never in Nx's
+ * workspace-data. Under cowshed that directory is build state on the checkout's build volume
+ * (specs/cowshed/16_build_volumes.md), and a consumer's read grant of the provider checkout does not reach a volume
+ * the checkout only links to (specs/cowshed/04_sandbox.md, "Read grants have one narrow meaning"), so a consumer
+ * could never read the receipt it is asked to validate. The directory ignores itself (a `.gitignore` of `*` written
+ * with its first record), so in any checkout git never tracks a record and Nx's file walk never hashes one: a record
+ * is no source or input of the run that publishes it.
+ */
+export const PRODUCER_RECORDS = join('.cache', 'producer-receipts');
 interface ToolResolution {
   readonly name: string;
   readonly from: string;
@@ -95,16 +105,18 @@ function configured(options: ProducerReceiptsOptions | undefined): readonly stri
  * its products never replaces the receipt an earlier run published: readers validate that receipt on its own evidence.
  */
 function recordPath(root: string, target: string, disposition: ProducerRecord['disposition']): string {
-  const load = createWorkspaceNxRequire(root);
   return join(
-    load('nx/src/utils/cache-directory').workspaceDataDirectoryForWorkspace(root),
+    root,
+    PRODUCER_RECORDS,
     `producer-${disposition === 'published' ? 'receipt' : 'refusal'}-${sha(target)}.json`,
   );
 }
 function publish(root: string, target: string, record: ProducerRecord): ReceiptEvidence<true> {
   try {
     const path = recordPath(root, target, record.disposition);
-    mkdirSync(dirname(path), { recursive: true });
+    const records = dirname(path);
+    mkdirSync(records, { recursive: true });
+    if (!existsSync(join(records, '.gitignore'))) writeFileSync(join(records, '.gitignore'), '*\n');
     const temporary = `${path}.${randomUUID()}`;
     try {
       writeFileSync(temporary, JSON.stringify(record), { flag: 'wx', mode: 0o600 });
@@ -550,10 +562,22 @@ function latestRefusal(root: string, target: string): string | null {
   }
 }
 function validatedReceipt(root: string, target: string): ReceiptEvidence<EnsureBuiltReceipt> {
+  const path = recordPath(root, target, 'published');
+  let text: string;
   try {
-    const record = typia.json.isParse<PublishedReceipt>(readFileSync(recordPath(root, target, 'published'), 'utf8'));
+    text = readFileSync(path, 'utf8');
+  } catch (error) {
+    // No receipt is a producer that never published one; any other failure is a receipt this reader cannot reach.
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT')
+      return { ok: false, detail: `No producer completion receipt at ${path}` };
+    if (error instanceof Error)
+      return { ok: false, detail: `Cannot read producer completion receipt: ${error.message}` };
+    throw error;
+  }
+  try {
+    const record = typia.json.isParse<PublishedReceipt>(text);
     if (record === null || record.version !== 1)
-      return { ok: false, detail: 'Missing/corrupt producer completion contract' };
+      return { ok: false, detail: `Corrupt producer completion contract at ${path}` };
     const receipt = record.receipt;
     if (
       receipt.workspaceRoot !== realpathSync(root) ||

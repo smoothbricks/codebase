@@ -914,12 +914,16 @@ its own Nx plugin options as
 `producerReceipts: { targets: ["lmao:rust-dist", "lmao:cargo-wasm", "lmao:cargo-thread-ffi"] }`, naming every target a
 consumer's snapshot declaration names. The pre-task hook captures the committed HEAD/tree and tracked-source/tool basis;
 the post-task hook uses Nx's actual successful `TaskResults`, hashes/hash details, argv and start/end times, including
-successful uncacheable prerequisites, and atomically publishes the receipt in that checkout's existing Nx
-workspace-data. Disabled publication performs no source prepass, so an ordinary consumer CLI pays none of that producer
-work. No file permission, path, daemon state or cached row can invent a completion receipt. Nx takes one pre/post
-task-hook pair per plugin, so the plugin's pair runs the controller's `COWSHED_NX_TASK_RECEIPT_ID` task-results hint
-first and these producer hooks second, each with the same options and run context and neither reading the other's
-output.
+successful uncacheable prerequisites, and atomically publishes the receipt in that checkout's
+`.cache/producer-receipts`. That is its source tree, not Nx's workspace-data: under cowshed workspace-data is build
+state on the checkout's build volume, which a consumer's read grant of the provider checkout does not reach, so the
+consumer could not read the receipt it validates. The directory ignores itself with a `.gitignore` of `*`, so no
+checkout tracks a record and Nx never hashes one. A missing receipt refuses naming the path it was looked for at; a
+receipt the consumer cannot read refuses with the read error (EPERM under a sandbox). Disabled publication performs no
+source prepass, so an ordinary consumer CLI pays none of that producer work. No file permission, path, daemon state or
+cached row can invent a completion receipt. Nx takes one pre/post task-hook pair per plugin, so the plugin's pair runs
+the controller's `COWSHED_NX_TASK_RECEIPT_ID` task-results hint first and these producer hooks second, each with the
+same options and run context and neither reading the other's output.
 
 The receipt binds the selected target, basis commit SHA and committed tree SHA, actual argv, declared producer
 environment identity and bound tool/module inputs, independent product output SHA-256, measured wall time, and an

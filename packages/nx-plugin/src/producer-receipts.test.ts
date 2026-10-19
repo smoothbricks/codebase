@@ -9,6 +9,7 @@ import type { TaskResults } from 'nx/src/tasks-runner/life-cycle';
 import type { EnsureBuiltProducerReceipt } from './ensure-built.js';
 import {
   completedProducerTasks,
+  PRODUCER_RECORDS,
   postTasksExecution,
   preTasksExecution,
   producerEnvironmentIdentity,
@@ -116,16 +117,14 @@ describe('actual producer completion evidence', () => {
   });
   it('publishes a refusal beside a published receipt, never over it, and names it in the miss', async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), 'producer-refusal-')));
-    const inherited = process.env.NX_WORKSPACE_DATA_DIRECTORY;
-    delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
     try {
       await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'refusal-fixture' }));
       await writeFile(join(root, 'nx.json'), '{}');
       await symlink(join(repoRoot, 'node_modules'), join(root, 'node_modules'), 'dir');
-      const data = join(root, '.nx', 'workspace-data');
-      await mkdir(data, { recursive: true });
+      const records = join(root, PRODUCER_RECORDS);
+      await mkdir(records, { recursive: true });
       const name = createHash('sha256').update(JSON.stringify(task.id)).digest('hex');
-      const receiptPath = join(data, `producer-receipt-${name}.json`);
+      const receiptPath = join(records, `producer-receipt-${name}.json`);
       // What an earlier run published; this run's refusal is no evidence about it.
       const published = JSON.stringify({ version: 1, disposition: 'published', receipt: 'an earlier run' });
       await writeFile(receiptPath, published);
@@ -143,21 +142,44 @@ describe('actual producer completion evidence', () => {
         },
       );
       expect(await readFile(receiptPath, 'utf8')).toBe(published);
-      expect((await readdir(data)).sort()).toEqual([`producer-receipt-${name}.json`, `producer-refusal-${name}.json`]);
+      expect((await readdir(records)).sort()).toEqual([
+        '.gitignore',
+        `producer-receipt-${name}.json`,
+        `producer-refusal-${name}.json`,
+      ]);
+      // The records directory ignores itself, so no checkout tracks or hashes a record.
+      expect(await readFile(join(records, '.gitignore'), 'utf8')).toBe('*\n');
       expect(readProducerReceipt(root, task.id)).toEqual({
         ok: false,
-        detail:
-          "Missing/corrupt producer completion contract; the producer's latest run refused: No bound producer pre-execution frame",
+        detail: `Corrupt producer completion contract at ${receiptPath}; the producer's latest run refused: No bound producer pre-execution frame`,
       });
-      // With no receipt at all, the miss still says why the latest run published none.
+      // With no receipt at all, the miss names where the receipt would be and why the latest run published none.
       await rm(receiptPath);
-      const missing = readProducerReceipt(root, task.id);
-      expect(missing.ok ? 'hit' : missing.detail).toEndWith(
-        "; the producer's latest run refused: No bound producer pre-execution frame",
-      );
+      expect(readProducerReceipt(root, task.id)).toEqual({
+        ok: false,
+        detail: `No producer completion receipt at ${receiptPath}; the producer's latest run refused: No bound producer pre-execution frame`,
+      });
     } finally {
-      if (inherited === undefined) delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
-      else process.env.NX_WORKSPACE_DATA_DIRECTORY = inherited;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it('tells a receipt it cannot read from a missing one, naming the path either way', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'producer-unreadable-')));
+    try {
+      const records = join(root, PRODUCER_RECORDS);
+      await mkdir(records, { recursive: true });
+      const name = createHash('sha256').update(JSON.stringify(task.id)).digest('hex');
+      const receiptPath = join(records, `producer-receipt-${name}.json`);
+      expect(readProducerReceipt(root, task.id)).toEqual({
+        ok: false,
+        detail: `No producer completion receipt at ${receiptPath}`,
+      });
+      // A sandbox that may not read the receipt answers EPERM; an unreadable file answers EACCES the same way.
+      await writeFile(receiptPath, '{}', { mode: 0 });
+      const denied = readProducerReceipt(root, task.id);
+      expect(denied.ok ? 'hit' : denied.detail).toStartWith('Cannot read producer completion receipt: EACCES');
+      expect(denied.ok ? 'hit' : denied.detail).toContain(receiptPath);
+    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
