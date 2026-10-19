@@ -123,9 +123,9 @@ import {
 import path from 'node:path';
 import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
 import {
+  type ProducerProbe,
   pinnedSnapshot,
   pluginProbe,
-  type ProducerProbe,
   recordedSnapshot,
   type SealedSnapshot,
   type SnapshotDeclaration,
