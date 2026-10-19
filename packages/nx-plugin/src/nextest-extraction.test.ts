@@ -199,6 +199,9 @@ describe('smoo-nx-nextest-extract', () => {
           '.',
           '--user-config-file',
           'none',
+          // A gate forces colour (FORCE_COLOR, CARGO_TERM_COLOR), which puts escape codes inside the summary line.
+          '--color',
+          'never',
         ],
         { cwd: root, encoding: 'utf8' },
       );
