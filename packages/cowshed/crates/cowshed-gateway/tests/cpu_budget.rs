@@ -655,30 +655,40 @@ async fn jobserver_class_is_validated_and_a_wait_bound_is_an_unknown_field() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// One answer line off a lease connection, byte by byte, so nothing past it is read out of a
+/// connection that is handed on afterwards.
+async fn answer_line(stream: &mut UnixStream) -> Value {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    while line.last() != Some(&b'\n') {
+        assert_eq!(
+            stream.read(&mut byte).await.expect("read answer"),
+            1,
+            "the gateway closed before a whole answer line"
+        );
+        line.push(byte[0]);
+    }
+    serde_json::from_slice(&line).expect("an answer is JSON")
+}
+
 /// One resident: a real `sleep` that holds its `resident-pool` lease connection as its stdin, the
 /// shape of the Nx daemon a shed's supervisor keeps, and the pool its grant names. The grant
-/// names the pool alone: no tokens, no fifo.
-async fn resident(socket: &Path, checkout: &str, job_id: u64) -> (std::process::Child, PathBuf) {
+/// names the pool alone: no tokens, no fifo. The request is the runtime's own I/O and the sleep is
+/// spawned under the fork lock, as the gateway's own children are, so no blocking-pool thread or
+/// unfenced spawn sits between the gateway's sockets and the child.
+async fn resident(socket: &Path, checkout: &str, job_id: u64) -> (tokio::process::Child, PathBuf) {
+    use cowshed_os::fork_lock::Spawn as _;
     let request = serde_json::json!({ "op": "resident-pool", "checkout": checkout,
         "command": "node nx/dist/src/daemon/server/start.js",
         "job": { "repoId": "owner/repo", "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
             "jobId": job_id } });
-    let held_socket = socket.to_path_buf();
-    let (stream, queued, granted) = tokio::task::spawn_blocking(move || {
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&held_socket).expect("connect resident");
-        stream
-            .write_all(format!("{request}\n").as_bytes())
-            .expect("ask resident pool");
-        let mut answers = StdBufReader::new(stream.try_clone().expect("clone")).lines();
-        let queued = answers.next().expect("queued").expect("read");
-        let granted = answers.next().expect("granted").expect("read");
-        (stream, queued, granted)
-    })
-    .await
-    .expect("resident answers");
-    let queued: Value = serde_json::from_str(&queued).expect("JSON");
-    let granted: Value = serde_json::from_str(&granted).expect("JSON");
+    let mut stream = UnixStream::connect(socket).await.expect("connect resident");
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("ask resident pool");
+    let queued = answer_line(&mut stream).await;
+    let granted = answer_line(&mut stream).await;
     assert_eq!(queued["lease"], "queued", "{queued}");
     assert_eq!(granted["lease"], "granted", "{granted}");
     assert!(
@@ -695,10 +705,12 @@ async fn resident(socket: &Path, checkout: &str, job_id: u64) -> (std::process::
             .expect("a resident names its pool"),
     );
     // The resident process itself holds the lease from here on, as the daemon's job does.
-    let child = Command::new("/bin/sleep")
+    let lease = std::os::fd::OwnedFd::from(stream.into_std().expect("the lease as a descriptor"));
+    let child = tokio::process::Command::new("/bin/sleep")
         .arg("600")
-        .stdin(Stdio::from(std::os::fd::OwnedFd::from(stream)))
-        .spawn()
+        .stdin(Stdio::from(lease))
+        .kill_on_drop(true)
+        .spawn_locked()
         .expect("spawn the resident sleep");
     (child, pool)
 }
@@ -753,8 +765,7 @@ async fn a_resident_holds_no_token_and_each_request_it_runs_asks_the_host() {
 
     // A resident's death closes its pool, and the ledger is as it was without any resident.
     for (mut child, pool) in residents {
-        child.kill().expect("SIGKILL the resident");
-        child.wait().expect("reap");
+        child.kill().await.expect("SIGKILL and reap the resident");
         while UnixStream::connect(&pool).await.is_ok() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
