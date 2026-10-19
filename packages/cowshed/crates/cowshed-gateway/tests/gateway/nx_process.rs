@@ -322,6 +322,170 @@ async fn await_exit(kq: OwnedFd) -> bool {
     .expect("exit waiter task")
 }
 
+/// One snapshot of the process table: the Nx cache servers `parent` owns.
+fn servers_of(parent: u32, script: &Path) -> Vec<u32> {
+    let listing = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,args="])
+        .output_locked()
+        .expect("ps snapshot");
+    assert!(
+        listing.status.success(),
+        "ps snapshot failed: {:?}",
+        listing.status
+    );
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 3 {
+                return None;
+            }
+            let pid: u32 = fields[0].parse().ok()?;
+            let ppid: u32 = fields[1].parse().ok()?;
+            (ppid == parent && is_server_args(&fields[2..].join(" "), script)).then_some(pid)
+        })
+        .collect()
+}
+
+/// A kqueue registered for `pid`'s exit, for [`await_exit`].
+fn watch_exit(pid: u32) -> OwnedFd {
+    // SAFETY: kqueue returns a new descriptor or -1; the descriptor is owned from here on.
+    let kq_raw = unsafe { libc::kqueue() };
+    assert!(kq_raw >= 0, "kqueue: {}", std::io::Error::last_os_error());
+    // SAFETY: `kq_raw` is a fresh descriptor that nothing else owns.
+    let kq = unsafe { OwnedFd::from_raw_fd(kq_raw) };
+    let change = libc::kevent {
+        ident: usize::try_from(pid).expect("pid fits the kevent identifier"),
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: one change, no returned events; the change buffer lives across the call.
+    let registered = unsafe {
+        libc::kevent(
+            kq.as_raw_fd(),
+            &change,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(
+        registered,
+        0,
+        "register NOTE_EXIT for server {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    kq
+}
+
+/// A project's cache server ends with the project's last session, as when a test discards the
+/// scratch project it adopted; another project's server is left serving. Measured 2026-10-19:
+/// seven of the gateway's nine servers belonged to scratch projects discarded hours earlier.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_projects_cache_server_ends_with_its_last_session() {
+    use cowshed_gateway::{MirrorCacheConfig, NxCacheServiceConfig};
+
+    let server = server_script();
+    let root = secure_fixture_dir(&format!("cowshed-nx-lifetime-{}", std::process::id()));
+    let (mirror, directory) = (root.path().join("mirror"), root.path().join("nx"));
+    for path in [&mirror, &directory] {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(path)
+            .expect("create fixture directory");
+    }
+    let gateway = gateway(
+        GatewayConfig {
+            mirror_cache: MirrorCacheConfig::new(mirror),
+            nx_cache: Some(NxCacheServiceConfig {
+                script: server.clone(),
+                path: server_path(),
+                directory,
+                max_bytes: 1024 * 1024,
+                cap_bytes: 64 * 1024 * 1024,
+            }),
+            ..GatewayConfig::default()
+        },
+        Arc::new(NoCredentials),
+        Arc::new(LocalConnector {
+            health: UpstreamHealth::Healthy,
+            observed: None,
+        }),
+        Arc::new(DiscardAudit),
+    )
+    .await;
+    let handle = gateway.handle();
+
+    // A scratch project with two workspaces, and a project that stays.
+    let mut endpoints = Vec::new();
+    for (workspace, repo, byte) in [
+        ("nx-lifetime-scratch-a", "owner/nx-lifetime-scratch", 1),
+        ("nx-lifetime-scratch-b", "owner/nx-lifetime-scratch", 2),
+        ("nx-lifetime-kept", "owner/nx-lifetime-kept", 3),
+    ] {
+        let (installed, token, _) = session(
+            workspace,
+            repo,
+            block_endpoint(free_endpoint()),
+            byte,
+            1,
+            WorkspacePolicy::default(),
+        );
+        endpoints.push((install_in_free_block(&handle, installed).await, token));
+    }
+    // Each project's first read starts its server and misses; the scratch project's starts first.
+    let read = |(endpoint, token): &(SocketAddr, String)| {
+        let endpoint = *endpoint;
+        let request = nx_request(endpoint, "GET", token, "42");
+        async move {
+            let response = proxy_request(endpoint, request).await;
+            assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        }
+    };
+    read(&endpoints[0]).await;
+    let [scratch] = servers_of(std::process::id(), &server)[..] else {
+        panic!("the scratch project's read starts one server")
+    };
+    read(&endpoints[2]).await;
+    let servers = servers_of(std::process::id(), &server);
+    let [kept] = servers
+        .iter()
+        .copied()
+        .filter(|&pid| pid != scratch)
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("the kept project's read starts its own server: {servers:?}")
+    };
+    let scratch_exit = watch_exit(scratch);
+
+    // One of the scratch project's two workspaces leaves: its server keeps serving the other.
+    handle
+        .remove("nx-lifetime-scratch-a", 1)
+        .await
+        .expect("remove one scratch session");
+    read(&endpoints[1]).await;
+    assert_eq!(servers_of(std::process::id(), &server), servers);
+
+    // The last scratch workspace leaves, as when the test discards the project: its server ends,
+    // and the kept project's serves on.
+    handle
+        .remove("nx-lifetime-scratch-b", 1)
+        .await
+        .expect("remove the last scratch session");
+    assert!(
+        await_exit(scratch_exit).await,
+        "the scratch project's server {scratch} exits"
+    );
+    assert_eq!(servers_of(std::process::id(), &server), [kept]);
+    read(&endpoints[2]).await;
+    gateway.drain().await.expect("drain");
+}
+
 /// Parent of the gateway child: starts it, finds its server, and checks the process contract.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
@@ -359,27 +523,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
     let entries = PathBuf::from(ready["entries"].as_str().expect("entries path"));
 
     // One snapshot of the process table: exactly one server, owned by this gateway.
-    let listing = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,args="])
-        .output_locked()
-        .expect("ps snapshot");
-    assert!(
-        listing.status.success(),
-        "ps snapshot failed: {:?}",
-        listing.status
-    );
-    let servers: Vec<u32> = String::from_utf8_lossy(&listing.stdout)
-        .lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 3 {
-                return None;
-            }
-            let pid: u32 = fields[0].parse().ok()?;
-            let ppid: u32 = fields[1].parse().ok()?;
-            (ppid == gateway_pid && is_server_args(&fields[2..].join(" "), &server)).then_some(pid)
-        })
-        .collect();
+    let servers = servers_of(gateway_pid, &server);
     assert_eq!(
         servers.len(),
         1,
@@ -388,36 +532,7 @@ async fn host_controller_nx_backend_process_serves_and_releases_its_store() {
     let server_pid = servers[0];
 
     // Register the exit before anything can kill the gateway, so the event cannot be missed.
-    // SAFETY: kqueue returns a new descriptor or -1; the descriptor is owned from here on.
-    let kq_raw = unsafe { libc::kqueue() };
-    assert!(kq_raw >= 0, "kqueue: {}", std::io::Error::last_os_error());
-    // SAFETY: `kq_raw` is a fresh descriptor that nothing else owns.
-    let kq = unsafe { OwnedFd::from_raw_fd(kq_raw) };
-    let change = libc::kevent {
-        ident: usize::try_from(server_pid).expect("pid fits the kevent identifier"),
-        filter: libc::EVFILT_PROC,
-        flags: libc::EV_ADD | libc::EV_ONESHOT,
-        fflags: libc::NOTE_EXIT,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    // SAFETY: one change, no returned events; the change buffer lives across the call.
-    let registered = unsafe {
-        libc::kevent(
-            kq.as_raw_fd(),
-            &change,
-            1,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(
-        registered,
-        0,
-        "register NOTE_EXIT for server {server_pid}: {}",
-        std::io::Error::last_os_error()
-    );
+    let kq = watch_exit(server_pid);
 
     // While the gateway is live, a second server on the same store is refused structurally.
     let lock = entries.join(".owner.lock");
