@@ -11,13 +11,13 @@
 
 use super::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, DefragmentResult, DoctorReport, EmptyResult, ExecScope,
-    ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor,
-    JobListeningPorts, JobTail, JobTailLimits, JobserverClass, LandOptions, LandReport, MirrorInfo,
-    OutputPublication, ProjectGrantDelta, PushOptions, PushReport, RebaseOptions, RebaseReport,
-    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult,
-    ResizeResult, ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob, TraceContext,
-    WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
+    CheckpointResult, CommandArg, DefragmentResult, DoctorReport, EmptyResult, ExecClass,
+    ExecScope, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo,
+    JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits, LandOptions, LandReport,
+    MirrorInfo, OutputPublication, ProjectGrantDelta, PushOptions, PushReport, RebaseOptions,
+    RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
+    ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob,
+    TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
 use super::process::{JobProcessEvent, JobProcessTree};
 use super::resources::{JobResourceSample, SampleInterval};
@@ -627,8 +627,8 @@ pub enum ExecStdin {
     },
 }
 
-fn is_background(class: &JobserverClass) -> bool {
-    *class == JobserverClass::Background
+fn is_background(class: &ExecClass) -> bool {
+    *class == ExecClass::Background
 }
 
 fn minimum_want() -> NonZeroUsize {
@@ -665,10 +665,12 @@ pub struct ExecParams {
     pub stderr_copy: Option<OutputPublication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_key: Option<AdmissionKey>,
-    /// The host CPU admission class, omitted for background, which is what ordinary exec asks for.
-    /// Only the coordinator.exec route admits the gate class.
+    /// The class the job is admitted under (05_gateway.md "Bands"), omitted for background, which
+    /// is what ordinary exec asks for: `interactive` for a command its requester awaits, and
+    /// `resident` for one that serves requests and holds no token, which a worker may ask for;
+    /// only the coordinator.exec route admits the gate class.
     #[serde(default, skip_serializing_if = "is_background")]
-    pub class: JobserverClass,
+    pub class: ExecClass,
     /// The most CPU tokens the command can use at once; omitted for one.
     #[serde(default = "minimum_want", skip_serializing_if = "is_minimum_want")]
     pub want: NonZeroUsize,
@@ -927,7 +929,7 @@ mod tests {
         let OperationRequest::WorkerExec(exec) = &request else {
             panic!("decoded {request:?}");
         };
-        assert_eq!(exec.class, JobserverClass::Background);
+        assert_eq!(exec.class, ExecClass::Background);
         assert_eq!(exec.want, NonZeroUsize::MIN);
         assert_eq!(exec.scope, ExecScope::Workspace);
         assert_eq!(request.params().expect("encode"), params);
@@ -944,7 +946,7 @@ mod tests {
         let OperationRequest::CoordinatorExec(exec) = &request else {
             panic!("decoded {request:?}");
         };
-        assert_eq!(exec.class, JobserverClass::Gate);
+        assert_eq!(exec.class, ExecClass::Gate);
         assert_eq!(exec.want.get(), 8);
         assert_eq!(exec.scope, ExecScope::HostGate);
         assert_eq!(request.params().expect("encode"), params);

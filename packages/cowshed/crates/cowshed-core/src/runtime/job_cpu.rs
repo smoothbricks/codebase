@@ -12,20 +12,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cowshed_gateway_types::{
-    JobserverAnswer, JobserverClass, JobserverJob, JobserverRequest, LeaseState,
-    ResidentPoolRequest,
+    JobserverAnswer, JobserverJob, JobserverRequest, LeaseState, ResidentPoolRequest,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 
-use crate::api::dto::JobId;
+use crate::api::dto::{ExecClass, JobId};
 use crate::error::{CowshedError, CpuAdmissionRefusal, Result};
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
 
 #[derive(Debug)]
 pub struct JobCpuAsk {
-    pub class: JobserverClass,
+    pub class: ExecClass,
     pub want: NonZeroUsize,
     pub checkout: PathBuf,
     pub command: String,
@@ -166,14 +165,16 @@ impl JobCpuAdmission for GatewayJobCpu {
                 workspace_incarnation: ask.job.1.as_str(),
                 job_id: NonZeroU64::new(ask.job.2.get()).expect("a validated JobId is nonzero"),
             };
+            // The ledger knows two token-holding classes (05_gateway.md "Bands"): interactive
+            // asks as background, whose tokens it shares, and a resident asks for a pool alone.
             let frame = match ask.class {
-                JobserverClass::Background => serde_json::to_vec(&JobserverRequest::background(
-                    ask.want, &checkout, command, job,
-                )),
-                JobserverClass::Gate => {
+                ExecClass::Background | ExecClass::Interactive => serde_json::to_vec(
+                    &JobserverRequest::background(ask.want, &checkout, command, job),
+                ),
+                ExecClass::Gate => {
                     serde_json::to_vec(&JobserverRequest::gate(ask.want, &checkout, command, job))
                 }
-                JobserverClass::Resident => {
+                ExecClass::Resident => {
                     serde_json::to_vec(&ResidentPoolRequest::new(&checkout, command, job))
                 }
             };
@@ -219,12 +220,12 @@ impl JobCpuAdmission for GatewayJobCpu {
             // only its pool, since it holds no token and its children ask the host through it.
             let (tokens, pool) = match (ask.class, granted.tokens, granted.cpu_pool, granted.fifo) {
                 (
-                    JobserverClass::Background | JobserverClass::Gate,
+                    ExecClass::Background | ExecClass::Interactive | ExecClass::Gate,
                     Some(tokens),
                     Some(pool),
                     Some(_fifo),
                 ) => (Some(tokens), pool),
-                (JobserverClass::Resident, None, Some(pool), None) => (None, pool),
+                (ExecClass::Resident, None, Some(pool), None) => (None, pool),
                 (class, ..) => {
                     return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
                         detail: format!(

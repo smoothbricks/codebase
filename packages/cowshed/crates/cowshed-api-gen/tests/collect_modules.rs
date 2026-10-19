@@ -345,12 +345,9 @@ fn collect_binds_each_declaration_to_its_module_and_refuses_a_duplicate_name() {
         model.modules["DaemonStatus"],
         "cowshed_gateway_types::status"
     );
-    // The class an exec names and the budget a refusal reports are the gateway's own
-    // declarations: the exec API references them instead of restating them.
-    assert_eq!(
-        model.modules["JobserverClass"],
-        "cowshed_gateway_types::cpu_budget"
-    );
+    // The class an exec names is the exec API's own declaration (ExecClass), apart from the ledger's
+    // wire class; the budget a refusal reports is the gateway's own declaration.
+    assert_eq!(model.modules["ExecClass"], "cowshed_core::api::dto");
     assert_eq!(
         model.modules["CpuBudgetStatus"],
         "cowshed_gateway_types::cpu_budget"

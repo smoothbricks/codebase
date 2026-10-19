@@ -15,10 +15,10 @@ use cowshed_apfs::{
 };
 use cowshed_core::api::dto::{
     AbandonedWork, AdoptOptions, AttachOptions, CheckpointInfo, CheckpointOptions, CheckpointQuota,
-    CheckpointResult, CommandArg, DefragmentResult, DoctorReport, ExecCommand, ExecRequest,
-    ExecScope, Finding, FindingSeverity, ForkOptions, GcOptions, GcReport, GitOid, GrantDelta,
-    GrantSet, JobId, JobInfo, JobJournalCursor, JobState, JobTail, JobTailBytes, JobTailLimits,
-    JobserverClass, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport,
+    CheckpointResult, CommandArg, DefragmentResult, DoctorReport, ExecClass, ExecCommand,
+    ExecRequest, ExecScope, Finding, FindingSeverity, ForkOptions, GcOptions, GcReport, GitOid,
+    GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobState, JobTail, JobTailBytes,
+    JobTailLimits, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport,
     RebaseOptions, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
     ResizeResult, ResizeVolume, RunSandboxMode, StdinSource, StepReport, WorkspaceInfo,
     WorkspaceState, WorkspaceTarget,
@@ -1801,7 +1801,7 @@ async fn router_decodes_tagged_non_utf8_argv_without_a_string_boundary() {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Admitted {
     source: AdmissionSource,
-    class: JobserverClass,
+    class: ExecClass,
     want: NonZeroUsize,
     scope: ExecScope,
 }
@@ -1853,10 +1853,11 @@ async fn start_recording_admissions(
 }
 
 /// The route that decoded an exec is its authority. The worker route — a worker connection, or a
-/// coordinator connection naming worker.exec — admits background work in the workspace sandbox
-/// and nothing more: a gate, or the host gate, is refused as the typed class-not-permitted error
-/// before the workspace is read or anything is admitted. The coordinator route admits both, and
-/// the host sees the route that decoded each exec.
+/// coordinator connection naming worker.exec — admits background, interactive and resident work in
+/// the workspace sandbox and nothing more: a gate, or the host gate, is refused as the typed
+/// class-not-permitted error before the workspace is read or anything is admitted. The coordinator
+/// route admits both, and the host sees the route that decoded each exec and the class the request
+/// named, exactly as an embedding process spells it on the napi wire.
 #[tokio::test]
 async fn router_admits_a_gate_only_through_the_coordinator_route() {
     let root = test_root();
@@ -1870,12 +1871,18 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
     let gate = json!({"class": "gate", "want": 8});
     let host_gate = json!({"class": "gate", "want": 8, "scope": "hostGate"});
     let host_only = json!({"scope": "hostGate"});
+    let interactive_host = json!({"class": "interactive", "scope": "hostGate"});
 
     for authority in [worker.clone(), coordinator(repo.clone())] {
         for (ask, class, scope) in [
-            (&gate, JobserverClass::Gate, ExecScope::Workspace),
-            (&host_gate, JobserverClass::Gate, ExecScope::HostGate),
-            (&host_only, JobserverClass::Background, ExecScope::HostGate),
+            (&gate, ExecClass::Gate, ExecScope::Workspace),
+            (&host_gate, ExecClass::Gate, ExecScope::HostGate),
+            (&host_only, ExecClass::Background, ExecScope::HostGate),
+            (
+                &interactive_host,
+                ExecClass::Interactive,
+                ExecScope::HostGate,
+            ),
         ] {
             let error = route(
                 &router,
@@ -1908,37 +1915,64 @@ async fn router_admits_a_gate_only_through_the_coordinator_route() {
             json!(1)
         );
     }
-    assert_eq!(
-        route(
-            &router,
-            worker,
-            "worker.exec",
-            main_exec(&repo, &incarnation, json!({"want": 4})),
-        )
-        .await
-        .expect("a worker admits a heavy ordinary runner"),
-        json!(1)
-    );
+    for (ask, admits) in [
+        (
+            json!({"want": 4}),
+            "a worker admits a heavy ordinary runner",
+        ),
+        (
+            json!({"class": "interactive"}),
+            "a worker admits work its requester waits on",
+        ),
+        (
+            json!({"class": "resident"}),
+            "a worker admits a resident that holds no token",
+        ),
+    ] {
+        assert_eq!(
+            route(
+                &router,
+                worker.clone(),
+                "worker.exec",
+                main_exec(&repo, &incarnation, ask),
+            )
+            .await
+            .expect(admits),
+            json!(1)
+        );
+    }
     let eight = NonZeroUsize::new(8).unwrap();
     assert_eq!(
         *admitted.lock().unwrap(),
         vec![
             Admitted {
                 source: AdmissionSource::Coordinator,
-                class: JobserverClass::Gate,
+                class: ExecClass::Gate,
                 want: eight,
                 scope: ExecScope::Workspace,
             },
             Admitted {
                 source: AdmissionSource::Coordinator,
-                class: JobserverClass::Gate,
+                class: ExecClass::Gate,
                 want: eight,
                 scope: ExecScope::HostGate,
             },
             Admitted {
                 source: AdmissionSource::Worker,
-                class: JobserverClass::Background,
+                class: ExecClass::Background,
                 want: NonZeroUsize::new(4).unwrap(),
+                scope: ExecScope::Workspace,
+            },
+            Admitted {
+                source: AdmissionSource::Worker,
+                class: ExecClass::Interactive,
+                want: NonZeroUsize::MIN,
+                scope: ExecScope::Workspace,
+            },
+            Admitted {
+                source: AdmissionSource::Worker,
+                class: ExecClass::Resident,
+                want: NonZeroUsize::MIN,
                 scope: ExecScope::Workspace,
             },
         ]
@@ -2400,7 +2434,7 @@ async fn one_connection_answers_output_and_status_while_a_wait_is_pending() {
     let job = worker
         .exec(ExecRequest {
             command: ExecCommand::Argv(vec![CommandArg::from("build")]),
-            class: JobserverClass::Background,
+            class: ExecClass::Background,
             want: NonZeroUsize::MIN,
             scope: ExecScope::Workspace,
             cwd: None,
@@ -2521,11 +2555,12 @@ impl cowshed_core::runtime::job_cpu::JobCpuAdmission for GrantingCpu {
         Box::pin(async move {
             let pool = PathBuf::from("/nonexistent/cowshed-test-cpu-pool.sock");
             Ok(match ask.class {
-                cowshed_core::api::JobserverClass::Resident => {
+                cowshed_core::api::ExecClass::Resident => {
                     cowshed_core::runtime::job_cpu::JobCpuGrant::resident(pool, Box::new(()))
                 }
-                cowshed_core::api::JobserverClass::Background
-                | cowshed_core::api::JobserverClass::Gate => {
+                cowshed_core::api::ExecClass::Background
+                | cowshed_core::api::ExecClass::Interactive
+                | cowshed_core::api::ExecClass::Gate => {
                     cowshed_core::runtime::job_cpu::JobCpuGrant::new(ask.want, pool, Box::new(()))
                 }
             })
@@ -2727,7 +2762,7 @@ async fn exec_in(
     worker
         .exec(ExecRequest {
             command,
-            class: JobserverClass::Background,
+            class: ExecClass::Background,
             want: NonZeroUsize::MIN,
             scope: ExecScope::Workspace,
             cwd: None,
@@ -2809,7 +2844,7 @@ async fn a_keyed_lookup_reaches_one_job_or_proven_absence_over_the_controller() 
 
     let request = || ExecRequest {
         command: ExecCommand::Argv(vec![CommandArg::from("build")]),
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         want: NonZeroUsize::MIN,
         scope: ExecScope::Workspace,
         cwd: None,
@@ -4140,7 +4175,7 @@ async fn host_controller_a_keyed_job_distinguishes_unnamed_sessions() {
                 .map(CommandArg::from)
                 .collect(),
         ),
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         want: NonZeroUsize::MIN,
         scope: ExecScope::Workspace,
         cwd: None,
@@ -4541,7 +4576,7 @@ async fn host_controller_open_stdin_delivers_binary_and_counts_only_written_pipe
                 .map(CommandArg::from)
                 .collect(),
             ),
-            class: JobserverClass::Background,
+            class: ExecClass::Background,
             want: NonZeroUsize::MIN,
             scope: ExecScope::Workspace,
             cwd: None,
@@ -4701,7 +4736,7 @@ async fn host_controller_close_waits_for_an_in_progress_pipe_write() {
                 .map(CommandArg::from)
                 .collect(),
             ),
-            class: JobserverClass::Background,
+            class: ExecClass::Background,
             want: NonZeroUsize::MIN,
             scope: ExecScope::Workspace,
             cwd: None,
@@ -4954,7 +4989,7 @@ async fn an_attachment_writes_and_ends_open_stdin_and_detaching_keeps_the_job() 
     let job = worker
         .exec(ExecRequest {
             command: ExecCommand::Argv(vec![CommandArg::from("cat")]),
-            class: JobserverClass::Background,
+            class: ExecClass::Background,
             want: NonZeroUsize::MIN,
             scope: ExecScope::Workspace,
             cwd: None,

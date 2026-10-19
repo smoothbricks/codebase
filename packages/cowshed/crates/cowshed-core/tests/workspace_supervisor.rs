@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cowshed_core::api::{
-    AdmissionKey, CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecCommand,
-    ExecRequest, ExecScope, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState,
+    AdmissionKey, CONTROLLER_COMMITMENT_VERSION, CommandArg, ControllerCommitment, ExecClass,
+    ExecCommand, ExecRequest, ExecScope, ExitStatus, JobFailure, JobId, JobJournalCursor, JobState,
     JobTailBytes, JobTailLimits, MAX_COMMAND_ARG_BYTES, OutputLimitInfo, OutputPublication,
     OutputStorage, OutputSummary, ProtectedOutput, PublicationPolicy, RunSandboxMode, Sha256Digest,
     StdinKind, StdinSource, StreamInfo, WorkspacePath,
@@ -31,7 +31,6 @@ use cowshed_core::storage::job_artifact::{
     AdmissionLookup, ArtifactConfig, ArtifactStore, FIRST_KEYED_LAYOUT, JobAdmission, JobEnding,
     JobScheduling, StreamKind,
 };
-use cowshed_gateway_types::JobserverClass;
 #[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::Run as _;
 use cowshed_os::fork_lock::Spawn as _;
@@ -480,8 +479,8 @@ impl JobCpuAdmission for ImmediateCpu {
         Box::pin(async move {
             let pool = PathBuf::from(TEST_POOL);
             Ok(match ask.class {
-                JobserverClass::Resident => JobCpuGrant::resident(pool, Box::new(())),
-                JobserverClass::Background | JobserverClass::Gate => {
+                ExecClass::Resident => JobCpuGrant::resident(pool, Box::new(())),
+                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
                     JobCpuGrant::new(ask.want, pool, Box::new(()))
                 }
             })
@@ -566,7 +565,7 @@ fn scripted_harness(label: &str) -> (Harness, mpsc::UnboundedReceiver<CpuRequest
 
 fn gate(request: ExecRequest) -> ExecRequest {
     ExecRequest {
-        class: JobserverClass::Gate,
+        class: ExecClass::Gate,
         ..request
     }
 }
@@ -716,7 +715,7 @@ fn request(stdin: StdinSource) -> ExecRequest {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         want: NonZeroUsize::MIN,
         scope: ExecScope::Workspace,
     }
@@ -6534,7 +6533,7 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     let started = h.handle.info(first.request.job_id).await.unwrap();
     assert_eq!(
         (started.class, started.cpu_tokens),
-        (JobserverClass::Resident, None)
+        (ExecClass::Resident, None)
     );
     assert!(
         first.request.cwd.as_os_str().is_empty(),
@@ -7861,7 +7860,7 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
     let job = JobId::new(1).unwrap();
     assert_eq!(
         (cpu.ask.class, cpu.ask.want),
-        (JobserverClass::Background, NonZeroUsize::new(6).unwrap())
+        (ExecClass::Background, NonZeroUsize::new(6).unwrap())
     );
     assert_eq!(cpu.ask.checkout, root.join("workspace"));
     assert_eq!(cpu.ask.job.2, job);
@@ -7876,7 +7875,7 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
         ),
         (
             JobState::Queued,
-            JobserverClass::Background,
+            ExecClass::Background,
             ExecScope::Workspace,
             None,
             None
@@ -7920,7 +7919,7 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
     let ended = h.handle.wait(job).await.unwrap();
     assert_eq!(
         (ended.cpu_tokens, ended.nice, ended.class),
-        (NonZeroUsize::new(4), Some(10), JobserverClass::Background)
+        (NonZeroUsize::new(4), Some(10), ExecClass::Background)
     );
     released
         .await
@@ -8100,9 +8099,52 @@ async fn a_worker_gate_is_refused_before_any_record_request_or_spawn() {
     assert!(h.spawned.try_recv().is_err(), "no spawn");
 }
 
-/// A coordinator's gate asks for its tokens, runs at the supervisor's own nice, and may name the
-/// host boundary for an argv; a host-gate script, which needs the sandboxed exec host, is refused
-/// before any effect.
+/// A worker may ask for interactive work, the class of a command its requester waits on
+/// (05_gateway.md "Bands"): the supervisor asks the CPU budget with that class -- which its
+/// gateway admission sends as background -- and places the command at the supervisor's own nice,
+/// above a gate's +5 and background's +10, and the job reports both.
+#[tokio::test]
+async fn a_worker_interactive_job_asks_its_class_and_runs_above_the_gate() {
+    let (mut h, mut asked, _root) = scripted_harness("cpu-interactive");
+    let handle = h.handle.clone();
+    let exec = tokio::spawn(async move {
+        handle
+            .exec(
+                None,
+                None,
+                ExecRequest {
+                    class: ExecClass::Interactive,
+                    want: NonZeroUsize::new(2).unwrap(),
+                    ..request(StdinSource::Empty)
+                },
+                AdmissionSource::Worker,
+            )
+            .await
+    });
+    let cpu = asked.recv().await.unwrap();
+    assert_eq!(
+        (cpu.ask.class, cpu.ask.want),
+        (ExecClass::Interactive, NonZeroUsize::new(2).unwrap())
+    );
+    cpu.answer.send(Ok(NonZeroUsize::new(2).unwrap())).unwrap();
+    let job = exec.await.unwrap().unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    assert_eq!(
+        spawned.request.cpu.nice, 0,
+        "interactive runs above the gate"
+    );
+    let info = h.handle.info(job).await.unwrap();
+    assert_eq!(
+        (info.class, info.nice, info.cpu_tokens),
+        (ExecClass::Interactive, Some(0), NonZeroUsize::new(2))
+    );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+}
+
+/// A coordinator's gate asks for its tokens, runs five below the supervisor's own nice, and may
+/// name the host boundary for an argv; a host-gate script, which needs the sandboxed exec host, is
+/// refused before any effect.
 #[tokio::test]
 async fn a_coordinator_gate_runs_at_gate_nice_and_may_reach_the_host_boundary() {
     let (mut h, mut asked, _root) = scripted_harness("cpu-gate");
@@ -8125,19 +8167,19 @@ async fn a_coordinator_gate_runs_at_gate_nice_and_may_reach_the_host_boundary() 
         let cpu = asked.recv().await.unwrap();
         assert_eq!(
             (cpu.ask.class, cpu.ask.want),
-            (JobserverClass::Gate, NonZeroUsize::new(8).unwrap())
+            (ExecClass::Gate, NonZeroUsize::new(8).unwrap())
         );
         cpu.answer.send(Ok(NonZeroUsize::new(8).unwrap())).unwrap();
         let job = exec.await.unwrap().unwrap();
         let spawned = h.spawned.recv().await.unwrap();
         assert_eq!(
             (spawned.request.scope, spawned.request.cpu.nice),
-            (scope, 0)
+            (scope, 5)
         );
         let info = h.handle.info(job).await.unwrap();
         assert_eq!(
             (info.class, info.scope, info.nice),
-            (JobserverClass::Gate, scope, Some(0))
+            (ExecClass::Gate, scope, Some(5))
         );
         complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
         h.handle.wait(job).await.unwrap();
@@ -8204,10 +8246,10 @@ async fn the_sealed_record_keeps_the_class_scope_grant_and_observed_nice() {
     assert_eq!(
         (sealed.class, sealed.scope, sealed.cpu_tokens, sealed.nice),
         (
-            JobserverClass::Gate,
+            ExecClass::Gate,
             ExecScope::Workspace,
             NonZeroUsize::new(2),
-            Some(0)
+            Some(5)
         )
     );
 }

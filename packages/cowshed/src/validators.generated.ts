@@ -352,6 +352,11 @@ export const parseErrorCode = (json: string): Api.ErrorCode => assertErrorCode(J
 export const assertErrorCodeList = typia.createAssertEquals<readonly Api.ErrorCode[]>();
 export const parseErrorCodeList = (json: string): readonly Api.ErrorCode[] => assertErrorCodeList(JSON.parse(json));
 
+export const assertExecClass = typia.createAssertEquals<Api.ExecClass>();
+export const parseExecClass = (json: string): Api.ExecClass => assertExecClass(JSON.parse(json));
+export const assertExecClassList = typia.createAssertEquals<readonly Api.ExecClass[]>();
+export const parseExecClassList = (json: string): readonly Api.ExecClass[] => assertExecClassList(JSON.parse(json));
+
 export const assertExecCommand = typia.createAssertEquals<Api.ExecCommand>();
 export const parseExecCommand = (json: string): Api.ExecCommand => assertExecCommand(JSON.parse(json));
 export const assertExecCommandList = typia.createAssertEquals<readonly Api.ExecCommand[]>();
@@ -662,12 +667,6 @@ export const parseJobVolumeUsage = (json: string): Api.JobVolumeUsage => assertJ
 export const assertJobVolumeUsageList = typia.createAssertEquals<readonly Api.JobVolumeUsage[]>();
 export const parseJobVolumeUsageList = (json: string): readonly Api.JobVolumeUsage[] =>
   assertJobVolumeUsageList(JSON.parse(json));
-
-export const assertJobserverClass = typia.createAssertEquals<Api.JobserverClass>();
-export const parseJobserverClass = (json: string): Api.JobserverClass => assertJobserverClass(JSON.parse(json));
-export const assertJobserverClassList = typia.createAssertEquals<readonly Api.JobserverClass[]>();
-export const parseJobserverClassList = (json: string): readonly Api.JobserverClass[] =>
-  assertJobserverClassList(JSON.parse(json));
 
 export const assertLandAdoptionCommitment = typia.createAssertEquals<Api.LandAdoptionCommitment>();
 export const parseLandAdoptionCommitment = (json: string): Api.LandAdoptionCommitment =>

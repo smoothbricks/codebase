@@ -10,7 +10,6 @@ use crate::storage::bootstrap::{HostSetupReport, UninstallReport};
 use crate::storage::lifecycle::{DerivedWorkspace, MountState, Pin as LifecyclePin};
 use base64::Engine;
 use bytes::Bytes;
-pub use cowshed_gateway_types::JobserverClass;
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -24,6 +23,34 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::io::AsyncRead;
+
+/// The class an exec is admitted under: one row of 05_gateway.md "Bands", fixing at the job's
+/// birth both its place in the token order and the nice it runs at. It is the exec's own axis,
+/// apart from the ledger's wire class ([`cowshed_gateway_types::JobserverClass`]): interactive
+/// asks the ledger as background and a resident asks with its own operation, so neither reaches
+/// the ledger as a class of its own.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecClass {
+    /// Every other exec, the default: checkout fairness behind the gate within half the host,
+    /// at nice +10.
+    #[default]
+    Background,
+    /// Work a person or model is waiting on, declared by the requester that awaits its result:
+    /// it asks the ledger as background and runs at nice 0, above the gate. A worker may ask
+    /// for it, since it buys a band and no token.
+    Interactive,
+    /// A land's gate job and every task its pool relays: first for returned tokens, at nice +5.
+    /// Only the trusted coordinator route admits it.
+    Gate,
+    /// A process that stays up to serve requests -- the Nx daemon a shed's supervisor keeps, a
+    /// worker that runs each request it is sent -- and is idle between them. It holds no token
+    /// for its lifetime: its grant is a pool that holds none and asks the host ledger, at
+    /// background class for its checkout, for each descendant that asks it, so a resident costs
+    /// tokens only while a request of its runs (05_gateway.md "A resident holds no token"). It
+    /// runs at background nice and names no want.
+    Resident,
+}
 
 pub const MAX_JOB_ID: u64 = (1_u64 << 53) - 1;
 pub const MAX_INLINE_OUTPUT_BYTES: usize = 64 * 1024;
@@ -1957,15 +1984,15 @@ pub struct JobInfo {
     /// Set only for a job that failed before its command ran, for a reason its exit status
     /// cannot name.
     pub failure: Option<JobFailure>,
-    /// The class the job was admitted under (05_gateway.md "Host CPU budget"): background unless a
-    /// trusted coordinator route admitted it as a gate, or it was admitted as a resident that
-    /// holds no token.
-    pub class: JobserverClass,
+    /// The class the job was admitted under (05_gateway.md "Bands"): background unless its
+    /// requester declared it interactive, a trusted coordinator route admitted it as a gate, or
+    /// it was admitted as a resident that holds no token.
+    pub class: ExecClass,
     /// Where the job's command ran: the workspace sandbox, or a coordinator's host gate.
     pub scope: ExecScope,
-    /// The nice the job's command was observed at right after its spawn set it: a gate runs at 0,
-    /// background and a resident at +10. Absent before the command exists and for a job whose
-    /// command was never observed; never inferred from the class.
+    /// The nice the job's command was observed at right after its spawn set it: interactive runs
+    /// at 0, a gate at +5, background and a resident at +10. Absent before the command exists and
+    /// for a job whose command was never observed; never inferred from the class.
     pub nice: Option<i32>,
     /// The CPU tokens the job's gateway grant held. Absent until a grant is held, and for a
     /// resident, which holds none.
@@ -1980,7 +2007,7 @@ impl JobInfo {
                 "failure is present only for the failed state",
             ));
         }
-        if self.scope == ExecScope::HostGate && self.class != JobserverClass::Gate {
+        if self.scope == ExecScope::HostGate && self.class != ExecClass::Gate {
             return Err(DtoError::InvalidJobProjection(
                 "a host gate job is admitted as a gate",
             ));
@@ -2075,7 +2102,7 @@ struct JobInfoRef<'a> {
     stdin: &'a StdinInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<JobFailure>,
-    class: JobserverClass,
+    class: ExecClass,
     scope: ExecScope,
     #[serde(skip_serializing_if = "Option::is_none")]
     nice: Option<i32>,
@@ -2116,7 +2143,7 @@ struct JobInfoWire {
     stdin: StdinInfo,
     #[serde(default)]
     failure: Option<JobFailure>,
-    class: JobserverClass,
+    class: ExecClass,
     scope: ExecScope,
     #[serde(default)]
     nice: Option<i32>,
@@ -2220,7 +2247,7 @@ pub struct SealedJob {
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
     /// The class the job was admitted under, as JobInfo.class.
-    pub class: JobserverClass,
+    pub class: ExecClass,
     /// Where the job's command ran, as JobInfo.scope.
     pub scope: ExecScope,
     /// The nice the job's command was observed at, as JobInfo.nice.
@@ -2599,9 +2626,10 @@ pub struct ExecRequest {
     /// Names this exec for idempotent admission: a repeat with the same key and request answers
     /// the job the first admitted, and never spawns again.
     pub admission_key: Option<AdmissionKey>,
-    /// The host CPU admission class (05_gateway.md "Host CPU budget"): background, or a gate when a
-    /// trusted coordinator route asks for one.
-    pub class: JobserverClass,
+    /// The class the command is admitted under (05_gateway.md "Bands"): background by default,
+    /// interactive when its requester awaits its result, a gate when a trusted coordinator route
+    /// asks for one, or a resident that holds no token.
+    pub class: ExecClass,
     /// The most CPU tokens the command can use at once; its grant is between one and this count.
     /// A resident holds none and names only the default.
     pub want: NonZeroUsize,
@@ -2623,8 +2651,8 @@ pub enum ExecScope {
 
 /// The pairings an exec's scheduling may carry (05_gateway.md "Host CPU budget"): the host gate
 /// scope is a gate, and every other pairing is valid.
-pub fn validate_scheduling(class: JobserverClass, scope: ExecScope) -> Result<(), DtoError> {
-    if scope == ExecScope::HostGate && class != JobserverClass::Gate {
+pub fn validate_scheduling(class: ExecClass, scope: ExecScope) -> Result<(), DtoError> {
+    if scope == ExecScope::HostGate && class != ExecClass::Gate {
         return Err(DtoError::InvalidScheduling(
             "the host gate scope requires the gate class",
         ));

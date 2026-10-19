@@ -896,13 +896,15 @@ failure cpuAdmission. Killing a queued job withdraws its request and seals Kille
 held until the owned job concludes. Caller MAKEFLAGS/CARGO_MAKEFLAGS/MFLAGS and BOUNDED_EXEC_CPU_* never substitute for
 that allocation; actual pool/count override caller env after filtering.
 
-Gate is trusted coordinator/operator only; workers default Background / Workspace and cannot request Gate or HostGate.
-The owned command's nice is Gate0 / Background+10, not the reusable host's or supervisor's. On macOS placement/read-back
-occurs while the existing observation fence holds the child. On Linux the child reports placement before exec or group
-reporting on a private CLOEXEC pipe: a 20-byte stack record of outcome, actual pid, requested, observed and errno. No
-allocation occurs in the forked report path. REPLY_NICE_REFUSED (tag11) carries the typed failure in the warm-host
-exchange; absence is explicit, not a guessed nice. A script that exits before reporting its group answers EXITED, never
-STARTED. Failed placement is priority, and observed nice stays absent until placement succeeds.
+Gate is trusted coordinator/operator only; workers default Background / Workspace, may ask Interactive or Resident, and
+cannot request Gate or HostGate. The owned command's nice is its class's row of 05_gateway.md "Bands" — Interactive 0 /
+Gate +5 / Background and Resident +10 — not the reusable host's or supervisor's. An interactive job asks the gateway as
+background; its class reaches the ledger only as that. On macOS placement/read-back occurs while the existing
+observation fence holds the child. On Linux the child reports placement before exec or group reporting on a private
+CLOEXEC pipe: a 20-byte stack record of outcome, actual pid, requested, observed and errno. No allocation occurs in the
+forked report path. REPLY_NICE_REFUSED (tag11) carries the typed failure in the warm-host exchange; absence is explicit,
+not a guessed nice. A script that exits before reporting its group answers EXITED, never STARTED. Failed placement is
+priority, and observed nice stays absent until placement succeeds.
 
 HostGate is an explicitly authorized argv host one-shot on this same server, without ExecutedChild or activation; it
 preserves the real-APFS host boundary and refuses scripts, read-only mode and sessions, never custom environment names.

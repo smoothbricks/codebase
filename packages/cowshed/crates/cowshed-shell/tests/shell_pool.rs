@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cowshed_core::api::ExecClass;
 use cowshed_core::api::{
     CommandArg, ExecCommand, ExecRequest, ExecScope, ExitStatus, JobAccounting, JobFailure,
     JobInfo, JobState, RunSandboxMode, ScriptCommand, ScriptValue, StdinSource, WorkspacePath,
@@ -37,7 +38,7 @@ use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
 use cowshed_core::storage::job_artifact::{ArtifactConfig, StreamKind};
 use cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH;
-use cowshed_gateway_types::{JobserverClass, WorkspaceToken};
+use cowshed_gateway_types::WorkspaceToken;
 use cowshed_os::host_load::HostLoad;
 
 const COUNT: &str = "printf 'activation\\n' >> \"$TMPDIR/activations\"\n";
@@ -57,18 +58,21 @@ fn shell_host() -> PathBuf {
 /// The pool every test grant names; the commands here only read its name.
 const TEST_POOL: &str = "/nonexistent/cowshed-test-cpu-pool.sock";
 
-/// The gateway's CPU budget for these tests: each request is granted its whole want at once.
+/// The gateway's CPU budget for these tests: each request is granted its whole want at once, and
+/// a resident is granted its pool alone, as the gateway answers one.
 #[derive(Debug)]
 struct GrantingCpu;
 
 impl JobCpuAdmission for GrantingCpu {
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
         Box::pin(async move {
-            Ok(JobCpuGrant::new(
-                ask.want,
-                PathBuf::from(TEST_POOL),
-                Box::new(()),
-            ))
+            let pool = PathBuf::from(TEST_POOL);
+            Ok(match ask.class {
+                ExecClass::Resident => JobCpuGrant::resident(pool, Box::new(())),
+                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
+                    JobCpuGrant::new(ask.want, pool, Box::new(()))
+                }
+            })
         })
     }
 }
@@ -252,7 +256,7 @@ fn request(argv: &[&str]) -> ExecRequest {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         want: NonZeroUsize::MIN,
         scope: ExecScope::Workspace,
     }
@@ -260,12 +264,12 @@ fn request(argv: &[&str]) -> ExecRequest {
 
 fn gate(request: ExecRequest) -> ExecRequest {
     ExecRequest {
-        class: JobserverClass::Gate,
+        class: ExecClass::Gate,
         ..request
     }
 }
 
-/// The nice the kernel holds for `pid`, read from outside every sandbox. A class nice is 0 or
+/// The nice the kernel holds for `pid`, read from outside every sandbox. A class nice is 0, 5 or
 /// 10, never -1, so -1 is getpriority's error.
 fn kernel_nice(pid: u32) -> i32 {
     // SAFETY: a read of another process's scheduling priority.
@@ -1485,7 +1489,7 @@ async fn host_controller_owned_commands_run_under_their_grant_at_their_class_nic
         );
         assert_eq!(
             (ran.info.cpu_tokens, ran.info.nice, ran.info.class),
-            (NonZeroUsize::new(3), Some(10), JobserverClass::Background),
+            (NonZeroUsize::new(3), Some(10), ExecClass::Background),
             "warm {warm}"
         );
 
@@ -1494,7 +1498,23 @@ async fn host_controller_owned_commands_run_under_their_grant_at_their_class_nic
         let base = kernel_nice(std::process::id());
         for (request, source, nice) in [
             (sh("read _"), AdmissionSource::Worker, 10),
-            (gate(sh("read _")), AdmissionSource::Coordinator, 0),
+            (
+                ExecRequest {
+                    class: ExecClass::Interactive,
+                    ..sh("read _")
+                },
+                AdmissionSource::Worker,
+                0,
+            ),
+            (
+                ExecRequest {
+                    class: ExecClass::Resident,
+                    ..sh("read _")
+                },
+                AdmissionSource::Worker,
+                10,
+            ),
+            (gate(sh("read _")), AdmissionSource::Coordinator, 5),
         ] {
             if base <= nice {
                 let (observed, info) = held_nice(&handle, request, source).await;
@@ -1576,9 +1596,9 @@ async fn host_controller_a_coordinator_host_gate_runs_outside_the_sandbox() {
     assert_eq!(
         (info.class, info.scope, info.nice, info.cpu_tokens),
         (
-            JobserverClass::Gate,
+            ExecClass::Gate,
             ExecScope::HostGate,
-            Some(0),
+            Some(5),
             NonZeroUsize::new(2)
         )
     );

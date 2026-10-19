@@ -25,11 +25,11 @@ use std::{
 use cowshed_core::{
     api::{
         AbandonedWork, BinaryData, BranchLandings, CarrySide, CheckpointInfo, CommandArg,
-        CpuMicros, CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule, ExecScope,
-        ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason, GcReport, GitOid,
-        GrantSet, HostLoadSample, JobAccounting, JobId, JobInfo, JobLeafAttribution,
-        JobProcessLeaf, JobResourceSample, JobState, JobStreamWatermark, JobVolumeUsage,
-        JobserverClass, LandReport, LandingCommits, OneCoreCpuPercent, OneCoreCpuPermille,
+        CpuMicros, CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule, ExecClass,
+        ExecScope, ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason,
+        GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId, JobInfo,
+        JobLeafAttribution, JobProcessLeaf, JobResourceSample, JobState, JobStreamWatermark,
+        JobVolumeUsage, LandReport, LandingCommits, OneCoreCpuPercent, OneCoreCpuPermille,
         OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProcessCoverage,
         ProcessCoverageGap, ProtectedOutput, PushReport, RebaseBuildVolume, RebaseCarrySkip,
         RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult, ResizeVolume,
@@ -238,7 +238,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         output_limit: None,
         stdin: empty_stdin(),
         failure: None,
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
         cpu_tokens: None,
@@ -334,7 +334,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             complete: true,
         },
         failure: None,
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: Some(10),
         cpu_tokens: NonZeroUsize::new(4),
@@ -368,9 +368,9 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             complete: true,
         },
         failure: None,
-        class: JobserverClass::Gate,
+        class: ExecClass::Gate,
         scope: ExecScope::Workspace,
-        nice: Some(0),
+        nice: Some(5),
         cpu_tokens: NonZeroUsize::new(8),
     };
     // A supervisor configured with no volume sampled it: its volumes say so.
@@ -415,7 +415,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         output_limit: None,
         stdin: empty_stdin(),
         failure: None,
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: Some(10),
         cpu_tokens: NonZeroUsize::new(2),
@@ -465,7 +465,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             complete: false,
         },
         failure: None,
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: Some(10),
         cpu_tokens: NonZeroUsize::new(1),
@@ -497,7 +497,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         resources: None,
         stdout: inline_stream(""),
         stderr: inline_stream("spawn refused\n"),
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
         cpu_tokens: None,
@@ -525,7 +525,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         stdout: inline_stream(""),
         stderr: inline_stream("syntax error: unterminated subshell\n"),
         failure: Some(cowshed_core::api::JobFailure::ScriptSyntax),
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
         cpu_tokens: None,
@@ -543,7 +543,7 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         stdout: inline_stream(""),
         stderr: inline_stream("jobserver admission is unavailable: connection refused\n"),
         failure: Some(cowshed_core::api::JobFailure::CpuAdmission),
-        class: JobserverClass::Gate,
+        class: ExecClass::Gate,
         scope: ExecScope::HostGate,
         nice: None,
         cpu_tokens: None,
@@ -561,10 +561,34 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         stdout: inline_stream(""),
         stderr: inline_stream("cannot place pid 4246 at nice 10\n"),
         failure: Some(cowshed_core::api::JobFailure::Priority),
-        class: JobserverClass::Background,
+        class: ExecClass::Background,
         scope: ExecScope::Workspace,
         nice: None,
         cpu_tokens: NonZeroUsize::new(1),
+        ..exited.clone()
+    };
+
+    // A job its requester waits on: it held background tokens and ran at the supervisor's own
+    // nice, above a gate (05_gateway.md "Bands").
+    let interactive = JobInfo {
+        job_id: JobId::new(11).expect("fixture job id"),
+        resources: None,
+        class: ExecClass::Interactive,
+        scope: ExecScope::Workspace,
+        nice: Some(0),
+        cpu_tokens: NonZeroUsize::new(2),
+        ..exited.clone()
+    };
+
+    // A resident that served its requests and ended: it held no token, so it names none, and its
+    // observed nice stands alone.
+    let resident = JobInfo {
+        job_id: JobId::new(12).expect("fixture job id"),
+        resources: None,
+        class: ExecClass::Resident,
+        scope: ExecScope::Workspace,
+        nice: Some(10),
+        cpu_tokens: None,
         ..exited.clone()
     };
 
@@ -588,6 +612,8 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
             document("job status", &cpu_admission_failed),
         ),
         ("priorityFailed", document("job status", &priority_failed)),
+        ("interactive", document("job status", &interactive)),
+        ("resident", document("job status", &resident)),
         ("list", document("job list", &list)),
     ])
 }
@@ -1567,7 +1593,10 @@ fn every_scheduling_fact_appears_in_the_corpus() {
         })
         .collect();
     for (field, spellings) in [
-        ("class", ["background", "gate"].as_slice()),
+        (
+            "class",
+            ["background", "interactive", "gate", "resident"].as_slice(),
+        ),
         ("scope", ["workspace", "hostGate"].as_slice()),
         (
             "failure",

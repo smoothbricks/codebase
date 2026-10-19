@@ -5098,7 +5098,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 stdout_copy: None,
                 stderr_copy: None,
                 admission_key: None,
-                class: cowshed_gateway_types::JobserverClass::Background,
+                class: crate::api::dto::ExecClass::Background,
                 want: std::num::NonZeroUsize::MIN,
                 scope: crate::api::dto::ExecScope::Workspace,
             };
@@ -12223,9 +12223,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             let (handle, grant) = self.admit_build_state(&workspace).await?;
             let mount = self.workspace_mount_path(&workspace)?;
             let class = if options.gate {
-                crate::api::dto::JobserverClass::Gate
+                crate::api::dto::ExecClass::Gate
             } else {
-                crate::api::dto::JobserverClass::Background
+                crate::api::dto::ExecClass::Background
             };
             let selections = timed_async(
                 "rebase",
@@ -15421,7 +15421,7 @@ mod removal_supervisor_tests {
                     stdout_copy: None,
                     stderr_copy: None,
                     admission_key: None,
-                    class: cowshed_gateway_types::JobserverClass::Background,
+                    class: crate::api::dto::ExecClass::Background,
                     want: std::num::NonZeroUsize::MIN,
                     scope: crate::api::dto::ExecScope::Workspace,
                 },
@@ -16218,7 +16218,7 @@ fn land_check_request(check: &str) -> ExecRequest {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
-        class: crate::api::dto::JobserverClass::Background,
+        class: crate::api::dto::ExecClass::Background,
         want: NonZeroUsize::MIN,
         scope: crate::api::dto::ExecScope::Workspace,
     }
@@ -16401,7 +16401,7 @@ async fn initialize_nx_caches(
             mount,
             root,
             crate::build_volume::cache_adapter::initialize_script(),
-            crate::api::dto::JobserverClass::Gate,
+            crate::api::dto::ExecClass::Gate,
         )?;
         let initialized = nx_probe_stdout(handle, build_volume.clone(), request)
             .await
@@ -16444,7 +16444,7 @@ fn nx_probe_request(
     mount: &Path,
     root: &Path,
     script: bytes::Bytes,
-    class: crate::api::dto::JobserverClass,
+    class: crate::api::dto::ExecClass,
 ) -> Result<ExecRequest> {
     let cwd = if root.as_os_str().is_empty() {
         None
@@ -16514,7 +16514,7 @@ async fn rebased_task_hashes(
     handle: &crate::runtime::supervisor::WorkspaceSupervisorHandle,
     build_volume: Option<PathBuf>,
     mount: &Path,
-    class: crate::api::dto::JobserverClass,
+    class: crate::api::dto::ExecClass,
 ) -> Result<
     std::result::Result<
         std::collections::BTreeMap<PathBuf, crate::build_volume::nx::TaskSelection>,

@@ -920,7 +920,12 @@ core count.
   that — and an idle host leaves every band's work at full speed. A class is fixed at the job's birth and its band with
   it: no live transition moves a running job between bands. An interactive job asks the gateway's ledger as background,
   whose tokens it shares; `interactive` is the supervisor's placement and the task server's class, never a third ledger
-  class.
+  class. A requester names its job's class in the exec request itself — `ExecClass`, one of `background`, `interactive`,
+  `gate` or `resident` (a resident, "A resident holds no token" above, runs at background nice and holds no token) — and
+  the CLI's `cowshed exec --class` and the API's `class` field are that one typed value (07_api.md, "CLI and API exec
+  parity"), so an embedding executor declares a class exactly as the CLI does. The ledger's wire class
+  (`JobserverClass`) is `background` or `gate` only: the supervisor sends interactive as background and a resident as
+  `resident-pool`, so neither reaches the ledger as a class of its own.
 
 - **Crash safety by connection.** The grant is tied to the connection: on exit, `SIGKILL` included, the kernel closes
   the socket and the gateway returns the tokens at once. A request that closes while queued leaves the queue. A gateway
