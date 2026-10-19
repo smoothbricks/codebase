@@ -7,7 +7,9 @@
 //! it never races the host's load and the run's no-progress bound stays the one that decides.
 //!
 //! The value is the plugin's `BOUNDED_TEST_IDLE_TIMEOUT_MS`, read from its source at compile time,
-//! so there is one number and no reader can pick a different one.
+//! so there is one number and no reader can pick a different one. The module is always compiled
+//! (two constants, no runtime cost), so a dependant's tests take it through a plain dependency,
+//! with no feature that would split the build's units from the tests'.
 
 use std::time::Duration;
 

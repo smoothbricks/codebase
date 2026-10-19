@@ -6,6 +6,5 @@ pub mod fork_lock;
 pub mod fsio;
 pub mod host_load;
 pub mod process;
-#[cfg(any(test, feature = "test-hooks"))]
 pub mod test_backstop;
 pub mod timing;
