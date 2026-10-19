@@ -1582,10 +1582,8 @@ async fn host_controller_a_coordinator_host_gate_runs_outside_the_sandbox() {
         .exec(None, None, host(), AdmissionSource::Coordinator)
         .await
         .expect("a coordinator's host gate is admitted");
-    let info = tokio::time::timeout(Duration::from_secs(60), handle.wait(job))
-        .await
-        .expect("job terminates")
-        .expect("job outcome");
+    // The job's end is the event; the leg's no-progress bound decides a hang.
+    let info = handle.wait(job).await.expect("job outcome");
     let stdout = read_stream(&handle, &info, StreamKind::Stdout).await;
     assert_eq!(info.exit, Some(ExitStatus::Exited { code: 0 }));
     assert_eq!(String::from_utf8_lossy(&stdout), "2");
