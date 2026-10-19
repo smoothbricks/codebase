@@ -493,7 +493,8 @@ struct JobserverIn {
     /// A Cargo build whose fifo may be given more tokens after it starts, up to `want`.
     #[serde(default)]
     grow: bool,
-    /// The requester's live CPU pool: the job's tokens come from it, not the host ledger.
+    /// The requester's live CPU pool, which the job waits on beside the host ledger: the first
+    /// grant serves it.
     parent_pool: Option<String>,
 }
 
@@ -1008,35 +1009,22 @@ async fn serve<R, W>(
             command,
             options,
         }) => {
-            // A requester that holds a live pool lends its job the tokens; only a pool that
-            // cannot be reached leaves the job to the host ledger (05_gateway.md "Work a holder
-            // starts draws on its grant").
+            // An exec from a holder waits on its requester's live pool and on the host ledger at
+            // once: the first grant serves it and the other ask is withdrawn (05_gateway.md "Work
+            // a holder starts draws on its grant"). Only a pool that cannot be reached is absent.
             let parent = match options.parent_pool.as_deref() {
                 None => None,
                 Some(path) => match connect_parent(path).await {
                     Ok(stream) => Some((path.to_path_buf(), stream)),
                     Err(error) => {
                         eprintln!(
-                            "cowshed: the requester's CPU pool {} does not answer ({error}); `{command}` asks the host budget",
+                            "cowshed: the requester's CPU pool {} does not answer ({error}); `{command}` asks the host budget alone",
                             path.display()
                         );
                         None
                     }
                 },
             };
-            if let Some((path, stream)) = parent {
-                hold_parent_jobserver(
-                    reader,
-                    writer,
-                    stream,
-                    &path,
-                    want,
-                    services.jobserver.clone(),
-                    options.pool_job,
-                )
-                .await;
-                return;
-            }
             let checkout: Arc<str> = Arc::from(checkout);
             let claim = Claim::new(&command, pid);
             let rank = options.admission.rank();
@@ -1056,11 +1044,14 @@ async fn serve<R, W>(
             hold_jobserver(
                 reader,
                 writer,
+                want,
                 admission,
+                parent,
                 services.jobserver.clone(),
                 options,
                 services.cpu_budget.clone(),
                 checkout,
+                &command,
             )
             .await;
         }
@@ -1190,18 +1181,29 @@ async fn hold<R, W, S, G>(
 /// fifo, name it in the granted answer, and hold until the client closes. The
 /// fifo is then drained and unlinked, and dropping the stake returns all of
 /// its tokens, including any a killed client read and never wrote back.
+///
+/// An exec from a holder (`parent`, its requester's live pool) waits on that pool and on the
+/// host ledger at once, and the first grant serves it (05_gateway.md "Work a holder starts draws
+/// on its grant"). The loser is withdrawn, which is said on stderr and as a timing event: the
+/// host stake dropped leaves the ledger's queue, and the pool connection closed leaves the pool's.
+/// A pool that answers and refuses before the host grants refuses the job. One ask is never
+/// granted twice, and each grant is accounted by the ledger that made it.
+#[allow(clippy::too_many_arguments)]
 async fn hold_jobserver<R, W>(
     mut reader: R,
     mut writer: W,
+    want: NonZeroUsize,
     (stake, granted, mut growth): (
         crate::cpu_budget::Stake,
         tokio::sync::oneshot::Receiver<usize>,
         Option<tokio::sync::mpsc::UnboundedReceiver<usize>>,
     ),
+    parent: Option<(PathBuf, cowshed_os::fork_lock::Fenced<UnixStream>)>,
     fifos: crate::jobserver::JobserverFifos,
     options: JobserverOptions,
     budget: CpuBudget,
     checkout: Arc<str>,
+    command: &str,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -1212,11 +1214,49 @@ async fn hold_jobserver<R, W>(
     {
         return;
     }
+    let asked = std::time::Instant::now();
+    let job = match &options.pool_job {
+        Some(job) => format!(
+            "{}/{} job {}",
+            job.repo_id, job.workspace_incarnation, job.job_id
+        ),
+        None => command.to_owned(),
+    };
+    let refuse = |path: &Path, why: String| {
+        failure(
+            ControlFailureCode::Rejected,
+            format!(
+                "the requester's CPU pool {} {why} before the host granted `{job}`; the job is refused",
+                path.display()
+            ),
+        )
+    };
+    let mut parent = match parent {
+        None => None,
+        Some((path, stream)) => {
+            let mut stream = BufReader::new(stream);
+            let request = format!(
+                "{}\n",
+                serde_json::json!({ "op": "cpu-pool", "want": want })
+            );
+            if let Err(error) = stream.get_mut().write_all(request.as_bytes()).await {
+                let why = format!("cannot be asked ({error})");
+                let _ = write_response(&mut writer, &refuse(&path, why)).await;
+                return;
+            }
+            Some((path, stream))
+        }
+    };
+    /// Which ledger's grant arrived first, and its count.
+    enum Winner {
+        Host(usize),
+        Pool(usize),
+    }
     let mut discard = [0_u8; 64];
-    let tokens = tokio::select! {
+    let winner = tokio::select! {
         biased;
         answer = granted => match answer {
-            Ok(tokens) => tokens,
+            Ok(tokens) => Winner::Host(tokens),
             Err(_) => {
                 let _ = write_response(
                     &mut writer,
@@ -1229,7 +1269,61 @@ async fn hold_jobserver<R, W>(
                 return;
             }
         },
+        answer = async {
+            match parent.as_mut() {
+                Some((path, stream)) => parent_grant(stream, want)
+                    .await
+                    .map_err(|why| refuse(path, why)),
+                None => std::future::pending().await,
+            }
+        } => match answer {
+            Ok(tokens) => Winner::Pool(tokens),
+            Err(refusal) => {
+                let _ = write_response(&mut writer, &refusal).await;
+                return;
+            }
+        },
         _ = reader.read(&mut discard) => return,
+    };
+    let waited = asked.elapsed().as_millis();
+    let tokens = match (winner, parent) {
+        (Winner::Host(tokens), None) => tokens,
+        (Winner::Host(tokens), Some((path, stream))) => {
+            // Closing the pool connection leaves the pool's queue.
+            drop(stream);
+            withdrawn(
+                &job,
+                tokens,
+                "the host ledger",
+                &format!("the requester's CPU pool {}", path.display()),
+                waited,
+            );
+            tokens
+        }
+        (Winner::Pool(tokens), Some((path, stream))) => {
+            // Dropping the stake leaves the host ledger's queue; a host grant that raced in
+            // returns with it.
+            drop(stake);
+            withdrawn(
+                &job,
+                tokens,
+                &format!("the requester's CPU pool {}", path.display()),
+                "the host ledger",
+                waited,
+            );
+            hold_parent_grant(
+                reader,
+                writer,
+                stream,
+                &path,
+                tokens,
+                fifos,
+                options.pool_job,
+            )
+            .await;
+            return;
+        }
+        (Winner::Pool(_), None) => unreachable!("only a requester's pool grants from a pool"),
     };
     let source = options.pool_job.as_ref().map(|job| {
         // A gate's children rank as the gate job does, by its age, at every return; background
@@ -1426,69 +1520,38 @@ where
     }
 }
 
-/// Hold one job's grant borrowed from its requester's live pool (05_gateway.md "Work a holder
-/// starts draws on its grant"): answer `queued` at once, ask the pool for `want` tokens, and on
-/// its grant serve the job its fifo and, for a job, its own lent pool, as a host grant is
-/// served. The host ledger takes no place for it: its tokens are the requester's. A pool that
-/// answers and refuses refuses the job, never a second, host grant. The pool's end ends the
-/// job's accounting, never its work: its own pool lends nothing more and the job runs on to its
-/// own exit, as across a gateway restart. The client's close returns the tokens to the pool.
-async fn hold_parent_jobserver<R, W>(
+/// Say that `job`'s first grant came from `winner` and its ask of `loser` was withdrawn, on
+/// stderr and as a jobserver timing event (05_gateway.md "Work a holder starts draws on its
+/// grant").
+fn withdrawn(job: &str, tokens: usize, winner: &str, loser: &str, waited_ms: u128) {
+    eprintln!(
+        "cowshed: `{job}` was granted {tokens} token(s) by {winner}; its ask of {loser} was withdrawn after {waited_ms} ms"
+    );
+    cowshed_os::timing::event("jobserver", || {
+        format!(
+            "grant {job} tokens={tokens} by {winner}; {loser} ask withdrawn after {waited_ms}ms"
+        )
+    });
+}
+
+/// Serve a job the grant its requester's live pool made, as a host grant is served: its fifo
+/// and, for a job, its own lent pool. The host ledger holds no place for it, since its tokens are
+/// the requester's. The pool's end ends the job's accounting, never its work: its own pool lends
+/// nothing more and the job runs on to its own exit, as across a gateway restart. The client's
+/// close returns the tokens to the pool.
+async fn hold_parent_grant<R, W>(
     mut reader: R,
     mut writer: W,
-    parent: cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
+    mut parent: BufReader<cowshed_os::fork_lock::Fenced<UnixStream>>,
     parent_path: &Path,
-    want: NonZeroUsize,
+    tokens: usize,
     fifos: crate::jobserver::JobserverFifos,
     pool_job: Option<JobserverJobIn>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::AsyncWriteExt as _;
-    if write_response(&mut writer, &lease(LeaseState::Queued))
-        .await
-        .is_err()
-    {
-        return;
-    }
-    let refuse = |why: String| {
-        failure(
-            ControlFailureCode::Rejected,
-            format!(
-                "the requester's CPU pool {} {why}; no host grant is taken while the requester holds one",
-                parent_path.display()
-            ),
-        )
-    };
-    let mut parent = tokio::io::BufReader::new(parent);
-    let request = format!(
-        "{}\n",
-        serde_json::json!({ "op": "cpu-pool", "want": want })
-    );
-    if let Err(error) = parent.get_mut().write_all(request.as_bytes()).await {
-        let _ = write_response(&mut writer, &refuse(format!("cannot be asked ({error})"))).await;
-        return;
-    }
     let mut discard = [0_u8; 64];
-    let tokens = tokio::select! {
-        biased;
-        granted = parent_grant(&mut parent, want) => match granted {
-            Ok(tokens) => tokens,
-            Err(why) => {
-                let _ = write_response(&mut writer, &refuse(why)).await;
-                return;
-            }
-        },
-        // The client withdrew: dropping the pool connection leaves the pool's queue.
-        _ = reader.read(&mut discard) => return,
-    };
-    cowshed_os::timing::event("jobserver", || {
-        format!(
-            "grant tokens={tokens}/{want} from the requester's pool {}",
-            parent_path.display()
-        )
-    });
     let source = pool_job.as_ref().map(|job| {
         (
             crate::jobserver::PoolSource::Lent(

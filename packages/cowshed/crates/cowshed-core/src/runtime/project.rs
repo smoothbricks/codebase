@@ -13377,8 +13377,8 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.reconcile_gateway_for_work(&workspace, &incarnation, &handle)
             .await?;
         // This controller runs in the requester's process, so a pool it inherited is the
-        // requester's: the job's tokens come from it, never from the host ledger while the
-        // requester holds a grant (05_gateway.md "Work a holder starts draws on its grant").
+        // requester's: the job waits on it and on the host ledger at once, and the first grant
+        // serves it (05_gateway.md "Work a holder starts draws on its grant").
         handle
             .exec_from(
                 token.as_ref(),

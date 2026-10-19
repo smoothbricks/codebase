@@ -420,25 +420,36 @@ physical resizing, read-only mounts and legacy-image conversion remain native-ho
 `/private/tmp/cowshed-dtest-<pid>-<n>-<label>` and share process cleanup with the image fixtures, but neither their
 setup nor their cleanup enumerates or releases disk images.
 
-Cargo lifecycle fixtures run the real Cargo that drives the test (`CARGO`, or the first executable `cargo` on an
-absolute `PATH` entry); nothing installed answers to `cargo` (03_caches.md, "Cargo reads its budget from its holder").
-Cargo lock fixtures still invoke ambient `cargo`: after build-script readiness they independently report its parent PID
-and Cargo executable, check those against the kernel executable/argv and the entry process's parent edge, retain its
-kernel process group, and match the lock refusal to that actual Cargo process. An observed FIFO — one a holder
-configured — is checked as a live kernel FIFO only its user can open. Existing profile locks, the newly-created-profile
-control, seed preservation and native/Directory lifecycle oracles remain unchanged (16_build_volumes.md, "Targets and
-seeds"). The native build-volume holder subprocess uses `--nocapture --quiet` so inherited single-thread libtest
-formatting cannot prefix its actual-PID record. Its kernel-holder, forced-release diagnostics, checkout-label ownership
-and reclamation assertions remain exact.
+Cargo lifecycle fixtures run the real Cargo that drives the test: canonical `CARGO`, never a `cargo` found on `PATH`,
+where an earlier install's link may still answer to the name. `rustc` and `rustdoc` resolve by Cargo's own rule
+(`RUSTC`/`RUSTDOC`, else the first executable on an absolute `PATH` entry, canonicalized), since a Nix toolchain's Cargo
+sits in another store path than its compiler. Nothing installed answers to `cargo`, `rustc` or `rustdoc` (03_caches.md,
+"Cargo reads its budget from its holder"). Cargo lock fixtures still invoke ambient `cargo`: after build-script
+readiness they independently report its parent PID and Cargo executable, check those against the kernel executable/argv
+and the entry process's parent edge, retain its kernel process group, and match the lock refusal to that actual Cargo
+process. An observed FIFO — one a holder configured — is checked as a live kernel FIFO only its user can open. Existing
+profile locks, the newly-created-profile control, seed preservation and native/Directory lifecycle oracles remain
+unchanged (16_build_volumes.md, "Targets and seeds"). The native build-volume holder subprocess uses
+`--nocapture --quiet` so inherited single-thread libtest formatting cannot prefix its actual-PID record. Its
+kernel-holder, forced-release diagnostics, checkout-label ownership and reclamation assertions remain exact.
 
-The holder's configuration is proved against real Cargo (`cowshed-gateway`'s `tests/jobserver_cargo.rs`): a job's
-one-token grant, asked as the supervisor asks it, names its fifo beside its pool socket; a real `cargo test` under
-exactly the variables the holder exports compiles one crate at a time (a rustc wrapper records each compile's start and
-end), the test's nested `cargo build` reads the same fifo and compiles one at a time, the test's nested job asking the
-pool socket for every core is lent the holder's own token, and the host ledger holds that one grant with nobody waiting.
-The same build with nothing exported compiles independent crates side by side. Those fixtures clear every inherited
-sizing variable (`CARGO_MAKEFLAGS`, `MAKEFLAGS`, `MFLAGS`, `CARGO_BUILD_JOBS`, the test-thread counts, the pool markers,
-a rustc wrapper) before they set their own, so the runner's own grant cannot size them.
+The holder's configuration is proved against the gateway's own contract over its real control socket, with no Cargo and
+no compile (`cowshed-gateway`'s `tests/jobserver_fifo.rs`). A reader standing in for Cargo takes and writes back fifo
+bytes as Cargo's jobserver client does. A job grant asked as the supervisor asks it (`pool: true`) names a `0600` fifo
+beside its pool socket holding exactly `g − 1` bytes (none for `g = 1`). The pool's socket lends the fifo's bytes first
+and the holder's own token last: a one-token pool lends its implicit token to a socket child; while the reader holds a
+larger pool's bytes, the next child waits and is granted once the reader writes them back. A closed child's tokens reach
+the child waiting behind it, the fifo holds `g − 1` bytes again once every child has closed and never more, and the host
+ledger holds the job's `g` alone throughout. `CpuPlacement::environment`'s unit tests in `cowshed-core`'s supervisor
+hold what a job's command receives: `CARGO_MAKEFLAGS`/`MAKEFLAGS` naming the held fifo, `RUST_TEST_THREADS` and
+`NEXTEST_TEST_THREADS` at `g` unless the caller named them, and for a resident its pool, a zero count and no jobserver.
+How Cargo reads a jobserver is Cargo's own to test; an end-to-end proof with real Cargo belongs in a nightly, not the
+gate. A test whose jobs only its fixture gateway's ledger may budget runs as a requester holding no pool: the controller
+runs in the test's process, and an exec from a holder also waits on the holder's pool (05_gateway.md, "Work a holder
+starts draws on its grant"), so a test that inherits its runner's pool is testing that runner's grant. It runs its body
+again in a child test process without the pool markers, `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS`, rather than editing
+the environment of a process other tests may share. The `bounded-exec` executor suite likewise clears every inherited
+sizing variable for its own run, so a gate's grant to the suite's process is no ceiling on the runners its cases size.
 
 Directory build-state freshness uses observed filesystem change times, not synthetic wall-clock marks. If a listed child
 or subtree disappears during a live scan, the nearest surviving ancestor records that removal; the root uses its

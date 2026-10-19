@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, jest } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, it, jest } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { access, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
@@ -8,7 +8,7 @@ import { onProgressClock } from '../../__tests__/progress-clock.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { ownedSocketDirectory } from '../../testing.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readInheritedCpuPool } from './cpu-pool.js';
-import { CPU_TOKENS_ENV, type CpuBudget, parseInheritedTokens, type TokenGrant } from './cpu-tokens.js';
+import { CPU_TOKENS_ENV, type CpuBudget, type TokenGrant } from './cpu-tokens.js';
 import {
   type BoundedExecContext,
   type BoundedExecResult,
@@ -28,7 +28,26 @@ const ownedProcessGroups = new Set<number>();
 const originalStdoutWrite = process.stdout.write;
 const originalStderrWrite = process.stderr.write;
 
-const nextestWant = Math.min(8, parseInheritedTokens(process.env.NEXTEST_TEST_THREADS) ?? 8);
+/** What the nextest cases declare as `parallelism`, and so what they ask: the suite runs under no inherited ceiling. */
+const nextestWant = 8;
+
+/**
+ * Every sizing variable a holder exports to its command (specs/cowshed/05_gateway.md, "Sized to the grant", "Cargo reads
+ * its holder's jobserver"). This suite's own process runs under them when a gate's `bounded-exec` started it, and the
+ * executor reads them as inherited ceilings and pool beside the ones its cases construct, so the suite clears them
+ * (specs/cowshed/08_testing.md: fixtures clear every inherited sizing variable before they set their own).
+ */
+const INHERITED_SIZING_ENV = [
+  CPU_POOL_ENV,
+  CPU_TOKENS_ENV,
+  'NEXTEST_TEST_THREADS',
+  'RUST_TEST_THREADS',
+  'CARGO_BUILD_JOBS',
+  'CARGO_MAKEFLAGS',
+  'MAKEFLAGS',
+  'MFLAGS',
+] as const;
+const inheritedSizing = INHERITED_SIZING_ENV.map((name) => [name, process.env[name]] as const);
 
 /**
  * Prints the budget variables it sees, then what a grandchild sees: a command's environment reaches its descendants,
@@ -41,6 +60,19 @@ console.log(execFileSync('node', ['-p', read]).toString().trim());
 `;
 
 describe('@smoothbricks/nx-plugin:bounded-exec', () => {
+  beforeAll(() => {
+    for (const name of INHERITED_SIZING_ENV) {
+      delete process.env[name];
+    }
+  });
+
+  afterAll(() => {
+    for (const [name, value] of inheritedSizing) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
   afterEach(async () => {
     process.stdout.write = originalStdoutWrite;
     process.stderr.write = originalStderrWrite;

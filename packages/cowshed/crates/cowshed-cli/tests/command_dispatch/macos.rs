@@ -217,7 +217,7 @@ enum Project<'a> {
     /// [`Project::Plain`] and then the build-volume tests' tree ([`write_build_project`]).
     Build {
         nx: Option<(&'a Path, &'a Path)>,
-        rust: Option<&'a Path>,
+        rust: Option<&'a RustToolchain>,
     },
     /// [`Project::Plain`] whose `.cowshed.toml` also declares [`DECLARED_STATE`] build state,
     /// with an ignored, untracked nested Git checkout already there ([`write_declared_project`]).
@@ -2147,38 +2147,66 @@ fn directory_a_failed_nx_test_leaves_no_daemon_under_its_root_substrate_lifecycl
     assert!(!root.exists(), "{} was removed", root.display());
 }
 
-/// The real Rust toolchain on the test's `PATH`, resolved at run time like [`repository_nx`]: the
-/// first executable `cargo` in an absolute `PATH` directory, followed to its real file so `rustc`
-/// is the one beside it. Nothing stands in for `cargo` on `PATH` (05_gateway.md, "Host CPU
-/// budget": a grant reaches Cargo as configuration Cargo reads).
-fn rust_toolchain() -> PathBuf {
-    let path = std::env::var_os("PATH").expect("the test's PATH");
-    let cargo = std::env::split_paths(&path)
-        .filter(|directory| directory.is_absolute())
-        .map(|directory| directory.join("cargo"))
-        .find(|candidate| {
-            candidate.metadata().is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+/// The real Rust toolchain that drives this test, each program followed to its real file.
+struct RustToolchain {
+    cargo: PathBuf,
+    rustc: PathBuf,
+    rustdoc: PathBuf,
+}
+
+impl RustToolchain {
+    /// `cargo` is canonical `CARGO`, which Cargo and nextest set for every test to the real
+    /// driver running it, so no installed `cargo` link, an earlier install's included, can stand
+    /// in (05_gateway.md, "Cargo reads its holder's jobserver"). `rustc` and `rustdoc` resolve by
+    /// Cargo's own rule: `RUSTC`/`RUSTDOC` if set, else the first executable on an absolute
+    /// `PATH` entry, canonicalized. Nothing installed answers to `rustc` or `rustdoc`. Canonical
+    /// `CARGO` need not sit beside them: a Nix toolchain's `bin/cargo` is a wrapper that execs
+    /// the Cargo of another store path.
+    fn of_this_test() -> Self {
+        let cargo = fs::canonicalize(
+            std::env::var_os("CARGO").expect("Cargo publishes its real compiler driver"),
+        )
+        .expect("real Cargo driver");
+        let toolchain = Self {
+            cargo,
+            rustc: cargo_tool("RUSTC", "rustc"),
+            rustdoc: cargo_tool("RUSTDOC", "rustdoc"),
+        };
+        eprintln!(
+            "fixture Rust toolchain: cargo={}, rustc={}, rustdoc={}",
+            toolchain.cargo.display(),
+            toolchain.rustc.display(),
+            toolchain.rustdoc.display()
+        );
+        toolchain
+    }
+
+    /// Each program under the name a checkout's shim directory gives it.
+    fn programs(&self) -> [(&'static str, &Path); 3] {
+        [
+            ("cargo", &self.cargo),
+            ("rustc", &self.rustc),
+            ("rustdoc", &self.rustdoc),
+        ]
+    }
+}
+
+/// The real file of the tool Cargo runs as `program`: `variable` if set, else the first
+/// executable `program` on an absolute `PATH` entry.
+fn cargo_tool(variable: &str, program: &str) -> PathBuf {
+    let named = std::env::var_os(variable).map(PathBuf::from).or_else(|| {
+        std::env::split_paths(&std::env::var_os("PATH").expect("the test's PATH"))
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| directory.join(program))
+            .find(|candidate| {
+                candidate.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
             })
-        })
-        .expect("cargo on PATH")
-        .canonicalize()
-        .expect("the real cargo resolves");
-    let bin = cargo.parent().expect("cargo has a directory").to_path_buf();
-    let rustc = bin.join("rustc");
-    assert!(
-        rustc.metadata().is_ok_and(|metadata| {
-            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-        }),
-        "executable rustc beside the real Cargo {}",
-        cargo.display()
-    );
-    eprintln!(
-        "fixture Rust toolchain: cargo={}, rustc={}",
-        cargo.display(),
-        rustc.canonicalize().expect("rustc resolves").display()
-    );
-    bin
+    });
+    let named = named.unwrap_or_else(|| panic!("{variable} or an executable {program} on PATH"));
+    fs::canonicalize(&named)
+        .unwrap_or_else(|error| panic!("{program} {}: {error}", named.display()))
 }
 
 /// The fixture repository declares its own toolchain, as a real one does through its shell:
@@ -2186,18 +2214,18 @@ fn rust_toolchain() -> PathBuf {
 /// fixture's `node`, the programs resolve through the checkout's shim directory, which travels
 /// with every clone (03_caches.md), so every job runs plain `cargo` and build-state discovery
 /// asks that same Cargo for the target directory.
-fn declare_rust(checkout: &Path, rust: &Path) {
+fn declare_rust(checkout: &Path, rust: &RustToolchain) {
     let bin = checkout.join(".cowshed/bin");
     fs::create_dir_all(&bin).unwrap();
-    for program in ["cargo", "rustc", "rustdoc"] {
-        std::os::unix::fs::symlink(rust.join(program), bin.join(program)).unwrap();
+    for (name, program) in rust.programs() {
+        std::os::unix::fs::symlink(program, bin.join(name)).unwrap();
     }
 }
 
 /// A Cargo workspace of two path crates, `fixture-app` depending on `fixture-base`: libraries
 /// only, so building them links nothing. Its lockfile comes from the same Cargo the sandbox
 /// runs, so no build rewrites a tracked file.
-fn write_cargo_workspace(checkout: &Path, rust: &Path) {
+fn write_cargo_workspace(checkout: &Path, rust: &RustToolchain) {
     fs::write(
         checkout.join("Cargo.toml"),
         "[workspace]\nmembers = [\"base\", \"app\"]\nresolver = \"3\"\n",
@@ -2220,9 +2248,10 @@ fn write_cargo_workspace(checkout: &Path, rust: &Path) {
         fs::write(checkout.join(directory).join("Cargo.toml"), manifest).unwrap();
         fs::write(checkout.join(directory).join("src/lib.rs"), source).unwrap();
     }
-    let lockfile = Command::new(rust.join("cargo"))
+    let lockfile = Command::new(&rust.cargo)
         .args(["generate-lockfile", "--offline"])
         .current_dir(checkout)
+        .env("RUSTC", &rust.rustc)
         .env_remove("CARGO_TARGET_DIR")
         .output()
         .expect("cargo generate-lockfile");
@@ -2236,7 +2265,7 @@ fn write_cargo_workspace(checkout: &Path, rust: &Path) {
 /// Main's tree for the build-volume tests, written into `checkout` and committed: the Nx project
 /// with its outputs declared and/or the Cargo workspace, with every build output and the tests'
 /// own control files ignored, so a retiring land finds the landing tree clean.
-fn write_build_project(checkout: &Path, nx: Option<(&Path, &Path)>, rust: Option<&Path>) {
+fn write_build_project(checkout: &Path, nx: Option<(&Path, &Path)>, rust: Option<&RustToolchain>) {
     if let Some((nx, node)) = nx {
         write_nx_project(checkout, nx, node, true);
     }
@@ -2581,7 +2610,7 @@ impl Drop for Holder {
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_lifecycle() {
     let (nx, node) = repository_nx();
-    let rust = rust_toolchain();
+    let rust = RustToolchain::of_this_test();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: Some((&nx, &node)),
         rust: Some(&rust),
@@ -2618,8 +2647,13 @@ async fn directory_a_fork_of_a_warm_target_is_all_fresh_and_all_hits_substrate_l
         .env("HOME", fixture.storage.home())
         .env(
             "PATH",
-            std::env::join_paths([rust.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-                .unwrap(),
+            // The checkout's declared toolchain, as its own jobs run it ([`declare_rust`]).
+            std::env::join_paths([
+                w2.join(".cowshed/bin").as_path(),
+                Path::new("/usr/bin"),
+                Path::new("/bin"),
+            ])
+            .unwrap(),
         )
         .env("CI", "true")
         .output()
@@ -3601,11 +3635,20 @@ async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substra
 /// A job admitted before an adoption keeps the volume it was admitted with: its working
 /// directory stays in main's previous volume, which therefore stays until the job exits. A job
 /// admitted afterwards resolves main's link to the adopted volume (16_build_volumes.md, "Process
-/// lifetime across a swap", "Garbage collection").
+/// lifetime across a swap", "Garbage collection"). The first job holds its tokens while later
+/// jobs run, so both draw on the fixture gateway's ledger, never on a pool this test's runner
+/// holds, whose single token the first job would keep from them ([`holds_no_cpu_pool`]).
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_jobs_get_the_new_one()
  {
-    let rust = rust_toolchain();
+    if !holds_no_cpu_pool(
+        "macos::directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_jobs_get_the_new_one",
+    )
+    .await
+    {
+        return;
+    }
+    let rust = RustToolchain::of_this_test();
     let mut fixture = Fixture::with_directory(Project::Build {
         nx: None,
         rust: Some(&rust),
@@ -6367,6 +6410,49 @@ async fn queued_request(socket: &Path) -> cowshed_gateway_types::CpuWaiter {
     }
 }
 
+/// Every variable a holder hands its CPU grant to the process it starts by (05_gateway.md,
+/// "Nested runners use a parent-held sub-ledger", "Cargo reads its holder's jobserver").
+const HOLDER_CPU_BUDGET: [&str; 5] = [
+    "BOUNDED_EXEC_CPU_POOL",
+    "BOUNDED_EXEC_CPU_TOKENS",
+    "CARGO_MAKEFLAGS",
+    "MAKEFLAGS",
+    "MFLAGS",
+];
+
+/// Marks the child test process [`holds_no_cpu_pool`] starts.
+const NO_CPU_POOL_CHILD: &str = "COWSHED_TEST_NO_CPU_POOL_CHILD";
+
+/// Whether this process is a requester that holds no CPU pool, so `test`'s body runs here. The
+/// controller runs in the requester's process, and a job draws on the requester's live pool, never
+/// on the host ledger (05_gateway.md, "Work a holder starts draws on its grant"); a test process a
+/// gate's runner started holds that runner's pool. A test whose jobs only its fixture gateway's
+/// ledger may budget therefore runs `test` again in a child test process whose environment names
+/// none of [`HOLDER_CPU_BUDGET`] (08_testing.md: fixtures clear every inherited sizing variable),
+/// answers `false` once that child passed, and its body runs only in the child. A child, not
+/// `remove_var`, since the tests of one binary may share its process and its environment.
+async fn holds_no_cpu_pool(test: &str) -> bool {
+    if std::env::var_os(NO_CPU_POOL_CHILD).is_some() {
+        return true;
+    }
+    let mut child = tokio::process::Command::new(std::env::current_exe().expect("test executable"));
+    child
+        .args(["--exact", test, "--nocapture"])
+        .env(NO_CPU_POOL_CHILD, "1");
+    for name in HOLDER_CPU_BUDGET {
+        child.env_remove(name);
+    }
+    let status = child
+        .status()
+        .await
+        .expect("run the scenario in a child test process");
+    assert!(
+        status.success(),
+        "{test}, run by a requester that holds no CPU pool: {status}"
+    );
+    false
+}
+
 /// An exec on a loaded host answers at its admission, not at its CPU grant (05_gateway.md, "The
 /// task server owns the live grant and nice"; 11_shell.md, "Server-owned CPU admission and nice
 /// placement"). Measured before: `cowshed exec --background` returned at the grant, 25 s later on
@@ -6374,9 +6460,17 @@ async fn queued_request(socket: &Path) -> cowshed_gateway_types::CpuWaiter {
 /// held whole by another checkout: the CLI's `--background` exec prints its job `queued` while the
 /// gateway holds its request, and it runs once the load returns its tokens; a keyed API exec
 /// answers with its id while queued, reads queued, and its kill withdraws the request without a
-/// command.
+/// command. Both execs ask that ledger only because their requester holds no pool of its own
+/// ([`holds_no_cpu_pool`]).
 #[tokio::test]
 async fn directory_an_exec_on_a_loaded_host_answers_at_admission_and_cancels_while_queued() {
+    if !holds_no_cpu_pool(
+        "macos::directory_an_exec_on_a_loaded_host_answers_at_admission_and_cancels_while_queued",
+    )
+    .await
+    {
+        return;
+    }
     let mut fixture = Fixture::directory();
     let mut service = serve_project(&mut fixture, &[]).await;
     let socket = fixture.storage.store().join("gateway.sock");

@@ -716,23 +716,28 @@ core count.
   this classification does not yet prove that its parent has released the upstream grant. Distinguishing those cases
   before any host fallback remains an admission follow-up; connected refusals and protocol errors already fail without a
   second take.
-- **Work a holder starts draws on its grant** (2026-10-19). The rule above, that no holder waits for another grant from
-  an ancestor or the host, covers every way work starts under a holder, not only a nested runner. Two places are named
-  here, since each sits where a reader would not look for it:
-  - **A `cowshed exec` from a process holding a live pool** is admitted from that pool. The controller runs in the
-    requester's process (in-process for the CLI and every embedder; `cowshed controller` inherits its embedder's
-    environment), so it reads the requester's descriptor by the rule above and hands it to the workspace supervisor,
-    whose jobserver request names it as `parentPool`. The gateway asks that pool for the job's `want`
-    (`{"op":"cpu-pool","want":<n>}`), and on its grant serves the job its fifo and its own lent pool in the job's scope,
-    exactly as for a host grant; the host ledger takes no place for it, since the tokens are the requester's. The order
-    is `bounded-exec`'s: a pool that cannot be reached is absent, and the job asks the host (said on the gateway's
-    stderr); a pool that answers and refuses, falls silent or breaks protocol refuses the job, never a second, host
-    grant, because a host fallback is what would hide the next deadlock. The pool's end ends the job's accounting, never
-    its work: its own pool lends nothing more and the job runs on to its own exit. A resident holds no token, so it is
-    admitted through its own relay pool as before.
-  - **A Cargo is no holder.** It reads its holder's fifo ("Cargo reads its holder's jobserver" below) and asks nobody,
-    so the jobs a `cargo test` starts draw on the pool its holder exported, and a `cargo` started from a bare shell,
-    under no holder, holds nothing its descendants could wait behind: they ask the host as any root request does.
+- **Work a holder starts draws on its grant** (2026-10-19; first grant wins, 2026-10-20). The rule above, that no holder
+  waits for another grant from an ancestor or the host, covers every way work starts under a holder, not only a nested
+  runner. A holder exports its grant through two doors, its fifo and its pool socket, and work its command starts takes
+  the holder's tokens through either, the holder's own token last ("Cargo reads its holder's jobserver" below): a Cargo
+  reads the fifo and asks nobody, and a nested runner or a `cowshed exec` asks the pool socket. The controller runs in
+  the requester's process (in-process for the CLI and every embedder; `cowshed controller` inherits its embedder's
+  environment), so an exec's supervisor names the requester's descriptor as the jobserver request's `parentPool`. An
+  exec from a holder then waits on the pool and on the host ledger at once: the gateway asks the pool for the job's
+  `want` (`{"op":"cpu-pool","want":<n>}`) and the host ledger for the request's checkout at its class's rank. The first
+  grant serves the job, its fifo and its own lent pool in the job's scope, as any grant is served. The other ask is
+  withdrawn: the pool connection closes, which leaves the pool's queue, or the host stake drops, which leaves the
+  ledger's. The gateway says so on stderr
+  (``cowshed: `<job>` was granted <n> token(s) by <ledger>; its ask of <ledger> was withdrawn after <ms> ms``) and as a
+  `COWSHED_TIMING` `jobserver` event naming the job, the ledger that granted and the wait. One ask is never granted
+  twice, and each grant is real and accounted by the ledger that made it: a host grant in the host ledger like any root
+  grant, a pool grant in the pool alone. Nothing hangs on a pool: a pool whose tokens its own work holds leaves the job
+  to the host, which grants it when it has room. A pool that cannot be reached is absent, and the job asks the host
+  alone (said on stderr); a pool that answers and refuses, falls silent or breaks protocol before the host grants
+  refuses the job. A pool grant's end ends the job's accounting, never its work: its own pool lends nothing more and the
+  job runs on to its own exit. A resident holds no token, so it is admitted through its own relay pool as before. A
+  `cargo` started from a bare shell, under no holder, holds nothing its descendants could wait behind: they ask the host
+  as any root request does.
 
   Measured 2026-10-19, the case it closes: a test case's own scratch job — a cowshed job of the scratch project's
   supervisor, which the gateway starts and so is no descendant of the test — asked the host as background for its own
@@ -986,10 +991,10 @@ core count.
   the grant: a wait for the host is not the command's time.
 - **A queued descendant is not idle** (2026-10-18, Danny: a job waiting for a CPU token is queued, not idle; "idle"
   means nothing is happening while nothing is expected to happen). Work a command starts draws on the command's pool
-  ("Work a holder starts draws on its grant"): a cowshed exec whose requester holds a live `BOUNDED_EXEC_CPU_POOL` is
-  admitted from that pool, never queued at the host while its requester holds a grant. A descendant can still wait — for
-  its requester's own pool, or at the host when its requester holds no pool. A descendant that knows its work waits
-  tells the run on the pool it inherited: it writes `{"op":"host-wait"}` on `BOUNDED_EXEC_CPU_POOL`, is answered
+  ("Work a holder starts draws on its grant"): a cowshed exec whose requester holds a live `BOUNDED_EXEC_CPU_POOL` waits
+  on that pool and on the host at once, and the first grant serves it. A descendant can still wait — for its requester's
+  pool and the host together, or at the host alone when its requester holds no pool. A descendant that knows its work
+  waits tells the run on the pool it inherited: it writes `{"op":"host-wait"}` on `BOUNDED_EXEC_CPU_POOL`, is answered
   `{"ok":true,"wait":"held"}` at once, and holds the connection for as long as the work waits. Every pool of the run,
   its sub-pools included, counts to the run. While at least one is held the run's idle clock is stopped: the time left
   of its no-progress interval is kept, nothing is spent, and stderr says `bounded-exec: idle clock stopped`. When the
@@ -1082,10 +1087,12 @@ core count.
     and runs over budget until it ends, as a runner does across a gateway restart; a Cargo started after it finds no
     fifo and runs unconfigured.
 
-  Measured with real Cargo (`cowshed-gateway`'s `tests/jobserver_cargo.rs`): a `cargo test` of four independent crates
-  under a job's one-token grant compiled one crate at a time, its test's nested `cargo build` one at a time from the
-  same fifo, and its test's nested job asking the pool for every core was lent the holder's token while the host ledger
-  held that one grant and nobody waited; with nothing exported, the same build compiled them side by side.
+  Held over the gateway's real socket with no Cargo (`cowshed-gateway`'s `tests/jobserver_fifo.rs`): a job grant of `g`
+  names a fifo beside its pool socket holding `g − 1` bytes; its socket lends the fifo's bytes first and the holder's
+  token last, a child waits while a reader standing in for Cargo holds the bytes and is granted when they are written
+  back, a closed child's tokens reach the next, and the host ledger holds `g` alone throughout. What a job's command
+  receives is `CpuPlacement::environment`'s unit test. How Cargo reads a jobserver is Cargo's own to test; an end-to-end
+  proof with real Cargo belongs in a nightly, not the gate.
 
 - **A runner no jobserver sizes.** A grant bounds what reads its fifo and its test variables, nothing else.
   `cargo mutants` hands every cargo it starts a jobserver of its own, `--jobserver-tasks` tokens, one per core by
@@ -1110,15 +1117,18 @@ growing before a younger land's task starts, a short build growing to and never 
 starting before a running one of the same land grows) and `tests/cpu_budget.rs` over a real socket (`SIGKILL` of a
 holding client returns its tokens to the waiter at once; checkouts share background's half; a gate job and its task
 granted the free half while a lone background grant still holds its own; refusals; a holder at background's whole room
-whose child, queued at the saturated host, is granted at once when asked with the holder's pool, the host ledger
-unchanged, while a pool that answers and refuses refuses its child and an unreachable one leaves it to the host); the
-plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
-`executor.test.ts` (a granted run sized and released, a refused one run as asked, a target's jobserver variables ignored
-for the run's own fifo); `cpu-pool.test.ts` and the gateway's lent-pool test (a pool's fifo holds `g − 1` bytes, a child
-is lent the implicit token while a reader holds the bytes, the next child waits until the reader writes them back, a
-child's close puts them back); `tests/jobserver_cargo.rs` (above); and the band tests: each class runs in its own band
-at its own nice whatever the host's state — interactive above gate above background — and gate work is served returned
-tokens ahead of interactive and background work.
+whose child, queued at the saturated host, is granted at once when asked with the holder's pool, its host ask withdrawn
+and the host ledger unchanged, while a pool that answers and refuses refuses its child and an unreachable one leaves it
+to the host; a one-token holder whose token a sibling holds has its exec granted by the host when the host has room, and
+the pool's next child is lent the token at once; with the host full and the pool busy, the exec waits in the ledger and
+is granted by whichever frees first, a pool grant leaving the ledger's queue); the plugin's `cpu-tokens.test.ts` (each
+runner's `want` and sizing, a killed holder closing its grant) and `executor.test.ts` (a granted run sized and released,
+a refused one run as asked, a target's jobserver variables ignored for the run's own fifo); `cpu-pool.test.ts` and the
+gateway's lent-pool test (a pool's fifo holds `g − 1` bytes, a child is lent the implicit token while a reader holds the
+bytes, the next child waits until the reader writes them back, a child's close puts them back);
+`tests/jobserver_fifo.rs` (above); and the band tests: each class runs in its own band at its own nice whatever the
+host's state — interactive above gate above background — and gate work is served returned tokens ahead of interactive
+and background work.
 
 ## The task server schedules work units
 

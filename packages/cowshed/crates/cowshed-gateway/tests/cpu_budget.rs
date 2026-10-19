@@ -956,22 +956,16 @@ async fn each_exec_class_takes_its_own_ledger_place_through_the_supervisors_admi
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Work a holder starts draws on its grant (05_gateway.md "Work a holder starts draws on its
-/// grant"). A holder at background's whole room waits on a child job it asked for; asked of the
-/// host, that child could never be granted, since background holds all of its room and the floor
-/// grants only below it. Asked with the holder's live pool, the child is granted at once from the
-/// holder's tokens while the host stays saturated, and the host ledger takes no place for it. A
-/// pool that answers and refuses refuses the child, never a second, host grant; only a pool that
-/// cannot be reached leaves the child to the host.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_pool() {
-    use cowshed_core::api::{ExecClass, JobId};
-    use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _, JobCpuAsk};
-
-    let (gateway, root, socket) = gateway(4).await;
-    let admission = GatewayJobCpu::new(socket.clone());
-    let ask = |want: usize, checkout: &str, job: u64, parent: Option<&Path>| JobCpuAsk {
-        class: ExecClass::Background,
+/// A background exec of `checkout`'s job `job`, as a supervisor asks it, from a requester that
+/// holds the live pool `parent` or none.
+fn exec_ask(
+    want: usize,
+    checkout: &str,
+    job: u64,
+    parent: Option<&Path>,
+) -> cowshed_core::runtime::job_cpu::JobCpuAsk {
+    cowshed_core::runtime::job_cpu::JobCpuAsk {
+        class: cowshed_core::api::ExecClass::Background,
         want: NonZeroUsize::new(want).unwrap(),
         checkout: PathBuf::from(checkout),
         command: format!("{checkout} job {job}"),
@@ -979,19 +973,33 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
             cowshed_core::repository::RepoId::parse("owner/repo").unwrap(),
             cowshed_core::metadata::WorkspaceIncarnation::new("0123456789abcdef0123456789abcdef")
                 .unwrap(),
-            JobId::new(job).unwrap(),
+            cowshed_core::api::JobId::new(job).unwrap(),
         ),
         parent: parent.map(|pool| pool.to_string_lossy().into_owned()),
-    };
+    }
+}
 
+/// Work a holder starts draws on its grant (05_gateway.md "Work a holder starts draws on its
+/// grant"). A holder at background's whole room waits on a child job it asked for; asked of the
+/// host alone, that child could never be granted, since background holds all of its room and the
+/// floor grants only below it. Asked with the holder's live pool, the child is granted at once
+/// from the holder's tokens while the host stays saturated, and its host ask is withdrawn, so the
+/// host ledger takes no place for it. A pool that answers and refuses before the host grants
+/// refuses the child; only a pool that cannot be reached leaves the child to the host alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_pool() {
+    use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
+
+    let (gateway, root, socket) = gateway(4).await;
+    let admission = GatewayJobCpu::new(socket.clone());
     // The holder takes background's whole room: 2 of 4 tokens.
     let holder = admission
-        .admit(ask(4, "/w/holder", 1, None))
+        .admit(exec_ask(4, "/w/holder", 1, None))
         .await
         .expect("the holder is granted");
     assert_eq!(holder.tokens(), NonZeroUsize::new(2));
     // Asked of the host, the holder's child waits behind it: the host is saturated.
-    let mut host_child = Box::pin(admission.admit(ask(1, "/w/scratch", 2, None)));
+    let mut host_child = Box::pin(admission.admit(exec_ask(1, "/w/scratch", 2, None)));
     loop {
         tokio::select! {
             granted = &mut host_child => panic!("background had no room left: {granted:?}"),
@@ -1010,7 +1018,7 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
     // Asked with the holder's pool, it is granted from the holder's tokens while the host stays
     // saturated, and its own pool is served in its scope like any job's.
     let child = admission
-        .admit(ask(1, "/w/scratch", 3, Some(holder.pool())))
+        .admit(exec_ask(1, "/w/scratch", 3, Some(holder.pool())))
         .await
         .expect("the holder's pool grants its child");
     assert_eq!(child.tokens(), NonZeroUsize::new(1));
@@ -1023,15 +1031,17 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
 
     // The pool lends what it holds: a second child takes the holder's other token.
     let second = admission
-        .admit(ask(1, "/w/scratch", 4, Some(holder.pool())))
+        .admit(exec_ask(1, "/w/scratch", 4, Some(holder.pool())))
         .await
         .expect("the holder's second token");
     assert_eq!(second.tokens(), NonZeroUsize::new(1));
+    // Both children's host asks were withdrawn when the pool won: only the host child waits.
+    waiters_reach(&socket, "/w/scratch", 1).await;
 
-    // A pool that answers and refuses refuses the child, and it takes no host grant in its place:
-    // the gateway's own control socket answers a pool request as the unknown operation it is.
+    // A pool that answers and refuses before the host grants refuses the child: the gateway's own
+    // control socket answers a pool request as the unknown operation it is, and the host is full.
     let refused = admission
-        .admit(ask(1, "/w/scratch", 5, Some(&socket)))
+        .admit(exec_ask(1, "/w/scratch", 5, Some(&socket)))
         .await
         .expect_err("a pool that answers and refuses refuses the child");
     assert!(
@@ -1051,13 +1061,163 @@ async fn a_holder_at_backgrounds_room_has_its_childs_exec_granted_from_its_own_p
         .await
         .expect("the host child is granted once room returns");
     let absent = admission
-        .admit(ask(1, "/w/scratch", 6, Some(&holder_pool)))
+        .admit(exec_ask(1, "/w/scratch", 6, Some(&holder_pool)))
         .await
         .expect("an unreachable pool leaves the child to the host");
     assert_eq!(absent.tokens(), NonZeroUsize::new(1));
     assert_eq!(ledger(&socket).await.held, 2);
 
     drop((host, absent));
+    while ledger(&socket).await.held != 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Wait until `checkout`'s background stake has exactly `count` waiters in the ledger; a count
+/// that never settles fails within five seconds rather than at the leg's backstop.
+async fn waiters_reach(socket: &Path, checkout: &str, count: usize) {
+    let waiters = |status: &CpuBudgetStatus| {
+        status
+            .background
+            .iter()
+            .filter(|stake| stake.checkout == checkout)
+            .map(|stake| stake.waiters.len())
+            .sum::<usize>()
+    };
+    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        while waiters(&ledger(socket).await) != count {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let status = ledger(socket).await;
+    assert!(
+        settled.is_ok(),
+        "{checkout} has {} waiters, not {count}: {status:?}",
+        waiters(&status)
+    );
+}
+
+/// A child of the pool at `pool` asking for `want`, held once granted: what a sibling of an exec
+/// holds of its holder's pool. Answers the connection and its granted count.
+async fn pool_child(pool: &Path, want: usize) -> (UnixStream, u64) {
+    let mut stream = UnixStream::connect(pool).await.expect("connect the pool");
+    stream
+        .write_all(format!("{{\"op\":\"cpu-pool\",\"want\":{want}}}\n").as_bytes())
+        .await
+        .expect("ask the pool");
+    loop {
+        let answer = answer_line(&mut stream).await;
+        assert_eq!(answer["ok"], true, "{answer}");
+        if answer["lease"] == "granted" {
+            let tokens = answer["tokens"].as_u64().expect("a grant names its count");
+            return (stream, tokens);
+        }
+    }
+}
+
+/// An exec from a holder whose pool is busy waits on the host too, and the host grants it when
+/// it has room (05_gateway.md "Work a holder starts draws on its grant"). The holder's one token
+/// is lent to a sibling; the exec is granted by the host, which accounts for it, and its ask of
+/// the pool is withdrawn: once the sibling closes, the next child of the pool is lent that token
+/// at once, never held up behind a waiter that left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holders_exec_whose_pool_is_busy_is_granted_by_the_host_when_it_has_room() {
+    use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
+
+    let (gateway, root, socket) = gateway(4).await;
+    let admission = GatewayJobCpu::new(socket.clone());
+    let holder = admission
+        .admit(exec_ask(1, "/w/holder", 1, None))
+        .await
+        .expect("the holder is granted");
+    assert_eq!(holder.tokens(), NonZeroUsize::new(1));
+    let (sibling, lent) = pool_child(holder.pool(), 1).await;
+    assert_eq!(lent, 1, "the sibling is lent the holder's one token");
+
+    let exec = admission
+        .admit(exec_ask(1, "/w/scratch", 2, Some(holder.pool())))
+        .await
+        .expect("the host grants the exec while the pool is busy");
+    assert_eq!(exec.tokens(), NonZeroUsize::new(1));
+    let status = ledger(&socket).await;
+    assert_eq!(
+        status.held, 2,
+        "the host accounts for the exec beside the holder: {status:?}"
+    );
+
+    drop(sibling);
+    let (next, lent) = tokio::time::timeout(Duration::from_secs(5), pool_child(holder.pool(), 1))
+        .await
+        .expect("the withdrawn ask holds up no child of the pool");
+    assert_eq!(lent, 1);
+
+    drop((next, exec, holder));
+    while ledger(&socket).await.held != 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// With the host full and its holder's pool busy, an exec from the holder waits at the host,
+/// where the ledger shows it, and at the pool at once; whichever frees a token first grants it
+/// (05_gateway.md "Work a holder starts draws on its grant"). Freed at the host, the host grants
+/// it and accounts for it; freed at the pool, the pool grants it and its host ask leaves the
+/// ledger's queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holders_exec_on_a_full_host_with_a_busy_pool_is_granted_by_whichever_frees_first() {
+    use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
+
+    let (gateway, root, socket) = gateway(4).await;
+    let admission = GatewayJobCpu::new(socket.clone());
+    let holder = admission
+        .admit(exec_ask(1, "/w/holder", 1, None))
+        .await
+        .expect("the holder is granted");
+    // Background's room is 2 of 4: the holder and another checkout's job fill it.
+    let filler = admission
+        .admit(exec_ask(1, "/w/filler", 2, None))
+        .await
+        .expect("the filler is granted");
+
+    // The host frees first.
+    let (sibling, _) = pool_child(holder.pool(), 1).await;
+    let mut exec = Box::pin(admission.admit(exec_ask(1, "/w/scratch", 3, Some(holder.pool()))));
+    tokio::select! {
+        granted = &mut exec => panic!("neither the host nor the pool had a token: {granted:?}"),
+        () = waiters_reach(&socket, "/w/scratch", 1) => {}
+    }
+    drop(filler);
+    let by_host = exec.await.expect("the host's freed token grants the exec");
+    assert_eq!(by_host.tokens(), NonZeroUsize::new(1));
+    let status = ledger(&socket).await;
+    assert_eq!(
+        status.held, 2,
+        "the host accounts for its grant: {status:?}"
+    );
+    drop(sibling);
+
+    // The pool frees first: its sibling holds the pool's token, the host is full again.
+    let (sibling, _) = pool_child(holder.pool(), 1).await;
+    let mut exec = Box::pin(admission.admit(exec_ask(1, "/w/scratch", 4, Some(holder.pool()))));
+    tokio::select! {
+        granted = &mut exec => panic!("neither the host nor the pool had a token: {granted:?}"),
+        () = waiters_reach(&socket, "/w/scratch", 1) => {}
+    }
+    drop(sibling);
+    let by_pool = exec.await.expect("the pool's freed token grants the exec");
+    assert_eq!(by_pool.tokens(), NonZeroUsize::new(1));
+    waiters_reach(&socket, "/w/scratch", 0).await;
+    let status = ledger(&socket).await;
+    assert_eq!(
+        status.held, 2,
+        "the pool's grant takes no host place: {status:?}"
+    );
+
+    drop((by_pool, by_host, holder));
     while ledger(&socket).await.held != 0 {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

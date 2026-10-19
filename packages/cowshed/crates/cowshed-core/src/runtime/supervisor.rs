@@ -630,6 +630,99 @@ impl CpuPlacement {
     }
 }
 
+#[cfg(test)]
+mod cpu_placement_tests {
+    use super::*;
+
+    fn placement(held: Option<usize>) -> CpuPlacement {
+        CpuPlacement {
+            held: held.map(|tokens| super::super::job_cpu::HeldTokens {
+                tokens: std::num::NonZeroUsize::new(tokens).expect("a grant holds a token"),
+                fifo: PathBuf::from("/pool/j"),
+            }),
+            pool: PathBuf::from("/pool/p.sock"),
+            nice: 10,
+        }
+    }
+
+    /// The environment `placement` exports over `caller`, as names and values.
+    fn exported(placement: &CpuPlacement, caller: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let caller = caller
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        placement
+            .environment(&caller)
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.into_string().expect("a UTF-8 name"),
+                    value.into_string().expect("a UTF-8 value"),
+                )
+            })
+            .collect()
+    }
+
+    fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    /// A held grant exports its fifo to Cargo and make, and sizes test threads to the grant
+    /// (05_gateway.md "Cargo reads its holder's jobserver").
+    #[test]
+    fn a_held_grant_exports_its_jobserver_and_test_threads_to_the_command() {
+        assert_eq!(
+            exported(&placement(Some(3)), &[]),
+            expected(&[
+                ("BOUNDED_EXEC_CPU_POOL", "/pool/p.sock"),
+                ("BOUNDED_EXEC_CPU_TOKENS", "3"),
+                ("CARGO_MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
+                ("MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
+                ("RUST_TEST_THREADS", "3"),
+                ("NEXTEST_TEST_THREADS", "3"),
+            ])
+        );
+    }
+
+    /// A test-thread count the caller named is the caller's: the grant sets only the other one.
+    /// The jobserver is the grant's whatever the caller sent.
+    #[test]
+    fn a_caller_named_test_thread_count_is_kept_and_its_jobserver_is_not() {
+        assert_eq!(
+            exported(
+                &placement(Some(2)),
+                &[
+                    ("RUST_TEST_THREADS", "8"),
+                    ("CARGO_MAKEFLAGS", "-j --jobserver-auth=fifo:/caller"),
+                ],
+            ),
+            expected(&[
+                ("BOUNDED_EXEC_CPU_POOL", "/pool/p.sock"),
+                ("BOUNDED_EXEC_CPU_TOKENS", "2"),
+                ("CARGO_MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
+                ("MAKEFLAGS", "-j --jobserver-auth=fifo:/pool/j"),
+                ("NEXTEST_TEST_THREADS", "2"),
+            ])
+        );
+    }
+
+    /// A resident holds no token: its pool and a zero count, no jobserver, no test-thread sizing
+    /// (05_gateway.md "A resident holds no token").
+    #[test]
+    fn a_resident_exports_its_pool_and_no_jobserver() {
+        assert_eq!(
+            exported(&placement(None), &[]),
+            expected(&[
+                ("BOUNDED_EXEC_CPU_POOL", "/pool/p.sock"),
+                ("BOUNDED_EXEC_CPU_TOKENS", "0"),
+            ])
+        );
+    }
+}
+
 /// The nice a class's command runs at, its row of 05_gateway.md "Bands": interactive and an
 /// interactive resident at the supervisor's own, a gate five below it, background and a resident
 /// ten below it. Never negative: raising a priority takes a privilege no supervisor holds, so the
@@ -2828,9 +2921,9 @@ impl WorkspaceSupervisorHandle {
             .await
     }
 
-    /// [`Self::exec`] for a requester that holds a live CPU pool: the job's tokens come from
-    /// `cpu_parent` rather than the host ledger (05_gateway.md "Work a holder starts draws on its
-    /// grant"). `None` asks the host as `exec` does.
+    /// [`Self::exec`] for a requester that holds a live CPU pool: the job waits on `cpu_parent`
+    /// and on the host ledger at once, and the first grant serves it (05_gateway.md "Work a holder
+    /// starts draws on its grant"). `None` asks the host alone, as `exec` does.
     pub async fn exec_from(
         &self,
         session: Option<&SessionToken>,

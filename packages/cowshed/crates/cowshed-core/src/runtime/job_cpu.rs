@@ -30,9 +30,9 @@ pub struct JobCpuAsk {
     pub command: String,
     pub job: (RepoId, WorkspaceIncarnation, JobId),
     /// The live CPU pool of the process that asked for the job, when it holds one: a
-    /// token-holding job takes its tokens there, never from the host ledger while its requester
-    /// holds a grant (05_gateway.md "Work a holder starts draws on its grant"). A resident holds
-    /// no token, so it asks the host through its own relay pool as before.
+    /// token-holding job waits on it and on the host ledger at once, and the first grant serves
+    /// it (05_gateway.md "Work a holder starts draws on its grant"). A resident holds no token,
+    /// so it asks the host through its own relay pool as before.
     pub parent: Option<String>,
 }
 

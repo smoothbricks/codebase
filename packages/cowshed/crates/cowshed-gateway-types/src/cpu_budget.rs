@@ -73,9 +73,9 @@ pub struct JobserverRequest<'a> {
     class: JobserverClass,
     pool: bool,
     job: JobserverJob<'a>,
-    /// The live CPU pool of the process that asked for the job, when it holds one: the job's
-    /// tokens come from that pool, never from the host ledger while its requester holds a grant
-    /// (05_gateway.md "Host CPU budget", "Work a holder starts draws on its grant").
+    /// The live CPU pool of the process that asked for the job, when it holds one: the job waits
+    /// on that pool and on the host ledger at once, and the first grant serves it (05_gateway.md
+    /// "Host CPU budget", "Work a holder starts draws on its grant").
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_pool: Option<&'a str>,
 }
