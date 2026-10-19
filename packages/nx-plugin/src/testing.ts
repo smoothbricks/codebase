@@ -35,10 +35,17 @@ import { tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join, sep } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from './bounded-test-policy.js';
 import { findNxWorkspaceRoot } from './ensure-built.js';
 
 const run = promisify(execFile);
-const EXIT_TIMEOUT_MS = 10_000;
+/**
+ * How long a stopped process may take to exit when no caller names a grace: the leg's no-progress backstop
+ * (specs/cowshed/08_testing.md), so the exit itself decides and a hung one is the leg's to report. A smaller literal
+ * here was a per-test deadline on the host's load: a fixture Nx daemon and its plugin worker, SIGTERMed, outlived
+ * 10 s on a loaded gate host and failed teardown of a test that had passed.
+ */
+const EXIT_TIMEOUT_MS = BOUNDED_TEST_IDLE_TIMEOUT_MS;
 /** Under half of the SIGTERM-to-SIGKILL grace a bounded test leg gives, per round of signals. */
 const SIGNALLED_GRACE_MS = 3_000;
 const FIXTURE_HOME = 'smoothbricks-fixtures';
