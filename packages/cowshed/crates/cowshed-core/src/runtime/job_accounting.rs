@@ -334,6 +334,7 @@ impl Charged {
 mod tests {
     use super::*;
     use crate::api::resources::CpuMicros;
+    use proptest::prelude::*;
 
     fn leader(pid: u32) -> Birth {
         Birth::Observed(
@@ -572,5 +573,85 @@ mod tests {
                 read: mine.started,
             })
         );
+    }
+
+    proptest! {
+        /// However long a loaded host made each leader and its reaped children run, the job's CPU
+        /// is each leader's interval counted once, at its last reading, and never more than the
+        /// kernel's own total of that tree: per interval, the leader's and its children's user
+        /// ticks summed and converted once, and likewise their system ticks, as `wait4` reports on
+        /// reaping it. The job converts the four counters one by one, so it may fall short of that
+        /// by under a microsecond per sum, never exceed it. Timebase and counters are generated:
+        /// no host, clock or load decides the verdict.
+        #[test]
+        fn the_job_s_cpu_is_each_interval_once_and_never_above_the_kernel_s_reaped_total(
+            numerator in 1_u32..=1_000,
+            denominator in 1_u32..=1_000,
+            intervals in prop::collection::vec(
+                prop::collection::vec(
+                    (0..1_u64 << 36, 0..1_u64 << 36, 0..1_u64 << 36, 0..1_u64 << 36),
+                    1..6,
+                ),
+                1..4,
+            ),
+        ) {
+            let tick = MachTick {
+                numerator,
+                denominator: std::num::NonZeroU32::new(denominator).expect("a denominator"),
+            };
+            // The kernel's figure, from the ticks themselves, not through the conversion under test.
+            let kernel_us = |ticks: u64| {
+                u128::from(ticks) * u128::from(numerator) / (u128::from(denominator) * 1_000)
+            };
+            let mut fold = RusageChildren::charging(leader(100));
+            let (mut counted, mut kernel) = (0_u128, 0_u128);
+            for (index, increments) in intervals.iter().enumerate() {
+                let pid = 100 + u32::try_from(index).expect("a pid");
+                if index > 0 {
+                    fold.lead(leader(pid));
+                }
+                let mut ticks = RusageTicks {
+                    started: u64::from(pid) * 10,
+                    user: 0,
+                    system: 0,
+                    child_user: 0,
+                    child_system: 0,
+                };
+                for (step, &(user, system, child_user, child_system)) in increments.iter().enumerate() {
+                    ticks.user += user;
+                    ticks.system += system;
+                    ticks.child_user += child_user;
+                    ticks.child_system += child_system;
+                    let reading = ticks.convert(pid, tick).expect("exact");
+                    if step + 1 == increments.len() {
+                        fold.end(Ok(reading));
+                    } else {
+                        totals(fold.account(|_| Ok(reading)));
+                    }
+                }
+                let last = ticks.convert(pid, tick).expect("exact").total().expect("exact");
+                counted += u128::from(last.user_us.get() + last.sys_us.get());
+                kernel += kernel_us(ticks.user + ticks.child_user)
+                    + kernel_us(ticks.system + ticks.child_system);
+            }
+            let job = totals(fold.account(|_| panic!("every interval closed")));
+            let job = u128::from(job.user_us.get() + job.sys_us.get());
+            prop_assert_eq!(job, counted, "each interval counts once, at its last reading");
+            prop_assert!(
+                job <= kernel,
+                "the job's {} us exceed the kernel's reaped {} us",
+                job,
+                kernel
+            );
+            let sums = 2 * u128::try_from(intervals.len()).expect("a count");
+            prop_assert!(
+                kernel - job <= sums,
+                "the job's {} us fall {} us short of the kernel's {} us, more than its {} sums truncate",
+                job,
+                kernel - job,
+                kernel,
+                sums
+            );
+        }
     }
 }
