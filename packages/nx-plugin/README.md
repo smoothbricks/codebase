@@ -1589,6 +1589,16 @@ tests) owns those roots:
 A fixture retires on every exit path, a throwing body included: stop its daemon, unlink its socket alias, then delete
 its root. A daemon that outlives the stop keeps the alias and the root, so the next run's sweep still finds both.
 
+A fixture workspace that runs real Nx with this plugin links an installation it owns, never the host's.
+`@smoothbricks/nx-plugin/owned-installation`'s `ownedInstallation(censusRoot, makeRoot)` copies the closure the graph
+witness's installation census resolves from `censusRoot` (Nx, this plugin and TypeScript, each package with its
+dependency edges relinked beside it and the top-level bins in `.bin`) into the empty directory `makeRoot` creates, on
+the first `nodeModules()`, and proves the copy. `retire()` fails, naming the changed nodes, if a fixture wrote into it,
+then deletes it. The host's closure moves under a fixture that reads it: a shared Bun store relinked by another install,
+or, in a workspace that developer-links this plugin, the checkout its author is editing and rebuilding. Either fails the
+producer receipt's installation proof for work that is not the test's. This package's tests bind `censusRoot` to this
+repository; a consumer binds it to its own workspace root.
+
 ## Managed workspace files
 
 `nx generate @smoothbricks/nx-plugin:managed-files` stages the same managed files as `smoo monorepo update`, without

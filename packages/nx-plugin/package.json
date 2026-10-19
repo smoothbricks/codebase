@@ -99,6 +99,12 @@
       "import": "./dist/testing.js",
       "default": "./dist/testing.js"
     },
+    "./owned-installation": {
+      "types": "./dist/owned-installation.d.ts",
+      "development": "./src/owned-installation.ts",
+      "import": "./dist/owned-installation.js",
+      "default": "./dist/owned-installation.js"
+    },
     "./cross-check-policy": {
       "types": "./dist/cross-check-policy.d.ts",
       "development": "./src/cross-check-policy.ts",
