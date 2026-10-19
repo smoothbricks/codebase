@@ -257,7 +257,6 @@ enum Call {
         session: Option<SessionWire>,
         /// The build volume the caller resolved for this job (`WorkspaceSupervisorHandle::exec`).
         build_volume: Option<PathBuf>,
-        background: bool,
         /// The controller route that admitted the exec. It is chosen by the route that decoded the
         /// call, never by a request field or an environment value.
         source: AdmissionSource,
@@ -322,6 +321,11 @@ enum Call {
     List,
     #[serde(rename_all = "camelCase")]
     Kill {
+        job_id: JobId,
+    },
+    /// Leave the job running with nobody attached (`WorkspaceSupervisorHandle::detach`).
+    #[serde(rename_all = "camelCase")]
+    Detach {
         job_id: JobId,
     },
     #[serde(rename_all = "camelCase")]
@@ -1282,7 +1286,6 @@ async fn answer(
         Call::Exec {
             session: wire,
             build_volume,
-            background,
             source,
             request,
         } => {
@@ -1320,15 +1323,9 @@ async fn answer(
                 scope: request.scope,
             };
             let session = wire.map(session);
-            let job_id = if background {
-                supervisor
-                    .exec_background(session.as_ref(), build_volume, exec, source)
-                    .await?
-            } else {
-                supervisor
-                    .exec(session.as_ref(), build_volume, exec, source)
-                    .await?
-            };
+            let job_id = supervisor
+                .exec(session.as_ref(), build_volume, exec, source)
+                .await?;
             if let Some(writer) = writer {
                 lock(streams).insert(job_id, writer);
             }
@@ -1396,6 +1393,10 @@ async fn answer(
         Call::List => (to_value(&supervisor.list().await?)?, Bytes::new()),
         Call::Kill { job_id } => {
             supervisor.kill(job_id).await?;
+            (unit()?, Bytes::new())
+        }
+        Call::Detach { job_id } => {
+            supervisor.detach(job_id).await?;
             (unit()?, Bytes::new())
         }
         Call::Wait { job_id } => (to_value(&supervisor.wait(job_id).await?)?, Bytes::new()),
@@ -1945,7 +1946,6 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             session,
             build_volume,
             request,
-            background,
             source,
             reply,
         } => {
@@ -1955,11 +1955,17 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 session,
                 build_volume,
                 *request,
-                background,
                 source,
                 reply,
             )
             .await;
+        }
+        Command::Detach {
+            authority,
+            job_id,
+            reply,
+        } => {
+            let _ = reply.send(call(path, &authority, Call::Detach { job_id }, Bytes::new()).await);
         }
         Command::StdinWrite {
             authority,
@@ -2188,17 +2194,12 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one forwarded exec: the supervisor's socket, its authority, session and build volume, the request, how it runs and the route that admitted it, and where the answer goes"
-)]
 async fn forward_exec(
     path: &Path,
     authority: WorkspaceAuthoritySnapshot,
     session: Option<SessionToken>,
     build_volume: Option<PathBuf>,
     request: ExecRequest,
-    background: bool,
     source: AdmissionSource,
     reply: oneshot::Sender<Result<JobId>>,
 ) {
@@ -2220,7 +2221,6 @@ async fn forward_exec(
     let call_request = Call::Exec {
         session: session.as_ref().map(SessionWire::from),
         build_volume,
-        background,
         source,
         request: Box::new(ExecWire {
             argv,
@@ -2750,7 +2750,6 @@ mod admission_source_tests {
             "call": "exec",
             "session": null,
             "buildVolume": null,
-            "background": false,
             "source": "coordinator",
             "request": {
                 "argv": [{ "encoding": "utf8", "data": "true" }],

@@ -803,10 +803,11 @@ exits with the command's status. `--timeout <dur>` stops waiting after that long
 under the workspace supervisor, and `cowshed exec` exits 103 with an error naming its job, because it has no output or
 status of the command's to give. A command that finishes just as the timeout fires is waited for; `cowshed exec` prints
 the rest of its output and exits with its code. `--background` prints the numeric job id and returns at once, exit 0,
-naming on stderr how to reach the job. No CLI verb reattaches to a job; the cowshed API does (`worker("<ws>").job(<id>)`
-waits for it, reads its logs or kills it — see [integrations.md](integrations.md)). `cowshed exec` accepts
-`--session <name>` for a named session whose cwd and variables carry across calls; opening a name the workspace already
-holds rejoins that session and never closes it.
+naming on stderr how to reach the job; on a loaded host that is while the job still waits for its CPU grant, so its
+status reads `queued` until the grant arrives. No CLI verb reattaches to a job; the cowshed API does
+(`worker("<ws>").job(<id>)` waits for it, reads its logs or kills it — see [integrations.md](integrations.md)).
+`cowshed exec` accepts `--session <name>` for a named session whose cwd and variables carry across calls; opening a name
+the workspace already holds rejoins that session and never closes it.
 
 Commands under the workspace `.envrc` run in a warm shell: the supervisor activates the `.envrc` once and starts each
 command from that activated environment, so only the first command after the workspace shell's inputs change pays for

@@ -848,14 +848,19 @@ core count.
   job or spawn effects. Ordinary commands default Background, want1 and Workspace scope; producers that need parallel
   work supply their actual demand; a requester that awaits the result asks Interactive ("Bands"), which a worker may ask
   for, since it buys a band and no token; a resident (below) is Resident, which a worker may ask for, and names no want.
-  The supervisor records Queued, asks the gateway off its actor path and spawns only after a real grant. CPU admission
-  uses the control socket of the controller's validated host storage, the same store/gateway.sock authority its gateway
-  reconciliation uses, never an unrelated ambient store. A queued kill withdraws the request without spawning.
-  Missing/refused admission never causes an unbudgeted server spawn. The supervisor retains the allocation until the
-  owned job concludes. The gateway's existing CpuBudget ledger serves that exact allocation on a private
-  workspace-scoped CPU-pool endpoint; Nx bounded-exec and Cargo descendants borrow only from it, with sibling sums
-  bounded by its actual count, or, for a gate job, through it as gate-class host requests. The root FIFO is not offered
-  alongside the pool: that would spend the same tokens twice. Its canonical endpoint is
+  The supervisor records Queued, asks the gateway off its actor path and spawns only after a real grant. **The exec
+  answers at that admission, never at the grant** (11_shell.md, "Server-owned CPU admission and nice placement"): a job
+  waiting in the queue has its id, reads `queued` with its class and no `cpuTokens`, and is cancellable, since a request
+  that waits for no deadline must stay reachable for as long as it waits. Measured 2026-10-19 with the answer at the
+  grant: a `cowshed exec --background` on a loaded host returned 25 s later, so the executor's sequential admission of
+  100 held jobs stopped at the first waiting one, which had no id to report or cancel. CPU admission uses the control
+  socket of the controller's validated host storage, the same store/gateway.sock authority its gateway reconciliation
+  uses, never an unrelated ambient store. A queued kill withdraws the request without spawning. Missing/refused
+  admission never causes an unbudgeted server spawn. The supervisor retains the allocation until the owned job
+  concludes. The gateway's existing CpuBudget ledger serves that exact allocation on a private workspace-scoped CPU-pool
+  endpoint; Nx bounded-exec and Cargo descendants borrow only from it, with sibling sums bounded by its actual count,
+  or, for a gate job, through it as gate-class host requests. The root FIFO is not offered alongside the pool: that
+  would spend the same tokens twice. Its canonical endpoint is
   `<store>/run/cpu/<base64url-incarnation>/<opaque-endpoint>`: the unpadded 22-byte incarnation component losslessly
   encodes all 128 bits of the validated 32-lowercase-hex workspace incarnation, never a digest or truncated prefix. The
   opaque endpoint is an independent 22-byte unpadded base64url UUID. The gateway, sandbox builder and grant validator

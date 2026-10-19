@@ -1331,7 +1331,7 @@ async fn disconnect_does_not_cancel_background_process() {
     let session = open_named(&h.handle, "daemon").await;
     let job = h
         .handle
-        .exec_background(
+        .exec(
             Some(&session),
             None,
             request(StdinSource::Empty),
@@ -1339,6 +1339,7 @@ async fn disconnect_does_not_cancel_background_process() {
         )
         .await
         .unwrap();
+    h.handle.detach(job).await.unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     let survivor = h.handle.clone();
     drop(h.handle);
@@ -1518,10 +1519,12 @@ async fn output_limit_terms_kills_and_drains_before_terminal_commitment() {
     assert_eq!(info.output_limit.unwrap().limit_bytes, 4);
 }
 
+/// A spawn that fails comes after the exec answered at admission: the job ends `failed` with the
+/// failure's wrapper exit code and one terminal commitment, and its stderr says why.
 #[tokio::test]
 async fn spawn_failure_is_typed_terminal_with_one_terminal_commitment() {
     let (mut h, _root) = harness(7, 1024, true, false);
-    let error = h
+    let job = h
         .handle
         .exec(
             None,
@@ -1530,8 +1533,29 @@ async fn spawn_failure_is_typed_terminal_with_one_terminal_commitment() {
             AdmissionSource::Worker,
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::EnvironmentMissing);
+        .expect("answered at admission, before the spawn");
+    assert_eq!(job.get(), 7);
+    let ended = h.handle.wait(job).await.unwrap();
+    assert_eq!(
+        (ended.state, ended.exit),
+        (
+            JobState::Failed,
+            Some(ExitStatus::Exited {
+                code: ErrorCode::EnvironmentMissing
+                    .exec_wrapper_exit_code()
+                    .into()
+            })
+        )
+    );
+    let stderr = h
+        .handle
+        .log_read(job, StreamKind::Stderr, 0, false)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&stderr.bytes).starts_with("cowshed: "),
+        "the spawn failure is said on the job's stderr"
+    );
     let listed = h.handle.list().await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].job_id.get(), 7);
@@ -1552,9 +1576,10 @@ async fn named_session_preserves_cwd_env_and_background_membership() {
     first.env.insert("MODE".into(), "watch".into());
     let job = h
         .handle
-        .exec_background(Some(&session), None, first, AdmissionSource::Worker)
+        .exec(Some(&session), None, first, AdmissionSource::Worker)
         .await
         .unwrap();
+    h.handle.detach(job).await.unwrap();
     let spawned = h.spawned.recv().await.unwrap();
     let snapshot = h.handle.session_snapshot(&session).await.unwrap();
     assert_eq!(
@@ -1604,7 +1629,7 @@ async fn a_registered_credential_env_name_never_reaches_a_child() {
     first.env.insert("MODE".into(), "watch".into());
     let job = h
         .handle
-        .exec_background(Some(&session), None, first, AdmissionSource::Worker)
+        .exec(Some(&session), None, first, AdmissionSource::Worker)
         .await
         .unwrap();
     let spawned = h.spawned.recv().await.unwrap();
@@ -2898,7 +2923,7 @@ fn a_dropped_supervisor_ends_the_jobs_it_still_runs() {
         let (mut h, root) = harness(1, 1024, false, false);
         let job = h
             .handle
-            .exec_background(
+            .exec(
                 None,
                 None,
                 request(StdinSource::Empty),
@@ -3520,7 +3545,6 @@ async fn a_keyed_exec_whose_reply_was_lost_answers_its_one_job_from_the_next_sup
                 "call": "exec",
                 "session": null,
                 "buildVolume": null,
-                "background": false,
                                 "source": AdmissionSource::Worker,
                 "request": {
                     "argv": argv,
@@ -6889,7 +6913,7 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
                 (handle.clone(), None)
             };
             let job = caller
-                .exec_background(
+                .exec(
                     None,
                     None,
                     ExecRequest {
@@ -7008,7 +7032,7 @@ async fn a_shed_stops_its_idle_nx_daemon_and_starts_another_only_for_a_job() {
 
     let job = h
         .handle
-        .exec_background(
+        .exec(
             None,
             None,
             request(StdinSource::Empty),
@@ -7042,7 +7066,7 @@ async fn a_shed_keeps_its_nx_daemon_while_a_job_runs() {
 
     let job = h
         .handle
-        .exec_background(
+        .exec(
             None,
             None,
             request(StdinSource::Empty),
@@ -7933,14 +7957,14 @@ async fn a_job_killed_while_queued_leaves_the_queue_without_a_command() {
     let (mut h, mut asked, _root) = scripted_harness("cpu-withdraw");
     let job = h
         .handle
-        .exec_background(
+        .exec(
             None,
             None,
             request(StdinSource::Empty),
             AdmissionSource::Worker,
         )
         .await
-        .expect("a background exec is answered at admission");
+        .expect("an exec is answered at admission");
     let cpu = asked.recv().await.unwrap();
     assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Queued);
     h.handle.kill(job).await.unwrap();
@@ -7965,14 +7989,14 @@ async fn a_job_killed_while_queued_is_reported_over_the_socket_and_its_workspace
     let (h, mut asked, _root) = scripted_harness("cpu-withdraw-served");
     let (remote, _path) = served(&h.handle).await;
     let job = remote
-        .exec_background(
+        .exec(
             None,
             None,
             request(StdinSource::Empty),
             AdmissionSource::Worker,
         )
         .await
-        .expect("a background exec is answered at admission");
+        .expect("an exec is answered at admission");
     let cpu = asked.recv().await.unwrap();
     remote.kill(job).await.unwrap();
     cpu.withdrawn
@@ -8004,62 +8028,50 @@ async fn a_job_killed_while_queued_is_reported_over_the_socket_and_its_workspace
 }
 
 /// A refused admission -- a gate whose bound elapsed, a gateway that is not there -- fails the
-/// job before any command: a foreground caller gets the refusal itself, a background caller reads
-/// it on the job's stderr, and the record types the failure.
+/// job before any command. Its caller was answered at admission, before the gateway said
+/// anything, so it reads the refusal on the job's stderr, the record types the failure, and the
+/// exit is the refusal's wrapper code.
 #[tokio::test]
 async fn a_refused_cpu_admission_fails_the_job_before_any_command() {
     let (mut h, mut asked, _root) = scripted_harness("cpu-refused");
-    let handle = h.handle.clone();
-    let exec = tokio::spawn(async move {
-        handle
-            .exec(
-                None,
-                None,
-                request(StdinSource::Empty),
-                AdmissionSource::Worker,
-            )
-            .await
-    });
     let refusal = || {
         CowshedError::conflict(
             "gateway refused the CPU grant: /w: 8 tokens in 1 running grant(s)",
             "retry once the holders finish",
         )
     };
-    asked
-        .recv()
-        .await
-        .unwrap()
-        .answer
-        .send(Err(refusal()))
-        .unwrap();
-    let refused = exec.await.unwrap().unwrap_err();
-    assert_eq!(refused.message, refusal().message);
-    let ended = h.handle.wait(JobId::new(1).unwrap()).await.unwrap();
-    assert_eq!(
-        (ended.state, ended.failure, ended.nice, ended.cpu_tokens),
-        (JobState::Failed, Some(JobFailure::CpuAdmission), None, None)
-    );
-
     let job = h
         .handle
-        .exec_background(
+        .exec(
             None,
             None,
             request(StdinSource::Empty),
             AdmissionSource::Worker,
         )
         .await
-        .unwrap();
-    asked
-        .recv()
-        .await
-        .unwrap()
-        .answer
-        .send(Err(refusal()))
-        .unwrap();
+        .expect("answered at admission, before the gateway answers");
+    let cpu = asked.recv().await.unwrap();
+    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Queued);
+    cpu.answer.send(Err(refusal())).unwrap();
     let ended = h.handle.wait(job).await.unwrap();
-    assert_eq!(ended.failure, Some(JobFailure::CpuAdmission));
+    assert_eq!(
+        (
+            ended.state,
+            ended.failure,
+            ended.nice,
+            ended.cpu_tokens,
+            ended.exit
+        ),
+        (
+            JobState::Failed,
+            Some(JobFailure::CpuAdmission),
+            None,
+            None,
+            Some(ExitStatus::Exited {
+                code: refusal().exec_wrapper_exit_code().into()
+            })
+        )
+    );
     let stderr = h
         .handle
         .log_read(job, StreamKind::Stderr, 0, false)

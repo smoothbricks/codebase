@@ -6300,5 +6300,237 @@ async fn real_apfs_killed_covered_install_restores_links_its_postinstall_removed
     fixture.stop_gateway().await;
 }
 
+/// The fixture gateway's ledger, read whole.
+async fn cpu_budget(socket: &Path) -> cowshed_gateway_types::CpuBudgetStatus {
+    cowshed_gateway::GatewayControlClient::new(socket.to_path_buf())
+        .expect("an absolute control socket")
+        .cpu_budget()
+        .await
+        .expect("the gateway answers its ledger")
+}
+
+/// The checkout [`LoadedHost`] holds the host for.
+const LOADING_CHECKOUT: &str = "/loaded-host/another-checkout";
+
+/// Another checkout's background work holding all of background's room in the fixture gateway's
+/// real ledger (05_gateway.md, "Room for a gate"): a background job of this project then waits
+/// for a returned token, as on a host other work has loaded. Its tokens return when it drops.
+struct LoadedHost {
+    _lease: tokio::io::BufReader<tokio::net::UnixStream>,
+}
+
+impl LoadedHost {
+    async fn hold(socket: &Path) -> Self {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let total = cpu_budget(socket).await.total;
+        let mut stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .expect("connect the gateway's control socket");
+        let mut request = serde_json::to_string(&cowshed_gateway_types::CpuTokensRequest::new(
+            std::num::NonZeroUsize::new(total).expect("a host has a token"),
+            LOADING_CHECKOUT,
+            "another checkout's background build",
+        ))
+        .expect("encode the request");
+        request.push('\n');
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("ask for the whole host");
+        let mut lease = tokio::io::BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            lease
+                .read_line(&mut line)
+                .await
+                .expect("the gateway answers");
+            let answer: serde_json::Value =
+                serde_json::from_str(&line).expect("a JSON answer line");
+            assert_eq!(answer["ok"], true, "{answer}");
+            if answer["lease"] == "granted" {
+                return Self { _lease: lease };
+            }
+        }
+    }
+}
+
+/// The one request the gateway holds waiting for a checkout other than the loading one, once the
+/// supervisor's ask for it reached the ledger. The ask leaves the supervisor off its actor path
+/// after the exec answered, so the ledger is read until it shows; a request that never arrives is
+/// a hang the leg's no-progress backstop decides.
+async fn queued_request(socket: &Path) -> cowshed_gateway_types::CpuWaiter {
+    loop {
+        let ledger = cpu_budget(socket).await;
+        let waiting: Vec<_> = ledger
+            .background
+            .into_iter()
+            .filter(|stake| stake.checkout != LOADING_CHECKOUT)
+            .flat_map(|stake| stake.waiters)
+            .collect();
+        if let Ok([waiter]) = <[_; 1]>::try_from(waiting) {
+            return waiter;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// An exec on a loaded host answers at its admission, not at its CPU grant (05_gateway.md, "The
+/// task server owns the live grant and nice"; 11_shell.md, "Server-owned CPU admission and nice
+/// placement"). Measured before: `cowshed exec --background` returned at the grant, 25 s later on
+/// a loaded host, so a waiting job had no id to read or cancel. Here the gateway's real ledger is
+/// held whole by another checkout: the CLI's `--background` exec prints its job `queued` while the
+/// gateway holds its request, and it runs once the load returns its tokens; a keyed API exec
+/// answers with its id while queued, reads queued, and its kill withdraws the request without a
+/// command.
+#[tokio::test]
+async fn directory_an_exec_on_a_loaded_host_answers_at_admission_and_cancels_while_queued() {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let socket = fixture.storage.store().join("gateway.sock");
+
+    let load = LoadedHost::hold(&socket).await;
+    let ran = fixture.checkout.join("ran");
+    let (stdout, stderr) = succeed(
+        &mut service,
+        [
+            "--json",
+            "exec",
+            "main",
+            "--background",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf ran > ran",
+        ],
+    )
+    .await;
+    let answer: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("one JSON envelope on stdout");
+    let info = &answer["result"];
+    assert_eq!(
+        (
+            info["state"].as_str(),
+            info["class"].as_str(),
+            &info["pid"],
+            &info["cpuTokens"]
+        ),
+        (
+            Some("queued"),
+            Some("background"),
+            &serde_json::Value::Null,
+            &serde_json::Value::Null
+        ),
+        "the backgrounded exec answered while its job waits for the host: {answer}\n{stderr}"
+    );
+    let waiting = queued_request(&socket).await;
+    assert_eq!(waiting.want, 1, "{waiting:?}");
+    assert!(!ran.exists(), "nothing ran while the host is loaded");
+    drop(load);
+    eventually(|| fs::read(&ran).is_ok_and(|bytes| bytes == b"ran")).await;
+    service
+        .shutdown()
+        .await
+        .expect("stop the CLI bridge so the API's runtime is the only controller");
+
+    let runtime = cowshed_core::runtime::ProjectRuntime::open_directory_existing_at(
+        &fixture.checkout,
+        RecoveryScope::Workspaces([WorkspaceName::main()].into()),
+        fixture.storage.clone(),
+        cowshed_cli::gateway_service::runtime_control,
+    )
+    .await
+    .expect("reopen the project runtime");
+    let (client, server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let connection = tokio::spawn(cowshed_core::api::server::serve_controller_connection(
+        server.into(),
+        cowshed_core::api::server::ConnectionAuthority::Coordinator {
+            repo_id: runtime.descriptor().repo_id.clone(),
+        },
+        runtime.router(),
+    ));
+    let (cowshed, token) = cowshed_core::Cowshed::connect(client.into())
+        .await
+        .expect("controller handshake");
+    let project = cowshed
+        .open(&fixture.checkout)
+        .await
+        .expect("open the project");
+    let coordinator = cowshed.coordinator(&project, token).expect("coordinator");
+    let worker = coordinator.worker("main").await.expect("main's worker");
+
+    let load = LoadedHost::hold(&socket).await;
+    let never = fixture.checkout.join("never");
+    let job = worker
+        .exec(cowshed_core::api::ExecRequest {
+            command: cowshed_core::api::dto::ExecCommand::Argv(vec![
+                cowshed_core::api::CommandArg::from("/bin/sh"),
+                cowshed_core::api::CommandArg::from("-c"),
+                cowshed_core::api::CommandArg::from("printf ran > never"),
+            ]),
+            cwd: None,
+            mode: cowshed_core::api::RunSandboxMode::ReadWrite,
+            env: std::collections::HashMap::new(),
+            trace: None,
+            stdin: cowshed_core::api::StdinSource::Empty,
+            stdout_copy: None,
+            stderr_copy: None,
+            admission_key: Some(
+                cowshed_core::api::dto::AdmissionKey::new("loaded-host-op").expect("a key"),
+            ),
+            class: cowshed_core::api::ExecClass::Background,
+            want: std::num::NonZeroUsize::MIN,
+            scope: cowshed_core::api::ExecScope::Workspace,
+        })
+        .await
+        .expect("a keyed exec answers at admission while the host is loaded");
+    let queued = job.status().await.expect("the queued job's status");
+    assert_eq!(
+        (
+            queued.state,
+            queued.class,
+            queued.pid,
+            queued.cpu_tokens,
+            queued.nice
+        ),
+        (
+            cowshed_core::api::dto::JobState::Queued,
+            cowshed_core::api::ExecClass::Background,
+            None,
+            None,
+            None
+        ),
+        "the answer's job is queued: its class is set and it holds no grant"
+    );
+    queued_request(&socket).await;
+    job.kill().await.expect("kill the queued job");
+    let ended = job
+        .wait()
+        .await
+        .expect("the cancelled job's terminal record");
+    assert_eq!(
+        (ended.state, ended.pid, ended.exit, ended.cpu_tokens),
+        (cowshed_core::api::dto::JobState::Killed, None, None, None),
+        "killed while queued: it never ran"
+    );
+    let ledger = cpu_budget(&socket).await;
+    assert!(
+        ledger
+            .background
+            .iter()
+            .filter(|stake| stake.checkout != LOADING_CHECKOUT)
+            .all(|stake| stake.waiters.is_empty() && stake.held == 0),
+        "the kill withdrew the request from the gateway's queue: {ledger:?}"
+    );
+    drop(load);
+    assert!(!never.exists(), "the cancelled job's command never ran");
+
+    drop(job);
+    drop(worker);
+    drop(coordinator);
+    connection.abort();
+    runtime.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
 #[path = "workspace_isolation.rs"]
 mod workspace_isolation;

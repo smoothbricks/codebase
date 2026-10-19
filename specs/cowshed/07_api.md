@@ -387,7 +387,7 @@ impl JobHandle {
     pub async fn logs(&self, stream: JobStream, offset: u64, follow: bool)
         -> Result<RawByteStream, CowshedError>; // representation-transparent; always resolves storage.artifact
     pub async fn attach(&self, cursor: Option<JobJournalCursor>) -> Result<JobAttachment, CowshedError>;
-    pub async fn detach(&self) -> Result<(), CowshedError>;          // job continues
+    pub async fn detach(&self) -> Result<(), CowshedError>;          // job continues; its captured prefixes are durable first
     pub async fn wait(&self) -> Result<JobInfo, CowshedError>;
     pub async fn kill(&self) -> Result<(), CowshedError>;            // awaits complete process-tree termination
 }

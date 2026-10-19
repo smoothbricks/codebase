@@ -207,6 +207,7 @@ async fn run(
     .await?;
     if background {
         let info = link.clone().info(job).await?;
+        link.detach(job).await?;
         return Ok(ExecResult {
             info,
             end: ExecEnd::Backgrounded,
@@ -236,10 +237,10 @@ impl ForegroundJob for ResidentJob {
         self.link.clone().info(self.job).await
     }
 
-    /// The supervisor keeps a job running whether or not anyone is attached, so there is
-    /// nothing to tell it.
+    /// The supervisor keeps a job running whether or not anyone is attached; detaching makes
+    /// its captured output durable for whoever reads it later.
     async fn detach(&self) -> Result<()> {
-        Ok(())
+        self.link.clone().detach(self.job).await
     }
 
     async fn kill(&self) -> Result<()> {
@@ -312,6 +313,16 @@ impl JobLink {
             Err(error) => {
                 self.followed(error).await?;
                 self.handle.kill(job).await
+            }
+            done => done,
+        }
+    }
+
+    async fn detach(mut self, job: JobId) -> Result<()> {
+        match self.handle.detach(job).await {
+            Err(error) => {
+                self.followed(error).await?;
+                self.handle.detach(job).await
             }
             done => done,
         }

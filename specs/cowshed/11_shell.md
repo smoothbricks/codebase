@@ -890,11 +890,19 @@ protected terminal record, and its controller commitment.
 ## Server-owned CPU admission and nice placement
 
 The supervisor's exec admission records Queued durably, acquires the gateway jobserver off the actor path, and spawns
-only under the actual grant (05_gateway.md, Host CPU budget). Status/cancel remain responsive while queued. Foreground
-exec answers at spawn/refusal; background exec answers at admission, with a later refusal on the job's stderr and
-failure cpuAdmission. Killing a queued job withdraws its request and seals Killed without a command. The grant stays
-held until the owned job concludes. Caller MAKEFLAGS/CARGO_MAKEFLAGS/MFLAGS and BOUNDED_EXEC_CPU_* never substitute for
-that allocation; actual pool/count override caller env after filtering.
+only under the actual grant (05_gateway.md, Host CPU budget). Status/cancel remain responsive while queued. **Every exec
+answers at admission**, foreground, `--background` and API caller alike (07_api.md, "CLI and API exec parity"): the
+answer is the job id while the job is `queued` with class and scope set and `cpuTokens`/`nice` absent, so its caller
+reads the grant from the job's status (`running`, `cpuTokens`, `nice`) and cancels it with kill while it waits. A
+foreground CLI exec therefore holds its job (05_gateway.md, "A job lives with its requester") from admission, not from
+spawn, so a requester killed while its job is queued withdraws it. A refusal after admission — the gateway's, or the
+class nice that cannot be placed — fails the job: `failed`, failure `cpuAdmission` or `priority`, exit the refusal's
+wrapper code, and its cause on the job's stderr; the exec call itself succeeded. Measured 2026-10-19 before this: a
+`cowshed exec --background` on a loaded host answered at its grant, 25 s later, so a queued job had no id to read or
+cancel. Killing a queued job withdraws its request and seals Killed without a command. Detaching (`--background`,
+`--timeout`, `JobHandle::detach`) promotes the captured prefixes to their protected files before it answers. The grant
+stays held until the owned job concludes. Caller MAKEFLAGS/CARGO_MAKEFLAGS/MFLAGS and BOUNDED_EXEC_CPU_* never
+substitute for that allocation; actual pool/count override caller env after filtering.
 
 Gate is trusted coordinator/operator only; workers default Background / Workspace, may ask Interactive or Resident, and
 cannot request Gate or HostGate. The owned command's nice is its class's row of 05_gateway.md "Bands" — Interactive 0 /

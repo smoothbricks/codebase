@@ -291,7 +291,7 @@ async fn held_nice(
     source: AdmissionSource,
 ) -> (i32, JobInfo) {
     let job = handle
-        .exec_background(
+        .exec(
             None,
             None,
             ExecRequest {
@@ -1524,12 +1524,37 @@ async fn host_controller_owned_commands_run_under_their_grant_at_their_class_nic
                     "warm {warm}: the kernel and the record agree on the class nice"
                 );
             } else {
-                let refused = handle
+                // Answered at admission: the class nice is refused at spawn, so the job fails
+                // typed, its exit the refusal's wrapper code and the placement it asked for on
+                // its stderr.
+                let job = handle
                     .exec(None, None, request, source)
                     .await
-                    .expect_err("a nice below the supervisor's own is refused");
-                let failure = refused.priority_source().expect("a typed priority failure");
-                assert_eq!(failure.requested, nice, "warm {warm}");
+                    .expect("answered at admission, before its nice is placed");
+                let failed = handle.wait(job).await.expect("the refused job's outcome");
+                assert_eq!(
+                    (
+                        failed.state,
+                        failed.failure,
+                        failed.pid,
+                        failed.exit.clone()
+                    ),
+                    (
+                        JobState::Failed,
+                        Some(JobFailure::Priority),
+                        None,
+                        Some(ExitStatus::Exited {
+                            code: ErrorCode::SandboxDenied.exec_wrapper_exit_code().into()
+                        })
+                    ),
+                    "warm {warm}: a nice below the supervisor's own is refused"
+                );
+                let stderr = read_stream(&handle, &failed, StreamKind::Stderr).await;
+                assert!(
+                    String::from_utf8_lossy(&stderr).contains(&format!("at nice {nice}:")),
+                    "warm {warm}: the refusal names the nice it asked for: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
             }
         }
         assert_eq!(

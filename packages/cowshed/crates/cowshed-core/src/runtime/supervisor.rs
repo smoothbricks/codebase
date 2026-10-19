@@ -2782,7 +2782,11 @@ impl WorkspaceSupervisorHandle {
     /// swap").
     ///
     /// `source` is who asks: only a coordinator may run a gate or reach the host boundary. The
-    /// answer comes once the job's command spawned under its CPU grant, or could not.
+    /// answer comes at admission, once the job is durable and `queued` for its CPU grant, never
+    /// at its spawn: the caller holds the job's id while it waits, reads its state, and kills it
+    /// to withdraw it from the gateway's queue (07_api.md, "CLI and API exec parity"). A
+    /// refusal that arrives after admission — the gateway's, or the class nice that cannot be
+    /// placed — fails the job, typed on its record and said on its stderr.
     pub async fn exec(
         &self,
         session: Option<&SessionToken>,
@@ -2790,38 +2794,25 @@ impl WorkspaceSupervisorHandle {
         request: ExecRequest,
         source: AdmissionSource,
     ) -> Result<JobId> {
-        self.exec_admitted(session, build_volume, request, false, source)
-            .await
-    }
-
-    /// As [`Self::exec`], answered as soon as the job is admitted: it spawns when its CPU grant
-    /// arrives, and a refusal is its own failure.
-    pub async fn exec_background(
-        &self,
-        session: Option<&SessionToken>,
-        build_volume: Option<PathBuf>,
-        request: ExecRequest,
-        source: AdmissionSource,
-    ) -> Result<JobId> {
-        self.exec_admitted(session, build_volume, request, true, source)
-            .await
-    }
-
-    async fn exec_admitted(
-        &self,
-        session: Option<&SessionToken>,
-        build_volume: Option<PathBuf>,
-        request: ExecRequest,
-        background: bool,
-        source: AdmissionSource,
-    ) -> Result<JobId> {
         self.call(|reply| Command::Exec {
             authority: self.authority.clone(),
             session: session.cloned(),
             build_volume,
             request: Box::new(request),
-            background,
             source,
+            reply,
+        })
+        .await
+    }
+
+    /// Leave the job running with nobody attached (11_shell.md, "`--background`"): its captured
+    /// prefixes are made durable in their protected files, and a session's job joins that
+    /// session's background set. A job that already ended is durable as it is, so it answers
+    /// at once.
+    pub async fn detach(&self, job_id: JobId) -> Result<()> {
+        self.call(|reply| Command::Detach {
+            authority: self.authority.clone(),
+            job_id,
             reply,
         })
         .await
@@ -3265,9 +3256,13 @@ pub(super) enum Command {
         session: Option<SessionToken>,
         build_volume: Option<PathBuf>,
         request: Box<ExecRequest>,
-        background: bool,
         source: AdmissionSource,
         reply: oneshot::Sender<Result<JobId>>,
+    },
+    Detach {
+        authority: WorkspaceAuthoritySnapshot,
+        job_id: JobId,
+        reply: oneshot::Sender<Result<()>>,
     },
     StdinWrite {
         authority: WorkspaceAuthoritySnapshot,
@@ -3810,8 +3805,6 @@ struct JobStateRecord {
     cpu: CpuStanding,
     /// Why the job failed before any status of its own could say, when it did.
     failure: Option<JobFailure>,
-    /// A foreground exec's answer, given once its command spawned or could not.
-    spawn_reply: Option<oneshot::Sender<Result<JobId>>>,
 }
 
 /// The complete authored environment's identity, before session or activation overlays. Values
@@ -3861,14 +3854,6 @@ struct PendingSpawn {
     mode: crate::api::dto::RunSandboxMode,
     scope: ExecScope,
     stdin: StdinSource,
-}
-
-/// What an exec admission did.
-enum ExecAdmission {
-    /// A keyed repeat of a job already admitted; nothing new happened.
-    Repeat(JobId),
-    /// A new job, durable and queued for its CPU grant.
-    Queued(JobId),
 }
 
 impl JobStateRecord {
@@ -4216,34 +4201,24 @@ impl SupervisorActor {
                 session,
                 build_volume,
                 request,
-                background,
                 source,
                 reply,
             } => {
-                match self
-                    .admit_exec(
-                        authority,
-                        session,
-                        build_volume,
-                        *request,
-                        background,
-                        source,
-                    )
-                    .await
-                {
-                    // A foreground caller is answered once its command spawned or could not.
-                    Ok(ExecAdmission::Queued(job_id)) if !background => {
-                        if let Some(job) = self.jobs.get_mut(&job_id) {
-                            job.spawn_reply = Some(reply);
-                        }
-                    }
-                    Ok(ExecAdmission::Queued(job_id) | ExecAdmission::Repeat(job_id)) => {
-                        let _ = reply.send(Ok(job_id));
-                    }
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                    }
-                }
+                // Answered at admission: the job is durable and queued, or refused.
+                let admitted = self
+                    .admit_exec(authority, session, build_volume, *request, source)
+                    .await;
+                let _ = reply.send(admitted);
+            }
+            Command::Detach {
+                authority,
+                job_id,
+                reply,
+            } => {
+                let result = self
+                    .validate_authority(&authority)
+                    .and_then(|()| self.detach(job_id));
+                let _ = reply.send(result);
             }
             Command::StdinWrite {
                 authority,
@@ -4904,9 +4879,8 @@ impl SupervisorActor {
         session: Option<SessionToken>,
         build_volume: Option<PathBuf>,
         request: ExecRequest,
-        background: bool,
         source: AdmissionSource,
-    ) -> Result<ExecAdmission> {
+    ) -> Result<JobId> {
         self.validate_authority(&authority)
             .and_then(|()| {
                 if self.lifecycle == ActorLifecycle::Running {
@@ -4984,7 +4958,7 @@ impl SupervisorActor {
                             AdmissionRefusal::StdinBound { job_id },
                         ))
                     } else {
-                        Ok(ExecAdmission::Repeat(job_id))
+                        Ok(job_id)
                     };
                 }
                 AdmissionLookup::Unprovable { set_aside } => {
@@ -5142,12 +5116,6 @@ impl SupervisorActor {
                 .seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy);
             return Err(error);
         }
-        if background && let Err(error) = self.artifacts.prepare_background(job_id) {
-            let _ = self
-                .artifacts
-                .seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy);
-            return Err(error);
-        }
 
         let stdin_info = stdin_info(&stdin);
         // A clock fault is not an invariant, and `started` orders job records and commitments.
@@ -5272,16 +5240,27 @@ impl SupervisorActor {
                 stdin,
             })),
             failure: None,
-            spawn_reply: None,
         };
-        if background
-            && let Some(identity) = session_identity
+        self.jobs.insert(job_id, job);
+        Ok(job_id)
+    }
+
+    /// Leave `job_id` running with nobody attached: both captured prefixes become durable in
+    /// their protected files before this answers, and a session's job joins its session's
+    /// background set until it ends. A job that ended is sealed, so it is durable already.
+    fn detach(&mut self, job_id: JobId) -> Result<()> {
+        let job = self.job(job_id)?;
+        if job.terminal() {
+            return Ok(());
+        }
+        let session_identity = job.session_identity;
+        self.artifacts.prepare_background(job_id)?;
+        if let Some(identity) = session_identity
             && let Some(session) = self.sessions.get_mut(&identity)
         {
             session.background_jobs.insert(job_id);
         }
-        self.jobs.insert(job_id, job);
-        Ok(ExecAdmission::Queued(job_id))
+        Ok(())
     }
 
     /// The host CPU budget answered for a queued job: spawn its command under the grant, or fail
@@ -5390,9 +5369,6 @@ impl SupervisorActor {
         job.info.nice = process.nice();
         job.process = Some(process);
         let started = job.birth.is_some();
-        if let Some(reply) = job.spawn_reply.take() {
-            let _ = reply.send(Ok(job_id));
-        }
         if started {
             self.record_groups();
         }
@@ -5407,25 +5383,18 @@ impl SupervisorActor {
     }
 
     /// End a job whose command never ran, failed by `error`: its exit is the failure's wrapper
-    /// code, a foreground caller is answered with the error itself, and a caller that was already
-    /// answered at admission reads why on the job's stderr.
+    /// code, and its caller, answered at admission, reads why on the job's stderr.
     async fn fail_before_command(
         &mut self,
         job_id: JobId,
         reason: KillReason,
         error: CowshedError,
     ) {
-        let Some(job) = self.jobs.get_mut(&job_id) else {
-            return;
-        };
-        let reply = job.spawn_reply.take();
-        if reply.is_none() {
-            self.process_output(
-                job_id,
-                StreamKind::Stderr,
-                Bytes::from(format!("cowshed: {}\n", error.message)),
-            );
-        }
+        self.process_output(
+            job_id,
+            StreamKind::Stderr,
+            Bytes::from(format!("cowshed: {}\n", error.message)),
+        );
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -5437,9 +5406,6 @@ impl SupervisorActor {
         job.kill_reason = Some(reason);
         end_job_stdin(job);
         self.finalize_job(job_id, Some(JobState::Failed)).await;
-        if let Some(reply) = reply {
-            let _ = reply.send(Err(error));
-        }
     }
 
     /// Hold the build volume mounted at `grant` for one job (16_build_volumes.md, "Garbage
@@ -5564,7 +5530,6 @@ impl SupervisorActor {
                     None,
                     grant,
                     request,
-                    true,
                     AdmissionSource::Coordinator,
                 )
                 .await
@@ -5572,7 +5537,16 @@ impl SupervisorActor {
             Err(error) => Err(error),
         };
         match started {
-            Ok(ExecAdmission::Queued(job_id) | ExecAdmission::Repeat(job_id)) => {
+            Ok(job_id) => {
+                // Nobody attaches to the keeper's job: it runs detached from its admission.
+                if let Err(error) = self.detach(job_id) {
+                    eprintln!(
+                        "cowshed: the Nx daemon job {} of {} runs, but its captured output is not durable: {}",
+                        job_id.get(),
+                        project_root.display(),
+                        error.message
+                    );
+                }
                 if let Some(keeper) = &mut self.nx_daemon {
                     keeper.starting = Some(job_id);
                 }
@@ -6433,11 +6407,6 @@ impl SupervisorActor {
         job.info.duration_ms = Some(duration_ms);
         job.info.exit = job.exit.clone();
         job.info.failure = failure;
-        // A foreground exec still waiting was cancelled before its command spawned: the job it
-        // admitted is its answer, and the job's status says how it ended.
-        if let Some(reply) = job.spawn_reply.take() {
-            let _ = reply.send(Ok(job_id));
-        }
         job.info.stdin.complete = true;
         if let Some(identity) = job.session_identity
             && let Some(session) = self.sessions.get_mut(&identity)

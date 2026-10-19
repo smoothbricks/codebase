@@ -12353,6 +12353,21 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             )
             .await?;
             let info = timed_async("land", "check-wait", handle.wait(job_id)).await?;
+            // The exec answered at admission, so a check the host never let run ends here as a
+            // failed job: that is the environment's refusal, never the workspace's failing check.
+            if let Some(
+                failure @ (crate::api::dto::JobFailure::CpuAdmission
+                | crate::api::dto::JobFailure::Priority),
+            ) = info.failure
+            {
+                return Err(CowshedError::environment_missing(
+                    format!(
+                        "land check `{check}` never ran ({failure:?}): {}",
+                        read_job_stderr_tail(&handle, job_id).await
+                    ),
+                    "read the host CPU ledger with `cowshed gateway status`, then retry land",
+                ));
+            }
             let exited = std::time::SystemTime::now();
             let exit_code = match info.exit {
                 Some(crate::api::dto::ExitStatus::Exited { code }) => Some(code),
@@ -13472,8 +13487,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
     ) -> Result<()> {
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
-        self.ensure_supervisor(&workspace).await?.info(job).await?;
-        Ok(())
+        self.ensure_supervisor(&workspace).await?.detach(job).await
     }
 
     async fn read_log(
@@ -15408,7 +15422,7 @@ mod removal_supervisor_tests {
         )
         .expect("start supervisor");
         let job = supervisor
-            .exec_background(
+            .exec(
                 None,
                 None,
                 ExecRequest {
