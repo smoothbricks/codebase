@@ -21,7 +21,7 @@ import type {
   EnsureBuiltProducerReceipt,
   EnsureBuiltReceipt,
 } from './ensure-built.js';
-import { censusStart, movedNodes, type NodeWitness, recordedStamp } from './ensure-built-witness.js';
+import { censusStart, movedNodes, type NodeWitness, recordedStamp, type StampFields } from './ensure-built-witness.js';
 
 export type ReceiptEvidence<T> =
   | { readonly ok: true; readonly value: T }
@@ -147,12 +147,18 @@ export function receiptNode(
   path: string,
   name: string,
   census?: { readonly start: bigint; readonly observed: NodeWitness[] },
+  recorded?: (path: string, stats: StampFields) => string | undefined,
 ): EnsureBuiltOutputReceipt {
   const stats = lstatSync(path, { bigint: true });
   census?.observed.push({ path, stamp: recordedStamp(stats, census.start) });
   const mode = Number(stats.mode & 0o7777n);
   if (stats.isFile())
-    return { path: name, type: 'file', mode, sha256: hashFile(path, Number(stats.size), ['sha256'], false)[0] };
+    return {
+      path: name,
+      type: 'file',
+      mode,
+      sha256: recorded?.(path, stats) ?? hashFile(path, Number(stats.size), ['sha256'], false)[0],
+    };
   if (stats.isSymbolicLink()) return { path: name, type: 'symlink', mode, linkText: readlinkSync(path) };
   if (stats.isDirectory()) {
     const entries = readdirSync(path).sort();

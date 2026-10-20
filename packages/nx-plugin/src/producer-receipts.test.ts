@@ -5,10 +5,15 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Task, TaskGraph } from 'nx/src/config/task-graph';
+import { expandOutputs } from 'nx/src/native';
 import type { TaskResults } from 'nx/src/tasks-runner/life-cycle';
+import { readModulePackageJson } from 'nx/src/utils/package-json';
+import { pastTick } from './__tests__/past-tick.js';
 import type { EnsureBuiltProducerReceipt } from './ensure-built.js';
+import { censusStart, type GraphInstallationCensus, readInstallationCensus } from './ensure-built-witness.js';
 import {
   completedProducerTasks,
+  installedClosureTool,
   PRODUCER_RECORDS,
   postTasksExecution,
   preTasksExecution,
@@ -179,6 +184,100 @@ describe('actual producer completion evidence', () => {
       const denied = readProducerReceipt(root, task.id);
       expect(denied.ok ? 'hit' : denied.detail).toStartWith('Cannot read producer completion receipt: EACCES');
       expect(denied.ok ? 'hit' : denied.detail).toContain(receiptPath);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * A workspace whose Nx is installed and whose plugin is a developer link: its package is a checkout outside
+ * `node_modules`, whose `dist` a rebuild rewrites in place without touching any lockfile or `node_modules` entry.
+ */
+async function developerLinkedWorkspace(): Promise<{ readonly root: string; readonly dist: string }> {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'producer-census-')));
+  const checkout = join(root, 'checkout');
+  await mkdir(join(checkout, 'dist'), { recursive: true });
+  await writeFile(
+    join(checkout, 'package.json'),
+    JSON.stringify({ name: '@smoothbricks/nx-plugin', version: '0.0.0', files: ['dist'] }),
+  );
+  const dist = join(checkout, 'dist/index.js');
+  await writeFile(dist, 'export const value = 1;\n');
+  await mkdir(join(root, 'node_modules/nx'), { recursive: true });
+  await writeFile(join(root, 'node_modules/nx/package.json'), JSON.stringify({ name: 'nx', version: '0.0.0' }));
+  await writeFile(join(root, 'node_modules/nx/index.js'), 'module.exports = {};\n');
+  await mkdir(join(root, 'node_modules/@smoothbricks'));
+  await symlink(checkout, join(root, 'node_modules/@smoothbricks/nx-plugin'), 'dir');
+  return { root, dist };
+}
+
+describe("the producer hook's installed-closure census", () => {
+  const sentinel = '0'.repeat(64);
+  /** One census of `root`'s closure, taking hashes from the census recorded at `record`. */
+  function closure(root: string, record: string) {
+    const tool = installedClosureTool(
+      root,
+      { plugins: ['@smoothbricks/nx-plugin'] },
+      null,
+      record,
+      readModulePackageJson,
+      expandOutputs,
+      { start: censusStart(), observed: [] },
+    );
+    if (!tool.ok) throw new Error(tool.detail);
+    return tool.value;
+  }
+  /** Records a census whose every file hash is `sentinel`: a census that reads a file reports its real hash instead. */
+  async function recordSentinels(record: string): Promise<GraphInstallationCensus> {
+    const recorded = readInstallationCensus(record);
+    if (recorded === undefined) throw new Error(`no census recorded at ${record}`);
+    await writeFile(
+      record,
+      JSON.stringify({ ...recorded, files: recorded.files.map(({ path }) => ({ path, sha256: sentinel })) }),
+    );
+    return recorded;
+  }
+
+  it('reads no file bytes of a closure whose node stamps have not moved, and names the phase it spent', async () => {
+    const { root } = await developerLinkedWorkspace();
+    try {
+      const record = join(root, 'census.json');
+      await pastTick();
+      closure(root, record);
+      const recorded = await recordSentinels(record);
+      const census = performance.getEntriesByName('producerReceipts:census', 'measure').length;
+      const files = new Set(recorded.files.map(({ path }) => path));
+      const hashed = closure(root, record).nodes.filter(({ path }) => files.has(path));
+      expect(hashed).toHaveLength(files.size);
+      expect(files.size).toBeGreaterThan(2);
+      expect(hashed.map((node) => (node.type === 'file' ? node.sha256 : node.type))).toEqual(
+        hashed.map(() => sentinel),
+      );
+      expect(performance.getEntriesByName('producerReceipts:census', 'measure').length).toBe(census + 1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reads again a developer-linked dist rewritten in place, with no lockfile or node_modules change', async () => {
+    const { root, dist } = await developerLinkedWorkspace();
+    try {
+      const record = join(root, 'census.json');
+      await pastTick();
+      closure(root, record);
+      await recordSentinels(record);
+      const rebuilt = 'export const value = 2;\n';
+      await writeFile(dist, rebuilt);
+      const nodes = closure(root, record).nodes;
+      expect(nodes.find(({ path }) => path === dist)).toMatchObject({
+        type: 'file',
+        sha256: createHash('sha256').update(rebuilt).digest('hex'),
+      });
+      expect(nodes.find(({ path }) => path === join(root, 'node_modules/nx/index.js'))).toMatchObject({
+        type: 'file',
+        sha256: sentinel,
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

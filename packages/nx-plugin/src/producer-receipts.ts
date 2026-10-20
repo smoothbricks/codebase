@@ -15,7 +15,9 @@ import { delimiter, dirname, join, resolve } from 'node:path';
 import type { NxJsonConfiguration } from 'nx/src/config/nx-json';
 import type { ProjectGraph } from 'nx/src/config/project-graph';
 import type { Task, TaskGraph } from 'nx/src/config/task-graph';
+import type { expandOutputs } from 'nx/src/native';
 import type { PostTasksExecutionContext, PreTasksExecutionContext } from 'nx/src/project-graph/plugins/public-api';
+import type { readModulePackageJsonWithoutFallbacks } from 'nx/src/utils/package-json';
 import typia from 'typia';
 import {
   createWorkspaceNxRequire,
@@ -35,13 +37,16 @@ import {
   receiptNode,
 } from './ensure-built-receipt.js';
 import {
+  censusFileHashes,
   censusStart,
-  graphInstallationIdentity,
+  graphInstallationCensus,
   movedNodes,
   type NodeWitness,
+  readInstallationCensus,
   workspaceSnapshot,
+  writeWitness,
 } from './ensure-built-witness.js';
-import { graphInputContractIdentity } from './graph-input-contract.js';
+import { type GraphInputContractProof, graphInputContractIdentity } from './graph-input-contract.js';
 
 export interface ProducerReceiptsOptions {
   readonly producerReceipts?: { readonly targets: readonly string[] };
@@ -56,15 +61,15 @@ export interface ProducerReceiptsOptions {
  * is no source or input of the run that publishes it.
  */
 export const PRODUCER_RECORDS = join('.cache', 'producer-receipts');
+/**
+ * The installation census the pre-task hook took last, in Nx's workspace-data beside the graph witness: a hash source
+ * for the next census ({@link installedClosureTool}), never a proof and never part of a receipt.
+ */
+const PRODUCER_INSTALLATION_CENSUS = 'producer-installation-census.json';
 interface ToolResolution {
   readonly name: string;
   readonly from: string;
   readonly target: string | null;
-}
-interface Installation {
-  readonly nodes: readonly NodeWitness[];
-  readonly resolutions: readonly (readonly [string, string, string | null])[];
-  readonly localInputs: string | null;
 }
 interface TargetBasis {
   readonly graph: TaskGraph;
@@ -179,6 +184,90 @@ function targetGraph(root: string, target: string, projectGraph: ProjectGraph): 
     false,
   );
 }
+/**
+ * The installed closure of Nx, this plugin, TypeScript and the local graph plugins as one producer tool: every node of
+ * the installation census, and the module namespace each of its resolutions searched. The census is not proved by a
+ * stat pass of its own: each of its nodes is stat-ed again as a tool node, a file whose stamp moved since the census
+ * read it is read again, and the capture's stability check refuses a tool node that moves before publication.
+ *
+ * Its value is a function of the closure's node stamps (device, inode, mode, size, mtime and ctime), not of the moment
+ * it is taken. So every node is stat-ed on every call, and that is what makes reuse safe: a file whose stamp is the one
+ * the census recorded at `record` read it at keeps that census's hash, so an unchanged closure reads no file bytes,
+ * while a file rewritten in place, as a developer-linked package's rebuilt `dist` is with no lockfile or
+ * `node_modules` change, moves its ctime and is read again. The tool's nodes take the hash this census read
+ * ({@link censusFileHashes}) instead of reading each file a second time: a write landing between two reads could make
+ * them disagree.
+ */
+export function installedClosureTool(
+  root: string,
+  nxJson: NxJsonConfiguration,
+  localInputs: GraphInputContractProof | null,
+  record: string,
+  resolvePackage: typeof readModulePackageJsonWithoutFallbacks,
+  expand: typeof expandOutputs,
+  census: { readonly start: bigint; readonly observed: NodeWitness[] },
+): ReceiptEvidence<EnsureBuiltProducerTool> {
+  let installationMiss = 'unproved installed module/resolution closure';
+  performance.mark('producerReceipts:census:start');
+  const installation = graphInstallationCensus(
+    root,
+    nxJson,
+    resolvePackage,
+    expand,
+    localInputs ?? { plugins: [], packages: [], identity: '[]' },
+    (detail) => {
+      installationMiss = detail;
+    },
+    readInstallationCensus(record),
+  );
+  performance.measure('producerReceipts:census', 'producerReceipts:census:start');
+  if (installation === null)
+    return { ok: false, detail: `Producer installed module/resolution closure is unproved: ${installationMiss}` };
+  writeWitness(record, installation);
+  const paths = new Set(installation.nodes.map(({ path }) => path));
+  const absent = new Set<string>();
+  function namespace(path: string): void {
+    let stats: ReturnType<typeof lstatSync>;
+    try {
+      stats = lstatSync(path);
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && ['ENOENT', 'ENOTDIR'].includes(String(error.code))) {
+        absent.add(path);
+        return;
+      }
+      throw error;
+    }
+    paths.add(path);
+    if (stats.isSymbolicLink()) paths.add(realpathSync(path));
+    if (stats.isDirectory()) for (const name of readdirSync(path)) paths.add(join(path, name));
+  }
+  const resolutions: ToolResolution[] = [];
+  for (const [from, name, target] of installation.resolutions) {
+    resolutions.push({ from, name, target });
+    for (const directory of createRequire(join(from, 'package.json')).resolve.paths(name) ?? []) {
+      namespace(directory);
+      const candidate = join(directory, name);
+      if (existsSync(candidate)) namespace(candidate);
+      else absent.add(candidate);
+    }
+  }
+  const recorded = censusFileHashes(installation);
+  const nodes = [...paths].sort().map((path) => receiptNode(path, path, census, recorded));
+  return {
+    ok: true,
+    value: {
+      kind: 'module',
+      name: 'installed-nx-plugin-closure',
+      from: root,
+      path: root,
+      physicalPath: realpathSync(root),
+      nodes,
+      missing: [...absent].sort(),
+      resolutions,
+      sha256: sha(nodes),
+    },
+  };
+}
 /** Tool resolution is captured in producer scope; readers inspect its recorded filesystem, not their own environment. */
 function toolsFor(
   root: string,
@@ -202,62 +291,19 @@ function toolsFor(
       if (proof.runtimeSource.kind === 'opaque') return { ok: false, detail: proof.runtimeSource.detail };
       needsCargo ||= Object.values(proof.inputs).some((input) => input.runtime.length > 0);
     }
-    let installationMiss = 'unproved installed module/resolution closure';
-    const identity = graphInstallationIdentity(
-      root,
-      nxJson,
-      load('nx/src/utils/package-json').readModulePackageJson,
-      load('nx/src/native').expandOutputs,
-      local ?? { plugins: [], packages: [], identity: '[]' },
-      (detail) => {
-        installationMiss = detail;
-      },
-    );
-    if (identity === null)
-      return { ok: false, detail: `Producer installed module/resolution closure is unproved: ${installationMiss}` };
-    const installation = typia.json.isParse<Installation>(identity);
-    if (installation === null) return { ok: false, detail: 'Invalid installed module closure evidence' };
     const observed: NodeWitness[] = [];
     const census = { start: censusStart(), observed };
-    const paths = new Set(installation.nodes.map(({ path }) => path));
-    const absent = new Set<string>();
-    function namespace(path: string): void {
-      let stats: ReturnType<typeof lstatSync>;
-      try {
-        stats = lstatSync(path);
-      } catch (error) {
-        if (error instanceof Error && 'code' in error && ['ENOENT', 'ENOTDIR'].includes(String(error.code))) {
-          absent.add(path);
-          return;
-        }
-        throw error;
-      }
-      paths.add(path);
-      if (stats.isSymbolicLink()) paths.add(realpathSync(path));
-      if (stats.isDirectory()) for (const name of readdirSync(path)) paths.add(join(path, name));
-    }
-    const resolutions: ToolResolution[] = [];
-    for (const [from, name, target] of installation.resolutions) {
-      resolutions.push({ from, name, target });
-      for (const directory of createRequire(join(from, 'package.json')).resolve.paths(name) ?? []) {
-        namespace(directory);
-        const candidate = join(directory, name);
-        if (existsSync(candidate)) namespace(candidate);
-        else absent.add(candidate);
-      }
-    }
-    const nodes = [...paths].sort().map((path) => receiptNode(path, path, census));
-    const module: EnsureBuiltProducerTool = {
-      kind: 'module',
-      name: 'installed-nx-plugin-closure',
-      from: root,
-      path: root,
-      physicalPath: realpathSync(root),
-      nodes,
-      missing: [...absent].sort(),
-      resolutions,
-      sha256: sha(nodes),
-    };
+    const closure = installedClosureTool(
+      root,
+      nxJson,
+      local,
+      join(data, PRODUCER_INSTALLATION_CENSUS),
+      load('nx/src/utils/package-json').readModulePackageJson,
+      load('nx/src/native').expandOutputs,
+      census,
+    );
+    if (!closure.ok) return closure;
+    const module = closure.value;
     const tools: EnsureBuiltProducerTool[] = [module];
     for (const name of ['nx-runtime', 'bun', 'sh', 'git', ...(needsCargo ? ['rustc', 'cargo'] : [])]) {
       const candidates =
@@ -365,9 +411,13 @@ export async function preTasksExecution(
   if (targets.length === 0) return;
   try {
     const load = createWorkspaceNxRequire(context.workspaceRoot);
+    // A hook that can hold a run for minutes names its phases: Nx reports each measure under NX_PERF_LOGGING.
+    performance.mark('producerReceipts:graph:start');
     const projectGraph = await load('nx/src/project-graph/project-graph').createProjectGraphAsync();
+    performance.measure('producerReceipts:graph', 'producerReceipts:graph:start');
     const bases = new Map<string, TargetBasis>();
     for (const target of targets) {
+      performance.mark('producerReceipts:source:start');
       const graph = targetGraph(context.workspaceRoot, target, projectGraph);
       const outputs = producerOutputPaths(
         context.workspaceRoot,
@@ -375,13 +425,16 @@ export async function preTasksExecution(
         load('nx/src/native').expandOutputs,
       );
       const source = captureProducerSource(context.workspaceRoot, outputs);
+      performance.measure('producerReceipts:source', 'producerReceipts:source:start');
       if (!source.ok) {
         runs.set(context.id, source);
         return;
       }
       bases.set(target, { graph, source: source.value });
     }
+    performance.mark('producerReceipts:tools:start');
     const tools = toolsFor(context.workspaceRoot, context.nxJsonConfiguration, projectGraph, [...bases.values()]);
+    performance.measure('producerReceipts:tools', 'producerReceipts:tools:start');
     runs.set(
       context.id,
       tools.ok

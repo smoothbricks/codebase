@@ -1010,6 +1010,23 @@ npm nodes of its project's dependency closure) are Nx's lockfile identities: the
 `bun.lock` bind them, and no installed closure is resolved for them, since under Bun's isolated linker most of them do
 not resolve from the task's project.
 
+The pre-task hook stats every node of that installed closure on every run, and that is what lets it skip reading bytes.
+The census is a function of the nodes' stamps (device, inode, mode, size, and mtime and ctime in nanoseconds), not of
+the moment it runs: the hook records the census it took in Nx's workspace-data (`producer-installation-census.json`, a
+hash source, never a proof), and the next run takes the hash of every file whose stamp has not moved and that the record
+did not read in the tick it changed in. An unchanged closure reads no file bytes; a developer-linked package whose
+`dist` a rebuild rewrites in place, with no lockfile or `node_modules` change, moves those files' ctimes and they are
+read again. No cheaper generation (a lockfile, a manifest, an install marker) keys it, since such a rebuild moves none
+of those. The tool's nodes take the hash the census read instead of reading each file a second time: a write landing
+between two reads could make them disagree. Nor does the census take a stat pass of its own to prove itself: the tool's
+nodes stat each of its nodes again, a file whose stamp moved since the census read it is read again, and the capture's
+stability check refuses a tool node that moves before publication. For a consumer that links this plugin from a checkout
+(about 28,000 closure nodes) the hook took 9-17 s of synchronous I/O on the plugin worker before, with every file read
+twice, and 6-9 s after, almost all of it stats; on a host whose disk-image layer is saturated the reads ran for minutes,
+while the worker's event loop could neither answer Nx nor reap its exited children. The hook's phases are performance
+measures (`producerReceipts:graph`, `producerReceipts:source`, `producerReceipts:tools`, `producerReceipts:census`),
+which Nx reports under `NX_PERF_LOGGING=true`.
+
 Validity compares the committed tree, not the current HEAD spelling. An empty commit with an identical tree keeps the
 receipt valid and its original basis SHA unchanged; the consumer never rewrites that provenance. A genuinely changed
 tree invalidates the receipt. Multi-target consumers require one tree and retain each producer's actual basis.

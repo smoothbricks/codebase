@@ -121,7 +121,7 @@ export function readGraphWitness(path: string): GraphWitness | null {
   }
 }
 
-export function writeWitness(path: string, value: GraphWitness | ArtifactWitness): void {
+export function writeWitness(path: string, value: GraphWitness | ArtifactWitness | GraphInstallationCensus): void {
   const temporary = `${path}.${randomUUID()}`;
   try {
     writeFileSync(temporary, JSON.stringify(value), { flag: 'wx', mode: 0o600 });
@@ -294,6 +294,34 @@ export function recordedInstallationCensus(
     if (error instanceof SyntaxError) return undefined;
     throw error;
   }
+}
+
+/** The census a caller recorded at `path`, `unproven` included: a hash source for {@link graphInstallationCensus}, never a
+ * proof. An absent, unreadable or malformed record is no hash source, and the next census reads every file.
+ */
+export function readInstallationCensus(path: string): GraphInstallationCensus | undefined {
+  try {
+    return typia.json.isParse<GraphInstallationCensus>(readFileSync(path, 'utf8')) ?? undefined;
+  } catch (error) {
+    if (error instanceof SyntaxError || systemError(error)) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * The hash `census` read of the file at `path`, while `stats` is the stamp it read the file at and it did not read the
+ * file in the tick it changed in ({@link unproven}); otherwise `undefined`, and the caller reads the bytes. A second
+ * reader of a file the census holds takes this instead of reading it again: a write landing between two reads could
+ * make them disagree, and a write since the census moves the stamp, so it is read again.
+ */
+export function censusFileHashes(
+  census: GraphInstallationCensus,
+): (path: string, stats: StampFields) => string | undefined {
+  const unprovenFiles = new Set(census.unproven);
+  const stamps = new Map(census.nodes.map(({ path, stamp }) => [path, stamp]));
+  const hashes = new Map(census.files.map(({ path, sha256 }) => [path, sha256]));
+  return (path, stats) =>
+    unprovenFiles.has(path) || stamps.get(path) !== nodeStamp(stats) ? undefined : hashes.get(path);
 }
 
 /**
