@@ -193,14 +193,20 @@ impl JobCpuAdmission for GatewayJobCpu {
             // The ledger knows two token-holding classes (05_gateway.md "Bands"): interactive
             // asks as background, whose tokens it shares, and either resident asks for a pool alone.
             let frame = match ask.class {
-                ExecClass::Background | ExecClass::Interactive => serde_json::to_vec(
-                    &JobserverRequest::background(ask.want, &checkout, command, job)
-                        .from_parent(ask.parent.as_deref()),
-                ),
-                ExecClass::Gate => serde_json::to_vec(
-                    &JobserverRequest::gate(ask.want, &checkout, command, job)
-                        .from_parent(ask.parent.as_deref()),
-                ),
+                ExecClass::Background | ExecClass::Interactive => {
+                    serde_json::to_vec(&JobserverRequest::background(
+                        ask.want,
+                        &checkout,
+                        command,
+                        job,
+                        ask.parent.as_deref(),
+                    ))
+                }
+                // A gate always takes its place in the repository's host queue. Borrowing a
+                // parent's token would start a second gate without that admission.
+                ExecClass::Gate => {
+                    serde_json::to_vec(&JobserverRequest::gate(ask.want, &checkout, command, job))
+                }
                 ExecClass::Resident | ExecClass::InteractiveResident => {
                     serde_json::to_vec(&ResidentPoolRequest::new(&checkout, command, job))
                 }

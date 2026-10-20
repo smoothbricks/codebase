@@ -814,45 +814,45 @@ core count.
   background but not fully starve background"; tg#7019, of two concurrent lands: "first should be full priority and
   second almost background until first completes"). A jobserver root request carries a typed
   `class: "background" | "gate"`; omission is background, and any other class is `invalid-request` (a resident asks with
-  `resident-pool`, below). Gate-class work is ranked by the gate job it serves, by that job's own admission: a gate root
-  request is its own job, and every task its pool relays ranks by the root's admission, not by when the task asked.
-  While any gate-class work wants tokens, the oldest gate job's next want is served once a token is free, wherever its
-  requests sit in their checkouts' queues: a waiting task takes `min(want, free)`, in the order that job's tasks asked.
-  All of it comes ahead of every queued background request (both jobserver and `cpu-tokens`). The work behind the gate
-  job being served — background and every younger gate job — is not starved meanwhile: a background checkout, or a
-  younger gate job, that waits holding nothing is granted one token first, oldest request first, as long as that work as
-  a whole then still holds less than half of N, so the job being served and the older ones hold the larger part. A
-  younger land is thereby "almost background" (tg#7019): its orchestrator starts on its floor token, and its tasks queue
-  behind the older land's until the older land stops wanting. Every grant is whole, so two younger gate jobs on their
-  floor tokens wait on nothing the other holds. Measured without that floor: a younger land asking for its
-  orchestrator's one token while the older land held 13 of 18 tokens waited out the older land and failed. A running
-  gate grant blocks nobody: with no gate-class work wanting tokens, ordinary checkout fairness serves background from
-  the free tokens within background's limit ("Room for a gate" below). An in-flight background grant stays exactly as it
-  is until its child exits or its connection closes. This is priority on genuinely returned tokens and on the half of
-  the host background never holds, not a budget increase or stolen allocation. Conservation remains `free + Σ held = N`.
+  `resident-pool`, below). A gate also carries its trusted `job.repoId`, workspace incarnation and job id, and requests
+  its private pool. Anonymous gate requests are refused. The ledger ranks the root and every task its pool relays by
+  both repository and the root's admission ticket, not the child's arrival. **Gates are serialized per repository and
+  parallel across repositories** (tg#7385): while a gate job or any of its relayed tasks holds tokens, no other gate job
+  for that repository may hold any, including a floor token. With no holder, the oldest queued job of that repository is
+  its head. Cancellation removes a queued claimant; a root ending does not release the repository until its last held
+  child releases too. An earlier ticket enqueued late cannot preempt a running job. These heads are derived from the
+  existing holders and waiters, not a second admission registry. Among eligible repository heads, the oldest job's next
+  request takes `min(want, free)`, in that job's request order, ahead of queued background. A background checkout or a
+  younger head **of another repository** holding nothing gets one floor token first, oldest request first, while work
+  behind the job being served still holds less than half of N. The younger repository's orchestrator can therefore start
+  while the older one's tasks take every returned token they want. A behind-head gate in the same repository stays
+  queued even beside free tokens; it cannot enter through the background selector. Background still uses its own free
+  room when no eligible gate wants tokens. Running grants are never preempted or resized. Conservation remains
+  `free + Σ held = N`.
 - **A land is a gate job, and its tasks are gate-class requests.** The selecting authority is the land queue holder:
   `~/Dev/.land-lock.sh` runs main's `tooling/land-host.sh`, the only path that gates a tree before `cowshed land`
   fast-forwards to it, and it runs that gate as `cowshed exec <workspace> --class gate --host -- …`. The trusted route
   alone grants the class (class-not-permitted for a worker). The job's own grant is the one token its orchestrator uses;
   its pool relays every task's ask, from the host or from inside the sandbox, as a gate-class request for the
   workspace's checkout, ranked by the job's own admission. A land therefore takes returned tokens at every task, in the
-  order its tasks ask, and is never frozen at the width of its first grant. Same-repo lands are already serialized by
-  the per-repository land lock. Lands of two repositories are served oldest gate job first: the younger land's
-  orchestrator starts on its floor token, the older land's tasks take every returned token they want, the younger land's
-  tasks take what the older one does not ask for, and the younger takes the older one's place when it completes. Neither
-  is preempted: a running task of either keeps its grant. The jobs the land's own cowshed steps start are gate-class
-  work too, since the land waits on each of them: the rebase carry's task-hash computation, which the lander asks for
-  with `cowshed rebase --gate`, `cowshed land`'s Nx cache initialization (16_build_volumes.md, "Carry" and "Rebase
-  carry"), and each `cowshed land --check` command (02_workspaces.md, "`cowshed land`" step 2). Measured 2026-10-19 with
-  the first two at background class: a land's task-hash job waited 21 s in the background queue with no other gate
-  running, and in one repository the same computation took 48 s on one land and 297 s on the next, while that
-  repository's whole land queue waited behind it. Measured 2026-10-20 with `--check` at background class, on a
-  three-token ledger (the macOS arm64 CI runner), whose background room is one token ("Room for a gate"): one long-lived
-  ordinary background job held that token, and the land's check waited at `check-wait` for the job to end, while the job
-  was waiting for the land, so the land never reached its adoption. That is the starvation the room exists to remove, at
-  the smallest host: on a host of three tokens or fewer, one ordinary long-lived background job keeps every other
-  background exec waiting until it ends. A process that stays up idle between work is a resident ("A resident holds no
-  token") and holds none; a land's own jobs never contest the background room at all.
+  order its tasks ask, and is never frozen at the width of its first grant. The per-repository land lock protects the
+  landing turn; the gateway independently enforces one token-holding gate job per repository. Lands of two repositories
+  are served oldest gate job first: the younger land's orchestrator starts on its floor token, the older land's tasks
+  take every returned token they want, the younger land's tasks take what the older one does not ask for, and the
+  younger takes the older one's place when it completes. Neither is preempted: a running task of either keeps its grant.
+  The jobs the land's own cowshed steps start are gate-class work too, since the land waits on each of them: the rebase
+  carry's task-hash computation, which the lander asks for with `cowshed rebase --gate`, `cowshed land`'s Nx cache
+  initialization (16_build_volumes.md, "Carry" and "Rebase carry"), and each `cowshed land --check` command
+  (02_workspaces.md, "`cowshed land`" step 2). Measured 2026-10-19 with the first two at background class: a land's
+  task-hash job waited 21 s in the background queue with no other gate running, and in one repository the same
+  computation took 48 s on one land and 297 s on the next, while that repository's whole land queue waited behind it.
+  Measured 2026-10-20 with `--check` at background class, on a three-token ledger (the macOS arm64 CI runner), whose
+  background room is one token ("Room for a gate"): one long-lived ordinary background job held that token, and the
+  land's check waited at `check-wait` for the job to end, while the job was waiting for the land, so the land never
+  reached its adoption. That is the starvation the room exists to remove, at the smallest host: on a host of three
+  tokens or fewer, one ordinary long-lived background job keeps every other background exec waiting until it ends. A
+  process that stays up idle between work is a resident ("A resident holds no token") and holds none; a land's own jobs
+  never contest the background room at all.
 - **A job lives with its requester** (2026-10-18, Danny tg#7386: "cowshed gateway is supposed to background every
   landing queued and not cause load that slows down the head of the queue"). A foreground job's only consumer is the
   process that asked for it, so when that process is gone the job stops and its tokens return. A gate job's verdict
@@ -892,8 +892,10 @@ core count.
   is never failed for waiting in the order that serves it: a gate jobserver request, like a background one, waits until
   it is granted or its client closes the connection, which leaves the queue. The operator request is
   `cowshed exec <workspace> --class gate --host --want N -- COMMAND [ARGS...]`, and it sends
-  `{"op":"jobserver","class":"gate","want":<n>,"checkout":"<root>","command":"…"}`. A waiting request holds nothing, so
-  its wait costs nobody; who holds the host while it waits is the live `cpu-budget` ledger below, not a refusal.
+  `{"op":"jobserver","class":"gate","want":<n>,"checkout":"<root>","command":"…","pool":true,"job":{"repoId":"<owner/repo>","workspaceIncarnation":"<incarnation>","jobId":<id>}}`.
+  A gate asks only the host repository queue: `parentPool` is refused for gates, and the supervisor does not forward an
+  inherited pool on gate admission. Otherwise a parent's token could start a second gate outside the repository order. A
+  waiting request holds nothing, so its wait costs nobody; the live `cpu-budget` ledger names what it waits behind.
   Measured with the 120000 ms bound this replaced: a younger land's gate was refused after 120003 ms while an older land
   held 13 of 18 tokens, killing the land for waiting in the very order the ledger serves. An unknown class is an invalid
   request, and so is a `waitMs` field: it is no longer part of the request. Running task wall/idle bounds still start at
@@ -961,7 +963,7 @@ core count.
     after unlink fails at path lookup; an already queued connection completes and hears the named refusal, rather than
     being abandoned during its handshake. The retirement log names the pool and counts queued refusals and accepted
     connections ended. Explicit close and owner drop use this same drain; neither aborts the listener task.
-- **Work-conserving but for the gate's room.** No grant is capped below `want` for fairness' sake: with nobody else
+- **Work-conserving within repository admission and the gate's room.** Among eligible requests, with nobody else
   waiting, a gate-class grant is `min(want, free)`, so a lone gate runner may hold all N tokens, because a gate's wall
   time is what the budget buys. A background grant is `min(want, room)`, the room being the free tokens within the
   background limit: that limit is the one cap, and it is the trade. Up to `⌈N/2⌉` tokens (9 of 18) sit idle exactly
@@ -970,8 +972,8 @@ core count.
   at once instead of waiting out the longest background run, which nothing can shorten once granted. A lone waiter also
   takes what its room holds when that is below its fair share: on an 18-token host, a background runner holding 6 does
   not make the sole background newcomer wait instead of taking the 3 left of the limit. Ordinary checkout fairness (the
-  share rule above) still bounds a grant while another ordinary checkout waits. Gate admission orders who is served
-  first; it never leaves a token idle.
+  share rule above) still bounds a grant while another ordinary checkout waits. Repository serialization may leave
+  tokens free when only a behind-head gate wants them; starting that gate is not useful concurrency.
 - **Bands** (2026-10-17, Danny tg#6693: "The gate class is served FIFO at highest priority over all other execs. The
   interactive class has priority over gate and regular exec. Priority is handled by OS niceness. When gate runs it needs
   more tickets than background but not fully starve background"). A job's class fixes, at the job's birth, both its
@@ -1081,6 +1083,9 @@ core count.
     establishment and request parsing; client-observed latency is a separate measurement.
   - `cpu-tokens grant ticket=<id> tokens=<g> want=<n> waited_ns=<n>` records the ledger's admission-to-selection wait,
     with checkout, peer pid and command. An immediately selected request has zero ledger wait, not zero wire latency.
+    Gate grants also name `gate_repo`, `gate_job`, `head_repo` and `head_job`: the granted job and the global oldest
+    admitted gate, including holders with no task currently queued. The two repositories may differ; two jobs of the
+    same repository may not hold tokens together. Background grants have no gate identity.
   - `cpu-tokens queue-step cause=ask|release ticket=<id> elapsed_ns=<n> grants=<n>` measures one actor transition
     through grant dispatch. `cpu-tokens handoff ticket=<released-id> elapsed_ns=<n> grants=<n>` measures stake release
     through dispatch when that release selects waiters, including time waiting in the actor's inbox. Neither includes

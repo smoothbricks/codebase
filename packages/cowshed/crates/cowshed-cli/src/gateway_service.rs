@@ -4412,8 +4412,14 @@ mod tests {
             let mut stream = tokio::net::UnixStream::connect(socket)
                 .await
                 .expect("connect");
+            let repo = format!(
+                "owner/{}",
+                Path::new(checkout).file_name().unwrap().to_str().unwrap()
+            );
             let request = serde_json::json!({ "op": "jobserver", "want": 1,
-                "checkout": checkout, "command": "land gate", "class": "gate" });
+                "checkout": checkout, "command": "land gate", "class": "gate", "pool": true,
+                "job": { "repoId": repo, "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+                    "jobId": 1 } });
             stream
                 .write_all(format!("{request}\n").as_bytes())
                 .await

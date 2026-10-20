@@ -73,9 +73,8 @@ pub struct JobserverRequest<'a> {
     class: JobserverClass,
     pool: bool,
     job: JobserverJob<'a>,
-    /// The live CPU pool of the process that asked for the job, when it holds one: the job waits
-    /// on that pool and on the host ledger at once, and the first grant serves it (05_gateway.md
-    /// "Host CPU budget", "Work a holder starts draws on its grant").
+    /// Only background jobs may borrow a requester's live pool. A gate always enters its
+    /// repository's host queue; its constructor cannot attach a parent pool.
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_pool: Option<&'a str>,
 }
@@ -86,6 +85,7 @@ impl<'a> JobserverRequest<'a> {
         checkout: &'a str,
         command: &'a str,
         job: JobserverJob<'a>,
+        parent_pool: Option<&'a str>,
     ) -> Self {
         Self {
             op: JOBSERVER_OP,
@@ -95,7 +95,7 @@ impl<'a> JobserverRequest<'a> {
             class: JobserverClass::Background,
             pool: true,
             job,
-            parent_pool: None,
+            parent_pool,
         }
     }
     pub const fn gate(
@@ -113,13 +113,6 @@ impl<'a> JobserverRequest<'a> {
             pool: true,
             job,
             parent_pool: None,
-        }
-    }
-    /// Take the job's tokens from its requester's live pool, when it has one.
-    pub const fn from_parent(self, parent_pool: Option<&'a str>) -> Self {
-        Self {
-            parent_pool,
-            ..self
         }
     }
 }

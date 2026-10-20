@@ -104,6 +104,19 @@ fn request(want: usize, checkout: &str) -> String {
     line
 }
 
+fn gate_request(want: usize, checkout: &str, command: &str) -> Value {
+    let repo = format!(
+        "owner/{}",
+        Path::new(checkout).file_name().unwrap().to_str().unwrap()
+    );
+    serde_json::json!({
+        "op": "jobserver", "want": want, "checkout": checkout, "command": command,
+        "class": "gate", "pool": true,
+        "job": { "repoId": repo, "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
+            "jobId": 1 }
+    })
+}
+
 /// One held `cpu-tokens` connection in this process, answered `queued`.
 struct Asker {
     lines: BufReader<tokio::net::unix::OwnedReadHalf>,
@@ -114,8 +127,7 @@ impl Asker {
     async fn jobserver(socket: &Path, want: usize, checkout: &str) -> Self {
         let stream = UnixStream::connect(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
-        let request = serde_json::json!({ "op": "jobserver", "want": want, "checkout": checkout,
-            "command": "land gate", "class": "gate" });
+        let request = gate_request(want, checkout, "land gate");
         writer
             .write_all(format!("{request}\n").as_bytes())
             .await
@@ -133,10 +145,7 @@ impl Asker {
     async fn gate_job(socket: &Path, checkout: &str) -> (Self, PathBuf) {
         let stream = UnixStream::connect(socket).await.expect("connect");
         let (reader, mut writer) = stream.into_split();
-        let request = serde_json::json!({ "op": "jobserver", "want": 1, "checkout": checkout,
-            "command": "nx run-many -t gate", "class": "gate", "pool": true,
-            "job": { "repoId": "owner/repo", "workspaceIncarnation": "0123456789abcdef0123456789abcdef",
-                "jobId": 1 } });
+        let request = gate_request(1, checkout, "nx run-many -t gate");
         writer
             .write_all(format!("{request}\n").as_bytes())
             .await
@@ -275,6 +284,15 @@ async fn grant_handoff_and_selection_timings_need_no_environment_switch() {
             assert!(value.parse::<u128>().is_ok(), "{line}");
         }
         assert!(stderr.contains("task-server terminal "), "{stderr}");
+        let other = stderr
+            .lines()
+            .find(|line| line.contains("gate_repo=Some(\"owner/other\")"))
+            .unwrap_or_else(|| panic!("missing gate identity: {stderr}"));
+        assert!(other.contains("head_repo=Some(\"owner/head\")"), "{other}");
+        assert!(
+            other.contains("gate_job=Some(") && other.contains("head_job=Some("),
+            "{other}"
+        );
         return;
     }
     assert!(std::env::var_os("COWSHED_TIMING").is_none());
@@ -321,6 +339,10 @@ async fn grant_handoff_and_selection_timings_need_no_environment_switch() {
     .await;
     assert_eq!(terminal["ok"], true);
     drop(unit);
+    let (head, _) = Asker::gate_job(&socket, "/w/head").await;
+    let (other, _) = Asker::gate_job(&socket, "/w/other").await;
+    assert_eq!(ledger(&socket).await.held, 2);
+    drop((head, other));
     gateway.drain().await.expect("drain");
     std::fs::remove_dir_all(root).expect("clean timing fixture");
 }
@@ -753,6 +775,11 @@ async fn jobserver_class_is_validated_and_a_wait_bound_is_an_unknown_field() {
         serde_json::json!({"class":"background","waitMs":100}),
         // A resident asks with its own operation, never as a token-holding jobserver class.
         serde_json::json!({"class":"resident"}),
+        // Gate serialization needs an identity and cannot be bypassed through a parent pool.
+        serde_json::json!({"class":"gate"}),
+        serde_json::json!({"class":"gate","pool":true}),
+        serde_json::json!({"class":"gate","pool":true,"parentPool":"/tmp/parent.sock",
+            "job":{"repoId":"owner/repo","workspaceIncarnation":"0123456789abcdef0123456789abcdef","jobId":1}}),
     ] {
         let mut request = serde_json::json!({"op":"jobserver","want":4,"checkout":"/w/refused","command":"cargo test"});
         request
@@ -993,6 +1020,82 @@ async fn each_exec_class_takes_its_own_ledger_place_through_the_supervisors_admi
     }
     gateway.drain().await.expect("drain");
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// Two checkouts of one repository cannot run gates together, even when the queued gate
+/// inherits the running gate's pool. A different repository still starts on the same host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gates_serialize_per_repository_through_supervisor_admission_not_parent_pools() {
+    use cowshed_core::api::ExecClass;
+    use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
+
+    let (gateway, root, socket) = gateway(8).await;
+    let admission = GatewayJobCpu::new(socket.clone());
+    let mut first_ask = exec_ask(1, "/w/first", 1, None);
+    first_ask.class = ExecClass::Gate;
+    let first = admission.admit(first_ask).await.expect("first gate");
+    let mut second_ask = exec_ask(1, "/w/second", 2, Some(first.pool()));
+    second_ask.class = ExecClass::Gate;
+    let second_admission = GatewayJobCpu::new(socket.clone());
+    let mut second = tokio::spawn(async move { second_admission.admit(second_ask).await });
+    loop {
+        tokio::select! {
+            result = &mut second => panic!("a second gate bypassed the repository queue: {result:?}"),
+            status = ledger(&socket) => {
+                assert_eq!(status.gate_jobs.len(), 1, "{status:?}");
+                if status.gate_queue.iter().any(|waiter| waiter.checkout == "/w/second") {
+                    break;
+                }
+            }
+        }
+    }
+    let mut other_ask = exec_ask(1, "/w/other", 3, None);
+    other_ask.class = ExecClass::Gate;
+    other_ask.job.0 = cowshed_core::repository::RepoId::parse("owner/other").unwrap();
+    let other = admission
+        .admit(other_ask)
+        .await
+        .expect("other repository runs");
+    let status = ledger(&socket).await;
+    assert_eq!(status.held, 2, "{status:?}");
+    assert_eq!(
+        status
+            .gate_jobs
+            .iter()
+            .map(|job| job.checkout.as_str())
+            .collect::<Vec<_>>(),
+        ["/w/first", "/w/other"],
+        "{status:?}"
+    );
+    let mut child = Asker::child(first.pool(), 6).await;
+    assert_eq!(child.granted().await, 6);
+    let status = ledger(&socket).await;
+    assert_eq!(status.gate_jobs.len(), 2, "{status:?}");
+    assert_eq!(status.gate_jobs[0].held, 7, "{status:?}");
+    assert_eq!(status.gate_queue[0].checkout, "/w/second", "{status:?}");
+    drop(child);
+    drop(first);
+    let second = second
+        .await
+        .expect("admission task")
+        .expect("next repository gate");
+    assert_eq!(second.tokens(), NonZeroUsize::new(1));
+    let status = ledger(&socket).await;
+    assert_eq!(status.gate_jobs.len(), 2, "{status:?}");
+    assert!(
+        status
+            .gate_jobs
+            .iter()
+            .all(|job| job.checkout != "/w/first"),
+        "{status:?}"
+    );
+    assert!(status.gate_queue.is_empty(), "{status:?}");
+    drop((second, other));
+    while ledger(&socket).await.held != 0 {
+        tokio::task::yield_now().await;
+    }
+    gateway.drain().await.expect("drain");
+    std::fs::remove_dir_all(root).expect("clean repository fixture");
 }
 
 /// A background exec of `checkout`'s job `job`, as a supervisor asks it, from a requester that

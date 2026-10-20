@@ -31,16 +31,6 @@ pub(crate) enum JobserverAdmission {
     Gate,
 }
 
-impl JobserverAdmission {
-    /// The root request's rank: a gate admission is a gate job of its own, its ticket its age.
-    pub(crate) fn rank(self) -> crate::cpu_budget::Rank {
-        match self {
-            Self::Background => crate::cpu_budget::Rank::Background,
-            Self::Gate => crate::cpu_budget::Rank::Gate,
-        }
-    }
-}
-
 /// The fifos of one gateway, in its private runtime directory.
 #[derive(Clone, Debug)]
 pub(crate) struct JobserverFifos {
@@ -174,6 +164,7 @@ pub(crate) enum PoolSource {
     Relay {
         host: crate::cpu_budget::CpuBudget,
         checkout: std::sync::Arc<str>,
+        repo: std::sync::Arc<str>,
         job: crate::cpu_budget::JobAge,
         tokens: std::num::NonZeroUsize,
     },
@@ -241,12 +232,13 @@ impl CpuPool {
             PoolSource::Relay {
                 host,
                 checkout,
+                repo,
                 job,
                 ..
             } => PoolLedger::Host {
                 budget: host,
                 checkout,
-                rank: crate::cpu_budget::Rank::GateTask(job),
+                rank: crate::cpu_budget::Rank::GateTask { repo, job },
             },
             PoolSource::Resident { host, checkout } => PoolLedger::Host {
                 budget: host,

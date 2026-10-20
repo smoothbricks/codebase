@@ -24,7 +24,8 @@
 //! asks here at gate class (`jobserver.rs`), ranked by the gate job's own admission: gate work is
 //! served oldest job first, and within one job in the order its tasks asked, so an older land
 //! takes every returned token its tasks want before a younger land's tasks get more than the
-//! one-token floor that keeps a younger land, like background, from starving.
+//! one-token floor that keeps a younger land in another repository, like background, from starving.
+//! Within a repository only one gate job holds tokens, including its relayed tasks.
 //!
 //! [`Ledger`] is the whole policy as a pure state machine; [`CpuBudget`] is the thin actor that
 //! feeds it requests and departures and answers status.
@@ -42,7 +43,6 @@ use cowshed_gateway_types::{
 use tokio::sync::{mpsc, oneshot};
 
 use crate::disk_lease::{Claim, Ticket};
-use crate::jobserver::JobserverAdmission;
 
 /// How many tokens the host has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,19 +61,44 @@ impl Default for CpuBudgetLimits {
     }
 }
 
-/// The gate job a request serves, as that job's own admission ticket: the smaller ticket is the
-/// older job, and gate-class work is served oldest job first.
+/// The gate job's admission ticket: the smaller ticket is the older job.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct JobAge(Ticket);
 
-/// Where a request stands in the order: its class and, for gate work, the job whose age ranks it.
-#[derive(Clone, Copy, Debug)]
+/// The admitted class: every gate carries its validated repository identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Class {
+    Background,
+    Gate(Arc<str>),
+}
+
+impl Class {
+    fn repo(&self) -> Option<&Arc<str>> {
+        match self {
+            Self::Background => None,
+            Self::Gate(repo) => Some(repo),
+        }
+    }
+
+    pub(crate) fn rank(&self) -> Rank {
+        match self {
+            Self::Background => Rank::Background,
+            Self::Gate(repo) => Rank::Gate(Arc::clone(repo)),
+        }
+    }
+}
+
+/// Where a request stands in the order: its repository and the job whose age ranks it.
+#[derive(Clone, Debug)]
 pub(crate) enum Rank {
     Background,
     /// A gate job's own admission: its ticket is the job's age.
-    Gate,
-    /// A task a gate job relays: it ranks by that job's age, not by when it asked.
-    GateTask(JobAge),
+    Gate(Arc<str>),
+    /// A relayed task keeps both the root gate's repository and its age.
+    GateTask {
+        repo: Arc<str>,
+        job: JobAge,
+    },
 }
 
 /// What a [`Ledger`] transition did, for the actor to carry out: the ticket may start its runner
@@ -86,12 +111,15 @@ pub(crate) struct Grant {
     waited: Duration,
     checkout: Arc<str>,
     claim: Claim,
+    class: Class,
+    job: Ticket,
+    head: Option<(Arc<str>, Ticket)>,
 }
 
 #[derive(Debug)]
 struct Waiter {
     ticket: Ticket,
-    class: JobserverAdmission,
+    class: Class,
     /// The job that ranks it: the gate job it serves, or its own ticket.
     job: Ticket,
     /// The count asked for, as asked.
@@ -110,7 +138,7 @@ impl Waiter {
 #[derive(Debug)]
 struct Holder {
     ticket: Ticket,
-    class: JobserverAdmission,
+    class: Class,
     job: Ticket,
     tokens: usize,
     want: usize,
@@ -139,7 +167,8 @@ struct Checkout {
 ///
 /// Invariants: `free` plus every checkout's `held` is `total`; background-class holders hold at
 /// most `background` together; a checkout is present exactly while it holds or waits; every
-/// ticket in `tickets` is a holder or a waiter of the checkout it names.
+/// ticket in `tickets` is a holder or a waiter of the checkout it names; all gate holders in one
+/// repository belong to one job, including holders in different checkouts.
 #[derive(Debug)]
 pub(crate) struct Ledger {
     total: usize,
@@ -213,12 +242,12 @@ impl Ledger {
 
     /// Grant waiters while tokens are free: gate class oldest job first, background fairest.
     ///
-    /// Gate-class work is ranked by the gate job it serves: the oldest job's wants come first,
-    /// wherever its requests sit in their checkouts' queues, and within one job a waiting task
-    /// takes `min(want, free)` in the order they asked. So a land takes every returned token its
-    /// tasks want before a younger land gets more than its floor, and both before queued
-    /// background work. The work behind the job being served is not starved meanwhile: a
-    /// background checkout, or a younger gate job, that waits holding nothing still gets one token
+    /// Among eligible repository heads, the oldest job's wants come first, wherever its requests
+    /// sit in their checkouts' queues. Within one job a task takes `min(want, free)` in request
+    /// order. A land takes every returned token its tasks want before a younger repository head
+    /// gets more than its floor, and both before queued background. The work behind the job being
+    /// served is not starved: a background checkout, or a younger head of another repository,
+    /// that waits holding nothing still gets one token
     /// first, as long as that work as a whole then still holds less than half the host, so the
     /// job being served and the older ones always hold the larger part.
     ///
@@ -241,6 +270,7 @@ impl Ledger {
             else {
                 return;
             };
+            let head = self.queue_head().map(|(repo, job)| (Arc::clone(repo), job));
             let checkout = self
                 .checkouts
                 .get_mut(&name)
@@ -252,7 +282,7 @@ impl Ledger {
             checkout.held += tokens;
             checkout.running.push(Holder {
                 ticket: waiter.ticket,
-                class: waiter.class,
+                class: waiter.class.clone(),
                 job: waiter.job,
                 tokens,
                 want: waiter.want,
@@ -267,6 +297,9 @@ impl Ledger {
                 waited: now.saturating_duration_since(waiter.asked),
                 checkout: name,
                 claim: waiter.claim,
+                class: waiter.class,
+                job: waiter.job,
+                head,
             });
         }
     }
@@ -279,22 +312,68 @@ impl Ledger {
             .checkouts
             .values()
             .flat_map(|checkout| &checkout.running)
-            .filter(|holder| holder.class == JobserverAdmission::Background)
+            .filter(|holder| holder.class == Class::Background)
             .map(|holder| holder.tokens)
             .sum();
         self.free.min(self.background.saturating_sub(held))
     }
 
-    /// The next grant while gate-class work waits: a starved claimant's one token, else the
-    /// oldest gate job's next waiting task's `min(want, free)`. `None` when no gate-class work
-    /// waits.
-    ///
-    /// The work behind the gate job served now is background and every younger gate job. A
-    /// claimant among it that holds nothing — a background checkout, or a younger gate job — gets
-    /// one token first, oldest request first, while that work as a whole then still holds less
-    /// than half the host. Every grant is whole, so two younger gate jobs each holding their floor
-    /// token wait on nothing the other holds: each runs on its token, and its tasks queue behind
-    /// the older jobs until those stop wanting.
+    /// A running job owns its repository until its last holder leaves. Otherwise the oldest
+    /// queued job is the head. A ticket minted earlier but enqueued late cannot preempt a holder.
+    fn gate_head(&self, repo: &str) -> Option<Ticket> {
+        self.checkouts
+            .values()
+            .flat_map(|checkout| &checkout.running)
+            .filter(|holder| {
+                holder
+                    .class
+                    .repo()
+                    .is_some_and(|name| name.as_ref() == repo)
+            })
+            .map(|holder| holder.job)
+            .min()
+            .or_else(|| {
+                self.checkouts
+                    .values()
+                    .flat_map(|checkout| &checkout.waiting)
+                    .filter(|waiter| {
+                        waiter
+                            .class
+                            .repo()
+                            .is_some_and(|name| name.as_ref() == repo)
+                    })
+                    .map(|waiter| waiter.job)
+                    .min()
+            })
+    }
+
+    fn gate_eligible(&self, waiter: &Waiter) -> bool {
+        waiter
+            .class
+            .repo()
+            .is_some_and(|repo| self.gate_head(repo) == Some(waiter.job))
+    }
+
+    /// The global age head for diagnostics, including a holder with no task currently queued.
+    fn queue_head(&self) -> Option<(&Arc<str>, Ticket)> {
+        self.checkouts
+            .values()
+            .flat_map(|checkout| {
+                checkout
+                    .running
+                    .iter()
+                    .filter_map(|holder| holder.class.repo().map(|repo| (repo, holder.job)))
+                    .chain(
+                        checkout.waiting.iter().filter_map(|waiter| {
+                            waiter.class.repo().map(|repo| (repo, waiter.job))
+                        }),
+                    )
+            })
+            .min_by_key(|(_, job)| *job)
+    }
+
+    /// The next grant while eligible gate-class work waits: a starved claimant's one token, else
+    /// the oldest repository head's next task. A gate behind its own repository head gets no floor.
     fn next_gate(&self) -> Option<Pick> {
         let (name, position, waiter) = self
             .checkouts
@@ -304,7 +383,7 @@ impl Ledger {
                     .waiting
                     .iter()
                     .enumerate()
-                    .filter(|(_, waiter)| waiter.class == JobserverAdmission::Gate)
+                    .filter(|(_, waiter)| self.gate_eligible(waiter))
                     .map(move |(position, waiter)| (name, position, waiter))
             })
             .min_by_key(|(_, _, waiter)| waiter.order())?;
@@ -315,11 +394,11 @@ impl Ledger {
                 .flat_map(|checkout| &checkout.running)
         };
         let behind: usize = holders()
-            .filter(|holder| holder.class == JobserverAdmission::Background || holder.job > head)
+            .filter(|holder| holder.class == Class::Background || holder.job > head)
             .map(|holder| holder.tokens)
             .sum();
         let job_holds = &|job: Ticket| {
-            holders().any(|holder| holder.class == JobserverAdmission::Gate && holder.job == job)
+            holders().any(|holder| holder.class.repo().is_some() && holder.job == job)
         };
         let starved = (2 * (behind + 1) < self.total)
             .then(|| {
@@ -328,9 +407,11 @@ impl Ledger {
                     .flat_map(|(name, checkout)| {
                         let background = (checkout.held == 0)
                             .then(|| {
-                                checkout.waiting.iter().enumerate().find(|(_, waiter)| {
-                                    waiter.class == JobserverAdmission::Background
-                                })
+                                checkout
+                                    .waiting
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, waiter)| waiter.class == Class::Background)
                             })
                             .flatten();
                         let younger_gates =
@@ -339,7 +420,7 @@ impl Ledger {
                                 .iter()
                                 .enumerate()
                                 .filter(move |(_, waiter)| {
-                                    waiter.class == JobserverAdmission::Gate
+                                    self.gate_eligible(waiter)
                                         && waiter.job > head
                                         && !job_holds(waiter.job)
                                 });
@@ -372,11 +453,18 @@ impl Ledger {
         if room == 0 {
             return None;
         }
-        let (name, checkout, head) = self
+        let (name, checkout, position, head) = self
             .checkouts
             .iter()
-            .filter_map(|(name, checkout)| Some((name, checkout, checkout.waiting.front()?)))
-            .min_by_key(|(_, checkout, head)| (checkout.held, head.ticket))?;
+            .filter_map(|(name, checkout)| {
+                let (position, head) = checkout
+                    .waiting
+                    .iter()
+                    .enumerate()
+                    .find(|(_, waiter)| waiter.class == Class::Background)?;
+                Some((name, checkout, position, head))
+            })
+            .min_by_key(|(_, checkout, _, head)| (checkout.held, head.ticket))?;
         let share = (self.background / self.checkouts.len()).max(1);
         let least = head.want.min(share.saturating_sub(checkout.held).max(1));
         let peers_wait = self
@@ -393,7 +481,7 @@ impl Ledger {
         };
         Some(Pick {
             checkout: Arc::clone(name),
-            position: 0,
+            position,
             tokens,
         })
     }
@@ -418,7 +506,7 @@ impl Ledger {
                 checkout
                     .waiting
                     .iter()
-                    .filter(|waiter| waiter.class == JobserverAdmission::Gate)
+                    .filter(|waiter| waiter.class.repo().is_some())
                     .map(move |waiter| (waiter, name))
             })
             .collect();
@@ -429,18 +517,18 @@ impl Ledger {
         for (name, checkout) in &self.checkouts {
             let mut stake = Vec::new();
             for holder in &checkout.running {
-                match holder.class {
-                    JobserverAdmission::Gate => gate_jobs
+                match &holder.class {
+                    Class::Gate(_) => gate_jobs
                         .entry((holder.job, name))
                         .or_default()
                         .push(holder),
-                    JobserverAdmission::Background => stake.push(holder),
+                    Class::Background => stake.push(holder),
                 }
             }
             let waiters: Vec<CpuWaiter> = checkout
                 .waiting
                 .iter()
-                .filter(|waiter| waiter.class == JobserverAdmission::Background)
+                .filter(|waiter| waiter.class == Class::Background)
                 .map(|waiter| CpuWaiter {
                     pid: waiter.claim.pid,
                     command: waiter.claim.command.to_string(),
@@ -520,7 +608,7 @@ enum Message {
         checkout: Arc<str>,
         want: NonZeroUsize,
         claim: Claim,
-        class: JobserverAdmission,
+        class: Class,
         /// The job whose age ranks it.
         job: Ticket,
         granted: oneshot::Sender<usize>,
@@ -592,9 +680,12 @@ impl CpuBudget {
     ) -> (Stake, oneshot::Receiver<usize>) {
         let ticket = self.tickets.fetch_add(1, Ordering::Relaxed);
         let (class, job) = match rank {
-            Rank::Background => (JobserverAdmission::Background, ticket),
-            Rank::Gate => (JobserverAdmission::Gate, ticket),
-            Rank::GateTask(JobAge(job)) => (JobserverAdmission::Gate, job),
+            Rank::Background => (Class::Background, ticket),
+            Rank::Gate(repo) => (Class::Gate(repo), ticket),
+            Rank::GateTask {
+                repo,
+                job: JobAge(job),
+            } => (Class::Gate(repo), job),
         };
         let (granted, receiver) = oneshot::channel();
         let _ = self.messages.send(Message::Ask {
@@ -694,13 +785,20 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             waited,
             checkout,
             claim,
+            class,
+            job,
+            head,
         } in effects.drain(..)
         {
             eprintln!(
-                "cowshed: timing cpu-tokens grant ticket={ticket} tokens={tokens} want={want} waited_ns={} checkout={checkout:?} pid={:?} command={:?}",
+                "cowshed: timing cpu-tokens grant ticket={ticket} tokens={tokens} want={want} waited_ns={} checkout={checkout:?} pid={:?} command={:?} gate_repo={:?} gate_job={:?} head_repo={:?} head_job={:?}",
                 waited.as_nanos(),
                 claim.pid,
                 claim.command,
+                class.repo(),
+                class.repo().map(|_| job),
+                head.as_ref().map(|(repo, _)| repo),
+                head.as_ref().map(|(_, job)| job),
             );
         }
     }
@@ -738,13 +836,7 @@ mod tests {
             checkout: &str,
             want: usize,
         ) -> Vec<(Ticket, usize)> {
-            self.ask_as(
-                ms,
-                ticket,
-                checkout,
-                want,
-                (JobserverAdmission::Background, ticket),
-            )
+            self.ask_as(ms, ticket, checkout, want, (Class::Background, ticket))
         }
 
         /// A gate job's own ask: its ticket is the job's age.
@@ -760,7 +852,7 @@ mod tests {
                 ticket,
                 checkout,
                 want,
-                (JobserverAdmission::Gate, ticket),
+                (Class::Gate(Arc::from(checkout)), ticket),
             )
         }
 
@@ -773,7 +865,13 @@ mod tests {
             checkout: &str,
             want: usize,
         ) -> Vec<(Ticket, usize)> {
-            self.ask_as(ms, ticket, checkout, want, (JobserverAdmission::Gate, job))
+            self.ask_as(
+                ms,
+                ticket,
+                checkout,
+                want,
+                (Class::Gate(Arc::from(checkout)), job),
+            )
         }
 
         fn ask_as(
@@ -782,7 +880,7 @@ mod tests {
             ticket: Ticket,
             checkout: &str,
             want: usize,
-            (class, job): (JobserverAdmission, Ticket),
+            (class, job): (Class, Ticket),
         ) -> Vec<(Ticket, usize)> {
             let now = self.origin + Duration::from_millis(ms);
             self.ledger.ask(
@@ -808,6 +906,22 @@ mod tests {
 
         /// Each grant as `(ticket, tokens)`; its wait is kept in `waited`.
         fn grants(&mut self) -> Vec<(Ticket, usize)> {
+            // Every transition, including a cancellation and a relayed child's release, preserves
+            // one running gate job per repository. Different repositories may run together.
+            let mut owners = HashMap::new();
+            for holder in self
+                .ledger
+                .checkouts
+                .values()
+                .flat_map(|checkout| &checkout.running)
+            {
+                if let Some(repo) = holder.class.repo()
+                    && let Some(previous) = owners.insert(repo, holder.job)
+                {
+                    assert_eq!(previous, holder.job, "two gate jobs hold tokens for {repo}");
+                }
+            }
+            assert!(self.balanced());
             let waited = &mut self.waited;
             self.effects
                 .drain(..)
@@ -1201,5 +1315,54 @@ mod tests {
         // The older land wants nothing more: the older of the younger lands is served next.
         assert_eq!(clock.leave(9, 13), [(21, 3)]);
         assert!(clock.balanced());
+    }
+
+    #[test]
+    fn same_repository_waits_without_a_floor_while_another_repository_runs() {
+        let mut clock = Clock::new(18);
+        let gate = |repo: &str, job| (Class::Gate(Arc::from(repo)), job);
+        assert_eq!(clock.ask_as(0, 1, "first", 1, gate("owner/a", 1)), [(1, 1)]);
+        assert_eq!(
+            clock.ask_as(1, 2, "first", 17, gate("owner/a", 1)),
+            [(2, 17)]
+        );
+        assert_eq!(clock.ask_as(2, 3, "second", 1, gate("owner/a", 3)), []);
+        assert_eq!(clock.ask_as(3, 4, "other", 1, gate("owner/b", 4)), []);
+        assert_eq!(clock.ask_as(4, 5, "first", 17, gate("owner/a", 1)), []);
+        // Only the other repository gets a floor; the first repository's head takes the rest.
+        assert_eq!(clock.leave(5, 2), [(4, 1), (5, 16)]);
+        // A root ending does not release its repository while a relayed task still holds tokens.
+        assert_eq!(clock.leave(6, 1), []);
+        assert_eq!(clock.leave(7, 5), [(3, 1)]);
+        assert_eq!(clock.leave(8, 3), []);
+        assert_eq!(clock.leave(9, 4), []);
+        assert_eq!(clock.status(9).held, 0);
+    }
+
+    #[test]
+    fn blocked_gates_cannot_use_background_room_and_cancellation_preserves_repo_order() {
+        let mut clock = Clock::new(8);
+        let gate = |job| (Class::Gate(Arc::from("owner/a")), job);
+        assert_eq!(clock.ask_as(0, 1, "first", 1, gate(1)), [(1, 1)]);
+        assert_eq!(clock.ask_as(1, 2, "second", 1, gate(2)), []);
+        assert_eq!(clock.ask_as(2, 3, "third", 1, gate(3)), []);
+        // Free tokens cannot start a behind-head gate through the background selector.
+        assert_eq!(clock.ask(3, 4, "background", 1), [(4, 1)]);
+        assert_eq!(clock.leave(4, 2), []);
+        assert_eq!(clock.leave(5, 1), [(3, 1)]);
+        assert_eq!(clock.leave(6, 3), []);
+        assert_eq!(clock.leave(7, 4), []);
+    }
+
+    #[test]
+    fn a_late_enqueued_older_ticket_cannot_preempt_a_running_repository() {
+        let mut clock = Clock::new(8);
+        let gate = |job| (Class::Gate(Arc::from("owner/a")), job);
+        assert_eq!(clock.ask_as(0, 10, "first", 1, gate(10)), [(10, 1)]);
+        assert_eq!(clock.ask_as(1, 5, "late", 1, gate(5)), []);
+        assert_eq!(clock.ask_as(2, 11, "first", 1, gate(10)), [(11, 1)]);
+        assert_eq!(clock.leave(3, 10), []);
+        assert_eq!(clock.leave(4, 11), [(5, 1)]);
+        assert_eq!(clock.leave(5, 5), []);
     }
 }

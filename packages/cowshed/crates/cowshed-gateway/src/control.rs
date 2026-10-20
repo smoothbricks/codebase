@@ -516,7 +516,7 @@ struct JobserverIn {
 }
 
 struct JobserverOptions {
-    admission: crate::jobserver::JobserverAdmission,
+    admission: crate::cpu_budget::Class,
     pool_job: Option<JobserverJobIn>,
     parent_pool: Option<PathBuf>,
 }
@@ -1344,13 +1344,14 @@ async fn hold_jobserver<R, W>(
         // A gate's children rank as the gate job does, by its age, at every return; background
         // children share the grant they were lent.
         let source = match options.admission {
-            crate::jobserver::JobserverAdmission::Gate => crate::jobserver::PoolSource::Relay {
+            crate::cpu_budget::Class::Gate(repo) => crate::jobserver::PoolSource::Relay {
                 host: budget.clone(),
                 checkout,
+                repo,
                 job: stake.job(),
                 tokens: std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
             },
-            crate::jobserver::JobserverAdmission::Background => crate::jobserver::PoolSource::Lent(
+            crate::cpu_budget::Class::Background => crate::jobserver::PoolSource::Lent(
                 std::num::NonZeroUsize::new(tokens).expect("a CPU grant is nonzero"),
             ),
         };
@@ -1790,10 +1791,29 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             } else {
                 None
             };
+            let admission = match class {
+                crate::jobserver::JobserverAdmission::Background => {
+                    crate::cpu_budget::Class::Background
+                }
+                crate::jobserver::JobserverAdmission::Gate => {
+                    let job = pool_job.as_ref().ok_or_else(|| {
+                        ControlError::Encoding(
+                            "a gate requires a private CPU pool and the trusted repository/job identity".to_owned(),
+                        )
+                    })?;
+                    if parent_pool.is_some() {
+                        return Err(ControlError::Encoding(
+                            "a gate is admitted by the host repository queue, never a parentPool"
+                                .to_owned(),
+                        ));
+                    }
+                    crate::cpu_budget::Class::Gate(Arc::from(job.repo_id.as_str()))
+                }
+            };
             (
                 tokens,
                 JobserverOptions {
-                    admission: class,
+                    admission,
                     pool_job,
                     parent_pool: parent_pool.map(PathBuf::from),
                 },
@@ -1802,7 +1822,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
             (
                 serde_json::from_value(value).map_err(encoding)?,
                 JobserverOptions {
-                    admission: crate::jobserver::JobserverAdmission::Background,
+                    admission: crate::cpu_budget::Class::Background,
                     pool_job: None,
                     parent_pool: None,
                 },
