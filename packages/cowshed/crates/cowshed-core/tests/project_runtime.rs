@@ -1118,6 +1118,7 @@ impl ProjectRuntimeHost for FakeHost {
             dry_run: options.dry_run,
             candidates: Vec::new(),
             deferred: Vec::new(),
+            abandoned_refs: Default::default(),
         })
     }
 

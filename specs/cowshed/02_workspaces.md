@@ -1191,14 +1191,16 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    removal that finds a bundle verifying for the same range keeps it instead of writing another. The verified bundle's
    tips are then fetched into main's repository, unforced, as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and
    `refs/cowshed/<ws>/abandoned/<head>/heads/<branch>`, each read back against the tip the bundle advertises, before
-   anything retires: the trash is emptied by `gc --abandoned`, main's repository is not, and keying the namespace by the
-   abandoned head means a later workspace reusing the name never overwrites what an earlier one left. A tip that cannot
-   be kept refuses the abandonment. The report says what keeps the tips (`AbandonedWork.preserved`): `preserved` with
-   each kept ref; `nothingToPreserve` for main's own `--restore --abandon` (below), where main is what is being restored
-   and its bundle is the copy; or `predatesPreservation` for a record an earlier build wrote, which kept no refs and
-   recorded none — the bundle it names was the one copy it made. A measurement's files (`unlandedPaths`) likewise are
-   `named`, or `predatesPaths` for a record from a build that counted commits by patch identity and named no file. A
-   command reporting a predating record warns once on stderr, naming what it does not record (00_overview.md).
+   anything retires: the trash is emptied by `gc --abandoned`, and the refs by any `gc` once main holds every tip by
+   this gate's own measurement, or by their owner's `gc --supersede` (01_storage.md, "Retention"). Keying the namespace
+   by the abandoned head means a later workspace reusing the name never overwrites what an earlier one left. A tip that
+   cannot be kept refuses the abandonment. The report says what keeps the tips (`AbandonedWork.preserved`): `preserved`
+   with each kept ref; `nothingToPreserve` for main's own `--restore --abandon` (below), where main is what is being
+   restored and its bundle is the copy; or `predatesPreservation` for a record an earlier build wrote, which kept no
+   refs and recorded none — the bundle it names was the one copy it made. A measurement's files (`unlandedPaths`)
+   likewise are `named`, or `predatesPaths` for a record from a build that counted commits by patch identity and named
+   no file. A command reporting a predating record warns once on stderr, naming what it does not record
+   (00_overview.md).
 
    Every retirement, abandoned or not, appends a `retire-workspace` line to the project's `deletion-log.jsonl`
    (01_storage.md) once the image is renamed into trash: the head and every local branch tip read before the image went,

@@ -29,7 +29,9 @@
 //!   moment the workspace's repository stops being reachable, and the line records its head and
 //!   every local branch with what keeps each tip — a ref in main's repository, or the target
 //!   that held it. Keeping an abandon bundle's tips before `gc --abandoned` deletes it
-//!   (`keep-abandoned-tips`) records the refs the same way, under the bundle's path.
+//!   (`keep-abandoned-tips`) records the refs the same way, under the bundle's path. Retiring an
+//!   abandonment's refs from main's repository (`retire-abandoned-ref`) records each tip with what
+//!   let it go: the target branch that holds it, or the reason its owner gave for superseding it.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -86,6 +88,8 @@ pub enum DeletionOp {
     RetireWorkspace,
     #[serde(rename = "keep-abandoned-tips")]
     KeepAbandonedTips,
+    #[serde(rename = "retire-abandoned-ref")]
+    RetireAbandonedRef,
 }
 
 impl std::fmt::Display for DeletionOp {
@@ -102,6 +106,7 @@ impl std::fmt::Display for DeletionOp {
             Self::ReleaseBuildVolume => "release-build-volume",
             Self::RetireWorkspace => "retire-workspace",
             Self::KeepAbandonedTips => "keep-abandoned-tips",
+            Self::RetireAbandonedRef => "retire-abandoned-ref",
         };
         formatter.write_str(tag)
     }
@@ -163,6 +168,9 @@ pub enum KeptBy {
         branch: String,
         head: crate::api::dto::GitOid,
     },
+    /// Nothing keeps the tip: its owner retired it as superseded, giving `reason`
+    /// (`gc --supersede`, 01_storage.md).
+    Superseded { reason: String },
 }
 
 /// Best-effort append of a line carrying Git facts, under the same never-fail rule as

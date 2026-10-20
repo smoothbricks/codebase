@@ -29,9 +29,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::api::dto::{
-    BranchLanding, BranchLandings, GitOid, LandingCommits, UnlandedPaths, WorkspaceLanding,
+    AbandonedRefs, AbandonedTip, BranchLanding, BranchLandings, GitOid, LandingCommits,
+    PreservedRef, UnlandedPaths, WorkspaceLanding,
 };
 use crate::git::{ContentNotHeld, GitRepository};
+use crate::metadata::WorkspaceName;
 
 /// The branch a workspace's work has to reach, resolved live, with the object store that holds it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,6 +307,92 @@ pub async fn measure_commits(
         Ok(commits) => commits,
         Err(reason) => LandingCommits::Indeterminate { reason },
     }
+}
+
+/// Every abandonment the target's repository keeps under `refs/cowshed/<ws>/abandoned/<head>/`,
+/// each tip measured against the target exactly as `rm` measures a branch: ancestry, then content
+/// (02_workspaces.md, `rm` step 1). One definition of landed serves both, so a tip that reached
+/// main by cherry-pick or a conflict-resolved pick reads as landed here as it would at `rm`.
+///
+/// The second list names every ref under an `abandoned/` namespace that is not one an abandonment
+/// writes (`HEAD` or `heads/<branch>` under a workspace name and a full head): those are never
+/// measured, so nothing may retire them. A listing that fails is the error, never an empty answer.
+pub async fn abandoned_refs(
+    store_root: &std::sync::Arc<Path>,
+    target: &LandingTarget,
+) -> std::result::Result<(Vec<AbandonedRefs>, Vec<String>), String> {
+    let refs = GitRepository::from_root(store_root, &target.repository)
+        .ref_tips(&["refs/cowshed"])
+        .await
+        .map_err(|error| error.message)?;
+    let mut namespaces: std::collections::BTreeMap<(WorkspaceName, GitOid), Vec<PreservedRef>> =
+        std::collections::BTreeMap::new();
+    let mut unreadable = Vec::new();
+    for (name, tip) in refs {
+        // A name rendered lossily is not the ref's name, and deleting by it would fail every sweep.
+        let name = match String::from_utf8(name) {
+            Ok(name) => name,
+            Err(error) => {
+                let name = String::from_utf8_lossy(error.as_bytes()).into_owned();
+                if name.starts_with("refs/cowshed/") && name.split('/').nth(3) == Some("abandoned")
+                {
+                    unreadable.push(name);
+                }
+                continue;
+            }
+        };
+        let Some(rest) = name.strip_prefix("refs/cowshed/") else {
+            continue;
+        };
+        let mut parts = rest.splitn(4, '/');
+        let (Some(workspace), Some("abandoned")) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let parsed = (|| {
+            let workspace = WorkspaceName::new(workspace).ok()?;
+            let head = GitOid::new(parts.next()?.to_owned()).ok()?;
+            let kept_as = parts.next()?;
+            let short = if kept_as == "HEAD" {
+                String::from("HEAD")
+            } else {
+                kept_as
+                    .strip_prefix("heads/")
+                    .filter(|branch| !branch.is_empty())?
+                    .to_owned()
+            };
+            let tip = GitOid::new(String::from_utf8_lossy(&tip).into_owned()).ok()?;
+            Some((workspace, head, short, tip))
+        })();
+        match parsed {
+            Some((workspace, head, short, tip)) => {
+                namespaces
+                    .entry((workspace, head))
+                    .or_default()
+                    .push(PreservedRef {
+                        name: short,
+                        tip,
+                        reference: name,
+                    });
+            }
+            None => unreadable.push(name),
+        }
+    }
+    let mut measured = Vec::with_capacity(namespaces.len());
+    for ((workspace, head), kept) in namespaces {
+        let mut tips = Vec::with_capacity(kept.len());
+        for kept in kept {
+            let commits = counted(store_root, target, &target.repository, kept.tip.as_str())
+                .await
+                .unwrap_or_else(|reason| LandingCommits::Indeterminate { reason });
+            tips.push(AbandonedTip { kept, commits });
+        }
+        measured.push(AbandonedRefs {
+            workspace,
+            head,
+            tips,
+        });
+    }
+    Ok((measured, unreadable))
 }
 
 /// The two questions of `rm` step 1 (02_workspaces.md), in order: a head the target contains is

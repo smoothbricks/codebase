@@ -70,7 +70,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
     lifecycle-intents.json           # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
     lifecycle-intents.json.lock      # flock held for each read-modify-write of the journal
-    deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released, one per workspace retired and per abandon bundle kept, with Git tips (storage/deletion_log.rs)
+    deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released, one per workspace retired and per abandon bundle kept and per abandoned ref retired, with Git tips (storage/deletion_log.rs)
     main.dmg                         # adopted main image (created here behind a PendingFence sidecar)
     main.dmg.grants.json             # controller-owned grants + detached metadata
     main.dmg.ca.key                  # main's workspace CA private key, 0600
@@ -254,6 +254,7 @@ burden with retention _conventions_, enforced by `cowshed gc`, never by a backgr
 | Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**         | landing/removal is always explicit                                                         |
 | Trash images (`sessions/.trash/…`)           | drained on next `gc`                                                                  | —                                                                                          |
 | Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; their tips are also kept as refs in main's repository     | explicit `cowshed gc --abandoned`                                                          |
+| Abandoned refs (in main's repository)        | retired by every `gc` once main holds each tip, by ancestry or content                | `cowshed gc --supersede <ws>/<head> --reason <one line>`                                   |
 
 - `cowshed gc` evaluates both checkpoint floors independently: it deletes only an unpinned checkpoint that is at least
   14 days old **and** is not among the newest five for that workspace. A user-supplied label creates an explicit pin;
@@ -289,6 +290,19 @@ burden with retention _conventions_, enforced by `cowshed gc`, never by a backgr
   anything is deleted. Keeping them is never hiding them: a plain `gc` reports how many the trash keeps and their
   allocated bytes, `doctor` reports them as an `abandon-bundles` info finding, and `ls --all` names each project's after
   its table. Naming them authorizes nothing; the plain sweep's own plan still never holds one.
+- Abandoned refs are retired by every `gc` once main holds them, so main's repository keeps no ref for work it already
+  has. Each `refs/cowshed/<ws>/abandoned/<head>/` namespace's tips are measured as the `rm` gate measures a branch
+  (02_workspaces.md, `rm` step 1): an ancestor of main's branch, or every file its commits change already as main has
+  it, whatever history, patch identity or conflict resolution got it there. A namespace main holds every tip of is
+  deleted ref by ref (`update-ref -d <ref> <tip>`, so a ref moved since it was measured is refused, never lost) and
+  journaled as one `retire-abandoned-ref` deletion-log line naming each tip and the branch and head that hold it
+  (`{"by":"target",…}`). Every other namespace is kept: `gc` reports it, `doctor` names it as an `abandoned-refs` info
+  finding with each tip's count of commits main does not hold, and `ls --all` names it after its table. Its owner lets
+  one go with `cowshed gc --supersede <ws>/<head> --reason "<one line>"`, which retires that namespace whatever main
+  holds and journals the reason (`{"by":"superseded","reason":…}`); a blank, whitespace-only or multi-line reason, or a
+  namespace main's repository does not keep, is refused. `--dry-run` reports both and deletes nothing. When main's
+  repository cannot be measured, nothing is retired and the report says why; a supersession then refuses. A ref under an
+  `abandoned/` namespace that no abandonment writes is reported and never touched.
 - Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
   one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
   trash image and empty mountpoint. Preview and execution validate the repository, workspace, incarnation, checkpoint

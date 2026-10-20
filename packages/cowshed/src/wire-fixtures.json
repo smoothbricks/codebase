@@ -32,6 +32,72 @@
   },
   "GcReport": {
     "dryRun": {
+      "abandonedRefs": {
+        "kept": [
+          {
+            "head": "7777777777777777777777777777777777777777",
+            "tips": [
+              {
+                "commits": {
+                  "behind": 4,
+                  "landed": 0,
+                  "state": "measured",
+                  "targetBranch": "main",
+                  "targetHead": "89abcdef0123456789abcdef0123456789abcdef",
+                  "unlanded": 2,
+                  "unlandedPaths": {
+                    "kind": "named",
+                    "paths": [
+                      {
+                        "change": {
+                          "kind": "missing"
+                        },
+                        "path": "src/spike.rs"
+                      }
+                    ]
+                  }
+                },
+                "kept": {
+                  "name": "HEAD",
+                  "reference": "refs/cowshed/cs-spike/abandoned/7777777777777777777777777777777777777777/HEAD",
+                  "tip": "7777777777777777777777777777777777777777"
+                }
+              },
+              {
+                "commits": {
+                  "reason": "the tip is not in main's repository",
+                  "state": "indeterminate"
+                },
+                "kept": {
+                  "name": "spike",
+                  "reference": "refs/cowshed/cs-spike/abandoned/7777777777777777777777777777777777777777/heads/spike",
+                  "tip": "8888888888888888888888888888888888888888"
+                }
+              }
+            ],
+            "workspace": "cs-spike"
+          }
+        ],
+        "retired": [
+          {
+            "by": {
+              "kind": "landed",
+              "targetBranch": "main",
+              "targetHead": "89abcdef0123456789abcdef0123456789abcdef"
+            },
+            "head": "6666666666666666666666666666666666666666",
+            "refs": [
+              {
+                "name": "HEAD",
+                "reference": "refs/cowshed/cs-landed/abandoned/6666666666666666666666666666666666666666/HEAD",
+                "tip": "6666666666666666666666666666666666666666"
+              }
+            ],
+            "workspace": "cs-landed"
+          }
+        ],
+        "unreadable": ["refs/cowshed/cs-spike/abandoned/notes"]
+      },
       "candidates": [
         {
           "bytes": 1024,
@@ -109,6 +175,27 @@
       "retainedPinned": 1
     },
     "swept": {
+      "abandonedRefs": {
+        "kept": [],
+        "retired": [
+          {
+            "by": {
+              "kind": "superseded",
+              "reason": "replaced by the gate rewrite"
+            },
+            "head": "7777777777777777777777777777777777777777",
+            "refs": [
+              {
+                "name": "HEAD",
+                "reference": "refs/cowshed/cs-spike/abandoned/7777777777777777777777777777777777777777/HEAD",
+                "tip": "7777777777777777777777777777777777777777"
+              }
+            ],
+            "workspace": "cs-spike"
+          }
+        ],
+        "unmeasured": "main is detached"
+      },
       "candidates": [],
       "deferred": [
         {

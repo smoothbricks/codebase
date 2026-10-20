@@ -560,6 +560,7 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
             reason: GcReason::ExpiredCheckpoint,
         }],
         deferred: Vec::new(),
+        abandoned_refs: AbandonedRefSweep::default(),
     };
     assert_eq!(
         serde_json::to_value(gc).expect("gc JSON"),
@@ -576,7 +577,8 @@ fn doctor_gc_and_empty_results_have_exact_shapes() {
                 "bytes":4096,
                 "reason":"expiredCheckpoint"
             }],
-            "deferred": []
+            "deferred": [],
+            "abandonedRefs": {"retired": [], "kept": []}
         })
     );
     assert_eq!(serde_json::to_value(EmptyResult {}).unwrap(), json!({}));
@@ -1012,6 +1014,7 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         serde_json::to_value(GcOptions {
             dry_run: true,
             abandoned: false,
+            supersede: None,
         })
         .unwrap(),
         json!({"dryRun":true,"abandoned":false})
@@ -1021,8 +1024,39 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
         GcOptions {
             dry_run: false,
             abandoned: true,
+            supersede: None,
         }
     );
+    assert_eq!(
+        serde_json::from_value::<GcOptions>(json!({
+            "supersede": {
+                "workspace": "raven",
+                "head": "1111111111111111111111111111111111111111",
+                "reason": "replaced by the gate rewrite"
+            }
+        }))
+        .unwrap()
+        .supersede
+        .map(|supersede| supersede.reason),
+        Some(SupersededReason::new("replaced by the gate rewrite").unwrap())
+    );
+    for blank in ["", "  \t", "two\nlines"] {
+        assert!(
+            SupersededReason::new(blank).is_err(),
+            "{blank:?} is no reason"
+        );
+        assert!(
+            serde_json::from_value::<GcOptions>(json!({
+                "supersede": {
+                    "workspace": "raven",
+                    "head": "1111111111111111111111111111111111111111",
+                    "reason": blank
+                }
+            }))
+            .is_err(),
+            "the wire refuses {blank:?} as a reason too"
+        );
+    }
 
     assert_eq!(
         serde_json::from_value::<AttachOptions>(json!({})).unwrap(),

@@ -674,7 +674,9 @@ Interrupting `rm --abandon` removes both before the command exits; a retry reval
 Bundles stay until `cowshed gc --abandoned`, but they are never out of sight: a plain `cowshed gc` says how many the
 trash keeps and their bytes, `cowshed doctor` reports them as an `abandon-bundles` finding, and `cowshed ls --all` names
 each project's after its table. `gc --abandoned` keeps each bundle's tips in main the same way before deleting it —
-including a bundle an older cowshed left without refs — and refuses, deleting nothing, when one cannot be kept.
+including a bundle an older cowshed left without refs — and refuses, deleting nothing, when one cannot be kept. The refs
+in main go when main holds every tip — any `cowshed gc` retires them then — or when you supersede the work
+(`cowshed gc`, below).
 
 `cowshed rm main --restore` is the reverse of `adopt`: it puts the pre-adoption checkout back and unbinds the project.
 Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.
@@ -1617,6 +1619,19 @@ instead ([APFS ownership](../../../specs/cowshed/01a_apfs.md#ownership-identity-
 
 Deletes retired and orphaned images and stale mountpoint dirs, prunes expired checkpoints, and reports what it freed.
 Safe to run anytime; `rm`, `land`, and `restore` also run it opportunistically.
+
+Every `gc` also retires the refs `rm --abandon` kept in main, `refs/cowshed/<ws>/abandoned/<head>/`, once main holds
+every tip, by ancestry or by content: a cherry-pick, a squash or a pick whose conflict was resolved counts, as it does
+for `rm`. Each retirement is a `retire-abandoned-ref` line in the project's deletion log. `gc` keeps the rest and names
+each with how many commits main does not hold; `cowshed doctor` reports them as `abandoned-refs` findings and
+`cowshed ls --all` after its table. When that work is no longer wanted, say why and let it go:
+
+```sh
+cowshed gc --supersede raven/<head> --reason "rewritten as the gate refactor"
+```
+
+The reason is one line and may not be blank; the deletion log records it beside each tip. `--dry-run` reports what would
+be retired and deletes nothing.
 
 An image under `sessions/` without its grants sidecar is skipped by other commands with a named warning; `doctor`
 reports it, and `gc` can reclaim it as an orphan after mount and lock checks. `gc` keeps going when an individual

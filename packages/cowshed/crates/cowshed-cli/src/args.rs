@@ -1,7 +1,9 @@
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, value_parser};
 use cowshed_apfs::DiskTool;
-use cowshed_core::api::{ExecClass, ExecScope, GrantDelta};
+use cowshed_core::api::{
+    AbandonedRefSupersession, ExecClass, ExecScope, GitOid, GrantDelta, SupersededReason,
+};
 use cowshed_core::metadata::{EgressMode, EgressRule, MetadataError, WorkspaceName};
 use cowshed_core::repository::RepoId;
 use std::ffi::{OsStr, OsString};
@@ -499,10 +501,11 @@ pub struct RekeyArgs {
     pub workspace: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GcArgs {
     pub dry_run: bool,
     pub abandoned: bool,
+    pub supersede: Option<AbandonedRefSupersession>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -888,7 +891,12 @@ fn cli_command() -> ClapCommand {
                 .arg(flag("dry-run")),
         )
         .subcommand(leaf("rekey").arg(positional("workspace", 0..=1)))
-        .subcommand(leaf("gc").args([flag("dry-run"), flag("abandoned")]))
+        .subcommand(leaf("gc").args([
+            flag("dry-run"),
+            flag("abandoned"),
+            value("supersede"),
+            value("reason"),
+        ]))
         .subcommand(leaf("push").arg(positional("workspace", 0..=1)).args([
             value("branch"),
             value("expected-workspace-incarnation"),
@@ -3053,6 +3061,7 @@ const GC: CommandSpec = CommandSpec {
         "`abandonedBundle` — under `--abandoned` only, the `<ws>-<tip>.bundle` files in `sessions/.trash/` that `rm --abandon` verified and left behind, holding commits main does not contain, which is why no plain `gc` ever deletes one. A plain `gc` still says how many the trash keeps and their allocated bytes, as `doctor` and `ls --all` do, so they are never out of sight. Before deleting any, `--abandoned` fetches each bundle's tips into main's repository as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and `.../heads/<branch>` — the refs `rm --abandon` already wrote, written again for a bundle an older cowshed left without them — and records them in the project's deletion log; a bundle it cannot keep that way stops the whole sweep, naming it, and nothing is deleted. `--dry-run --abandoned` lists them with their real allocated bytes first.",
         "A bare mountpoint whose only entry is root's `0700` `.fseventsd` is retained aside by an atomic, same-parent `.root-held-<uuid>` rename instead of deleting privileged debris. A mounted filesystem, symlink substitution, rename collision or another entry (hidden included) is never overwritten or moved. The retained log is named with a quoted privileged cleanup hint in `deferred`; it does not fail collection or make doctor unhealthy. Dry-run and doctor report it as information without renaming.",
         "Also collects build volumes no checkout links and superseded seeds. A running job's shared hold or an unfinished create/fork in the lifecycle intent journal defers release; otherwise a refused unforced unmount gets bounded grace, then is forced if needed, naming each initial holder's pid and command. Both gc and opportunistic collection in rm/land say why they skip volumes, and one failed release does not hide later candidates. Dry-run reports these reasons without changing any mount or image.",
+        "Every gc also retires the refs `rm --abandon` keeps in main's repository, `refs/cowshed/<ws>/abandoned/<head>/`, once main holds every tip by ancestry or by content — the measurement `rm` uses, so a cherry-pick, squash or conflict-resolved pick counts — and journals each in the project's deletion log as `retire-abandoned-ref`. Every other abandonment is kept and named with how many commits main does not hold, here, in `doctor` and in `ls --all`. Its owner lets one go with `--supersede <ws>/<head> --reason <one line>`, and the reason is journaled; nothing else ever deletes those refs.",
     ],
     options: &[
         Opt {
@@ -3063,13 +3072,63 @@ const GC: CommandSpec = CommandSpec {
             spelling: "--abandoned",
             meaning: "also reclaim the `sessions/.trash/<ws>-<tip>.bundle` files `rm --abandon` kept, after keeping each one's tips in main's repository under `refs/cowshed/<ws>/abandoned/<head>/`; they are reclaimed only when you ask",
         },
+        Opt {
+            spelling: "--supersede <ws>/<head>",
+            meaning: "retire the abandoned refs `refs/cowshed/<ws>/abandoned/<head>/` though main does not hold them, recording why in the project's deletion log; requires --reason",
+        },
+        Opt {
+            spelling: "--reason <one line>",
+            meaning: "why the work --supersede names is no longer needed: one line, not blank",
+        },
     ],
 };
 
 fn parse_gc(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &GC;
+    let supersede = match (os(matches, "supersede"), os(matches, "reason")) {
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(UsageError::new(
+                "--supersede needs --reason: say in one line why the work is no longer needed",
+                USAGE,
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(UsageError::new(
+                "--reason only explains a --supersede",
+                USAGE,
+            ));
+        }
+        (Some(namespace), Some(reason)) => {
+            let namespace = namespace
+                .to_str()
+                .ok_or_else(|| UsageError::new("--supersede names <ws>/<head> in UTF-8", USAGE))?;
+            let (workspace, head) = namespace.split_once('/').ok_or_else(|| {
+                UsageError::new(
+                    format!("--supersede names <ws>/<head>, got `{namespace}`"),
+                    USAGE,
+                )
+            })?;
+            let reason = reason
+                .into_string()
+                .map_err(|_| UsageError::new("--reason must be UTF-8", USAGE))
+                .and_then(|reason| {
+                    SupersededReason::new(reason)
+                        .map_err(|error| UsageError::new(error.to_string(), USAGE))
+                })?;
+            Some(AbandonedRefSupersession {
+                workspace: WorkspaceName::new(workspace)
+                    .map_err(|error| UsageError::new(error.to_string(), USAGE))?,
+                head: GitOid::new(head.to_owned())
+                    .map_err(|error| UsageError::new(error.to_string(), USAGE))?,
+                reason,
+            })
+        }
+    };
     Ok(Command::Gc(GcArgs {
         dry_run: flagged(matches, "dry-run"),
         abandoned: flagged(matches, "abandoned"),
+        supersede,
     }))
 }
 
@@ -3352,6 +3411,55 @@ mod tests {
             &["reseed", "raven", "extra"],
             &["reseed", "raven", "--from", "main", "--from", "lane"],
             &["reseed", "raven", "--refresh"],
+        ] {
+            assert!(parse_args(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn gc_supersedes_one_named_abandonment_only_with_a_one_line_reason() {
+        let head = "1".repeat(40);
+        let namespace = format!("raven/{head}");
+        assert_eq!(
+            parse_args([
+                "gc",
+                "--supersede",
+                &namespace,
+                "--reason",
+                "replaced by the rewrite"
+            ])
+            .unwrap()
+            .command,
+            Command::Gc(GcArgs {
+                supersede: Some(AbandonedRefSupersession {
+                    workspace: WorkspaceName::new("raven").unwrap(),
+                    head: GitOid::new(head.clone()).unwrap(),
+                    reason: SupersededReason::new("replaced by the rewrite").unwrap(),
+                }),
+                ..GcArgs::default()
+            })
+        );
+        for refused in [
+            &["gc", "--supersede", &namespace][..],
+            &["gc", "--reason", "replaced"],
+            &["gc", "--supersede", &namespace, "--reason", ""],
+            &["gc", "--supersede", &namespace, "--reason", "  \t"],
+            &["gc", "--supersede", &namespace, "--reason", "two\nlines"],
+            &["gc", "--supersede", "raven", "--reason", "replaced"],
+            &[
+                "gc",
+                "--supersede",
+                "raven/not-an-oid",
+                "--reason",
+                "replaced",
+            ],
+            &[
+                "gc",
+                "--supersede",
+                &format!("not/a/name/{head}"),
+                "--reason",
+                "replaced",
+            ],
         ] {
             assert!(parse_args(refused).is_err(), "{refused:?}");
         }

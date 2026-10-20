@@ -1908,6 +1908,7 @@ where
                 .gc(GcOptions {
                     dry_run: args.dry_run,
                     abandoned: args.abandoned,
+                    supersede: args.supersede,
                 })
                 .await?;
             for deferred in &report.deferred {
@@ -1919,6 +1920,7 @@ where
                     ))
                     .map_err(output_error)?;
             }
+            emit_abandoned_refs(output, &report)?;
             if json {
                 output.success(report.clone()).map_err(output_error)?;
             } else {
@@ -2060,6 +2062,7 @@ where
                     .gc(GcOptions {
                         dry_run: false,
                         abandoned: false,
+                        supersede: None,
                     })
                     .await?;
                 output
@@ -3606,15 +3609,113 @@ async fn emit_project_listing<W: Write, E: Write>(
                     .map(|workspace| landing_row(Some(&project.repo_id), workspace))
             }))
             .collect::<Vec<_>>();
-        return emit_aligned_rows(output, &rows);
-    }
-    if args.landed {
-        return emit_bare_names(
+        emit_aligned_rows(output, &rows)?;
+    } else if args.landed {
+        emit_bare_names(
             output,
             projects.iter().flat_map(|project| &project.workspaces),
-        );
+        )?;
+    } else {
+        emit_project_workspaces_table(output, &projects)?;
     }
-    emit_project_workspaces_table(output, &projects)
+    emit_kept_abandoned_refs(output, &projects).await
+}
+
+/// Name, after `ls --all`'s table, every abandonment each attached project's main keeps refs
+/// for because main does not hold it (01_storage.md); gc retires the rest, so they go unnamed.
+async fn emit_kept_abandoned_refs<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    projects: &[ProjectWorkspaces],
+) -> Result<()> {
+    // `ls` reads the host's projects, so its Git runs for the host store.
+    let roots = cowshed_core::storage::bootstrap::CanonicalRoots::global();
+    let host_store = roots.shared_store();
+    for project in projects {
+        let Some(main) = project.workspaces.iter().find(|workspace| {
+            workspace.role == WorkspaceRole::Main && workspace.state != WorkspaceState::Detached
+        }) else {
+            continue;
+        };
+        let measured = match cowshed_core::landing::resolve_target(
+            host_store,
+            &main.mount,
+            LANDING_TARGET_BRANCH,
+        )
+        .await
+        {
+            Ok(target) => cowshed_core::landing::abandoned_refs(host_store, &target).await,
+            Err(reason) => Err(reason),
+        };
+        match measured {
+            Ok((abandonments, unreadable)) => {
+                for kept in abandonments.iter().filter(|refs| !refs.landed()) {
+                    output
+                        .guidance(&format!(
+                            "{}: {kept}; {}",
+                            project.repo_id,
+                            kept.supersede_hint()
+                        ))
+                        .map_err(output_error)?;
+                }
+                for reference in unreadable {
+                    output
+                        .warning(&format!(
+                            "{}: {reference} is under an abandoned/ namespace no abandonment writes",
+                            project.repo_id
+                        ))
+                        .map_err(output_error)?;
+                }
+            }
+            Err(reason) => output
+                .warning(&format!(
+                    "{}: the abandoned refs its main keeps cannot be measured: {reason}",
+                    project.repo_id
+                ))
+                .map_err(output_error)?,
+        }
+    }
+    Ok(())
+}
+/// What a gc did with the abandonments main's repository keeps: each it retired (or, in a dry
+/// run, would) and why, and each it keeps with what main lacks of it and how to let it go.
+fn emit_abandoned_refs<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    report: &GcReport,
+) -> Result<()> {
+    let sweep = &report.abandoned_refs;
+    let verb = if report.dry_run {
+        "would retire"
+    } else {
+        "retired"
+    };
+    for retired in &sweep.retired {
+        output
+            .guidance(&format!(
+                "{verb} refs/cowshed/{}/abandoned/{}/: {}",
+                retired.workspace, retired.head, retired.by
+            ))
+            .map_err(output_error)?;
+    }
+    for kept in &sweep.kept {
+        output
+            .guidance(&format!("kept {kept}; {}", kept.supersede_hint()))
+            .map_err(output_error)?;
+    }
+    for unreadable in &sweep.unreadable {
+        output
+            .warning(&format!(
+                "{unreadable} is under an abandoned/ namespace no abandonment writes; gc leaves it"
+            ))
+            .map_err(output_error)?;
+    }
+    if let Some(reason) = &sweep.unmeasured {
+        output
+            .warning(&format!(
+                "gc kept every abandoned ref: main's repository cannot be measured: {reason}"
+            ))
+            .map_err(output_error)?;
+    }
+    Ok(())
 }
 
 /// Name what each project's trash keeps of `rm --abandon`: the recovery bundles of commits that

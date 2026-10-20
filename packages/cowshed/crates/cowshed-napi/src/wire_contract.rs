@@ -24,20 +24,21 @@ use std::{
 
 use cowshed_core::{
     api::{
-        AbandonedPreservation, AbandonedWork, BinaryData, BranchLandings, CarrySide,
-        CheckpointInfo, CommandArg, CpuMicros, CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode,
-        EgressRule, ExecClass, ExecScope, ExitStatus, Finding, FindingSeverity, GcCandidate,
-        GcDeferred, GcReason, GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId,
-        JobInfo, JobLeafAttribution, JobProcessLeaf, JobResourceSample, JobState,
-        JobStreamWatermark, JobVolumeUsage, LandReport, LandingCommits, OneCoreCpuPercent,
-        OneCoreCpuPermille, OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, PreservedRef,
-        ProcessCoverage, ProcessCoverageGap, ProtectedOutput, PushReport, RebaseBuildVolume,
-        RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult,
-        ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamBytes, StreamInfo,
-        StreamLines, TraceContext, TraceId, UnlandedChange, UnlandedPath, UnlandedPaths,
-        UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta,
-        WallMicros, WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName,
-        WorkspacePath, WorkspaceRole, WorkspaceState,
+        AbandonedPreservation, AbandonedRefRetirement, AbandonedRefSweep, AbandonedRefs,
+        AbandonedTip, AbandonedWork, BinaryData, BranchLandings, CarrySide, CheckpointInfo,
+        CommandArg, CpuMicros, CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule,
+        ExecClass, ExecScope, ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred,
+        GcReason, GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId, JobInfo,
+        JobLeafAttribution, JobProcessLeaf, JobResourceSample, JobState, JobStreamWatermark,
+        JobVolumeUsage, LandReport, LandingCommits, OneCoreCpuPercent, OneCoreCpuPermille,
+        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, PreservedRef, ProcessCoverage,
+        ProcessCoverageGap, ProtectedOutput, PushReport, RebaseBuildVolume, RebaseCarrySkip,
+        RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult, ResizeVolume,
+        RetiredAbandonedRefs, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamBytes,
+        StreamInfo, StreamLines, SupersededReason, TraceContext, TraceId, UnlandedChange,
+        UnlandedPath, UnlandedPaths, UsageReconciliation, UtcTimestamp, VolumeUnavailable,
+        VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation, WorkspaceInfo,
+        WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -967,6 +968,59 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
         })
         .collect(),
         deferred: Vec::new(),
+        abandoned_refs: AbandonedRefSweep {
+            retired: vec![RetiredAbandonedRefs {
+                workspace: WorkspaceName::new("cs-landed").expect("fixture workspace"),
+                head: oid("6666666666666666666666666666666666666666"),
+                refs: vec![PreservedRef {
+                    name: "HEAD".to_owned(),
+                    tip: oid("6666666666666666666666666666666666666666"),
+                    reference: "refs/cowshed/cs-landed/abandoned/6666666666666666666666666666666666666666/HEAD".to_owned(),
+                }],
+                by: AbandonedRefRetirement::Landed {
+                    target_branch: "main".to_owned(),
+                    target_head: oid("89abcdef0123456789abcdef0123456789abcdef"),
+                },
+            }],
+            kept: vec![AbandonedRefs {
+                workspace: WorkspaceName::new("cs-spike").expect("fixture workspace"),
+                head: oid("7777777777777777777777777777777777777777"),
+                tips: vec![
+                    AbandonedTip {
+                        kept: PreservedRef {
+                            name: "HEAD".to_owned(),
+                            tip: oid("7777777777777777777777777777777777777777"),
+                            reference: "refs/cowshed/cs-spike/abandoned/7777777777777777777777777777777777777777/HEAD".to_owned(),
+                        },
+                        commits: LandingCommits::Measured {
+                            target_branch: "main".to_owned(),
+                            target_head: oid("89abcdef0123456789abcdef0123456789abcdef"),
+                            unlanded: 2,
+                            landed: 0,
+                            behind: 4,
+                            unlanded_paths: UnlandedPaths::Named {
+                                paths: vec![UnlandedPath {
+                                    path: "src/spike.rs".to_owned(),
+                                    change: UnlandedChange::Missing,
+                                }],
+                            },
+                        },
+                    },
+                    AbandonedTip {
+                        kept: PreservedRef {
+                            name: "spike".to_owned(),
+                            tip: oid("8888888888888888888888888888888888888888"),
+                            reference: "refs/cowshed/cs-spike/abandoned/7777777777777777777777777777777777777777/heads/spike".to_owned(),
+                        },
+                        commits: LandingCommits::Indeterminate {
+                            reason: "the tip is not in main's repository".to_owned(),
+                        },
+                    },
+                ],
+            }],
+            unreadable: vec!["refs/cowshed/cs-spike/abandoned/notes".to_owned()],
+            unmeasured: None,
+        },
     };
     let gc_swept = GcReport {
         examined: 7,
@@ -980,6 +1034,24 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             path: PathBuf::from("/Users/fixture/Dev/.cowshed/gc/6"),
             diagnostic: "the image could not be detached before the deadline".to_owned(),
         }],
+        abandoned_refs: AbandonedRefSweep {
+            retired: vec![RetiredAbandonedRefs {
+                workspace: WorkspaceName::new("cs-spike").expect("fixture workspace"),
+                head: oid("7777777777777777777777777777777777777777"),
+                refs: vec![PreservedRef {
+                    name: "HEAD".to_owned(),
+                    tip: oid("7777777777777777777777777777777777777777"),
+                    reference: "refs/cowshed/cs-spike/abandoned/7777777777777777777777777777777777777777/HEAD".to_owned(),
+                }],
+                by: AbandonedRefRetirement::Superseded {
+                    reason: SupersededReason::new("replaced by the gate rewrite")
+                        .expect("fixture reason"),
+                },
+            }],
+            kept: Vec::new(),
+            unreadable: Vec::new(),
+            unmeasured: Some("main is detached".to_owned()),
+        },
     };
 
     let doctor_healthy = DoctorReport {

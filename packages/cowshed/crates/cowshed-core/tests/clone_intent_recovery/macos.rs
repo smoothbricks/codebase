@@ -1161,6 +1161,222 @@ fn resolved(directory: &Path, revision: &str) -> String {
         .to_owned()
 }
 
+/// Main's repository keeps no ref for work it already has (01_storage.md, "Retention"). Every gc
+/// retires an abandonment main holds by content — here a pick whose conflict main resolved to the
+/// workspace's own text, which neither ancestry nor patch identity sees — and journals it; it keeps
+/// one main lacks, which doctor names with its count. Its owner lets that one go only by naming it
+/// with a one-line reason, which the deletion log records.
+#[tokio::test]
+async fn gc_retires_the_abandoned_refs_main_holds_and_supersedes_the_rest_only_with_a_reason() {
+    let fixture = Fixture::new("abandoned-refs");
+    let runtime = fixture.adopt().await;
+    let listed = fixture
+        .call(&runtime, "project.list", json!({ "repoId": fixture.repo }))
+        .await
+        .expect("list workspaces");
+    let main = PathBuf::from(
+        listed
+            .as_array()
+            .and_then(|workspaces| {
+                workspaces
+                    .iter()
+                    .find(|workspace| workspace["info"]["role"] == "main")
+            })
+            .and_then(|workspace| workspace["info"]["mount"].as_str())
+            .unwrap_or_else(|| panic!("main's mount: {listed}")),
+    );
+    let mut heads = Vec::new();
+    for (workspace, file, text) in [
+        ("picked", "tracked", "picked\n"),
+        ("spike", "spike", "spike\n"),
+    ] {
+        let minted = fixture
+            .mint(&runtime, workspace, ForkOptions::default())
+            .await
+            .expect("mint workspace");
+        let mount = PathBuf::from(minted["info"]["mount"].as_str().expect("workspace mount"));
+        fs::write(mount.join(file), text).expect("workspace change");
+        git(&mount, &["add", file]);
+        git(&mount, &["commit", "-q", "-m", workspace]);
+        heads.push(head(&mount));
+    }
+    runtime.shutdown().await.expect("stop the creating runtime");
+    let (picked, spike) = (heads[0].clone(), heads[1].clone());
+    for workspace in ["picked", "spike"] {
+        let rm = fixture
+            .open_removing(workspace)
+            .await
+            .expect("open removal");
+        fixture
+            .call(
+                &rm,
+                "coordinator.destroy",
+                json!({
+                    "repoId": fixture.repo, "workspace": workspace,
+                    "options": RemoveOptions { abandon: true, ..RemoveOptions::default() },
+                }),
+            )
+            .await
+            .expect("--abandon keeps the unlanded tips in main");
+        rm.shutdown().await.expect("stop the abandoning runtime");
+    }
+    let picked_ref = format!("refs/cowshed/picked/abandoned/{picked}/HEAD");
+    let spike_ref = format!("refs/cowshed/spike/abandoned/{spike}/HEAD");
+    // Main changes the line itself, then takes the workspace's text resolving the conflict: the
+    // content lands under a commit whose diff no patch identity matches.
+    fs::write(main.join("tracked"), b"main\n").expect("main's own change");
+    git(&main, &["commit", "-q", "-am", "main's own change"]);
+    fs::write(main.join("tracked"), b"picked\n").expect("resolved pick");
+    git(
+        &main,
+        &["commit", "-q", "-am", "pick picked, conflict resolved"],
+    );
+    let main_head = head(&main);
+    let landed = json!({ "kind": "landed", "targetBranch": "main", "targetHead": main_head });
+
+    let gc = fixture.gc().await;
+    let sweep = async |options: Value| {
+        fixture
+            .call(
+                &gc,
+                "coordinator.gc",
+                json!({ "repoId": fixture.repo, "options": options }),
+            )
+            .await
+    };
+    let preview = sweep(json!({ "dryRun": true }))
+        .await
+        .expect("gc --dry-run");
+    assert_eq!(
+        preview["abandonedRefs"]["retired"][0]["workspace"], "picked",
+        "{preview}"
+    );
+    assert_eq!(
+        preview["abandonedRefs"]["retired"][0]["by"], landed,
+        "{preview}"
+    );
+    assert_eq!(
+        resolved(&main, &picked_ref),
+        picked,
+        "a dry run deletes nothing"
+    );
+
+    let swept = sweep(json!({})).await.expect("gc");
+    let report = &swept["abandonedRefs"];
+    assert_eq!(
+        report["retired"].as_array().map(Vec::len),
+        Some(1),
+        "{swept}"
+    );
+    assert_eq!(report["retired"][0]["by"], landed, "{swept}");
+    assert!(!has_ref(&main, &picked_ref), "gc retired {picked_ref}");
+    let retired = deletion_log(&fixture, "retire-abandoned-ref", "picked");
+    assert_eq!(retired["git"]["head"], json!(picked), "{retired}");
+    assert_eq!(
+        retired["git"]["tips"][0]["kept"],
+        json!({ "by": "target", "branch": "main", "head": main_head }),
+        "{retired}"
+    );
+    assert_eq!(report["kept"].as_array().map(Vec::len), Some(1), "{swept}");
+    assert_eq!(report["kept"][0]["workspace"], "spike", "{swept}");
+    assert_eq!(
+        report["kept"][0]["tips"][0]["commits"]["unlanded"], 1,
+        "{swept}"
+    );
+    assert_eq!(
+        resolved(&main, &spike_ref),
+        spike,
+        "gc keeps work main lacks"
+    );
+
+    let doctor = fixture
+        .call(&gc, "coordinator.doctor", json!({ "repoId": fixture.repo }))
+        .await
+        .expect("doctor");
+    let named = doctor["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter(|finding| finding["code"] == "abandoned-refs")
+        .collect::<Vec<_>>();
+    assert_eq!(named.len(), 1, "{doctor}");
+    let message = named[0]["message"].as_str().expect("message");
+    assert!(
+        message.contains(&format!("refs/cowshed/spike/abandoned/{spike}/"))
+            && message.contains("carries 1 commit main does not hold"),
+        "{doctor}"
+    );
+    assert!(
+        named[0]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains(&format!("cowshed gc --supersede spike/{spike}"))),
+        "{doctor}"
+    );
+
+    for reason in ["", "  \t", "two\nlines"] {
+        let refusal = sweep(json!({
+            "supersede": { "workspace": "spike", "head": spike, "reason": reason }
+        }))
+        .await
+        .expect_err("a supersession needs a one-line reason");
+        assert!(refusal.message.contains("superseded reason"), "{refusal:?}");
+    }
+    let refusal = sweep(json!({
+        "supersede": { "workspace": "picked", "head": picked, "reason": "landed already" }
+    }))
+    .await
+    .expect_err("gc already retired picked's refs");
+    assert_eq!(
+        refusal.code,
+        cowshed_core::ErrorCode::Conflict,
+        "{refusal:?}"
+    );
+    assert!(
+        refusal.message.contains(&format!(
+            "keeps no refs under refs/cowshed/picked/abandoned/{picked}/"
+        )),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        resolved(&main, &spike_ref),
+        spike,
+        "a refused supersession deletes nothing"
+    );
+
+    let reason = "the spike is replaced by the gate rewrite";
+    let superseded = sweep(json!({
+        "supersede": { "workspace": "spike", "head": spike, "reason": reason }
+    }))
+    .await
+    .expect("gc --supersede");
+    assert_eq!(
+        superseded["abandonedRefs"]["retired"][0]["by"],
+        json!({ "kind": "superseded", "reason": reason }),
+        "{superseded}"
+    );
+    assert!(!has_ref(&main, &spike_ref), "the owner retired {spike_ref}");
+    let retired = deletion_log(&fixture, "retire-abandoned-ref", "spike");
+    assert_eq!(
+        retired["git"]["tips"][0]["kept"],
+        json!({ "by": "superseded", "reason": reason }),
+        "{retired}"
+    );
+    gc.shutdown().await.expect("stop gc");
+}
+
+/// Whether `reference` names a commit in the repository at `directory`.
+fn has_ref(directory: &Path, reference: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(directory)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output_locked()
+        .expect("git process")
+        .status
+        .success()
+}
+
 /// The kernel claim on a new workspace's port block lasts until its image publication is
 /// complete and no longer (05_gateway.md): from then on the image owns the block, and another
 /// process's gateway reconcile installing the workspace's session must find no claim of the

@@ -6522,6 +6522,158 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         Ok(())
     }
 
+    /// What `gc` does with the abandonments main's repository keeps under
+    /// `refs/cowshed/<ws>/abandoned/<head>/` (02_workspaces.md, `rm` step 1; 01_storage.md): one
+    /// main holds every tip of — by ancestry or content, the `rm` gate's landed — is retired, and so
+    /// is the one `supersede` names, whatever main holds; every other one is kept and reported. Only
+    /// `retire` deletes anything, so a dry run and doctor read the same answer without acting on it.
+    ///
+    /// A main that cannot be measured keeps every ref and the report says why: no
+    /// ref is ever retired on an unanswered question. Superseding refuses instead, since its caller
+    /// asked for that one retirement by name and must not read silence as done.
+    async fn sweep_abandoned_refs(
+        &self,
+        supersede: Option<&crate::api::dto::AbandonedRefSupersession>,
+        retire: bool,
+    ) -> Result<crate::api::dto::AbandonedRefSweep> {
+        use crate::api::dto::{AbandonedRefRetirement, AbandonedRefSweep, RetiredAbandonedRefs};
+
+        let store_root = self.git.store_root();
+        let main = self.main_containment()?;
+        let measured =
+            match crate::landing::resolve_target(store_root, &main.mount, &main.branch).await {
+                Ok(target) => crate::landing::abandoned_refs(store_root, &target)
+                    .await
+                    .map(|(measured, unreadable)| (target, measured, unreadable)),
+                Err(reason) => Err(reason),
+            };
+        let (target, measured, unreadable) = match (measured, supersede) {
+            (Ok(measured), _) => measured,
+            (Err(reason), Some(supersede)) => {
+                return Err(CowshedError::conflict(
+                    format!(
+                        "cannot supersede refs/cowshed/{}/abandoned/{}/: main's repository cannot be \
+                         read: {reason}",
+                        supersede.workspace, supersede.head
+                    ),
+                    "attach main, then retry: cowshed doctor",
+                ));
+            }
+            (Err(reason), None) => {
+                return Ok(AbandonedRefSweep {
+                    unmeasured: Some(reason),
+                    ..AbandonedRefSweep::default()
+                });
+            }
+        };
+        if let Some(supersede) = supersede
+            && !measured
+                .iter()
+                .any(|refs| refs.workspace == supersede.workspace && refs.head == supersede.head)
+        {
+            return Err(CowshedError::conflict(
+                format!(
+                    "main's repository keeps no refs under refs/cowshed/{}/abandoned/{}/",
+                    supersede.workspace, supersede.head
+                ),
+                "cowshed doctor names every abandonment main keeps",
+            ));
+        }
+        let mut sweep = AbandonedRefSweep {
+            unreadable,
+            ..AbandonedRefSweep::default()
+        };
+        for refs in measured {
+            let by = match supersede {
+                Some(supersede)
+                    if supersede.workspace == refs.workspace && supersede.head == refs.head =>
+                {
+                    AbandonedRefRetirement::Superseded {
+                        reason: supersede.reason.clone(),
+                    }
+                }
+                _ if refs.landed() => AbandonedRefRetirement::Landed {
+                    target_branch: target.branch().to_owned(),
+                    target_head: target.tip().clone(),
+                },
+                _ => {
+                    sweep.kept.push(refs);
+                    continue;
+                }
+            };
+            if retire {
+                self.retire_abandoned_refs(&main.mount, &refs, &by).await?;
+            }
+            sweep.retired.push(RetiredAbandonedRefs {
+                workspace: refs.workspace,
+                head: refs.head,
+                refs: refs.tips.into_iter().map(|tip| tip.kept).collect(),
+                by,
+            });
+        }
+        Ok(sweep)
+    }
+
+    /// Delete one abandonment's refs from main's repository, each only if it still holds the tip
+    /// measured (`update-ref -d <ref> <tip>`), then journal the retirement with each tip and what
+    /// let it go (`retire-abandoned-ref`).
+    async fn retire_abandoned_refs(
+        &self,
+        main_root: &Path,
+        refs: &crate::api::dto::AbandonedRefs,
+        by: &crate::api::dto::AbandonedRefRetirement,
+    ) -> Result<()> {
+        use crate::api::dto::AbandonedRefRetirement;
+        use crate::storage::deletion_log::{GitTips, KeptBy, KeptTip};
+
+        let store_root = self.git.store_root();
+        for tip in &refs.tips {
+            run_git(
+                store_root,
+                main_root,
+                [
+                    "update-ref",
+                    "-d",
+                    tip.kept.reference.as_str(),
+                    tip.kept.tip.as_str(),
+                ],
+            )
+            .await?;
+        }
+        let kept = match by {
+            AbandonedRefRetirement::Landed {
+                target_branch,
+                target_head,
+            } => KeptBy::Target {
+                branch: target_branch.clone(),
+                head: target_head.clone(),
+            },
+            AbandonedRefRetirement::Superseded { reason } => KeptBy::Superseded {
+                reason: reason.as_str().to_owned(),
+            },
+        };
+        let namespace = refs.namespace();
+        crate::storage::deletion_log::log_git_tips(
+            &self.layout.project().project_root,
+            crate::storage::deletion_log::DeletionOp::RetireAbandonedRef,
+            refs.workspace.as_str(),
+            &main_root.join(&namespace),
+            GitTips {
+                head: refs.head.clone(),
+                tips: refs
+                    .tips
+                    .iter()
+                    .map(|tip| KeptTip {
+                        name: tip.kept.name.clone(),
+                        tip: tip.kept.tip.clone(),
+                        kept: kept.clone(),
+                    })
+                    .collect(),
+            },
+        );
+        Ok(())
+    }
+
     /// Keep every abandon bundle in `bundles` in the repository at `repository`, or refuse naming
     /// each one that could not be kept: a partial pass would read as complete, so nothing that
     /// follows deletes a bundle unless all of them are kept.
@@ -12023,6 +12175,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         )
         .await?;
         if options.dry_run {
+            let abandoned_refs = self
+                .sweep_abandoned_refs(options.supersede.as_ref(), false)
+                .await?;
             let freed_bytes = candidates
                 .iter()
                 .try_fold(0_u64, |sum, candidate| sum.checked_add(candidate.bytes))
@@ -12045,6 +12200,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .chain(plan.root_held_mountpoints().iter().map(root_held_deferred))
                     .collect(),
                 candidates: candidates.into_iter().chain(build.candidates).collect(),
+                abandoned_refs,
             });
         }
         // Old build state a refresh moved aside and did not live to delete (`discard`): gc is
@@ -12113,6 +12269,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .collect();
         self.keep_abandon_bundles(&self.main_containment()?.mount, &bundles)
             .await?;
+        // Refs go before the trash does: an abandonment main holds needs neither its refs nor its
+        // bundle, and a supersession that refuses (no such refs) has deleted nothing yet.
+        let abandoned_refs = self
+            .sweep_abandoned_refs(options.supersede.as_ref(), true)
+            .await?;
         let report = timed_async("gc", "substrate", self.substrate.execute_gc(plan))
             .await
             .map_err(native_storage_error)?;
@@ -12144,6 +12305,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             freed_bytes: report.freed_bytes.saturating_add(build.freed_bytes),
             dry_run: false,
             candidates: candidates.into_iter().chain(build.candidates).collect(),
+            abandoned_refs,
             deferred: report
                 .deferred
                 .into_iter()
@@ -13709,6 +13871,38 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 "gc-preview",
                 crate::api::dto::FindingSeverity::Error,
                 native_storage_error(error),
+            )),
+        }
+        // Abandonments main's repository still keeps for work main lacks: each is named with what
+        // main does not hold, so its owner lands it or supersedes it (01_storage.md). Measured the
+        // way gc measures, so doctor never names one the next gc would retire.
+        match self.sweep_abandoned_refs(None, false).await {
+            Ok(sweep) => {
+                for kept in &sweep.kept {
+                    findings.push(crate::api::dto::Finding {
+                        code: "abandoned-refs".into(),
+                        severity: crate::api::dto::FindingSeverity::Info,
+                        message: kept.to_string(),
+                        hint: kept.supersede_hint(),
+                        path: Some(self.main_containment()?.mount),
+                    });
+                }
+                if let Some(reason) = sweep.unmeasured {
+                    findings.push(crate::api::dto::Finding {
+                        code: "abandoned-refs".into(),
+                        severity: crate::api::dto::FindingSeverity::Info,
+                        message: format!(
+                            "the abandoned refs main keeps cannot be measured: {reason}"
+                        ),
+                        hint: "attach main, then cowshed doctor".into(),
+                        path: None,
+                    });
+                }
+            }
+            Err(error) => findings.push(native_finding(
+                "abandoned-refs",
+                crate::api::dto::FindingSeverity::Error,
+                error,
             )),
         }
         // Every clone of main copies main's extent map on its first write, so the count predicts

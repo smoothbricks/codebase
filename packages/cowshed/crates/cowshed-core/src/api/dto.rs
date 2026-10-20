@@ -78,6 +78,8 @@ pub const MAX_JOB_TAIL_BYTES: usize = MAX_INLINE_OUTPUT_BYTES;
 pub enum DtoError {
     #[error("job id must be in 1..={MAX_JOB_ID}, got {0}")]
     InvalidJobId(u64),
+    #[error("a superseded reason is one non-empty line, got {0:?}")]
+    InvalidSupersededReason(String),
     #[error("invalid git object id {0:?}")]
     InvalidGitOid(String),
     #[error("invalid UTC timestamp {0:?}")]
@@ -1075,6 +1077,9 @@ pub struct GcReport {
     pub dry_run: bool,
     pub candidates: Vec<GcCandidate>,
     pub deferred: Vec<GcDeferred>,
+    /// The abandonments main's repository keeps under `refs/cowshed/<ws>/abandoned/`: every sweep
+    /// retires those main holds (02_workspaces.md, `rm` step 1).
+    pub abandoned_refs: AbandonedRefSweep,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2893,6 +2898,26 @@ impl BranchName {
     }
 }
 
+/// Why an abandonment's kept tips no longer need keeping, said by their owner: one line, not blank.
+/// It is the record a `gc --supersede` leaves in the deletion log for commits main never held.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SupersededReason(String);
+
+impl SupersededReason {
+    pub fn new(value: impl Into<String>) -> Result<Self, DtoError> {
+        let value = value.into();
+        if value.trim().is_empty() || value.contains(['\n', '\r']) {
+            Err(DtoError::InvalidSupersededReason(value))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GitRef(String);
 
@@ -2935,6 +2960,7 @@ macro_rules! string_domain_serde {
 
 string_domain_serde!(BranchName);
 string_domain_serde!(GitRef);
+string_domain_serde!(SupersededReason);
 
 #[cfg_attr(any(), serde(rename_all = "camelCase"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3175,13 +3201,16 @@ pub struct RemoveOptions {
     pub abandon: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct GcOptions {
     pub dry_run: bool,
     /// Also reclaim the project trash's abandon bundles — `sessions/.trash/<ws>-<tip>.bundle` —
     /// once main's repository keeps each one's tips (01_storage.md). Never implied.
     pub abandoned: bool,
+    /// Retire one abandonment's refs though main does not hold them, recording the reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersede: Option<AbandonedRefSupersession>,
 }
 
 /// Authorization for removing a whole adopted project (`Coordinator::remove_project`). `force` and
@@ -3942,6 +3971,132 @@ pub struct PreservedRef {
     pub tip: GitOid,
     /// The full ref name in main's repository that holds `tip`.
     pub reference: String,
+}
+
+/// One abandonment's tips as main's repository keeps them, under
+/// `refs/cowshed/<workspace>/abandoned/<head>/`, each measured against main the way `rm` measures a
+/// branch (02_workspaces.md, `rm` step 1).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AbandonedRefs {
+    pub workspace: WorkspaceName,
+    pub head: GitOid,
+    pub tips: Vec<AbandonedTip>,
+}
+
+impl AbandonedRefs {
+    /// The namespace every tip of this abandonment lives under.
+    pub fn namespace(&self) -> String {
+        format!("refs/cowshed/{}/abandoned/{}", self.workspace, self.head)
+    }
+
+    /// Whether main holds every tip, by ancestry or content: nothing is lost by retiring them.
+    pub fn landed(&self) -> bool {
+        self.tips.iter().all(|tip| tip.commits.fully_landed())
+    }
+
+    /// The owner's verb that lets this abandonment go though main does not hold it.
+    pub fn supersede_hint(&self) -> String {
+        format!(
+            "land it, or: cowshed gc --supersede {}/{} --reason \"<why>\"",
+            self.workspace, self.head
+        )
+    }
+}
+
+/// The namespace and, per tip, how many commits main does not hold, or why that is unmeasured.
+impl fmt::Display for AbandonedRefs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/ keeps abandoned work:", self.namespace())?;
+        for (index, tip) in self.tips.iter().enumerate() {
+            let separator = if index == 0 { " " } else { "; " };
+            match &tip.commits {
+                LandingCommits::Measured { unlanded, .. } => write!(
+                    formatter,
+                    "{separator}{} at {} carries {unlanded} commit{} main does not hold",
+                    tip.kept.name,
+                    tip.kept.tip,
+                    if *unlanded == 1 { "" } else { "s" }
+                )?,
+                LandingCommits::Indeterminate { reason } => write!(
+                    formatter,
+                    "{separator}{} at {} is unmeasured: {reason}",
+                    tip.kept.name, tip.kept.tip
+                )?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One kept tip and what main holds of it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AbandonedTip {
+    pub kept: PreservedRef,
+    pub commits: LandingCommits,
+}
+
+/// An abandonment `gc` retired from main's repository, and what authorized it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetiredAbandonedRefs {
+    pub workspace: WorkspaceName,
+    pub head: GitOid,
+    pub refs: Vec<PreservedRef>,
+    pub by: AbandonedRefRetirement,
+}
+
+/// What lets an abandonment's refs go.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum AbandonedRefRetirement {
+    /// Main's `target_branch` at `target_head` holds every tip, by ancestry or content.
+    #[serde(rename_all = "camelCase")]
+    Landed {
+        target_branch: String,
+        target_head: GitOid,
+    },
+    /// The owner said the work is superseded; main may not hold it.
+    Superseded { reason: SupersededReason },
+}
+
+/// Why the refs went: what main holds them at, or the owner's reason.
+impl fmt::Display for AbandonedRefRetirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Landed {
+                target_branch,
+                target_head,
+            } => write!(formatter, "{target_branch} at {target_head} holds it"),
+            Self::Superseded { reason } => write!(formatter, "superseded: {}", reason.as_str()),
+        }
+    }
+}
+
+/// What one `gc` did with the abandonments main's repository keeps: those it retired (or, in a dry
+/// run, would retire), those it kept because main does not hold them, and refs under an
+/// `abandoned/` namespace it could not read as one, which it never touches.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AbandonedRefSweep {
+    pub retired: Vec<RetiredAbandonedRefs>,
+    pub kept: Vec<AbandonedRefs>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<String>,
+    /// Why main's repository could not be measured at all; nothing was retired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmeasured: Option<String>,
+}
+
+/// `gc --supersede <workspace>/<head> --reason <one line>`: retire that abandonment's refs though main
+/// does not hold them, recording why.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AbandonedRefSupersession {
+    pub workspace: WorkspaceName,
+    pub head: GitOid,
+    pub reason: SupersededReason,
 }
 
 /// What `cowshed rm` destroyed beyond the workspace image itself.

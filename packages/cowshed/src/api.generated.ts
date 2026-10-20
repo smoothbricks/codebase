@@ -16,6 +16,62 @@ export type AbandonedPreservation =
   | { readonly kind: 'predatesPreservation' };
 
 /**
+ * What lets an abandonment's refs go.
+ */
+export type AbandonedRefRetirement =
+  | ({ readonly kind: 'landed' } & {
+      readonly targetBranch: string;
+      readonly targetHead: GitOid;
+    })
+  | ({ readonly kind: 'superseded' } & {
+      readonly reason: SupersededReason;
+    });
+
+/**
+ * `gc --supersede <workspace>/<head> --reason <one line>`: retire that abandonment's refs though main
+ * does not hold them, recording why.
+ */
+export type AbandonedRefSupersession = {
+  readonly workspace: WorkspaceName;
+  readonly head: GitOid;
+  readonly reason: SupersededReason;
+};
+
+/**
+ * What one `gc` did with the abandonments main's repository keeps: those it retired (or, in a dry
+ * run, would retire), those it kept because main does not hold them, and refs under an
+ * `abandoned/` namespace it could not read as one, which it never touches.
+ */
+export type AbandonedRefSweep = {
+  readonly retired: ReadonlyArray<RetiredAbandonedRefs>;
+  readonly kept: ReadonlyArray<AbandonedRefs>;
+  readonly unreadable?: ReadonlyArray<string>;
+  /**
+   * Why main's repository could not be measured at all; nothing was retired.
+   */
+  readonly unmeasured?: string;
+};
+
+/**
+ * One abandonment's tips as main's repository keeps them, under
+ * `refs/cowshed/<workspace>/abandoned/<head>/`, each measured against main the way `rm` measures a
+ * branch (02_workspaces.md, `rm` step 1).
+ */
+export type AbandonedRefs = {
+  readonly workspace: WorkspaceName;
+  readonly head: GitOid;
+  readonly tips: ReadonlyArray<AbandonedTip>;
+};
+
+/**
+ * One kept tip and what main holds of it.
+ */
+export type AbandonedTip = {
+  readonly kept: PreservedRef;
+  readonly commits: LandingCommits;
+};
+
+/**
  * The commits a `--abandon` removal destroyed, and where they are kept.
  *
  * Every field is what a reader needs to *undo* the abandonment: the tip that is gone, the branch
@@ -1011,6 +1067,10 @@ export type GcOptions = {
    * once main's repository keeps each one's tips (01_storage.md). Never implied.
    */
   readonly abandoned?: boolean;
+  /**
+   * Retire one abandonment's refs though main does not hold them, recording the reason.
+   */
+  readonly supersede?: AbandonedRefSupersession;
 };
 
 export type GcReason =
@@ -1038,6 +1098,11 @@ export type GcReport = {
   readonly dryRun: boolean;
   readonly candidates: ReadonlyArray<GcCandidate>;
   readonly deferred: ReadonlyArray<GcDeferred>;
+  /**
+   * The abandonments main's repository keeps under `refs/cowshed/<ws>/abandoned/`: every sweep
+   * retires those main holds (02_workspaces.md, `rm` step 1).
+   */
+  readonly abandonedRefs: AbandonedRefSweep;
 };
 
 export type GcRequest = {
@@ -2312,6 +2377,16 @@ export type RestoreRequest = {
 };
 
 /**
+ * An abandonment `gc` retired from main's repository, and what authorized it.
+ */
+export type RetiredAbandonedRefs = {
+  readonly workspace: WorkspaceName;
+  readonly head: GitOid;
+  readonly refs: ReadonlyArray<PreservedRef>;
+  readonly by: AbandonedRefRetirement;
+};
+
+/**
  * Why a `Conflict` is safe to retry unchanged: the call planned against state a concurrent
  * operation changed before it acted, and changed nothing itself. Retrying is the remedy; no
  * other repair is needed.
@@ -2618,6 +2693,12 @@ export type StreamInfoRef = {
  * no `\n` ended.
  */
 export type StreamLines = number & tags.Type<'uint64'> & tags.Maximum<9007199254740991>;
+
+/**
+ * Why an abandonment's kept tips no longer need keeping, said by their owner: one line, not blank.
+ * It is the record a `gc --supersede` leaves in the deletion log for commits main never held.
+ */
+export type SupersededReason = string;
 
 /**
  * The workspace supervisors that served before the daemon started and that it has not finished
