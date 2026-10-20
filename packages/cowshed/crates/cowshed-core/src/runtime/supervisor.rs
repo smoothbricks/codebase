@@ -2113,16 +2113,31 @@ impl SpawnSink for SystemSpawnSink {
         // Warm hosts serve commands under a workspace `.envrc`; a bare workspace keeps one-shot
         // spawns for argv jobs.
         if let (Some(_), Some(shells)) = (&envrc_directory, self.shells.as_mut()) {
+            // The activated PATH is the shell's, set inside the sandbox: unknown here.
+            if let Some(program) = argv.first() {
+                refuse_unstartable(program, &cwd, None)?;
+            }
             return shells.spawn(
                 pooled(super::shell_job::HostCommand::Argv(argv), environment),
                 events,
             );
         }
-        let plan = one_shot_plan(sandbox, profile, cwd, argv)?;
         let mut environment = environment.child(&request.env);
         // The grant's pool, count and jobserver are the authority's, laid over whatever the
         // caller named.
         environment.extend(request.cpu.environment(&request.env));
+        if let Some(program) = argv.first() {
+            // Shell activation, when the profile has one, sets PATH inside the sandbox.
+            let path = sandbox
+                .capabilities
+                .contribution
+                .shell
+                .is_none()
+                .then(|| environment.get(OsStr::new("PATH")))
+                .flatten();
+            refuse_unstartable(program, &cwd, path.map(OsString::as_os_str))?;
+        }
+        let plan = one_shot_plan(sandbox, profile, cwd, argv)?;
         spawn_fenced(
             sandboxed_command(&plan, &environment),
             request.job_id,
@@ -2153,6 +2168,7 @@ fn host_gate_command(request: &ProcessSpawnRequest, cwd: &Path) -> Result<tokio:
             request.job_id.get()
         )));
     };
+    refuse_unstartable(program, cwd, request.env.get("PATH").map(OsStr::new))?;
     let mut command = tokio::process::Command::new(program);
     command
         .env_clear()
@@ -2162,6 +2178,19 @@ fn host_gate_command(request: &ProcessSpawnRequest, cwd: &Path) -> Result<tokio:
         .envs(request.cpu.environment(&request.env))
         .env("PWD", cwd);
     Ok(command)
+}
+
+/// Refuse an argv command whose program, `#!` interpreter or `env` name is proven absent, naming
+/// the missing one (`command_start.rs`): `sandbox-exec` would report any of them as the program
+/// itself. `path` is the job's PATH, `None` when shell activation sets it inside the sandbox.
+fn refuse_unstartable(program: &OsStr, cwd: &Path, path: Option<&OsStr>) -> Result<()> {
+    match super::command_start::unstartable(program, cwd, path) {
+        None => Ok(()),
+        Some(missing) => Err(CowshedError::not_found(
+            missing.to_string(),
+            "create the missing file, or name a program and interpreter the job's PATH holds",
+        )),
+    }
 }
 
 /// Spawn `command` as a job's one-shot leader: in a process group of its own, at `nice`, reaped
@@ -7851,6 +7880,63 @@ mod workspace_toolchain_tests {
                 .join(".cowshed/tools/bin/bash")
                 .to_str()
                 .expect("utf-8 path"),
+        );
+        std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
+    }
+
+    /// `sandbox-exec` reports a script whose `#!` interpreter is absent as its own failure:
+    /// "execvp() of './run' failed: No such file or directory", exit 71, for a script that exists
+    /// and is executable. The production spawn refuses it first and names the interpreter.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_script_whose_interpreter_is_absent_is_refused_naming_the_interpreter() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = scratch("absent-interpreter");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
+        std::fs::create_dir_all(root.join("home")).expect("home");
+        std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        std::fs::write(
+            mount.join(".cowshed/ca.pem"),
+            b"-----BEGIN CERTIFICATE-----\nWORKSPACE\n-----END CERTIFICATE-----\n",
+        )
+        .expect("workspace CA");
+        let script = mount.join("run");
+        std::fs::write(&script, "#!/nonexistent/cowshed-shell\nexit 0\n").expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let sandbox = sandbox_at(&mount);
+        let config = WorkspaceSupervisorConfig::default();
+        let request = ProcessSpawnRequest {
+            authority: config.authority,
+            job_id: JobId::new(1).expect("static job id"),
+            command: SpawnCommand::Argv(vec![OsString::from("./run")]),
+            cwd: mount.clone(),
+            env: BTreeMap::new(),
+            policy: SandboxPolicy::render(sandbox.clone()).expect("render"),
+            mode: crate::api::dto::RunSandboxMode::ReadWrite,
+            scope: ExecScope::Workspace,
+            cpu: CpuPlacement {
+                held: None,
+                pool: PathBuf::from("/pool/p.sock"),
+                nice: 0,
+            },
+        };
+        let (events, _received) = mpsc::channel(16);
+        let spawned = SystemSpawnSink::default().spawn(request, events).await;
+        let Err(refused) = spawned else {
+            panic!(
+                "the script was spawned; sandbox-exec then reports its interpreter as the script"
+            );
+        };
+        assert_eq!(refused.code, crate::ErrorCode::NotFound);
+        assert!(
+            refused
+                .message
+                .contains("exists, but its interpreter /nonexistent/cowshed-shell"),
+            "{}",
+            refused.message
         );
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }

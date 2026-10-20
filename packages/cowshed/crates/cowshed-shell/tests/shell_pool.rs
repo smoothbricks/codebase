@@ -781,10 +781,14 @@ async fn host_controller_each_command_has_its_own_cwd_env_streams_status_and_std
     .ok();
     assert_eq!(echoed.stdout, "piped input");
 
+    // Proven absent before the spawn: the supervisor refuses it (not-found, wrapper code 102)
+    // and names the program, instead of the host's exec failing 127.
     let missing = run(&handle, request(&["/no/such/program"])).await;
-    assert_eq!(missing.info.exit, Some(ExitStatus::Exited { code: 127 }));
+    assert_eq!(missing.info.exit, Some(ExitStatus::Exited { code: 102 }));
     assert!(
-        missing.stderr.contains("/no/such/program"),
+        missing
+            .stderr
+            .contains("/no/such/program does not exist, so the command did not start"),
         "{}",
         missing.stderr
     );

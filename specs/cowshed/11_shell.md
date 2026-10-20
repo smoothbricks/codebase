@@ -55,6 +55,17 @@ it does not mean the caller may reap processes whose parent is another process. 
 identity-fenced exit watch while the member is running, then wait for that member's actual exit event. The actual parent
 alone reaps its children; the command leader stays unreaped until release, and the independent host must remain usable.
 
+**A command that cannot start is named.** A failed `execvp` names the program it was given, whatever was missing:
+macOS's `sandbox-exec` prints `execvp() of 'tooling/codegraph' failed: No such file or directory` and exits 71 both when
+that script is absent and when it exists and is executable but its `#!` interpreter is not there. So before spawning an
+argv command, in a one-shot child, a warm host or a host gate, the supervisor follows the links the kernel will: the
+program (relative to the cwd, or looked up on the job's PATH), the interpreter its `#!` line names, and the name an
+`env` interpreter looks up on that PATH. The first one proven absent (`ENOENT` or `ENOTDIR`) refuses the spawn as
+not-found (wrapper exit 102), naming it on the job's stderr. Only absence is judged: a path the supervisor cannot
+inspect, an unreadable script, `env` with options, and any name looked up on a PATH that shell activation sets inside
+the sandbox are the kernel's to decide, so this never becomes a second sandbox. Nothing rewrites the command: the kernel
+still runs the interpreter, and `$0` and `BASH_SOURCE` stay the script's.
+
 **Process identity and signal ownership.** The process that creates a command's group observes its leader's immutable
 birth identity before anything can reap it, including a leader that exits immediately. One-shot commands and activation
 hosts are direct children held by a parent-owned reap/signal fence. A job's leader is observed exiting **without
