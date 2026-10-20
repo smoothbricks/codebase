@@ -237,45 +237,80 @@ pub struct Recorded {
     pub uninspected: Vec<io::Error>,
 }
 
-/// Replace the ledger at `path` with these `(job id, group leader)` pairs and the `inherited`
-/// unresolved groups not seen released. One that cannot be inspected is carried as it is, so the
-/// current jobs' groups are recorded whatever an inherited group's inspection does.
-pub fn record(
-    path: &Path,
-    groups: &[(u64, GroupLeader)],
-    inherited: &[UnresolvedGroup],
-) -> io::Result<Recorded> {
-    let mut carried = Vec::with_capacity(inherited.len());
-    let mut uninspected = Vec::new();
-    for group in inherited {
-        match group.still_held() {
-            Ok(false) => {}
-            Ok(true) => carried.push(*group),
-            Err(error) => {
-                carried.push(*group);
-                uninspected.push(error);
+/// The two paths of the supervisor's atomic group publication, prepared once when it starts.
+/// No group state is retained here: every publication borrows the actor's current records.
+pub struct Recorder {
+    path: PathBuf,
+    temporary: PathBuf,
+}
+
+impl Recorder {
+    pub fn new(path: PathBuf) -> Self {
+        let temporary = path.with_extension(format!("groups.{}", std::process::id()));
+        Self { path, temporary }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Replace the ledger with the current groups and inherited unresolved groups not seen
+    /// released. An inspection failure keeps its group and is reported to the supervisor.
+    pub fn record<I>(&self, groups: I, inherited: &[UnresolvedGroup]) -> io::Result<Recorded>
+    where
+        I: Iterator<Item = (u64, GroupLeader)> + Clone,
+    {
+        let mut carried = Vec::with_capacity(inherited.len());
+        let mut uninspected = Vec::new();
+        for group in inherited {
+            match group.still_held() {
+                Ok(false) => {}
+                Ok(true) => carried.push(*group),
+                Err(error) => {
+                    carried.push(*group);
+                    uninspected.push(error);
+                }
             }
         }
+        let ledger = Publication {
+            supervisor: std::process::id(),
+            groups: Groups(groups),
+            ended: false,
+            unresolved: &carried,
+        };
+        publish(&self.path, &self.temporary, &ledger)?;
+        Ok(Recorded {
+            carried,
+            uninspected,
+        })
     }
-    let ledger = Ledger {
-        supervisor: std::process::id(),
-        ended: false,
-        groups: groups
-            .iter()
-            .map(|&(job_id, leader)| Group {
-                job_id,
-                pgid: leader.pgid,
-                leader_start: Some(leader.start),
-                leader_birth: None,
-            })
-            .collect(),
-        unresolved: carried.clone(),
-    };
-    replace(path, &ledger)?;
-    Ok(Recorded {
-        carried,
-        uninspected,
-    })
+}
+
+/// The write view preserves Ledger's field order and omission rules without owning its arrays.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Publication<'a, G> {
+    supervisor: u32,
+    groups: G,
+    ended: bool,
+    #[serde(skip_serializing_if = "<[UnresolvedGroup]>::is_empty")]
+    unresolved: &'a [UnresolvedGroup],
+}
+
+struct Groups<I>(I);
+
+impl<I> Serialize for Groups<I>
+where
+    I: Iterator<Item = (u64, GroupLeader)> + Clone,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.clone().map(|(job_id, leader)| Group {
+            job_id,
+            pgid: leader.pgid,
+            leader_start: Some(leader.start),
+            leader_birth: None,
+        }))
+    }
 }
 
 fn still_held(groups: &[UnresolvedGroup]) -> io::Result<Vec<UnresolvedGroup>> {
@@ -289,10 +324,14 @@ fn still_held(groups: &[UnresolvedGroup]) -> io::Result<Vec<UnresolvedGroup>> {
 }
 
 fn replace(path: &Path, ledger: &Ledger) -> io::Result<()> {
-    let bytes = serde_json::to_vec(ledger).map_err(io::Error::other)?;
     let temporary = path.with_extension(format!("groups.{}", std::process::id()));
-    std::fs::write(&temporary, bytes)?;
-    std::fs::rename(&temporary, path)
+    publish(path, &temporary, ledger)
+}
+
+fn publish(path: &Path, temporary: &Path, ledger: &impl Serialize) -> io::Result<()> {
+    let bytes = serde_json::to_vec(ledger).map_err(io::Error::other)?;
+    std::fs::write(temporary, bytes)?;
+    std::fs::rename(temporary, path)
 }
 
 /// Whose ledger may be acted on.
@@ -1566,7 +1605,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    use super::{GroupLeader, Writer, end_recorded, ledger_path, names_groups, record, take_lost};
+    use super::{GroupLeader, Writer, end_recorded, ledger_path, names_groups, take_lost};
     #[cfg(target_os = "macos")]
     use cowshed_os::fork_lock::Run as _;
     use cowshed_os::fork_lock::Spawn as _;
@@ -1817,7 +1856,9 @@ mod tests {
             .unwrap();
         assert_eq!(ready.trim(), "READY");
         let (_scratch, ledger) = scratch();
-        record(&ledger, &[(9, leader(group.0.id()))], &[]).unwrap();
+        super::Recorder::new(ledger.clone())
+            .record([(9, leader(group.0.id()))].into_iter(), &[])
+            .unwrap();
         group.0.kill().unwrap();
         // The leader exited; this test holds it unreaped, so its start time still answers.
         super::await_exit_unreaped(pgid).expect("leader exit");
@@ -1859,7 +1900,9 @@ mod tests {
         let mut job = job_group();
         let pgid = i32::try_from(job.id()).unwrap();
         let (_scratch, ledger) = scratch();
-        record(&ledger, &[(7, leader(job.id()))], &[]).unwrap();
+        super::Recorder::new(ledger.clone())
+            .record([(7, leader(job.id()))].into_iter(), &[])
+            .unwrap();
         assert!(group_alive(pgid));
 
         let ended = end_recorded(&ledger, Writer::Any, Duration::from_millis(200)).unwrap();
@@ -1883,7 +1926,9 @@ mod tests {
         let mut job = job_group();
         let pgid = i32::try_from(job.id()).unwrap();
         let (_scratch, ledger) = scratch();
-        record(&ledger, &[(3, leader(job.id()))], &[]).unwrap();
+        super::Recorder::new(ledger.clone())
+            .record([(3, leader(job.id()))].into_iter(), &[])
+            .unwrap();
 
         let other_supervisor = std::process::id() + 1;
         let ended =
@@ -1912,11 +1957,15 @@ mod tests {
         let (_scratch, ledger) = scratch();
         let own = Writer::Process(std::process::id());
         assert!(!names_groups(&ledger, Writer::Any).unwrap(), "no ledger");
-        record(&ledger, &[], &[]).unwrap();
+        super::Recorder::new(ledger.clone())
+            .record(std::iter::empty(), &[])
+            .unwrap();
         assert!(!names_groups(&ledger, own).unwrap(), "retired in order");
 
         let mut job = job_group();
-        record(&ledger, &[(4, leader(job.id()))], &[]).unwrap();
+        super::Recorder::new(ledger.clone())
+            .record([(4, leader(job.id()))].into_iter(), &[])
+            .unwrap();
         assert!(names_groups(&ledger, own).unwrap());
         assert!(names_groups(&ledger, Writer::Any).unwrap());
         assert!(!names_groups(&ledger, Writer::Process(std::process::id() + 1)).unwrap());
@@ -1951,8 +2000,12 @@ mod tests {
         };
         assert_ne!(reused, stranger_leader);
         let (_scratch, ledger) = scratch();
-        record(&ledger, &[(5, reused)], &[]).unwrap();
-        record(&ledger, &[(5, reused)], &[]).unwrap();
+        super::Recorder::new(ledger.clone())
+            .record([(5, reused)].into_iter(), &[])
+            .unwrap();
+        super::Recorder::new(ledger.clone())
+            .record([(5, reused)].into_iter(), &[])
+            .unwrap();
 
         assert_eq!(
             end_recorded(&ledger, Writer::Any, Duration::ZERO).unwrap(),
@@ -2265,7 +2318,10 @@ mod tests {
             // takes it over again rather than forgetting it.
             assert_eq!(super::unresolved(&ledger).unwrap(), taken, "{label}");
             assert_eq!(
-                record(&ledger, &[], &taken).unwrap().carried,
+                super::Recorder::new(ledger.clone())
+                    .record(std::iter::empty(), &taken)
+                    .unwrap()
+                    .carried,
                 taken,
                 "{label}"
             );
@@ -2282,7 +2338,11 @@ mod tests {
             }
             assert!(super::unresolved(&ledger).unwrap().is_empty(), "{label}");
             assert!(
-                record(&ledger, &[], &taken).unwrap().carried.is_empty(),
+                super::Recorder::new(ledger.clone())
+                    .record(std::iter::empty(), &taken)
+                    .unwrap()
+                    .carried
+                    .is_empty(),
                 "{label}"
             );
             assert!(
@@ -2378,7 +2438,9 @@ mod tests {
             let group = OwnedGroup(job_group());
             let pgid = i32::try_from(group.0.id()).unwrap();
             let (_scratch, ledger) = scratch();
-            record(&ledger, &[(7, leader(group.0.id()))], &[]).unwrap();
+            super::Recorder::new(ledger.clone())
+                .record([(7, leader(group.0.id()))].into_iter(), &[])
+                .unwrap();
             if previously_ended {
                 let mut recorded = super::read(&ledger).unwrap().unwrap();
                 recorded.ended = true;
@@ -2678,3 +2740,7 @@ mod tests {
         drop(job);
     }
 }
+
+#[cfg(test)]
+#[path = "job_groups_publication_tests.rs"]
+mod publication_tests;

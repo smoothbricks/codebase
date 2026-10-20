@@ -883,7 +883,9 @@ mod tests {
     fn ledger_naming(scratch: &Path, child: &std::process::Child) -> PathBuf {
         let leader = super::super::job_groups::GroupLeader::observe(child.id()).unwrap();
         let ledger = scratch.join("supervisor.groups");
-        super::super::job_groups::record(&ledger, &[(1, leader)], &[]).unwrap();
+        super::super::job_groups::Recorder::new(ledger.clone())
+            .record([(1, leader)].into_iter(), &[])
+            .unwrap();
         ledger
     }
 
@@ -959,7 +961,9 @@ mod tests {
         );
         let mut foreign = sandboxed_group_leader();
         let ledger = scratch.join("supervisor.groups");
-        super::super::job_groups::record(&ledger, &[], &[]).unwrap();
+        super::super::job_groups::Recorder::new(ledger.clone())
+            .record(std::iter::empty(), &[])
+            .unwrap();
         let record = scratch.join("server-process.json");
         write_record(&record, foreign.id(), &scratch.join("refusing.sock"));
         let plan = prepare_daemon_stop(&record, &ledger).unwrap();
@@ -1298,7 +1302,7 @@ mod lifecycle_authority_tests {
     use std::os::unix::process::CommandExt as _;
 
     use super::*;
-    use crate::runtime::job_groups::{GroupLeader, record};
+    use crate::runtime::job_groups::{GroupLeader, Recorder};
     use cowshed_os::fork_lock::{Run as _, RunAsync, Spawn as _};
 
     const SELF_ONLY: &str = "(version 1)(allow default)(deny signal (target others))";
@@ -1323,7 +1327,9 @@ mod lifecycle_authority_tests {
     fn ledger_for(scratch: &Path, child: &std::process::Child) -> PathBuf {
         let leader = GroupLeader::observe(child.id()).expect("observe the group leader");
         let ledger = scratch.join("supervisor.groups");
-        record(&ledger, &[(1, leader)], &[]).expect("record the job's group");
+        Recorder::new(ledger.clone())
+            .record([(1, leader)].into_iter(), &[])
+            .expect("record the job's group");
         ledger
     }
 
@@ -1407,7 +1413,9 @@ mod lifecycle_authority_tests {
         );
         let mut foreign = sandboxed_sleeper();
         let ledger = scratch.join("supervisor.groups");
-        record(&ledger, &[], &[]).expect("an empty ledger");
+        Recorder::new(ledger.clone())
+            .record(std::iter::empty(), &[])
+            .expect("an empty ledger");
         let record_path = scratch.join("server-process.json");
         write_daemon_record(&record_path, foreign.id());
 
@@ -1543,7 +1551,9 @@ mod lifecycle_authority_tests {
         }
         let leader = GroupLeader::observe(daemon.id()).expect("observe the daemon's group leader");
         let ledger = scratch.join("supervisor.groups");
-        record(&ledger, &[(1, leader)], &[]).expect("record the job's group");
+        Recorder::new(ledger.clone())
+            .record([(1, leader)].into_iter(), &[])
+            .expect("record the job's group");
         let DaemonStopPlan::Owned { process, exit } =
             prepare_daemon_stop(&record_path, &ledger).expect("the plan reads")
         else {

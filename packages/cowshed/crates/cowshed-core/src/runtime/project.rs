@@ -19863,7 +19863,9 @@ mod unresolved_retirement_tests {
             .spawn_locked()
             .unwrap();
         let birth = super::super::job_groups::GroupLeader::observe(child.id()).unwrap();
-        super::super::job_groups::record(&ledger, &[(9, birth)], &[]).unwrap();
+        super::super::job_groups::Recorder::new(ledger.clone())
+            .record([(9, birth)].into_iter(), &[])
+            .unwrap();
         let mut release = child.stdin.take().unwrap();
         let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut ready = String::new();

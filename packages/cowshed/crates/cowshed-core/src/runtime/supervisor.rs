@@ -3364,7 +3364,7 @@ impl WorkspaceSupervisor {
             volume_labels: config.volume_labels,
             workspace_volume: config.workspace_volume,
             credential_env_names: config.credential_env_names,
-            group_ledger: config.group_ledger,
+            group_ledger: config.group_ledger.map(super::job_groups::Recorder::new),
             job_spans,
             inherited_groups: config.inherited_groups,
             term_grace: config.term_grace,
@@ -4128,7 +4128,7 @@ fn process_observation_unavailable(job_id: JobId) -> CowshedError {
 
 struct SupervisorActor {
     authority: WorkspaceAuthoritySnapshot,
-    group_ledger: Option<PathBuf>,
+    group_ledger: Option<super::job_groups::Recorder>,
     /// See [`WorkspaceSupervisorConfig::telemetry_root`].
     job_spans: Option<JobSpanPublisher>,
     inherited_groups: Vec<super::job_groups::UnresolvedGroup>,
@@ -4684,21 +4684,21 @@ impl SupervisorActor {
         let Some(path) = &self.group_ledger else {
             return;
         };
-        let groups: Vec<(u64, super::job_groups::GroupLeader)> = self
+
+        let groups = self
             .jobs
             .iter()
             // A job sealed after a wait failure may have left its group running: nothing saw it
             // end, so the ledger keeps it for whoever finds this supervisor gone.
             .filter(|(_, job)| !job.sealed() || job.wait_failure.is_some())
-            .filter_map(|(job_id, job)| Some((job_id.get(), job.birth.as_ref()?.leader()?)))
-            .collect();
-        match super::job_groups::record(path, &groups, &self.inherited_groups) {
+            .filter_map(|(job_id, job)| Some((job_id.get(), job.birth.as_ref()?.leader()?)));
+        match path.record(groups, &self.inherited_groups) {
             Ok(recorded) => {
                 for error in &recorded.uninspected {
                     eprintln!(
                         "cowshed: an inherited unresolved process group in {} could not be \
                          inspected and is carried as it was: {error}",
-                        path.display()
+                        path.path().display()
                     );
                 }
                 self.inherited_groups = recorded.carried;
@@ -4708,7 +4708,7 @@ impl SupervisorActor {
                 // this supervisor die, which is worth saying where the daemon log shows it.
                 eprintln!(
                     "cowshed: cannot record the job process groups at {}: {error}",
-                    path.display()
+                    path.path().display()
                 );
             }
         }

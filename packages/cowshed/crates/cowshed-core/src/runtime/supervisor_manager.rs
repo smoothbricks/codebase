@@ -1502,7 +1502,9 @@ mod tests {
         let group = job.id().expect("the job runs");
         let ledger = super::super::job_groups::ledger_path(&socket);
         let leader = super::super::job_groups::GroupLeader::observe(group).expect("leader");
-        super::super::job_groups::record(&ledger, &[(7, leader)], &[]).expect("ledger");
+        super::super::job_groups::Recorder::new(ledger.clone())
+            .record([(7, leader)].into_iter(), &[])
+            .expect("ledger");
         let foreign = std::fs::symlink_metadata(&socket)
             .expect("its socket")
             .ino();

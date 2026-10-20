@@ -729,6 +729,12 @@ admitted but never sealed. Two things put that right:
   released. A prior ended marker does not authorize force or erase that evidence. Unresolved groups are diagnosed
   through `doctor`; they do not prevent a new supervisor from serving safe commands.
 
+  Publication borrows the current job-group iterator and the inspected inherited entries directly into the existing JSON
+  field order; it does not materialize a second group inventory. The actor prepares the destination and temporary paths
+  once. Ordinary publications without inherited groups allocate only their JSON output buffer; inherited recovery still
+  owns the carried entries and inspection errors it returns. This does not add an active-job frontier or change which
+  unsealed and failed-wait groups remain recorded.
+
 - **Sealing.** The next supervisor binds the workspace socket first, reconciles the predecessor's groups, then seals
   every admitted but unterminated record of the current incarnation as `failed` with `failure: supervisorLost` and a
   terminal commitment. It preserves the bytes already spilled to protected files, not bytes held only in lost memory.
