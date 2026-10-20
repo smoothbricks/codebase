@@ -24,9 +24,7 @@ use cowshed_os::timing::{event, span, spanned};
 use tokio::io::AsyncRead;
 
 use crate::args::{Cli, Command};
-use crate::gateway_service::{
-    ControlSocket, GatewayControl, control_socket_path, stable_workspace_id,
-};
+use crate::gateway_service::{ControlSocket, control_socket_path, stable_workspace_id};
 use crate::output::Output;
 use crate::runtime::{
     DispatchExit, ExecEnd, ExecPresentation, ExecResult, ForegroundJob, emit_mount_path,
@@ -156,18 +154,18 @@ async fn gateway_current(resident: &Resident) -> bool {
     let Ok(control) = ControlSocket::at(control_socket_path()) else {
         return false;
     };
-    let Ok(status) = control.status().await else {
-        return false;
-    };
     let authority = resident.authority();
     let identity = stable_workspace_id(
         &resident.repo_id,
         resident.workspace.as_str(),
         &authority.workspace_incarnation,
     );
-    let current = status.sessions.iter().any(|session| {
-        session.workspace_id == identity && session.revision == authority.grant_revision
-    });
+    let Ok(current) = control
+        .session_current(&identity, authority.grant_revision)
+        .await
+    else {
+        return false;
+    };
     if !current {
         event("resident", || {
             "declined: the gateway session is not current".to_owned()

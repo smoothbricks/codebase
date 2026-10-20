@@ -553,6 +553,14 @@ and every attach advances. An install must exceed every revision that workspace 
 revision behind as a tombstone — and a removal must name the installed revision; either refusal is `revision-fence`, and
 a removal of a session that is already gone is `not-installed`.
 
+A resident exec checks only its own installed revision with
+`{"op":"session-current","workspaceId":"<identity>","revision":<u64>}`. The authenticated host control plane answers
+`{"ok":true,"current":true|false}` directly from the installed session table: false for an absent identity or a
+different revision, including a removed session whose revision remains only as a tombstone. This is the same
+instantaneous observation as filtering status, not a reservation against a later rotation. It neither builds a host-wide
+census nor keeps a second revision inventory. Status remains the host's full diagnostic view; a failed single-session
+query leaves resident admission to the existing controller path.
+
 Core's project runtime owns workspace gateway preparation: after the decoded route's `AdmissionSource::admit` and live
 workspace-incarnation validation, and before exec, session opening or checked-land work, it reconciles only the selected
 workspace. Both `worker.exec` and trusted `coordinator.exec` use this boundary; connection role never substitutes for

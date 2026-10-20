@@ -93,6 +93,21 @@ impl GatewayControlClient {
             .ok_or(ControlError::InvalidResponse)
     }
 
+    /// Observe one installed workspace revision without requesting the host session census.
+    pub async fn session_current(
+        &self,
+        workspace_id: &str,
+        revision: u64,
+    ) -> Result<bool, ControlError> {
+        self.send(&ControlRequest::SessionCurrent {
+            workspace_id: workspace_id.to_owned(),
+            revision,
+        })
+        .await?
+        .current
+        .ok_or(ControlError::InvalidResponse)
+    }
+
     /// The host CPU budget's ledger (05_gateway.md "Host CPU budget", Wire): who holds and who
     /// waits for tokens, and the gate queue in the order returned tokens go to it.
     pub async fn cpu_budget(&self) -> Result<CpuBudgetStatus, ControlError> {
@@ -342,6 +357,11 @@ struct AuthenticatedControlRequestOut<'a> {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 enum ControlRequest {
+    SessionCurrent {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        revision: u64,
+    },
     Status,
     Install {
         session: SessionWire,
@@ -558,6 +578,8 @@ struct ControlResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<DaemonStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audit_events: Option<Vec<AuditEvent>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1647,6 +1669,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         .ok_or_else(|| ControlError::Encoding("control request op is required".to_owned()))?;
     let allowed: &[&str] = match op {
         "status" => &["op"],
+        "session-current" => &["op", "workspaceId", "revision"],
         "install" => &["op", "session"],
         "remove" => &["op", "workspaceId", "expectedRevision"],
         "audit-tail" => &["op", "workspaceId", "afterSequence", "limit", "follow"],
@@ -1882,6 +1905,23 @@ async fn dispatch(
     services: &ControlServices,
 ) -> (ControlResponse, Option<mpsc::Receiver<AuditEvent>>) {
     match request {
+        ControlRequest::SessionCurrent {
+            workspace_id,
+            revision,
+        } => (
+            match services
+                .handle
+                .session_current(workspace_id, revision)
+                .await
+            {
+                Ok(current) => ControlResponse {
+                    current: Some(current),
+                    ..success()
+                },
+                Err(error) => rejected(error),
+            },
+            None,
+        ),
         ControlRequest::Status => (
             match services.handle.status().await {
                 Ok(status) => ControlResponse {
@@ -2157,6 +2197,7 @@ fn success() -> ControlResponse {
     ControlResponse {
         ok: true,
         status: None,
+        current: None,
         audit_events: None,
         audit_event: None,
         mirror_info: None,
@@ -2294,6 +2335,9 @@ pub enum ControlError {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/fixture_dir.rs"]
+mod test_fixture_dir;
+#[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -2315,6 +2359,10 @@ mod tests {
     fn request_schema_rejects_unknown_fields_verbs_and_envelope_shapes() {
         for request in [
             r#"{"op":"status","token":"workspace-token"}"#,
+            r#"{"op":"session-current","workspaceId":"ws","revision":1,"extra":true}"#,
+            r#"{"op":"session-current","workspaceId":"ws"}"#,
+            r#"{"op":"session-current","revision":1}"#,
+            r#"{"op":"session-current","workspaceId":"ws","revision":-1}"#,
             r#"{"op":"repo-mirror","request":{"workspaceId":"ws","repoId":"repo","remote":"https://example.test/repo"},"push":true}"#,
             r#"{"op":"sim-openurl","url":"demo://value"}"#,
             r#"{"op":"unknown"}"#,
@@ -2480,5 +2528,36 @@ mod tests {
         );
         answering.await.expect("the answers");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn session_current_requires_an_explicit_boolean_answer() {
+        let id = Uuid::new_v4().simple().to_string();
+        let root = test_fixture_dir::secure_fixture_dir(&format!("cscurrent-{}", &id[..8]));
+        let socket = root.path().join("gateway.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let answering = tokio::spawn(async move {
+            for answer in [
+                b"{\"ok\":true,\"current\":true}\n".as_slice(),
+                b"{\"ok\":true,\"current\":false}\n".as_slice(),
+                b"{\"ok\":true}\n".as_slice(),
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let request = read_request_line(&mut stream).await.expect("one request");
+                assert!(matches!(parse_control_request(&request),
+                Ok(Incoming::Request(ControlRequest::SessionCurrent { workspace_id, revision: 7 }))
+                    if workspace_id == "ws"));
+                expect_eof(&mut stream).await.expect("one frame only");
+                stream.write_all(answer).await.expect("answer");
+            }
+        });
+        let client = GatewayControlClient::new(socket).expect("client");
+        assert!(client.session_current("ws", 7).await.expect("current"));
+        assert!(!client.session_current("ws", 7).await.expect("not current"));
+        assert!(matches!(
+            client.session_current("ws", 7).await,
+            Err(ControlError::InvalidResponse)
+        ));
+        answering.await.expect("answers");
     }
 }

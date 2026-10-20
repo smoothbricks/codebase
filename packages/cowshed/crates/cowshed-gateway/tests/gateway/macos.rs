@@ -2253,6 +2253,12 @@ async fn control_socket_is_local_authenticated_and_reports_status() {
     )
     .await;
     let client = GatewayControlClient::new(control.clone()).expect("control client");
+    assert!(
+        !client
+            .session_current("controlled", 1)
+            .await
+            .expect("absent session")
+    );
     let endpoint = free_endpoint();
     let (session, _token, _) = session(
         "controlled",
@@ -2271,6 +2277,24 @@ async fn control_socket_is_local_authenticated_and_reports_status() {
     assert_eq!(status.sessions.len(), 1);
     assert_eq!(status.sessions[0].workspace_id, "controlled");
     assert_eq!(status.sessions[0].revision, 1);
+    assert!(
+        client
+            .session_current("controlled", 1)
+            .await
+            .expect("installed revision")
+    );
+    assert!(
+        !client
+            .session_current("controlled", 2)
+            .await
+            .expect("different revision")
+    );
+    assert!(
+        !client
+            .session_current("other", 1)
+            .await
+            .expect("different workspace")
+    );
     let stale = client
         .remove("controlled", 2)
         .await
@@ -2294,8 +2318,15 @@ async fn control_socket_is_local_authenticated_and_reports_status() {
             .sessions
             .is_empty()
     );
+    assert!(
+        !client
+            .session_current("controlled", 1)
+            .await
+            .expect("tombstone is not installed")
+    );
     gateway.drain().await.expect("drain gateway");
     assert!(!control.exists());
+    assert!(client.session_current("controlled", 1).await.is_err());
 }
 
 #[tokio::test]
@@ -2333,6 +2364,13 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
         gateway.handle().install(make_session(1, endpoint)).await,
         Err(GatewayError::StaleRevision)
     ));
+    assert!(
+        !gateway
+            .handle()
+            .session_current("revision", 1)
+            .await
+            .expect("removed revision")
+    );
     let endpoint = install_in_free_block(&gateway.handle(), make_session(2, endpoint)).await;
 
     let (occupied_endpoint, occupied) = occupied_endpoint();
@@ -2345,6 +2383,20 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
     ));
     let status = gateway.handle().status().await.expect("rotation status");
     assert_eq!(status.sessions[0].revision, 2);
+    assert!(
+        gateway
+            .handle()
+            .session_current("revision", 2)
+            .await
+            .expect("failed rotation preserves revision")
+    );
+    assert!(
+        !gateway
+            .handle()
+            .session_current("revision", 3)
+            .await
+            .expect("failed rotation is not installed")
+    );
     assert_eq!(status.sessions[0].endpoint, endpoint.to_string());
     let old_listener = TcpStream::connect(endpoint)
         .await
@@ -2361,7 +2413,108 @@ async fn revision_tombstone_and_rotation_preserve_authority() {
         gateway.handle().status().await.expect("status").sessions[0].revision,
         3
     );
+    assert!(
+        !gateway
+            .handle()
+            .session_current("revision", 2)
+            .await
+            .expect("old revision")
+    );
+    assert!(
+        gateway
+            .handle()
+            .session_current("revision", 3)
+            .await
+            .expect("rotated revision")
+    );
     gateway.drain().await.expect("drain gateway");
+}
+
+/// Same actor, socket, client and optimized binary; alternate arms to share host load.
+/// Session IDs have the 101-byte shape of stable_workspace_id. One query is one
+/// resident admission; setup, installs and shutdown are outside the measured intervals.
+#[tokio::test]
+#[ignore = "manual per-admission census versus point-query measurement"]
+async fn session_current_benchmark() {
+    const JOBS: usize = 1000;
+    for count in [0_usize, 1, 8, 48, 128] {
+        let root = secure_fixture_dir(&format!("cowshed-current-{}-{count}", std::process::id()));
+        let control = root.path().join("gateway.sock");
+        let (mut config, _cache) = test_config();
+        config.control_socket = Some(control.clone());
+        let gateway = gateway(
+            config,
+            Arc::new(NoCredentials),
+            Arc::new(LocalConnector {
+                health: UpstreamHealth::Healthy,
+                observed: None,
+            }),
+            Arc::new(DiscardAudit),
+        )
+        .await;
+        let client = GatewayControlClient::new(control).expect("client");
+        let mut endpoints = Vec::with_capacity(count);
+        let mut identity = format!("p{:032x}.w{:032x}.i{:032x}", 0, 0, 1);
+        for index in 0..count {
+            identity = format!("p{:032x}.w{index:032x}.i{:032x}", 0, 1);
+            let (session, _, _) = session(
+                &identity,
+                "owner/repo-benchmark",
+                block_endpoint(free_endpoint()),
+                42,
+                1,
+                WorkspacePolicy::default(),
+            );
+            endpoints.push(install_in_free_block(&gateway.handle(), session).await);
+        }
+        let mut census = Vec::with_capacity(JOBS);
+        let mut point = Vec::with_capacity(JOBS);
+        for iteration in 0..JOBS + 20 {
+            for direct in [iteration % 2 == 0, iteration % 2 != 0] {
+                let started = Instant::now();
+                let current = if direct {
+                    client
+                        .session_current(&identity, 1)
+                        .await
+                        .expect("point query")
+                } else {
+                    client
+                        .status()
+                        .await
+                        .expect("census")
+                        .sessions
+                        .iter()
+                        .any(|session| session.workspace_id == identity && session.revision == 1)
+                };
+                let elapsed = started.elapsed();
+                assert_eq!(current, count != 0);
+                if iteration >= 20 {
+                    if direct {
+                        point.push(elapsed);
+                    } else {
+                        census.push(elapsed);
+                    }
+                }
+            }
+        }
+        let census_total: Duration = census.iter().sum();
+        let point_total: Duration = point.iter().sum();
+        census.sort_unstable();
+        point.sort_unstable();
+        eprintln!(
+            "session_current sessions={count} jobs={JOBS} census_mean_us={:.6} point_mean_us={:.6} census_1000_ms={:.6} point_1000_ms={:.6} census_median_us={:.6} point_median_us={:.6}",
+            census_total.as_secs_f64() * 1e6 / JOBS as f64,
+            point_total.as_secs_f64() * 1e6 / JOBS as f64,
+            census_total.as_secs_f64() * 1e3,
+            point_total.as_secs_f64() * 1e3,
+            census[JOBS / 2].as_secs_f64() * 1e6,
+            point[JOBS / 2].as_secs_f64() * 1e6
+        );
+        gateway.drain().await.expect("drain gateway");
+        for endpoint in endpoints {
+            release_claim(endpoint);
+        }
+    }
 }
 
 /// An audit sink that fails closes the gateway: in-flight work is cut, new work is refused, the

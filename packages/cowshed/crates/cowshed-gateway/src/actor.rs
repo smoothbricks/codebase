@@ -132,6 +132,23 @@ impl GatewayHandle {
         receive.await.map_err(|_| GatewayError::Stopped)
     }
 
+    /// Whether this exact workspace revision is installed now. Like status, this is an
+    /// observation, not a reservation against a later install or removal.
+    pub async fn session_current(
+        &self,
+        workspace_id: impl Into<String>,
+        revision: u64,
+    ) -> Result<bool, GatewayError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::SessionCurrent {
+            workspace_id: workspace_id.into(),
+            revision,
+            reply,
+        })
+        .await?;
+        receive.await.map_err(|_| GatewayError::Stopped)
+    }
+
     async fn send(&self, command: Command) -> Result<(), GatewayError> {
         self.commands
             .send(command)
@@ -488,6 +505,11 @@ pub(crate) enum Command {
         generation: u64,
         host: String,
         reply: oneshot::Sender<Result<Arc<rustls::ServerConfig>, GatewayError>>,
+    },
+    SessionCurrent {
+        workspace_id: String,
+        revision: u64,
+        reply: oneshot::Sender<bool>,
     },
     Status {
         reply: oneshot::Sender<DaemonStatus>,
@@ -1237,6 +1259,11 @@ impl Actor {
                         } => {
                             let result = self.mint_leaf(&workspace_id, generation, &host);
                             let _ = reply.send(result);
+                        }
+                        Command::SessionCurrent { workspace_id, revision, reply } => {
+                            let current = self.sessions.get(&workspace_id)
+                                .is_some_and(|session| session.revision == revision);
+                            let _ = reply.send(current);
                         }
                         Command::Status { reply } => {
                             let _ = reply.send(self.status());

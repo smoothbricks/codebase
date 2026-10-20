@@ -75,6 +75,14 @@ impl ControlSocket {
             .map(Self)
             .map_err(control_error)
     }
+
+    /// Observe only the installed revision the resident admission path needs.
+    pub async fn session_current(&self, workspace_id: &str, revision: u64) -> Result<bool> {
+        self.0
+            .session_current(workspace_id, revision)
+            .await
+            .map_err(control_error)
+    }
 }
 
 #[async_trait]
