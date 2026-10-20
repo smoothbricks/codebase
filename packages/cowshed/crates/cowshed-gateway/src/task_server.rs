@@ -27,8 +27,8 @@
 //!   observation never mints a grant. Its asks reach the budget in selection order, and what
 //!   cannot be observed stays unknown.
 //!
-//! Every decision is a logged fact (`COWSHED_TIMING` shows the stream) and the whole fold is
-//! inspectable through the `task-queue` control operation, so a lander reads the queue instead
+//! Every decision is a logged fact on stderr, without an opt-in environment variable, and the
+//! whole fold is inspectable through the `task-queue` control operation, so a lander reads the queue instead
 //! of asking for an assignment. A unit's terminal fact is the only lifecycle this scheduler
 //! speaks: it records the outcome — with the owner and workspace incarnation the receipts bind
 //! to — and releases what the run held.
@@ -792,28 +792,23 @@ async fn run(
                 Some(Message::Terminal { unit, outcome, reply }) => {
                     let settled = ledger.terminal(&unit, outcome, &mut follow);
                     if let Ok(facts) = &settled {
-                        cowshed_os::timing::event("task-server", || {
-                            format!(
-                                "terminal {} owner={} incarnation={} outcome={}",
-                                facts.unit,
-                                facts.owner,
-                                facts.incarnation.as_deref().unwrap_or("none"),
-                                outcome,
-                            )
-                        });
+                        eprintln!(
+                            "cowshed: timing task-server terminal unit={:?} owner={:?} incarnation={:?} outcome={outcome}",
+                            facts.unit,
+                            facts.owner,
+                            facts.incarnation,
+                        );
                     }
                     let _ = reply.send(settled.map(|_| ()));
                 }
                 Some(Message::Leave { ticket }) => {
                     if let Some(facts) = ledger.leave(ticket, &mut follow) {
-                        cowshed_os::timing::event("task-server", || {
-                            format!(
-                                "terminal {} owner={} incarnation={} outcome=abandoned",
-                                facts.unit,
-                                facts.owner,
-                                facts.incarnation.as_deref().unwrap_or("none"),
-                            )
-                        });
+                        eprintln!(
+                            "cowshed: timing task-server terminal ticket={ticket} unit={:?} owner={:?} incarnation={:?} outcome=abandoned",
+                            facts.unit,
+                            facts.owner,
+                            facts.incarnation,
+                        );
                     }
                 }
                 Some(Message::Granted { ticket, tokens }) => {
@@ -844,16 +839,15 @@ async fn run(
                         .unit_of(ticket)
                         .expect("selected ticket remains live")
                         .facts;
-                    cowshed_os::timing::event("task-server", || {
-                        format!(
-                            "select {} attempt={attempt} owner={} incarnation={} waited={waited:?} band={band:?} want={} leases={:?}",
-                            facts.unit,
-                            facts.owner,
-                            facts.incarnation.as_deref().unwrap_or("none"),
-                            facts.want,
-                            facts.leases,
-                        )
-                    });
+                    eprintln!(
+                        "cowshed: timing task-server select ticket={ticket} unit={:?} attempt={attempt} owner={:?} incarnation={:?} waited_ns={} band={band:?} want={} leases={:?}",
+                        facts.unit,
+                        facts.owner,
+                        facts.incarnation,
+                        waited.as_nanos(),
+                        facts.want,
+                        facts.leases,
+                    );
                     let Some(reply) = replies.remove(&ticket) else {
                         // The client left before its turn: abandon the attempt it freed.
                         ledger.leave(ticket, &mut Vec::new());

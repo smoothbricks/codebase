@@ -235,6 +235,96 @@ async fn ledger(socket: &Path) -> CpuBudgetStatus {
         .expect("a ledger")
 }
 
+/// The deployed daemon does not set COWSHED_TIMING. Exercise the real wire in a subprocess
+/// with that variable absent, so a test runner's own environment cannot enable the records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grant_handoff_and_selection_timings_need_no_environment_switch() {
+    const CHILD: &str = "COWSHED_TIMING_PROOF_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "grant_handoff_and_selection_timings_need_no_environment_switch",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("COWSHED_TIMING")
+            .output()
+            .await
+            .expect("run timing proof");
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
+        assert!(output.status.success(), "{stderr}");
+        for (record, duration) in [
+            ("lease-grant scheduler=\"CPU budget\"", "elapsed_ns="),
+            ("lease-grant scheduler=\"jobserver\"", "elapsed_ns="),
+            ("lease-grant scheduler=\"task scheduler\"", "elapsed_ns="),
+            ("cpu-tokens grant ", "waited_ns="),
+            ("cpu-tokens queue-step cause=ask ", "elapsed_ns="),
+            ("cpu-tokens queue-step cause=release ", "elapsed_ns="),
+            ("cpu-tokens handoff ", "elapsed_ns="),
+            ("task-server select ", "waited_ns="),
+        ] {
+            let line = stderr
+                .lines()
+                .find(|line| line.contains(record))
+                .unwrap_or_else(|| panic!("missing {record}: {stderr}"));
+            let value = line
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix(duration))
+                .unwrap_or_else(|| panic!("missing {duration}: {line}"));
+            assert!(value.parse::<u128>().is_ok(), "{line}");
+        }
+        assert!(stderr.contains("task-server terminal "), "{stderr}");
+        return;
+    }
+    assert!(std::env::var_os("COWSHED_TIMING").is_none());
+    let (gateway, root, socket) = gateway(2).await;
+    let mut holder = Asker::ask(&socket, 1, "/w/holder").await;
+    assert_eq!(holder.granted().await, 1);
+    let mut waiter = Asker::ask(&socket, 1, "/w/waiter").await;
+    let queued = ledger(&socket).await;
+    assert_eq!(queued.held, 1);
+    assert_eq!(
+        queued
+            .background
+            .iter()
+            .map(|row| row.waiters.len())
+            .sum::<usize>(),
+        1
+    );
+    drop(holder);
+    assert_eq!(waiter.granted().await, 1);
+    drop(waiter);
+    let mut jobserver = Asker::send(
+        &socket,
+        serde_json::json!({
+            "op": "jobserver", "want": 1, "checkout": "/w/job",
+            "command": "jobserver timing proof"
+        }),
+    )
+    .await;
+    assert_eq!(jobserver.granted().await, 1);
+    drop(jobserver);
+    let mut unit = Asker::send(
+        &socket,
+        serde_json::json!({
+            "op": "task-admit", "unit": "timed-unit", "owner": "/w/task",
+            "command": "task timing proof", "want": 0
+        }),
+    )
+    .await;
+    assert_eq!(unit.answer().await["lease"], "granted");
+    let terminal = one_shot(
+        &socket,
+        "{\"op\":\"task-terminal\",\"unit\":\"timed-unit\",\"outcome\":\"landed\"}\n",
+    )
+    .await;
+    assert_eq!(terminal["ok"], true);
+    drop(unit);
+    gateway.drain().await.expect("drain");
+    std::fs::remove_dir_all(root).expect("clean timing fixture");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_killed_with_sigkill_returns_its_tokens_at_once() {
     let (gateway, root, socket) = gateway(8).await;

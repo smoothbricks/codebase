@@ -1150,6 +1150,7 @@ async fn hold<R, W, S, G>(
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let asked = std::time::Instant::now();
     if write_response(&mut writer, &lease(LeaseState::Queued))
         .await
         .is_err()
@@ -1176,8 +1177,15 @@ async fn hold<R, W, S, G>(
         // either way it leaves the queue.
         _ = reader.read(&mut discard) => return,
     };
-    if write_response(&mut writer, &answer(grant)).await.is_err() {
+    let response = answer(grant);
+    if write_response(&mut writer, &response).await.is_err() {
         return;
+    }
+    if matches!(response.lease, Some(LeaseState::Granted)) {
+        eprintln!(
+            "cowshed: timing lease-grant scheduler={scheduler:?} elapsed_ns={}",
+            asked.elapsed().as_nanos(),
+        );
     }
     while let Ok(read) = reader.read(&mut discard).await
         && read > 0
@@ -1323,7 +1331,7 @@ async fn hold_jobserver<R, W>(
                 writer,
                 stream,
                 &path,
-                tokens,
+                (tokens, asked),
                 fifos,
                 options.pool_job,
             )
@@ -1348,7 +1356,7 @@ async fn hold_jobserver<R, W>(
         };
         (source, job)
     });
-    let Some(served) = answer_grant(&mut writer, &fifos, tokens, source).await else {
+    let Some(served) = answer_grant(&mut writer, &fifos, tokens, source, asked).await else {
         return;
     };
     // Hold until the client closes. The fifo keeps the grant's `g − 1` bytes for the grant's
@@ -1397,6 +1405,7 @@ async fn answer_grant<W>(
     fifos: &crate::jobserver::JobserverFifos,
     tokens: usize,
     pool: Option<(crate::jobserver::PoolSource, &JobserverJobIn)>,
+    asked: std::time::Instant,
 ) -> Option<Served>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -1442,6 +1451,10 @@ where
         served.close().await;
         return None;
     }
+    eprintln!(
+        "cowshed: timing lease-grant scheduler=\"jobserver\" elapsed_ns={} tokens={tokens}",
+        asked.elapsed().as_nanos(),
+    );
     Some(served)
 }
 
@@ -1517,7 +1530,7 @@ async fn hold_parent_grant<R, W>(
     mut writer: W,
     mut parent: BufReader<cowshed_os::fork_lock::Fenced<UnixStream>>,
     parent_path: &Path,
-    tokens: usize,
+    (tokens, asked): (usize, std::time::Instant),
     fifos: crate::jobserver::JobserverFifos,
     pool_job: Option<JobserverJobIn>,
 ) where
@@ -1533,7 +1546,7 @@ async fn hold_parent_grant<R, W>(
             job,
         )
     });
-    let Some(served) = answer_grant(&mut writer, &fifos, tokens, source).await else {
+    let Some(served) = answer_grant(&mut writer, &fifos, tokens, source, asked).await else {
         return;
     };
     let mut served = Some(served);

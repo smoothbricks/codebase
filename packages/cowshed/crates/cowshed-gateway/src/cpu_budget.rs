@@ -527,6 +527,7 @@ enum Message {
     },
     Leave {
         ticket: Ticket,
+        released: Instant,
     },
     Status {
         reply: oneshot::Sender<CpuBudgetStatus>,
@@ -559,6 +560,7 @@ impl Drop for Stake {
         // An actor that is gone holds no tokens to return.
         let _ = self.messages.send(Message::Leave {
             ticket: self.ticket,
+            released: Instant::now(),
         });
     }
 }
@@ -625,6 +627,12 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
     let mut grants: HashMap<Ticket, oneshot::Sender<usize>> = HashMap::new();
     let mut effects = Vec::new();
     while let Some(message) = messages.recv().await {
+        let started = Instant::now();
+        let transition = match &message {
+            Message::Ask { ticket, .. } => Some(("ask", *ticket, None)),
+            Message::Leave { ticket, released } => Some(("release", *ticket, Some(*released))),
+            Message::Status { .. } => None,
+        };
         match message {
             Message::Ask {
                 ticket,
@@ -649,13 +657,35 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
                     &mut effects,
                 );
             }
-            Message::Leave { ticket } => {
+            Message::Leave { ticket, .. } => {
                 grants.remove(&ticket);
                 ledger.leave(Instant::now(), ticket, &mut effects);
             }
             Message::Status { reply } => {
                 let _ = reply.send(ledger.status(Instant::now()));
             }
+        }
+        // Deliver all grants before diagnostics: stderr backpressure must not sit between the
+        // grants of one transition, and the measured step excludes its own reporting.
+        for grant in &effects {
+            if let Some(granted) = grants.remove(&grant.ticket) {
+                let _ = granted.send(grant.tokens);
+            }
+        }
+        let elapsed = started.elapsed();
+        if let Some((cause, ticket, released)) = transition {
+            if let Some(released) = released.filter(|_| !effects.is_empty()) {
+                eprintln!(
+                    "cowshed: timing cpu-tokens handoff ticket={ticket} elapsed_ns={} grants={}",
+                    released.elapsed().as_nanos(),
+                    effects.len(),
+                );
+            }
+            eprintln!(
+                "cowshed: timing cpu-tokens queue-step cause={cause} ticket={ticket} elapsed_ns={} grants={}",
+                elapsed.as_nanos(),
+                effects.len(),
+            );
         }
         for Grant {
             ticket,
@@ -666,19 +696,12 @@ async fn run(mut ledger: Ledger, mut messages: mpsc::UnboundedReceiver<Message>)
             claim,
         } in effects.drain(..)
         {
-            // A client gone before its grant leaves next, and its tokens come back with it.
-            if let Some(granted) = grants.remove(&ticket) {
-                let _ = granted.send(tokens);
-            }
-            cowshed_os::timing::event("cpu-tokens", || {
-                format!(
-                    "grant {tokens}/{want} after {waited:?} to {checkout}: pid {} `{}`",
-                    claim
-                        .pid
-                        .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
-                    claim.command,
-                )
-            });
+            eprintln!(
+                "cowshed: timing cpu-tokens grant ticket={ticket} tokens={tokens} want={want} waited_ns={} checkout={checkout:?} pid={:?} command={:?}",
+                waited.as_nanos(),
+                claim.pid,
+                claim.command,
+            );
         }
     }
 }

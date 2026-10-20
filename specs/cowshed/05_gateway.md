@@ -1074,8 +1074,19 @@ core count.
 - **Spans.** The executor prints
   `cowshed: cpu-tokens wait done elapsed=<ms>ms status=ok tokens=<g>/<want> runner=<kind>` before the command's own
   output (`status=err … runs unbudgeted: <reason>` without a grant), so a slow or failing task says how long it waited
-  and how many threads it ran with. With `COWSHED_TIMING` set, the gateway prints each grant: tokens, want, the wait,
-  the checkout, and the client's pid and command.
+  and how many threads it ran with. Gateway grant and scheduling records are unconditional stderr diagnostics, including
+  in the installed LaunchAgent: no `COWSHED_TIMING` switch is needed. Each line starts `cowshed: timing`:
+  - `lease-grant scheduler=<name> elapsed_ns=<n>` measures from the held request's queued-answer boundary through the
+    successful granted-response write, including the wait and jobserver FIFO/pool preparation. It excludes connection
+    establishment and request parsing; client-observed latency is a separate measurement.
+  - `cpu-tokens grant ticket=<id> tokens=<g> want=<n> waited_ns=<n>` records the ledger's admission-to-selection wait,
+    with checkout, peer pid and command. An immediately selected request has zero ledger wait, not zero wire latency.
+  - `cpu-tokens queue-step cause=ask|release ticket=<id> elapsed_ns=<n> grants=<n>` measures one actor transition
+    through grant dispatch. `cpu-tokens handoff ticket=<released-id> elapsed_ns=<n> grants=<n>` measures stake release
+    through dispatch when that release selects waiters, including time waiting in the actor's inbox. Neither includes
+    its own diagnostic write. All grants of a transition are dispatched before its records are written. Numeric
+    durations are nanoseconds, so p50/p99 require no parsing of human duration suffixes. Status reads emit no scheduling
+    step. The existing opt-in spans remain available for other lifecycle detail.
 - **Cargo reads its holder's jobserver** (2026-10-19, Danny: why need cargo wrappers, rather than configure it properly;
   tg#6787, tg#6998, tg#7002). A CPU grant reaches the processes its holder starts as the configuration Cargo and its
   test runners already read; no `cargo` on `PATH` intercepts anything, and nothing installed answers to the name ("The
@@ -1215,8 +1226,10 @@ chooses which ready unit acquires a lease. Strong models propose task boundaries
   units in selection order (with any lease class they find full and who holds it), the waiting units with each
   dependency's outcome, the running units with their leases, granted tokens and caps, each class's places and holders,
   and the CPU ledger as an observation.
-- **Decisions are logged facts.** Every selection and terminal fact is written to the `task-server` timing stream, and
-  `task-queue` reports the live fold; nothing in the scheduler is a second authority over the plan.
+- **Decisions are logged facts.** Every selection and terminal fact is written unconditionally to stderr as
+  `cowshed: timing task-server select|terminal`, with unit, owner and incarnation. A selection includes its ticket,
+  attempt, numeric `waited_ns` from admission to selection, band, want and leases. `task-queue` reports the live fold;
+  nothing in the scheduler is a second authority over the plan.
 
 Tests: the scheduler's own regressions pin the policy without an agent in the loop — the exact order over a crafted fact
 set, the same order from the same facts however they arrive, a low-priority unit selected at its age bound under a
