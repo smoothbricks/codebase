@@ -136,9 +136,11 @@ additions absent from **old**, and removals present in **old union adds**. Witne
 Capacity, malformed-image, and unsorted-batch errors leave slot bytes unchanged.
 
 Runs and contiguous Stride updates merge intervals with batch events in one sweep. Retained interval scratch is bounded
-by the chooser: at most 1,453 records before spilling into the existing dense plane. Sparse member scratch stays bounded
-by Array eligibility. A Words in-place trial counts result runs with word masks/carry and proves that Words still wins
-the common chooser.
+by the chooser: at most 1,453 records before spilling into the existing dense plane. Array, Cone and noncontiguous
+Stride payloads merge their ordered members directly when old cardinality plus additions is at most 4,096, without
+staging and extracting a dense plane. The same merge produces cardinality changes and per-value witnesses. Sparse member
+scratch stays bounded by Array eligibility; larger results retain the dense path. A Words in-place trial counts result
+runs with word masks/carry and proves that Words still wins the common chooser.
 
 The patch keeps its root, except that an EF result with fewer than two members falls back to forest/empty. Geometry or
 varint-width changes assemble the new image in retained scratch before touching the slot. Stable geometry retains the
@@ -182,6 +184,18 @@ Benchmarks use the bench profile and report workload-specific observations: atta
 owned accounting separately from wire bytes, run-rich count/algebra cells, enumerable/restaged controls, and warm patch
 allocations. No speed ratio from an earlier layout is a claim about native v1. Compare interleaved controls on the same
 binary and machine before drawing performance conclusions.
+
+The sparse patch control is reproducible with:
+
+```sh
+cargo run --locked -p bitmosaic --profile bench --features bench-internals --example patch_sequence
+```
+
+It alternates the former Cone/Stride dense staging path and the direct ordered merge in one binary, restores the same
+input outside timing, compares canonical output bytes and reports warm allocation calls/bytes. Array and over-bound
+cells are unchanged-path controls. This path serves the VM's bitmap insert/remove opcodes, not just owned set algebra.
+The native payload remains the source of truth: its existing order feeds the merge, and counts/witnesses come from that
+same pass. No cache or second store is introduced.
 
 Standard Roaring import/export is a possible later public-request interoperability feature. No Roaring codec or
 production Roaring dependency is implemented.

@@ -39,6 +39,90 @@ fn reserved_scratch(image_bytes: usize, touched_chunks: usize) -> PatchScratch {
 }
 
 #[test]
+fn compact_sequence_patches_preserve_bytes_counts_and_witnesses() {
+    for jitter in [false, true] {
+        for n in [2u32, 16, 32, 128, 512, 1024, 4094, 4095, 4096, 4097] {
+            for base in [0u32, 0xffff_0000] {
+                let members: Vec<_> = (0..n)
+                    .map(|i| base + 8 * i + if jitter { i % 3 } else { 0 })
+                    .collect();
+                let middle = members[n as usize / 2];
+                let batches = [
+                    (vec![members[0], middle + 1], vec![middle]),
+                    (vec![middle + 1], vec![middle + 1]),
+                    (vec![], members.clone()),
+                    (vec![], vec![middle + 1]),
+                    (vec![base + 65535], vec![members[0]]),
+                ];
+                let image = Bitmosaic::from_sorted(members.iter().copied()).to_forest_bytes();
+                let mut scratch = reserved_scratch(32 * 1024, 1);
+                for (adds, removes) in batches {
+                    let mut oracle: BTreeSet<_> = members.iter().copied().collect();
+                    let add_new: Vec<_> =
+                        adds.iter().map(|value| !oracle.contains(value)).collect();
+                    oracle.extend(adds.iter().copied());
+                    let remove_held: Vec<_> =
+                        removes.iter().map(|value| oracle.contains(value)).collect();
+                    for value in &removes {
+                        oracle.remove(value);
+                    }
+                    let canonical =
+                        Bitmosaic::from_sorted(oracle.iter().copied()).to_forest_bytes();
+                    let mut previous = None;
+                    for dense in [true, false] {
+                        #[cfg(feature = "bench-internals")]
+                        bitmosaic::patch_sequence::force_dense(dense);
+                        #[cfg(not(feature = "bench-internals"))]
+                        if dense {
+                            continue;
+                        }
+                        let mut slot = image.clone();
+                        slot.resize(32 * 1024, 0xa5);
+                        let mut add_bits = vec![0; adds.len().div_ceil(64)];
+                        let mut remove_bits = vec![0; removes.len().div_ceil(64)];
+                        let report = patch_witnessed(
+                            &mut slot,
+                            &adds,
+                            &removes,
+                            &mut scratch,
+                            &mut BatchOutcome::new(&mut add_bits, &mut remove_bits),
+                        )
+                        .unwrap();
+                        assert_eq!(&slot[..report.serialized_len], canonical);
+                        assert_eq!(report.len, oracle.len() as u64);
+                        assert_eq!(
+                            report.added as usize,
+                            add_new.iter().filter(|held| **held).count()
+                        );
+                        assert_eq!(
+                            report.removed as usize,
+                            remove_held.iter().filter(|held| **held).count()
+                        );
+                        for (i, expected) in add_new.iter().enumerate() {
+                            assert_eq!(add_bits[i / 64] >> (i % 64) & 1 != 0, *expected);
+                        }
+                        for (i, expected) in remove_held.iter().enumerate() {
+                            assert_eq!(remove_bits[i / 64] >> (i % 64) & 1 != 0, *expected);
+                        }
+                        assert_eq!(
+                            BitmosaicView::open_verified(&slot)
+                                .unwrap()
+                                .range()
+                                .collect::<Vec<_>>(),
+                            oracle.iter().copied().collect::<Vec<_>>()
+                        );
+                        if let Some(old) = previous {
+                            assert_eq!(slot, old);
+                        }
+                        previous = Some(slot);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn run_patch_split_bridge_spill_and_empty_preserve_witnesses() {
     let initial = (0..4096u32).chain(32768..36864);
     let mut oracle: BTreeSet<_> = initial.collect();

@@ -44,3 +44,7 @@ required-features = ["bench-internals"]
 [[example]]
 name = "g378_words_refuter"
 required-features = ["bench-internals"]
+
+[[example]]
+name = "patch_sequence"
+required-features = ["bench-internals"]

@@ -841,14 +841,57 @@ fn apply<W: Witness>(
     (added, removed)
 }
 
-/// Merge one chunk's adds and removes with its old `Array` payload (`u16`
-/// little-endian members, ascending) into `members`, ascending, as a
-/// sequence: no plane is zeroed, staged or extracted for a chunk that is
-/// a sequence before and can only be one after. Returns how many adds were
-/// fresh and how many removes were held, and tells the witness which;
-/// adds land first, removes act on the result, exactly as [`apply`].
-fn merge_array<W: Witness>(
-    old: &[u8],
+/// Merge one chunk's adds and removes directly with its ordered payload.
+/// Array, Cone and Stride select a member without a search or a dense plane.
+/// The caller bounds the result by Array eligibility. Counts and witnesses
+/// are byproducts of the merge; adds land first, exactly as in [`apply`].
+fn merge_sequence<W: Witness>(
+    old: CView<'_>,
+    adds: &[u32],
+    removes: &[u32],
+    offsets: (usize, usize),
+    witness: &mut W,
+    members: &mut Vec<u16>,
+) -> (u32, u32) {
+    match old {
+        CView::Array(values) => merge_members(
+            (values.len() / 2, |i| read_u16_at(values, 2 * i)),
+            adds,
+            removes,
+            offsets,
+            witness,
+            members,
+        ),
+        CView::Stride { first, stride, len } => merge_members(
+            (usize::from(len) + 1, |i| {
+                (usize::from(first) + i * usize::from(stride)) as u16
+            }),
+            adds,
+            removes,
+            offsets,
+            witness,
+            members,
+        ),
+        CView::Cone {
+            first,
+            scale,
+            residuals,
+            ..
+        } => merge_members(
+            (residuals.len(), |i| cone_value(first, scale, residuals, i)),
+            adds,
+            removes,
+            offsets,
+            witness,
+            members,
+        ),
+        _ => unreachable!("sparse merge requires Array, Cone or Stride"),
+    }
+}
+
+#[inline]
+fn merge_members<W: Witness>(
+    (old_len, old_at): (usize, impl Fn(usize) -> u16),
     adds: &[u32],
     removes: &[u32],
     (a0, r0): (usize, usize),
@@ -856,11 +899,10 @@ fn merge_array<W: Witness>(
     members: &mut Vec<u16>,
 ) -> (u32, u32) {
     members.clear();
-    let old_len = old.len() / 2;
     let (mut o, mut a, mut r) = (0usize, 0usize, 0usize);
     let (mut added, mut removed) = (0u32, 0u32);
     loop {
-        let member = (o < old_len).then(|| read_u16_at(old, 2 * o));
+        let member = (o < old_len).then(|| old_at(o));
         let add = adds.get(a).map(|v| (*v & 0xFFFF) as u16);
         let candidate = match (member, add) {
             (None, None) => break,
@@ -2016,20 +2058,29 @@ fn plan_forest<W: Witness, const CAPTURE: bool>(
             });
             continue;
         }
-        // A chunk that is a sequence — an `Array`, or absent — and whose
-        // result cannot exceed the Array bound is merged as a sequence:
-        // the plane would be zeroed, staged, applied and extracted to
-        // arrive at the same members.
+        // Ordered payloads already encode the member sequence. Merge it
+        // directly when old cardinality + adds proves the result sparse;
+        // staging a dense plane would discard and then recover that order.
         let sequence = match located {
-            None => Some(&[][..]),
-            Some((_, CView::Array(values))) => Some(values),
+            None => Some(CView::Array(&[])),
+            Some((_, container @ CView::Array(_))) => Some(container),
+            Some((_, container @ (CView::Cone { .. } | CView::Stride { .. }))) => {
+                #[cfg(feature = "bench-internals")]
+                if !crate::patch_sequence::enabled() {
+                    None
+                } else {
+                    Some(container)
+                }
+                #[cfg(not(feature = "bench-internals"))]
+                Some(container)
+            }
             Some(_) => None,
         };
-        if let Some(values) = sequence
-            && values.len() / 2 + chunk_adds.len() <= ARRAY_MAX
+        if let Some(container) = sequence
+            && container.cardinality() as usize + chunk_adds.len() <= ARRAY_MAX
         {
-            let (a, r) = merge_array(
-                values,
+            let (a, r) = merge_sequence(
+                container,
                 chunk_adds,
                 chunk_removes,
                 (add_range.start, remove_range.start),

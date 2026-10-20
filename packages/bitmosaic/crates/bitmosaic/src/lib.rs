@@ -35,6 +35,25 @@ pub use patch::{
     BatchOutcome, PatchError, PatchReport, PatchScratch, PreparedPatch, Witness, patch,
     patch_witnessed, prepare_patch_in_witnessed, prepare_patch_witnessed,
 };
+
+/// Same-binary control for sparse patch measurements; absent from shipped builds.
+#[cfg(feature = "bench-internals")]
+pub mod patch_sequence {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static DENSE: AtomicBool = AtomicBool::new(false);
+
+    /// Force the former Cone/Stride dense staging path. Process-global;
+    /// measurement harnesses must not change it during a patch.
+    pub fn force_dense(force: bool) {
+        DENSE.store(force, Ordering::Relaxed);
+    }
+
+    /// Whether compact sequences may bypass the dense staging plane.
+    pub(crate) fn enabled() -> bool {
+        !DENSE.load(Ordering::Relaxed)
+    }
+}
 pub(crate) use range::ContainerRange;
 pub use range::{
     AndNotRange, AndRange, Forest64Range, ForestRange, OrRange, Range, RangeIter, XorRange,
