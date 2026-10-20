@@ -3202,9 +3202,26 @@ async fn run_unix_control(
     loop {
         tokio::select! {
             result = accept_locked(|context| listener.poll_accept(context)) => {
-                let Ok((stream, _)) = result else { break };
-                let Ok(credentials) = stream.peer_cred() else { continue };
+                let (stream, _) = match result {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        eprintln!("cowshed: gateway control socket stopped accepting: {error}");
+                        break;
+                    }
+                };
+                let credentials = match stream.peer_cred() {
+                    Ok(credentials) => credentials,
+                    Err(error) => {
+                        eprintln!("cowshed: gateway control connection dropped unanswered: its peer credentials could not be read: {error}");
+                        continue;
+                    }
+                };
                 if credentials.uid() != authorized_uid || connections.len() >= capacity {
+                    eprintln!(
+                        "cowshed: gateway control connection dropped unanswered: uid {} (authorized {authorized_uid}), {} of {capacity} connections",
+                        credentials.uid(),
+                        connections.len()
+                    );
                     continue;
                 }
                 let services = services.clone();
@@ -3212,9 +3229,17 @@ async fn run_unix_control(
                     crate::control::serve_control_unix(stream, services).await;
                 });
             }
-            _ = connections.join_next(), if !connections.is_empty() => {}
+            ended = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = ended {
+                    eprintln!("cowshed: gateway control connection task failed: {error}");
+                }
+            }
             changed = stopped.changed() => {
-                if changed.is_err() || *stopped.borrow() { break; }
+                if changed.is_err() || *stopped.borrow() {
+                    let reason = if changed.is_err() { "shutdown sender dropped" } else { "shutdown requested" };
+                    eprintln!("cowshed: gateway control listener stopping: {reason}; closing {} connections", connections.len());
+                    break;
+                }
             }
         }
     }

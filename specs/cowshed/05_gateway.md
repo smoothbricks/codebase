@@ -545,7 +545,9 @@ coordinator-side; the data plane supplies neither git credentials nor a push pat
 The control plane provides status and audit to host tools, a project-bound repo-mirror operation to coordinators, and
 the host's disk-lifecycle lease and CPU budget to every process that runs a disk tool or a parallel runner (below). Peer
 credentials on the Unix socket (and equivalent local authentication on TCP) must identify an authorized host process;
-the data-plane token is never accepted on the control plane.
+the data-plane token is never accepted on the control plane. The Unix accept loop records listener failure, unreadable
+peer credentials, unauthorized UID, connection-capacity refusal, connection-task failure and shutdown; an admission
+refusal is never a silent return.
 
 Workspace sessions are installed and removed over the control plane, and the gateway's session table is a cache of host
 inventory, never an authority. Each session carries its workspace's effective grant revision, which every grant change
@@ -953,6 +955,12 @@ core count.
   pool's life: the resident's exit closes it. A different token class would leave the resident in the ledger holding
   something; exempting it from the budget would leave the requests it runs unbudgeted; acquiring per request through a
   relay pool is the gate job's existing mechanism and budgets exactly the work.
+  - **CPU pool retirement.** Pool retirement unlinks its endpoint before closing its listener. It drains the kernel
+    accept queue, not merely the runtime's readiness cache, and answers queued and already accepted connections with
+    `{"ok":false,"code":"pool-retired","error":"the CPU pool owner's lease ended"}` followed by EOF. A new connection
+    after unlink fails at path lookup; an already queued connection completes and hears the named refusal, rather than
+    being abandoned during its handshake. The retirement log names the pool and counts queued refusals and accepted
+    connections ended. Explicit close and owner drop use this same drain; neither aborts the listener task.
 - **Work-conserving but for the gate's room.** No grant is capped below `want` for fairness' sake: with nobody else
   waiting, a gate-class grant is `min(want, free)`, so a lone gate runner may hold all N tokens, because a gate's wall
   time is what the budget buys. A background grant is `min(want, room)`, the room being the free tokens within the

@@ -205,7 +205,8 @@ enum PoolLedger {
 pub(crate) struct CpuPool {
     path: PathBuf,
     fifo: Option<JobserverFifo>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<io::Result<()>>>,
 }
 
 impl CpuPool {
@@ -225,8 +226,11 @@ impl CpuPool {
             PoolSource::Resident { .. } => None,
         };
         let path = directory.join(opaque_name());
-        let listener =
-            cowshed_os::fork_lock::Fenced::create(|| tokio::net::UnixListener::bind(&path))?;
+        let listener = cowshed_os::fork_lock::Fenced::create(|| {
+            let listener = std::os::unix::net::UnixListener::bind(&path)?;
+            listener.set_nonblocking(true)?;
+            tokio::io::unix::AsyncFd::new(listener)
+        })?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let ledger = match source {
             PoolSource::Lent(_) => PoolLedger::Fifo(FifoTokens::start(
@@ -250,18 +254,25 @@ impl CpuPool {
                 rank: crate::cpu_budget::Rank::Background,
             },
         };
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let retiring_path = path.clone();
         let task = tokio::spawn(async move {
             let mut children = tokio::task::JoinSet::new();
+            let (children_stop, child_stopped) = tokio::sync::watch::channel(());
             loop {
                 tokio::select! {
+                    biased;
+                    _ = &mut stopped => break,
                     accepted = async {
-                        let mut accepting = std::pin::pin!(listener.accept());
-                        std::future::poll_fn(|cx| cowshed_os::fork_lock::create(|| Ok(accepting.as_mut().poll(cx)))
-                            .expect("polling socket accept runs an infallible closure")).await
-                    } => match accepted {
-                        Ok((stream, _)) => {
-                            children.spawn(serve_pool(cowshed_os::fork_lock::Fenced::new(stream), ledger.clone(), std::sync::Arc::clone(&directory)));
+                        loop {
+                            let mut ready = listener.readable().await?;
+                            if let Ok(result) = ready.try_io(|listener| accept_pool_connection(listener.get_ref())) {
+                                break result;
+                            }
                         }
+                    } => match accepted {
+                        Ok(stream) => {
+                            children.spawn(serve_pool_until_retired(stream, ledger.clone(), std::sync::Arc::clone(&directory), child_stopped.clone()));                        }
                         Err(error) => { eprintln!("cowshed: CPU pool listener failed: {error}"); break; }
                     },
                     ended = children.join_next(), if !children.is_empty() => {
@@ -269,11 +280,35 @@ impl CpuPool {
                     }
                 }
             }
-            children.shutdown().await;
+            let retired = retire_pool_listener(listener.get_ref(), &retiring_path).await;
+            drop(listener);
+            drop(children_stop);
+            let mut ended = 0;
+            while let Some(result) = children.join_next().await {
+                match result {
+                    Ok(true) => ended += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("cowshed: CPU pool child failed during retirement: {error}")
+                    }
+                }
+            }
+            match &retired {
+                Ok(refused) => eprintln!(
+                    "cowshed: CPU pool {} listener closed: refused {refused} queued connections, ended {ended} accepted connections (pool-retired)",
+                    retiring_path.display()
+                ),
+                Err(error) => eprintln!(
+                    "cowshed: CPU pool {} retirement failed: {error}",
+                    retiring_path.display()
+                ),
+            }
+            retired.map(|_| ())
         });
         Ok(Self {
             path,
             fifo,
+            stop: Some(stop),
             task: Some(task),
         })
     }
@@ -288,42 +323,93 @@ impl CpuPool {
     }
 
     pub(crate) async fn close(mut self) -> io::Result<()> {
+        drop(self.stop.take());
         if let Some(task) = self.task.take() {
-            task.abort();
-            if let Err(error) = task.await
-                && !error.is_cancelled()
-            {
-                return Err(io::Error::other(format!("CPU pool task failed: {error}")));
-            }
+            task.await
+                .map_err(|error| io::Error::other(format!("CPU pool task failed: {error}")))??;
         }
         if let Some(fifo) = self.fifo.take() {
             fifo.drain_and_unlink();
         }
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        Ok(())
     }
 }
 
 impl Drop for CpuPool {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        // Dropping the signal requests the same queued-connection drain as explicit close.
+        // The task retains the listener until that drain completes; it must not be aborted.
+        drop(self.stop.take());
         if let Some(fifo) = self.fifo.take() {
             fifo.drain_and_unlink();
         }
-        if let Err(error) = std::fs::remove_file(&self.path)
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            eprintln!(
-                "cowshed: cannot remove CPU pool {}: {error}",
-                self.path.display()
-            );
+    }
+}
+
+fn accept_pool_connection(
+    listener: &std::os::unix::net::UnixListener,
+) -> io::Result<cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>> {
+    cowshed_os::fork_lock::Fenced::create(|| {
+        let (stream, _) = listener.accept()?;
+        stream.set_nonblocking(true)?;
+        tokio::net::UnixStream::from_std(stream)
+    })
+}
+
+async fn retire_pool_listener(
+    listener: &std::os::unix::net::UnixListener,
+    path: &Path,
+) -> io::Result<usize> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut refused = 0;
+    loop {
+        // No new path lookup can reach this listener. Drain its kernel accept queue before
+        // closing it: aborting the listener can strand a concurrent Darwin connect forever.
+        // Tokio's readiness cache can still be empty while the kernel already has connections.
+        match accept_pool_connection(listener) {
+            Ok(mut stream) => {
+                refused += 1;
+                refuse_retired_pool(&mut stream).await;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(refused),
+            Err(error) => return Err(error),
         }
     }
+}
+
+async fn refuse_retired_pool(stream: &mut cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>) {
+    use tokio::io::AsyncWriteExt as _;
+
+    if let Err(error) = stream
+        .write_all(b"{\"ok\":false,\"code\":\"pool-retired\",\"error\":\"the CPU pool owner's lease ended\"}\n")
+        .await
+    {
+        eprintln!("cowshed: CPU pool could not deliver pool-retired: {error}");
+    }
+    if let Err(error) = stream.shutdown().await {
+        eprintln!("cowshed: CPU pool could not close refused connection: {error}");
+    }
+}
+
+async fn serve_pool_until_retired(
+    mut stream: cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
+    ledger: PoolLedger,
+    directory: std::sync::Arc<PathBuf>,
+    mut stopped: tokio::sync::watch::Receiver<()>,
+) -> bool {
+    let retired = tokio::select! {
+        biased;
+        _ = stopped.changed() => true,
+        _ = serve_pool(&mut stream, ledger, directory) => false,
+    };
+    if retired {
+        refuse_retired_pool(&mut stream).await;
+    }
+    retired
 }
 
 /// A fresh name no job id predicts: 22 base64url characters of a random UUID.
@@ -572,7 +658,7 @@ impl Admission {
 }
 
 async fn serve_pool(
-    stream: cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
+    stream: &mut cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>,
     ledger: PoolLedger,
     directory: std::sync::Arc<PathBuf>,
 ) {
@@ -769,9 +855,15 @@ mod tests {
         let granted: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(granted["lease"], "granted");
         assert_eq!(granted["tokens"], 2);
-        drop(reader);
         let fifo = pool.fifo().expect("a lent pool has a fifo").to_owned();
         pool.close().await.expect("the actual pool retires");
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let retired: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(retired["ok"], false);
+        assert_eq!(retired["code"], "pool-retired");
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
         assert!(!endpoint.exists());
         assert!(!fifo.exists(), "closing the pool unlinks its fifo");
         std::fs::remove_dir_all(root).unwrap();
@@ -873,6 +965,55 @@ mod tests {
         pool.close().await.unwrap();
         assert!(!fifo.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retiring_a_pool_answers_every_connection_still_in_its_accept_queue() {
+        use tokio::io::AsyncReadExt as _;
+
+        for explicit_close in [true, false] {
+            let root = PathBuf::from(format!("/tmp/cspr-{}", uuid::Uuid::new_v4().simple()));
+            let pool = CpuPool::start(
+                std::sync::Arc::new(root.clone()),
+                PoolSource::Lent(std::num::NonZeroUsize::new(2).unwrap()),
+            )
+            .unwrap();
+            let endpoint = pool.path().to_owned();
+            let fifo = pool.fifo().expect("a lent pool has a fifo").to_owned();
+            // This current-thread runtime has not polled the listener task yet. All eight
+            // real connections are in its kernel accept queue, not in a serving task.
+            let mut clients = Vec::new();
+            for _ in 0..8 {
+                let mut client = cowshed_os::fork_lock::create(|| {
+                    std::os::unix::net::UnixStream::connect(&endpoint)
+                })
+                .unwrap();
+                client
+                    .write_all(b"{\"op\":\"cpu-pool\",\"want\":1}\n")
+                    .unwrap();
+                client.set_nonblocking(true).unwrap();
+                clients.push(tokio::net::UnixStream::from_std(client).unwrap());
+            }
+            if explicit_close {
+                pool.close().await.unwrap();
+            } else {
+                drop(pool);
+            }
+            for mut client in clients {
+                let mut response = String::new();
+                client.read_to_string(&mut response).await.unwrap();
+                assert!(
+                    !response.is_empty(),
+                    "retirement silently dropped a queued connection"
+                );
+                let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(response["ok"], false);
+                assert_eq!(response["code"], "pool-retired");
+            }
+            assert!(!endpoint.exists());
+            assert!(!fifo.exists(), "retirement unlinks the pool's fifo");
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
