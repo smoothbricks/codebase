@@ -147,6 +147,15 @@ Each detector returns data through one `CapabilityContribution`:
   the program name; a conflicting detector contribution returns a typed conflict naming core and the detector, never a
   missing-owner panic.
 
+  Core also contributes one `bash` the same way a detector resolves its tool: the first executable `bash` in the host's
+  conventional installation directories (the user's and system Nix profiles, `/run/current-system/sw/bin`, Homebrew,
+  `/usr/local/bin`, `/usr/bin`, `/bin`), linked as `bash` in the mode's private `tools/bin`, with literal reads of the
+  link lookups and the resolved executable and, for a store-resolved bash, the immutable store read above. Scripts name
+  their shell `#!/usr/bin/env bash`, and a job without shell activation runs on the bootstrap PATH alone, whose fixed
+  system directories hold no bash on NixOS; with this link `env` finds one on every host. The directory it was found in
+  never joins PATH. The runtime never parses a script's interpreter line or rewrites argv0: the kernel runs the
+  interpreter, so `$0` and `BASH_SOURCE` stay the script's.
+
   Reconciliation reads the owned-name manifest and checks every requested link; it never scans unrelated entries. A
   clean manifest and matching links require no write or durability barrier. Before repairing a set, preparation durably
   publishes the union of old and requested names as pending, then repairs the links, syncs their directory, and only

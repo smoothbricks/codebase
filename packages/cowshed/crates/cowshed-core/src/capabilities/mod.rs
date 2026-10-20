@@ -377,6 +377,16 @@ fn detect_with(
         "cowshed",
         &[crate::host_dirs::support_directory(context.home).join("bin")],
     )?;
+    // `#!/usr/bin/env bash` is how a checkout's scripts name their shell, and a job without
+    // shell activation runs on the bootstrap PATH alone, whose fixed system directories hold no
+    // bash on NixOS. Resolve exactly one bash the way a detector resolves its tool, so `env`
+    // finds it there; its directory never joins PATH.
+    add_bootstrap(
+        &mut result.contribution,
+        context,
+        "bash",
+        &host_program_directories(context),
+    )?;
     let mut owners = result
         .contribution
         .bootstrap_programs
@@ -1087,6 +1097,22 @@ pub mod test_support {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, "").unwrap();
             }
+        }
+        /// What core detection contributes for `bash` on this host: the one bash
+        /// [`host_program_directories`] resolves first, with the grants that resolution takes. It
+        /// depends on the host, so a test expecting the core contribution derives it here rather
+        /// than naming a path.
+        pub fn core_bash(&self) -> CapabilityContribution {
+            let mut contribution = CapabilityContribution::default();
+            let context = self.context();
+            add_bootstrap(
+                &mut contribution,
+                &context,
+                "bash",
+                &host_program_directories(&context),
+            )
+            .unwrap();
+            contribution
         }
     }
     impl Default for Fixture {

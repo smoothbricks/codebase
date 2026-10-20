@@ -84,7 +84,8 @@ mod tests {
     }
 
     /// A shim or tool link into the store reads the store without any Nix convention, on a host
-    /// that has one; a workspace's own script beside it reads nothing.
+    /// that has one; a workspace's own script beside it reads nothing beyond what the core bash
+    /// probe's own resolution reads.
     #[test]
     fn a_program_linked_into_the_store_reads_the_store_without_a_nix_project() {
         let fixture = Fixture::new();
@@ -94,7 +95,10 @@ mod tests {
             std::fs::write(bin.join("script"), "#!/bin/sh\n").unwrap();
         }
         let detect = || super::super::detect(&fixture.context(), &BTreeMap::new()).unwrap();
-        assert!(!detect().contribution.grants.contains(&store_read()));
+        assert_eq!(
+            detect().contribution.grants.contains(&store_read()),
+            fixture.core_bash().grants.contains(&store_read())
+        );
 
         std::os::unix::fs::symlink(
             "/nix/store/00000000000000000000000000000000-node/bin/node",
@@ -110,19 +114,20 @@ mod tests {
     }
 
     #[test]
-    fn a_program_linked_outside_the_store_adds_no_grant_beyond_the_core_probe() {
+    fn a_program_linked_outside_the_store_adds_no_grant_beyond_the_core_probes() {
         let fixture = Fixture::new();
         let tools = fixture.root.join(".cowshed/tools/bin");
         std::fs::create_dir_all(&tools).unwrap();
         std::os::unix::fs::symlink("/usr/bin/env", tools.join("env")).unwrap();
         let detected = super::super::detect(&fixture.context(), &BTreeMap::new()).unwrap();
-        assert_eq!(
-            detected.contribution.grants,
-            [CapabilityGrant {
-                path: crate::host_dirs::support_directory(&fixture.home).join("bin/cowshed"),
-                scope: GrantScope::Literal,
-                access: GrantAccess::Read,
-            }]
-        );
+        let mut grants = vec![CapabilityGrant {
+            path: crate::host_dirs::support_directory(&fixture.home).join("bin/cowshed"),
+            scope: GrantScope::Literal,
+            access: GrantAccess::Read,
+        }];
+        grants.extend(fixture.core_bash().grants);
+        grants.sort();
+        grants.dedup();
+        assert_eq!(detected.contribution.grants, grants);
     }
 }

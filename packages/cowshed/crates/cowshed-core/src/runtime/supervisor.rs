@@ -7812,6 +7812,49 @@ mod workspace_toolchain_tests {
         std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
     }
 
+    /// A job in a workspace without shell activation meets the bootstrap PATH alone, whose fixed
+    /// system directories hold no bash on NixOS. `#!/usr/bin/env bash` still finds the bash core
+    /// detection linked into the mode's private `tools/bin`: run exactly as a one-shot job, a
+    /// script with that line reports the link as its bash.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_env_bash_script_finds_the_linked_bash_without_shell_activation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = scratch("env-bash");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(mount.join(".cowshed")).expect("private root");
+        std::fs::create_dir_all(root.join("home")).expect("home");
+        std::fs::write(mount.join(".cowshed/token"), "A".repeat(43)).expect("token");
+        std::fs::write(
+            mount.join(".cowshed/ca.pem"),
+            b"-----BEGIN CERTIFICATE-----\nWORKSPACE\n-----END CERTIFICATE-----\n",
+        )
+        .expect("workspace CA");
+        let script = mount.join("which-bash");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\nset -euo pipefail\ncommand -v bash\n",
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let sandbox = sandbox_at(&mount);
+
+        let output = run_as_job(&sandbox, &mount, vec![OsString::from("./which-bash")])
+            .await
+            .expect("run the script as a job");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("utf-8").trim_end(),
+            mount
+                .join(".cowshed/tools/bin/bash")
+                .to_str()
+                .expect("utf-8 path"),
+        );
+        std::fs::remove_file(sandbox_runtime_link(&sandbox)).ok();
+    }
+
     /// Every cargo a workspace runs wraps rustc with the sccache the host pinned: the program
     /// itself, not a name the repository shell's `PATH` may not resolve. A host that pinned none,
     /// or whose pinned store path was collected, builds without a wrapper rather than failing

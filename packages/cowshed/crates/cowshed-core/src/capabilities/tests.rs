@@ -2,19 +2,54 @@ use super::test_support::Fixture;
 use super::*;
 
 #[test]
-fn a_plain_repository_has_only_the_core_executable_probe() {
+fn a_plain_repository_has_only_the_core_executable_probes() {
     let fixture = Fixture::new();
     let detected = detect(&fixture.context(), &BTreeMap::new()).unwrap();
+    let bash = fixture.core_bash();
     assert!(detected.active.is_empty());
-    assert!(detected.contribution.bootstrap_programs.is_empty());
     assert_eq!(
-        detected.contribution.grants,
-        [CapabilityGrant {
-            path: crate::host_dirs::support_directory(&fixture.home).join("bin/cowshed"),
-            scope: GrantScope::Literal,
-            access: GrantAccess::Read,
-        }]
+        detected.contribution.bootstrap_programs,
+        bash.bootstrap_programs
     );
+    let mut grants = vec![CapabilityGrant {
+        path: crate::host_dirs::support_directory(&fixture.home).join("bin/cowshed"),
+        scope: GrantScope::Literal,
+        access: GrantAccess::Read,
+    }];
+    grants.extend(bash.grants);
+    // Detection hands its grants back sorted and deduplicated.
+    grants.sort();
+    grants.dedup();
+    assert_eq!(detected.contribution.grants, grants);
+}
+
+/// A job without shell activation runs on the bootstrap PATH alone, and NixOS keeps no bash in
+/// its fixed system directories: so `#!/usr/bin/env bash` resolves only because core detection
+/// links one bash from the host's conventional installation directories, with that resolution's
+/// own read grants and nothing else.
+#[test]
+fn bash_is_a_core_bootstrap_resolved_from_the_host_program_directories() {
+    let fixture = Fixture::new();
+    let detected = detect(&fixture.context(), &BTreeMap::new()).unwrap();
+    let bash = bootstrap_program("bash", &host_program_directories(&fixture.context()))
+        .unwrap()
+        .expect("every supported host installs a bash in a conventional directory");
+    assert!(
+        detected
+            .contribution
+            .bootstrap_programs
+            .contains(&BootstrapProgram {
+                name: "bash",
+                target: bash.clone()
+            }),
+        "{:?}",
+        detected.contribution.bootstrap_programs
+    );
+    assert!(detected.contribution.grants.contains(&CapabilityGrant {
+        path: bash,
+        scope: GrantScope::Literal,
+        access: GrantAccess::Read,
+    }));
 }
 
 #[test]
@@ -32,21 +67,26 @@ fn the_installed_cowshed_is_a_core_bootstrap_without_controller_data_authority()
         detected.active.is_empty(),
         "core bootstrap needs no project capability"
     );
-    assert_eq!(
-        detected.contribution.bootstrap_programs,
-        [BootstrapProgram {
-            name: "cowshed",
-            target: program.clone()
-        }]
-    );
-    assert_eq!(
-        detected.contribution.grants,
-        [bin.join("cowshed"), program].map(|path| CapabilityGrant {
+    let bash = fixture.core_bash();
+    let mut programs = vec![BootstrapProgram {
+        name: "cowshed",
+        target: program.clone(),
+    }];
+    programs.extend(bash.bootstrap_programs);
+    // Detection hands its programs back sorted, like its grants.
+    programs.sort();
+    assert_eq!(detected.contribution.bootstrap_programs, programs);
+    let mut grants = [bin.join("cowshed"), program]
+        .map(|path| CapabilityGrant {
             path,
             scope: GrantScope::Literal,
             access: GrantAccess::Read,
         })
-    );
+        .to_vec();
+    grants.extend(bash.grants);
+    grants.sort();
+    grants.dedup();
+    assert_eq!(detected.contribution.grants, grants);
     assert!(detected.contribution.shared_caches.is_empty());
 }
 
