@@ -39,6 +39,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &RESIZE,
     &DEFRAG,
     &RESEED,
+    &CACHE,
     &REKEY,
     &GC,
     &PUSH,
@@ -96,6 +97,7 @@ pub enum Command {
     Defrag(DefragArgs),
     Reseed(ReseedArgs),
     Rekey(RekeyArgs),
+    Cache(CacheCommand),
     Gc(GcArgs),
     Push(PushArgs),
     Rebase(RebaseArgs),
@@ -152,6 +154,7 @@ impl Command {
             | Self::Rebase(_)
             | Self::Land(_)
             | Self::Credential(_)
+            | Self::Cache(_)
             | Self::Controller
             | Self::Identity(_) => ProjectDiscovery::Required,
             Self::List(args) if !args.all => ProjectDiscovery::Optional,
@@ -485,6 +488,12 @@ pub struct ResizeArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DefragArgs {
     pub workspace: String,
+}
+
+/// `cache clear [<ws>]` — delete a workspace's Nx state and the project's Nx store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CacheCommand {
+    Clear { workspace: Option<String> },
 }
 
 /// `reseed <ws|main> [--from <target>] [--dry-run]` — discard live build state for a seed clone.
@@ -891,6 +900,11 @@ fn cli_command() -> ClapCommand {
                 .arg(flag("dry-run")),
         )
         .subcommand(leaf("rekey").arg(positional("workspace", 0..=1)))
+        .subcommand(
+            leaf("cache")
+                .subcommand_required(true)
+                .subcommand(leaf("clear").arg(positional("workspace", 0..=1))),
+        )
         .subcommand(leaf("gc").args([
             flag("dry-run"),
             flag("abandoned"),
@@ -1075,6 +1089,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "resize" => parse_resize(leaf)?,
         "defrag" => parse_defrag(leaf)?,
         "reseed" => parse_reseed(leaf)?,
+        "cache" => parse_cache(leaf)?,
         "rekey" => parse_rekey(leaf)?,
         "gc" => parse_gc(leaf)?,
         "push" => parse_push(leaf)?,
@@ -2993,6 +3008,40 @@ fn parse_defrag(matches: &ArgMatches) -> Result<Command, UsageError> {
     }))
 }
 
+const CACHE: CommandSpec = CommandSpec {
+    name: "cache",
+    missing: "cache action is required",
+    args: "clear [<ws>]",
+    trailing: "",
+    summary: "clear a workspace's Nx state and the project's Nx store",
+    about: &[
+        "`clear` deletes both Nx caches cowshed keeps and says how many entries each held: the workspace's own Nx state on its build volume — every entry in `.nx/cache` and `.nx/workspace-data`, the cached outputs together with the task database that indexes them — and the project's accepted-task store, which the gateway serves to every workspace of the project. With no `<ws>` it clears the workspace the command runs inside.",
+        "`nx reset` does not do this: in a cowshed checkout `.nx/cache` and `.nx/workspace-data` are links into the build volume, and `nx reset` removes the links and leaves every entry on the volume, where the next refresh links them back.",
+        "Nothing running is stopped except the checkout's own Nx daemon and the project's Nx cache backend, and each starts again on its next request. The workspace is refused while a job or land holds its build volume, another lifecycle operation holds the workspace, or a process other than that daemon has its Nx task database open; the store is refused while any of the project's Nx requests is in flight or queued, or a land is publishing to it. Each refusal names what is running and clears nothing of that cache.",
+        "The workspace is cleared first, then the store. When the store refuses after that, the refusal says the workspace was cleared; run the command again once the named work has ended. Prints one line per cache with its entry count; --json returns CacheClearReport.",
+    ],
+    options: &[],
+};
+
+fn parse_cache(matches: &ArgMatches) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &CACHE;
+    let (action, child) = matches
+        .subcommand()
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    let command = match action {
+        "clear" => CacheCommand::Clear {
+            workspace: optional_workspace(child, "workspace", false, USAGE)?,
+        },
+        other => {
+            return Err(UsageError::new(
+                format!("unknown cache action `{other}`"),
+                USAGE,
+            ));
+        }
+    };
+    Ok(Command::Cache(command))
+}
+
 const RESEED: CommandSpec = CommandSpec {
     name: "reseed",
     missing: "reseed requires a workspace",
@@ -3413,6 +3462,66 @@ mod tests {
             &["reseed", "raven", "--refresh"],
         ] {
             assert!(parse_args(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn cache_clear_names_one_workspace_or_infers_it() {
+        assert_eq!(
+            parse_args(["cache", "clear", "raven"]).unwrap().command,
+            Command::Cache(CacheCommand::Clear {
+                workspace: Some("raven".into())
+            })
+        );
+        assert_eq!(
+            parse_args(["cache", "clear", "main", "--json"])
+                .unwrap()
+                .command,
+            Command::Cache(CacheCommand::Clear {
+                workspace: Some("main".into())
+            })
+        );
+        assert_eq!(
+            parse_args(["cache", "clear"]).unwrap().command,
+            Command::Cache(CacheCommand::Clear { workspace: None })
+        );
+        for refused in [
+            &["cache"][..],
+            &["cache", "reset"],
+            &["cache", "clear", "not/a/name"],
+            &["cache", "clear", "raven", "extra"],
+            &["cache", "clear", "raven", "--force"],
+        ] {
+            assert!(parse_args(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn cache_clear_help_says_nx_reset_leaves_the_entries() {
+        for argv in [
+            &["help", "cache"][..],
+            &["cache", "--help"],
+            &["cache", "clear", "--help"],
+        ] {
+            assert_eq!(
+                parse_args(argv.iter().copied()).unwrap().command,
+                Command::Help(Some(&CACHE))
+            );
+        }
+        let page = CACHE
+            .page()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for fact in [
+            "cache clear [<ws>]",
+            "`nx reset` removes the links and leaves every entry on the volume",
+            "`.nx/cache` and `.nx/workspace-data`",
+            "accepted-task store",
+            "names what is running",
+            "CacheClearReport",
+        ] {
+            assert!(page.contains(fact), "missing {fact}: {page}");
         }
     }
 

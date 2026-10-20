@@ -56,6 +56,7 @@ export interface NativeCoordinatorOperations
     NativeCoordinatorResize,
     NativeCoordinatorDefragment,
     NativeCoordinatorReseed,
+    NativeCoordinatorClearNxState,
     NativeCoordinatorDetach,
     NativeCoordinatorAssignSlot,
     NativeCoordinatorDestroy,
@@ -150,6 +151,24 @@ export async function coordinatorChangeRepoId(
   args: CoordinatorChangeRepoIdArguments,
 ): Promise<NativeWorkspaceRefHandle> {
   return handle.changeRepoId(JSON.stringify(args));
+}
+
+/** A handle that serves `coordinator.clearNxState`. */
+export interface NativeCoordinatorClearNxState {
+  clearNxState(argumentsJson: string): Promise<string>;
+}
+
+/** The request fields a `coordinator.clearNxState` caller names; its handle binds the rest. */
+export type CoordinatorClearNxStateArguments = Pick<Api.WorkspaceRequest, 'workspace'>;
+
+/**
+ * Deletes a workspace's Nx cache and task database contents on its build volume.
+ */
+export async function coordinatorClearNxState(
+  handle: NativeCoordinatorClearNxState,
+  args: CoordinatorClearNxStateArguments,
+): Promise<Api.NxStateClearResult> {
+  return V.parseNxStateClearResult(await handle.clearNxState(JSON.stringify(args)));
 }
 
 /** A handle that serves `coordinator.defragment`. */

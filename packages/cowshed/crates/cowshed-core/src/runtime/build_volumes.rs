@@ -42,6 +42,7 @@ use cowshed_apfs::store_lock::LockMode;
 
 type Host = MacOsApfsExecutionHost<SystemCommandRunner>;
 
+mod nx_clear;
 mod reseed;
 pub(crate) use reseed::ReseedWorkspace;
 
@@ -4056,6 +4057,87 @@ mod tests {
         // Owned runtime shutdown joins its blocking tasks: no sleeps or PID inference.
         drop(runtime);
         assert!(acquire_collector(&store, &repo).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_nx_state_clear_refuses_running_work_then_empties_cache_and_task_data() {
+        let scratch = Scratch::directory("nx-state-clear");
+        let (checkout, live, mount) = scratch.linked_checkout("topic", 1);
+        BuildVolumeState {
+            paths: vec![
+                BuildStatePath::new(".nx/cache", "nx/cache").unwrap(),
+                BuildStatePath::new(".nx/workspace-data", "nx/workspace-data").unwrap(),
+            ],
+            fingerprint: None,
+        }
+        .write(&mount)
+        .unwrap();
+        let cache = mount.join("nx/cache");
+        let data = mount.join("nx/workspace-data");
+        fs::create_dir_all(cache.join("terminalOutputs")).unwrap();
+        fs::write(cache.join("terminalOutputs/101"), b"terminal output").unwrap();
+        fs::create_dir_all(cache.join("101")).unwrap();
+        fs::write(cache.join("101/out.js"), b"cached output").unwrap();
+        fs::write(cache.join("run.json"), b"{}").unwrap();
+        fs::create_dir_all(&data).unwrap();
+        let database = data.join("T-v3.db");
+        fs::write(&database, b"").unwrap();
+        fs::write(data.join("project-graph.json"), b"{}").unwrap();
+        let topic = owner("topic", '1');
+        let image_lock = scratch.image_lock(&topic.name);
+        fs::create_dir_all(image_lock.parent().unwrap()).unwrap();
+        let clear = || {
+            scratch
+                .volumes
+                .clear_nx_state(topic.name.clone(), checkout.clone(), image_lock.clone())
+        };
+        let refused = |refusal: CowshedError, named: &str| {
+            assert_eq!(refusal.code, crate::ErrorCode::Conflict, "{refusal}");
+            assert!(refusal.message.contains(named), "{refusal}");
+            assert!(refusal.message.contains("nothing was cleared"), "{refusal}");
+        };
+
+        // A job admitted on the volume, an Nx client with the task database open, and another
+        // lifecycle operation each refuse by name, and nothing is deleted.
+        let job = scratch.layout.hold(&live).unwrap();
+        refused(clear().await.unwrap_err(), &std::process::id().to_string());
+        drop(job);
+        let open = fs::File::open(&database).unwrap();
+        refused(clear().await.unwrap_err(), &database.display().to_string());
+        drop(open);
+        let locked = scratch.lock(&topic).await;
+        refused(
+            clear().await.unwrap_err(),
+            &image_lock.display().to_string(),
+        );
+        drop(locked);
+        assert!(cache.join("101/out.js").exists());
+        assert!(database.exists());
+
+        let cleared = clear().await.unwrap();
+        assert_eq!(cleared.workspace, topic.name);
+        assert_eq!(cleared.volume, live.to_string());
+        assert_eq!(
+            cleared.cache_entries, 3,
+            "terminalOutputs, 101 and run.json"
+        );
+        assert_eq!(
+            cleared.workspace_data_entries, 2,
+            "the task database and the graph"
+        );
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0);
+        let left: Vec<_> = fs::read_dir(&data)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["T-v3.lock"], "only Nx's own open lock stays");
+        assert_eq!(
+            scratch.layout.linked(&checkout).unwrap(),
+            Some(live.clone())
+        );
+        drop(scratch.layout.hold(&live).expect("the claim is let go"));
+        scratch.release_all();
     }
 
     #[cfg(target_os = "macos")]

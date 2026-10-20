@@ -123,9 +123,9 @@ commit — never blocks an install; an installed record that cannot be read is a
 installs the invoking build without judging it; it is refused with `--uninstall` and `--force`, which install nothing.
 
 The commands that change a workspace or run work in one — `adopt`, `fork`, `mv`, `checkpoint`, `restore`, `path`,
-`exec`, `grant`, `rm`, `forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `rekey`, `gc`, `push`, `rebase`,
-`land` — first ask the daemon whether it runs their build, before they open the project or change anything. A daemon of
-another build refuses them up front (exit 4), naming both builds, with the remedy this verb provides:
+`exec`, `grant`, `rm`, `forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`, `cache clear`, `rekey`, `gc`, `push`,
+`rebase`, `land` — first ask the daemon whether it runs their build, before they open the project or change anything. A
+daemon of another build refuses them up front (exit 4), naming both builds, with the remedy this verb provides:
 
 ```
 $ cowshed rm raven
@@ -969,6 +969,33 @@ allocation from the seed and `freedBytes` is zero. Execution reports actual repl
 allocation. The signed preview reduction is `previousBytes - replacementBytes`, not execution's stdout. These are
 GC-style allocated image bytes, not unique physical bytes: APFS shares extents, so no corresponding increase in physical
 free space is promised.
+
+### `cowshed cache clear [<name|main>]`
+
+Delete both Nx caches cowshed keeps: the workspace's own Nx state on its build volume — every entry in `.nx/cache` and
+`.nx/workspace-data`, the cached outputs together with the task database that indexes them — and the project's
+accepted-task store the gateway serves to every workspace of the project. With no name it clears the workspace you are
+in.
+
+```
+cowshed cache clear raven
+cowshed cache clear main --json
+```
+
+Do not use `nx reset` for this. In a cowshed checkout `.nx/cache` and `.nx/workspace-data` are links into the build
+volume; `nx reset` removes the links and leaves every entry on the volume, where the next refresh links them back.
+
+Run while idle. The workspace is refused while a job or land holds its build volume, another lifecycle operation holds
+it, or a process other than its Nx daemon has the task database open; the store is refused while any of the project's Nx
+requests is in flight or queued, or a land is publishing. Each refusal names what is running and clears nothing of that
+cache. Only the checkout's Nx daemon and the project's Nx backend are stopped, and both restart on their next request.
+The workspace is cleared first: when the store then refuses, the message says the workspace was cleared, and running the
+command again once the named work ends clears the store. Seeds are not cleared, so a fork from a seed captured earlier
+still carries its entries until the next land refreshes it
+([16 Build volumes](../../../specs/cowshed/16_build_volumes.md#clearing-a-checkouts-nx-state)).
+
+Bare stdout is one line per cache with its entry count; `--json` returns
+`CacheClearReport { workspace: { workspace, volume, cacheEntries, workspaceDataEntries }, store: { repoId, entries } }`.
 
 ### `cowshed rekey <name|main>`
 

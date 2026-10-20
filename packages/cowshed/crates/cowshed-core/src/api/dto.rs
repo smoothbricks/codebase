@@ -3177,6 +3177,37 @@ pub struct ReseedResult {
     pub dry_run: bool,
 }
 
+/// What `cowshed cache clear` deleted from one checkout's Nx state on its build volume
+/// (16_build_volumes.md, "Clearing a checkout's Nx state"): the entries directly in every
+/// `.nx/cache` and every `.nx/workspace-data` directory the volume holds, deleted together
+/// under the volume's exclusive claim with the checkout's Nx closed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NxStateClearResult {
+    pub workspace: WorkspaceName,
+    pub volume: String,
+    pub cache_entries: u64,
+    pub workspace_data_entries: u64,
+}
+
+/// What `cowshed cache clear` deleted from the project's accepted-task store the gateway serves
+/// (03_caches.md, "Nx accepted-task artifact service"): the archives in its entries directory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NxStoreClearResult {
+    pub repo_id: RepoId,
+    pub entries: u64,
+}
+
+/// `cowshed cache clear`: the checkout's Nx state and the project's gateway store, each with
+/// the entries it deleted.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheClearReport {
+    pub workspace: NxStateClearResult,
+    pub store: NxStoreClearResult,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct CheckpointOptions {
@@ -4377,6 +4408,8 @@ result_bodies!(
     ResizeResult,
     DefragmentResult,
     ReseedResult,
+    NxStateClearResult,
+    CacheClearReport,
     SlotResult,
     WorkspaceInfo,
     JobInfo,

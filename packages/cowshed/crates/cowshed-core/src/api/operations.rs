@@ -14,10 +14,10 @@ use super::dto::{
     CheckpointResult, CommandArg, DefragmentResult, DoctorReport, EmptyResult, ExecClass,
     ExecScope, ForkOptions, GcOptions, GcReport, GrantDelta, GrantSet, JobId, JobInfo,
     JobJournalCursor, JobListeningPorts, JobTail, JobTailLimits, LandOptions, LandReport,
-    MirrorInfo, OutputPublication, ProjectGrantDelta, PushOptions, PushReport, RebaseOptions,
-    RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
-    ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode, ScriptCommand, SealedJob,
-    TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
+    MirrorInfo, NxStateClearResult, OutputPublication, ProjectGrantDelta, PushOptions, PushReport,
+    RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
+    RemoveReport, ReseedResult, ResizeResult, ResizeVolume, RunSandboxMode, ScriptCommand,
+    SealedJob, TraceContext, WorkspaceIncarnation, WorkspaceInfo, WorkspacePath, WorkspaceTarget,
 };
 use super::process::{JobProcessEvent, JobProcessTree};
 use super::resources::{JobResourceSample, SampleInterval};
@@ -295,6 +295,8 @@ operations! {
     coordinator json "coordinator.defragment" CoordinatorDefragment(WorkspaceRequest) -> DefragmentResult;
     /// Replaces a workspace's build volume with a clone of an existing target seed.
     coordinator json "coordinator.reseed" CoordinatorReseed(ReseedRequest) -> ReseedResult;
+    /// Deletes a workspace's Nx cache and task database contents on its build volume.
+    coordinator json "coordinator.clearNxState" CoordinatorClearNxState(WorkspaceRequest) -> NxStateClearResult;
     /// Detaches a workspace.
     coordinator json "coordinator.detach" CoordinatorDetach(WorkspaceRequest) -> EmptyResult;
     /// Assigns a workspace's gateway port slot.

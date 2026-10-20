@@ -824,6 +824,17 @@ impl ProjectRuntimeHost for FakeHost {
         ))
     }
 
+    async fn clear_nx_state(
+        &mut self,
+        workspace: WorkspaceName,
+    ) -> Result<cowshed_core::api::dto::NxStateClearResult> {
+        self.workspace(&workspace)?;
+        Err(CowshedError::environment_missing(
+            "this lifecycle test host has no build-volume storage",
+            "use the directory Nx state clear fixture",
+        ))
+    }
+
     async fn checkpoint(
         &mut self,
         workspace: WorkspaceName,

@@ -41,6 +41,7 @@
   "coordinator.resize": { "repoId": "acme/widget", "workspace": "feature", "capacity": "64G", "volume": "build" },
   "coordinator.defragment": { "repoId": "acme/widget", "workspace": "feature" },
   "coordinator.reseed": { "repoId": "acme/widget", "workspace": "feature", "from": "main", "dryRun": false },
+  "coordinator.clearNxState": { "repoId": "acme/widget", "workspace": "feature" },
   "coordinator.detach": { "repoId": "acme/widget", "workspace": "feature" },
   "coordinator.assignSlot": { "repoId": "acme/widget", "workspace": "feature", "slot": 3 },
   "coordinator.destroy": {

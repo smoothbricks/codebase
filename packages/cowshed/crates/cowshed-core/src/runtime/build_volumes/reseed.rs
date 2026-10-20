@@ -293,7 +293,7 @@ fn allocated_image_bytes(path: &Path) -> Result<u64> {
     }
 }
 
-fn named(holders: &[cowshed_os::process::Holder]) -> String {
+pub(super) fn named(holders: &[cowshed_os::process::Holder]) -> String {
     if holders.is_empty() {
         "no visible process (the kernel or another user may hold it)".to_owned()
     } else {

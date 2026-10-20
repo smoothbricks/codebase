@@ -352,24 +352,25 @@ images are unaffected.
 
 ## Command map
 
-| Goal                             | Command                                                                              |
-| -------------------------------- | ------------------------------------------------------------------------------------ |
-| Adopt a repository               | `cowshed adopt [path] [--repo-id owner/repo]`                                        |
-| Create from selected repo's main | `cowshed fork <ws>`                                                                  |
-| Create from another workspace    | `cowshed fork <src> <ws>`                                                            |
-| Create clean at a revision       | `cowshed fork [<src>] <ws> --ref <rev>`                                              |
-| List selected repository         | `cowshed ls`                                                                         |
-| Resolve/attach a mount           | `cowshed path <workspace>`                                                           |
-| Run a sandboxed command          | `cowshed exec <workspace> -- <argv...>`                                              |
-| Checkpoint / restore             | `cowshed checkpoint <workspace> [label]`, `cowshed restore <workspace> <label>`      |
-| Detach / attach                  | `cowshed detach <workspace>`, `cowshed attach <workspace>`                           |
-| Preserve Git work                | `cowshed push <workspace>`, `cowshed rebase <workspace>`, `cowshed land <workspace>` |
-| Remove a workspace               | `cowshed rm <workspace>`                                                             |
-| Preview / run reclamation        | `cowshed gc --dry-run`, `cowshed gc`                                                 |
-| Replace rebuildable build state  | `cowshed reseed <ws> [--from <target>] [--dry-run]` (default target: main)           |
-| Make `fork` fast on an old main  | `cowshed defrag main` (idle checkout; `doctor` warns `main-extents` when it is due)  |
-| Diagnose host state              | `cowshed doctor`                                                                     |
-| Manage the gateway               | `cowshed gateway start`, `status`, `stop`                                            |
+| Goal                                            | Command                                                                              |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Adopt a repository                              | `cowshed adopt [path] [--repo-id owner/repo]`                                        |
+| Create from selected repo's main                | `cowshed fork <ws>`                                                                  |
+| Create from another workspace                   | `cowshed fork <src> <ws>`                                                            |
+| Create clean at a revision                      | `cowshed fork [<src>] <ws> --ref <rev>`                                              |
+| List selected repository                        | `cowshed ls`                                                                         |
+| Resolve/attach a mount                          | `cowshed path <workspace>`                                                           |
+| Run a sandboxed command                         | `cowshed exec <workspace> -- <argv...>`                                              |
+| Checkpoint / restore                            | `cowshed checkpoint <workspace> [label]`, `cowshed restore <workspace> <label>`      |
+| Detach / attach                                 | `cowshed detach <workspace>`, `cowshed attach <workspace>`                           |
+| Preserve Git work                               | `cowshed push <workspace>`, `cowshed rebase <workspace>`, `cowshed land <workspace>` |
+| Remove a workspace                              | `cowshed rm <workspace>`                                                             |
+| Preview / run reclamation                       | `cowshed gc --dry-run`, `cowshed gc`                                                 |
+| Replace rebuildable build state                 | `cowshed reseed <ws> [--from <target>] [--dry-run]` (default target: main)           |
+| Clear a workspace's and the project's Nx caches | `cowshed cache clear [<ws>]` (not `nx reset`, which only removes the links)          |
+| Make `fork` fast on an old main                 | `cowshed defrag main` (idle checkout; `doctor` warns `main-extents` when it is due)  |
+| Diagnose host state                             | `cowshed doctor`                                                                     |
+| Manage the gateway                              | `cowshed gateway start`, `status`, `stop`                                            |
 
 `--project <git-root>`, `--json`, and `--quiet` are global options accepted by repository-scoped commands. Gateway
 service commands are host-global and reject `--project`.

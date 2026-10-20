@@ -31,7 +31,7 @@ use crate::{
         CredentialProvider, SystemConnector, UpstreamConnector,
     },
     mirror::{MirrorCacheStatus, MirrorService},
-    nx_cache::{NxCacheBackend, NxPublication},
+    nx_cache::{NxCacheBackend, NxCacheClearRefusal, NxCacheUse, NxPublication},
     proxy,
     repo_mirror::{Git2RepoTransport, RepoMirrorError, RepoMirrorHandle, RepoTransport},
     sim_broker::{SimBrokerError, SimBrokerHandle, SimRunner, XcrunSimRunner},
@@ -102,6 +102,14 @@ impl GatewayHandle {
             reply,
         })
         .await?;
+        receive.await.map_err(|_| GatewayError::Stopped)?
+    }
+
+    /// Clear the project's Nx accepted-task store, answering the archives deleted (03_caches.md,
+    /// "Nx accepted-task artifact service"). Refused while the project's Nx work is in flight.
+    pub async fn clear_nx_cache(&self, repo_id: String) -> Result<u64, GatewayError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::ClearNxCache { repo_id, reply }).await?;
         receive.await.map_err(|_| GatewayError::Stopped)?
     }
 
@@ -479,6 +487,15 @@ pub(crate) enum Command {
     NxBackendStarted {
         repo_id: String,
         result: Result<(NxCacheBackend, tokio::process::Child), String>,
+    },
+    ClearNxCache {
+        repo_id: String,
+        reply: oneshot::Sender<Result<u64, GatewayError>>,
+    },
+    NxCacheCleared {
+        repo_id: String,
+        result: Result<u64, NxCacheClearRefusal>,
+        reply: oneshot::Sender<Result<u64, GatewayError>>,
     },
     BeginNxPublication {
         publication: NxPublication,
@@ -897,6 +914,9 @@ enum NxBackendState {
         reason: String,
         retry_after: std::time::Instant,
     },
+    /// The project's store is being cleared: its backend has stopped and no new one starts until
+    /// the clear reports, so every request meanwhile is the method's miss or refusal.
+    Clearing,
 }
 
 /// One request's Nx backend admission: serve now, wait for the start, or refuse as an outage.
@@ -1028,6 +1048,9 @@ struct PermitState {
     workspace_id: String,
     class: PermitClass,
     generation: u64,
+    /// The project whose Nx backend this permit's request is served by; `None` for every other
+    /// request.
+    nx_repo: Option<String>,
 }
 
 struct SessionState {
@@ -1197,11 +1220,20 @@ impl Actor {
                         Command::NxBackendStarted { repo_id, result } => {
                             self.nx_backend_started(repo_id, result).await;
                         }
+                        Command::ClearNxCache { repo_id, reply } => {
+                            self.clear_nx_cache(repo_id, reply);
+                        }
+                        Command::NxCacheCleared { repo_id, result, reply } => {
+                            self.nx_cache_cleared(&repo_id, result, reply);
+                        }
                         Command::BeginNxPublication { publication, reply } => {
                             let result = match self.nx_backends.get(&publication.repo_id) {
                                 Some(NxBackendState::Ready { .. }) => Ok(()),
                                 Some(NxBackendState::Starting { .. }) => Err(GatewayError::NxAuthority(
                                     "the project's Nx cache backend is still starting".to_owned(),
+                                )),
+                                Some(NxBackendState::Clearing) => Err(GatewayError::NxAuthority(
+                                    "the project's Nx cache store is being cleared".to_owned(),
                                 )),
                                 Some(NxBackendState::Failed { reason, .. }) => {
                                     Err(GatewayError::NxAuthority(reason.clone()))
@@ -1505,7 +1537,9 @@ impl Actor {
                 }
                 | NxBackendState::Failed { .. },
             ) => {}
-            Some(NxBackendState::Ready { process: None, .. }) | None => return,
+            Some(NxBackendState::Ready { process: None, .. } | NxBackendState::Clearing) | None => {
+                return;
+            }
         }
         eprintln!(
             "cowshed: Nx cache backend for {repo_id} stopped: its project has no session left"
@@ -1653,6 +1687,7 @@ impl Actor {
             self.nx_backends.get(&backend.repo_id),
             Some(
                 NxBackendState::Starting { .. }
+                    | NxBackendState::Clearing
                     | NxBackendState::Ready {
                         process: Some(_),
                         ..
@@ -1735,6 +1770,11 @@ impl Actor {
         match self.nx_backends.get(repo_id) {
             Some(NxBackendState::Ready { .. }) => return NxAdmission::Ready,
             Some(NxBackendState::Starting { .. }) => return NxAdmission::Starting,
+            Some(NxBackendState::Clearing) => {
+                return NxAdmission::Unavailable(NxRefusal::outage(
+                    "the project's Nx cache store is being cleared".to_owned(),
+                ));
+            }
             Some(NxBackendState::Failed {
                 reason,
                 retry_after,
@@ -1747,6 +1787,150 @@ impl Actor {
             Ok(()) => NxAdmission::Starting,
             Err(reason) => NxAdmission::Unavailable(NxRefusal::outage(reason)),
         }
+    }
+
+    /// The Nx work of `repo_id` this gateway serves now, by workspace: admitted and queued
+    /// requests and open publications. Clearing the store under any of it would cut it off.
+    fn nx_cache_use(&self, repo_id: &str) -> NxCacheUse {
+        let mut usage = NxCacheUse::default();
+        for permit in self.permits.values() {
+            if permit.nx_repo.as_deref() == Some(repo_id) {
+                *usage
+                    .in_flight
+                    .entry(permit.workspace_id.clone())
+                    .or_default() += 1;
+            }
+        }
+        for pending in &self.queue {
+            if pending.seed.nx_token.is_some() && pending.seed.repo_id == repo_id {
+                *usage
+                    .queued
+                    .entry(pending.seed.workspace_id.clone())
+                    .or_default() += 1;
+            }
+        }
+        for pending in &self.nx_queue {
+            if pending.repo_id == repo_id {
+                *usage
+                    .queued
+                    .entry(pending.workspace_id.clone())
+                    .or_default() += 1;
+            }
+        }
+        usage.publishing = self
+            .nx_publications
+            .iter()
+            .filter(|(_, publication)| publication.repo_id == repo_id)
+            .map(|(workspace_id, _)| workspace_id.clone())
+            .collect();
+        usage
+    }
+
+    /// Clear `repo_id`'s accepted-task store (03_caches.md, "Nx accepted-task artifact service").
+    /// Refused, with what is running named, while the project's Nx work is in flight, its backend
+    /// is starting, or the host configured that backend. Otherwise the backend stops, the store is
+    /// emptied under its own lease, and the next Nx request starts a fresh backend; requests
+    /// meanwhile are misses, as in any backend outage. The work runs in its own task and reports
+    /// through `NxCacheCleared`, so the actor never waits on it.
+    fn clear_nx_cache(
+        &mut self,
+        repo_id: String,
+        reply: oneshot::Sender<Result<u64, GatewayError>>,
+    ) {
+        if self.draining {
+            let _ = reply.send(Err(GatewayError::Draining));
+            return;
+        }
+        let Some(directory) = self
+            .config
+            .nx_cache
+            .as_ref()
+            .map(|config| config.directory.clone())
+        else {
+            let _ = reply.send(Err(NxCacheClearRefusal::Unconfigured.into()));
+            return;
+        };
+        let usage = self.nx_cache_use(&repo_id);
+        let refusal = if usage.is_idle() {
+            match self.nx_backends.get(&repo_id) {
+                Some(NxBackendState::Starting { .. }) => Some(NxCacheClearRefusal::Starting),
+                Some(NxBackendState::Clearing) => Some(NxCacheClearRefusal::Clearing),
+                Some(NxBackendState::Ready { process: None, .. }) => {
+                    Some(NxCacheClearRefusal::HostConfigured)
+                }
+                Some(
+                    NxBackendState::Ready {
+                        process: Some(_), ..
+                    }
+                    | NxBackendState::Failed { .. },
+                )
+                | None => None,
+            }
+        } else {
+            Some(NxCacheClearRefusal::Busy(usage))
+        };
+        if let Some(refusal) = refusal {
+            let _ = reply.send(Err(refusal.into()));
+            return;
+        }
+        // Only a backend the gateway started, a failed start or none is left: the states above
+        // were refused.
+        let process = match self.nx_backends.remove(&repo_id) {
+            Some(NxBackendState::Ready { process, .. }) => process,
+            _ => None,
+        };
+        self.nx_backends
+            .insert(repo_id.clone(), NxBackendState::Clearing);
+        let store = crate::nx_cache::project_store(&directory, &repo_id);
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let result = async {
+                if let Some(process) = process {
+                    crate::nx_cache::stop_backend(&repo_id, *process).await?;
+                }
+                tokio::task::spawn_blocking(move || crate::nx_cache::clear_store(&store))
+                    .await
+                    .map_err(|error| {
+                        NxCacheClearRefusal::Failed(format!(
+                            "the Nx cache store clear task failed: {error}"
+                        ))
+                    })?
+            }
+            .await;
+            let _ = commands
+                .send(Command::NxCacheCleared {
+                    repo_id,
+                    result,
+                    reply,
+                })
+                .await;
+        });
+    }
+
+    /// The end of a clear: the project has no backend until its next Nx request starts one.
+    fn nx_cache_cleared(
+        &mut self,
+        repo_id: &str,
+        result: Result<u64, NxCacheClearRefusal>,
+        reply: oneshot::Sender<Result<u64, GatewayError>>,
+    ) {
+        if matches!(
+            self.nx_backends.get(repo_id),
+            Some(NxBackendState::Clearing)
+        ) {
+            self.nx_backends.remove(repo_id);
+        }
+        match &result {
+            Ok(entries) => {
+                eprintln!(
+                    "cowshed: Nx cache store for {repo_id} cleared: {entries} entries deleted"
+                );
+            }
+            Err(refusal) => {
+                eprintln!("cowshed: Nx cache store for {repo_id} was not cleared: {refusal}");
+            }
+        }
+        let _ = reply.send(result.map_err(GatewayError::from));
     }
 
     /// Removes a backend -- its child gone, or its project's last session -- revokes its writers,
@@ -2117,6 +2301,7 @@ impl Actor {
                 workspace_id,
                 class,
                 generation: seed.generation,
+                nx_repo: seed.nx_token.as_ref().map(|_| seed.repo_id.clone()),
             },
         );
         seed.activate(
@@ -2876,7 +3061,9 @@ impl Actor {
                     }
                     process.wait().await?;
                 }
-                NxBackendState::Ready { process: None, .. } | NxBackendState::Failed { .. } => {}
+                NxBackendState::Ready { process: None, .. }
+                | NxBackendState::Failed { .. }
+                | NxBackendState::Clearing => {}
             }
         }
         let sessions = std::mem::take(&mut self.sessions);
@@ -3475,6 +3662,8 @@ pub enum GatewayError {
     SimBroker(#[from] SimBrokerError),
     #[error("Nx cache authority refused: {0}")]
     NxAuthority(String),
+    #[error("Nx cache store not cleared: {0}")]
+    NxCacheClear(#[from] NxCacheClearRefusal),
     #[error("gateway session capacity is exhausted")]
     SessionCapacity,
     #[error("gateway I/O failed: {0}")]
@@ -3937,8 +4126,9 @@ mod tests {
                             process.wait().await.expect("reap fixture child");
                         }
                     }
-                    NxBackendState::Ready { process: None, .. } | NxBackendState::Failed { .. } => {
-                    }
+                    NxBackendState::Ready { process: None, .. }
+                    | NxBackendState::Failed { .. }
+                    | NxBackendState::Clearing => {}
                 }
             }
             for session in self.actor.sessions.values_mut() {
@@ -4781,6 +4971,130 @@ mod tests {
         assert_eq!(actor.queue.len(), 1, "the ordinary queued request stays");
         assert_eq!(actor.global_queued, 2);
         assert_eq!(actor.sessions["nx-unit-q"].queued, 1);
+        fixture.finish().await;
+    }
+
+    /// One authenticated Nx GET from `workspace`, answered as the actor answers it at once.
+    #[cfg(target_os = "macos")]
+    async fn unit_admitted_get(
+        fixture: &mut TestActor,
+        workspace: &str,
+        token: &str,
+    ) -> Result<Admission, AdmissionError> {
+        let (reply, receive) = oneshot::channel();
+        let (cancel, cancelled) = oneshot::channel();
+        fixture
+            .actor
+            .admit(
+                workspace.to_owned(),
+                Authentication::Bearer(Some(token.to_owned())),
+                nx_intent(Method::GET, "/nx/v1/cache/101"),
+                reply,
+                cancelled,
+            )
+            .await;
+        let answer = receive.await.expect("answered");
+        drop(cancel);
+        answer
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn nx_cache_clear_refuses_in_flight_work_and_then_clears_the_store() {
+        let root = TestRoot::new("nx-clear");
+        let mut fixture = TestActor::new(&root).await;
+        let repo = "owner/nx-clear";
+        let token = fixture.install("nx-clear", repo, 95, 1).await;
+        fixture.actor.config.nx_cache = Some(crate::nx_cache::NxCacheServiceConfig {
+            script: root.0.join("unavailable-server"),
+            path: std::ffi::OsString::new(),
+            directory: root.0.join("nx"),
+            max_bytes: 1024,
+            cap_bytes: 4096,
+        });
+        let project = crate::nx_cache::project_store(&root.0.join("nx"), repo);
+        let entries = project.join("entries");
+        std::fs::create_dir_all(entries.join(".staging")).expect("store fixture");
+        for key in ["101", "202", "abc_-9"] {
+            std::fs::write(entries.join(key), b"archive").expect("archive fixture");
+        }
+        std::fs::write(entries.join(".owner.lock"), b"").expect("lease fixture");
+        std::fs::write(project.join("sieve.hand"), b"1\n").expect("cursor fixture");
+        fixture.actor.nx_backends.insert(
+            repo.to_owned(),
+            NxBackendState::Ready {
+                backend: unit_backend(repo),
+                process: Some(Box::new(unit_child().await)),
+            },
+        );
+
+        // An admitted Nx request is in flight: refused, naming its workspace; nothing changes.
+        let admission = unit_admitted_get(&mut fixture, "nx-clear", &token)
+            .await
+            .expect("the GET activates");
+        let (reply, refused) = oneshot::channel();
+        fixture.actor.clear_nx_cache(repo.to_owned(), reply);
+        let error = refused
+            .await
+            .expect("answered")
+            .expect_err("in-flight work refuses");
+        assert!(
+            matches!(
+                &error,
+                GatewayError::NxCacheClear(NxCacheClearRefusal::Busy(usage))
+                    if usage.in_flight.get("nx-clear") == Some(&1)
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("1 Nx request(s) in flight from workspace nx-clear"),
+            "{error}"
+        );
+        assert!(matches!(
+            fixture.actor.nx_backends.get(repo),
+            Some(NxBackendState::Ready { .. })
+        ));
+        assert!(entries.join("101").exists());
+        fixture.actor.complete(admission.permit_id);
+        drop(admission);
+
+        // Idle: the backend stops and the store is cleared; a request meanwhile is a miss.
+        let (reply, cleared) = oneshot::channel();
+        fixture.actor.clear_nx_cache(repo.to_owned(), reply);
+        assert!(matches!(
+            fixture.actor.nx_backends.get(repo),
+            Some(NxBackendState::Clearing)
+        ));
+        let miss = unit_admitted_get(&mut fixture, "nx-clear", &token)
+            .await
+            .err()
+            .expect("a request while the store clears is refused");
+        assert_eq!(miss.status, StatusCode::NOT_FOUND);
+        let (repo_id, result, reply) = loop {
+            match fixture.actor.receiver.recv().await {
+                Some(Command::NxCacheCleared {
+                    repo_id,
+                    result,
+                    reply,
+                }) => break (repo_id, result, reply),
+                Some(_) => {}
+                None => panic!("the actor's command channel closed"),
+            }
+        };
+        fixture.actor.nx_cache_cleared(&repo_id, result, reply);
+        assert_eq!(cleared.await.expect("answered").expect("cleared"), 3);
+        for key in ["101", "202", "abc_-9"] {
+            assert!(!entries.join(key).exists(), "{key} is deleted");
+        }
+        assert!(
+            entries.join(".owner.lock").exists(),
+            "the lease is never unlinked"
+        );
+        assert!(entries.join(".staging").exists());
+        assert!(!project.join("sieve.hand").exists());
+        assert!(!fixture.actor.nx_backends.contains_key(repo));
         fixture.finish().await;
     }
 

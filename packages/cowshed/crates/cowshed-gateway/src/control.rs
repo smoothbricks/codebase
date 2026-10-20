@@ -117,6 +117,21 @@ impl GatewayControlClient {
             .ok_or(ControlError::InvalidResponse)
     }
 
+    /// Clear the project's Nx accepted-task store (03_caches.md, "Nx accepted-task artifact
+    /// service"). A refusal while the project's Nx work is in flight is [`ControlFailureCode::Busy`]
+    /// and names that work.
+    pub async fn clear_nx_cache(
+        &self,
+        repo_id: &cowshed_core::repository::RepoId,
+    ) -> Result<cowshed_core::api::NxStoreClearResult, ControlError> {
+        self.send(&ControlRequest::NxCacheClear {
+            repo_id: repo_id.clone(),
+        })
+        .await?
+        .nx_cache_cleared
+        .ok_or(ControlError::InvalidResponse)
+    }
+
     /// The gate jobs a gateway restart now would cut off (05_gateway.md, "An install waits for
     /// the gates in flight"): every gate job whose runners hold tokens and every gate job a
     /// waiting request serves, oldest first. It reads `gateJobs` and `gateQueue` of the
@@ -407,6 +422,11 @@ enum ControlRequest {
     },
     /// The task server's queue.
     TaskQueue,
+    /// Clear one project's Nx accepted-task store.
+    NxCacheClear {
+        #[serde(rename = "repoId")]
+        repo_id: cowshed_core::repository::RepoId,
+    },
 }
 
 /// A request as the control socket reads it: a one-shot [`ControlRequest`] answered and closed,
@@ -611,6 +631,9 @@ struct ControlResponse {
     /// The task server's queue fold.
     #[serde(skip_serializing_if = "Option::is_none")]
     task_queue: Option<TaskQueueStatus>,
+    /// What an `nx-cache-clear` deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nx_cache_cleared: Option<cowshed_core::api::NxStoreClearResult>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -630,6 +653,8 @@ pub enum ControlFailureCode {
     /// race that restore. Retry once status reports no `healing`.
     Healing,
     Rejected,
+    /// Work the operation would cut off is running; the message names it. Retry once it ends.
+    Busy,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1695,6 +1720,7 @@ fn parse_control_request_value(value: serde_json::Value) -> Result<Incoming, Con
         "cpu-budget" => &["op"],
         "task-terminal" => &["op", "unit", "outcome"],
         "task-queue" => &["op"],
+        "nx-cache-clear" => &["op", "repoId"],
         TASK_ADMIT_OP => &[
             "op",
             "unit",
@@ -2123,6 +2149,23 @@ async fn dispatch(
             },
             None,
         ),
+        ControlRequest::NxCacheClear { repo_id } => (
+            match services
+                .handle
+                .clear_nx_cache(repo_id.as_str().to_owned())
+                .await
+            {
+                Ok(entries) => ControlResponse {
+                    nx_cache_cleared: Some(cowshed_core::api::NxStoreClearResult {
+                        repo_id,
+                        entries,
+                    }),
+                    ..success()
+                },
+                Err(error) => rejected(error),
+            },
+            None,
+        ),
     }
 }
 
@@ -2244,6 +2287,7 @@ fn success() -> ControlResponse {
         cpu_budget: None,
         task_grant: None,
         task_queue: None,
+        nx_cache_cleared: None,
     }
 }
 
@@ -2278,6 +2322,7 @@ fn rejected(error: GatewayError) -> ControlResponse {
         }
         GatewayError::UnknownWorkspace => ControlFailureCode::NotInstalled,
         GatewayError::Config(_) | GatewayError::Tls(_) => ControlFailureCode::InvalidSession,
+        GatewayError::NxCacheClear(refusal) if refusal.is_busy() => ControlFailureCode::Busy,
         _ => ControlFailureCode::Rejected,
     };
     failure(code, error.to_string())
@@ -2443,6 +2488,17 @@ mod tests {
             parse_control_request(br#"{"op":"cpu-budget"}"#),
             Ok(Incoming::Request(ControlRequest::CpuBudget))
         ));
+        assert!(matches!(
+            parse_control_request(br#"{"op":"nx-cache-clear","repoId":"acme/widget"}"#),
+            Ok(Incoming::Request(ControlRequest::NxCacheClear { repo_id })) if repo_id.as_str() == "acme/widget"
+        ));
+        assert!(
+            parse_control_request(br#"{"op":"nx-cache-clear","repoId":"not a repo"}"#).is_err()
+        );
+        assert!(
+            parse_control_request(br#"{"op":"nx-cache-clear","repoId":"acme/widget","all":true}"#)
+                .is_err()
+        );
         assert!(
             parse_control_request(
                 format!(

@@ -83,6 +83,44 @@ impl ControlSocket {
             .await
             .map_err(control_error)
     }
+
+    /// Clear the project's Nx accepted-task store. A refusal while the project's Nx work is in
+    /// flight is a conflict naming that work; a gateway that is not running, or one of an earlier
+    /// build that does not serve `nx-cache-clear`, is said as the setup it needs.
+    pub async fn clear_nx_cache(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<cowshed_core::api::NxStoreClearResult> {
+        self.0
+            .clear_nx_cache(repo_id)
+            .await
+            .map_err(|error| match error {
+                ControlError::Io(source) if source.kind() == io::ErrorKind::NotFound => {
+                    CowshedError::environment_missing(
+                        "no gateway is running, so the project's Nx store has no owner to clear it",
+                        GATEWAY_START_HINT,
+                    )
+                }
+                ControlError::Rejected {
+                    code: ControlFailureCode::Busy,
+                    message,
+                } => CowshedError::conflict(
+                    format!("the gateway did not clear the project's Nx store: {message}"),
+                    "let the named Nx work finish, then run `cowshed cache clear` again",
+                ),
+                ControlError::Rejected {
+                    code: ControlFailureCode::InvalidRequest,
+                    message,
+                } => CowshedError::environment_missing(
+                    format!("the running gateway does not serve nx-cache-clear: {message}"),
+                    "cowshed setup",
+                ),
+                error => CowshedError::environment_missing(
+                    format!("the gateway did not clear the project's Nx store: {error}"),
+                    "cowshed gateway status",
+                ),
+            })
+    }
 }
 
 #[async_trait]

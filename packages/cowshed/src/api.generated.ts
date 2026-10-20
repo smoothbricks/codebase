@@ -338,6 +338,15 @@ export type BuildVolume = {
 };
 
 /**
+ * `cowshed cache clear`: the checkout's Nx state and the project's gateway store, each with
+ * the entries it deleted.
+ */
+export type CacheClearReport = {
+  readonly workspace: NxStateClearResult;
+  readonly store: NxStoreClearResult;
+};
+
+/**
  * One Nx task that missed the cache in the target after adoption, with the inputs Nx hashes
  * for it (`nx show target inputs`) and their digest.
  */
@@ -1771,6 +1780,28 @@ export type NxCarry = {
    * then is whole and indexed; the rest are misses the target rebuilds.
    */
   readonly stopped?: string;
+};
+
+/**
+ * What `cowshed cache clear` deleted from one checkout's Nx state on its build volume
+ * (16_build_volumes.md, "Clearing a checkout's Nx state"): the entries directly in every
+ * `.nx/cache` and every `.nx/workspace-data` directory the volume holds, deleted together
+ * under the volume's exclusive claim with the checkout's Nx closed.
+ */
+export type NxStateClearResult = {
+  readonly workspace: WorkspaceName;
+  readonly volume: string;
+  readonly cacheEntries: number & tags.Type<'uint64'>;
+  readonly workspaceDataEntries: number & tags.Type<'uint64'>;
+};
+
+/**
+ * What `cowshed cache clear` deleted from the project's accepted-task store the gateway serves
+ * (03_caches.md, "Nx accepted-task artifact service"): the archives in its entries directory.
+ */
+export type NxStoreClearResult = {
+  readonly repoId: RepoId;
+  readonly entries: number & tags.Type<'uint64'>;
 };
 
 /**

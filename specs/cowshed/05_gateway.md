@@ -456,18 +456,26 @@ classification, not a backend outage's, but answer the same 404/403. Unsupported
 or waiting for a backend.
 
 **Backend lifecycle isolation.** Each repository's backend is supervised by a per-repository lifecycle state
-(`Starting`, `Ready`, or `Failed { retry_after }`) held by the actor; backend startup and readiness waiting run outside
-it. Concurrent requests for one repository share one start (single-flight). A failed start records
-`Failed { retry_after }` with `retry_after` taken from `GatewayTimeouts.connect` (default 5 s); until it elapses,
-requests for that repository are refused as in the outage above, without starting another child, and other repositories
-are unaffected. If the child exits, the next request replaces it immediately within the same call. A startup worker's
-task failure is reported through the same failed-start transition; it cannot leave an unreported `Starting` state.
-Cancelling the reporting task also aborts its owned worker. A host-configured backend cannot replace a gateway-managed
-live child. Readiness logs the project, address and reclaimed staging-file count, never credentials. A backend lives
-with its project's sessions: when the last session of a repository leaves the gateway, the gateway stops the child it
-started for it (a start in flight is aborted) and forgets its state, so the next session's first request starts a new
-one; a host-configured backend owns no child and stays. Measured 2026-10-19: seven of the gateway's nine servers served
-scratch projects that tests had adopted and discarded hours earlier, each running until the gateway restarted.
+(`Starting`, `Ready`, `Failed { retry_after }`, or `Clearing`) held by the actor; backend startup, readiness waiting and
+a store clear run outside it. Concurrent requests for one repository share one start (single-flight). A failed start
+records `Failed { retry_after }` with `retry_after` taken from `GatewayTimeouts.connect` (default 5 s); until it
+elapses, requests for that repository are refused as in the outage above, without starting another child, and other
+repositories are unaffected. If the child exits, the next request replaces it immediately within the same call. A
+startup worker's task failure is reported through the same failed-start transition; it cannot leave an unreported
+`Starting` state. Cancelling the reporting task also aborts its owned worker. A host-configured backend cannot replace a
+gateway-managed live child. Readiness logs the project, address and reclaimed staging-file count, never credentials. A
+backend lives with its project's sessions: when the last session of a repository leaves the gateway, the gateway stops
+the child it started for it (a start in flight is aborted) and forgets its state, so the next session's first request
+starts a new one; a host-configured backend owns no child and stays. Measured 2026-10-19: seven of the gateway's nine
+servers served scratch projects that tests had adopted and discarded hours earlier, each running until the gateway
+restarted.
+
+**Clearing the store.** `nx-cache-clear` (Control plane, below) moves an idle repository whose backend the gateway
+started, failed to start or never started to `Clearing`: the backend stops, the store is cleared under its own lease
+(03_caches.md, "Nx accepted-task artifact service"), and the state is forgotten when the clear reports, so the next
+request starts a fresh backend. Every request meanwhile is refused as in the outage above, and no start begins. A
+repository with an admitted or queued Nx request or a publication is refused, naming the work by workspace; one that is
+`Starting` or already `Clearing`, or whose backend the host configured, is refused too.
 
 **Outage before and after the response head.** The statuses above apply only before the response head. Once the upstream
 commits a success head, the gateway keeps `200` and cannot change it. A body that then fails, times out, or is dropped
@@ -605,6 +613,11 @@ older snapshot, so a removal never revokes a newer decision, which would leave a
 revision until its next attach. A write refused with `revision-fence` or `not-installed` lost a race to a reconcile that
 read a newer snapshot; that decision stands, and the write counts as superseded rather than failing the command that ran
 the reconcile.
+
+`{"op":"nx-cache-clear","repoId":"<owner/repo>"}` is one-shot and clears the project's Nx accepted-task store (the
+`/nx/v1/cache/{hash}` route's "Clearing the store"). It answers `nxCacheCleared: { repoId, entries }` with the archives
+deleted. Nx work of the project in flight, a backend starting or a clear already running is the failure code `busy`,
+whose message names that work; any other refusal is `rejected`.
 
 Every request is one line. A one-shot request is followed by the client's EOF and answered with one line; a
 `disk-lease`, `cpu-tokens`, `jobserver` or `resident-pool` request is held for as long as its client keeps the

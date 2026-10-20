@@ -505,6 +505,17 @@ closed if reclamation fails. This is ownership of retained bytes, not a backgrou
 remains an honest miss, and the gateway's post-adoption check requires all accepted cacheable hashes to hit
 (16_build_volumes.md).
 
+**Clearing.** `cowshed cache clear` (06_cli.md, "Cache clear") empties a project's store through the gateway, which owns
+its backend. It refuses while the project's Nx work is in flight — an admitted or queued request, a land holding
+publication authority, or a backend still starting — naming each workspace, and refuses a host-configured backend's
+store, which is not the gateway's. Otherwise the gateway stops the backend it started (`SIGTERM`, as a drain does; one
+still running after 10 s is killed and reaped), takes the store's lease itself (the same `flock` on
+`entries/.owner.lock`, never unlinked) and deletes every archive (each file in `entries/` whose name is a task key) and
+`sieve.hand`. Staging is left to the next backend's startup reclamation. A lease another process holds is a typed
+store-locked refusal. Until the clear reports, the project's requests get the outage's miss or refusal and no backend
+starts; the next request after it starts a fresh one. The store holds only what lands publish, so a cleared entry
+returns only through another land's publication.
+
 The package follows the repository's public-package release conventions (`npm:public`, generated conventional-commit
 versions, normal build/release targets). Each consumer migration adopts the published dependency and deletes the
 superseded source in the same change.

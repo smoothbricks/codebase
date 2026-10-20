@@ -247,7 +247,8 @@ Every build-state path is a fixed link onto the checkout's build volume
 live outside the volume, so no fork, land or seed sees them, and every `cowshed fork` clones the directory from main.
 `cowshed doctor` reports each such path as `build-link`; `cowshed exec <ws> -- true` relinks it (the refresh before
 every exec discards what is there), and `cowshed setup` does the same for every workspace. A script that means to clear
-Nx's state should empty the directory, never remove the path.
+Nx's state should empty the directory, never remove the path: `cowshed cache clear <ws>` does that for `.nx/cache` and
+`.nx/workspace-data` together, and clears the project's gateway Nx store too.
 
 ## Parallel test fixture collisions
 

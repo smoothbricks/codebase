@@ -3,10 +3,11 @@ use super::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
     DefragmentResult, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions, GcReport,
     GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobListeningPorts, JobTail,
-    JobTailLimits, LandOptions, LandReport, MirrorInfo, ProjectGrantDelta, ProjectGrants,
-    PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions, RemoveProjectOptions,
-    RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult, ResizeVolume, SealedJob,
-    StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo, WorkspaceTarget,
+    JobTailLimits, LandOptions, LandReport, MirrorInfo, NxStateClearResult, ProjectGrantDelta,
+    ProjectGrants, PushOptions, PushReport, RebaseOptions, RebaseReport, RemoveOptions,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
+    ResizeVolume, SealedJob, StdinSource, StepReport, WorkspaceIncarnation, WorkspaceInfo,
+    WorkspaceTarget,
 };
 use super::frame;
 use super::operations::{
@@ -2103,6 +2104,13 @@ impl Coordinator {
             dry_run,
         };
         invoke::<operations::CoordinatorReseed>(&*self.runtime, &request).await
+    }
+
+    /// Delete a workspace's Nx cache and task database contents on its build volume, refused
+    /// while a job, land or live Nx holds them. `nx reset` cannot: it unlinks the build links.
+    pub async fn clear_nx_state(&self, workspace: &str) -> Result<NxStateClearResult> {
+        let request = self.workspace_request(workspace)?;
+        invoke::<operations::CoordinatorClearNxState>(&*self.runtime, &request).await
     }
 
     pub async fn assign_slot(&self, workspace: &str, slot: u32) -> Result<()> {

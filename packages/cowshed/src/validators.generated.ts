@@ -171,6 +171,12 @@ export const assertBuildVolumeList = typia.createAssertEquals<readonly Api.Build
 export const parseBuildVolumeList = (json: string): readonly Api.BuildVolume[] =>
   assertBuildVolumeList(JSON.parse(json));
 
+export const assertCacheClearReport = typia.createAssertEquals<Api.CacheClearReport>();
+export const parseCacheClearReport = (json: string): Api.CacheClearReport => assertCacheClearReport(JSON.parse(json));
+export const assertCacheClearReportList = typia.createAssertEquals<readonly Api.CacheClearReport[]>();
+export const parseCacheClearReportList = (json: string): readonly Api.CacheClearReport[] =>
+  assertCacheClearReportList(JSON.parse(json));
+
 export const assertCacheMiss = typia.createAssertEquals<Api.CacheMiss>();
 export const parseCacheMiss = (json: string): Api.CacheMiss => assertCacheMiss(JSON.parse(json));
 export const assertCacheMissList = typia.createAssertEquals<readonly Api.CacheMiss[]>();
@@ -806,6 +812,20 @@ export const assertNxCarry = typia.createAssertEquals<Api.NxCarry>();
 export const parseNxCarry = (json: string): Api.NxCarry => assertNxCarry(JSON.parse(json));
 export const assertNxCarryList = typia.createAssertEquals<readonly Api.NxCarry[]>();
 export const parseNxCarryList = (json: string): readonly Api.NxCarry[] => assertNxCarryList(JSON.parse(json));
+
+export const assertNxStateClearResult = typia.createAssertEquals<Api.NxStateClearResult>();
+export const parseNxStateClearResult = (json: string): Api.NxStateClearResult =>
+  assertNxStateClearResult(JSON.parse(json));
+export const assertNxStateClearResultList = typia.createAssertEquals<readonly Api.NxStateClearResult[]>();
+export const parseNxStateClearResultList = (json: string): readonly Api.NxStateClearResult[] =>
+  assertNxStateClearResultList(JSON.parse(json));
+
+export const assertNxStoreClearResult = typia.createAssertEquals<Api.NxStoreClearResult>();
+export const parseNxStoreClearResult = (json: string): Api.NxStoreClearResult =>
+  assertNxStoreClearResult(JSON.parse(json));
+export const assertNxStoreClearResultList = typia.createAssertEquals<readonly Api.NxStoreClearResult[]>();
+export const parseNxStoreClearResultList = (json: string): readonly Api.NxStoreClearResult[] =>
+  assertNxStoreClearResultList(JSON.parse(json));
 
 export const assertOneCoreCpuPercent = typia.createAssertEquals<Api.OneCoreCpuPercent>();
 export const parseOneCoreCpuPercent = (json: string): Api.OneCoreCpuPercent =>

@@ -1,6 +1,6 @@
 use crate::args::{
-    AdoptArgs, Cli, Command, ExecArgs, GrantTarget, MoveDestination, ProjectDiscovery, RevokeArgs,
-    RevokeSelection, StdinSource as CliStdinSource,
+    AdoptArgs, CacheCommand, Cli, Command, ExecArgs, GrantTarget, MoveDestination,
+    ProjectDiscovery, RevokeArgs, RevokeSelection, StdinSource as CliStdinSource,
 };
 use crate::forget;
 use crate::gateway_service;
@@ -146,6 +146,13 @@ pub trait CliService: Send {
     ) -> Result<ResizeResult>;
     async fn defragment(&mut self, workspace: &str) -> Result<DefragmentResult>;
     async fn reseed(&mut self, workspace: &str, from: &str, dry_run: bool) -> Result<ReseedResult>;
+    /// Delete the workspace's Nx state on its build volume (`coordinator.clearNxState`).
+    async fn clear_nx_state(
+        &mut self,
+        workspace: &str,
+    ) -> Result<cowshed_core::api::NxStateClearResult>;
+    /// Ask the gateway to clear the project's Nx accepted-task store.
+    async fn clear_nx_store(&mut self) -> Result<cowshed_core::api::NxStoreClearResult>;
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
         let _ = workspace;
         Err(CowshedError::environment_missing(
@@ -227,6 +234,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Resize(_)
         | Command::Defrag(_)
         | Command::Reseed(_)
+        | Command::Cache(_)
         | Command::Rekey(_)
         | Command::Gc(_)
         | Command::Push(_)
@@ -292,6 +300,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Resize(_)
         | Command::Defrag(_)
         | Command::Reseed(_)
+        | Command::Cache(_)
         | Command::Rekey(_)
         | Command::Gc(_)
         | Command::Push(_)
@@ -394,6 +403,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         Command::Detach(args) => named([args.workspace.as_deref()]),
         Command::Push(args) => named([args.workspace.as_deref()]),
         Command::Rebase(args) => named([args.workspace.as_deref()]),
+        Command::Cache(CacheCommand::Clear { workspace }) => named([workspace.as_deref()]),
         Command::Adopt(_)
         | Command::List(_)
         | Command::BuildState
@@ -831,6 +841,26 @@ impl CliService for ActorBridge {
 
     async fn reseed(&mut self, workspace: &str, from: &str, dry_run: bool) -> Result<ReseedResult> {
         self.coordinator()?.reseed(workspace, from, dry_run).await
+    }
+
+    async fn clear_nx_state(
+        &mut self,
+        workspace: &str,
+    ) -> Result<cowshed_core::api::NxStateClearResult> {
+        self.coordinator()?.clear_nx_state(workspace).await
+    }
+
+    async fn clear_nx_store(&mut self) -> Result<cowshed_core::api::NxStoreClearResult> {
+        let descriptor = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| {
+                CowshedError::internal("the CLI project runtime has already been shut down")
+            })?
+            .descriptor();
+        gateway_service::ControlSocket::at(descriptor.storage.store().join("gateway.sock"))?
+            .clear_nx_cache(&descriptor.repo_id)
+            .await
     }
 
     async fn rekey(&mut self, workspace: &str) -> Result<RekeyReport> {
@@ -1875,6 +1905,12 @@ where
                 service.reconcile_gateway().await?;
             }
             emit_reseed_result(output, json, result)?;
+            Ok(success())
+        }
+        Command::Cache(CacheCommand::Clear { workspace }) => {
+            let workspace = resolve_workspace(service, workspace, "cache clear").await?;
+            let report = clear_caches(service, &workspace).await?;
+            emit_cache_clear_report(output, json, report)?;
             Ok(success())
         }
         Command::Rekey(args) => {
@@ -3333,6 +3369,70 @@ async fn resolve_detach_root(cli: &Cli) -> Result<PathBuf> {
     })?;
     let storage = host_storage().await?;
     resolve_session_project_root(storage.store(), workspace, "detach")
+}
+
+/// `cache clear` (06_cli.md, "Cache clear"): the workspace's Nx state, then the project's store,
+/// each under its own refusal. A workspace refusal leaves both caches as they were. A store
+/// refusal after the workspace was cleared says so, so the failure is never read as nothing
+/// having changed.
+async fn clear_caches(
+    service: &mut dyn CliService,
+    workspace: &str,
+) -> Result<cowshed_core::api::CacheClearReport> {
+    let state = service.clear_nx_state(workspace).await?;
+    match service.clear_nx_store().await {
+        Ok(store) => Ok(cowshed_core::api::CacheClearReport {
+            workspace: state,
+            store,
+        }),
+        Err(mut error) => {
+            error.message = format!(
+                "workspace {}'s Nx state was cleared ({}), but the project's Nx store was not: {}",
+                state.workspace,
+                nx_state_entries(&state),
+                error.message
+            );
+            Err(error)
+        }
+    }
+}
+
+fn nx_state_entries(state: &cowshed_core::api::NxStateClearResult) -> String {
+    format!(
+        "{} entries in .nx/cache, {} in .nx/workspace-data, build volume {}",
+        state.cache_entries, state.workspace_data_entries, state.volume
+    )
+}
+
+/// One stdout line per cache cleared, with its entry count; `--json` is the named report.
+fn emit_cache_clear_report<W: Write, E: Write>(
+    output: &mut Output<W, E>,
+    json: bool,
+    report: cowshed_core::api::CacheClearReport,
+) -> Result<()> {
+    if json {
+        return output.success(report).map_err(output_error);
+    }
+    output
+        .bare_line(
+            format!(
+                "cleared workspace {} Nx state: {}",
+                report.workspace.workspace,
+                nx_state_entries(&report.workspace)
+            )
+            .as_bytes(),
+        )
+        .map_err(output_error)?;
+    output
+        .bare_line(
+            format!(
+                "cleared project {} Nx store: {} entries",
+                report.store.repo_id.as_str(),
+                report.store.entries
+            )
+            .as_bytes(),
+        )
+        .map_err(output_error)
 }
 
 fn emit_reseed_result<W: Write, E: Write>(

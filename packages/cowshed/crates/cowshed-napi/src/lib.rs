@@ -707,6 +707,8 @@ mod parity_tests {
             Command::Resize(_) => Some(&["coordinator.resize"]),
             Command::Defrag(_) => Some(&["coordinator.defragment"]),
             Command::Reseed(_) => Some(&["coordinator.reseed"]),
+            // The store half is the gateway's control socket, which the addon does not reach.
+            Command::Cache(_) => Some(&["coordinator.clearNxState"]),
             Command::Gc(_) => Some(&["coordinator.gc"]),
             Command::Push(_) => Some(&["worker.push"]),
             Command::Rebase(_) => Some(&["coordinator.rebase"]),
@@ -783,6 +785,10 @@ mod parity_tests {
         (
             &["reseed", "main", "--from", "parity", "--dry-run"],
             Some(&["coordinator.reseed"]),
+        ),
+        (
+            &["cache", "clear", "parity"],
+            Some(&["coordinator.clearNxState"]),
         ),
         (&["gc"], Some(&["coordinator.gc"])),
         (&["push", "parity"], Some(&["worker.push"])),

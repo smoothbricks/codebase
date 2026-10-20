@@ -219,6 +219,10 @@ pub trait ProjectRuntimeHost: Send + 'static {
         from: WorkspaceName,
         dry_run: bool,
     ) -> Result<crate::api::dto::ReseedResult>;
+    async fn clear_nx_state(
+        &mut self,
+        workspace: WorkspaceName,
+    ) -> Result<crate::api::dto::NxStateClearResult>;
     async fn checkpoint(
         &mut self,
         workspace: WorkspaceName,
@@ -1328,6 +1332,12 @@ impl ProjectActor {
                         .host
                         .reseed(params.workspace, params.from, params.dry_run)
                         .await?,
+                )
+            }
+            Op::CoordinatorClearNxState(params) => {
+                self.require_repo(&params.repo_id)?;
+                respond::<operations::CoordinatorClearNxState>(
+                    &self.host.clear_nx_state(params.workspace).await?,
                 )
             }
             Op::CoordinatorDetach(params) => {
@@ -11941,6 +11951,35 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         } else {
             volumes.execute_reseed(plan).await
         }
+    }
+
+    /// Delete the Nx state on the workspace's build volume (16_build_volumes.md, "Clearing a
+    /// checkout's Nx state"). Like reseed it refuses running work instead of stopping it.
+    async fn clear_nx_state(
+        &mut self,
+        workspace: WorkspaceName,
+    ) -> Result<crate::api::dto::NxStateClearResult> {
+        self.validate_binding().await?;
+        let current = self.current(&workspace).await?;
+        if !matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            return Err(CowshedError::conflict(
+                format!("workspace {workspace} is detached, so its build link cannot be read"),
+                format!("cowshed attach {workspace}, then retry `cowshed cache clear {workspace}`"),
+            ));
+        }
+        let checkout = self.workspace_mount_path(&workspace)?;
+        let image_lock = self
+            .layout
+            .canonical_image(&workspace)
+            .map_err(native_integrity_error)?
+            .lock()
+            .to_owned();
+        self.build_volumes()?
+            .clear_nx_state(workspace, checkout, image_lock)
+            .await
     }
 
     async fn checkpoint(

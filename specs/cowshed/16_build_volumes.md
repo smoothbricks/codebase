@@ -186,9 +186,10 @@ unmount is forced.
 
 A link displaced between refreshes detaches the checkout from its volume until the next one: what a tool writes there
 reaches no fork, land or seed. A tool that removes the path itself (`nx reset`, an `rm -rf` of the path) leaves its next
-run to make a real directory there, and a clone of main copies that directory. `cowshed doctor` reports each build-state
-path that is not what a refresh would leave (`build-link`: missing, a real directory, or something else) without
-changing it, and names `cowshed exec <ws> -- true`, whose refresh relinks it.
+run to make a real directory there, and a clone of main copies that directory. So `nx reset` clears nothing: it removes
+the links and leaves every entry on the volume, and `cowshed cache clear` is the clear ("Clearing a checkout's Nx
+state"). `cowshed doctor` reports each build-state path that is not what a refresh would leave (`build-link`: missing, a
+real directory, or something else) without changing it, and names `cowshed exec <ws> -- true`, whose refresh relinks it.
 
 A discarded directory is first renamed into `<checkout>/.cowshed/discard/`. That is the same volume, in cowshed's
 excluded namespace, and never a sibling in the source tree. The link then takes the path, and the refresh returns
@@ -485,6 +486,28 @@ allocation gives a per-image net estimate, not a container-free-space measuremen
   filesystem readers; then replace the volume, report deleted allocation and verify dirty tracked source, untracked
   files, Git state and index bytes unchanged. A stale source seed is used without refreshing or mounting it. Focused
   directory tests refuse absent seeds, unfinished lifecycle journal entries, held image locks and stale plans.
+
+### Clearing a checkout's Nx state
+
+`cowshed cache clear [<ws>]` (06_cli.md, "Cache clear") deletes every entry directly in each `.nx/cache` and
+`.nx/workspace-data` directory the workspace's build volume holds: cached outputs, terminal outputs and the run summary
+together with the task database that indexes them, so no row outlives its artifacts and no artifact outlives its row.
+The directories stay, because they are what the build links name. `nx reset` is not this operation: it removes
+`.nx/cache` and `.nx/workspace-data` themselves, which here are the links (`rmSync` of a link removes only the link,
+measured), so every entry stays on the volume and the next refresh links it back.
+
+It takes reseed's exclusions and refuses instead of stopping work. The workspace must be mounted. Its image lock is
+taken without waiting, so a fork, reseed or land of it refuses the clear. Its `<id>.dmg.hold` is claimed exclusively
+without waiting: an admitted job's shared hold or a land's refuses, naming the hold path and each visible holder's PID
+and command. The Nx-close protocol then stops only the checkout's own daemon and refuses another database holder by PID
+and command. Nx's open locks (`<database>.lock`) are held for the whole deletion, with a second look at the databases
+under them, so no Nx client opens a task database meanwhile; those lock files stay. A checkout that links no build
+volume is `not-found` (`cowshed doctor` reports its `build-link`). Seeds are untouched: a fork or reseed from a seed
+captured before the clear still carries its entries until a land refreshes that seed.
+
+- **Enforced by**: a directory-host test in which a job's shared hold, an open task database and a held image lock each
+  refuse by name and delete nothing; the clear then empties both directories, counts their entries, keeps Nx's open lock
+  and lets go of the claim.
 
 ## Fork: `cowshed fork [<src>] <ws>`
 

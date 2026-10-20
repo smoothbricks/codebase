@@ -798,6 +798,19 @@ lifecycle/image locks and unfinished create/fork/adopt work refuse; opening for 
 replays that work. The storage and publication rules remain 16_build_volumes.md §One link per checkout, §Targets and
 seeds and §Garbage collection.
 
+### Nx state clear
+
+`coordinator.clearNxState` is a coordinator-only, JSON-only operation:
+`WorkspaceRequest { repoId: RepoId, workspace: WorkspaceName } -> NxStateClearResult`. No worker, workspace-ref or
+project-discovery capability serves it. Rust `Coordinator::clear_nx_state` uses it; the CLI's `cache clear` calls it
+before asking the gateway to clear the project's store (06_cli.md, "Cache clear").
+
+`NxStateClearResult` is the named core DTO with `workspace`, `volume` (the cleared build volume), `cacheEntries` and
+`workspaceDataEntries`: the entries deleted directly in every `.nx/cache` and `.nx/workspace-data` directory the volume
+holds. Held jobs and land work, lifecycle/image locks and other Nx task-database holders refuse as `conflict` and delete
+nothing; the storage rules are 16_build_volumes.md, "Clearing a checkout's Nx state". The CLI's JSON result is
+`CacheClearReport { workspace: NxStateClearResult, store: NxStoreClearResult { repoId, entries } }`.
+
 ### Generated surfaces
 
 Canonical declarations in `cowshed-core/src/api/dto.rs`, `operations.rs` and capability authority generate the public

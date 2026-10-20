@@ -225,6 +225,16 @@ impl Coordinator {
         )
     }
 
+    /// Deletes a workspace's Nx cache and task database contents on its build volume.
+    #[napi(js_name = "clearNxState")]
+    pub fn clear_nx_state(&self, env: Env, arguments: String) -> napi::Result<JsObject> {
+        super::json_call::<operations::CoordinatorClearNxState, _>(
+            env,
+            Arc::clone(&self.inner),
+            arguments,
+        )
+    }
+
     /// Detaches a workspace.
     #[napi(js_name = "detach")]
     pub fn detach(&self, env: Env, arguments: String) -> napi::Result<JsObject> {

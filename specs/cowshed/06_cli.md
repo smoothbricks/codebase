@@ -92,13 +92,13 @@ Two verbs own the host story, both runnable from any directory:
 
 The verbs that change workspace or lifecycle state or run a job through a workspace supervisor — `adopt`, `fork`, `mv`,
 `checkpoint`, `restore`, `path`, `exec`, `grant`, `rm`, `forget`, `attach`, `detach`, `resize`, `defrag`, `reseed`,
-`rekey`, `gc`, `push`, `rebase`, `land` — first ask the host daemon's supervisor manager whether it runs this CLI's
-build (`sameBuild`, 11_shell.md), before the project is opened, so not even recovery mutates anything. A daemon of
-another build is refused up front with "the cowshed daemon is build X; this cowshed is build Y" and the hint "run
-`cowshed setup` from the cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on PATH";
-no daemon answering is not a disagreement. `ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`, `controller`,
-`credential`, `identity`, `sccache`, `skill`, `--version` and `--help` are not asked: `doctor` diagnoses the
-disagreement, and `setup` and `gateway` end it. `gateway status` and `doctor` (`gateway-stale-binary`) name
+`cache clear`, `rekey`, `gc`, `push`, `rebase`, `land` — first ask the host daemon's supervisor manager whether it runs
+this CLI's build (`sameBuild`, 11_shell.md), before the project is opened, so not even recovery mutates anything. A
+daemon of another build is refused up front with "the cowshed daemon is build X; this cowshed is build Y" and the hint
+"run `cowshed setup` from the cowshed you mean to use: it installs that build as both the daemon and the `cowshed` on
+PATH"; no daemon answering is not a disagreement. `ls`, `doctor`, `build-state`, `mount`, `setup`, `gateway`,
+`controller`, `credential`, `identity`, `sccache`, `skill`, `--version` and `--help` are not asked: `doctor` diagnoses
+the disagreement, and `setup` and `gateway` end it. `gateway status` and `doctor` (`gateway-stale-binary`) name
 `cowshed setup` as the remedy for a daemon running other bytes than the CLI.
 
 The stranded-user journey this contract exists for: after a reboot with locked or unmounted volumes, `cowshed doctor`
@@ -269,6 +269,7 @@ never errors).
 | `cowshed resize <ws\|main> <size>`                  | new capacity                                          | Grow the image (01a, "Detached growth"); with `--build <size>` instead, grow the workspace's build volume and its seed (16, "Substrate"). The supervisor stops for the resize and restarts after; a held volume refuses before anything changes. `--json`: `ResizeResult { workspace, volume: "workspace"\|"build", previousCapacity, capacity }`.                                                                                                                                                                                                                                                                                                                                                                                  |
 | `cowshed defrag <ws>`                               | extent count after the rewrite                        | Rewrite the image contiguously (01a, "Clone cost follows extents, not size"): detached like `resize`, refused while busy or short of free space, copied without cloning, renamed over, verified, remounted. `--json`: `DefragmentResult { workspace, previousExtents, extents, bytes }`.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `cowshed reseed <ws> [--from <target>] [--dry-run]` | reclaimed allocated image bytes (0 in preview)        | Discard the workspace's live build contents for a new clone of the target's current-incarnation latest existing seed (default main). Source Git state is untouched; missing incremental work rebuilds cold. Never refresh or delete a seed; absent seed refuses. Coordinator-only; refuses jobs, land holds, filesystem holders and unfinished lifecycle work. `--json`: named `ReseedResult`.                                                                                                                                                                                                                                                                                                                                      |
+| `cowshed cache clear [<ws>]`                        | one line per cache cleared, with its entry count      | Delete the workspace's Nx state on its build volume (every entry in `.nx/cache` and `.nx/workspace-data`) and the project's gateway Nx store, each refused by name while running work holds it ("Cache clear", below). `nx reset` is no substitute: it removes the build links and leaves every entry. `--json`: `CacheClearReport { workspace, store }`.                                                                                                                                                                                                                                                                                                                                                                           |
 | `cowshed rekey <ws\|main>`                          | workspace name (`--json`: `RekeyResult`)              | Rebuild the CA identity of a workspace whose companion key is missing or invalid: republish its quarantined sidecar beside the still-in-place image (revision + 1), mint fresh credentials into the live mount, consume the quarantine entry. Invalidates in-flight job certificates.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `cowshed gc [--abandoned]`                          | freed bytes                                           | Two-phase exact candidate plan (01); `--dry-run` lists typed candidates and sums bytes with zero mutation. Only explicit `--abandoned` also reclaims the recovery bundles `rm --abandon` kept in `sessions/.trash`, after keeping each one's tips in main's repository (`refs/cowshed/<ws>/abandoned/<head>/`, 01); `--dry-run --abandoned` lists them without deleting them. Every `gc` also retires the abandoned refs main holds, by ancestry or content, and keeps and names the rest; `--supersede <ws>/<head> --reason <one line>` retires one main does not hold, journaling why (01).                                                                                                                                       |
 | `cowshed doctor`                                    | `--json` findings                                     | Invariant checks; each finding carries a `fix:` hint.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -333,6 +334,33 @@ Nx daemon may be stopped under its exclusive hold; publication follows a success
 allocated-byte observations and signed estimated reduction on stderr; `--json` uses the named result above. Execution's
 bare stdout is the removed image's allocated bytes, not net savings. APFS clones share extents: neither preview nor
 execution promises a corresponding increase in physical free space (16 §Garbage collection).
+
+### Cache clear
+
+`cache clear [<ws>]` deletes both Nx caches cowshed keeps: the workspace's own Nx state on its build volume
+(16_build_volumes.md, "Clearing a checkout's Nx state") and the project's accepted-task store the gateway serves
+(03_caches.md, "Nx accepted-task artifact service"). It acts on the workspace in place, so it infers `<ws>` from the
+working directory. The store is per project, so clearing it for one workspace clears it for all of them; every other
+checkout's Nx state is its own and is cleared by naming that checkout. `nx reset` is no substitute: in a cowshed
+checkout `.nx/cache` and `.nx/workspace-data` are links into the build volume, and `nx reset` removes the links and
+leaves every entry on the volume, where the next refresh links them back.
+
+The workspace is cleared first, through `coordinator.clearNxState` (07_api.md), then the store, through the gateway's
+`nx-cache-clear` control operation (05_gateway.md). Each refuses as a `conflict` naming what is running, and a refusal
+clears nothing of that cache. The workspace refuses while a job or land holds its build volume, a lifecycle operation
+holds its image lock, or a process other than its Nx daemon has a task database open or is opening one. The store
+refuses while one of the project's Nx requests is admitted or queued, a land holds publication authority, or its backend
+is starting. These are the existing records of running work — the build volume's job-admission hold, Nx's own database
+descriptors and open locks, the gateway's admission table — and no second registry is kept. A store refusal after the
+workspace was cleared says the workspace was cleared; clearing is idempotent, so the same command clears the store once
+the named work ends. Nothing is stopped except the checkout's Nx daemon (as `nx daemon --stop` stops it) and the
+project's Nx backend, and each starts again on its next request.
+
+Bare stdout is one line per cache,
+`cleared workspace <ws> Nx state: <n> entries in .nx/cache, <m> in .nx/workspace-data, build volume <id>` and
+`cleared project <owner/repo> Nx store: <k> entries`. An entry is one name directly in such a directory, deleted with
+whatever it holds; a store entry is one archive. `--json` returns
+`CacheClearReport { workspace: NxStateClearResult { workspace, volume, cacheEntries, workspaceDataEntries }, store: NxStoreClearResult { repoId, entries } }`.
 
 ### Build-volume names and reclamation
 
@@ -498,9 +526,9 @@ both ways out: name one, or run the command from inside one.
 
 The split is by what the verb does to the workspace, not by convenience:
 
-| Infers from cwd                        | Requires the name                     |
-| -------------------------------------- | ------------------------------------- |
-| `rebase`, `push`, `checkpoint`, `path` | `rm`, `land`, `restore`, `mv`, `exec` |
+| Infers from cwd                                       | Requires the name                     |
+| ----------------------------------------------------- | ------------------------------------- |
+| `rebase`, `push`, `checkpoint`, `path`, `cache clear` | `rm`, `land`, `restore`, `mv`, `exec` |
 
 Verbs that act on a workspace **in place** infer it. Verbs that **retire it** (`rm`, `land`), **replace it** (`restore`
 mints a fresh incarnation over the running one), or **rename or move it** (`mv`) require it to be named, so that losing
