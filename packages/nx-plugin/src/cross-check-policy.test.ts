@@ -220,13 +220,23 @@ describe('Linux cross-check policy', () => {
 
 /**
  * The managed pre-push hook, run for real in a fixture repository whose `tooling/direnv/repo-path` puts stand-ins
- * first on PATH: `uname` says Darwin, `smoo` passes the denylist, and `nx` prints what a cross run printed and exits
- * with its status. The hook must call a miss a miss and every other Nx failure what it is.
+ * first on PATH: `uname` says Darwin, `smoo` passes the denylist, `direnv` enters the checkout's environment, and `nx`
+ * prints what a cross run printed and exits with its status, refusing to run in any environment but the checkout's.
+ * The hook must ask in the checkout's environment and call a miss a miss and every other failure what it is.
  */
 describe('managed pre-push cross probe', () => {
   const hook = join(import.meta.dir, '../managed/raw/tooling/git-hooks/pre-push.sh');
+  /** The SDK the checkout's environment names; the caller's shell names another. */
+  const CHECKOUT_SDK = '/checkout/MacOSX.sdk';
 
-  async function push(nxOutput: string, nxStatus: number): Promise<{ status: number | null; stderr: string }> {
+  interface Push {
+    readonly nxOutput: string;
+    readonly nxStatus: number;
+    /** Whether direnv is on the hook's PATH. */
+    readonly direnv?: boolean;
+  }
+
+  async function push({ nxOutput, nxStatus, direnv = true }: Push): Promise<{ status: number | null; stderr: string }> {
     const root = await mkdtemp(join(tmpdir(), 'pre-push-cross-'));
     try {
       const bin = join(root, 'bin');
@@ -238,14 +248,28 @@ describe('managed pre-push cross probe', () => {
       };
       await stub('uname', 'echo Darwin');
       await stub('smoo', 'exit 0');
-      await stub('nx', `printf '%s\\n' "$NX_STUB_OUTPUT"; exit ${nxStatus}`);
-      await writeFile(join(root, 'repo', 'tooling', 'direnv', 'repo-path'), `#!/bin/sh\necho "${bin}:$PATH"\n`);
+      // Nx keys on the environment it runs in: outside the checkout's, it is not the gate's run.
+      await stub(
+        'nx',
+        `[ "$SDKROOT" = '${CHECKOUT_SDK}' ] || { echo "nx stub: keyed on the caller's SDKROOT $SDKROOT" >&2; exit 1; }\nprintf '%s\\n' "$NX_STUB_OUTPUT"; exit ${nxStatus}`,
+      );
+      if (direnv) {
+        // The checkout's .envrc: `direnv exec <checkout>` enters the environment that checkout declares.
+        await stub(
+          'direnv',
+          `[ "$1" = exec ] && [ "$2" = "$PWD" ] || { echo "direnv stub: unexpected $*" >&2; exit 64; }\nexport SDKROOT='${CHECKOUT_SDK}'\nshift 2\nexec "$@"`,
+        );
+      }
+      // Without direnv, PATH holds the stand-ins and the system directories alone, so no host direnv is found.
+      const path = direnv ? `${bin}:$PATH` : `${bin}:/usr/bin:/bin`;
+      await writeFile(join(root, 'repo', 'tooling', 'direnv', 'repo-path'), `#!/bin/sh\necho "${path}"\n`);
       await chmod(join(root, 'repo', 'tooling', 'direnv', 'repo-path'), 0o755);
       await writeFile(join(root, 'repo', 'tooling', 'direnv', 'ttsc-env.sh'), '');
       expect(spawnSync('git', ['init', '-q', join(root, 'repo')]).status).toBe(0);
       const run = spawnSync('bash', [hook, 'origin'], {
         cwd: join(root, 'repo'),
-        env: { ...process.env, NX_STUB_OUTPUT: nxOutput },
+        // The caller's shell carries another directory's SDK, as a shell inside a parent directory's devenv does.
+        env: { ...process.env, NX_STUB_OUTPUT: nxOutput, SDKROOT: '/nix/store/caller-apple-sdk/MacOSX.sdk' },
         input: '',
         encoding: 'utf8',
       });
@@ -255,21 +279,37 @@ describe('managed pre-push cross probe', () => {
     }
   }
 
-  it('passes a hit', async () => {
-    expect((await push('Successfully ran target cargo-lint-cross', 0)).status).toBe(0);
+  it("passes a hit, asked in the checkout's environment rather than the caller's", async () => {
+    const { status, stderr } = await push({ nxOutput: 'Successfully ran target cargo-lint-cross', nxStatus: 0 });
+    expect(stderr).not.toContain("keyed on the caller's SDKROOT");
+    expect(status).toBe(0);
   });
 
   it('names a miss when the cross target refused to compile', async () => {
-    const { status, stderr } = await push(CARGO_CROSS_LINT_REFUSAL, 1);
+    const { status, stderr } = await push({ nxOutput: CARGO_CROSS_LINT_REFUSAL, nxStatus: 1 });
     expect(status).toBe(1);
     expect(stderr).toContain('NOT cached for this tree');
     expect(stderr).toContain('bun run check:linux');
   });
 
-  it('names any other Nx failure as that, never as a cache miss', async () => {
-    const { status, stderr } = await push('NX   NX_WORKSPACE_ROOT_PATH names another workspace', 1);
+  it('names any other failure as that, never as a cache miss', async () => {
+    const { status, stderr } = await push({
+      nxOutput: 'NX   NX_WORKSPACE_ROOT_PATH names another workspace',
+      nxStatus: 1,
+    });
     expect(status).toBe(1);
-    expect(stderr).toContain('Nx failed (exit 1) before the Linux cross-compile check reached');
+    expect(stderr).toContain('failed (exit 1) before it reached');
+    expect(stderr).not.toContain('NOT cached');
+  });
+
+  it("refuses, naming direnv, when it cannot enter the checkout's environment", async () => {
+    const { status, stderr } = await push({
+      nxOutput: 'Successfully ran target cargo-lint-cross',
+      nxStatus: 0,
+      direnv: false,
+    });
+    expect(status).toBe(1);
+    expect(stderr).toContain('direnv is not on PATH');
     expect(stderr).not.toContain('NOT cached');
   });
 });

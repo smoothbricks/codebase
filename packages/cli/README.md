@@ -889,14 +889,20 @@ pattern configured the check passes silently, which is what CI and every clone t
 with `git config --add smoothbricks.publicDenylist '<regex>'`; run the command bare to judge `HEAD` before pushing.
 
 The second gate runs only on macOS. Linux `nx lint` already compiles the Linux `cfg(target_os)` arm; Darwin does not.
-This gate is a probe: it runs `nx run-many -t cargo-lint-cross` and nothing else. Nx caches that target on the Cargo
-inputs, so a hit is a prior real Linux clippy and the push proceeds. On a miss the target's own guard refuses to start
-without `cargo-zigbuild` on PATH, which a macOS shell carries only inside the linux-cross profile, so the push is
-refused with `bun run check:linux` named — the hook never enters linux-cross and never starts a compile, so what it
-costs is one Nx graph construction rather than an unbounded clippy. `bun run check:linux` is
-`tooling/devenv -P linux-cross shell --` around that same Nx target; it is the only place the gate runs from a plain
-shell, so it is deliberately not quiet. A push made from an already-entered linux-cross shell passes the guard and runs
-the check itself. `git push --no-verify` skips the hook.
+This gate asks Nx for one target: it runs `direnv exec <checkout> nx run-many -t cargo-lint-cross`, in the checkout's
+own environment, the one the land gate runs in. It needs direnv on the caller's PATH and no devenv the caller entered:
+not "no devenv", but the checkout's devenv. The reason is that devenv declares a checkout's tooling and the environment
+it builds with, so a bare `nx` is an environment question rather than a PATH question. Tasks key on that environment as
+well as on the tree (the macOS SDK a native build links against, for one), and a push from a shell carrying another
+directory's devenv keyed the gate's tasks on that shell's `SDKROOT` and `DEVELOPER_DIR`, missed them, and built them
+against the wrong SDK. Nx caches the target on the Cargo inputs, so a hit is a prior real Linux clippy and the push
+proceeds. On a miss Nx restores or builds the target's dependencies in that environment, and the target's own guard
+refuses to start without `cargo-zigbuild` on PATH, which a macOS shell carries only inside the linux-cross profile, so
+the push is refused with `bun run check:linux` named; any other failure, in Nx or in direnv entering the checkout, is
+named as that and never as a miss. The hook never enters linux-cross and never starts the cross clippy, so it never
+costs an unbounded clippy. `bun run check:linux` is `tooling/devenv -P linux-cross shell --` around that same Nx target;
+it is the only place the gate runs from a plain shell, so it is deliberately not quiet. A push made from an
+already-entered linux-cross shell passes the guard and runs the check itself. `git push --no-verify` skips the hook.
 
 Conventional commit scopes should use Nx project names. For packages in the same npm scope as the root package, smoo
 requires `package.json` `nx.name` to be the unscoped package name, such as `cli` for `@smoothbricks/cli`, so subjects

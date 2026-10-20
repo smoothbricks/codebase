@@ -14,15 +14,25 @@
 # present. From a plain shell the cross target itself never compiles here: on
 # a miss its guard refuses. Its dependencies are ordinary Nx tasks whose outputs
 # the cross key reads, so Nx restores them from the cache or, for a tree no gate
-# ran, builds them. A refusal names the one command that fixes it; any other Nx
+# ran, builds them. A refusal names the one command that fixes it; any other
 # failure is said as that, never as a cache miss.
+#
+# Nx runs in this checkout's environment, `direnv exec <checkout>`, which is the
+# environment the land gate runs in, never in the environment of whatever shell
+# ran `git push`. devenv declares this checkout's tooling and the environment it
+# builds with (the macOS SDK it links against among it), and tasks key on that
+# environment as well as on the tree: a push from a shell carrying another
+# directory's devenv keyed the gate's tasks on that shell's SDKROOT and
+# DEVELOPER_DIR, missed every one of them, and then built them against the wrong
+# SDK. Under the checkout's environment the keys are the gate's, and a dependency
+# that does miss builds the way the gate builds it.
 #
 # Why the cross target never compiles here. The cross-clippy needs zig and
 # cargo-zigbuild, which a macOS host carries only in the linux-cross devenv
-# profile. A hook that entered that profile spent minutes compiling on a push
-# the user expected to take a second, and it did so in an environment they
-# never asked for. Pushing is not the place to discover that the tree has not
-# been compiled for Linux: the land gate, or `bun run check:linux`, is.
+# profile, not in the default shell `direnv exec` enters. A hook that entered
+# that profile spent minutes compiling on a push the user expected to take a
+# second. Pushing is not the place to discover that the tree has not been
+# compiled for Linux: the land gate, or `bun run check:linux`, is.
 #
 # The target's own guard refuses to start when cargo-zigbuild is not on PATH,
 # which is what turns a miss into a refusal here. A push made from a shell that
@@ -30,8 +40,9 @@
 # guard, so there a miss runs the check itself: the same clippy `check:linux`
 # runs, in the toolchain the user entered for it.
 #
-# Everything in tooling depends only on devenv.nix packages, so this hook also
-# works with no devenv on PATH. It must never pretend a check ran that did not.
+# The denylist gate needs only tooling/direnv/repo-path's PATH; the cross gate
+# needs direnv on the caller's PATH, and the checkout's own devenv through it,
+# not a devenv the caller entered. It must never pretend a check ran that did not.
 
 cd "$(git rev-parse --show-toplevel)"
 TOOLING="$PWD/tooling"
@@ -66,13 +77,22 @@ case "$(uname -s)" in
   *) exit 0 ;;
 esac
 
+if ! command -v direnv >/dev/null; then
+  cat >&2 <<'EOF'
+pre-push: direnv is not on PATH, so the Linux cross-compile check cannot run in
+this checkout's environment, and a check run in any other environment keys on
+values the land gate never used. Put direnv on PATH, then push again.
+EOF
+  exit 1
+fi
+
 # The guard's refusal (nx-plugin cross-check-policy.ts CARGO_CROSS_LINT_REFUSAL)
 # is the one line that means the key missed. Nx exits 1 for every task failure,
 # so the hook reads the output for it rather than guessing from the status.
 output=$(mktemp "${TMPDIR:-/tmp}/pre-push-cross.XXXXXX") || exit 1
 trap 'rm -f "$output"' EXIT
 set -o pipefail
-nx run-many -t cargo-lint-cross --output-style=static 2>&1 | tee "$output"
+direnv exec "$PWD" nx run-many -t cargo-lint-cross --output-style=static 2>&1 | tee "$output"
 status=$?
 [ "$status" -eq 0 ] && exit 0
 
@@ -90,9 +110,10 @@ EOF
 else
   cat >&2 <<EOF
 
-pre-push: Nx failed (exit $status) before the Linux cross-compile check reached
-a cache verdict; the output above names why. This is not a cache miss, and
-bun run check:linux will not fix it.
+pre-push: the Linux cross-compile check failed (exit $status) before it reached
+a cache verdict, in Nx or in direnv entering this checkout's environment; the
+output above names why. This is not a cache miss, and bun run check:linux will
+not fix it.
 EOF
 fi
 exit 1
