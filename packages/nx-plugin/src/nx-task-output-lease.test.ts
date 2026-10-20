@@ -1,5 +1,6 @@
 import { expect, it } from 'bun:test';
 import { channel } from 'node:diagnostics_channel';
+import { mkdirSync } from 'node:fs';
 import { mkdir, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Subprocess } from 'bun';
@@ -244,6 +245,112 @@ it('shares ownership across configurations without blocking independent targets,
     await releaseOther?.();
     await release();
     await Promise.all([owner.close(), other.close()]);
+  }
+});
+
+/** One output target of its own, so persistent lock files from other runs never contend. */
+function leaseTask(target: string) {
+  return {
+    id: `${target}:build`,
+    target: { project: `${target}-${crypto.randomUUID()}`, target: 'build' },
+    overrides: {},
+    outputs: ['app/dist'],
+    cache: true,
+  };
+}
+
+/** The helper pid a held lease's lock file names; the file is the helper's own record. */
+async function leaseHolder(path: string): Promise<number> {
+  const record: unknown = JSON.parse(await readFile(path, 'utf8'));
+  if (typeof record !== 'object' || record === null || !('pid' in record) || typeof record.pid !== 'number') {
+    throw new Error(`lease file ${path} names no helper pid`);
+  }
+  return record.pid;
+}
+
+/** The lock path of the next lease `acquire` asks for, read from the diagnostics channel it publishes before waiting. */
+function nextLeasePath(): Promise<string> {
+  const path = Promise.withResolvers<string>();
+  const events = channel('nx:task-output-lease');
+  const onEvent = (message: unknown) => {
+    if (typeof message !== 'object' || message === null || !('phase' in message) || message.phase !== 'waiting') return;
+    events.unsubscribe(onEvent);
+    if ('paths' in message && Array.isArray(message.paths) && typeof message.paths[0] === 'string')
+      path.resolve(message.paths[0]);
+    else path.reject(new Error(`waiting event names no lock path: ${JSON.stringify(message)}`));
+  };
+  events.subscribe(onEvent);
+  return path.promise;
+}
+
+/** Whether process `pid` is reaped: the parent's exit handler has then run in the same libuv callback. */
+async function reaped(pid: number): Promise<void> {
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    const turn = Promise.withResolvers<void>();
+    setImmediate(turn.resolve);
+    await turn.promise;
+  }
+}
+
+it('wakes a waiter with the slot of a helper that died holding a lease, failing only the holder', async () => {
+  const leases = new TaskOutputLeases(1, null, 'output');
+  try {
+    const heldPath = nextLeasePath();
+    const release = await leases.acquire([leaseTask('held')]);
+    const helper = await leaseHolder(await heldPath);
+    // The one slot is taken, so this waits for it.
+    const waiting = leases.acquire([leaseTask('queued')]);
+    process.kill(helper, 'SIGKILL');
+    await expect(release()).rejects.toThrow('worker exited (code null, signal SIGKILL)');
+    // The helper's exit freed its slot: the waiter forks a successor rather than waiting for a release no one can send.
+    const releaseQueued = await guardEvent(waiting, "a waiter for a dead helper's slot", () => 'no successor helper');
+    await releaseQueued();
+  } finally {
+    await leases.close();
+  }
+});
+
+it('retires a helper that replied with an error, so the next acquire takes its slot', async () => {
+  const leases = new TaskOutputLeases(1, null, 'output');
+  try {
+    // The helper cannot open a lock path that is a directory, so it replies with an error and serves no more.
+    const blockedPath = nextLeasePath().then((path) => mkdirSync(path, { recursive: true }));
+    const refused = leases.acquire([leaseTask('unopenable')]);
+    await blockedPath;
+    await expect(refused).rejects.toThrow('failed:');
+    const release = await guardEvent(
+      leases.acquire([leaseTask('after-error')]),
+      'an acquire after a helper replied with an error',
+      () => 'the failed helper still holds the only slot',
+    );
+    await release();
+  } finally {
+    await leases.close();
+  }
+});
+
+it('does not hand an idle helper that died to the next acquire', async () => {
+  const leases = new TaskOutputLeases(1, null, 'output');
+  try {
+    const idlePath = nextLeasePath();
+    const release = await leases.acquire([leaseTask('idle')]);
+    const helper = await leaseHolder(await idlePath);
+    await release();
+    process.kill(helper, 'SIGKILL');
+    await reaped(helper);
+    const releaseNext = await guardEvent(
+      leases.acquire([leaseTask('after-idle-death')]),
+      'an acquire after the idle helper died',
+      () => 'no successor helper',
+    );
+    await releaseNext();
+  } finally {
+    await leases.close();
   }
 });
 

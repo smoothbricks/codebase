@@ -3262,10 +3262,10 @@ index 0000000000000000000000000000000000000000..ab141ad0de874122b363f2fd1894dcbd
 +}
 diff --git a/dist/src/tasks-runner/task-output-lease.js b/dist/src/tasks-runner/task-output-lease.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..9f8639b22d29c8a4aca18a0efaec7a264ff2485c
+index 0000000000000000000000000000000000000000..129f933b5cadc7a8735b4f9454fdc67870c9c818
 --- /dev/null
 +++ b/dist/src/tasks-runner/task-output-lease.js
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,225 @@
 +"use strict";
 +const { channel } = require("node:diagnostics_channel");
 +const { writeFileSync } = require("node:fs");
@@ -3312,12 +3312,21 @@ index 0000000000000000000000000000000000000000..9f8639b22d29c8a4aca18a0efaec7a26
 +    });
 +}
 +else {
++    // The pool's slots. A slot is held by a live helper in `workers`; an acquire
++    // that finds none free waits in `waiters` for one of exactly two events:
++    // a release hands it the released helper, or a helper leaves the pool
++    // (exit, failed spawn, failed send, or an error reply, after which it is
++    // killed) and `retire` hands it that helper's slot to fork a successor.
++    // Every way a helper can stop serving goes through `retire`, so no waiter
++    // waits for a slot nothing will free.
 +    class TaskOutputLeases {
 +        constructor(parallelism, invocationTracker, purpose) {
 +            this.purpose = purpose;
 +            this.invocationTracker = invocationTracker;
 +            this.parallelism = Math.max(1, parallelism);
 +            this.workers = new Set();
++            this.children = new Set();
++            this.reserved = 0;
 +            this.idle = [];
 +            this.waiters = [];
 +            this.stopping = false;
@@ -3347,43 +3356,17 @@ index 0000000000000000000000000000000000000000..9f8639b22d29c8a4aca18a0efaec7a26
 +            const paths = targets.map((target) => join(workspaceDataDirectory, "task-output-leases", `${hashArray([this.purpose, target])}.lock`));
 +            events.publish({ phase: "waiting", purpose: this.purpose, targets, paths, pid: process.pid });
 +            let entry = this.idle.pop();
-+            if (!entry && this.workers.size >= this.parallelism) {
++            if (!entry && this.workers.size + this.reserved >= this.parallelism) {
++                // An entry from a release, or null: a retired helper's slot, reserved for this acquire.
 +                entry = await new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
++                if (!entry) this.reserved--;
++                if (this.stopping) {
++                    if (entry) this.idle.push(entry);
++                    throw new Error(`Task output lease acquisition cancelled during runner cleanup: ${targets.join(", ")}`);
++                }
 +            }
 +            if (!entry) {
-+                const worker = fork(__filename, ["--nx-task-output-lease-worker"], {
-+                    execPath: process.execPath,
-+                    execArgv: [],
-+                    stdio: ["ignore", "inherit", "inherit", "ipc"],
-+                });
-+                entry = { worker, pending: null, failed: null, phase: "idle", exited: null };
-+                entry.exited = new Promise((resolve) => worker.once("exit", resolve));
-+                this.workers.add(entry);
-+                worker.on("message", (message) => {
-+                    const pending = entry.pending;
-+                    entry.pending = null;
-+                    if (message.type === "error") {
-+                        const error = new Error(`Task output lease for ${entry.targets.join(", ")} at ${entry.paths.join(", ")} failed: ${message.message}`);
-+                        error.stack += `\nCaused by lease helper:\n${message.stack}`;
-+                        entry.failed = error;
-+                        pending?.reject(error);
-+                    }
-+                    else {
-+                        pending?.resolve();
-+                    }
-+                });
-+                worker.on("error", (cause) => {
-+                    const error = new Error(`Task output lease helper failed for ${entry.targets.join(", ")} at ${entry.paths.join(", ")}`, { cause });
-+                    entry.failed = error;
-+                    entry.pending?.reject(error);
-+                    entry.pending = null;
-+                });
-+                worker.on("exit", (code, signal) => {
-+                    entry.failed ??= new Error(`Task output lease worker exited (code ${code}, signal ${signal ?? "none"}) for ${entry.targets.join(", ")} at ${entry.paths.join(", ")}`);
-+                    entry.pending?.reject(entry.failed);
-+                    entry.pending = null;
-+                    this.workers.delete(entry);
-+                });
++                entry = this.spawn();
 +            }
 +            entry.targets = targets;
 +            entry.paths = paths;
@@ -3404,11 +3387,73 @@ index 0000000000000000000000000000000000000000..9f8639b22d29c8a4aca18a0efaec7a26
 +                else this.idle.push(entry);
 +            };
 +        }
++        spawn() {
++            const worker = fork(__filename, ["--nx-task-output-lease-worker"], {
++                execPath: process.execPath,
++                execArgv: [],
++                stdio: ["ignore", "inherit", "inherit", "ipc"],
++            });
++            const exited = Promise.withResolvers();
++            const entry = { worker, pending: null, failed: null, retired: false, phase: "idle", exited: exited.promise, targets: [], paths: [] };
++            const gone = () => {
++                this.children.delete(entry);
++                exited.resolve();
++            };
++            this.workers.add(entry);
++            this.children.add(entry);
++            worker.on("message", (message) => {
++                const pending = entry.pending;
++                entry.pending = null;
++                if (message.type === "error") {
++                    // The helper unlocked what it held before replying; it no longer serves.
++                    const error = new Error(`Task output lease for ${entry.targets.join(", ")} at ${entry.paths.join(", ")} failed: ${message.message}`);
++                    error.stack += `\nCaused by lease helper:\n${message.stack}`;
++                    pending?.reject(error);
++                    this.retire(entry, error);
++                }
++                else {
++                    pending?.resolve();
++                }
++            });
++            worker.on("error", (cause) => {
++                this.retire(entry, new Error(`Task output lease helper failed for ${entry.targets.join(", ")} at ${entry.paths.join(", ")}`, { cause }));
++                // A helper that never started emits no exit.
++                if (worker.pid === undefined) gone();
++            });
++            worker.on("exit", (code, signal) => {
++                this.retire(entry, new Error(`Task output lease worker exited (code ${code}, signal ${signal ?? "none"}) for ${entry.targets.join(", ")} at ${entry.paths.join(", ")}`));
++                gone();
++            });
++            return entry;
++        }
++        // Takes a helper that no longer serves out of the pool, once: its
++        // pending exchange fails with the reason, and its slot goes to the
++        // oldest waiter, which forks a successor.
++        retire(entry, error) {
++            if (entry.retired) return;
++            entry.retired = true;
++            entry.failed ??= error;
++            entry.pending?.reject(entry.failed);
++            entry.pending = null;
++            // A live helper that stopped serving holds no lease: its error reply unlocked them, or a failed send left
++            // it unreachable. Killing it releases whatever the kernel still records.
++            entry.worker.kill("SIGKILL");
++            this.workers.delete(entry);
++            const index = this.idle.indexOf(entry);
++            if (index !== -1) this.idle.splice(index, 1);
++            const waiter = this.waiters.shift();
++            if (waiter) {
++                this.reserved++;
++                waiter.resolve(null);
++            }
++        }
 +        exchange(entry, message) {
 +            if (entry.failed) return Promise.reject(entry.failed);
 +            return new Promise((resolve, reject) => {
 +                entry.pending = { resolve, reject };
-+                entry.worker.send(message);
++                entry.worker.send(message, (error) => {
++                    if (error) this.retire(entry, new Error(`Task output lease helper for ${entry.targets.join(", ")} at ${entry.paths.join(", ")} could not be sent ${message.type}`, { cause: error }));
++                });
 +            });
 +        }
 +        async withTasks(tasks, action) {
@@ -3437,7 +3482,7 @@ index 0000000000000000000000000000000000000000..9f8639b22d29c8a4aca18a0efaec7a26
 +        async close() {
 +            await this.cancelPending();
 +            this.closed = true;
-+            await Promise.all([...this.workers].map((entry) => {
++            await Promise.all([...this.children].map((entry) => {
 +                entry.worker.kill("SIGKILL");
 +                return entry.exited;
 +            }));

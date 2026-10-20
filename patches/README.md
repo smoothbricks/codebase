@@ -132,13 +132,22 @@ transitions with the lock purpose, target names and lock paths. Cancellation use
 lock helpers, which execute no task work, to interrupt a blocking native wait without depending on a JavaScript signal
 handler. Producers retain their existing shutdown protocol.
 
+A waiter for a pool slot waits for exactly two events: a release hands it the released helper, or a helper leaves the
+pool and its slot is handed on to fork a successor. A helper leaves the pool on every way it can stop serving: its exit,
+a failed spawn, a failed send, or an error reply, after which the client kills it (its reply came after it unlocked what
+it held). A helper that dies holding a lease fails only that holder's release, with the exit named; a dead idle helper
+is never handed out. Without this, one failed acquire in a one-worker pool (`--parallel=1`) left a live, idle helper
+holding the only slot and every later acquire waiting forever, the client and its helper both idle with no lock wait. No
+deadline stands in for these events.
+
 `packages/nx-plugin/src/nx-task-output-lease.test.ts` exercises two actual Nx clients against one output tree, pauses
 the real cache capture while another producer attempts to publish, checks both complete byte-exact artifacts, then
 restores one through a dependent runtime-input hash. Binary file content is hashed as bytes by its producer; the
 runtime-input wrapper's deliberate non-UTF-8 failure sentinel is unchanged. The suite also starts two cold continuous
 clients at the same barrier, requires one real producer and one shared waiter while that producer is alive, and requires
-both clients to complete after it exits. Drop these hunks only when the installed upstream orchestrator protects the
-same complete lifetime and atomic startup, retaining the regressions.
+both clients to complete after it exits. Its pool cases kill a helper holding a lease, make a helper reply with an
+error, and kill an idle helper; each next acquire must take the freed slot. Drop these hunks only when the installed
+upstream orchestrator protects the same complete lifetime and atomic startup, retaining the regressions.
 
 ## Non-workspace file packages
 
