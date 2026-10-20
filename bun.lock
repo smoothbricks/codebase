@@ -83,7 +83,7 @@
     },
     "packages/cowshed": {
       "name": "@smoothbricks/cowshed",
-      "version": "0.2.6-next.0",
+      "version": "0.3.0",
       "bin": {
         "cowshed": "./bin/cowshed",
       },
