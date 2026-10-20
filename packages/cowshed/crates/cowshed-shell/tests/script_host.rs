@@ -3,6 +3,12 @@
 //! The host runs unsandboxed here: these tests are about what brush and the fork do with a
 //! job's process group, streams and status, which no sandbox changes. The workspace has no
 //! `.envrc`, so the host holds exactly the environment it was started with.
+//! On Linux each host-using test re-executes its exact case through
+//! `sudo -n systemd-run --scope -p Delegate=yes`, as the native cgroup harness does. A root
+//! setup process delegates that fresh scope, then runs the test as the original unprivileged
+//! user. No user session bus or externally delegated test runner is required. Missing sudo,
+//! systemd, or delegated controllers fails the test; nothing skips or substitutes a regular
+//! file. Each request gets a fresh job cgroup, retired after `cgroup.kill` and the empty event.
 //!
 //! A fixture ends a host as a supervisor does: it closes its end of the control socket, never
 //! `shutdown(2)`s it. Darwin can lose a peer shutdown's wakeup for a host already asleep in
@@ -17,6 +23,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use cowshed_core::api::{ExitStatus, ScriptCommand, ScriptValue};
+#[cfg(target_os = "linux")]
+use cowshed_core::runtime::job_cgroup::{CgroupAuthority, IncarnationCgroups, JobCgroup};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_EXITED,
@@ -24,6 +32,8 @@ use cowshed_core::runtime::shell_host::{
     REQUEST_RELEASE, REQUEST_SCRIPT, REQUEST_SIGNAL, read_frame, send_with_descriptors,
 };
 use cowshed_core::script::{Binding, RenderedScript, render};
+#[cfg(target_os = "linux")]
+use cowshed_os::fork_lock::Run as _;
 
 /// The exec host binary under test, read when the test runs. `env!` would bake in the path of
 /// the checkout that compiled this test, but the test runs from a cached nextest archive that
@@ -44,6 +54,168 @@ struct Host {
     control: Option<std::os::unix::net::UnixStream>,
     directory: PathBuf,
     finished: bool,
+    #[cfg(target_os = "linux")]
+    cgroups: IncarnationCgroups,
+    #[cfg(target_os = "linux")]
+    jobs: std::cell::RefCell<Vec<JobCgroup>>,
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_authority() -> &'static CgroupAuthority {
+    static AUTHORITY: std::sync::LazyLock<CgroupAuthority> = std::sync::LazyLock::new(|| {
+        CgroupAuthority::delegated().expect("the setup role delegated a real cgroup v2 scope")
+    });
+    &AUTHORITY
+}
+
+#[cfg(target_os = "linux")]
+const DELEGATED_CASE_ROLE: &str = "COWSHED_SCRIPT_HOST_ROLE";
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize, serde::Serialize)]
+enum DelegatedCaseRole {
+    Delegate { uid: u32, gid: u32 },
+    Run { uid: u32, gid: u32 },
+}
+
+#[cfg(target_os = "linux")]
+fn fixture_program(name: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("the delegated script fixture requires {name} on PATH"))
+}
+
+/// Return only after this exact case passed in the delegated subprocess. The `Run` role alone
+/// returns false and executes the original body; the other roles are harnesses, not skipped tests.
+#[cfg(target_os = "linux")]
+fn delegated_case(case: &str) -> bool {
+    let role = std::env::var_os(DELEGATED_CASE_ROLE).map(|role| {
+        serde_json::from_slice::<DelegatedCaseRole>(role.as_encoded_bytes())
+            .expect("the script fixture's delegated role")
+    });
+    let mut command = match role {
+        Some(DelegatedCaseRole::Run { uid, gid }) => {
+            // SAFETY: these calls only read this process's credentials.
+            assert_eq!(unsafe { libc::geteuid() }, uid, "the test is unprivileged");
+            // SAFETY: as above.
+            assert_eq!(unsafe { libc::getegid() }, gid, "the runner's group");
+            assert_ne!(uid, 0, "root only prepares delegation, never runs the test");
+            cgroup_authority();
+            println!("COWSHED_SCRIPT_HOST_CASE {case}");
+            return false;
+        }
+        Some(DelegatedCaseRole::Delegate { uid, gid }) => {
+            // SAFETY: geteuid only reads this process's credentials.
+            assert_eq!(
+                unsafe { libc::geteuid() },
+                0,
+                "the scope setup requires root"
+            );
+            let membership =
+                std::fs::read_to_string("/proc/self/cgroup").expect("the setup role's cgroup");
+            let relative = membership
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .filter(|path| path.starts_with('/'))
+                .expect("the setup role runs in cgroup v2");
+            let scope = Path::new(cowshed_core::runtime::job_cgroup::CGROUP_MOUNT)
+                .join(relative.trim_start_matches('/'));
+            for file in [
+                "",
+                "cgroup.procs",
+                "cgroup.threads",
+                "cgroup.subtree_control",
+            ] {
+                let path = scope.join(file);
+                std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+                    .unwrap_or_else(|error| panic!("delegate {}: {error}", path.display()));
+            }
+            // The waiting setup parent cannot populate the distributing root. Both it and the
+            // ordinary test controller stay outside every admitted job in this controller leaf.
+            let leaf = scope.join(cowshed_core::runtime::job_cgroup::CONTROLLER_LEAF);
+            std::fs::create_dir(&leaf).expect("create the fresh scope's controller leaf");
+            for file in ["", "cgroup.procs", "cgroup.threads"] {
+                let path = leaf.join(file);
+                std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+                    .unwrap_or_else(|error| panic!("delegate {}: {error}", path.display()));
+            }
+            std::fs::write(leaf.join("cgroup.procs"), "0")
+                .expect("move the setup parent out of the distributing scope");
+            let mut command = std::process::Command::new(fixture_program("setpriv"));
+            command
+                .arg("--reuid")
+                .arg(uid.to_string())
+                .arg("--regid")
+                .arg(gid.to_string())
+                .args(["--clear-groups", "--"])
+                .env(
+                    DELEGATED_CASE_ROLE,
+                    serde_json::to_string(&DelegatedCaseRole::Run { uid, gid })
+                        .expect("serialize the unprivileged role"),
+                );
+            command
+        }
+        None => {
+            // SAFETY: getuid/getgid only read this process's credentials.
+            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+            assert_ne!(uid, 0, "start the script tests as the ordinary runner");
+            let mut command = std::process::Command::new(fixture_program("sudo"));
+            command.arg("-n").arg(fixture_program("env")).arg(format!(
+                "{DELEGATED_CASE_ROLE}={}",
+                serde_json::to_string(&DelegatedCaseRole::Delegate { uid, gid })
+                    .expect("serialize the delegation role"),
+            ));
+            // sudo resets its environment. Preserve nextest's relocated binary and corpus
+            // paths, plus the runner's declared tools; never fall back to a compiled-in path.
+            for name in [
+                "PATH",
+                "CARGO_BIN_EXE_cowshed-shell-host",
+                "CARGO_MANIFEST_DIR",
+            ] {
+                let mut assignment = std::ffi::OsString::from(format!("{name}="));
+                assignment.push(
+                    std::env::var_os(name)
+                        .unwrap_or_else(|| panic!("the test runner must set {name}")),
+                );
+                command.arg(assignment);
+            }
+            for name in ["TMPDIR", "LD_LIBRARY_PATH", "RUST_BACKTRACE"] {
+                if let Some(value) = std::env::var_os(name) {
+                    let mut assignment = std::ffi::OsString::from(format!("{name}="));
+                    assignment.push(value);
+                    command.arg(assignment);
+                }
+            }
+            command.arg(fixture_program("systemd-run")).args([
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--property=Delegate=yes",
+                "--",
+            ]);
+            command
+        }
+    };
+    let output = command
+        .arg(std::env::current_exe().expect("the running script_host test binary"))
+        .args(["--exact", case, "--nocapture", "--quiet"])
+        .output_locked()
+        .unwrap_or_else(|error| panic!("start delegated script case {case}: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("{stdout}");
+    cowshed_os::eprintln!("{stderr}");
+    assert!(
+        output.status.success(),
+        "delegated script case {case} failed: {}",
+        output.status,
+    );
+    assert!(
+        stdout.contains(&format!("COWSHED_SCRIPT_HOST_CASE {case}")),
+        "the delegated subprocess never entered case {case}",
+    );
+    true
 }
 
 impl Host {
@@ -53,6 +225,17 @@ impl Host {
     }
 
     fn start_with_path(label: &str, path: &std::ffi::OsStr) -> Self {
+        // Move the fixture controller before spawning the reusable host: neither belongs to a
+        // job. Each host gets its own incarnation, even when tests run concurrently.
+        #[cfg(target_os = "linux")]
+        let cgroups = cgroup_authority()
+            .incarnation(
+                &cowshed_core::metadata::WorkspaceIncarnation::new(
+                    uuid::Uuid::new_v4().simple().to_string(),
+                )
+                .expect("incarnation"),
+            )
+            .expect("create this host's job cgroups");
         let program = shell_host();
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socket pair");
         let directory = std::env::temp_dir().join(format!(
@@ -90,6 +273,10 @@ impl Host {
                 control: Some(ours),
                 directory: canonical,
                 finished: false,
+                #[cfg(target_os = "linux")]
+                cgroups,
+                #[cfg(target_os = "linux")]
+                jobs: std::cell::RefCell::new(Vec::new()),
             })
         })();
         match started {
@@ -108,12 +295,39 @@ impl Host {
     }
 
     fn run(&mut self, script: &RenderedScript) -> Ran {
-        run_on(self.control(), &self.directory, script, None)
+        run_on(self, script, None)
     }
 
     /// Run `script`, sending the host `signal` for it once it has started.
     fn run_signalled(&mut self, script: &RenderedScript, signal: i32) -> Ran {
-        run_on(self.control(), &self.directory, script, Some(signal))
+        run_on(self, script, Some(signal))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn placement(&self) -> OwnedFd {
+        let mut jobs = self.jobs.borrow_mut();
+        let id =
+            cowshed_core::api::JobId::new(u64::try_from(jobs.len()).unwrap() + 1).expect("job id");
+        let job = self.cgroups.admit(id).expect("admit the protocol job");
+        let placement = job.placement().expect("open the cgroup placement");
+        jobs.push(job);
+        placement.into_descriptor()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retire_jobs(&mut self) -> std::io::Result<()> {
+        for job in self.jobs.get_mut().drain(..) {
+            job.kill_and_wait().map_err(std::io::Error::other)?;
+            job.terminal()
+                .map_err(|refused| std::io::Error::other(refused.error))?
+                .retire()
+                .map_err(std::io::Error::other)?;
+        }
+        std::fs::remove_dir(
+            cgroup_authority()
+                .root()
+                .join(format!("ws-{}", self.cgroups.incarnation().as_str())),
+        )
     }
 
     /// Go away as a supervisor does: close the control socket, which the host reads as its end
@@ -130,6 +344,8 @@ impl Host {
         }
         // The actual parent host must retire its held group before it is joined.
         self.close_control();
+        #[cfg(target_os = "linux")]
+        self.retire_jobs()?;
         cowshed_os::eprintln!(
             "script-fixture host={} phase=control-closed",
             self.child.id()
@@ -205,14 +421,7 @@ struct Submitted {
 }
 
 /// Send a rendered script to a host's control socket and read the host's first reply.
-fn submit(
-    control: &std::os::unix::net::UnixStream,
-    directory: &Path,
-    script: &RenderedScript,
-) -> Submitted {
-    let (stdout_read, stdout_write) = pipe();
-    let (stderr_read, stderr_write) = pipe();
-    let stdin = OwnedFd::from(std::fs::File::open("/dev/null").expect("null device"));
+fn submit(host: &Host, script: &RenderedScript) -> Submitted {
     let mut frame = FrameWriter::new(REQUEST_SCRIPT)
         .bytes(script.text.as_bytes())
         .unwrap()
@@ -233,6 +442,28 @@ fn submit(
                 .unwrap(),
         };
     }
+    submit_command(host, frame)
+}
+
+fn submit_command(host: &Host, frame: FrameWriter) -> Submitted {
+    submit_request(
+        host,
+        frame,
+        #[cfg(target_os = "linux")]
+        Some(host.placement()),
+    )
+}
+
+fn submit_request(
+    host: &Host,
+    frame: FrameWriter,
+    #[cfg(target_os = "linux")] placement: Option<OwnedFd>,
+) -> Submitted {
+    let control = host.control();
+    let directory = &host.directory;
+    let (stdout_read, stdout_write) = pipe();
+    let (stderr_read, stderr_write) = pipe();
+    let stdin = OwnedFd::from(std::fs::File::open("/dev/null").expect("null device"));
     let frame = frame
         .bytes(directory.as_os_str().as_encoded_bytes())
         .unwrap()
@@ -253,7 +484,17 @@ fn submit(
         ready_write.as_raw_fd(),
         go_read.as_raw_fd(),
     ];
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    let descriptors = {
+        let mut descriptors = vec![
+            stdin.as_raw_fd(),
+            stdout_write.as_raw_fd(),
+            stderr_write.as_raw_fd(),
+        ];
+        descriptors.extend(placement.as_ref().map(|placement| placement.as_raw_fd()));
+        descriptors
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let descriptors = [
         stdin.as_raw_fd(),
         stdout_write.as_raw_fd(),
@@ -263,6 +504,8 @@ fn submit(
         send_with_descriptors(control.as_raw_fd(), &frame, &descriptors).expect("send the request");
     std::io::Write::write_all(&mut &*control, &frame[sent..]).expect("send the rest");
     drop((stdin, stdout_write, stderr_write));
+    #[cfg(target_os = "linux")]
+    drop(placement);
     cowshed_os::eprintln!(
         "script-fixture control={} phase=request-sent",
         control.as_raw_fd()
@@ -327,13 +570,9 @@ fn submit(
 
 /// Run a rendered script on a host's control socket as a supervisor does: its exit, then its
 /// streams to their end, then its release. Returns the job's exit and streams.
-fn run_on(
-    control: &std::os::unix::net::UnixStream,
-    directory: &Path,
-    script: &RenderedScript,
-    signal: Option<i32>,
-) -> Ran {
-    let Submitted { reply, readers } = submit(control, directory, script);
+fn run_on(host: &Host, script: &RenderedScript, signal: Option<i32>) -> Ran {
+    let control = host.control();
+    let Submitted { reply, readers } = submit(host, script);
     let (tag, mut fields) = FrameReader::new(&reply).unwrap();
     let (birth, status) = match tag {
         REPLY_SCRIPT_SYNTAX => (None, None),
@@ -498,6 +737,10 @@ impl Drop for ScriptJobGuard {
 
 #[test]
 fn a_script_has_its_own_streams_and_exact_status() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("a_script_has_its_own_streams_and_exact_status") {
+        return;
+    }
     let mut host = Host::start("streams");
     let ran = host.run(&text("printf out; printf err >&2; exit 7"));
     assert_eq!((ran.stdout.as_str(), ran.stderr.as_str()), ("out", "err"));
@@ -524,6 +767,10 @@ fn a_script_has_its_own_streams_and_exact_status() {
 /// the job and its pid is free for another process.
 #[test]
 fn the_host_reports_the_leader_it_observed_before_reaping_it() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("the_host_reports_the_leader_it_observed_before_reaping_it") {
+        return;
+    }
     let mut host = Host::start("birth");
     for source in ["sleep 0.2", "exit 0"] {
         let ran = host.run(&text(source));
@@ -543,16 +790,16 @@ fn the_host_reports_the_leader_it_observed_before_reaping_it() {
 /// the next command.
 #[test]
 fn the_host_signals_its_command_s_group_until_it_is_released() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("the_host_signals_its_command_s_group_until_it_is_released") {
+        return;
+    }
     let mut host = Host::start("signal");
     let ran = host.run_signalled(&text("sleep 30"), libc::SIGKILL);
     assert_eq!(signaled(ran.status.as_ref()), Some(libc::SIGKILL));
 
     let marker = host.directory.join("descendant");
-    let Submitted { reply, readers } = submit(
-        host.control(),
-        &host.directory,
-        &outliving_descendant(&marker, 3),
-    );
+    let Submitted { reply, readers } = submit(&host, &outliving_descendant(&marker, 3));
     let (tag, _) = FrameReader::new(&reply).unwrap();
     assert_eq!(tag, REPLY_STARTED);
     assert_eq!(read_exit(host.control()), ExitStatus::Exited { code: 3 });
@@ -595,13 +842,13 @@ fn the_host_signals_its_command_s_group_until_it_is_released() {
 /// exits.
 #[test]
 fn a_host_whose_supervisor_goes_away_ends_the_command_it_holds() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("a_host_whose_supervisor_goes_away_ends_the_command_it_holds") {
+        return;
+    }
     let mut host = Host::start("orphan");
     let marker = host.directory.join("descendant");
-    let Submitted { reply, readers } = submit(
-        host.control(),
-        &host.directory,
-        &outliving_descendant(&marker, 0),
-    );
+    let Submitted { reply, readers } = submit(&host, &outliving_descendant(&marker, 0));
     let (tag, _) = FrameReader::new(&reply).unwrap();
     assert_eq!(tag, REPLY_STARTED);
     assert_eq!(read_exit(host.control()), ExitStatus::Exited { code: 0 });
@@ -651,6 +898,10 @@ fn gone(pid: i32) -> bool {
 
 #[test]
 fn a_script_that_does_not_parse_never_runs() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("a_script_that_does_not_parse_never_runs") {
+        return;
+    }
     let mut host = Host::start("syntax");
     let marker = host.directory.join("ran");
     let ran = host.run(&text(&format!("touch {}; if true; then", marker.display())));
@@ -664,6 +915,10 @@ fn a_script_that_does_not_parse_never_runs() {
 
 #[test]
 fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host") {
+        return;
+    }
     let mut host = Host::start("group");
     cowshed_os::eprintln!(
         "script-group phase=host-started host_pid={} control_fd={} fixture={}",
@@ -691,7 +946,7 @@ fn killing_a_script_job_group_reaches_its_grandchildren_and_spares_the_host() {
         leader.display()
     ));
     cowshed_os::eprintln!("script-group phase=submitting");
-    let Submitted { reply, readers } = submit(host.control(), &host.directory, &rendered);
+    let Submitted { reply, readers } = submit(&host, &rendered);
     cowshed_os::eprintln!("script-group phase=start-reply");
     let (tag, mut fields) = FrameReader::new(&reply).expect("start reply");
     assert_eq!(tag, REPLY_STARTED);
@@ -850,6 +1105,10 @@ fn an_unreaped_zombie_is_exited_even_while_the_null_signal_reaches_it() {
 /// Several hosts forking back to back make the race likely.
 #[test]
 fn scripts_forked_at_once_each_run_whole() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("scripts_forked_at_once_each_run_whole") {
+        return;
+    }
     // Every host starts before any job pipe exists, so no host inherits another's pipe end.
     let hosts: Vec<Host> = (0..8)
         .map(|index| Host::start(&format!("burst-{index}")))
@@ -885,6 +1144,10 @@ fn scripts_forked_at_once_each_run_whole() {
 
 #[test]
 fn nothing_one_script_does_to_its_process_reaches_the_next() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("nothing_one_script_does_to_its_process_reaches_the_next") {
+        return;
+    }
     cowshed_os::eprintln!("script-isolation phase=starting-host");
     let mut host = Host::start("isolation");
     cowshed_os::eprintln!("script-isolation phase=first-command");
@@ -907,6 +1170,10 @@ fn nothing_one_script_does_to_its_process_reaches_the_next() {
 
 #[test]
 fn values_reach_the_script_as_data_in_every_quoting_context() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("values_reach_the_script_as_data_in_every_quoting_context") {
+        return;
+    }
     let mut host = Host::start("values");
     let hostile = r#"a "b" 'c' $(touch pwned) `id` ; rm -rf x *"#;
     for parts in [
@@ -960,6 +1227,10 @@ fn corpus() -> Corpus {
 /// script interface: both must agree which scripts parse, and what an accepted one prints.
 #[test]
 fn the_shared_corpus_parses_and_prints_what_bash_does() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("the_shared_corpus_parses_and_prints_what_bash_does") {
+        return;
+    }
     let corpus = corpus();
     assert_eq!(corpus.schema, "cowshed.shell-script-corpus/v1");
     let mut host = Host::start("corpus");
@@ -1001,6 +1272,10 @@ fn the_shared_corpus_parses_and_prints_what_bash_does() {
 /// supervisor a closed socket and nothing else.
 #[test]
 fn a_host_that_cannot_run_direnv_says_so() {
+    #[cfg(target_os = "linux")]
+    if delegated_case("a_host_that_cannot_run_direnv_says_so") {
+        return;
+    }
     let host = Host::start_with_path("no-direnv", std::ffi::OsStr::new("/nonexistent/bin"));
     let envrc = host.directory.join(".envrc");
     std::fs::write(&envrc, b"").expect("envrc");
@@ -1029,4 +1304,171 @@ fn a_host_that_cannot_run_direnv_says_so() {
         reason.contains("direnv") && reason.contains("/nonexistent/bin"),
         "the reason names the tool and where it was looked for: {reason}"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn linux_request(tag: u8, source: &str) -> FrameWriter {
+    match tag {
+        REQUEST_SCRIPT => FrameWriter::new(tag)
+            .bytes(source.as_bytes())
+            .unwrap()
+            .u32(0),
+        cowshed_core::runtime::shell_host::REQUEST_RUN => FrameWriter::new(tag)
+            .list([b"/bin/sh".as_slice(), b"-c", source.as_bytes()].into_iter())
+            .unwrap(),
+        _ => panic!("not a command request"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_argv_and_scripts_enter_the_job_cgroup_without_leaking_placement() {
+    if delegated_case("linux_argv_and_scripts_enter_the_job_cgroup_without_leaking_placement") {
+        return;
+    }
+    let host = Host::start("cgroup-placement");
+    let host_membership = std::fs::read_to_string(format!("/proc/{}/cgroup", host.child.id()))
+        .expect("the host's initial cgroup");
+    for tag in [
+        cowshed_core::runtime::shell_host::REQUEST_RUN,
+        REQUEST_SCRIPT,
+    ] {
+        let ready = host.directory.join(format!("ready-{tag}"));
+        let hold = host.directory.join(format!("hold-{tag}"));
+        for path in [&ready, &hold] {
+            let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: the path is NUL-terminated and belongs to this fixture.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        }
+        // Only builtins read and report the interpreter's own membership before it can run an
+        // external program. The FIFO holds that same process alive for descriptor inspection.
+        let source = format!(
+            "while IFS= read -r line; do printf '%s\\n' \"$line\"; done < /proc/self/cgroup; \
+             printf ready > \"{}\"; read -r _ < \"{}\"",
+            ready.display(),
+            hold.display(),
+        );
+        let Submitted { reply, readers } = submit_command(&host, linux_request(tag, &source));
+        let (tag, mut fields) = FrameReader::new(&reply).expect("start reply");
+        assert_eq!(tag, REPLY_STARTED);
+        let birth = fields.birth().expect("the held command");
+        fields.finish().expect("complete start reply");
+        assert_eq!(std::fs::read_to_string(&ready).unwrap(), "ready");
+        let jobs = host.jobs.borrow();
+        let job = jobs.last().expect("the request's admitted cgroup");
+        let membership = format!(
+            "0::/{}\n",
+            job.path()
+                .strip_prefix(cowshed_core::runtime::job_cgroup::CGROUP_MOUNT)
+                .expect("cgroup beneath the unified mount")
+                .display(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("/proc/{}/cgroup", birth.pid())).unwrap(),
+            membership,
+        );
+        for descriptor in
+            std::fs::read_dir(format!("/proc/{}/fd", birth.pid())).expect("the command's fds")
+        {
+            let path = descriptor.expect("a descriptor").path();
+            let target = match std::fs::read_link(&path) {
+                Ok(target) => target,
+                // The ready FIFO can close between readdir and readlink.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("readlink {}: {error}", path.display()),
+            };
+            assert_ne!(
+                target,
+                job.path().join("cgroup.procs"),
+                "placement authority leaked into job code",
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(format!("/proc/{}/cgroup", host.child.id())).unwrap(),
+            host_membership,
+            "the reusable host never enters a job cgroup",
+        );
+        assert_ne!(membership, host_membership);
+        job.kill().expect("kill through the job cgroup");
+        assert_eq!(
+            signaled(Some(&read_exit(host.control()))),
+            Some(libc::SIGKILL)
+        );
+        job.wait_empty().expect("kernel confirms the job is empty");
+        let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
+        assert_eq!(
+            stdout, membership,
+            "the first job code observed its own cgroup"
+        );
+        assert_eq!(stderr, "");
+        release(host.control());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_commands_without_a_placement_descriptor_are_refused() {
+    if delegated_case("linux_commands_without_a_placement_descriptor_are_refused") {
+        return;
+    }
+    for tag in [
+        cowshed_core::runtime::shell_host::REQUEST_RUN,
+        REQUEST_SCRIPT,
+    ] {
+        let host = Host::start("missing-placement");
+        let marker = host.directory.join("ran");
+        let source = format!("printf ran > \"{}\"", marker.display());
+        let Submitted { reply, readers } = submit_request(&host, linux_request(tag, &source), None);
+        let (tag, mut fields) = FrameReader::new(&reply).expect("refusal reply");
+        assert_eq!(tag, REPLY_HOST_FAILED);
+        let diagnostic = String::from_utf8_lossy(fields.bytes().unwrap());
+        assert!(diagnostic.contains("cgroup placement"), "{diagnostic}");
+        fields.finish().unwrap();
+        let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
+        assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
+        assert!(!marker.exists(), "nothing runs without cgroup placement");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_refused_cgroup_placement_never_runs_the_command() {
+    if delegated_case("linux_refused_cgroup_placement_never_runs_the_command") {
+        return;
+    }
+    for tag in [
+        cowshed_core::runtime::shell_host::REQUEST_RUN,
+        REQUEST_SCRIPT,
+    ] {
+        let mut host = Host::start("refused-placement");
+        drop(host.placement());
+        let path = host
+            .jobs
+            .borrow()
+            .last()
+            .unwrap()
+            .path()
+            .join("cgroup.procs");
+        // A real cgroup interface, deliberately opened read-only: entering it must fail. No
+        // ordinary file stands in for a cgroup, even in the negative case.
+        let placement = OwnedFd::from(std::fs::File::open(path).expect("read-only cgroup.procs"));
+        let marker = host.directory.join("ran");
+        let source = format!("printf ran > \"{}\"", marker.display());
+        let Submitted { reply, readers } =
+            submit_request(&host, linux_request(tag, &source), Some(placement));
+        let (tag, mut fields) = FrameReader::new(&reply).expect("placement refusal");
+        assert_eq!(tag, REPLY_EXITED, "a refused child was never started");
+        assert_eq!(fields.exit().unwrap(), ExitStatus::Exited { code: 126 });
+        fields.finish().unwrap();
+        let [stdout, stderr] = readers.map(|reader| reader.join().expect("stream reader"));
+        assert_eq!(stdout, "");
+        assert!(stderr.contains("cgroup placement"), "{stderr}");
+        assert!(!marker.exists(), "a placement failure never runs job code");
+        let ran = host.run(&text("printf after"));
+        assert_eq!(exited(ran.status.as_ref()), Some(0));
+        assert_eq!(
+            ran.stdout, "after",
+            "placement failure did not enter the host"
+        );
+    }
 }

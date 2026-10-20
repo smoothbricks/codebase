@@ -11,6 +11,10 @@
 //! `u32` payload length followed by the payload: a tag byte and its fields, each byte string
 //! length-prefixed. Descriptors ride as `SCM_RIGHTS` on the first bytes of a request frame.
 //! Requests are served strictly in order; the host is exclusive to one command at a time.
+//! Linux command requests require a fourth descriptor: a controller-opened `cgroup.procs`
+//! placement, entered only by the forked command and closed before any job program can use it.
+//! The host stays outside the job's cgroup; a missing placement refuses the command. macOS
+//! instead carries its existing observation-ready and observation-go descriptors after stdio.
 //!
 //! A command's exchange: `REQUEST_RUN` or `REQUEST_SCRIPT`, then `REPLY_NICE_REFUSED` (a child that
 //! placed its own nice was refused it and never ran; the exchange ends) or `REPLY_STARTED`, any number of
@@ -20,7 +24,8 @@
 //! the job's group alone and a signal can reach descendants that outlive the leader. A signal the
 //! host cannot deliver is answered by `REPLY_SIGNAL_FAILED` in the reply stream. A supervisor that
 //! closes the socket while the host holds a command has the host end the command's group --
-//! SIGTERM, a grace, SIGKILL -- and reap it.
+//! SIGTERM, a grace, SIGKILL -- and reap it. Linux supervisors retain their cgroup capability
+//! independently of this exchange and use it to end every member, including changed groups.
 
 use std::ffi::OsString;
 use std::io;
@@ -52,19 +57,22 @@ pub const REQUEST_APPROVE: u8 = 1;
 /// Evaluate `.envrc` once: `[directory]`, descriptors `[stderr]`.
 pub const REQUEST_ACTIVATE: u8 = 2;
 /// Fork an argv into a new process group: `[argv, cwd, overlay, child nice]`, descriptors
-/// `[stdin, stdout, stderr]`, followed on macOS by `[observation_ready, observation_go]`. The
-/// child nice is [`FrameWriter::child_nice`].
+/// `[stdin, stdout, stderr]`, followed on Linux by `[cgroup_placement]` and on macOS by
+/// `[observation_ready, observation_go]`. Linux enters the cgroup before exec. The child nice
+/// is [`FrameWriter::child_nice`].
 pub const REQUEST_RUN: u8 = 3;
 /// Run a rendered script: `[text, bindings, cwd, overlay, child nice]`, descriptors `[stdin,
-/// stdout, stderr]`, followed on macOS by `[observation_ready, observation_go]`. The host parses before
-/// it forks. The new group leader waits at the macOS fence until the supervisor registers its
-/// native observer, then builds a brush shell from the activated environment and runs the
-/// program. Every script process is in the job's group; the child's own wait status is the job's.
+/// stdout, stderr]`, followed on Linux by `[cgroup_placement]` and on macOS by
+/// `[observation_ready, observation_go]`. The host parses before it forks. The child enters
+/// its Linux cgroup immediately after fork, or waits at the macOS observation fence, then
+/// builds a brush shell from the activated environment and runs the program. Descendants
+/// inherit Linux cgroup membership; the child's own wait status is the job's.
 pub const REQUEST_SCRIPT: u8 = 4;
-/// Signal the held command's group: `[signal]`. Sent between `REPLY_STARTED` and
-/// `REQUEST_RELEASE`. The host is the command's parent and holds the leader unreaped until the
-/// release, so the group id names the job's group alone. Unanswered when delivered; a failure
-/// is answered with `REPLY_SIGNAL_FAILED`.
+/// Signal the held command's group: `[signal]`. Linux supervisors instead signal the job's
+/// cgroup directly, including descendants that changed groups or outlived their host. Sent
+/// between `REPLY_STARTED` and `REQUEST_RELEASE`. The host is the command's parent and holds
+/// the leader unreaped until the release, so the group id names the job's group alone.
+/// Unanswered when delivered; a failure is answered with `REPLY_SIGNAL_FAILED`.
 pub const REQUEST_SIGNAL: u8 = 5;
 /// The job concluded: reap its command `[]`. Sent once, after `REPLY_EXITED`; answered by
 /// `REPLY_RELEASED`, after which the host serves its next command.
@@ -604,9 +612,15 @@ fn receive_with_descriptors(
     header.msg_iovlen = 1;
     header.msg_control = control.as_mut_ptr().cast();
     header.msg_controllen = control_len as _;
+    // Linux installs every received descriptor close-on-exec atomically, including the cgroup
+    // placement authority, so no command can inherit it through a concurrent exec.
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
     let received = loop {
         // SAFETY: `header` references live, writable buffers for the duration of the call.
-        let received = unsafe { libc::recvmsg(socket, &mut header, 0) };
+        let received = unsafe { libc::recvmsg(socket, &mut header, flags) };
         if received >= 0 {
             break usize::try_from(received).map_err(io::Error::other)?;
         }
@@ -629,6 +643,7 @@ fn receive_with_descriptors(
                     let raw = std::ptr::read_unaligned(data.add(index));
                     // Owned from here, so a malformed frame still closes what it carried.
                     let owned = OwnedFd::from_raw_fd(raw);
+                    #[cfg(not(target_os = "linux"))]
                     libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
                     descriptors.push(owned);
                 }

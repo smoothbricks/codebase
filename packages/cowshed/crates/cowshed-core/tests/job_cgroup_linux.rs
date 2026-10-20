@@ -17,6 +17,16 @@
 //! and shmem charges only; regular-file page-cache and block-I/O attribution remain blocked.
 //! A host without passwordless sudo, systemd, a delegable cgroup v2, or (given loop devices)
 //! `mkfs.ext4` fails naming the refused step; nothing is skipped.
+//!
+//! The containment cases keep escapees alive past everything a process-group or parent-chain
+//! census follows: a background child, a child that leaves its parent's session while the parent
+//! runs, and a child that waits on its parent's pidfd to see the parent exit before it leaves the
+//! session. Each admits its job through the supervisor's own sink, places the leader before it
+//! runs and ends the job with `kill_and_wait`. Every handshake is a pipe or a pidfd and every
+//! wait is the kernel's own event: no sleep, retry or clock stands in for one. The admission
+//! refusals are provoked through real cgroup interfaces -- a hierarchy limit, a controller the
+//! incarnation withholds, a `cgroup.kill` its owner cannot write, a cgroup removed under its
+//! holder -- never through a stand-in directory.
 
 #![cfg(target_os = "linux")]
 
@@ -26,12 +36,19 @@ use std::os::unix::fs::chown;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
 
 use cowshed_core::api::dto::JobId;
-use cowshed_core::metadata::WorkspaceIncarnation;
+use cowshed_core::error::ErrorCode;
+use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
+use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::job_cgroup::{
-    CGROUP_MOUNT, CONTROLLER_LEAF, CgroupAuthority, CgroupError, IncarnationCgroups, JobCgroup,
-    JobCgroupIdentity,
+    CGROUP_MOUNT, CONTROLLER_LEAF, CgroupAuthority, CgroupError, CgroupMemberSignal, Controller,
+    IncarnationCgroups, JobCgroup, JobCgroupIdentity,
+};
+use cowshed_core::runtime::supervisor::{
+    SpawnSink as _, SystemSpawnSink, WorkspaceAuthoritySnapshot,
 };
 use cowshed_os::fork_lock::{Run as _, Spawn as _};
 use serde::{Deserialize, Serialize};
@@ -41,6 +58,8 @@ const ROLE_TEST: &str = "job_cgroup_role";
 const REPORT: &str = "COWSHED_JOB_CGROUP_REPORT ";
 const PAUSED: &str = "COWSHED_JOB_CGROUP_PAUSED";
 const HELD: &str = "COWSHED_JOB_CGROUP_HELD";
+/// One milestone of an escape fixture's process: this prefix, then a JSON [`Stage`].
+const STAGE: &str = "COWSHED_JOB_CGROUP_STAGE ";
 /// The directory workloads keep their files in ([`Scratch`]).
 const STORAGE: &str = "COWSHED_JOB_CGROUP_STORAGE";
 
@@ -58,6 +77,10 @@ enum Role {
     },
     Controller,
     Workload(Workload),
+    /// A job's leader that starts a background descendant, then holds until it is released.
+    Leader(Escapee),
+    /// A background descendant of a job's leader: it outlives the leader's stdio, not the job.
+    Escapee(Escapee),
 }
 
 /// What a workload process does, in order.
@@ -111,6 +134,55 @@ impl WorkloadReport {
 struct WorkloadExit {
     report: WorkloadReport,
     cpu_us: u64,
+}
+
+/// How a background descendant relates to the session its job's leader runs in. Each is a way
+/// for a process to leave a process group or a parent chain without leaving its job.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum Detach {
+    /// Stays in the leader's session and process group, running in the background.
+    Background,
+    /// Calls `setsid(2)` while its parent still runs.
+    SessionWhileParentLives,
+    /// Waits on its parent's pidfd until the parent has exited, and only then calls `setsid(2)`.
+    SessionAfterParentExit,
+}
+
+/// What a job's leader starts: a descendant that ignores `SIGTERM`, closes the stdio it
+/// inherited and ends only by a kill.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Escapee {
+    detach: Detach,
+    /// The controller's pid. The controller's exit is the one event besides a kill that ends an
+    /// escapee, so a scenario that fails leaves no process behind in the delegated scope.
+    controller: u32,
+}
+
+/// What a process of an escape fixture has done when it states a [`Stage`].
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum StageKind {
+    /// The job's leader, placed before it ran.
+    Leader,
+    /// The escapee holds its parent's pidfd and has not yet done what its [`Detach`] says.
+    Armed,
+    /// The escapee has done it, and is about to close the stdio it inherited.
+    Detached,
+}
+
+/// One milestone of an escape fixture's process, on its output after [`STAGE`].
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Stage {
+    kind: StageKind,
+    pid: u32,
+    /// The cgroup the process read as its first action.
+    first_cgroup: String,
+    /// Whether its parent's pidfd was readable when it stated this; never for a leader, whose
+    /// parent is the controller.
+    parent_exited: bool,
 }
 
 #[test]
@@ -191,6 +263,8 @@ fn job_cgroup_role() {
             println!("COWSHED_JOB_CGROUP_CONTROLLER_DONE");
         }
         Role::Workload(workload) => work(&workload),
+        Role::Leader(escapee) => lead(&escapee),
+        Role::Escapee(escapee) => escape(&escapee),
     }
 }
 
@@ -332,6 +406,132 @@ fn work(workload: &Workload) {
     }
 }
 
+/// A job's leader that starts an escapee: say where it was born, start the escapee on the stdio
+/// it inherited itself, then hold until the controller releases it. The hold also waits on the
+/// escapee's pidfd, so an escapee that ends first fails the scenario at once instead of leaving
+/// the controller waiting for output nobody will write.
+fn lead(escapee: &Escapee) {
+    let first_cgroup = own_cgroup();
+    stage(StageKind::Leader, &first_cgroup, false);
+    #[expect(
+        clippy::zombie_processes,
+        reason = "this fixture must orphan a live escapee; the controller joins its cgroup and pidfd"
+    )]
+    let mut child = escapee_command(escapee)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn_locked()
+        .expect("start the escapee");
+    let escapee_pidfd = pidfd_of(child.id(), "escapee");
+    // Released by one byte on stdin, the way a held workload waits.
+    let mut watched = [
+        libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        escapee_pidfd.watch(),
+    ];
+    wait_for_events(&mut watched, -1);
+    if watched[1].revents != 0 {
+        let status = child.wait().expect("reap the unexpectedly exited escapee");
+        panic!("the escapee ended while its leader was held: {status}");
+    }
+    // The released leader deliberately exits without waiting: the live child must outlast it.
+    let mut byte = [0];
+    std::io::stdin().read_exact(&mut byte).expect("release");
+}
+
+/// The escapee: say where it was born, leave its session as `detach` says, close the stdio it
+/// inherited, then live until the job's kill ends it. Every wait is a kernel event on a pidfd,
+/// never a clock, and a polite `SIGTERM` is ignored: only a kill ends it.
+fn escape(escapee: &Escapee) -> ! {
+    let first_cgroup = own_cgroup();
+    // SAFETY: signal(2) with a constant disposition.
+    let previous = unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+    assert_ne!(
+        previous,
+        libc::SIG_ERR,
+        "ignore SIGTERM in the escapee: {}",
+        last_error()
+    );
+    // The controller holds the leader until this has armed, so the pid is still the parent's.
+    let parent_pid = current_parent();
+    let parent = pidfd_of(parent_pid, "parent");
+    let controller = pidfd_of(escapee.controller, "controller");
+    stage(StageKind::Armed, &first_cgroup, parent.exited());
+    match escapee.detach {
+        Detach::Background => {}
+        Detach::SessionWhileParentLives => new_session(),
+        Detach::SessionAfterParentExit => {
+            // A pidfd is readable once its process has exited, and by then the kernel has
+            // already given that process's children to a new parent.
+            parent.await_exit();
+            assert_ne!(
+                current_parent(),
+                parent_pid,
+                "the escapee is an orphan once its parent exited"
+            );
+            new_session();
+        }
+    }
+    stage(StageKind::Detached, &first_cgroup, parent.exited());
+    close_inherited_stdio();
+    // Alive the way a daemon waits: on a kernel event. The controller's own exit is the only one
+    // that is not a kill, so a failed scenario leaves no process behind in the scope.
+    controller.await_exit();
+    // SAFETY: _exit never returns, and nothing past here is wanted: no destructor, no harness.
+    unsafe { libc::_exit(0) }
+}
+
+/// State a milestone of this process on the output it inherited: one line, written at once.
+fn stage(kind: StageKind, first_cgroup: &str, parent_exited: bool) {
+    let record = Stage {
+        kind,
+        pid: std::process::id(),
+        first_cgroup: first_cgroup.to_owned(),
+        parent_exited,
+    };
+    let line = serde_json::to_string(&record).expect("stage");
+    println!("{STAGE}{line}");
+    std::io::stdout().flush().expect("flush");
+}
+
+/// This binary again, in the escapee's role.
+fn escapee_command(escapee: &Escapee) -> Command {
+    role_command(&Role::Escapee(escapee.clone()))
+}
+
+/// This process's parent as the kernel names it now.
+fn current_parent() -> u32 {
+    // SAFETY: getppid cannot fail.
+    u32::try_from(unsafe { libc::getppid() }).expect("a parent pid is never negative")
+}
+
+/// Leave the session and process group this process was born into.
+fn new_session() {
+    // SAFETY: setsid takes no arguments and fails only for a process group leader.
+    let session = unsafe { libc::setsid() };
+    assert_eq!(
+        u32::try_from(session),
+        Ok(std::process::id()),
+        "setsid made this process its own session leader: {}",
+        last_error()
+    );
+}
+
+/// Close stdin, stdout and stderr the way a daemon does, so no pipe it inherited outlives the
+/// process that opened it.
+fn close_inherited_stdio() {
+    std::io::stdout().flush().expect("flush stdout");
+    for descriptor in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: closes a descriptor this process owns and never uses again.
+        let closed = unsafe { libc::close(descriptor) };
+        assert_eq!(closed, 0, "close fd {descriptor}: {}", last_error());
+    }
+}
+
 /// The scenarios, run by the unprivileged controller that holds the delegated scope.
 fn control() {
     report_fixture_authority("controller");
@@ -371,16 +571,11 @@ fn control() {
     storage_io_outlives_its_processes(&jobs);
     retirement_waits_for_the_last_process(&jobs);
     restart_lookup_keeps_the_identity_under_its_incarnation(&authority, &jobs);
+    escapees_die_with_their_job(&authority);
+    admission_refuses_what_it_cannot_contain(&authority);
 
     // Leave the scope as admission found it.
-    for identity in jobs.outstanding().expect("outstanding") {
-        jobs.lookup(&identity)
-            .expect("lookup")
-            .terminal()
-            .expect("every workload ended")
-            .retire()
-            .expect("retire");
-    }
+    retire_outstanding(&jobs);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -887,6 +1082,541 @@ fn restart_lookup_keeps_the_identity_under_its_incarnation(
     ));
 }
 
+/// Leave an incarnation as admission found it: every job cgroup still in it has ended, and goes.
+fn retire_outstanding(jobs: &IncarnationCgroups) {
+    for identity in jobs.outstanding().expect("outstanding") {
+        jobs.lookup(&identity)
+            .expect("lookup")
+            .terminal()
+            .expect("every workload ended")
+            .retire()
+            .expect("retire");
+    }
+}
+
+/// A job's kill reaches a background escapee however it left the leader's session, and the job
+/// is sealed only after the kernel reports every process of it gone (07_api.md, "Complete job
+/// accounting and observation reconciliation"). The leader is placed before it runs and the
+/// escapee is only ever born of it, so its membership is inherited: once it has left the
+/// leader's session, or the leader has exited and the kernel has reparented it, nothing but the
+/// cgroup ties it to the job.
+fn escapees_die_with_their_job(authority: &CgroupAuthority) {
+    let incarnation = incarnation(3);
+    let snapshot = authority_snapshot(&incarnation);
+    let jobs = authority.incarnation(&incarnation).expect("incarnation");
+    let mut sink = SystemSpawnSink::default();
+    let escapes = [
+        (1, Detach::Background),
+        (2, Detach::SessionWhileParentLives),
+        (3, Detach::SessionAfterParentExit),
+    ];
+    for (id, detach) in escapes {
+        kill_reaches_the_escapee(&mut sink, &snapshot, &jobs, id, detach);
+    }
+    let left = jobs.outstanding().expect("outstanding");
+    assert!(
+        left.is_empty(),
+        "every escape fixture retired its job cgroup: {left:?}"
+    );
+}
+
+fn kill_reaches_the_escapee(
+    sink: &mut SystemSpawnSink,
+    authority: &WorkspaceAuthoritySnapshot,
+    jobs: &IncarnationCgroups,
+    id: u64,
+    detach: Detach,
+) {
+    let scenario = format!("{detach:?}");
+    println!("escape fixture {scenario}: start");
+    let job = native_admission(sink, authority, job_id(id));
+    let path = relative(job.path());
+    let layout = format!("/ws-{}/job-{id}", authority.workspace_incarnation.as_str());
+    assert!(
+        path.ends_with(&layout),
+        "{scenario}: {path} is not the {layout} cgroup of the job"
+    );
+    let parent_exits_first = detach == Detach::SessionAfterParentExit;
+    let escapee = Escapee {
+        detach,
+        controller: std::process::id(),
+    };
+    let mut leader = Spawned::leading(&job, &escapee);
+    let leader_pid = leader.child.id();
+    let born = leader.await_stage(StageKind::Leader);
+    assert_eq!(
+        (born.pid, born.first_cgroup.as_str()),
+        (leader_pid, path.as_str()),
+        "{scenario}: the leader's first instruction ran in the job"
+    );
+    let armed = leader.await_stage(StageKind::Armed);
+    let escapee_pid = armed.pid;
+    assert_eq!(
+        armed.first_cgroup, path,
+        "{scenario}: the escapee was born in the job"
+    );
+    assert!(
+        !armed.parent_exited,
+        "{scenario}: the leader still ran when the escapee armed"
+    );
+    // Held from a moment each process is known to run, so neither can name another process.
+    let leader_pidfd = pidfd_of(leader_pid, "leader");
+    let escapee_pidfd = pidfd_of(escapee_pid, "escapee");
+    assert!(
+        !escapee_pidfd.exited(),
+        "{scenario}: the escapee runs when its pidfd is first held"
+    );
+    assert!(
+        !leader_pidfd.exited(),
+        "{scenario}: the leader runs when the escapee arms"
+    );
+    if parent_exits_first {
+        // The escapee only waits on its parent's pidfd: until the parent exits it is still the
+        // leader's child, in the leader's group and session.
+        let leader_lineage = lineage(leader_pid);
+        assert_eq!(
+            lineage(escapee_pid),
+            Lineage {
+                parent: leader_pid,
+                group: leader_lineage.group,
+                session: leader_lineage.session,
+            },
+            "{scenario}: the waiting escapee has not left the leader's session"
+        );
+        leader.release();
+    }
+    let detached = leader.await_stage(StageKind::Detached);
+    assert_eq!(
+        detached.pid, escapee_pid,
+        "{scenario}: one process stated both stages"
+    );
+    assert_eq!(
+        detached.parent_exited, parent_exits_first,
+        "{scenario}: the parent had exited when the escapee detached only if it exits first"
+    );
+    // What the kernel itself says about the escapee, not what it claims.
+    let after = lineage(escapee_pid);
+    let own = (escapee_pid, escapee_pid);
+    let (group, session) = match detach {
+        Detach::Background => {
+            let leaders = lineage(leader_pid);
+            (leaders.group, leaders.session)
+        }
+        Detach::SessionWhileParentLives | Detach::SessionAfterParentExit => own,
+    };
+    assert_eq!(
+        (after.group, after.session),
+        (group, session),
+        "{scenario}: the escapee's process group and session"
+    );
+    if parent_exits_first {
+        assert_ne!(
+            after.parent, leader_pid,
+            "{scenario}: the kernel reparented the escapee when its leader exited"
+        );
+    } else {
+        assert_eq!(
+            after.parent, leader_pid,
+            "{scenario}: the escapee is still its leader's child"
+        );
+    }
+    // A leader that exited first closes the output with its escapee: reading it to its end
+    // proves the escapee let go of the pipe it inherited.
+    let leader = if parent_exits_first {
+        let (status, rest) = leader.reap();
+        assert!(
+            status.success(),
+            "{scenario}: the released leader exited normally: {status}\n{rest}"
+        );
+        assert!(
+            leader_pidfd.exited(),
+            "{scenario}: the leader had exited before the escapee left its session"
+        );
+        None
+    } else {
+        Some(leader)
+    };
+    let mut members = vec![escapee_pid];
+    if leader.is_some() {
+        members.push(leader_pid);
+    }
+    members.sort_unstable();
+    assert_eq!(
+        census(&job),
+        members,
+        "{scenario}: every live process of the job is a member, whatever its session"
+    );
+    assert_eq!(
+        cgroup_of(escapee_pid),
+        path,
+        "{scenario}: the kernel places the escapee in the job"
+    );
+    assert!(
+        !escapee_pidfd.exited(),
+        "{scenario}: the escapee is alive when the kill is issued"
+    );
+    assert_eq!(
+        leader_pidfd.exited(),
+        parent_exits_first,
+        "{scenario}: the leader has exited only where the scenario ends it first"
+    );
+    assert!(
+        job.populated().expect("populated before the kill"),
+        "{scenario}: the job holds live processes before the kill"
+    );
+
+    job.kill_and_wait()
+        .unwrap_or_else(|error| panic!("{scenario}: kill and wait: {error}"));
+    // The wait joined the exit of every process the kill ended, so both pidfds are readable now:
+    // the kernel's exit event, which an empty `cgroup.events` alone can precede.
+    for (name, pidfd) in [("leader", &leader_pidfd), ("escapee", &escapee_pidfd)] {
+        assert!(
+            pidfd.exited(),
+            "{scenario}: the {name}'s pidfd is readable when kill_and_wait returns"
+        );
+    }
+    assert!(
+        !job.populated().expect("populated after the kill"),
+        "{scenario}: the job is empty after the kill"
+    );
+    assert!(
+        !events_populated(&job),
+        "{scenario}: cgroup.events reads populated 0 after the kill"
+    );
+    assert!(
+        census(&job).is_empty(),
+        "{scenario}: no process is left in cgroup.procs after the kill"
+    );
+    let (receipt, concurrent) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| job.retire(Duration::ZERO).expect("retire"));
+        let second = scope.spawn(|| job.retire(Duration::ZERO).expect("concurrent retire"));
+        (
+            first.join().expect("first retire"),
+            second.join().expect("second retire"),
+        )
+    });
+    assert!(
+        Arc::ptr_eq(&receipt, &concurrent),
+        "{scenario}: retirement shares one proof"
+    );
+    assert_receipt(&receipt.members, &members, &scenario);
+    assert!(
+        receipt.metadata_gap,
+        "{scenario}: atomic kill has no exhaustive member list"
+    );
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let permissions = std::fs::metadata(job.path())
+            .expect("job metadata")
+            .permissions();
+        std::fs::set_permissions(job.path(), std::fs::Permissions::from_mode(0o0))
+            .expect("deny final counter reads");
+        let refused = job.finish();
+        std::fs::set_permissions(job.path(), permissions).expect("restore job permissions");
+        assert!(
+            refused.is_err(),
+            "{scenario}: unavailable final counters refuse finalization"
+        );
+    }
+    let retried = job
+        .retire(Duration::ZERO)
+        .expect("retry after refused finalization");
+    assert!(
+        Arc::ptr_eq(&receipt, &retried),
+        "{scenario}: retry retains every signal row"
+    );
+    if let Some(leader) = leader {
+        let (status, rest) = leader.reap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "{scenario}: the job's kill ended the leader: {status}\n{rest}"
+        );
+    }
+
+    let identity = job.identity().clone();
+    let job = Arc::try_unwrap(job).expect("nothing else holds the admitted cgroup");
+    let terminal = job.terminal().expect("sealed");
+    for (name, pidfd) in [("leader", &leader_pidfd), ("escapee", &escapee_pidfd)] {
+        assert!(
+            pidfd.exited(),
+            "{scenario}: the {name}'s pidfd is readable when the job is sealed"
+        );
+    }
+    let cpu = terminal.cpu().expect("final cpu");
+    terminal.charged_memory().expect("final charged memory");
+    terminal.storage_io().expect("final storage I/O");
+    let removed = terminal.path().to_path_buf();
+    let totals = terminal.retire().expect("retire");
+    assert_eq!(
+        totals.cpu, cpu,
+        "{scenario}: retirement collects the final counters"
+    );
+    assert!(
+        !removed.exists(),
+        "{scenario}: {} was retired",
+        removed.display()
+    );
+    assert!(matches!(
+        jobs.lookup(&identity),
+        Err(CgroupError::Missing { .. })
+    ));
+    let left = jobs.outstanding().expect("outstanding");
+    assert!(
+        !left.contains(&identity),
+        "{scenario}: retired, yet outstanding: {left:?}"
+    );
+    println!("escape fixture {scenario}: leader {leader_pid}, escapee {escapee_pid}, {after:?}");
+}
+
+/// Admission is the one moment a job's cgroup can be refused, and a refusal leaves nothing behind
+/// that a retry or a restart would trip over. Each case provokes a real kernel refusal through a
+/// real cgroup interface; no stand-in directory plays a cgroup.
+fn admission_refuses_what_it_cannot_contain(authority: &CgroupAuthority) {
+    a_name_in_use_is_refused(authority);
+    a_hierarchy_limit_refuses_creation(authority);
+    a_cgroup_without_a_controller_is_removed_again(authority);
+    an_unwritable_cgroup_kill_refuses_attachment(authority);
+    a_vanished_cgroup_refuses_kill_and_wait();
+    shared_finalization_removes_only_the_admitted_hierarchy(authority);
+}
+
+/// The supervisor's own sink refuses a job whose workspace incarnation already holds a cgroup of
+/// that name, and leaves the cgroup it found alone; the same job id in another incarnation is
+/// another cgroup.
+fn a_name_in_use_is_refused(authority: &CgroupAuthority) {
+    let (first, second) = (incarnation(4), incarnation(5));
+    let (here, there) = (authority_snapshot(&first), authority_snapshot(&second));
+    let jobs = authority.incarnation(&first).expect("incarnation");
+    let others = authority.incarnation(&second).expect("incarnation");
+    let existing = jobs.admit(job_id(1)).expect("an earlier admission");
+    let mut sink = SystemSpawnSink::default();
+    let refusal = sink
+        .admit_cgroup(&here, job_id(1))
+        .expect_err("a name in use is refused, never adopted or admitted uncontained");
+    assert_eq!(
+        refusal.code,
+        ErrorCode::EnvironmentMissing,
+        "a name in use is an environment refusal: {refusal:?}"
+    );
+    assert!(
+        refusal
+            .message
+            .contains(&existing.path().display().to_string()),
+        "the refusal names the cgroup in use: {refusal:?}"
+    );
+    let kept = jobs.lookup(existing.identity()).expect("lookup");
+    assert_eq!(
+        kept.identity(),
+        existing.identity(),
+        "the refused admission left the earlier one untouched"
+    );
+    let admitted = sink
+        .admit_cgroup(&here, job_id(2))
+        .expect("admit")
+        .expect("a cgroup");
+    assert_eq!(admitted.path().parent(), existing.path().parent());
+    assert_eq!(admitted.identity().job_id(), job_id(2));
+    let elsewhere = sink
+        .admit_cgroup(&there, job_id(1))
+        .expect("admit")
+        .expect("a cgroup");
+    assert_ne!(elsewhere.path(), existing.path());
+    assert_eq!(elsewhere.identity().incarnation(), &second);
+    retire_outstanding(&jobs);
+    retire_outstanding(&others);
+}
+
+/// The kernel's own hierarchy limit refuses a new cgroup beneath an incarnation. The library and
+/// the supervisor's sink both report it and create nothing: the same job is admitted once the
+/// limit is lifted.
+fn a_hierarchy_limit_refuses_creation(authority: &CgroupAuthority) {
+    let incarnation = incarnation(6);
+    let snapshot = authority_snapshot(&incarnation);
+    let jobs = authority.incarnation(&incarnation).expect("incarnation");
+    let mut sink = SystemSpawnSink::default();
+    let first = native_admission(&mut sink, &snapshot, job_id(1));
+    let limit = first
+        .path()
+        .parent()
+        .expect("the incarnation's cgroup")
+        .join("cgroup.max.descendants");
+    std::fs::write(&limit, "0").expect("set the descendant limit");
+    let library = jobs.admit(job_id(2));
+    let native = sink.admit_cgroup(&snapshot, job_id(2));
+    let listed = jobs.outstanding();
+    // Lifted before anything is judged, so a failed assertion cannot leave the scope refusing.
+    std::fs::write(&limit, "max").expect("lift the descendant limit");
+    let refusal = library.expect_err("the kernel refuses a cgroup beneath the limit");
+    assert!(
+        matches!(refusal, CgroupError::Io { call: "mkdir", .. }),
+        "{refusal:?}"
+    );
+    let refusal = native.expect_err("the production sink refuses it too");
+    assert_eq!(
+        refusal.code,
+        ErrorCode::EnvironmentMissing,
+        "a refused creation is an environment refusal: {refusal:?}"
+    );
+    let listed = listed.expect("outstanding");
+    assert_eq!(
+        listed.len(),
+        1,
+        "the refused admission created no cgroup beside the first: {listed:?}"
+    );
+    let retry = native_admission(&mut sink, &snapshot, job_id(2));
+    assert_eq!(retry.identity().job_id(), job_id(2));
+    retire_outstanding(&jobs);
+}
+
+/// A cgroup the incarnation gives no memory controller cannot be opened for accounting. That
+/// refusal comes after the kernel created the directory -- the place a missing `cgroup.kill` is
+/// refused too -- so it must take the directory away again, and the job's name is free to try
+/// once the controller is back.
+fn a_cgroup_without_a_controller_is_removed_again(authority: &CgroupAuthority) {
+    let incarnation = incarnation(7);
+    let jobs = authority.incarnation(&incarnation).expect("incarnation");
+    let probe = jobs.admit(job_id(1)).expect("admit");
+    let distribution = probe
+        .path()
+        .parent()
+        .expect("the incarnation's cgroup")
+        .join("cgroup.subtree_control");
+    let sealed = probe.terminal().expect("sealed");
+    sealed.retire().expect("retire");
+    std::fs::write(&distribution, "-memory").expect("withhold the memory controller");
+    let refused = jobs.admit(job_id(2));
+    let listed = jobs.outstanding();
+    std::fs::write(&distribution, "+memory").expect("restore the memory controller");
+    let refusal = refused.expect_err("a cgroup without the memory controller is refused");
+    let CgroupError::ControllerUnavailable { controller, .. } = &refusal else {
+        panic!("a missing controller refuses the admission as such: {refusal:?}");
+    };
+    assert_eq!(*controller, Controller::Memory, "{refusal:?}");
+    let listed = listed.expect("outstanding");
+    assert!(
+        listed.is_empty(),
+        "the refused admission left a cgroup behind: {listed:?}"
+    );
+    let retry = jobs
+        .admit(job_id(2))
+        .expect("the refused job's name is free again");
+    let sealed = retry.terminal().expect("sealed");
+    sealed.retire().expect("retire");
+}
+
+/// A restarted controller reattaches to a job by looking it up, which opens `cgroup.kill` again.
+/// Where its owner cannot write it, the lookup is refused with the kernel's reason and the cgroup
+/// stays in place; once it is writable again, the same lookup attaches.
+fn an_unwritable_cgroup_kill_refuses_attachment(authority: &CgroupAuthority) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let incarnation = incarnation(8);
+    let jobs = authority.incarnation(&incarnation).expect("incarnation");
+    let job = jobs.admit(job_id(1)).expect("admit");
+    let identity = job.identity().clone();
+    let kill = job.path().join("cgroup.kill");
+    let writable = std::fs::metadata(&kill)
+        .expect("stat cgroup.kill")
+        .permissions();
+    let denied = std::fs::Permissions::from_mode(0o0);
+    std::fs::set_permissions(&kill, denied).expect("deny cgroup.kill");
+    let attached = jobs.lookup(&identity);
+    std::fs::set_permissions(&kill, writable).expect("restore cgroup.kill");
+    let refusal = attached.expect_err("an unwritable cgroup.kill refuses the attachment");
+    let CgroupError::KillUnavailable { path, source } = &refusal else {
+        panic!("an unwritable cgroup.kill is KillUnavailable: {refusal:?}");
+    };
+    assert_eq!(path, &kill, "{refusal:?}");
+    assert_eq!(
+        source.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{refusal:?}"
+    );
+    assert_eq!(
+        jobs.outstanding().expect("outstanding").as_slice(),
+        std::slice::from_ref(&identity),
+        "a refused attachment leaves the job's cgroup in place"
+    );
+    let attached = jobs.lookup(&identity).expect("attach");
+    let sealed = attached.terminal().expect("sealed");
+    sealed.retire().expect("retire");
+}
+
+/// An empty cgroup can be removed under its holder: its descriptors then name nothing, and
+/// `cgroup.kill` is gone with it. Ending or awaiting such a job is an error naming the cgroup,
+/// never a silent success.
+fn a_vanished_cgroup_refuses_kill_and_wait() {
+    let incarnation = incarnation(9);
+    let snapshot = authority_snapshot(&incarnation);
+    let mut sink = SystemSpawnSink::default();
+    let job = native_admission(&mut sink, &snapshot, job_id(1));
+    std::fs::remove_dir(job.path()).expect("remove the empty cgroup");
+    let refused = [
+        ("kill", job.kill()),
+        ("wait_empty", job.wait_empty()),
+        ("kill_and_wait", job.kill_and_wait()),
+    ];
+    let path = job.path().display().to_string();
+    for (call, result) in refused {
+        let error = result.expect_err("a vanished cgroup is never reported killed or empty");
+        assert!(
+            error.to_string().contains(&path),
+            "{call} names the cgroup that vanished: {error}"
+        );
+    }
+}
+
+/// The actor can finalize while a late host release still holds an Arc and a placement fd.
+/// Neither stale capability may enter or remove a replacement at the old path.
+fn shared_finalization_removes_only_the_admitted_hierarchy(authority: &CgroupAuthority) {
+    let incarnation = incarnation(10);
+    let snapshot = authority_snapshot(&incarnation);
+    let jobs = authority.incarnation(&incarnation).expect("incarnation");
+    let mut sink = SystemSpawnSink::default();
+    let job = native_admission(&mut sink, &snapshot, job_id(1));
+    let late_host = Arc::clone(&job);
+    let placement = job.placement().expect("placement retained by a late host");
+    let original = job.identity().clone();
+    std::fs::create_dir(job.path().join("empty-child")).expect("an empty owned child cgroup");
+    let proof = job.retire(Duration::ZERO).expect("empty retirement");
+    assert!(proof.members.is_empty());
+    assert!(!proof.metadata_gap, "no kill ran for an empty admission");
+    let totals = job
+        .finish()
+        .expect("finalize with shared descriptors still held");
+    assert!(
+        !job.path().exists(),
+        "the empty hierarchy is removed before seal"
+    );
+    assert!(jobs.outstanding().expect("outstanding").is_empty());
+
+    let replacement = jobs.admit(job_id(1)).expect("a new cgroup at the old path");
+    assert_ne!(replacement.identity(), &original);
+    assert_eq!(
+        late_host.finish().expect("cached final counters"),
+        totals,
+        "late finalization returns its own counters, never removes the replacement"
+    );
+    let late_proof = late_host.retire(Duration::ZERO).expect("cached exit proof");
+    assert!(
+        Arc::ptr_eq(&proof, &late_proof),
+        "late retirement never re-signals"
+    );
+    assert!(replacement.path().exists());
+    let mut command = workload_command(&Workload::default());
+    placement.on_exec(&mut command);
+    assert!(
+        command.spawn_locked().is_err(),
+        "a removed cgroup's retained placement descriptor cannot start a command"
+    );
+    replacement
+        .terminal()
+        .expect("empty replacement")
+        .retire()
+        .expect("retire replacement");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Workload processes
 
@@ -899,6 +1629,13 @@ struct Spawned {
 impl Spawned {
     fn placed(job: &JobCgroup, workload: &Workload) -> Self {
         let mut command = workload_command(workload);
+        job.placement().expect("placement").on_exec(&mut command);
+        Self::spawn(command)
+    }
+
+    /// A job's leader that starts `escapee`, placed in `job` before it runs.
+    fn leading(job: &JobCgroup, escapee: &Escapee) -> Self {
+        let mut command = role_command(&Role::Leader(escapee.clone()));
         job.placement().expect("placement").on_exec(&mut command);
         Self::spawn(command)
     }
@@ -938,6 +1675,24 @@ impl Spawned {
         }
     }
 
+    /// The next stage of `kind` that any process of the workload tree states; every other line
+    /// is skipped. The output ending first fails the scenario naming the stage it never reached.
+    fn await_stage(&mut self, kind: StageKind) -> Stage {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = self.stdout.read_line(&mut line).expect("workload output");
+            assert_ne!(read, 0, "the output ended before the {kind:?} stage");
+            if let Some(json) = line.strip_prefix(STAGE) {
+                let stage: Stage = serde_json::from_str(json)
+                    .unwrap_or_else(|error| panic!("stage record {line:?}: {error}"));
+                if stage.kind == kind {
+                    return stage;
+                }
+            }
+        }
+    }
+
     fn resume(&mut self) {
         self.stdin.write_all(b"r").expect("resume the workload");
     }
@@ -958,15 +1713,30 @@ impl Spawned {
             cpu_us,
         }
     }
+
+    /// The workload's end: its output read to the end -- reached only once every process that
+    /// inherited the pipe has closed or lost it -- and then its status, reaped with its rusage.
+    fn reap(mut self) -> (std::process::ExitStatus, String) {
+        let mut rest = String::new();
+        self.stdout
+            .read_to_string(&mut rest)
+            .expect("workload output");
+        let (status, _) = reap_workload(&self.child).expect("reap the workload with rusage");
+        (status, rest)
+    }
+}
+
+/// This binary again, in `role`.
+fn role_command(role: &Role) -> Command {
+    let mut command = Command::new(test_binary());
+    command
+        .args(role_arguments())
+        .env(ROLE, serde_json::to_string(role).expect("role"));
+    command
 }
 
 fn workload_command(workload: &Workload) -> Command {
-    let mut command = Command::new(test_binary());
-    command.args(role_arguments()).env(
-        ROLE,
-        serde_json::to_string(&Role::Workload(workload.clone())).expect("role"),
-    );
-    command
+    role_command(&Role::Workload(workload.clone()))
 }
 
 fn report_in(output: &str) -> WorkloadReport {
@@ -2095,7 +2865,12 @@ fn burn(millis: u64) {
 
 /// This process's cgroup v2 path, as `/proc/self/cgroup` names it.
 fn own_cgroup() -> String {
-    let content = std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
+    cgroup_of("self")
+}
+
+/// The cgroup v2 path `/proc/<process>/cgroup` names, for a pid or `self`.
+fn cgroup_of(process: impl std::fmt::Display) -> String {
+    let content = read_kernel(format!("/proc/{process}/cgroup"));
     content
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
@@ -2117,6 +2892,175 @@ fn relative(path: &Path) -> String {
     )
 }
 
+/// A kernel file read whole; one that cannot be read fails the scenario naming it.
+fn read_kernel(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref();
+    std::fs::read_to_string(path).unwrap_or_else(|error| panic!("read {path:?}: {error}"))
+}
+
+/// A process named by the one identity the kernel never gives another: its pidfd, readable once
+/// the process has exited. Waiting on it is waiting on the kernel's own event.
+struct Pidfd(std::os::fd::OwnedFd);
+
+impl Pidfd {
+    fn open(pid: u32) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd as _;
+
+        let pid = libc::pid_t::try_from(pid).map_err(std::io::Error::other)?;
+        let (pid, flags): (libc::c_long, libc::c_long) = (pid.into(), 0);
+        // SAFETY: pidfd_open takes plain integers; a non-negative answer is a new descriptor.
+        let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, flags) };
+        if opened < 0 {
+            return Err(last_error());
+        }
+        let descriptor = libc::c_int::try_from(opened).map_err(std::io::Error::other)?;
+        // SAFETY: pidfd_open just returned this descriptor and nothing else owns it.
+        Ok(Self(unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(descriptor)
+        }))
+    }
+
+    /// A poll entry that turns readable when the process has exited.
+    fn watch(&self) -> libc::pollfd {
+        use std::os::fd::AsRawFd as _;
+
+        libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }
+    }
+
+    /// Whether the process has exited, asked once.
+    fn exited(&self) -> bool {
+        let mut watched = [self.watch()];
+        wait_for_events(&mut watched, 0);
+        watched[0].revents & libc::POLLIN != 0
+    }
+
+    /// Block until the kernel reports that the process has exited. No clock bounds this wait.
+    fn await_exit(&self) {
+        let mut watched = [self.watch()];
+        wait_for_events(&mut watched, -1);
+        assert_ne!(
+            watched[0].revents & libc::POLLIN,
+            0,
+            "the pidfd woke without reporting an exit (poll revents {})",
+            watched[0].revents
+        );
+    }
+}
+
+/// A pidfd for `pid`, a process that must exist; `whose` names it in the failure.
+fn pidfd_of(pid: u32, whose: &str) -> Pidfd {
+    Pidfd::open(pid).unwrap_or_else(|error| panic!("open a pidfd for {whose} {pid}: {error}"))
+}
+
+/// `poll(2)` over `watched`, again after every signal. `timeout` is 0 to ask once and -1 to wait
+/// for the kernel's event.
+fn wait_for_events(watched: &mut [libc::pollfd], timeout: libc::c_int) {
+    let count = libc::nfds_t::try_from(watched.len()).expect("a few descriptors");
+    loop {
+        // SAFETY: `watched` is a live array of exactly `count` pollfd entries.
+        if unsafe { libc::poll(watched.as_mut_ptr(), count, timeout) } >= 0 {
+            return;
+        }
+        let error = last_error();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted,
+            "poll {} descriptors: {error}",
+            watched.len()
+        );
+    }
+}
+
+/// A process's parent, process group and session, as `/proc/<pid>/stat` states them.
+#[derive(Debug, Eq, PartialEq)]
+struct Lineage {
+    parent: u32,
+    group: u32,
+    session: u32,
+}
+
+fn lineage(pid: u32) -> Lineage {
+    let stat = read_kernel(format!("/proc/{pid}/stat"));
+    // The command name may hold spaces and parentheses: the fields resume after its last one.
+    let (_, fields) = stat
+        .rsplit_once(") ")
+        .unwrap_or_else(|| panic!("no command in {stat:?}"));
+    // `fields` starts at the state, field 3; the parent, group and session are the next three.
+    let mut fields = fields.split_whitespace().skip(1);
+    let mut next = |name: &str| -> u32 {
+        let field = fields
+            .next()
+            .unwrap_or_else(|| panic!("{name} missing from {stat:?}"));
+        field
+            .parse()
+            .unwrap_or_else(|error| panic!("{name} {field:?} in {stat:?}: {error}"))
+    };
+    let (parent, group, session) = (next("ppid"), next("pgrp"), next("session"));
+    Lineage {
+        parent,
+        group,
+        session,
+    }
+}
+
+/// The pids `cgroup.procs` lists for `job`, in order.
+fn census(job: &JobCgroup) -> Vec<u32> {
+    let path = job.path().join("cgroup.procs");
+    let procs = read_kernel(&path);
+    let mut pids = Vec::new();
+    for line in procs.lines() {
+        let pid = line
+            .parse::<u32>()
+            .unwrap_or_else(|error| panic!("member {line:?} of {path:?}: {error}"));
+        pids.push(pid);
+    }
+    pids.sort_unstable();
+    pids
+}
+
+/// `populated` of the job's `cgroup.events`, read directly.
+fn events_populated(job: &JobCgroup) -> bool {
+    let events = read_kernel(job.path().join("cgroup.events"));
+    match events
+        .lines()
+        .find_map(|line| line.strip_prefix("populated "))
+    {
+        Some("0") => false,
+        Some("1") => true,
+        other => panic!(
+            "{} has no populated state ({other:?}): {events:?}",
+            job.path().display()
+        ),
+    }
+}
+
+/// What `retire` retained of the processes the kill ended: each pid, the image it ran, SIGKILL.
+fn assert_receipt(receipt: &[CgroupMemberSignal], killed: &[u32], scenario: &str) {
+    let image = test_binary().to_string_lossy().into_owned();
+    let mut retained: Vec<(u32, i32)> = receipt
+        .iter()
+        .map(|member| (member.pid, member.signal))
+        .collect();
+    retained.sort_unstable();
+    let expected: Vec<(u32, i32)> = killed.iter().map(|pid| (*pid, libc::SIGKILL)).collect();
+    assert_eq!(
+        retained, expected,
+        "{scenario}: the receipt names every process the kill ended, each killed: {receipt:?}"
+    );
+    for member in receipt {
+        assert_eq!(
+            member.image.as_deref(),
+            Some(image.as_str()),
+            "{scenario}: the receipt names the image of process {}",
+            member.pid
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Fixture plumbing
 
@@ -2135,6 +3079,33 @@ fn incarnation(ordinal: u8) -> WorkspaceIncarnation {
 
 fn job_id(value: u64) -> JobId {
     JobId::new(value).expect("job id")
+}
+
+fn authority_snapshot(incarnation: &WorkspaceIncarnation) -> WorkspaceAuthoritySnapshot {
+    WorkspaceAuthoritySnapshot {
+        repo_id: RepoId::parse("local/default").expect("static repo id"),
+        workspace: WorkspaceName::new("main").expect("static workspace name"),
+        workspace_incarnation: incarnation.clone(),
+        grant_revision: 1,
+        lifecycle_revision: 1,
+    }
+}
+
+/// A job's cgroup as the supervisor's production sink admits it before the job is recorded.
+fn native_admission(
+    sink: &mut SystemSpawnSink,
+    authority: &WorkspaceAuthoritySnapshot,
+    id: JobId,
+) -> Arc<JobCgroup> {
+    let admitted = sink
+        .admit_cgroup(authority, id)
+        .unwrap_or_else(|error| panic!("native admission of job {}: {error}", id.get()));
+    admitted.unwrap_or_else(|| {
+        panic!(
+            "the production sink admitted job {} without a cgroup",
+            id.get()
+        )
+    })
 }
 
 fn test_binary() -> PathBuf {

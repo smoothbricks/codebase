@@ -8,6 +8,107 @@ use cowshed_os::fork_lock::Run as _;
 const CHILD: &str = "COWSHED_DIAGNOSTICS_NOFILE_CHILD";
 const TEST: &str = "runtime::shell_job::diagnostics_tests::descriptor_exhaustion_reports_the_diagnostics_clone_failure";
 
+#[cfg(not(target_os = "linux"))]
+fn isolated_command() -> Command {
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .args(["--exact", TEST, "--nocapture"])
+        .env(CHILD, "1");
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn delegated_command() -> Command {
+    // SAFETY: getuid/getgid read this ordinary test runner's credentials.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    assert_ne!(uid, 0, "run the fixture as the ordinary CI user");
+    let mut command = Command::new("sudo");
+    command.args(["-n", "env"]).arg(format!("{CHILD}=delegate"));
+    command.arg(format!("COWSHED_DIAGNOSTICS_UID={uid}"));
+    command.arg(format!("COWSHED_DIAGNOSTICS_GID={gid}"));
+    let mut path = OsString::from("PATH=");
+    path.push(std::env::var_os("PATH").expect("PATH"));
+    command.arg(path);
+    command.args([
+        "systemd-run",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "--property=Delegate=yes",
+        "--",
+    ]);
+    command.arg(std::env::current_exe().expect("test executable"));
+    command.args(["--exact", TEST, "--nocapture"]);
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn delegate_and_run() {
+    use super::super::job_cgroup::{CGROUP_MOUNT, CONTROLLER_LEAF};
+
+    let uid = std::env::var("COWSHED_DIAGNOSTICS_UID")
+        .expect("uid")
+        .parse::<u32>()
+        .expect("uid");
+    let gid = std::env::var("COWSHED_DIAGNOSTICS_GID")
+        .expect("gid")
+        .parse::<u32>()
+        .expect("gid");
+    // SAFETY: geteuid reads this scope setup process's credentials.
+    assert_eq!(unsafe { libc::geteuid() }, 0, "scope setup requires root");
+    let membership = std::fs::read_to_string("/proc/self/cgroup").expect("scope membership");
+    let relative = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .filter(|path| path.starts_with('/'))
+        .expect("cgroup v2 membership");
+    let scope = Path::new(CGROUP_MOUNT).join(relative.trim_start_matches('/'));
+    for name in [
+        "",
+        "cgroup.procs",
+        "cgroup.threads",
+        "cgroup.subtree_control",
+    ] {
+        std::os::unix::fs::chown(scope.join(name), Some(uid), Some(gid)).expect("delegate scope");
+    }
+    let leaf = scope.join(CONTROLLER_LEAF);
+    std::fs::create_dir(&leaf).expect("controller leaf");
+    for name in ["", "cgroup.procs", "cgroup.threads"] {
+        std::os::unix::fs::chown(leaf.join(name), Some(uid), Some(gid)).expect("delegate leaf");
+    }
+    std::fs::write(leaf.join("cgroup.procs"), "0").expect("move waiting setup into leaf");
+    let mut command = Command::new("setpriv");
+    command
+        .arg("--reuid")
+        .arg(uid.to_string())
+        .arg("--regid")
+        .arg(gid.to_string());
+    command.args(["--clear-groups", "--"]);
+    command.arg(std::env::current_exe().expect("test executable"));
+    command
+        .args(["--exact", TEST, "--nocapture"])
+        .env(CHILD, "1");
+    run_isolated(command);
+}
+
+fn run_isolated(mut command: Command) {
+    let output = command
+        .output_locked()
+        .expect("run isolated descriptor-limit supervisor");
+    assert!(
+        output.status.success(),
+        "descriptor-limit supervisor failed: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("COWSHED_DIAGNOSTICS_VERIFIED"),
+        "the isolated subprocess must execute the selected case"
+    );
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
 /// Only the isolated child changes its process-wide limit; every existing descriptor remains
 /// usable, but the real F_DUPFD_CLOEXEC boundary answers EMFILE.
 struct DescriptorLimit(libc::rlimit, Vec<std::fs::File>);
@@ -63,19 +164,17 @@ impl Drop for DescriptorLimit {
 
 #[test]
 fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("delegate")) {
+        delegate_and_run();
+        return;
+    }
     if std::env::var_os(CHILD).is_none() {
-        let output = Command::new(std::env::current_exe().expect("test executable"))
-            .args(["--exact", TEST, "--nocapture"])
-            .env(CHILD, "1")
-            .output_locked()
-            .expect("run isolated descriptor-limit supervisor");
-        assert!(
-            output.status.success(),
-            "descriptor-limit supervisor failed: {}\nstdout: {}\nstderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        #[cfg(target_os = "linux")]
+        let command = delegated_command();
+        #[cfg(not(target_os = "linux"))]
+        let command = isolated_command();
+        run_isolated(command);
         return;
     }
 
@@ -103,13 +202,34 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 ..ShellPoolConfig::default()
             },
         );
+        let job_id = JobId::new(17).expect("job id");
+        #[cfg(target_os = "linux")]
+        let cgroup = {
+            use super::super::job_cgroup::CgroupAuthority;
+            let authority = CgroupAuthority::delegated().expect("real delegated cgroup");
+            let incarnation = crate::metadata::WorkspaceIncarnation::new(
+                uuid::Uuid::new_v4().simple().to_string(),
+            )
+            .expect("incarnation");
+            Arc::new(
+                authority
+                    .incarnation(&incarnation)
+                    .expect("incarnation cgroups")
+                    .admit(job_id)
+                    .expect("admit before descriptor exhaustion"),
+            )
+        };
         let (stdin, stdin_writer) = pipe().expect("job stdin");
         let (stdout_reader, stdout) = pipe().expect("job stdout");
         let (stderr_reader, stderr) = pipe().expect("job stderr");
-        let control = Arc::new(JobControl::default());
+        let control = Arc::new(JobControl {
+            target: Mutex::new(Target::Pending),
+            requested: AtomicI32::new(0),
+            #[cfg(target_os = "linux")]
+            cgroup: Arc::clone(&cgroup),
+        });
         let (_release, released) = oneshot::channel();
         let (events, mut observed) = mpsc::channel(4);
-        let job_id = JobId::new(17).expect("job id");
         #[cfg(target_os = "macos")]
         let monitor = super::super::process_monitor::ProcessMonitor::prepare(job_id)
             .expect("prepare observation before exhausting descriptors");
@@ -129,6 +249,8 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 cwd: PathBuf::from("/"),
                 overlay: Vec::new(),
                 nice: 10,
+                #[cfg(target_os = "linux")]
+                cgroup: Arc::clone(&cgroup),
                 #[cfg(target_os = "macos")]
                 monitor,
             },
@@ -181,5 +303,8 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
             .read_to_end(&mut stdout_bytes)
             .expect("stdout closes without a launch");
         assert!(stdout_bytes.is_empty());
+        #[cfg(target_os = "linux")]
+        cgroup.finish().expect("remove the refused empty admission");
     });
+    println!("COWSHED_DIAGNOSTICS_VERIFIED");
 }

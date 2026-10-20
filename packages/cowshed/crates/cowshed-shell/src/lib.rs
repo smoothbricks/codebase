@@ -22,6 +22,10 @@
 //! An argv job is forked and exec'd directly. A script job is forked without exec: the child
 //! leads the job's process group and runs the parsed program in an upstream brush interpreter
 //! built from the already-activated environment ([`script`]).
+//!
+//! Linux commands receive a mandatory controller-opened cgroup placement descriptor with their
+//! streams. Only the child enters it, before argv exec or script interpretation; the descriptor
+//! closes before job code runs. The reusable host stays outside every job cgroup.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -36,6 +40,8 @@ use std::process::{Command, Stdio};
 
 use cowshed_core::api::dto::ExitStatus;
 use cowshed_core::developer_links;
+#[cfg(target_os = "linux")]
+use cowshed_core::runtime::job_cgroup::Placement;
 use cowshed_core::runtime::job_groups::{self, Birth};
 use cowshed_core::runtime::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, CONTROL_DESCRIPTOR, FrameReader, FrameWriter, REPLY_ACTIVATED,
@@ -173,13 +179,27 @@ fn one_descriptor(descriptors: &mut Vec<OwnedFd>, what: &str) -> io::Result<Owne
     Ok(descriptors.remove(0))
 }
 
-/// The command's observation fence, passed with its streams and closed once the held child
-/// has been released. A script child closes these explicitly because it does not exec.
-/// Placement and the unreleased-child fence travel together to either launch path.
+/// The command's nice and platform placement, passed with its streams. Linux requires the
+/// controller-opened cgroup descriptor; macOS requires the observation fence. A script child
+/// closes these explicitly because it does not exec.
 pub(crate) struct CommandPlacement {
     nice: Option<i32>,
+    #[cfg(target_os = "linux")]
+    cgroup: Placement,
     #[cfg(target_os = "macos")]
     hold: ObservationHold,
+}
+
+impl CommandPlacement {
+    fn take(nice: Option<i32>, descriptors: &mut Vec<OwnedFd>) -> io::Result<Self> {
+        Ok(Self {
+            nice,
+            #[cfg(target_os = "linux")]
+            cgroup: Placement::from_descriptor(one_descriptor(descriptors, "cgroup placement")?),
+            #[cfg(target_os = "macos")]
+            hold: ObservationHold::take(descriptors)?,
+        })
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -291,8 +311,7 @@ impl Host {
                 let stdin = one_descriptor(&mut descriptors, "stdin")?;
                 let stdout = one_descriptor(&mut descriptors, "stdout")?;
                 let stderr = one_descriptor(&mut descriptors, "stderr")?;
-                #[cfg(target_os = "macos")]
-                let hold = ObservationHold::take(&mut descriptors)?;
+                let placement = CommandPlacement::take(nice, &mut descriptors)?;
                 let environment = self.command_environment(&cwd, &overlay)?;
                 report_unopenable_jobserver(&environment, &stderr)?;
                 script::run(
@@ -301,11 +320,7 @@ impl Host {
                     &bindings,
                     &cwd,
                     &environment,
-                    CommandPlacement {
-                        nice,
-                        #[cfg(target_os = "macos")]
-                        hold,
-                    },
+                    placement,
                     [stdin, stdout, stderr],
                 )
             }
@@ -318,18 +333,13 @@ impl Host {
                 let stdin = one_descriptor(&mut descriptors, "stdin")?;
                 let stdout = one_descriptor(&mut descriptors, "stdout")?;
                 let stderr = one_descriptor(&mut descriptors, "stderr")?;
-                #[cfg(target_os = "macos")]
-                let hold = ObservationHold::take(&mut descriptors)?;
+                let placement = CommandPlacement::take(nice, &mut descriptors)?;
                 self.run(
                     socket,
                     &argv,
                     &cwd,
                     &overlay,
-                    CommandPlacement {
-                        nice,
-                        #[cfg(target_os = "macos")]
-                        hold,
-                    },
+                    placement,
                     [stdin, stdout, stderr],
                 )
             }
@@ -545,6 +555,8 @@ impl Host {
     ) -> io::Result<()> {
         let CommandPlacement {
             nice,
+            #[cfg(target_os = "linux")]
+            cgroup,
             #[cfg(target_os = "macos")]
             hold,
         } = placement;
@@ -564,6 +576,8 @@ impl Host {
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        #[cfg(target_os = "linux")]
+        cgroup.on_exec(&mut command);
         // A child its supervisor cannot hold sets its own nice before exec and reports exactly
         // what it observed: a refusal fails the spawn and reaches the supervisor typed, so no
         // command runs at a nice nobody verified.

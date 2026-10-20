@@ -1207,8 +1207,33 @@ an observed process until a read names its image again: its CPU covers nothing a
 observed CPU's share of the accounted total, never more than the whole; observed CPU beyond the total stays in the
 signed reconciliation.
 
-A Linux job's accounting source is its own cgroup v2; without one, a Linux sample is the typed operational error naming
-the missing source, not a sample without accounting.
+A Linux job's membership and accounting source are its own cgroup v2, `ws-<incarnation>/job-<id>`. Admission creates it
+before recording or dispatching the job; the controller's open `Placement` descriptor moves the first process into it
+before exec (or before a pooled host interprets a script). A supervisor without delegation refuses admission with
+`NotDelegated`, naming the unwritable directory, `cgroup.procs`, or `cgroup.subtree_control`. A cgroup that cannot be
+created, or whose `cgroup.kill` cannot be opened, likewise refuses the job; there is no uncontained fallback. Changing
+sessions, including after the parent exits, does not change membership.
+
+Terminal retirement signals the cgroup's observed members through pidfds, grants TERM one grace deadline, then writes
+`cgroup.kill` if membership remains. The job seals only after `cgroup.events` reads `populated 0`; `poll(POLLPRI)` wakes
+that wait, never a periodic timer. Retained member pidfds are then joined with `poll(POLLIN)` too: Linux's `cgroup_exit`
+precedes `exit_notify`, so the empty-cgroup notification can precede pidfd readability. The terminal receipt reports
+kernel containment only after those proofs. `cgroup.kill` requires Linux 5.14; the supervisor's peer-pidfd protocol sets
+the overall floor at Linux 6.5 (11_shell.md). Below the relevant capability floor, missing interfaces or failed
+peer-pidfd acquisition are operational refusals, never a downgrade to process groups. Linux acceptance must run in a
+delegated scope on a real Linux kernel; compilation or a Darwin run is not evidence of Linux exit behavior.
+
+The actor retains the admitted cgroup even before spawn. After terminal sampling it reads final counters, checks the
+directory identity, and removes the empty hierarchy before releasing the claim. This does not depend on the last exec
+host's shared descriptor closing; that descriptor then names a removed cgroup and cannot place a later command. A queued
+cancellation or refused spawn removes its empty admission by the same path.
+
+Successful retirement and finalization are single-flight and cached for explicit retries and late host Drop; a failed
+final counter read cannot consume the signal rows. `Kernel` proves empty membership, not an exhaustive member census:
+`cgroup.kill` returns no killed-member list. Every atomic kill of populated membership therefore sets
+`outlivedIncomplete`, even when the pre-signal pidfd snapshot supplied rows, because concurrent forks may have been
+ended without a row. Empty rows without this marker mean no member was ended by retirement; the marker preserves the
+distinction without freezing the job. Metadata gaps do not prevent killing, joining, or sealing proven-empty membership.
 
 ```rust
 pub enum JobLeafAttribution {

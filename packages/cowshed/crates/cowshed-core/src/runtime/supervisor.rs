@@ -591,6 +591,10 @@ pub struct ProcessSpawnRequest {
     pub scope: ExecScope,
     /// The CPU grant and class nice the command alone runs under.
     pub cpu: CpuPlacement,
+    /// Native Linux admission owns this cgroup before any command can start. Injected sinks
+    /// without native processes have no kernel membership.
+    #[cfg(target_os = "linux")]
+    pub cgroup: Option<Arc<super::job_cgroup::JobCgroup>>,
 }
 
 /// What a spawn places a job's owned command under: its CPU grant, served to the command as the
@@ -932,6 +936,11 @@ pub struct OwnedProcess {
 /// job concluded, or when its supervisor goes away -- so the group id names the job's group alone
 /// for as long as signals may be sent, descendants that outlive the leader included.
 pub trait RunningProcess: Send {
+    /// A native Linux spawn's complete kernel membership, retained through terminal accounting.
+    #[cfg(target_os = "linux")]
+    fn cgroup(&self) -> Option<&Arc<super::job_cgroup::JobCgroup>> {
+        None
+    }
     /// The command's process as its parent observed it before anything could reap it. `None`
     /// until the process exists; a warm-shell job reports it with [`ProcessEvent::Started`].
     fn process(&self) -> Option<&OwnedProcess>;
@@ -956,6 +965,17 @@ pub trait RunningProcess: Send {
 
 #[async_trait]
 pub trait SpawnSink: Send {
+    /// Prepare kernel membership before the actor records an admission. A non-native sink
+    /// owns no OS process; the production sink must return a cgroup or refuse.
+    #[cfg(target_os = "linux")]
+    fn admit_cgroup(
+        &mut self,
+        _authority: &WorkspaceAuthoritySnapshot,
+        _job_id: JobId,
+    ) -> Result<Option<Arc<super::job_cgroup::JobCgroup>>> {
+        Ok(None)
+    }
+
     async fn spawn(
         &mut self,
         request: ProcessSpawnRequest,
@@ -2087,6 +2107,8 @@ fn sandboxed_command(
 #[derive(Default)]
 pub struct SystemSpawnSink {
     shells: Option<super::shell_job::WorkspaceShells>,
+    #[cfg(target_os = "linux")]
+    cgroups: Option<super::job_cgroup::IncarnationCgroups>,
 }
 
 impl SystemSpawnSink {
@@ -2099,17 +2121,57 @@ impl SystemSpawnSink {
     ) -> Self {
         Self {
             shells: Some(super::shell_job::WorkspaceShells::new(program, config, cpu)),
+            #[cfg(target_os = "linux")]
+            cgroups: None,
         }
     }
 }
 
 #[async_trait]
 impl SpawnSink for SystemSpawnSink {
+    #[cfg(target_os = "linux")]
+    fn admit_cgroup(
+        &mut self,
+        authority: &WorkspaceAuthoritySnapshot,
+        job_id: JobId,
+    ) -> Result<Option<Arc<super::job_cgroup::JobCgroup>>> {
+        if !self
+            .cgroups
+            .as_ref()
+            .is_some_and(|jobs| jobs.incarnation() == &authority.workspace_incarnation)
+        {
+            let delegated =
+                super::job_cgroup::CgroupAuthority::delegated().map_err(cgroup_error)?;
+            self.cgroups = Some(
+                delegated
+                    .incarnation(&authority.workspace_incarnation)
+                    .map_err(cgroup_error)?,
+            );
+        }
+        self.cgroups
+            .as_ref()
+            .expect("authority was established above")
+            .admit(job_id)
+            .map(Arc::new)
+            .map(Some)
+            .map_err(cgroup_error)
+    }
+
     async fn spawn(
         &mut self,
         request: ProcessSpawnRequest,
         events: mpsc::Sender<ProcessEvent>,
     ) -> Result<Box<dyn RunningProcess>> {
+        #[cfg(target_os = "linux")]
+        let cgroup = request.cgroup.clone().ok_or_else(|| {
+            CowshedError::environment_missing(
+                format!(
+                    "job {} has no admitted cgroup: refusing to run an uncontained command",
+                    request.job_id.get()
+                ),
+                "delegate a writable cgroup v2 subtree and admit the job before spawning it",
+            )
+        })?;
         let cwd =
             crate::exec::contained_cwd(&request.policy.ceiling().workspace_mount, &request.cwd)
                 .map_err(map_exec_error)?;
@@ -2121,6 +2183,8 @@ impl SpawnSink for SystemSpawnSink {
                 command,
                 request.job_id,
                 request.cpu.nice,
+                #[cfg(target_os = "linux")]
+                cgroup,
                 #[cfg(target_os = "macos")]
                 monitor,
                 events,
@@ -2150,6 +2214,8 @@ impl SpawnSink for SystemSpawnSink {
             caller: &request.env,
             grant_revision: request.authority.grant_revision,
             cpu: &request.cpu,
+            #[cfg(target_os = "linux")]
+            cgroup: Arc::clone(&cgroup),
             #[cfg(target_os = "macos")]
             monitor: monitor.clone(),
         };
@@ -2201,12 +2267,38 @@ impl SpawnSink for SystemSpawnSink {
             sandboxed_command(&plan, &environment),
             request.job_id,
             request.cpu.nice,
+            #[cfg(target_os = "linux")]
+            cgroup,
             #[cfg(target_os = "macos")]
             monitor,
             events,
         )
         .await
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn cgroup_error(error: super::job_cgroup::CgroupError) -> CowshedError {
+    CowshedError::environment_missing(
+        format!("job cgroup containment: {error}"),
+        "run the supervisor in a delegated cgroup v2 scope (Delegate=yes), with writable \
+         cgroup.procs, cgroup.subtree_control and cgroup.kill; Linux 6.5+ is required",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn refused_cgroup(
+    mut refusal: CowshedError,
+    cgroup: Option<&super::job_cgroup::JobCgroup>,
+) -> CowshedError {
+    if let Some(cgroup) = cgroup
+        && let Err(cleanup) = cgroup.finish()
+    {
+        refusal.message.push_str(&format!(
+            "; removing the unstarted job's cgroup also failed: {cleanup}"
+        ));
+    }
+    refusal
 }
 
 /// The host-boundary command of a trusted coordinator's host exec, at whatever class it was
@@ -2262,6 +2354,7 @@ async fn spawn_fenced(
     mut command: tokio::process::Command,
     job_id: JobId,
     nice: i32,
+    #[cfg(target_os = "linux")] cgroup: Arc<super::job_cgroup::JobCgroup>,
     #[cfg(target_os = "macos")] monitor: ProcessMonitor,
     events: mpsc::Sender<ProcessEvent>,
 ) -> Result<Box<dyn RunningProcess>> {
@@ -2272,6 +2365,11 @@ async fn spawn_fenced(
     prepare_child_descriptors(command.as_std_mut())
         .map_err(ExecError::from)
         .map_err(map_exec_error)?;
+    #[cfg(target_os = "linux")]
+    cgroup
+        .placement()
+        .map_err(cgroup_error)?
+        .on_exec(command.as_std_mut());
     // SAFETY: `pre_exec` runs in the forked child, between `fork` and `exec`, in a process
     // that was multithreaded at the fork. Only async-signal-safe calls are legal there, and
     // POSIX lists `setpgid` as one; it allocates nothing, takes no lock, and touches no
@@ -2413,6 +2511,8 @@ async fn spawn_fenced(
         fence,
         stdin: StdinLane::new(stdin_sender),
         nice,
+        #[cfg(target_os = "linux")]
+        cgroup,
         #[cfg(target_os = "macos")]
         monitor,
     }))
@@ -2794,11 +2894,18 @@ struct SystemRunningProcess {
     stdin: StdinLane,
     /// The nice the command was observed at once placed.
     nice: i32,
+    #[cfg(target_os = "linux")]
+    cgroup: Arc<super::job_cgroup::JobCgroup>,
     #[cfg(target_os = "macos")]
     monitor: ProcessMonitor,
 }
 
 impl RunningProcess for SystemRunningProcess {
+    #[cfg(target_os = "linux")]
+    fn cgroup(&self) -> Option<&Arc<super::job_cgroup::JobCgroup>> {
+        Some(&self.cgroup)
+    }
+
     fn process(&self) -> Option<&OwnedProcess> {
         Some(self.fence.process())
     }
@@ -2825,6 +2932,15 @@ impl RunningProcess for SystemRunningProcess {
     }
 
     fn signal_process_tree(&mut self, signal: ProcessSignal) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            match signal {
+                ProcessSignal::Term => self.cgroup.terminate(),
+                ProcessSignal::Kill => self.cgroup.kill(),
+            }
+            .map_err(cgroup_error)
+        }
+        #[cfg(not(target_os = "linux"))]
         self.fence.signal(match signal {
             ProcessSignal::Term => libc::SIGTERM,
             ProcessSignal::Kill => libc::SIGKILL,
@@ -4065,6 +4181,9 @@ struct JobStateRecord {
     info: JobInfo,
     started_at: Instant,
     process: Option<Box<dyn RunningProcess>>,
+    /// Admission owns membership even while the job is queued or its spawn was refused.
+    #[cfg(target_os = "linux")]
+    cgroup: Option<Arc<super::job_cgroup::JobCgroup>>,
     stdout: VecDeque<Bytes>,
     stderr: VecDeque<Bytes>,
     /// Each stream's counts as its chunks were admitted; their bytes are the read cursors.
@@ -5433,15 +5552,20 @@ impl SupervisorActor {
             .and_then(|value| {
                 JobId::new(value).map_err(|error| CowshedError::internal(error.to_string()))
             })?;
+        #[cfg(target_os = "linux")]
+        let cgroup = self.spawner.admit_cgroup(&self.authority, job_id)?;
         {
             let _span = cowshed_os::timing::span("admit", "record");
-            self.artifacts.admit(
+            let admitted = self.artifacts.admit(
                 job_id,
                 self.authority.grant_revision,
                 &command,
                 admission,
                 scheduling,
-            )?;
+            );
+            #[cfg(target_os = "linux")]
+            let admitted = admitted.map_err(|error| refused_cgroup(error, cgroup.as_deref()));
+            admitted?;
         }
         self.next_job_id = expected_next;
         let admission = cowshed_os::timing::spanned(
@@ -5459,6 +5583,8 @@ impl SupervisorActor {
             let _ = self
                 .artifacts
                 .seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy);
+            #[cfg(target_os = "linux")]
+            let error = refused_cgroup(error, cgroup.as_deref());
             return Err(error);
         }
 
@@ -5472,6 +5598,8 @@ impl SupervisorActor {
                 let _ =
                     self.artifacts
                         .seal(job_id, JobState::Failed.into(), stdout_copy, stderr_copy);
+                #[cfg(target_os = "linux")]
+                let error = refused_cgroup(error, cgroup.as_deref());
                 return Err(error);
             }
         };
@@ -5562,6 +5690,8 @@ impl SupervisorActor {
             info,
             started_at: Instant::now(),
             process: None,
+            #[cfg(target_os = "linux")]
+            cgroup,
             stdout: VecDeque::new(),
             stderr: VecDeque::new(),
             stdout_tally: StreamTally::default(),
@@ -5691,6 +5821,8 @@ impl SupervisorActor {
                 ProcessSpawnRequest {
                     authority,
                     job_id,
+                    #[cfg(target_os = "linux")]
+                    cgroup: job.cgroup.clone(),
                     command,
                     cwd,
                     env,
@@ -7408,9 +7540,9 @@ fn account(
     ))
 }
 
-/// A Linux job's totals are its own cgroup v2's, and no production spawn places a job in one
-/// yet (07_api.md, "Complete job accounting and observation reconciliation"): with no source,
-/// the sample cannot be stated, and says why rather than inventing totals.
+/// This sampler does not yet accept the native cgroup capability as an accounting input.
+/// Membership and retirement still use that capability; an unavailable resource sample must
+/// not claim the contained job lacks a cgroup or invent zero totals.
 #[cfg(not(target_os = "macos"))]
 fn account(
     sampler: &mut JobSampler,
@@ -7418,10 +7550,10 @@ fn account(
 ) -> Result<(JobAccounting, JobLeafAttribution)> {
     Err(CowshedError::environment_missing(
         format!(
-            "job group {} has no CPU accounting source: no cgroup v2 of its own holds it",
+            "job group {} cannot be sampled: the resource sampler has no cgroup accounting input",
             sampler.leader().pid()
         ),
-        "the job runs on; its resources are stated once jobs run in their own cgroup",
+        "job containment and retirement remain active; cgroup accounting is unavailable to this sampler",
     ))
 }
 
@@ -9581,6 +9713,8 @@ mod sandbox_environment_tests {
                 pool: PathBuf::from("/pool/p.sock"),
                 nice: 0,
             },
+            #[cfg(target_os = "linux")]
+            cgroup: None,
         };
         let command = host_gate_command(&request, &mount).expect("host gate command");
         let environment: BTreeMap<&OsStr, Option<&OsStr>> = command.as_std().get_envs().collect();

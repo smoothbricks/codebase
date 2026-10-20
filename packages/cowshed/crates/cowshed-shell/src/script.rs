@@ -3,11 +3,13 @@
 //! The host parses the text first, so a script that does not parse fails before anything runs.
 //! It then forks without exec, the way bash runs a subshell. The child:
 //!
+//! - on Linux, enters the job's cgroup immediately after fork through the controller-opened
+//!   placement descriptor, then closes it. Descendants inherit membership even if they change
+//!   process groups; the supervisor signals this cgroup, not the reusable host;
 //! - leads a new process group, the job's: brush runs with job control off, so every external
-//!   command and every descendant joins that group, and the supervisor's TERM → grace → KILL
-//!   reaches all of them while the host, in a group of its own, is untouched. The child alone
-//!   creates the group, and the host gives the supervisor the pid only once the child reports
-//!   that it exists;
+//!   command initially joins that group. On macOS the supervisor's TERM → grace → KILL reaches
+//!   the held group while the host, in a group of its own, is untouched. The child alone creates
+//!   the group, and the host gives the supervisor the pid only once the child reports it exists;
 //! - holds the job's stdin, stdout and stderr as its own 0, 1 and 2, and nothing else the host
 //!   had open;
 //! - builds a brush shell from the host's already-activated environment — no activation, no rc
@@ -48,6 +50,8 @@ pub(crate) fn run(
 ) -> io::Result<()> {
     let crate::CommandPlacement {
         nice,
+        #[cfg(target_os = "linux")]
+        cgroup,
         #[cfg(target_os = "macos")]
         hold,
     } = placement;
@@ -113,6 +117,13 @@ pub(crate) fn run(
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(error) = cgroup.enter() {
+                refuse(job_descriptors[2], "cgroup placement failed", error);
+            }
+            drop(cgroup);
+        }
         child(
             job_descriptors,
             ready,
@@ -125,6 +136,8 @@ pub(crate) fn run(
         );
     }
     drop((stdin, stdout, stderr, ready_write));
+    #[cfg(target_os = "linux")]
+    drop(cgroup);
     #[cfg(target_os = "macos")]
     drop(hold);
     let mut reported = report.map(|(_, (reported, report))| {

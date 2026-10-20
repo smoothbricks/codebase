@@ -38,16 +38,25 @@
 //! ever ran in the job, so a descendant reaped before any observer looked still counts. A counter
 //! the kernel does not provide is an error that names it, never a zero. Retirement first collects
 //! the final counters, then removes the cgroup.
+//!
+//! # Kernel contract
+//!
+//! The supervisor requires Linux 6.5 for its peer pidfd. Membership termination additionally
+//! requires `cgroup.kill` (Linux 5.14): admission opens it before a command can run, and refuses
+//! a missing or unwritable interface rather than falling back to process groups. Empty membership
+//! is proved by `cgroup.events`, read on the same descriptor watched with `poll(POLLPRI)`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _, Seek as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::api::dto::JobId;
 use crate::api::resources::{
@@ -135,6 +144,13 @@ pub enum CgroupError {
     },
     #[error("job cgroup {path} already exists: a job's cgroup is created once and never reused")]
     AlreadyExists { path: PathBuf },
+    #[error("{admission}; removing the refused job cgroup {path} also failed: {source}")]
+    AdmissionCleanup {
+        path: PathBuf,
+        admission: Box<CgroupError>,
+        #[source]
+        source: io::Error,
+    },
     #[error("job cgroup {path} does not exist")]
     Missing { path: PathBuf },
     #[error("job cgroup {path} is cgroup {found}, not cgroup {recorded} that admission recorded")]
@@ -147,6 +163,14 @@ pub enum CgroupError {
     ForeignIncarnation {
         fence: WorkspaceIncarnation,
         found: WorkspaceIncarnation,
+    },
+    #[error(
+        "job cgroup {path} is unavailable: job containment requires writable cgroup.kill (Linux 5.14+); the supervisor requires Linux 6.5+ for peer pidfds ({source})"
+    )]
+    KillUnavailable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
     },
     #[error("job cgroup {path} still holds processes: its counters are not final")]
     Populated { path: PathBuf },
@@ -481,17 +505,32 @@ impl IncarnationCgroups {
         if !make_directory(&path)? {
             return Err(CgroupError::AlreadyExists { path });
         }
-        let directory = open_directory(&path)?;
-        let cgroup_id = cgroup_id(&directory).map_err(failed("fstat", &path))?;
-        JobCgroup::open(
-            JobCgroupIdentity {
-                incarnation: self.incarnation.clone(),
-                job_id,
-                cgroup_id,
-            },
-            path,
-            directory,
-        )
+        let admitted = (|| {
+            let directory = open_directory(&path)?;
+            let cgroup_id = cgroup_id(&directory).map_err(failed("fstat", &path))?;
+            JobCgroup::open(
+                JobCgroupIdentity {
+                    incarnation: self.incarnation.clone(),
+                    job_id,
+                    cgroup_id,
+                },
+                path,
+                directory,
+            )
+        })();
+        admitted.map_err(|admission| {
+            // Only this attempt created this directory and no placement was issued. A missing
+            // kernel interface must not leave a reused-name refusal hiding the original cause.
+            let path = self.job_path(job_id);
+            match fs::remove_dir(&path) {
+                Ok(()) => admission,
+                Err(source) => CgroupError::AdmissionCleanup {
+                    path,
+                    admission: Box::new(admission),
+                    source,
+                },
+            }
+        })
     }
 
     /// Reopen the job cgroup `identity` names: only one of this incarnation, and only while it
@@ -555,6 +594,154 @@ impl IncarnationCgroups {
     }
 }
 
+/// A member observed alive during retirement and the last signal sent to its membership.
+/// Linux has no observation-fold index; the pid is diagnostic, never signal authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CgroupMemberSignal {
+    pub pid: u32,
+    pub image: Option<String>,
+    pub signal: i32,
+}
+
+/// Kernel membership is empty; diagnostic rows are not an exhaustive killed-member census.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CgroupRetirement {
+    pub members: Vec<CgroupMemberSignal>,
+    pub metadata_gap: bool,
+}
+
+#[derive(Debug)]
+struct Member {
+    pid: u32,
+    handle: OwnedFd,
+    image: Option<String>,
+    signal: Option<i32>,
+}
+
+impl Member {
+    fn wait_exited(&self) -> io::Result<()> {
+        let mut event = libc::pollfd {
+            fd: self.handle.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: one retained pidfd; an indefinite event wait, never a sampling clock.
+            let ready = unsafe { libc::poll(&raw mut event, 1, -1) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if event.revents & libc::POLLIN != 0 {
+                return Ok(());
+            }
+            return Err(io::Error::other(format!(
+                "pidfd exit watch returned {}",
+                event.revents
+            )));
+        }
+    }
+
+    fn exited(&self) -> io::Result<bool> {
+        let mut event = libc::pollfd {
+            fd: self.handle.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: one live pidfd; zero timeout is a readiness query, not a polling loop.
+            if unsafe { libc::poll(&raw mut event, 1, 0) } >= 0 {
+                return Ok(event.revents & libc::POLLIN != 0);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    fn terminate(&mut self) -> io::Result<()> {
+        // SAFETY: a live pidfd and a plain signal, no siginfo payload. A reused numeric pid
+        // can never redirect this signal; the handle remains bound to the opened process.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.handle.as_raw_fd(),
+                libc::SIGTERM,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } == 0
+        {
+            self.signal = Some(libc::SIGTERM);
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    fn receipt(self) -> Option<CgroupMemberSignal> {
+        self.signal.map(|signal| CgroupMemberSignal {
+            pid: self.pid,
+            image: self.image,
+            signal,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct SignalledMembers {
+    pinned: BTreeMap<u32, Member>,
+    exited: Vec<CgroupMemberSignal>,
+    metadata_gap: bool,
+}
+
+impl SignalledMembers {
+    fn observe(&mut self, members: Vec<Member>) -> io::Result<()> {
+        for member in members {
+            match self.pinned.entry(member.pid) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(member);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if entry.get().exited()?
+                        && let Some(receipt) = entry.insert(member).receipt()
+                    {
+                        self.exited.push(receipt);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn proof(&mut self) -> Arc<CgroupRetirement> {
+        let Self {
+            pinned,
+            mut exited,
+            metadata_gap,
+        } = std::mem::take(self);
+        exited.extend(pinned.into_values().filter_map(Member::receipt));
+        Arc::new(CgroupRetirement {
+            members: exited,
+            metadata_gap,
+        })
+    }
+}
+
+/// Successful retirement and finalization are shared with late Drop and explicit retry callers.
+#[derive(Debug, Default)]
+struct Retirement {
+    proof: Option<Arc<CgroupRetirement>>,
+    totals: Option<JobCgroupTotals>,
+}
+
 /// One job's cgroup, open for placing its first process and reading its counters.
 #[derive(Debug)]
 pub struct JobCgroup {
@@ -562,6 +749,9 @@ pub struct JobCgroup {
     path: PathBuf,
     directory: OwnedFd,
     procs: OwnedFd,
+    kill: OwnedFd,
+    signalled: Mutex<SignalledMembers>,
+    retirement: Mutex<Retirement>,
 }
 
 impl JobCgroup {
@@ -574,11 +764,21 @@ impl JobCgroup {
         require_controllers(&path, &available, &Controller::ACCOUNTING)?;
         let procs = open_at(directory.as_raw_fd(), c"cgroup.procs", libc::O_WRONLY)
             .map_err(failed_in("open", &path, "cgroup.procs"))?;
+        let kill =
+            open_at(directory.as_raw_fd(), c"cgroup.kill", libc::O_WRONLY).map_err(|source| {
+                CgroupError::KillUnavailable {
+                    path: path.join("cgroup.kill"),
+                    source,
+                }
+            })?;
         Ok(Self {
             identity,
             path,
             directory,
             procs,
+            kill,
+            signalled: Mutex::new(SignalledMembers::default()),
+            retirement: Mutex::new(Retirement::default()),
         })
     }
 
@@ -630,6 +830,296 @@ impl JobCgroup {
         Ok(Placement(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
+    /// Kill the complete membership atomically with respect to forks and migrations. A process
+    /// in a different session or a descendant cgroup is still a member. This is not an exit proof.
+    pub fn kill(&self) -> Result<()> {
+        let members = self.members();
+        let mut signalled = self
+            .signalled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let recording = members.and_then(|members| {
+            signalled
+                .observe(members)
+                .map_err(failed("poll(pidfd)", &self.path))?;
+            signalled
+                .pinned
+                .values()
+                .filter_map(|member| match member.exited() {
+                    Ok(false) => Some(Ok(member.pid)),
+                    Ok(true) => None,
+                    Err(error) => Some(Err(failed("poll(pidfd)", &self.path)(error))),
+                })
+                .collect::<Result<Vec<_>>>()
+        });
+        let populated = self.populated();
+        if matches!(populated, Ok(false)) {
+            // Empty membership cannot fork: do not issue a kill that would need a receipt.
+            return recording.map(|_| ());
+        }
+        // Diagnostic snapshot failures do not revoke the controller's authority to end the
+        // complete membership. Report them after attempting the atomic kernel operation.
+        write_one(self.kill.as_raw_fd(), b"1").map_err(failed_in(
+            "write",
+            &self.path,
+            "cgroup.kill",
+        ))?;
+        // cgroup.kill exposes no killed-member list. A fork can occur after even a nonempty
+        // snapshot, so every atomic kill of populated membership marks the rows non-exhaustive.
+        signalled.metadata_gap = true;
+        for pid in recording? {
+            signalled
+                .pinned
+                .get_mut(&pid)
+                .expect("the pinned member remains held")
+                .signal = Some(libc::SIGKILL);
+        }
+        populated.map(|_| ())
+    }
+
+    /// Ask every currently live member to end, addressing each through a pidfd. KILL later
+    /// uses cgroup.kill, so children born after this finite TERM snapshot cannot escape.
+    pub fn terminate(&self) -> Result<()> {
+        let members = self.members()?;
+        let mut signalled = self
+            .signalled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        signalled
+            .observe(members)
+            .map_err(failed("poll(pidfd)", &self.path))?;
+        for member in signalled.pinned.values_mut() {
+            if member.signal != Some(libc::SIGKILL) {
+                member
+                    .terminate()
+                    .map_err(failed("pidfd_send_signal(SIGTERM)", &self.path))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// TERM the current members, grant one grace deadline, then atomically KILL any remaining
+    /// membership and join the kernel's empty notification. Successful proof is cached and shared
+    /// across explicit retries and late Drop; only one retirement runs at a time. This method does
+    /// not reap a leader, remove the hierarchy, or publish a terminal record.
+    pub fn retire(&self, grace: Duration) -> Result<Arc<CgroupRetirement>> {
+        let mut retirement = self
+            .retirement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(proof) = &retirement.proof {
+            return Ok(Arc::clone(proof));
+        }
+        if let Err(term) = self.terminate() {
+            let ended = self.kill_and_wait();
+            return Err(CgroupError::Malformed {
+                path: self.path.clone(),
+                detail: format!("TERM refused: {term}; KILL and empty-membership join: {ended:?}"),
+            });
+        }
+        let deadline = Instant::now()
+            .checked_add(grace)
+            .ok_or_else(|| CgroupError::Malformed {
+                path: self.path.clone(),
+                detail: "TERM grace exceeds the monotonic clock's range".to_owned(),
+            })?;
+        if self.wait_empty_until(Some(deadline))? {
+            self.join_signalled()?;
+        } else {
+            self.kill_and_wait()?;
+        }
+        let mut signalled = self
+            .signalled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let proof = signalled.proof();
+        retirement.proof = Some(Arc::clone(&proof));
+        Ok(proof)
+    }
+
+    fn members(&self) -> Result<Vec<Member>> {
+        let mut pids = BTreeSet::new();
+        collect_members(&self.directory, &self.path, &mut pids)?;
+        let mut members = Vec::with_capacity(pids.len());
+        for pid in pids {
+            // SAFETY: plain pid and flags; a successful syscall returns a fresh owned fd.
+            let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if opened < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    continue;
+                }
+                return Err(failed("pidfd_open", &self.path)(error));
+            }
+            let fd = libc::c_int::try_from(opened).expect("a kernel descriptor fits c_int");
+            // SAFETY: pidfd_open just returned this descriptor and nothing else owns it.
+            let handle = unsafe { OwnedFd::from_raw_fd(fd) };
+            let process = PathBuf::from(format!("/proc/{pid}"));
+            let membership = match fs::read_to_string(process.join("cgroup")) {
+                Ok(membership) => membership,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(failed_in("read", &process, "cgroup")(error)),
+            };
+            let current = Path::new(CGROUP_MOUNT)
+                .join(unified_membership(&membership)?.trim_start_matches('/'));
+            if !current.starts_with(&self.path) {
+                continue;
+            }
+            let image = match fs::read_link(process.join("exe")) {
+                Ok(image) => Some(image.to_string_lossy().into_owned()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    None
+                }
+                Err(error) => return Err(failed_in("readlink", &process, "exe")(error)),
+            };
+            let member = Member {
+                pid,
+                handle,
+                image,
+                signal: None,
+            };
+            if !member.exited().map_err(failed("poll(pidfd)", &process))? {
+                members.push(member);
+            }
+        }
+        Ok(members)
+    }
+
+    /// Block until the kernel reports no live member. No clock drives this wait: cgroup.events
+    /// changes wake poll(POLLPRI), and each wake is followed by a fresh read on that descriptor.
+    pub fn wait_empty(&self) -> Result<()> {
+        self.wait_empty_until(None)?;
+        self.join_signalled()
+    }
+
+    /// cgroup_exit precedes exit_notify in Linux do_exit. After populated 0, join the retained
+    /// pidfds too: membership is empty, but the final pidfd notification may still be pending.
+    fn join_signalled(&self) -> Result<()> {
+        let signalled = self
+            .signalled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for member in signalled.pinned.values() {
+            member
+                .wait_exited()
+                .map_err(failed("poll(pidfd exit)", &self.path))?;
+        }
+        Ok(())
+    }
+
+    /// End every member and retain the cgroup until the kernel reports that every one exited.
+    pub fn kill_and_wait(&self) -> Result<()> {
+        let killed = self.kill();
+        let waited = self.wait_empty();
+        match (killed, waited) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(kill), Err(wait)) => Err(CgroupError::Malformed {
+                path: self.path.clone(),
+                detail: format!("KILL failed: {kill}; empty-membership join failed: {wait}"),
+            }),
+        }
+    }
+
+    fn wait_empty_until(&self, deadline: Option<Instant>) -> Result<bool> {
+        let fd = open_at(self.directory.as_raw_fd(), c"cgroup.events", libc::O_RDONLY)
+            .map_err(failed_in("open", &self.path, "cgroup.events"))?;
+        let mut file = fs::File::from(fd);
+        let mut text = String::with_capacity(64);
+        loop {
+            file.rewind()
+                .map_err(failed_in("seek", &self.path, "cgroup.events"))?;
+            text.clear();
+            file.read_to_string(&mut text).map_err(failed_in(
+                "read",
+                &self.path,
+                "cgroup.events",
+            ))?;
+            if !populated(&self.path, &text)? {
+                return Ok(true);
+            }
+            let remaining =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if remaining == Some(Duration::ZERO) {
+                return Ok(false);
+            }
+            let timeout = remaining.map(|remaining| libc::timespec {
+                tv_sec: libc::time_t::try_from(remaining.as_secs()).unwrap_or(libc::time_t::MAX),
+                tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+            });
+            let mut event = libc::pollfd {
+                fd: file.as_raw_fd(),
+                events: libc::POLLPRI,
+                revents: 0,
+            };
+            // SAFETY: one live descriptor, optional valid timeout, and no signal-mask change.
+            // The optional timeout is the single TERM grace deadline, never a sampling period.
+            let answer = unsafe {
+                libc::ppoll(
+                    &raw mut event,
+                    1,
+                    timeout
+                        .as_ref()
+                        .map_or(std::ptr::null(), std::ptr::from_ref),
+                    std::ptr::null(),
+                )
+            };
+            if answer < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(failed_in("ppoll(POLLPRI)", &self.path, "cgroup.events")(
+                    error,
+                ));
+            }
+            if event.revents & (libc::POLLNVAL | libc::POLLHUP) != 0 {
+                return Err(CgroupError::Malformed {
+                    path: self.path.join("cgroup.events"),
+                    detail: format!("membership watch closed (poll revents {})", event.revents),
+                });
+            }
+            // A timeout also rereads the kernel's state before it decides the grace expired.
+            // POLLERR accompanies POLLPRI on cgroup.events and is not a failed observation.
+        }
+    }
+
+    /// Collect final counters and remove an empty job's hierarchy without requiring the exec
+    /// host's last Arc to have dropped. The actor calls this after its terminal sample, before
+    /// releasing the claim. Descriptors retained by a late host release then name a removed
+    /// cgroup, never a newly admitted job that happens to reuse the path.
+    pub fn finish(&self) -> Result<JobCgroupTotals> {
+        let mut retirement = self
+            .retirement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(totals) = retirement.totals {
+            return Ok(totals);
+        }
+        if self.populated()? {
+            return Err(CgroupError::Populated {
+                path: self.path.clone(),
+            });
+        }
+        self.join_signalled()?;
+        if retirement.proof.is_none() {
+            let proof = self
+                .signalled
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .proof();
+            retirement.proof = Some(proof);
+        }
+        let totals = finish_cgroup(&self.identity, &self.path, &self.directory)?;
+        retirement.totals = Some(totals);
+        Ok(totals)
+    }
+
     /// The job holds no process any more: its counters are final, and only now may it be
     /// retired. A populated cgroup is handed back with the reason.
     pub fn terminal(self) -> Result<TerminalJobCgroup, Box<NotTerminal>> {
@@ -654,6 +1144,49 @@ impl JobCgroup {
     }
 }
 
+/// Read only the owned cgroup subtree, never a process-table census.
+fn collect_members(directory: &OwnedFd, path: &Path, pids: &mut BTreeSet<u32>) -> Result<()> {
+    let procs =
+        read_at(directory, c"cgroup.procs").map_err(failed_in("read", path, "cgroup.procs"))?;
+    for line in procs.lines() {
+        let pid = line
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid != 0)
+            .ok_or_else(|| CgroupError::Malformed {
+                path: path.join("cgroup.procs"),
+                detail: format!("invalid member pid {line:?}"),
+            })?;
+        pids.insert(pid);
+    }
+    for entry in fs::read_dir(path).map_err(failed("readdir", path))? {
+        let entry = entry.map_err(failed("readdir", path))?;
+        if entry.file_type().map_err(failed("stat", path))?.is_dir() {
+            let child = entry.path();
+            let opened = open_directory(&child)?;
+            collect_members(&opened, &child, pids)?;
+        }
+    }
+    Ok(())
+}
+
+/// One control write; cgroup interface files do not accept partial writes.
+fn write_one(fd: RawFd, byte: &[u8; 1]) -> io::Result<()> {
+    loop {
+        // SAFETY: the caller holds fd open and the byte is readable for the duration of write.
+        match unsafe { libc::write(fd, byte.as_ptr().cast(), 1) } {
+            1 => return Ok(()),
+            -1 => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            _ => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+        }
+    }
+}
+
 /// A job cgroup that could not be proven empty, and why.
 #[derive(Debug)]
 pub struct NotTerminal {
@@ -666,22 +1199,37 @@ pub struct NotTerminal {
 pub struct Placement(OwnedFd);
 
 impl Placement {
+    /// Receive the controller-opened descriptor over the exec-host's authenticated control lane.
+    pub fn from_descriptor(descriptor: OwnedFd) -> Self {
+        Self(descriptor)
+    }
+
+    /// Transfer the placement authority to the exec host, never a pathname chosen by the job.
+    pub fn into_descriptor(self) -> OwnedFd {
+        self.0
+    }
+
+    /// Enter in the forked child, before exec or interpreting a script. Only write(2) runs; the
+    /// caller must close this descriptor before running a script that does not exec.
+    pub fn enter(&self) -> io::Result<()> {
+        write_one(self.0.as_raw_fd(), b"0")
+    }
+
     /// Have the process `command` spawns enter the job's cgroup after it forks and before it
     /// executes its program, so nothing the program runs is charged anywhere else. A failed
     /// entry fails the spawn.
     pub fn on_exec(self, command: &mut std::process::Command) {
-        let procs = self.0;
-        // SAFETY: the closure runs in the forked child before exec and makes one write(2), which
-        // is async-signal-safe, on a descriptor the command owns until it is dropped. "0" names
-        // the writing process, so the child moves itself and nothing else.
+        // SAFETY: enter and the failure diagnostic make only async-signal-safe write calls.
         unsafe {
             command.pre_exec(move || {
-                let written = libc::write(procs.as_raw_fd(), c"0".as_ptr().cast(), 1);
-                match written {
-                    1 => Ok(()),
-                    -1 => Err(io::Error::last_os_error()),
-                    _ => Err(io::Error::from(io::ErrorKind::WriteZero)),
-                }
+                self.enter().inspect_err(|_| {
+                    let diagnostic = b"cowshed: cgroup placement failed before exec\n";
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        diagnostic.as_ptr().cast(),
+                        diagnostic.len(),
+                    );
+                })
             });
         }
     }
@@ -724,24 +1272,42 @@ impl TerminalJobCgroup {
     /// cgroup admission created. A counter that cannot be read leaves the cgroup in place: once
     /// it is gone, nothing could ever read it again.
     pub fn retire(self) -> Result<JobCgroupTotals> {
-        let totals = JobCgroupTotals {
-            cpu: self.cpu()?,
-            charged_memory: self.charged_memory()?,
-            storage_io: self.storage_io()?,
-        };
-        let current = open_directory(&self.path)?;
-        let found = cgroup_id(&current).map_err(failed("fstat", &self.path))?;
-        if found != self.identity.cgroup_id {
-            return Err(CgroupError::Replaced {
-                path: self.path,
-                recorded: self.identity.cgroup_id,
-                found,
-            });
-        }
-        drop((current, self.directory));
-        fs::remove_dir(&self.path).map_err(failed("rmdir", &self.path))?;
-        Ok(totals)
+        finish_cgroup(&self.identity, &self.path, &self.directory)
     }
+}
+
+fn finish_cgroup(
+    identity: &JobCgroupIdentity,
+    path: &Path,
+    directory: &OwnedFd,
+) -> Result<JobCgroupTotals> {
+    let totals = JobCgroupTotals {
+        cpu: read_cpu(directory, path)?,
+        charged_memory: read_charged_memory(directory, path)?,
+        storage_io: read_storage_io(directory, path)?,
+    };
+    let current = open_directory(path)?;
+    let found = cgroup_id(&current).map_err(failed("fstat", path))?;
+    if found != identity.cgroup_id {
+        return Err(CgroupError::Replaced {
+            path: path.to_path_buf(),
+            recorded: identity.cgroup_id,
+            found,
+        });
+    }
+    remove_empty_hierarchy(path)?;
+    Ok(totals)
+}
+
+/// Population was proved empty recursively; the owned hierarchy can contain empty child groups.
+fn remove_empty_hierarchy(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path).map_err(failed("readdir", path))? {
+        let entry = entry.map_err(failed("readdir", path))?;
+        if entry.file_type().map_err(failed("stat", path))?.is_dir() {
+            remove_empty_hierarchy(&entry.path())?;
+        }
+    }
+    fs::remove_dir(path).map_err(failed("rmdir", path))
 }
 
 /// What a job cgroup counted over its whole life, read after its last process ended.

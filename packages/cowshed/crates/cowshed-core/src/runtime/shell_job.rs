@@ -1,11 +1,11 @@
 //! Commands that run in warm exec hosts: the supervisor's side of [`super::shell_host`].
 //!
-//! A job keeps every part of its contract: its own anonymous stdin/stdout/stderr pipes, pumped
-//! and quota-accounted by the supervisor exactly as for a one-shot child; its own process group
-//! (the host forks the argv with `setpgid`); its exact exit; and a kill that reaches its group —
-//! never the host's — unless the host itself is still activating for that job. The host holds the
-//! command's leader unreaped until the job concludes, so a kill also reaches descendants that
-//! outlive the leader.
+//! A job keeps its own anonymous stdin/stdout/stderr pipes, pumped and quota-accounted by the
+//! supervisor exactly as for a one-shot child, and its exact exit. On Linux each command enters
+//! its controller-owned cgroup before argv exec or script interpretation; TERM uses retained
+//! cgroup members and KILL uses `cgroup.kill`, never the warm host's group. The capability survives
+//! host loss. On macOS the host retains the command's group leader until the job concludes, so
+//! signals still reach descendants that outlive it. Cold activation remains owned by its host.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -25,6 +25,8 @@ use bytes::Bytes;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Interest};
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(target_os = "linux")]
+use super::job_cgroup::JobCgroup;
 use super::job_cpu::JobCpuAdmission;
 use super::job_groups::Birth;
 use super::shell_host::{
@@ -108,6 +110,8 @@ pub(super) enum HostCommand {
 /// One command admitted to run in a warm shell.
 pub(super) struct PooledSpawn<'a> {
     pub job_id: JobId,
+    #[cfg(target_os = "linux")]
+    pub cgroup: Arc<JobCgroup>,
     pub command: HostCommand,
     pub cwd: PathBuf,
     /// The executed-child profile the supervisor rendered once for its authority.
@@ -205,7 +209,12 @@ impl WorkspaceShells {
             stderr,
             events.clone(),
         ));
-        let control = Arc::new(JobControl::default());
+        let control = Arc::new(JobControl {
+            target: Mutex::new(Target::Pending),
+            requested: AtomicI32::new(0),
+            #[cfg(target_os = "linux")]
+            cgroup: Arc::clone(&spawn.cgroup),
+        });
         let (release, released) = oneshot::channel();
         tokio::spawn(drive(
             pool,
@@ -219,6 +228,8 @@ impl WorkspaceShells {
                 cwd: spawn.cwd,
                 overlay,
                 nice: spawn.cpu.nice,
+                #[cfg(target_os = "linux")]
+                cgroup: spawn.cgroup,
                 #[cfg(target_os = "macos")]
                 monitor: spawn.monitor.clone(),
             },
@@ -300,20 +311,17 @@ fn null_device() -> io::Result<OwnedFd> {
 // ---------------------------------------------------------------------------------------------
 // Job control shared with the supervisor actor
 
-/// Which process group a job's signals reach right now, and through whom.
+/// Where a job's signals go now, retaining requests until a command has been placed.
 ///
-/// While a fresh host activates for the job, that host's group is the job (activation output and
-/// failure belong to the job): this process is the host's parent and signals it through the
-/// host's reap fence ([`ChildFence`]). Once the command starts, the command's own group is: the
-/// host forked the command and holds it unreaped until the job concludes, so a signal is sent to
-/// the host, which applies it to the command's group. No signal is ever sent to a group whose
-/// leader this process cannot vouch for. A signal requested while neither is published -- before
-/// the host exists, or between its activation and the command's start -- is recorded and
-/// delivered the moment one is published, so no window loses it.
-#[derive(Default)]
+/// A cold activation is signalled through its host's reap fence. Once activation ends, Linux
+/// signals use the job cgroup directly; macOS forwards them to the command's parent host. A
+/// request while placement is pending is replayed when the command starts, so signalling an
+/// initially empty cgroup cannot lose a cancellation. Linux keeps that authority after host loss.
 pub(super) struct JobControl {
     target: Mutex<Target>,
     requested: AtomicI32,
+    #[cfg(target_os = "linux")]
+    cgroup: Arc<JobCgroup>,
 }
 
 #[derive(Default)]
@@ -328,7 +336,16 @@ enum Target {
 }
 
 impl Target {
-    fn deliver(&self, signal: i32) -> Result<()> {
+    fn deliver(&self, signal: i32, #[cfg(target_os = "linux")] cgroup: &JobCgroup) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if !matches!(self, Self::Host(_)) {
+            return match signal {
+                libc::SIGTERM => cgroup.terminate(),
+                libc::SIGKILL => cgroup.kill(),
+                _ => unreachable!("job control only requests TERM or KILL"),
+            }
+            .map_err(super::supervisor::cgroup_error);
+        }
         match self {
             Self::Host(fence) => fence.signal(signal),
             Self::Command(host) => host.send(signal).map_err(|_| {
@@ -356,7 +373,11 @@ impl JobControl {
         let delivered = if requested == 0 {
             Ok(())
         } else {
-            published.deliver(requested)
+            published.deliver(
+                requested,
+                #[cfg(target_os = "linux")]
+                &self.cgroup,
+            )
         };
         *target = published;
         delivered
@@ -371,7 +392,11 @@ impl JobControl {
         self.target
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .deliver(signal)
+            .deliver(
+                signal,
+                #[cfg(target_os = "linux")]
+                &self.cgroup,
+            )
     }
 }
 
@@ -386,6 +411,11 @@ struct PooledProcess {
 }
 
 impl RunningProcess for PooledProcess {
+    #[cfg(target_os = "linux")]
+    fn cgroup(&self) -> Option<&Arc<JobCgroup>> {
+        Some(&self.control.cgroup)
+    }
+
     fn process(&self) -> Option<&OwnedProcess> {
         // The job's processes arrive with `ProcessEvent::Activating` and `ProcessEvent::Started`.
         None
@@ -436,6 +466,8 @@ struct RunCommand {
     overlay: Vec<(OsString, OsString)>,
     /// The nice the command runs at, its class's.
     nice: i32,
+    #[cfg(target_os = "linux")]
+    cgroup: Arc<JobCgroup>,
     #[cfg(target_os = "macos")]
     monitor: super::process_monitor::ProcessMonitor,
 }
@@ -444,8 +476,8 @@ enum Outcome {
     Exited(ExitStatus),
     /// A started command's exit was reported as it happened, and its hold has ended.
     Reported,
-    /// The command ran but its end was not observed: its host is gone, and with it the only
-    /// process that could prove the command's group its own, so the group was not signalled.
+    /// The command ran but its end was not observed: its host is gone. Linux retains the cgroup
+    /// capability; on macOS the one process that could prove its group is gone too.
     Unobserved(CowshedError),
     /// No command was started; the diagnostic is already on the job's stderr.
     NotLaunched(CowshedError),
@@ -571,7 +603,7 @@ async fn run_pooled(
                     return Outcome::NotLaunched(error);
                 }
             }
-            // The host is the job's first process: it activates for this job alone.
+            // Activation belongs to this job, but the reusable host stays outside its cgroup.
             let _ = events
                 .send(ProcessEvent::Activating {
                     job_id,
@@ -621,9 +653,8 @@ async fn run_pooled(
             }
         }
     };
-    // The activation is over: a signal from here on waits for the command, which leads a group
-    // of its own. Signalling the host while it forks the command would kill the host and leave
-    // the command running with nothing to signal it.
+    // Activation is over: stop signalling its host while it forks the command. Linux uses the
+    // job cgroup now and replays the request after placement; macOS waits for the held group.
     signal_failed(events, job_id, control.publish(Target::Pending)).await;
     let host = checkout.host_mut();
     let JobIo {
@@ -655,8 +686,8 @@ async fn run_pooled(
             return Outcome::NotLaunched(error);
         }
     };
-    // The host applies the job's signals to the command's group while it holds the command; the
-    // run forwards them until the command is released.
+    // Publishing the placed command replays pending requests. Linux signals the cgroup directly;
+    // macOS forwards signals to the host until it releases the command.
     let (signals, mut forwarded) = mpsc::unbounded_channel();
     signal_failed(events, job_id, control.publish(Target::Command(signals))).await;
     let _ = events
@@ -673,15 +704,15 @@ async fn run_pooled(
     let exit = match host.exited(&mut forwarded, job_id, events).await {
         Ok(exit) => exit,
         Err(error) => {
-            // Its host is gone, and with it the one process that could prove the command's group
-            // its own: nothing signals the group from here.
+            // The host is gone, so no group signal is safe from here. Linux still retains the
+            // job cgroup independently of this run and can end every remaining member.
             checkout.poison();
             return Outcome::Unobserved(error);
         }
     };
     let _ = events.send(ProcessEvent::Exited { job_id, exit }).await;
-    // Descendants of the exited leader may run on, holding the job's output open; the leader
-    // stays held so a kill still reaches them, until the job concludes and drops its handle.
+    // Descendants may outlive the leader. Its host retains it until the job concludes; Linux
+    // membership and cancellation remain the cgroup's, independent of this hold.
     if let Err(error) = host
         .released(&mut forwarded, &mut released, job_id, events)
         .await
@@ -838,10 +869,25 @@ impl ExecHost {
             held.ready.as_raw_fd(),
             held.go.as_raw_fd(),
         ];
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        let placement = command
+            .cgroup
+            .placement()
+            .map_err(super::supervisor::cgroup_error)?
+            .into_descriptor();
+        #[cfg(target_os = "linux")]
+        let raw = [
+            descriptors[0].as_raw_fd(),
+            descriptors[1].as_raw_fd(),
+            descriptors[2].as_raw_fd(),
+            placement.as_raw_fd(),
+        ];
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let raw = descriptors.each_ref().map(AsRawFd::as_raw_fd);
         self.send(frame, &raw).await?;
         drop(descriptors);
+        #[cfg(target_os = "linux")]
+        drop(placement);
         // The nice the command was observed at while the fence held it, before it ran anything.
         // A refusal fails the launch; this host is then dropped, which ends the held command.
         #[cfg(target_os = "macos")]
