@@ -27,7 +27,6 @@ import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { createRunProgress, withProgressReport } from './progress.js';
-import { createRunnerLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
 import {
   COWSHED_EXECUTABLE_ENV,
   createHostCommands,
@@ -37,6 +36,7 @@ import {
   RamTempVolume,
   ramTempPaths,
 } from './ram-temp.js';
+import { createRunnerLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
 import type { BoundedExecOptions } from './schema.js';
 import {
   type BoundedExecRecord,
