@@ -1679,8 +1679,18 @@ collection fail.
 Invariant checks: every image has a marker, every mount matches an image, grants files parse, the gateway is reachable,
 no retired caches volume is left (`caches-volume`), and git identity at the workspace mount root matches the checkout
 (`includeIf gitdir:` files that would not apply under the mount root). Exit 0 when healthy; otherwise the code of the
-most severe finding (3/4/5). Stdout is `healthy` or `unhealthy`. Stderr is every finding, then the distinct `next:`
-commands those findings carry — findings first, hints after, never interleaved.
+most severe finding (3/4/5). Stdout is `healthy` or `unhealthy`. Stderr is first the progress of every probe as it runs,
+then every finding, then the distinct `next:` commands those findings carry — findings first, hints after, never
+interleaved.
+
+Each probe is a `cowshed: doctor <probe> start` line and a `done elapsed=<duration> status=ok|err` line, and a probe
+that waits for another party — launchd, securityd, the gateway or sccache server at its socket, the commitment publisher
+— names it before it asks:
+`cowshed: doctor gateway-status waits-on=launchd (dev.cowshed.gateway), then the gateway daemon at /private/cowshed/store/gateway.sock`.
+The project's checks run inside the `doctor project` step, per workspace as `doctor <workspace>/<check>`. A doctor that
+seems stuck is in the probe of its last `start` without a `done`, waiting on the `waits-on=` party it named. Doctor adds
+no timeout: an absent or refusing party is a finding, one that never answers stays named on stderr, and no probe reports
+an answer it did not get.
 
 Store-wide listing and diagnosis continue past an unreadable project's records: listing warns with the project name, and
 doctor records a finding for it while checking other projects.

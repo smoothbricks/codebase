@@ -17,6 +17,7 @@
 //! command read as a waterfall and the gap before a step is time no span covered.
 
 use std::borrow::Cow;
+use std::convert::Infallible;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -167,6 +168,18 @@ pub async fn timed_async<T, E: fmt::Display>(
     };
     done(format_args!("{scope} {step}"), started, result.is_ok());
     result
+}
+
+/// [`timed_async`] for a step that answers a value rather than a result, so it always ends
+/// `status=ok`: a doctor probe, which reports a failure of what it asked as a finding, not as
+/// its own.
+pub async fn timed_value<T>(
+    scope: &'static str,
+    step: impl Into<Cow<'static, str>>,
+    work: impl Future<Output = T>,
+) -> T {
+    let Ok(value) = timed_async(scope, step, async { Ok::<_, Infallible>(work.await) }).await;
+    value
 }
 
 fn done(label: fmt::Arguments<'_>, started: Instant, ok: bool) {
@@ -339,6 +352,23 @@ mod tests {
                 ended(2, Some("no signing key")),
                 ended(0, Some("no signing key")),
             ]
+        );
+    }
+
+    /// A step that answers a value is reported like any other, and ends without an error.
+    #[tokio::test]
+    async fn a_value_step_is_reported_and_ends_without_an_error() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let value = reporting(
+            StepSink::new(sender),
+            timed_value("doctor", "probe", async { 7 }),
+        )
+        .await;
+
+        assert_eq!(value, 7);
+        assert_eq!(
+            reports(&mut receiver),
+            [started(0, None, "doctor", "probe"), ended(0, None)]
         );
     }
 

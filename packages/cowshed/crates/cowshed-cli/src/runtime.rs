@@ -4718,7 +4718,9 @@ fn retired_layout_finding(record: RetiredLayoutRecord) -> Finding {
 }
 
 fn retired_mount_layout_findings(store_root: &Path) -> Vec<Finding> {
-    match retired_layout_paths(store_root) {
+    match cowshed_os::timing::timed("doctor", format_args!("retired-mount-layout"), || {
+        retired_layout_paths(store_root)
+    }) {
         Ok(records) => records.into_iter().map(retired_layout_finding).collect(),
         Err(error) => vec![Finding {
             code: "retired-mount-layout-scan".into(),
@@ -4946,8 +4948,18 @@ fn departed_volume_references_finding(
 }
 
 async fn diagnose_host() -> Result<Vec<Finding>> {
+    use cowshed_os::timing::{attribute, timed, timed_async, timed_value};
     let home = gateway_service::canonical_home()?;
-    let plan = plan_host_setup(&home, CachesVolume::Keep).await;
+    let plan = timed_async("doctor", "host-storage", async {
+        attribute(
+            "doctor",
+            format_args!("host-storage"),
+            "waits-on",
+            "securityd (security find-generic-password, System.keychain) and launchd (system/dev.cowshed.storage)",
+        );
+        plan_host_setup(&home, CachesVolume::Keep).await
+    })
+    .await;
     let mut findings = match plan {
         Ok(plan) => host_storage_findings(&plan),
         Err(error) => vec![Finding {
@@ -4958,10 +4970,23 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
             path: None,
         }],
     };
-    if let Some(finding) = caches_volume_finding() {
-        findings.push(finding);
-    }
-    match gateway_service::service_status().await {
+    findings
+        .extend(timed_value("doctor", "caches-volume", async { caches_volume_finding() }).await);
+    let gateway = timed_async("doctor", "gateway-status", async {
+        attribute(
+            "doctor",
+            format_args!("gateway-status"),
+            "waits-on",
+            format_args!(
+                "launchd ({}), then the gateway daemon at {}",
+                crate::launchd::GATEWAY_LABEL,
+                cowshed_gateway_types::control_socket_path().display()
+            ),
+        );
+        gateway_service::service_status().await
+    })
+    .await;
+    match gateway {
         Ok(status) => findings.extend(gateway_findings(&status)),
         Err(error) => findings.push(Finding {
             code: "gateway-status".into(),
@@ -4971,19 +4996,43 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
             path: None,
         }),
     }
-    findings.extend(vnode_table_finding(cowshed_core::vnodes::VnodeTable::read()));
-    findings.extend(orphaned_disk_image_helpers_finding(
-        cowshed_apfs::disk_image_helpers::OrphanedHelpers::read(),
-    ));
+    findings.extend(vnode_table_finding(timed(
+        "doctor",
+        format_args!("vnode-table"),
+        cowshed_core::vnodes::VnodeTable::read,
+    )));
+    findings.extend(orphaned_disk_image_helpers_finding(timed(
+        "doctor",
+        format_args!("disk-image-helpers"),
+        cowshed_apfs::disk_image_helpers::OrphanedHelpers::read,
+    )));
     // One snapshot answers both findings: departed volumes need no census of their own.
-    let budget = cowshed_apfs::attach_budget::observe();
+    let budget = timed(
+        "doctor",
+        format_args!("attach-budget"),
+        cowshed_apfs::attach_budget::observe,
+    );
     let departed = budget
         .as_ref()
         .ok()
         .and_then(|budget| departed_volume_references_finding(&budget.reading));
     findings.extend(disk_image_attach_budget_finding(budget));
     findings.extend(departed);
-    match crate::capabilities::sccache::service::service_status().await {
+    let sccache = timed_async("doctor", "sccache-status", async {
+        attribute(
+            "doctor",
+            format_args!("sccache-status"),
+            "waits-on",
+            format_args!(
+                "launchd ({}), then the sccache server at {}",
+                crate::launchd::SCCACHE_LABEL,
+                cowshed_core::capabilities::sccache::server_socket().display()
+            ),
+        );
+        crate::capabilities::sccache::service::service_status().await
+    })
+    .await;
+    match sccache {
         Ok(status) => findings.push(sccache_finding(&status)),
         Err(error) => findings.push(Finding {
             code: "sccache-status".into(),
@@ -4996,11 +5045,13 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     // Whether the agent still has a program to run, which the status above cannot answer: a loaded
     // agent whose store path was collected looks identical to a healthy one until launchd next
     // tries to exec it, which may be a reboot away.
-    match crate::capabilities::sccache::service::control_target(&home) {
-        Ok(target) => findings.extend(crate::capabilities::sccache::nix::pinning_findings(
-            &home,
-            target.plist_path(),
-        )),
+    let pinning = timed("doctor", format_args!("sccache-agent"), || {
+        crate::capabilities::sccache::service::control_target(&home).map(|target| {
+            crate::capabilities::sccache::nix::pinning_findings(&home, target.plist_path())
+        })
+    });
+    match pinning {
+        Ok(pinning) => findings.extend(pinning),
         Err(error) => findings.push(Finding {
             code: "sccache-agent".into(),
             severity: FindingSeverity::Error,
@@ -5011,7 +5062,7 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     }
     // Inventory validates the existing store itself. A pending host setup action is a finding,
     // not permission to hide project state. One registry traversal supplies every view below.
-    match doctor_projects().await {
+    match timed_async("doctor", "inventory", doctor_projects()).await {
         Ok((projects, mains, checkoutless, unreadable)) => {
             let roots = CanonicalRoots::global();
             let store = roots.store();
@@ -5154,11 +5205,12 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    use cowshed_os::timing::{timed, timed_async};
     let repair = matches!(&cli.command, Command::Doctor(args) if args.repair);
-    let project_root = resolve_project_root(&cli).await;
+    let project_root = timed_async("doctor", "project-root", resolve_project_root(&cli)).await;
     let mut findings = diagnose_host().await?;
     if repair && let Ok(root) = project_root.as_ref() {
-        match repair_project_artifacts(root).await {
+        match timed_async("doctor", "artifact-repair", repair_project_artifacts(root)).await {
             Ok(repaired) => findings.extend(repaired),
             Err(error) => findings.push(Finding {
                 code: "artifact-repair".into(),
@@ -5173,11 +5225,22 @@ where
     // project is reported explicitly rather than silently skipped because a host needs repair.
     match project_root {
         Ok(root) => {
-            match ActorBridge::open_existing(&root, runtime_recovery_scope(&cli.command)?).await {
+            let scope = runtime_recovery_scope(&cli.command)?;
+            match timed_async(
+                "doctor",
+                "project-open",
+                ActorBridge::open_existing(&root, scope),
+            )
+            .await
+            {
                 Ok(mut bridge) => {
-                    let identity = git_identity_findings(&bridge);
-                    let project = bridge.doctor().await;
-                    let teardown = bridge.shutdown().await.err();
+                    let identity = timed("doctor", format_args!("git-identity"), || {
+                        git_identity_findings(&bridge)
+                    });
+                    let project = timed_async("doctor", "project", bridge.doctor()).await;
+                    let teardown = timed_async("doctor", "project-shutdown", bridge.shutdown())
+                        .await
+                        .err();
                     match identity {
                         Ok(identity) => findings.extend(identity),
                         Err(error) => findings.push(Finding {

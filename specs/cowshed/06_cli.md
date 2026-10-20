@@ -63,6 +63,23 @@ Two verbs own the host story, both runnable from any directory:
   to finish. `doctor --repair` opens the way every other verb does. While the retired caches volume still exists it
   reports the `caches-volume` warning, whose hint is `cowshed setup --retire-caches-volume` once only the volume's
   marker remains and `cowshed setup, then cowshed setup --retire-caches-volume` before that.
+
+  Doctor says where it is as it goes, on stderr, in the lifecycle-span form every slow verb uses
+  (`cowshed: <scope> <step> start`, then `done elapsed=<duration> status=ok|err`): every probe is a `doctor <probe>`
+  step, and a probe that waits for another party's answer names that party, before it asks, on the line after its
+  `start`: `cowshed: doctor <probe> waits-on=<party>` (launchd, securityd, the gateway or the sccache server at its
+  socket, the commitment publisher). The host probes are `host-storage`, `caches-volume`, `gateway-status`,
+  `vnode-table`, `disk-image-helpers`, `attach-budget`, `sccache-status`, `sccache-agent`, `inventory` and
+  `retired-mount-layout`; the project's are `project-root`, `artifact-repair` (`--repair` only), `project-open`,
+  `git-identity`, `project` and `project-shutdown`, and `project` runs one step per project check, per workspace as
+  `<workspace>/<check>` (`main/marker`). A doctor that does not finish therefore names, in its last `start` without a
+  `done`, the probe it waits in, and in that probe's `waits-on=` whose answer is missing. `status=err` means the probe's
+  own query failed; the failure is also its finding. Doctor sets no deadline of its own: a party that is absent or
+  refuses is a typed finding (`gateway-down`, `gateway-status`, `sccache-status`, `project-checks-skipped`, …), and one
+  that accepted and never answers stays named on stderr rather than cut off by a timer that would report a guess; no
+  probe reports an answer it did not get. A caller that asked for its steps (07_api.md) hears the same steps; `--json`
+  changes stdout only.
+
 - **`setup`** is idempotent host repair: provision absent volumes, repair detached or mis-mounted ones,
   FileVault-encrypt unencrypted ones in place and store passphrases in System.keychain, validate markers precisely, pin
   `/etc/fstab`, and install the `dev.cowshed.storage` system LaunchDaemon that unlocks and mounts before login

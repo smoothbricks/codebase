@@ -13388,7 +13388,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let store_root = &std::sync::Arc::clone(self.git.store_root());
 
         let mut findings = Vec::new();
-        match self.binding_move().await {
+        match cowshed_os::timing::timed_async("doctor", "binding", self.binding_move()).await {
             Ok(None) => {}
             Ok(Some(moved)) if self.recovery_scope.repairs() => {
                 if let Err(error) = self.record_binding(moved).await {
@@ -13415,7 +13415,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let identity_intent = crate::storage::recovery::RepositoryIdentityIntent::path(
             self.descriptor.storage.store(),
         );
-        if identity_intent.symlink_metadata().is_ok() {
+        if cowshed_os::timing::timed_value("doctor", "identity-intent", async {
+            identity_intent.symlink_metadata().is_ok()
+        })
+        .await
+        {
             findings.push(crate::api::dto::Finding {
                 code: "identity-change-unfinished".into(),
                 severity: crate::api::dto::FindingSeverity::Warning,
@@ -13427,7 +13431,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 path: Some(identity_intent),
             });
         }
-        match self.reload_lifecycle_intents().await {
+        match cowshed_os::timing::timed_async(
+            "doctor",
+            "lifecycle-intents",
+            self.reload_lifecycle_intents(),
+        )
+        .await
+        {
             Ok(()) => findings.extend(
                 self.lifecycle_intents
                     .records()
@@ -13447,12 +13457,20 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             )),
         }
         let project_root = self.layout.project().project_root.clone();
-        match crate::storage::lifecycle::dispatch_blocking(move || {
-            crate::storage::apfs::native::interrupted_publications(&project_root)
-        })
-        .await
-        {
-            Ok(Ok(sidecars)) => findings.extend(sidecars.into_iter().map(|sidecar| {
+        let interrupted =
+            cowshed_os::timing::timed_async("doctor", "interrupted-publication", async {
+                crate::storage::lifecycle::dispatch_blocking(move || {
+                    crate::storage::apfs::native::interrupted_publications(&project_root)
+                })
+                .await
+                .map_err(|error| {
+                    CowshedError::internal(format!("publication scan task failed: {error}"))
+                })
+                .and_then(|scanned| scanned.map_err(native_storage_error))
+            })
+            .await;
+        match interrupted {
+            Ok(sidecars) => findings.extend(sidecars.into_iter().map(|sidecar| {
                 crate::api::dto::Finding {
                     code: "interrupted-publication".into(),
                     severity: crate::api::dto::FindingSeverity::Warning,
@@ -13467,22 +13485,30 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     path: Some(sidecar),
                 }
             })),
-            Ok(Err(error)) => findings.push(native_finding(
-                "interrupted-publication",
-                crate::api::dto::FindingSeverity::Error,
-                native_storage_error(error),
-            )),
             Err(error) => findings.push(native_finding(
                 "interrupted-publication",
                 crate::api::dto::FindingSeverity::Error,
-                CowshedError::internal(format!("publication scan task failed: {error}")),
+                error,
             )),
         }
         // Gateway reachability is host-scoped, not project-scoped, and is diagnosed once by the
         // CLI's host diagnosis with a launchd-aware message and hint. A second `gateway-down`
         // author here produced two Error rows with the same code and contradictory recovery
         // steps; a project cannot answer a host question, so it no longer tries.
-        match self.commitments.health().await {
+        match cowshed_os::timing::timed_async("doctor", "audit-sink", async {
+            cowshed_os::timing::attribute(
+                "doctor",
+                format_args!("audit-sink"),
+                "waits-on",
+                format_args!(
+                    "the commitment publisher sealing its queued segments under {}",
+                    self.telemetry_root.display()
+                ),
+            );
+            self.commitments.health().await
+        })
+        .await
+        {
             Ok(health) if health.failed > 0 => findings.push(crate::api::dto::Finding {
                 code: "audit-sink".into(),
                 severity: crate::api::dto::FindingSeverity::Warning,
@@ -13504,7 +13530,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 error,
             )),
         }
-        let abandoned = match self.abandoned_pending_workspaces().await {
+        let abandoned = match cowshed_os::timing::timed_async(
+            "doctor",
+            "abandoned-pending",
+            self.abandoned_pending_workspaces(),
+        )
+        .await
+        {
             Ok(abandoned) => abandoned
                 .into_iter()
                 .map(|(image, _)| image)
@@ -13518,7 +13550,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 std::collections::BTreeSet::new()
             }
         };
-        match self.pending_metadata().await {
+        match cowshed_os::timing::timed_async(
+            "doctor",
+            "pending-publication",
+            self.pending_metadata(),
+        )
+        .await
+        {
             Ok(pending) => {
                 for (image, metadata) in pending {
                     let (message, hint) = if abandoned.contains(&image) {
@@ -13566,7 +13604,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // finding above — while the tombstone half still runs.
         let mut companion_images: Vec<(WorkspaceName, PathBuf)> = Vec::new();
 
-        match self.authoritative().await {
+        match cowshed_os::timing::timed_async("doctor", "workspaces", self.authoritative()).await {
             Ok(workspaces) => {
                 let seed_targets = workspaces
                     .iter()
@@ -13583,9 +13621,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 for workspace in workspaces {
                     let workspace_name = workspace.derived.workspace.name().clone();
                     findings.extend(
-                        unresolved_group_findings(
-                            &workspace_name,
-                            self.job_group_ledger(&workspace_name),
+                        cowshed_os::timing::timed_value(
+                            "doctor",
+                            format!("{workspace_name}/job-groups"),
+                            unresolved_group_findings(
+                                &workspace_name,
+                                self.job_group_ledger(&workspace_name),
+                            ),
                         )
                         .await,
                     );
@@ -13635,10 +13677,16 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                 workspace.derived.workspace.incarnation().clone();
                             let expected_project_root = self.descriptor.git_root.clone();
                             let checked_marker_path = marker_path.clone();
-                            let marker = crate::storage::lifecycle::dispatch_blocking(move || {
-                                crate::metadata::WorkspaceMarker::read_from(&checked_marker_path)
+                            let marker = cowshed_os::timing::timed_async(
+                                "doctor",
+                                format!("{workspace_name}/marker"),
+                                crate::storage::lifecycle::dispatch_blocking(move || {
+                                    crate::metadata::WorkspaceMarker::read_from(
+                                        &checked_marker_path,
+                                    )
                                     .map_err(|error| error.to_string())
-                            })
+                                }),
+                            )
                             .await;
                             match marker {
                                 Ok(Ok(marker)) => findings.extend(diagnose_mounted_marker(
@@ -13671,30 +13719,43 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             }
                             let install_root = expected_mount.clone();
                             let install_workspace = workspace_name.clone();
-                            match crate::storage::lifecycle::dispatch_blocking(move || {
-                                node_modules_install_findings(&install_workspace, &install_root)
-                            })
+                            match cowshed_os::timing::timed_async(
+                                "doctor",
+                                format!("{workspace_name}/node-modules-install"),
+                                async {
+                                    crate::storage::lifecycle::dispatch_blocking(move || {
+                                        node_modules_install_findings(
+                                            &install_workspace,
+                                            &install_root,
+                                        )
+                                    })
+                                    .await
+                                    .map_err(|error| {
+                                        CowshedError::internal(format!(
+                                            "install receipt scan failed: {error}"
+                                        ))
+                                    })
+                                    .and_then(|install| install)
+                                },
+                            )
                             .await
                             {
-                                Ok(Ok(install)) => findings.extend(install),
-                                Ok(Err(error)) => findings.push(native_finding(
+                                Ok(install) => findings.extend(install),
+                                Err(error) => findings.push(native_finding(
                                     "node-modules-install",
                                     crate::api::dto::FindingSeverity::Error,
                                     error,
                                 )),
-                                Err(error) => findings.push(native_finding(
-                                    "node-modules-install",
-                                    crate::api::dto::FindingSeverity::Error,
-                                    CowshedError::internal(format!(
-                                        "install receipt scan failed: {error}"
-                                    )),
-                                )),
                             }
-                            match crate::git::GitRepository::from_root(
-                                self.git.store_root(),
-                                &expected_mount,
+                            match cowshed_os::timing::timed_async(
+                                "doctor",
+                                format!("{workspace_name}/merge-driver"),
+                                crate::git::GitRepository::from_root(
+                                    self.git.store_root(),
+                                    &expected_mount,
+                                )
+                                .inspect_merge_drivers(),
                             )
-                            .inspect_merge_drivers()
                             .await
                             {
                                 Ok(drivers) => {
@@ -13717,11 +13778,15 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                             if !workspace_name.is_main()
                                 && let Some(main_mount) = main_mount.as_ref()
                             {
-                                match crate::git::GitRepository::from_root(
-                                    self.git.store_root(),
-                                    &expected_mount,
+                                match cowshed_os::timing::timed_async(
+                                    "doctor",
+                                    format!("{workspace_name}/main-remote"),
+                                    crate::git::GitRepository::from_root(
+                                        self.git.store_root(),
+                                        &expected_mount,
+                                    )
+                                    .inspect_cowshed_upstream(main_mount),
                                 )
-                                .inspect_cowshed_upstream(main_mount)
                                 .await
                                 {
                                     Ok(upstream) => {
@@ -13745,38 +13810,42 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                     name: workspace_name.clone(),
                                     incarnation: workspace.derived.workspace.incarnation().clone(),
                                 };
-                                let diagnosed = async {
-                                    let Some(tree) = git_optional_ref_oid(
-                                        store_root,
-                                        &expected_mount,
-                                        "HEAD^{tree}",
-                                    )
-                                    .await?
-                                    else {
-                                        return Ok::<_, CowshedError>(Vec::new());
-                                    };
-                                    let Some(age) = self
-                                        .build_volumes()?
-                                        .seed_age(owner, expected_mount.clone(), tree.clone())
+                                let diagnosed = cowshed_os::timing::timed_async(
+                                    "doctor",
+                                    format!("{workspace_name}/seed-age"),
+                                    async {
+                                        let Some(tree) = git_optional_ref_oid(
+                                            store_root,
+                                            &expected_mount,
+                                            "HEAD^{tree}",
+                                        )
                                         .await?
-                                    else {
-                                        return Ok(Vec::new());
-                                    };
-                                    let mut result = seed_tree_findings(
-                                        store_root,
-                                        &workspace_name,
-                                        &age,
-                                        &tree,
-                                        &expected_mount,
-                                    )
-                                    .await?;
-                                    result.extend(seed_age_finding(
-                                        &workspace_name,
-                                        &age,
-                                        expected_mount.clone(),
-                                    ));
-                                    Ok(result)
-                                }
+                                        else {
+                                            return Ok::<_, CowshedError>(Vec::new());
+                                        };
+                                        let Some(age) = self
+                                            .build_volumes()?
+                                            .seed_age(owner, expected_mount.clone(), tree.clone())
+                                            .await?
+                                        else {
+                                            return Ok(Vec::new());
+                                        };
+                                        let mut result = seed_tree_findings(
+                                            store_root,
+                                            &workspace_name,
+                                            &age,
+                                            &tree,
+                                            &expected_mount,
+                                        )
+                                        .await?;
+                                        result.extend(seed_age_finding(
+                                            &workspace_name,
+                                            &age,
+                                            expected_mount.clone(),
+                                        ));
+                                        Ok(result)
+                                    },
+                                )
                                 .await;
                                 match diagnosed {
                                     Ok(diagnosed) => findings.extend(diagnosed),
@@ -13788,16 +13857,23 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                                 }
                             }
                             let checkout = expected_mount.clone();
-                            let links = crate::storage::lifecycle::dispatch_blocking(move || {
-                                unsettled_build_links(&checkout)
-                            })
-                            .await
-                            .map_err(|error| {
-                                CowshedError::internal(format!(
-                                    "build link inspection failed: {error}"
-                                ))
-                            })
-                            .and_then(|links| links);
+                            let links = cowshed_os::timing::timed_async(
+                                "doctor",
+                                format!("{workspace_name}/build-link"),
+                                async {
+                                    crate::storage::lifecycle::dispatch_blocking(move || {
+                                        unsettled_build_links(&checkout)
+                                    })
+                                    .await
+                                    .map_err(|error| {
+                                        CowshedError::internal(format!(
+                                            "build link inspection failed: {error}"
+                                        ))
+                                    })
+                                    .and_then(|links| links)
+                                },
+                            )
+                            .await;
                             match links {
                                 Ok(links) => {
                                     findings.extend(links.into_iter().map(|(path, unsettled)| {
@@ -13827,21 +13903,30 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         }
         // A collision names two workspaces of possibly two projects; each project reports its own
         // part and, under --repair, moves its newer member.
-        findings.extend(self.port_collision_findings().await);
+        findings.extend(
+            cowshed_os::timing::timed_value(
+                "doctor",
+                "port-collisions",
+                self.port_collision_findings(),
+            )
+            .await,
+        );
         // A blocked collection sends the operator here, so this reads gc's own preview rather than a
         // second scan that could disagree with the command that forwarded to it. A preview that
         // cannot be taken at all is itself the finding — reporting a healthy host while `gc` refuses
         // leaves the operator with no next move. It is the `--abandoned` preview, so the abandon
         // bundles a plain sweep keeps are named too; a preview deletes nothing.
-        match self
-            .substrate
-            .preview_gc(
+        match cowshed_os::timing::timed_async(
+            "doctor",
+            "gc-preview",
+            self.substrate.preview_gc(
                 &self.descriptor.repo_id,
                 crate::storage::lifecycle::StorageGcOptions {
                     abandoned_bundles: true,
                 },
-            )
-            .await
+            ),
+        )
+        .await
         {
             Ok(plan) => {
                 findings.extend(plan.root_held_mountpoints().iter().map(root_held_finding));
@@ -13957,7 +14042,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // Abandonments main's repository still keeps for work main lacks: each is named with what
         // main does not hold, so its owner lands it or supersedes it (01_storage.md). Measured the
         // way gc measures, so doctor never names one the next gc would retire.
-        match self.sweep_abandoned_refs(None, false).await {
+        match cowshed_os::timing::timed_async(
+            "doctor",
+            "abandoned-refs",
+            self.sweep_abandoned_refs(None, false),
+        )
+        .await
+        {
             Ok(sweep) => {
                 for kept in &sweep.kept {
                     findings.push(crate::api::dto::Finding {
@@ -13995,9 +14086,13 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 .map(|(_, image)| image.clone())
         {
             let counted = image.clone();
-            let extents = crate::storage::lifecycle::dispatch_blocking(move || {
-                crate::storage::apfs::extents::count_extents(&counted)
-            })
+            let extents = cowshed_os::timing::timed_async(
+                "doctor",
+                "main-extents",
+                crate::storage::lifecycle::dispatch_blocking(move || {
+                    crate::storage::apfs::extents::count_extents(&counted)
+                }),
+            )
             .await;
             findings.push(match extents {
                 Ok(Ok(extents)) => main_extents_finding(image, extents),
@@ -14017,28 +14112,32 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             })
             .collect::<Vec<_>>();
         findings.extend(
-            crate::storage::lifecycle::dispatch_blocking(move || {
-                siblings
-                    .into_iter()
-                    .filter_map(|(name, sibling)| {
-                        use std::os::unix::fs::MetadataExt;
-                        let metadata = std::fs::symlink_metadata(&sibling).ok()?;
-                        Some(crate::api::dto::Finding {
-                            code: "defrag-leftover".into(),
-                            severity: crate::api::dto::FindingSeverity::Warning,
-                            message: format!(
-                                "{} is the copy an interrupted or still-running cowshed defrag {name} was writing; it holds {} bytes",
-                                sibling.display(),
-                                metadata.blocks().saturating_mul(cowshed_apfs::SECTOR_BYTES)
-                            ),
-                            hint: format!(
-                                "cowshed defrag {name} replaces it; with no defrag running, deleting it is safe"
-                            ),
-                            path: Some(sibling),
+            cowshed_os::timing::timed_async(
+                "doctor",
+                "defrag-leftover",
+                crate::storage::lifecycle::dispatch_blocking(move || {
+                    siblings
+                        .into_iter()
+                        .filter_map(|(name, sibling)| {
+                            use std::os::unix::fs::MetadataExt;
+                            let metadata = std::fs::symlink_metadata(&sibling).ok()?;
+                            Some(crate::api::dto::Finding {
+                                code: "defrag-leftover".into(),
+                                severity: crate::api::dto::FindingSeverity::Warning,
+                                message: format!(
+                                    "{} is the copy an interrupted or still-running cowshed defrag {name} was writing; it holds {} bytes",
+                                    sibling.display(),
+                                    metadata.blocks().saturating_mul(cowshed_apfs::SECTOR_BYTES)
+                                ),
+                                hint: format!(
+                                    "cowshed defrag {name} replaces it; with no defrag running, deleting it is safe"
+                                ),
+                                path: Some(sibling),
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>()
-            })
+                        .collect::<Vec<_>>()
+                }),
+            )
             .await
             .unwrap_or_default(),
         );
@@ -14048,9 +14147,17 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         let store_root = self.descriptor.storage.store().to_path_buf();
         let repo_id = self.descriptor.repo_id.clone();
         findings.extend(
-            crate::storage::lifecycle::dispatch_blocking(move || {
-                quarantine_and_companion_findings_blocking(&store_root, &repo_id, &companion_images)
-            })
+            cowshed_os::timing::timed_async(
+                "doctor",
+                "quarantine",
+                crate::storage::lifecycle::dispatch_blocking(move || {
+                    quarantine_and_companion_findings_blocking(
+                        &store_root,
+                        &repo_id,
+                        &companion_images,
+                    )
+                }),
+            )
             .await
             .unwrap_or_default(),
         );
