@@ -67,6 +67,32 @@ index 5a59f762f2002f61f84d0966c8fb48d48b3bdce2..f190d2b93cc7c1d0f59dcb1e76ef7d3e
  function handleNoWorkspace(globalNxVersion) {
      output_1.output.log({
          title: `The current directory isn't part of an Nx workspace.`,
+diff --git a/dist/src/command-line/daemon/daemon.js b/dist/src/command-line/daemon/daemon.js
+index 237830c6863aa8c5bdab8c4794c6fc9f1e4a48b5..857a97118d646f25f61696b2db672de56f558327 100644
+--- a/dist/src/command-line/daemon/daemon.js
++++ b/dist/src/command-line/daemon/daemon.js
+@@ -7,6 +7,21 @@ const handle_import_1 = require("../../utils/handle-import");
+ const output_1 = require("../../utils/output");
+ async function daemonHandler(args) {
+     const { daemonClient } = await (0, handle_import_1.handleImport)('../../daemon/client/client.js', __dirname);
++    if (args.start && process.env.NX_DAEMON_START === 'never') {
++        // An explicit start is a start: under the rule every cowshed job runs
++        // with, it is refused as policy, never quietly honoured, or one command
++        // would recreate the daemon that outlives its job.
++        output_1.output.error({
++            title: 'Nx daemon not started: NX_DAEMON_START=never forbids this client starting a daemon',
++            bodyLines: [
++                'Every cowshed job runs under it, so no daemon outlives the job that started it.',
++                "The checkout's daemon is its keeper's to start. A test that must start its own daemon runs that one nx",
++                'without NX_DAEMON_START, through its named fixture escape (FIXTURE_STARTS_ITS_OWN_DAEMON).',
++            ],
++        });
++        // The handler's number is the command's exit code (handleErrors).
++        return 1;
++    }
+     if (args.start) {
+         const pid = await daemonClient.startInBackground();
+         output_1.output.log({
 diff --git a/dist/src/command-line/release/version/version-actions.js b/dist/src/command-line/release/version/version-actions.js
 index 006c077033a6e92a8bdcc6c732110736fb465b5a..2ac4a0252c813cec5492b7ac83e2d5160b97bc32 100644
 --- a/dist/src/command-line/release/version/version-actions.js

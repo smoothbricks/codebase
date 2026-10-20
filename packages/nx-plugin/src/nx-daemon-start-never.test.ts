@@ -7,7 +7,7 @@ import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { awaitExit, isRunning, processTable, terminate } from './testing.js';
 
 /**
- * Guards the `NX_DAEMON_START=never` hunk of `patches/nx@23.2.1.patch`. A stock client that finds no live daemon
+ * Guards the `NX_DAEMON_START=never` hunks of `patches/nx@23.2.1.patch`. A stock client that finds no live daemon
  * starts one, detached into a session of its own, and the record shares it with every client of the checkout. Cowshed
  * ends a job's whole process tree when the job ends (`specs/cowshed/11_shell.md`), so a daemon one job's client
  * started would end with that job while another job's `nx run` still used it. Every cowshed job therefore runs with
@@ -122,5 +122,34 @@ it('a client that may never start a daemon continues without one that stopped un
     } finally {
       holder.kill('SIGKILL');
     }
+  });
+});
+
+/**
+ * An explicit `nx daemon --start` calls the daemon start directly, past the implicit-start check above, so under the
+ * job's rule it is refused as policy: a non-zero exit naming `NX_DAEMON_START=never` and the fixture escape, and no
+ * daemon. The same command without the variable, which is what a test's named fixture escape runs, starts one.
+ */
+it('refuses an explicit daemon start under the job rule, and starts one without it', async () => {
+  await withNxFixture('nx-daemon-start-explicit', async ({ workspace, socketDirectory }) => {
+    await fixtureWorkspace(workspace);
+    const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'true' };
+
+    const refused = spawnSync('bun', [nxEntry, 'daemon', '--start'], {
+      cwd: workspace,
+      env: { ...env, NX_DAEMON_START: 'never' },
+      encoding: 'utf8',
+    });
+    const said = `${refused.stdout}${refused.stderr}`;
+    expect(refused.status, said).toBe(1);
+    expect(said).toContain('NX_DAEMON_START=never forbids this client starting a daemon');
+    expect(said).toContain('FIXTURE_STARTS_ITS_OWN_DAEMON');
+    expect(await recordedPid(workspace)).toBeNull();
+
+    const started = spawnSync('bun', [nxEntry, 'daemon', '--start'], { cwd: workspace, env, encoding: 'utf8' });
+    expect(started.status, `${started.stdout}${started.stderr}`).toBe(0);
+    const daemon = await recordedPid(workspace);
+    if (daemon === null) throw new Error('an explicit start without the variable left no daemon record');
+    expect(isRunning(daemon)).toBe(true);
   });
 });

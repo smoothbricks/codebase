@@ -294,7 +294,9 @@ after the client chose it; its successor belongs to its starter (cowshed's keepe
 daemon off for its own process alone (`disableDaemonForThisProcess`, never the `disabled` marker that only `nx reset`
 clears), and throws an error tagged `daemonStartForbidden` that names the variable. The project-graph builder then notes
 it and continues without the daemon; any other request in flight fails with that error. The client never calls
-`startInBackground`. Without the variable nothing changes.
+`startInBackground` implicitly, and an explicit `nx daemon --start` (`command-line/daemon/daemon.js`), which would call
+it directly, is refused as policy: exit 1 with a reason naming the variable and the test fixture escape. Without the
+variable nothing changes.
 
 `nx-daemon-start-never.test.ts` runs the installed Nx against a fixture with `NX_DAEMON=true`:
 
@@ -303,7 +305,9 @@ it and continues without the daemon; any other request in flight fails with that
 - a running daemon is used, and the record still names it;
 - a killed daemon's stale record starts nothing;
 - a record naming a live process that serves no socket: the command notes the variable and continues without a daemon,
-  the record is untouched, and no `disabled` marker is written.
+  the record is untouched, and no `disabled` marker is written;
+- `nx daemon --start` under the variable exits 1 naming it and the fixture escape, and leaves no record; without the
+  variable it starts a daemon.
 
 Drop the hunk only when cowshed no longer ends a job's tree around a shared daemon, or upstream Nx has an equivalent
 setting; retain the regression.
