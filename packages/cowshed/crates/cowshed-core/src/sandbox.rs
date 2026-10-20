@@ -2732,6 +2732,10 @@ mod tests {
         assert!(carve_back < secret);
     }
 
+    // The Seatbelt rule-ordering check and its parsers are macOS-only: Seatbelt is macOS's
+    // sandbox (Linux runs unsandboxed, 04_sandbox.md), and rendering the git roles resolves the
+    // host's active developer directory, which only macOS has.
+    #[cfg(target_os = "macos")]
     /// One rendered rule: whether it allows or denies, the file operations it names, and the
     /// `(kind "path")` filters it holds.
     struct FileRule<'a> {
@@ -2740,6 +2744,7 @@ mod tests {
         filters: Vec<(&'a str, &'a str)>,
     }
 
+    #[cfg(target_os = "macos")]
     fn file_rule(line: &str) -> Option<FileRule<'_>> {
         let (allow, rest) = line
             .strip_prefix("(allow ")
@@ -2769,6 +2774,7 @@ mod tests {
     }
 
     /// `file-read*` covers `file-read-data`; each operation covers itself.
+    #[cfg(target_os = "macos")]
     fn operations_overlap(allow: &[&str], deny: &[&str]) -> bool {
         let covers = |wide: &str, narrow: &str| {
             wide == narrow
@@ -2783,6 +2789,7 @@ mod tests {
 
     /// Whether every path `allow` matches lies within what `deny` matches: an allow beside or
     /// above a deny is the broad rule the deny narrows, one at or beneath it is undone by it.
+    #[cfg(target_os = "macos")]
     fn filter_within((allow_kind, allow): (&str, &str), (deny_kind, deny): (&str, &str)) -> bool {
         match deny_kind {
             "subpath" => allow == deny || allow.starts_with(&format!("{deny}/")),
@@ -2797,6 +2804,7 @@ mod tests {
     /// jobserver. Rendered with every carve-back under a protected root that a workspace has —
     /// its pool directory, a store socket, a store temp dir — for every role and mode, no such
     /// allow precedes any deny.
+    #[cfg(target_os = "macos")]
     #[test]
     fn no_allow_precedes_a_deny_that_covers_it() {
         let pool = cowshed_gateway_types::cpu_pool_directory(
