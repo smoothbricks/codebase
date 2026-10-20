@@ -82,8 +82,8 @@ import {
 import { runtimeInput, shellWord } from './runtime-input.js';
 import { isNonSourceDirectory } from './source-directories.js';
 import { postTasksExecution as postTaskResults, preTasksExecution as preTaskResults } from './task-results.js';
-import { assertUpstreamBasePrecondition } from './test-walk-policy.js';
 import { SHARD_TIMINGS_EXECUTOR, SHARD_TIMINGS_TARGET, timingsShardedSuite } from './test-timings.js';
+import { assertUpstreamBasePrecondition } from './test-walk-policy.js';
 import {
   isBuildOutputTargetName,
   isTestRunnerTargetName,
