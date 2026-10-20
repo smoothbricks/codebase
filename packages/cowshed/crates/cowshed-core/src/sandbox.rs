@@ -2951,7 +2951,7 @@ mod tests {
                 SandboxProfileRole::GitDiscovery,
                 SandboxProfileRole::GitDiscoveryGitOnly,
             ] {
-                let profile = seatbelt_profile(&config, role).unwrap();
+                let profile = seatbelt_profile(&config, role).unwrap().into_text();
                 let rules = profile.lines().filter_map(file_rule).collect::<Vec<_>>();
                 assert!(
                     rules.iter().any(|rule| !rule.allow
