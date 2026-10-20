@@ -1049,11 +1049,12 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
    refuse the retire after main had already moved.
 2. **Validate**: run the check _inside the sandbox_ — `--check <cmd>` if given, else no validation with one honest
    `cowshed:` stderr line saying so. Non-zero check → exit 4, workspace intact, output captured as a job (11_shell.md)
-   for diagnosis. The check is an ordinary sandboxed exec and gets exactly the environment one gets (04_sandbox.md): the
-   workspace's optional activated shell over cowshed's own job contract — the bootstrap `PATH` of the
-   `direnv`/`devenv`/`nix` packages and system directories, plus a private `HOME`. A verify command that needs more
-   needs it wired into the workspace, not leaked from the caller's shell; the check runs where the work was done, and a
-   check that only passes in the coordinator's environment has not validated the workspace.
+   for diagnosis. The check is an ordinary sandboxed exec, admitted at gate class as the land's own work (05_gateway.md,
+   "A land is a gate job"), and gets exactly the environment one gets (04_sandbox.md): the workspace's optional
+   activated shell over cowshed's own job contract — the bootstrap `PATH` of the `direnv`/`devenv`/`nix` packages and
+   system directories, plus a private `HOME`. A verify command that needs more needs it wired into the workspace, not
+   leaked from the caller's shell; the check runs where the work was done, and a check that only passes in the
+   coordinator's environment has not validated the workspace.
 
    Write checks as **bare commands** — `just verify`, `cargo test --workspace`. The sandbox `PATH` already _is_ the
    project's pinned toolchain, resolved to store paths, so wrapping a check in `devenv shell --` or a direnv

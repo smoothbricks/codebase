@@ -16254,7 +16254,8 @@ impl CheckedLandChecks {
     }
 }
 
-/// The job one `land --check` command runs as: an ordinary read-write child of the workspace.
+/// The job one `land --check` command runs as: a read-write child of the workspace, at gate class
+/// like the land's other own jobs (05_gateway.md, "A land is a gate job").
 ///
 /// It carries no environment of its own, so a check builds the units an interactive command
 /// builds. Forcing `CARGO_INCREMENTAL=0` here once made every workspace member a separate unit,
@@ -16275,7 +16276,7 @@ fn land_check_request(check: &str) -> ExecRequest {
         stdout_copy: None,
         stderr_copy: None,
         admission_key: None,
-        class: crate::api::dto::ExecClass::Background,
+        class: crate::api::dto::ExecClass::Gate,
         want: NonZeroUsize::MIN,
         scope: crate::api::dto::ExecScope::Workspace,
     }
@@ -16290,6 +16291,17 @@ mod land_check_tests {
     #[test]
     fn a_land_check_leaves_incremental_to_the_profile() {
         assert!(land_check_request("cargo test").env.is_empty());
+    }
+
+    /// A land's check is the land's own work, so it waits behind no background work: at
+    /// background class it queued behind one long-lived background job on a three-token host,
+    /// whose background room is that one token, and the land never reached its adoption.
+    #[test]
+    fn a_land_check_is_gate_class_work() {
+        assert_eq!(
+            land_check_request("cargo test").class,
+            crate::api::dto::ExecClass::Gate
+        );
     }
 }
 

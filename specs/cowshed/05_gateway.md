@@ -816,11 +816,18 @@ core count.
   orchestrator starts on its floor token, the older land's tasks take every returned token they want, the younger land's
   tasks take what the older one does not ask for, and the younger takes the older one's place when it completes. Neither
   is preempted: a running task of either keeps its grant. The jobs the land's own cowshed steps start are gate-class
-  work too, since the land lock waits on each of them: the rebase carry's task-hash computation, which the lander asks
-  for with `cowshed rebase --gate`, and `cowshed land`'s Nx cache initialization (16_build_volumes.md, "Carry" and
-  "Rebase carry"). Measured 2026-10-19 with both at background class: a land's task-hash job waited 21 s in the
-  background queue with no other gate running, and in one repository the same computation took 48 s on one land and 297
-  s on the next, while that repository's whole land queue waited behind it.
+  work too, since the land waits on each of them: the rebase carry's task-hash computation, which the lander asks for
+  with `cowshed rebase --gate`, `cowshed land`'s Nx cache initialization (16_build_volumes.md, "Carry" and "Rebase
+  carry"), and each `cowshed land --check` command (02_workspaces.md, "`cowshed land`" step 2). Measured 2026-10-19 with
+  the first two at background class: a land's task-hash job waited 21 s in the background queue with no other gate
+  running, and in one repository the same computation took 48 s on one land and 297 s on the next, while that
+  repository's whole land queue waited behind it. Measured 2026-10-20 with `--check` at background class, on a
+  three-token ledger (the macOS arm64 CI runner), whose background room is one token ("Room for a gate"): one long-lived
+  ordinary background job held that token, and the land's check waited at `check-wait` for the job to end, while the job
+  was waiting for the land, so the land never reached its adoption. That is the starvation the room exists to remove, at
+  the smallest host: on a host of three tokens or fewer, one ordinary long-lived background job keeps every other
+  background exec waiting until it ends. A process that stays up idle between work is a resident ("A resident holds no
+  token") and holds none; a land's own jobs never contest the background room at all.
 - **A job lives with its requester** (2026-10-18, Danny tg#7386: "cowshed gateway is supposed to background every
   landing queued and not cause load that slows down the head of the queue"). A foreground job's only consumer is the
   process that asked for it, so when that process is gone the job stops and its tokens return. A gate job's verdict

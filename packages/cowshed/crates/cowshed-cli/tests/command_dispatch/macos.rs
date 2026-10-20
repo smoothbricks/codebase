@@ -27,8 +27,8 @@ use cowshed_core::storage::apfs::{ApfsSubstrateConfig, build_volume_label};
 use cowshed_core::storage::bootstrap::{CanonicalRoots, ValidatedHostStorage};
 use cowshed_core::{ErrorCode, Result};
 use cowshed_gateway::{
-    ArrowAuditConfig, ArrowAuditSink, Gateway, GatewayConfig, KeychainCredentialProvider,
-    MirrorCacheConfig, SystemConnector,
+    ArrowAuditConfig, ArrowAuditSink, CpuBudgetLimits, Gateway, GatewayConfig,
+    KeychainCredentialProvider, MirrorCacheConfig, SystemConnector,
 };
 use cowshed_os::test_backstop::NO_PROGRESS;
 use std::ffi::OsString;
@@ -91,6 +91,10 @@ struct Fixture {
     storage: ValidatedHostStorage,
     granted: PathBuf,
     gateway: Option<Gateway>,
+    /// The tokens its gateway's CPU ledger serves: the host's by default, or a fixed small
+    /// host's, so a scenario whose admission depends on the host's size runs as a small CI
+    /// runner runs it.
+    cpu_budget: CpuBudgetLimits,
 }
 
 impl Fixture {
@@ -136,6 +140,7 @@ impl Fixture {
             storage,
             granted,
             gateway: None,
+            cpu_budget: CpuBudgetLimits::default(),
         }
     }
 
@@ -178,6 +183,7 @@ impl Fixture {
         let config = GatewayConfig {
             control_socket: Some(self.storage.store().join("gateway.sock")),
             mirror_cache: MirrorCacheConfig::new(cache),
+            cpu_budget: self.cpu_budget,
             ..GatewayConfig::default()
         };
         let connector =
@@ -3739,9 +3745,16 @@ async fn directory_an_open_cache_reader_allows_seed_capture_and_adoption_substra
 /// A job admitted before an adoption keeps the volume it was admitted with: its working
 /// directory stays in main's previous volume, which therefore stays until the job exits. A job
 /// admitted afterwards resolves main's link to the adopted volume (16_build_volumes.md, "Process
-/// lifetime across a swap", "Garbage collection"). The first job holds its tokens while later
-/// jobs run, so both draw on the fixture gateway's ledger, never on a pool this test's runner
-/// holds, whose single token the first job would keep from them ([`holds_no_cpu_pool`]).
+/// lifetime across a swap", "Garbage collection").
+///
+/// The job that runs across the adoption is a loop that sleeps between ticks: a resident, which
+/// holds no CPU token for its lifetime (05_gateway.md, "A resident holds no token"). The ledger
+/// has three tokens, as the macOS arm64 CI runner has, so its background room is one token
+/// ("Room for a gate"). Run as an ordinary background job, the loop held that token, so the
+/// land's `--check` job queued behind it at `check-wait` and the land never reached its adoption:
+/// it hung on that runner until the idle bound, twice, and hung the same way here with this
+/// ledger at three tokens, while at four it passed. The jobs draw on that fixture ledger, never on
+/// a pool this test's runner holds ([`holds_no_cpu_pool`]), so every run sees the runner's room.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_jobs_get_the_new_one()
  {
@@ -3757,6 +3770,9 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
         nx: None,
         rust: Some(&rust),
     });
+    fixture.cpu_budget = CpuBudgetLimits {
+        tokens: std::num::NonZeroUsize::new(3).expect("three tokens"),
+    };
     let mut service = serve_project(&mut fixture, &[]).await;
     assert_target_on_build_volume(&fixture.checkout);
     let layout = build_volumes(&fixture);
@@ -3770,7 +3786,17 @@ async fn directory_a_job_running_across_an_adoption_keeps_its_volume_and_later_j
     );
     succeed(
         &mut service,
-        ["exec", "main", "--background", "--", "/bin/sh", "-c", &job],
+        [
+            "exec",
+            "main",
+            "--background",
+            "--class",
+            "resident",
+            "--",
+            "/bin/sh",
+            "-c",
+            &job,
+        ],
     )
     .await;
     let ticks = old_mount.join("target/ticking/ticks");
