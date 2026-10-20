@@ -420,6 +420,110 @@ async fn host_controller_unix_sockets_are_admitted_in_the_workspace_tree_only() 
     std::fs::remove_dir_all(outside).expect("remove host socket directory");
 }
 
+/// What the sandboxed child met in its CPU pool directory, one line per probe.
+const CPU_POOL_PROBE: &str = r#"fifo=$1 file=$2 directory=$3
+if token=$( (exec 3<>"$fifo" && dd bs=1 count=1 <&3 2>/dev/null) 2>&1 ); then
+  printf 'fifo:%s\n' "$token"
+else
+  printf 'fifo refused: %s\n' "$token"
+fi
+if cat "$file" >/dev/null 2>&1; then echo 'file read'; else echo 'file refused'; fi
+if ls "$directory" >/dev/null 2>&1; then echo 'directory listed'; else echo 'directory refused'; fi
+parent=$(dirname "$directory")
+if ls "$parent" >/dev/null 2>&1; then echo 'pools listed'; else echo 'pools refused'; fi
+"#;
+
+/// A job's grant names its jobserver fifo and pool socket in the workspace's CPU pool directory
+/// (05_gateway.md "The jobserver fifo"), which lies behind a protected-root deny: the store's
+/// `/private/cowshed` on a host, the mount root here, which the profile denies at the same point
+/// and a fixture can write. The sandboxed child opens the fifo read-write and takes a token from
+/// it, and connects to the pool socket; a regular file beside them stays unreadable, and neither
+/// the directory nor the one holding sibling workspaces' pool directories is listable. A profile
+/// that emits the pool rules before that deny refuses the fifo with EPERM, and Cargo then runs
+/// outside the CPU budget.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_job_opens_its_jobserver_fifo_and_pool_socket_and_nothing_else_there() {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let root = short_scratch("cpu-pool");
+    let mut sandbox = workspace(&root, 41_152);
+    let pool = cowshed_gateway_types::cpu_pool_directory(
+        &sandbox.mount_root.join("store"),
+        "0198f2c0b7e34dc795f17b238b331c80",
+    )
+    .expect("pool directory");
+    std::fs::create_dir_all(&pool).expect("pool directory");
+    std::fs::set_permissions(&pool, std::fs::Permissions::from_mode(0o700))
+        .expect("pool directory mode");
+    let fifo = pool.join("job.fifo");
+    let raw = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: `raw` is a NUL-terminated path that outlives the call.
+    assert_eq!(
+        unsafe { libc::mkfifo(raw.as_ptr(), 0o600) },
+        0,
+        "mkfifo {}: {}",
+        fifo.display(),
+        std::io::Error::last_os_error()
+    );
+    // The holder's end keeps the fifo's bytes alive, as the gateway's does for a grant of 3.
+    let mut holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .expect("the holder's end of the fifo");
+    holder.write_all(b"ab").expect("two token bytes");
+    let socket = pool.join("pool.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("pool listener");
+    let file = pool.join("regular");
+    std::fs::write(&file, "not a token").expect("regular file beside the fifo");
+    sandbox.cpu_pool_directory = Some(pool.clone());
+    install_real_tool(&sandbox, "node");
+
+    let (exit, stdout, stderr) = run_in_sandbox(
+        &sandbox,
+        &sandbox.workspace_mount,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            CPU_POOL_PROBE.into(),
+            "probe".into(),
+            fifo.clone().into_os_string(),
+            file.into_os_string(),
+            pool.clone().into_os_string(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        exit,
+        ExitStatus::Exited { code: 0 },
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // Both doors are asserted at once, so a refusal names every rule it broke.
+    let connected = unix_socket_probe(&sandbox, "connect", &socket).await;
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&stdout).as_ref(),
+            connected.as_str()
+        ),
+        (
+            "fifo:a\nfile refused\ndirectory refused\npools refused\n",
+            "connected"
+        )
+    );
+    let mut left = [0; 2];
+    assert_eq!(
+        holder.read(&mut left).expect("the token the child left"),
+        1,
+        "the child took exactly one token from the real fifo"
+    );
+    assert_eq!(&left[..1], b"b");
+    std::fs::remove_dir_all(root).expect("remove test workspace");
+}
+
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_private_environment_symlinks_cannot_redirect_host_preparation() {

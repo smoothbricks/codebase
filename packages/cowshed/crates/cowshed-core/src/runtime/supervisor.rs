@@ -595,6 +595,20 @@ pub struct CpuPlacement {
     pub nice: i32,
 }
 
+/// The make flags a held grant exports to Cargo and make, ahead of its fifo's path.
+const JOBSERVER_FIFO_FLAGS: &str = "-j --jobserver-auth=fifo:";
+
+/// The jobserver fifo a command's environment names as its grant's, read back from the
+/// `CARGO_MAKEFLAGS` [`CpuPlacement::environment`] sets. The exec host, the first process inside
+/// the sandbox, opens it before the command runs and says on the job's stderr when it cannot.
+pub fn granted_jobserver_fifo(environment: &BTreeMap<OsString, OsString>) -> Option<&Path> {
+    environment
+        .get(OsStr::new("CARGO_MAKEFLAGS"))?
+        .as_bytes()
+        .strip_prefix(JOBSERVER_FIFO_FLAGS.as_bytes())
+        .map(|fifo| Path::new(OsStr::from_bytes(fifo)))
+}
+
 impl CpuPlacement {
     /// The variables only the grant's authority sets, laid over the caller's: a caller cannot
     /// name a pool, a count or a jobserver it was not granted. The fifo is the pool's own, whose
@@ -616,7 +630,7 @@ impl CpuPlacement {
             ),
         ];
         if let Some(held) = &self.held {
-            let mut flags = OsString::from("-j --jobserver-auth=fifo:");
+            let mut flags = OsString::from(JOBSERVER_FIFO_FLAGS);
             flags.push(&held.fifo);
             environment.push((OsString::from("CARGO_MAKEFLAGS"), flags.clone()));
             environment.push((OsString::from("MAKEFLAGS"), flags));
@@ -720,6 +734,27 @@ mod cpu_placement_tests {
                 ("BOUNDED_EXEC_CPU_TOKENS", "0"),
             ])
         );
+    }
+
+    /// The exec host reads back the fifo a held grant exported, and none where no grant set one.
+    #[test]
+    fn the_granted_fifo_is_read_back_from_the_exported_flags() {
+        let environment = |placement: &CpuPlacement| -> BTreeMap<OsString, OsString> {
+            placement
+                .environment(&BTreeMap::new())
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(
+            granted_jobserver_fifo(&environment(&placement(Some(3)))),
+            Some(Path::new("/pool/j"))
+        );
+        assert_eq!(granted_jobserver_fifo(&environment(&placement(None))), None);
+        let foreign = BTreeMap::from([(
+            OsString::from("CARGO_MAKEFLAGS"),
+            OsString::from("-j4 --jobserver-auth=3,4"),
+        )]);
+        assert_eq!(granted_jobserver_fifo(&foreign), None);
     }
 }
 

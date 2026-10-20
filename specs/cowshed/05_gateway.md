@@ -1070,13 +1070,26 @@ core count.
   - **A pool's end.** A pool's close drains its fifo and unlinks it. A Cargo that outlives it keeps its open descriptor
     and runs over budget until it ends, as a runner does across a gateway restart; a Cargo started after it finds no
     fifo and runs unconfigured.
+  - **A fifo the command cannot open is reported, never silent.** A command that cannot open its grant's fifo — a
+    sandbox profile that does not admit it, a fifo gone — runs, and every Cargo it starts runs without the jobserver,
+    outside the CPU budget. Cargo says so itself on stderr,
+    `failed to connect to jobserver from environment variable CARGO_MAKEFLAGS=… (os error N)`, naming the fifo and the
+    errno, and nothing of cowshed's filters that line. A warm exec host, the first process inside the sandbox, opens the
+    fifo read-write and non-blocking once before each command and on failure writes
+    `cowshed: the job's CPU jobserver fifo <path> cannot be opened in the sandbox (<error>); Cargo will run without it, outside the CPU budget`
+    on the job's stderr; the command still runs. A one-shot child (a workspace without an exec host) runs no cowshed
+    code inside the sandbox before its command, so Cargo's own line is its report. Until 2026-10-20 every sandboxed
+    Cargo met this: the profile emitted the pool directory's rules before the `/private/cowshed` deny, which re-denied
+    the fifo's open with EPERM (04_sandbox.md).
 
   Held over the gateway's real socket with no Cargo (`cowshed-gateway`'s `tests/jobserver_fifo.rs`): a job grant of `g`
   names a fifo beside its pool socket holding `g − 1` bytes; its socket lends the fifo's bytes first and the holder's
   token last, a child waits while a reader standing in for Cargo holds the bytes and is granted when they are written
   back, a closed child's tokens reach the next, and the host ledger holds `g` alone throughout. What a job's command
-  receives is `CpuPlacement::environment`'s unit test. How Cargo reads a jobserver is Cargo's own to test; an end-to-end
-  proof with real Cargo belongs in a nightly, not the gate.
+  receives is `CpuPlacement::environment`'s unit test. That the sandbox opens the fifo and the pool socket and nothing
+  else in the pool directory is `cowshed-core`'s `devenv_runtime_dir.rs` host-controller probe under the real profile,
+  and that a fifo it refuses is reported while the command runs is `cowshed-shell`'s `shell_pool.rs`. How Cargo reads a
+  jobserver is Cargo's own to test; an end-to-end proof with real Cargo belongs in a nightly, not the gate.
 
 - **A runner no jobserver sizes.** A grant bounds what reads its fifo and its test variables, nothing else.
   `cargo mutants` hands every cargo it starts a jobserver of its own, `--jobserver-tasks` tokens, one per core by
@@ -1103,14 +1116,14 @@ holds its own; refusals, among them a `jobserver` request and a `cpu-pool` ask n
 a holder at background's whole room whose child, queued at the saturated host, is granted at once when asked with the
 holder's pool, its host ask withdrawn and the host ledger unchanged, while a pool that answers and refuses refuses its
 child and an unreachable one leaves it to the host; a one-token holder whose token a sibling holds has its exec granted
-by the host when the host has room, and the pool's next child is lent the token at once; with the host full and the
-pool busy, the exec waits in the ledger and is granted by whichever frees first, a pool grant leaving the ledger's
-queue); the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
+by the host when the host has room, and the pool's next child is lent the token at once; with the host full and the pool
+busy, the exec waits in the ledger and is granted by whichever frees first, a pool grant leaving the ledger's queue);
+the plugin's `cpu-tokens.test.ts` (each runner's `want` and sizing, a killed holder closing its grant) and
 `executor.test.ts` (a granted run sized and released, a refused one run as asked, a target's jobserver variables ignored
 for the run's own fifo); `cpu-pool.test.ts` (a request naming `grow` refused like any other unknown field) and the
 gateway's lent-pool test (a pool's fifo holds `g − 1` bytes, a child is lent the implicit token while a reader holds the
-bytes, the next child waits until the reader writes them back, a child's close puts them back); `tests/jobserver_fifo.rs`
-(above); and the band tests: each class runs in its own band at its own nice whatever the
+bytes, the next child waits until the reader writes them back, a child's close puts them back);
+`tests/jobserver_fifo.rs` (above); and the band tests: each class runs in its own band at its own nice whatever the
 host's state — interactive above gate above background — and gate work is served returned tokens ahead of interactive
 and background work.
 

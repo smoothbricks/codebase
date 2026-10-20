@@ -802,27 +802,6 @@ pub fn seatbelt_profile(
     // which no job may write (every host process's temp files live there): `mktemp` under a
     // devenv shell then picked one and failed with EPERM instead of using the job's temp dir.
 
-    if let Some(directory) = &config.cpu_pool_directory {
-        let directory = sbpl_path(directory)?;
-        push_line(
-            &mut profile,
-            &format!(
-                "(allow network-outbound (remote unix-socket (path-prefix \"{directory}/\")))"
-            ),
-        );
-        push_line(
-            &mut profile,
-            &format!("(allow file-read-metadata (subpath \"{directory}\"))"),
-        );
-        // A pool's make jobserver fifo lives beside its socket (05_gateway.md "Cargo reads its
-        // holder's jobserver"): its tokens are read and written back, and nothing else there is.
-        push_line(
-            &mut profile,
-            &format!(
-                "(allow file-read-data file-write-data (require-all (subpath \"{directory}\") (vnode-type FIFO)))"
-            ),
-        );
-    }
     for socket in &sockets {
         push_line(
             &mut profile,
@@ -955,6 +934,38 @@ pub fn seatbelt_profile(
     // outbound rule is ever consulted.
     for socket in &sockets {
         push_readable_ancestors(&mut profile, socket)?;
+    }
+    // The workspace's CPU pool directory, `<store>/run/cpu/<incarnation>` (05_gateway.md "The
+    // jobserver fifo"), sits behind the `/private/cowshed` deny, so its rules land here for the
+    // reason the socket ancestors above do: emitted before that deny, last-match-wins re-denied
+    // the jobserver FIFO's open with EPERM, and Cargo ran outside the CPU budget. The profile is
+    // rendered per workspace, not per job, so no job's fifo can be a literal here: the scope is
+    // this workspace's own pool directory, and inside it only FIFOs open and only sockets connect.
+    // Its ancestors and entries resolve by metadata, as the installed cowshed's do: neither the
+    // directory nor `run/cpu`, where sibling workspaces' directories sit, is listable.
+    if let Some(directory) = &config.cpu_pool_directory {
+        for ancestor in directory.ancestors().skip(1) {
+            push_literal_rule(&mut profile, "allow file-read-metadata", ancestor)?;
+        }
+        let directory = sbpl_path(directory)?;
+        push_line(
+            &mut profile,
+            &format!("(allow file-read-metadata (subpath \"{directory}\"))"),
+        );
+        push_line(
+            &mut profile,
+            &format!(
+                "(allow network-outbound (remote unix-socket (path-prefix \"{directory}/\")))"
+            ),
+        );
+        // Its jobserver fifo's tokens are read and written back (05_gateway.md "Cargo reads its
+        // holder's jobserver"), and nothing else there is.
+        push_line(
+            &mut profile,
+            &format!(
+                "(allow file-read-data file-write-data (require-all (subpath \"{directory}\") (vnode-type FIFO)))"
+            ),
+        );
     }
     // Every tool-specific authority is a detected capability's contribution (15_capabilities.md):
     // its shared caches with their access where the host keeps them, their ancestors beneath HOME
@@ -2719,6 +2730,128 @@ mod tests {
         let secret = profile.rfind("/Users/tester/.ssh").unwrap();
         assert!(grant < secret);
         assert!(carve_back < secret);
+    }
+
+    /// One rendered rule: whether it allows or denies, the file operations it names, and the
+    /// `(kind "path")` filters it holds.
+    struct FileRule<'a> {
+        allow: bool,
+        operations: Vec<&'a str>,
+        filters: Vec<(&'a str, &'a str)>,
+    }
+
+    fn file_rule(line: &str) -> Option<FileRule<'_>> {
+        let (allow, rest) = line
+            .strip_prefix("(allow ")
+            .map(|rest| (true, rest))
+            .or_else(|| line.strip_prefix("(deny ").map(|rest| (false, rest)))?;
+        let operations = rest
+            .split_whitespace()
+            .take_while(|token| !token.starts_with('('))
+            .filter(|operation| operation.starts_with("file-"))
+            .collect::<Vec<_>>();
+        let mut filters = Vec::new();
+        for kind in ["subpath", "literal", "path-prefix"] {
+            let opener = format!("({kind} \"");
+            let mut text = rest;
+            while let Some(start) = text.find(&opener) {
+                let path = &text[start + opener.len()..];
+                let end = path.find('"').expect("a quoted filter path closes");
+                filters.push((kind, &path[..end]));
+                text = &path[end..];
+            }
+        }
+        Some(FileRule {
+            allow,
+            operations,
+            filters,
+        })
+    }
+
+    /// `file-read*` covers `file-read-data`; each operation covers itself.
+    fn operations_overlap(allow: &[&str], deny: &[&str]) -> bool {
+        let covers = |wide: &str, narrow: &str| {
+            wide == narrow
+                || wide
+                    .strip_suffix('*')
+                    .is_some_and(|stem| narrow.starts_with(stem))
+        };
+        allow
+            .iter()
+            .any(|a| deny.iter().any(|d| covers(a, d) || covers(d, a)))
+    }
+
+    /// Whether every path `allow` matches lies within what `deny` matches: an allow beside or
+    /// above a deny is the broad rule the deny narrows, one at or beneath it is undone by it.
+    fn filter_within((allow_kind, allow): (&str, &str), (deny_kind, deny): (&str, &str)) -> bool {
+        match deny_kind {
+            "subpath" => allow == deny || allow.starts_with(&format!("{deny}/")),
+            "path-prefix" => allow.starts_with(deny),
+            _ => allow == deny && allow_kind != "path-prefix",
+        }
+    }
+
+    /// SBPL is last-match-wins, so an allow at or beneath a later deny of an overlapping file
+    /// operation is dead: the deny re-denies it. The CPU pool directory's jobserver fifo rule sat
+    /// before the `/private/cowshed` deny and Cargo inside every sandbox ran without its
+    /// jobserver. Rendered with every carve-back under a protected root that a workspace has —
+    /// its pool directory, a store socket, a store temp dir — for every role and mode, no such
+    /// allow precedes any deny.
+    #[test]
+    fn no_allow_precedes_a_deny_that_covers_it() {
+        let pool = cowshed_gateway_types::cpu_pool_directory(
+            Path::new("/private/cowshed/store"),
+            "0198f2c0b7e34dc795f17b238b331c80",
+        )
+        .unwrap();
+        let fifos = format!(
+            "(allow file-read-data file-write-data (require-all (subpath \"{}\") (vnode-type FIFO)))",
+            pool.display()
+        );
+        for mode in [RunSandboxMode::ReadOnly, RunSandboxMode::ReadWrite] {
+            let mut config = config(mode);
+            config.cpu_pool_directory = Some(pool.clone());
+            config
+                .allowed_unix_sockets
+                .push(PathBuf::from("/private/cowshed/store/daemon.sock"));
+            config.exec_temp_dir = PathBuf::from("/private/cowshed/store/acme/widget/tmp/raven");
+            for role in [
+                SandboxProfileRole::TrustedSupervisor,
+                SandboxProfileRole::ExecutedChild,
+                SandboxProfileRole::GitDiscovery,
+                SandboxProfileRole::GitDiscoveryGitOnly,
+            ] {
+                let profile = seatbelt_profile(&config, role).unwrap();
+                let rules = profile.lines().filter_map(file_rule).collect::<Vec<_>>();
+                assert!(
+                    rules.iter().any(|rule| !rule.allow
+                        && rule.filters.contains(&("subpath", "/private/cowshed"))),
+                    "{mode:?} {role:?} denies the protected store root"
+                );
+                let mut dead = Vec::new();
+                for (index, deny) in rules.iter().enumerate().filter(|(_, rule)| !rule.allow) {
+                    for allow in rules[..index].iter().filter(|rule| rule.allow) {
+                        if operations_overlap(&allow.operations, &deny.operations)
+                            && allow.filters.iter().any(|allowed| {
+                                deny.filters
+                                    .iter()
+                                    .any(|denied| filter_within(*allowed, *denied))
+                            })
+                        {
+                            dead.push(format!(
+                                "{:?} {:?} before {:?}",
+                                allow.operations, allow.filters, deny.filters
+                            ));
+                        }
+                    }
+                }
+                assert!(dead.is_empty(), "{mode:?} {role:?}: {dead:#?}");
+                assert!(
+                    profile.contains(&fifos),
+                    "{mode:?} {role:?} opens the pool's fifos"
+                );
+            }
+        }
     }
 
     #[test]

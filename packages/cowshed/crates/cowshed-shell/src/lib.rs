@@ -28,6 +28,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
@@ -205,6 +206,34 @@ fn reply(socket: &UnixStream, frame: FrameWriter) -> io::Result<()> {
     socket.write_all(&frame.finish()?)
 }
 
+/// Opens the grant's jobserver fifo the command's environment names, once, as Cargo will: read
+/// and write, without blocking. This host is the first process inside the sandbox, so a fifo it
+/// cannot open is one the command's Cargo cannot either, and that Cargo runs without it, outside
+/// the CPU budget (05_gateway.md "Cargo reads its holder's jobserver"). That is said on the job's
+/// stderr before the command runs, and the command still runs.
+fn report_unopenable_jobserver(
+    environment: &BTreeMap<OsString, OsString>,
+    stderr: &OwnedFd,
+) -> io::Result<()> {
+    let Some(fifo) = cowshed_core::runtime::supervisor::granted_jobserver_fifo(environment) else {
+        return Ok(());
+    };
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(fifo);
+    if let Err(error) = opened {
+        writeln!(
+            std::fs::File::from(stderr.try_clone()?),
+            "cowshed: the job's CPU jobserver fifo {} cannot be opened in the sandbox ({error}); \
+             Cargo will run without it, outside the CPU budget",
+            fifo.display()
+        )?;
+    }
+    Ok(())
+}
+
 impl Host {
     fn handle(
         &mut self,
@@ -264,6 +293,7 @@ impl Host {
                 #[cfg(target_os = "macos")]
                 let hold = ObservationHold::take(&mut descriptors)?;
                 let environment = self.command_environment(&cwd, &overlay)?;
+                report_unopenable_jobserver(&environment, &stderr)?;
                 script::run(
                     socket,
                     utf8(text)?,
@@ -501,6 +531,7 @@ impl Host {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "empty argv"));
         };
         let environment = self.command_environment(cwd, overlay)?;
+        report_unopenable_jobserver(&environment, &stderr)?;
         let diagnostics = stderr.try_clone()?;
         let mut command = Command::new(OsStr::from_bytes(program));
         command

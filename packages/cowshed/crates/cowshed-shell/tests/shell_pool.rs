@@ -55,17 +55,21 @@ fn shell_host() -> PathBuf {
     )
 }
 
-/// The pool and jobserver fifo every test grant names; the commands here only read their names.
+/// The pool every test grant names; the commands here only read its name.
 const TEST_POOL: &str = "/nonexistent/cowshed-test-cpu-pool.sock";
-const TEST_FIFO: &str = "/nonexistent/cowshed-test-cpu-pool.fifo";
 
 /// The gateway's CPU budget for these tests: each request is granted its whole want at once, and
-/// a resident is granted its pool alone, as the gateway answers one.
+/// a resident is granted its pool alone, as the gateway answers one. A held grant's jobserver is
+/// `fifo`, a real one in the workspace's pool directory, which its exec host opens before every
+/// command (05_gateway.md "Cargo reads its holder's jobserver").
 #[derive(Debug)]
-struct GrantingCpu;
+struct GrantingCpu {
+    fifo: PathBuf,
+}
 
 impl JobCpuAdmission for GrantingCpu {
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
+        let fifo = self.fifo.clone();
         Box::pin(async move {
             let pool = PathBuf::from(TEST_POOL);
             Ok(match ask.class {
@@ -75,7 +79,7 @@ impl JobCpuAdmission for GrantingCpu {
                 ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
                     let held = HeldTokens {
                         tokens: ask.want,
-                        fifo: PathBuf::from(TEST_FIFO),
+                        fifo,
                     };
                     JobCpuGrant::new(held, pool, Box::new(()))
                 }
@@ -123,7 +127,7 @@ impl Workspace {
             mode: cowshed_core::sandbox::RunSandboxMode::ReadWrite,
             grants: SandboxGrants::default(),
             allowed_unix_sockets: Vec::new(),
-            cpu_pool_directory: None,
+            cpu_pool_directory: Some(Self::pool_directory(root)),
             additional_denies: Vec::new(),
             shed_links: Vec::new(),
             git_worktree_repository: None,
@@ -131,6 +135,20 @@ impl Workspace {
             repository_caches: Vec::new(),
             capabilities: Default::default(),
         }
+    }
+
+    /// The workspace's CPU pool directory under its fixture store, as the gateway names one.
+    fn pool_directory(root: &Path) -> PathBuf {
+        cowshed_gateway_types::cpu_pool_directory(
+            &root.join("store"),
+            authority(1).workspace_incarnation.as_str(),
+        )
+        .expect("pool directory")
+    }
+
+    /// The jobserver fifo every held grant of this workspace names.
+    fn jobserver(&self) -> PathBuf {
+        Self::pool_directory(&self.root).join("job.fifo")
     }
 
     fn new(label: &str, port_base: u16) -> Self {
@@ -153,6 +171,9 @@ impl Workspace {
         let exec_temp_dir = root.join("tmp");
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir_all(&exec_temp_dir).expect("exec temp dir");
+        let pool = Self::pool_directory(&root);
+        std::fs::create_dir_all(&pool).expect("pool directory");
+        fifo(&pool.join("job.fifo"));
         let installed = std::env::split_paths(&std::env::var_os("PATH").expect("host PATH"))
             .map(|directory| directory.join("direnv"))
             .find(|candidate| candidate.is_file())
@@ -210,7 +231,9 @@ impl Workspace {
             volume_labels: None,
             workspace_volume: None,
             job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
-            cpu: Arc::new(GrantingCpu),
+            cpu: Arc::new(GrantingCpu {
+                fifo: self.jobserver(),
+            }),
         };
         let artifacts = ArtifactStoreSink::open(
             config.workspace_root.clone(),
@@ -1087,6 +1110,34 @@ async fn host_controller_a_host_that_breaks_while_activating_fails_the_job_with_
         ran.stderr
     );
     assert!(ran.stdout.is_empty());
+}
+
+/// A grant's jobserver fifo the sandbox does not let the command open — the profile without its
+/// pool directory, as a profile whose pool rules a later deny undid — is said on the job's stderr
+/// before the command runs, naming the fifo and the error, and the command still runs, argv and
+/// script alike. A job whose fifo opens hears nothing of it.
+#[tokio::test]
+#[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
+async fn host_controller_a_jobserver_fifo_the_sandbox_refuses_is_reported_and_the_command_runs() {
+    let mut workspace = Workspace::new("shell-pool-jobserver", 41_392);
+    workspace.envrc("");
+    let opened = workspace.supervisor(false);
+    run(&opened, sh("true")).await.ok();
+    let quiet = run(&opened, sh("printf ran")).await.ok();
+    assert_eq!((quiet.stdout.as_str(), quiet.stderr.as_str()), ("ran", ""));
+
+    workspace.sandbox.cpu_pool_directory = None;
+    let refused = workspace.supervisor(false);
+    let report = format!(
+        "cowshed: the job's CPU jobserver fifo {} cannot be opened in the sandbox (Operation not \
+         permitted (os error 1)); Cargo will run without it, outside the CPU budget\n",
+        workspace.jobserver().display()
+    );
+    for request in [sh("printf ran"), script(&["printf ran"], Vec::new())] {
+        let ran = run(&refused, request).await.ok();
+        assert_eq!(ran.stdout, "ran");
+        assert!(ran.stderr.ends_with(&report), "{:?}", ran.stderr);
+    }
 }
 
 /// A FIFO at `path`: its reader and its writer each wait for the other, so a process blocked on

@@ -75,21 +75,34 @@ const CHECKOUT: &str = "/w/job";
 /// How long a child that must wait is watched for a grant it must not get.
 const NOT_GRANTED: Duration = Duration::from_millis(200);
 
-/// A real gateway of 8 tokens, so background's room (half the host) holds a job of 3.
+/// A real gateway of 8 tokens, so background's room (half the host) holds a job of 3. On Linux
+/// `GatewayConfig::validate` demands a data-socket root before anything else, an owned 0o700
+/// directory; this test's sockets are its control socket and the pools', so it stays empty.
 async fn gateway(root: &Path) -> (Gateway, PathBuf) {
     let cache = root.join("cache");
     std::fs::create_dir(&cache).unwrap();
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = root.join("gateway.sock");
-    let gateway = Gateway::start(
-        GatewayConfig {
-            control_socket: Some(socket.clone()),
-            mirror_cache: MirrorCacheConfig::new(cache),
-            cpu_budget: CpuBudgetLimits {
-                tokens: NonZeroUsize::new(8).unwrap(),
-            },
-            ..GatewayConfig::default()
+    let config = GatewayConfig {
+        control_socket: Some(socket.clone()),
+        mirror_cache: MirrorCacheConfig::new(cache),
+        cpu_budget: CpuBudgetLimits {
+            tokens: NonZeroUsize::new(8).unwrap(),
         },
+        ..GatewayConfig::default()
+    };
+    #[cfg(target_os = "linux")]
+    let config = {
+        let data = root.join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        GatewayConfig {
+            data_socket_root: Some(data),
+            ..config
+        }
+    };
+    let gateway = Gateway::start(
+        config,
         Arc::new(NoCredentials),
         Arc::new(NoConnector),
         Arc::new(DiscardAudit),
