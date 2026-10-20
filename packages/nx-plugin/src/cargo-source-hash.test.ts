@@ -1,11 +1,25 @@
 import { expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { statSync } from 'node:fs';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { runtimeInputValue } from './__tests__/runtime-input.js';
-import { hashCargoPathInputs, readCargoResolve } from './cargo-source-hash.js';
+import { CARGO_ANCESTOR_INPUTS, compiledInFiles, hashCargoPathInputs, readCargoResolve } from './cargo-source-hash.js';
 
 useFixtureCargoHome();
 
@@ -564,3 +578,130 @@ it.each(['helper', 'cli'])(
     }
   },
 );
+
+it('keeps the v2 transcript across forward source includes and an ignored source included through an alias', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-hash-fused-')));
+  const manifest = join(root, 'Cargo.toml');
+  const contents = new Map([
+    ['Cargo.toml', '[workspace]\nmembers=["a","z"]\nresolver="2"\n'],
+    ['a/Cargo.toml', '[package]\nname="a"\nversion="0.1.0"\nedition="2021"\n'],
+    ['z/Cargo.toml', '[package]\nname="z"\nversion="0.1.0"\nedition="2021"\n'],
+    ['a/src/lib.rs', 'const Z: &str = include_str!("../../z/src/lib.rs");\n'],
+    ['z/src/lib.rs', 'const H: &str = include_str!("../hidden.txt");\nconst P: &str = include_str!("payload.bin");\n'],
+    ['z/src/hidden.rs', 'const S: &str = include_str!("secret.bin");\n'],
+    ['z/src/payload.bin', 'payload'],
+    ['z/src/secret.bin', 'secret'],
+    ['.gitignore', 'z/src/hidden.rs\n'],
+  ]);
+  try {
+    for (const [path, text] of contents) {
+      await mkdir(dirname(join(root, path)), { recursive: true });
+      await writeFile(join(root, path), text);
+    }
+    await symlink('src/hidden.rs', join(root, 'z/hidden.txt'));
+    execFileSync('git', ['init', '--quiet', root], { stdio: 'pipe' });
+    execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', manifest], { stdio: 'pipe' });
+    // Independent explicit v2 transcript. In particular, z's source is named by a,
+    // while hidden.rs is discovery-only until the unignored alias names its bytes.
+    const inputs: { file: string; key: string }[] = [
+      { file: manifest, key: JSON.stringify(['a', '0.1.0', 'ancestor', '1/Cargo.toml']) },
+      { file: join(root, 'a/Cargo.toml'), key: JSON.stringify(['a', '0.1.0', 'file', 'Cargo.toml']) },
+      { file: join(root, 'a/src/lib.rs'), key: JSON.stringify(['a', '0.1.0', 'file', 'src/lib.rs']) },
+      {
+        file: join(root, 'z/src/lib.rs'),
+        key: JSON.stringify(['a', '0.1.0', 'include', 'src/lib.rs\0../../z/src/lib.rs']),
+      },
+      { file: join(root, 'z/Cargo.toml'), key: JSON.stringify(['z', '0.1.0', 'file', 'Cargo.toml']) },
+      {
+        file: join(root, 'z/src/secret.bin'),
+        key: JSON.stringify(['z', '0.1.0', 'include', 'src/hidden.rs\0secret.bin']),
+      },
+      {
+        file: join(root, 'z/src/hidden.rs'),
+        key: JSON.stringify(['z', '0.1.0', 'include', 'src/lib.rs\0../hidden.txt']),
+      },
+      {
+        file: join(root, 'z/src/payload.bin'),
+        key: JSON.stringify(['z', '0.1.0', 'include', 'src/lib.rs\0payload.bin']),
+      },
+    ];
+    for (let ancestor = dirname(root), depth = 2; ; ancestor = dirname(ancestor), depth += 1) {
+      for (const name of CARGO_ANCESTOR_INPUTS) {
+        const file = join(ancestor, name);
+        if (statSync(file, { throwIfNoEntry: false })?.isFile()) {
+          inputs.push({ file, key: JSON.stringify(['a', '0.1.0', 'ancestor', depth + '/' + name]) });
+        }
+      }
+      if (dirname(ancestor) === ancestor) break;
+    }
+    const expected = createHash('sha256');
+    expected.update('cargo-path-inputs-v2\0');
+    expected.update(JSON.stringify(['z', '0.1.0', 'link', 'hidden.txt']));
+    expected.update('\0symlink\0src/hidden.rs\0');
+    for (const { file, key } of inputs.sort((left, right) =>
+      left.key < right.key ? -1 : left.key > right.key ? 1 : 0,
+    )) {
+      const bytes = await readFile(file);
+      expected.update(key);
+      expected.update('\0' + bytes.length + '\0');
+      expected.update(bytes);
+    }
+    const before = await hashCargoPathInputs(manifest, root, { includeWorkspace: true });
+    expect(before).toBe(expected.digest('hex'));
+    await writeFile(join(root, 'z/src/secret.bin'), 'changed');
+    expect(await hashCargoPathInputs(manifest, root, { includeWorkspace: true })).not.toBe(before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it('keeps literal discovery exact and refuses unreadable sources', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cargo-hash-literals-')));
+  const source = join(root, 'src/lib.rs');
+  const unicode = 'spelling-e\u0301-\u{10000}-payload';
+  try {
+    await mkdir(dirname(source), { recursive: true });
+    await writeFile(
+      join(root, 'Cargo.toml'),
+      '[package]\nname="literals"\nversion="0.1.0"\nedition="2021"\n[workspace]\n',
+    );
+    await writeFile(join(root, 'src/data'), 'data');
+    await writeFile(join(root, 'src', unicode), 'unicode spelling');
+    await writeFile(
+      source,
+      [
+        'const A: &str = include_str!(r#"data"#,);',
+        'const B: &[u8] = include_bytes!["data"];',
+        'const C: &str = include_str!{"data"};',
+        `const U: &str = include_str!(${JSON.stringify(unicode)});`,
+        '// include_str!("missing")',
+        '/* outer /* include_bytes!("missing") */ comment */',
+        'const D: &str = r###"include_str!("missing")"###;',
+        'include!("missing");',
+        'include_str!("");',
+        'include_str!("da\\\\ta");',
+        'include_str!(concat!("da", "ta"));',
+        'include_str!("missing");',
+        'include_str!("data"];',
+        'include_str!("unterminated',
+      ].join('\n'),
+    );
+    expect(compiledInFiles(root, new Map())).toEqual([
+      { file: join(root, 'src/data'), source, literal: 'data' },
+      { file: join(root, 'src', unicode), source, literal: unicode },
+    ]);
+    execFileSync('cargo', ['generate-lockfile', '--offline', '--manifest-path', join(root, 'Cargo.toml')], {
+      stdio: 'pipe',
+    });
+    await chmod(source, 0);
+    expect(() => compiledInFiles(root, new Map())).toThrow();
+    // A cold native Cargo census can report the denial before the source read;
+    // both paths must preserve the operational refusal rather than skip the file.
+    await expect(hashCargoPathInputs(join(root, 'Cargo.toml'), root, { includeWorkspace: true })).rejects.toThrow(
+      'EACCES',
+    );
+  } finally {
+    await chmod(source, 0o600);
+    await rm(root, { recursive: true, force: true });
+  }
+});

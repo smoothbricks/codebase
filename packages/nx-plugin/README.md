@@ -426,8 +426,25 @@ toolchain pins, wrapper scripts, N-API configuration and CLI version.
 Runtime file identities are rooted in Cargo package name/version and the declared input role, not in the consuming
 checkout's absolute path or depth. Source paths are package-relative; compiled-in data keeps its declaring source and
 literal path as its identity. Identical main/shed inputs therefore share a key, while changed bytes, module names and
-symlink targets still move it. Shared bytes are read once, and all identities are sorted before hashing. The Cargo
-resolution memo schema retains package names/versions; refreshing that memo does not reset the Nx task database.
+symlink targets still move it. File identities retain their globally sorted `cargo-path-inputs-v2` transcript, including
+the original insertion order for equal identities. The Cargo resolution memo schema retains package names/versions;
+refreshing that memo does not reset the Nx task database.
+
+Runtime include discovery is a bounded fuse, not a source-byte cache. Ordinary scheduled Rust sources are read once:
+their buffer supplies both the existing literal scanner and SHA-256. `file` identities precede the same package's
+`include` identities; packages sharing an identity are processed together. An earlier package's include can consume a
+later package's source, but only its discovered references survive until that later identity's boundary. Retention is
+one live file buffer plus the current UTF-8 decode/tokens and path metadata, including across package boundaries.
+Literal spellings are copied into path-sized storage with the same UTF-8 encoding, without Unicode normalization, so
+substring views cannot pin decoded source files.
+
+Discovery still scans ignored sources, just as the graph scanner does. Discovery-only sources that are later included
+(for example through an unignored symlink that resolves to an ignored `.rs`) are read twice: serving those from one read
+would require retaining bytes across their discovery and sorted hash positions. This exception preserves the old digest
+rather than introducing a workspace-sized cache. No source bytes or runtime discovery memo survive an invocation.
+Read-count, timing, corpus-equivalence and retention evidence is recorded in
+`benchmarks/cargo-source-read.results.json`; `benchmarks/cargo-source-read.bench.ts` measures real filesystem reads in a
+Node bundle (Bun does not refresh named builtin imports when the benchmark installs its read observers).
 
 Members the file index cannot hold, outside the Nx workspace or under `node_modules`, are hashed by one runtime
 `smoo-nx-cargo-hash --closure <projectRoot> <Cargo.toml>` entry, present only while such members exist. Its cached

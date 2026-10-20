@@ -812,15 +812,26 @@ export async function hashCargoPathInputs(
   const inputKey = (pkg: LocalCargoPackage, role: InputRole, path: string) =>
     JSON.stringify([pkg.name, pkg.version, role, path.split(sep).join('/')]);
   const directories = new Map<string, LocalCargoPackage>();
-  const files = new Map<string, string>();
+  interface FileInput {
+    readonly file: string;
+    readonly key: string;
+    readonly order: number;
+  }
+  const files = new Map<string, FileInput>();
+  const compareInputs = (left: FileInput, right: FileInput) =>
+    left.key < right.key ? -1 : left.key > right.key ? 1 : left.order - right.order;
   const ancestors = new Set<string>();
   const links = new Map<string, { key: string; target: string }>();
   const packageSources: { file: string; key: string }[] = [];
   // Read shared bytes once. The smallest declared identity makes multiple owners
   // deterministic without using a consuming checkout's mount path as an input.
-  const includeFile = (file: string, key: string) => {
+  const includeFile = (file: string, key: string): FileInput | undefined => {
     const prior = files.get(file);
-    if (prior === undefined || key < prior) files.set(file, key);
+    if (prior !== undefined && key >= prior.key) return undefined;
+    // Rekeying must retain the old Map insertion order for equal v2 identities.
+    const input = { file, key, order: prior?.order ?? files.size };
+    files.set(file, input);
+    return input;
   };
   const packages = [...cargo.local].sort((left, right) =>
     left.name < right.name
@@ -899,17 +910,24 @@ export async function hashCargoPathInputs(
     }
   }
   for (const [directory, owner] of directories) await walk(directory, owner, '');
-  const compiledCache = new Map<string, CompiledCargoInput[]>();
-  for (const [directory, owner] of directories) {
-    for (const input of compiledInFiles(directory, compiledCache)) {
-      if (!ignored(input.file)) {
-        includeFile(
-          await realpath(input.file),
-          inputKey(owner, 'include', relative(directory, input.source) + '\0' + input.literal),
-        );
-      }
-    }
+  interface SourceScan {
+    readonly directory: string;
+    readonly owner: LocalCargoPackage;
+    readonly sources: readonly string[];
+    readonly found: Map<string, CompiledCargoInput>;
   }
+  const scans = new Map<string, SourceScan>();
+  const groups = new Map<string, SourceScan[]>();
+  for (const [directory, owner] of directories) {
+    const scan: SourceScan = { directory, owner, sources: [...compiledSourceFiles(directory)], found: new Map() };
+    for (const source of scan.sources) scans.set(source, scan);
+    // Equal package identities can interleave, so their discovery shares one boundary.
+    const prefix = JSON.stringify([owner.name, owner.version]).slice(0, -1) + ',';
+    const group = groups.get(prefix);
+    if (group === undefined) groups.set(prefix, [scan]);
+    else group.push(scan);
+  }
+  const scheduled = [...files.values()].sort(compareInputs);
   const hash = createHash('sha256');
   hash.update('cargo-path-inputs-v2\0');
   for (const { key, target } of [...links.values()].sort((left, right) =>
@@ -920,14 +938,51 @@ export async function hashCargoPathInputs(
     hash.update(target);
     hash.update('\0');
   }
-  for (const [file, key] of [...files].sort((left, right) => (left[1] < right[1] ? -1 : left[1] > right[1] ? 1 : 0))) {
-    const bytes = await readFile(file);
-    hash.update(key);
+  async function consume(input: FileInput): Promise<void> {
+    if (files.get(input.file) !== input) return;
+    const bytes = await readFile(input.file);
+    const scan = scans.get(input.file);
+    if (scan !== undefined) {
+      scans.delete(input.file);
+      collectCompiledInputs(input.file, bytes.toString('utf8'), scan.found);
+    }
+    hash.update(input.key);
     hash.update('\0');
     hash.update(String(bytes.length));
     hash.update('\0');
     hash.update(bytes);
   }
+  let next = 0;
+  for (const [prefix, group] of [...groups].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))) {
+    // All ordinary sources have a file identity before this package's include identities.
+    // Earlier includes may already have consumed a later package's source; only its
+    // discovered references survive that boundary, never the source buffer.
+    const boundary = prefix + '"include",';
+    while (next < scheduled.length && scheduled[next].key < boundary) await consume(scheduled[next++]);
+    const included: FileInput[] = [];
+    for (const scan of group) {
+      for (const source of scan.sources) {
+        if (!scans.delete(source)) continue;
+        // Discovery also visits ignored sources. They have no scheduled identity;
+        // if an include alias later names one, preserve the old read-then-hash path.
+        collectCompiledInputs(source, readFileSync(source, 'utf8'), scan.found);
+      }
+      for (const input of [...scan.found.values()].sort((left, right) =>
+        left.file < right.file ? -1 : left.file > right.file ? 1 : 0,
+      )) {
+        if (ignored(input.file)) continue;
+        const accepted = includeFile(
+          await realpath(input.file),
+          inputKey(scan.owner, 'include', relative(scan.directory, input.source) + '\0' + input.literal),
+        );
+        if (accepted !== undefined) included.push(accepted);
+      }
+      scan.found.clear();
+    }
+    for (const input of included.sort(compareInputs)) await consume(input);
+    while (next < scheduled.length && scheduled[next].key.startsWith(prefix)) await consume(scheduled[next++]);
+  }
+  while (next < scheduled.length) await consume(scheduled[next++]);
   return hash.digest('hex');
 }
 
@@ -1062,15 +1117,7 @@ const INCLUDE_CLOSERS: Readonly<Record<string, string>> = { '(': ')', '[': ']', 
 const INCLUDE_STRING = /^"([^"\\\r\n]*)"$/u;
 const INCLUDE_RAW_STRING = /^r(#*)"([\s\S]*)"\1$/u;
 
-/**
- * Existing literal include_str!/include_bytes! files read by this package's Rust sources.
- * One graph owns the memo; runtime hashes use a fresh memo. Nested packages own their
- * sources separately. Computed paths and arbitrary build-script reads remain explicit inputs.
- */
-export function compiledInFiles(root: string, cache: Map<string, CompiledCargoInput[]>): CompiledCargoInput[] {
-  const cached = cache.get(root);
-  if (cached !== undefined) return cached;
-  const found = new Map<string, CompiledCargoInput>();
+function* compiledSourceFiles(root: string): Generator<string> {
   const skipped: readonly string[] = HASH_SKIPPED_DIRECTORIES;
   const scan = [root];
   while (scan.length > 0) {
@@ -1081,29 +1128,46 @@ export function compiledInFiles(root: string, cache: Map<string, CompiledCargoIn
       if (entry.isDirectory()) {
         if (!skipped.includes(entry.name) && !existsSync(join(child, 'Cargo.toml'))) scan.push(child);
       } else if (entry.isFile() && entry.name.endsWith('.rs')) {
-        const text = readFileSync(child, 'utf8');
-        if (!text.includes('include_')) continue;
-        const tokens = rustTokens(text);
-        for (let index = 0; index < tokens.length; index += 1) {
-          if (tokens[index]?.text !== 'include_str' && tokens[index]?.text !== 'include_bytes') continue;
-          if (tokens[index + 1]?.text !== '!') continue;
-          const closing = INCLUDE_CLOSERS[tokens[index + 2]?.text ?? ''];
-          const end = tokens[index + 4]?.text === ',' ? index + 5 : index + 4;
-          if (closing === undefined || tokens[end]?.text !== closing) continue;
-          const literal = tokens[index + 3]?.text ?? '';
-          const path = INCLUDE_STRING.exec(literal)?.[1] ?? INCLUDE_RAW_STRING.exec(literal)?.[2];
-          if (path === undefined || path === '') continue;
-          const file = resolve(current, path);
-          if (statSync(file, { throwIfNoEntry: false })?.isFile()) {
-            const prior = found.get(file);
-            if (prior === undefined || child < prior.source || (child === prior.source && path < prior.literal)) {
-              found.set(file, { file, source: child, literal: path });
-            }
-          }
-        }
+        yield child;
       }
     }
   }
+}
+
+function collectCompiledInputs(source: string, text: string, found: Map<string, CompiledCargoInput>): void {
+  if (!text.includes('include_')) return;
+  const tokens = rustTokens(text);
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (tokens[index]?.text !== 'include_str' && tokens[index]?.text !== 'include_bytes') continue;
+    if (tokens[index + 1]?.text !== '!') continue;
+    const closing = INCLUDE_CLOSERS[tokens[index + 2]?.text ?? ''];
+    const end = tokens[index + 4]?.text === ',' ? index + 5 : index + 4;
+    if (closing === undefined || tokens[end]?.text !== closing) continue;
+    // Own the spelling before matching: captures (and RegExp's last-match state)
+    // must reference path-sized storage, not a view into the decoded source.
+    const literal = Buffer.from(tokens[index + 3]?.text ?? '', 'utf8').toString('utf8');
+    const path = INCLUDE_STRING.exec(literal)?.[1] ?? INCLUDE_RAW_STRING.exec(literal)?.[2];
+    if (path === undefined || path === '') continue;
+    const file = resolve(dirname(source), path);
+    if (statSync(file, { throwIfNoEntry: false })?.isFile()) {
+      const prior = found.get(file);
+      if (prior === undefined || source < prior.source || (source === prior.source && path < prior.literal)) {
+        found.set(file, { file, source, literal: path });
+      }
+    }
+  }
+}
+
+/**
+ * Existing literal include_str!/include_bytes! files read by this package's Rust sources.
+ * One graph owns the memo; runtime hashing consumes the same discovery alongside source
+ * bytes. Nested packages own their sources separately. Computed paths remain explicit inputs.
+ */
+export function compiledInFiles(root: string, cache: Map<string, CompiledCargoInput[]>): CompiledCargoInput[] {
+  const cached = cache.get(root);
+  if (cached !== undefined) return cached;
+  const found = new Map<string, CompiledCargoInput>();
+  for (const source of compiledSourceFiles(root)) collectCompiledInputs(source, readFileSync(source, 'utf8'), found);
   const files = [...found.values()].sort((left, right) =>
     left.file < right.file ? -1 : left.file > right.file ? 1 : 0,
   );
