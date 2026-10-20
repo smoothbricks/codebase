@@ -33,12 +33,14 @@ impl Drop for FixtureDir {
 /// Where every gateway test fixture lives. `COWSHED_RUNTIME_LINK` names the short alias a
 /// workspace's runtime grant already covers; it is used exactly as spelled, never canonicalized,
 /// because canonicalizing would expand it past `sockaddr_un.sun_path`'s 104 bytes (SUN_LEN).
-/// Otherwise the system temporary directory, which a workspace's TMPDIR never reaches as a
-/// deep store path when the tests run outside it.
+/// Otherwise `/tmp`, spelled as such, as cpu_budget.rs's roots are. Not the system temporary
+/// directory: on a macOS CI runner that is `/var/folders/<..>/T/`, and a job's pool socket several
+/// levels under a fixture there (`run/cpu/<checkout>/<pool>`) passes SUN_LEN, so the gateway
+/// refuses the pool ("path must be shorter than SUN_LEN").
 pub fn scratch_parent() -> PathBuf {
     let path = match std::env::var_os("COWSHED_RUNTIME_LINK") {
         Some(value) => PathBuf::from(value),
-        None => std::env::temp_dir(),
+        None => PathBuf::from("/tmp"),
     };
     assert!(
         path.is_absolute(),
