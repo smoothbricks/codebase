@@ -1491,7 +1491,7 @@ impl GitRepository {
     /// already holds another tip refuses rather than being overwritten, and every ref is read back
     /// and compared with the tip the bundle advertises: one that does not resolve to it has kept
     /// nothing. A bundle advertising anything but `HEAD` and branches is refused, never partly
-    /// kept. Automatic maintenance stays off: this repository belongs to the user.
+    /// kept. Like every bundle verb it starts no automatic maintenance in this repository.
     pub async fn preserve_bundle(
         &self,
         bundle: &Path,
@@ -1551,7 +1551,6 @@ impl GitRepository {
             OsString::from("--quiet"),
             OsString::from("--no-tags"),
             OsString::from("--no-write-fetch-head"),
-            OsString::from("--no-auto-maintenance"),
             bundle.as_os_str().to_owned(),
         ];
         fetch.extend(kept.iter().map(|(advertised, preserved)| {
@@ -3269,16 +3268,27 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = Command::from(git_command_at(root));
+    let mut command = bundle_git_command(root, alternate_objects);
     command.args(args);
-    if let Some(objects) = alternate_objects {
-        command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
-    }
     command.kill_on_drop(true);
     command
         .output_locked()
         .await
         .map_err(|error| git_spawn_error(&error))
+}
+
+/// Git for a bundle verb at `root`, before its verb. Automatic maintenance is off: a fetch would
+/// otherwise start `git maintenance run --auto --detach`, a child that outlives the command and
+/// writes `objects/maintenance.lock` into the repository it fetched into. In the verification
+/// scratch that write races the scratch's removal, which then fails with "Directory not empty";
+/// in main's repository it is maintenance nobody asked for.
+fn bundle_git_command(root: &Path, alternate_objects: Option<&Path>) -> Command {
+    let mut command = Command::from(git_command_at(root));
+    command.args(["-c", "maintenance.auto=false"]);
+    if let Some(objects) = alternate_objects {
+        command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects);
+    }
+    command
 }
 
 /// Does `path` currently hold a git repository?
@@ -5277,6 +5287,63 @@ mod tests {
         fn as_ref(&self) -> &std::ffi::OsStr {
             self.root.as_os_str()
         }
+    }
+
+    /// A fetch starts `git maintenance run --auto --detach` unless told not to, and that child
+    /// outlives the command and writes `objects/maintenance.lock` into the repository: the
+    /// verification scratch then fails its removal with "Directory not empty". Git's own trace of a
+    /// real bundle fetch through the bundle command shows the fetch's children and no maintenance.
+    #[tokio::test]
+    async fn a_bundle_fetch_starts_no_detached_maintenance() {
+        use cowshed_os::fork_lock::RunAsync as _;
+
+        let source = repository();
+        let scratch = crate::temp_root::TempRoot::new_in(
+            &crate::temp_parent::canonical_parent(),
+            "cowshed-bundle-maintenance",
+        );
+        let bundle = scratch.join("work.bundle");
+        git(
+            &source.root,
+            &[
+                "bundle",
+                "create",
+                bundle.to_str().expect("UTF-8 path"),
+                "HEAD",
+                "main",
+            ],
+        );
+        let target = scratch.join("target");
+        fs::create_dir_all(&target).expect("target directory");
+        git(&target, &["init", "-q", "--bare", "."]);
+        let trace = scratch.join("trace");
+
+        let output = super::bundle_git_command(&target, None)
+            .env("GIT_TRACE2", &trace)
+            .args(["fetch", "--quiet", "--no-tags"])
+            .arg(&bundle)
+            .arg("HEAD:refs/recovered/0")
+            .output_locked()
+            .await
+            .expect("run git fetch");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let trace = fs::read_to_string(&trace).expect("git trace");
+        let children: Vec<&str> = trace
+            .lines()
+            .filter(|line| line.contains("child_start"))
+            .collect();
+        assert!(
+            !children.is_empty(),
+            "the fetch started its own children: {trace}"
+        );
+        assert!(
+            children.iter().all(|line| !line.contains("maintenance")),
+            "{children:#?}"
+        );
     }
 
     fn repository() -> Repository {
