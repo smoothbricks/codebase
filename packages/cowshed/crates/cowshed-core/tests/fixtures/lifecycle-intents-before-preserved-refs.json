@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "entries": {
+    "accounting-process-fence-proof": {
+      "operation": {
+        "kind": "retire",
+        "workspace": "accounting-process-fence-proof",
+        "options": {
+          "force": true,
+          "restore": false,
+          "abandon": true
+        }
+      },
+      "completion": {
+        "kind": "retire",
+        "result": {
+          "abandoned": {
+            "head": "25083b8a9d7ebce13096bb67ff3ceb9fe7829e7f",
+            "targetBranch": "main",
+            "targetHead": "9fdd4333e5688a149150647cd5e9e35a107ccaca",
+            "unlandedCommits": 14,
+            "bundle": "/private/cowshed/store/smoothbricks/codebase/sessions/.trash/accounting-process-fence-proof-25083b8a9d7ebce13096bb67ff3ceb9fe7829e7f.bundle"
+          }
+        }
+      },
+      "phase": "mutating"
+    },
+    "nx-cache-advisor": {
+      "operation": {
+        "kind": "retire",
+        "workspace": "nx-cache-advisor",
+        "options": {
+          "force": true,
+          "restore": false,
+          "abandon": true
+        }
+      },
+      "completion": {
+        "kind": "retire",
+        "result": {
+          "abandoned": {
+            "head": "71f6d4d10b9d1592792e81a010ee465f60aa3293",
+            "targetBranch": "main",
+            "targetHead": "bcc9c3d0f77e03af8093aedda55660f6e8986e42",
+            "unlandedCommits": 236,
+            "branches": [
+              {
+                "branch": "wip/spec-numbers-sb",
+                "tip": "af775053183a3eb6398d7fb1e5424f99a0beb665",
+                "commits": {
+                  "state": "measured",
+                  "targetBranch": "main",
+                  "targetHead": "bcc9c3d0f77e03af8093aedda55660f6e8986e42",
+                  "unlanded": 5,
+                  "landed": 227,
+                  "behind": 874
+                }
+              }
+            ],
+            "bundle": "/private/cowshed/store/smoothbricks/codebase/sessions/.trash/nx-cache-advisor-71f6d4d10b9d1592792e81a010ee465f60aa3293.bundle"
+          }
+        }
+      },
+      "phase": "mutating"
+    }
+  }
+}

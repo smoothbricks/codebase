@@ -842,17 +842,23 @@ pub enum LandingCommits {
     Measured {
         target_branch: String,
         target_head: GitOid,
-        /// Commits that change one of the files the unlanded paths name: zero exactly when they
-        /// name none, and zero is the only value that authorizes removing the workspace without
-        /// `--abandon`.
+        /// Commits the target does not hold: those changing a file `unlanded_paths` names, or for a
+        /// measurement recorded before files were named, those `git cherry` found unheld. Zero is
+        /// the only value that authorizes removing the workspace without `--abandon`.
         unlanded: u64,
         /// Commits whose every change the target already holds, however it got there: by ancestry,
         /// cherry-pick, squash-merge, a history rewrite, or a conflict-resolved pick.
         landed: u64,
         /// Commits the target has that the workspace does not.
         behind: u64,
-        /// Each file whose change the target does not hold, in path order, and why.
-        unlanded_paths: Vec<UnlandedPath>,
+        /// The files whose change the target does not hold, or that the measurement predates them.
+        /// A record without the field is one a build before named files wrote: it reads as
+        /// [`UnlandedPaths::PredatesPaths`] and is written back without the field, as it was.
+        #[serde(
+            default = "UnlandedPaths::predating",
+            skip_serializing_if = "UnlandedPaths::is_predating"
+        )]
+        unlanded_paths: UnlandedPaths,
     },
     /// Nothing was compared and nothing may be inferred. This never means landed: every consumer
     /// treats it exactly as it treats unlanded work.
@@ -872,6 +878,30 @@ impl LandingCommits {
             Self::Measured { target_head, .. } => Some(target_head),
             Self::Indeterminate { .. } => None,
         }
+    }
+}
+
+/// Which files a landing measurement found the target lacking the change of.
+///
+/// Three facts are kept apart: no file unheld (`Named` and empty), these files unheld (`Named`),
+/// and a measurement a build recorded before it named files (`PredatesPaths`): that build judged
+/// commits by patch identity and recorded no file, so nothing about files may be inferred from it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum UnlandedPaths {
+    /// Each file whose change the target does not hold, in path order, and why.
+    Named { paths: Vec<UnlandedPath> },
+    /// Recorded by a build from before measurements named files (02_workspaces.md, `rm` step 1).
+    PredatesPaths,
+}
+
+impl UnlandedPaths {
+    const fn predating() -> Self {
+        Self::PredatesPaths
+    }
+
+    const fn is_predating(&self) -> bool {
+        matches!(self, Self::PredatesPaths)
     }
 }
 
@@ -3854,11 +3884,53 @@ pub struct AbandonedWork {
     /// The local branches besides `head` whose unheld commits went into the bundle as refs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<BranchLanding>,
-    /// `HEAD` and each of `branches`, as main's repository keeps them: under
-    /// `refs/cowshed/<ws>/abandoned/<head>/`, written before the image is retired. Empty for
-    /// main's own `--restore --abandon`, whose bundle the restored checkout keeps.
-    pub preserved: Vec<PreservedRef>,
+    /// What keeps the abandoned tips besides the bundle (02_workspaces.md, `rm` step 1). A record
+    /// without the field is one a build before preserved refs wrote: it reads as
+    /// [`AbandonedPreservation::PredatesPreservation`] and is written back without the field.
+    #[serde(
+        default = "AbandonedPreservation::predating",
+        skip_serializing_if = "AbandonedPreservation::is_predating"
+    )]
+    pub preserved: AbandonedPreservation,
     pub bundle: PathBuf,
+}
+
+/// What main's repository keeps of an abandonment's tips.
+///
+/// Three facts are kept apart, because each tells a reader something else about where the
+/// commits are: refs main keeps, nothing to keep because main itself is what was abandoned, and a
+/// record from a build that kept no refs and so never recorded any.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum AbandonedPreservation {
+    /// Main's repository keeps every tip, under `refs/cowshed/<ws>/abandoned/<head>/`, written
+    /// before the image retired.
+    Preserved { refs: Vec<PreservedRef> },
+    /// Main's own `--restore --abandon`: main's repository is what is being restored, so there is
+    /// no main to keep refs in; the bundle in the restored checkout's Git directory holds them.
+    NothingToPreserve,
+    /// Recorded by a build from before abandonments kept refs. That build kept none: the bundle
+    /// it names is the one copy it made, and `gc --abandoned` keeps its tips in main before
+    /// deleting it (01_storage.md).
+    PredatesPreservation,
+}
+
+impl AbandonedPreservation {
+    const fn predating() -> Self {
+        Self::PredatesPreservation
+    }
+
+    const fn is_predating(&self) -> bool {
+        matches!(self, Self::PredatesPreservation)
+    }
+
+    /// The refs main's repository keeps; none for the other two states.
+    pub fn refs(&self) -> &[PreservedRef] {
+        match self {
+            Self::Preserved { refs } => refs,
+            Self::NothingToPreserve | Self::PredatesPreservation => &[],
+        }
+    }
 }
 
 /// One tip an abandonment kept in main's repository.

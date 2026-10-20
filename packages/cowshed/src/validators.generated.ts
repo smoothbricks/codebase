@@ -2,6 +2,13 @@
 import typia from 'typia';
 import type * as Api from './api.generated.js';
 
+export const assertAbandonedPreservation = typia.createAssertEquals<Api.AbandonedPreservation>();
+export const parseAbandonedPreservation = (json: string): Api.AbandonedPreservation =>
+  assertAbandonedPreservation(JSON.parse(json));
+export const assertAbandonedPreservationList = typia.createAssertEquals<readonly Api.AbandonedPreservation[]>();
+export const parseAbandonedPreservationList = (json: string): readonly Api.AbandonedPreservation[] =>
+  assertAbandonedPreservationList(JSON.parse(json));
+
 export const assertAbandonedWork = typia.createAssertEquals<Api.AbandonedWork>();
 export const parseAbandonedWork = (json: string): Api.AbandonedWork => assertAbandonedWork(JSON.parse(json));
 export const assertAbandonedWorkList = typia.createAssertEquals<readonly Api.AbandonedWork[]>();
@@ -1383,6 +1390,12 @@ export const parseUnlandedPath = (json: string): Api.UnlandedPath => assertUnlan
 export const assertUnlandedPathList = typia.createAssertEquals<readonly Api.UnlandedPath[]>();
 export const parseUnlandedPathList = (json: string): readonly Api.UnlandedPath[] =>
   assertUnlandedPathList(JSON.parse(json));
+
+export const assertUnlandedPaths = typia.createAssertEquals<Api.UnlandedPaths>();
+export const parseUnlandedPaths = (json: string): Api.UnlandedPaths => assertUnlandedPaths(JSON.parse(json));
+export const assertUnlandedPathsList = typia.createAssertEquals<readonly Api.UnlandedPaths[]>();
+export const parseUnlandedPathsList = (json: string): readonly Api.UnlandedPaths[] =>
+  assertUnlandedPathsList(JSON.parse(json));
 
 export const assertUsageReconciliation = typia.createAssertEquals<Api.UsageReconciliation>();
 export const parseUsageReconciliation = (json: string): Api.UsageReconciliation =>

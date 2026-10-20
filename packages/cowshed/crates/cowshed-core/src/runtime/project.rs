@@ -13,9 +13,9 @@ use url::Url;
 #[cfg(target_os = "macos")]
 use super::storage_host::RuntimeStorageHost;
 #[cfg(target_os = "macos")]
-use crate::api::dto::AbandonedWork;
-#[cfg(target_os = "macos")]
 use crate::api::dto::GitOid;
+#[cfg(target_os = "macos")]
+use crate::api::dto::{AbandonedPreservation, AbandonedWork};
 use crate::api::dto::{
     AdmissionKey, AdoptOptions, AttachOptions, CheckpointOptions, CheckpointQuota,
     CheckpointResult, CommandArg, DoctorReport, EmptyResult, ExecRequest, ForkOptions, GcOptions,
@@ -26,7 +26,7 @@ use crate::api::dto::{
     WorkspaceIncarnation, WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 #[cfg(target_os = "macos")]
-use crate::api::dto::{BranchLandings, LandingCommits};
+use crate::api::dto::{BranchLandings, LandingCommits, UnlandedPaths};
 #[cfg(target_os = "macos")]
 use crate::api::dto::{LandedReport, RunSandboxMode};
 use crate::api::operations::{
@@ -6372,7 +6372,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             target_head,
             unlanded_commits,
             branches,
-            preserved,
+            preserved: AbandonedPreservation::Preserved { refs: preserved },
             bundle,
         })
     }
@@ -6411,7 +6411,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .main_containment()
             .map_err(|error| error.message)?
             .mount;
-        let preserved = abandoned.map_or(&[][..], |work| work.preserved.as_slice());
+        let preserved = abandoned.map_or(&[][..], |work| work.preserved.refs());
         let kept = |name: &str, tip: &GitOid| -> std::result::Result<KeptBy, String> {
             if let Some(kept) = preserved
                 .iter()
@@ -7321,9 +7321,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             unlanded_commits,
             // The restored checkout keeps main's other branches; only HEAD's range is abandoned.
             branches: Vec::new(),
-            // Main's repository is the one being restored: its bundle is what the restored
-            // checkout keeps, under its own Git directory.
-            preserved: Vec::new(),
+            // Main's repository is the one being restored: there is no main to keep refs in, and
+            // the bundle the restored checkout keeps, under its own Git directory, holds them.
+            preserved: AbandonedPreservation::NothingToPreserve,
             bundle: final_directory.join(name),
         })
     }
@@ -15333,13 +15333,15 @@ mod removal_refusal_tests {
             unlanded,
             landed,
             behind: 0,
-            unlanded_paths: if unlanded == 0 {
-                Vec::new()
-            } else {
-                vec![unheld(
-                    "src/lib.rs",
-                    crate::api::dto::UnlandedChange::Missing,
-                )]
+            unlanded_paths: crate::api::dto::UnlandedPaths::Named {
+                paths: if unlanded == 0 {
+                    Vec::new()
+                } else {
+                    vec![unheld(
+                        "src/lib.rs",
+                        crate::api::dto::UnlandedChange::Missing,
+                    )]
+                },
             },
         })
     }
@@ -15477,14 +15479,14 @@ mod removal_refusal_tests {
                 },
             ),
         ];
-        let with_paths = |unlanded_paths: Vec<crate::api::dto::UnlandedPath>| {
+        let with_paths = |paths: Vec<crate::api::dto::UnlandedPath>| {
             state(LandingCommits::Measured {
                 target_branch: DEFAULT_LANDING_BRANCH.to_owned(),
                 target_head: oid('1'),
                 unlanded: 2,
                 landed: 0,
                 behind: 0,
-                unlanded_paths,
+                unlanded_paths: crate::api::dto::UnlandedPaths::Named { paths },
             })
         };
         assert!(
@@ -15578,10 +15580,9 @@ mod removal_refusal_tests {
                     unlanded: 2,
                     landed: 0,
                     behind: 0,
-                    unlanded_paths: vec![unheld(
-                        "side.txt",
-                        crate::api::dto::UnlandedChange::Added,
-                    )],
+                    unlanded_paths: crate::api::dto::UnlandedPaths::Named {
+                        paths: vec![unheld("side.txt", crate::api::dto::UnlandedChange::Added)],
+                    },
                 },
             }],
         };
@@ -15686,7 +15687,9 @@ mod removal_refusal_tests {
                 unlanded: 2,
                 landed: 0,
                 behind: 0,
-                unlanded_paths: vec![unheld("side.txt", crate::api::dto::UnlandedChange::Added)],
+                unlanded_paths: crate::api::dto::UnlandedPaths::Named {
+                    paths: vec![unheld("side.txt", crate::api::dto::UnlandedChange::Added)],
+                },
             },
         };
         let unlanded = with_branches(BranchLandings::Measured {
@@ -19029,14 +19032,22 @@ fn removal_unlanded_refusal(
             unlanded_paths,
             ..
         } => {
-            let mut finding = format!(
-                "workspace {workspace} head {head} carries {unlanded} commit{} changing {} \
-                 file{} whose change {branch} does not hold ({branch} is at {target_head}): {}",
-                if *unlanded == 1 { "" } else { "s" },
-                unlanded_paths.len(),
-                if unlanded_paths.len() == 1 { "" } else { "s" },
-                unlanded_paths_text(unlanded_paths, branch),
-            );
+            let mut finding = match unlanded_paths {
+                UnlandedPaths::Named { paths } => format!(
+                    "workspace {workspace} head {head} carries {unlanded} commit{} changing {} \
+                     file{} whose change {branch} does not hold ({branch} is at {target_head}): {}",
+                    if *unlanded == 1 { "" } else { "s" },
+                    paths.len(),
+                    if paths.len() == 1 { "" } else { "s" },
+                    unlanded_paths_text(paths, branch),
+                ),
+                UnlandedPaths::PredatesPaths => format!(
+                    "workspace {workspace} head {head} carries {unlanded} commit{} that {branch} \
+                     does not hold by patch identity ({branch} is at {target_head}); this \
+                     measurement predates named files",
+                    if *unlanded == 1 { "" } else { "s" },
+                ),
+            };
             if let Some(published) = published {
                 let drift = match (published.target_ahead, published.target_behind) {
                     (0, behind) => format!("local {branch} is {behind} behind it"),
@@ -19072,13 +19083,21 @@ fn removal_unlanded_refusal(
                         unlanded,
                         unlanded_paths,
                         ..
-                    } => format!(
-                        "{} at {} ({unlanded} commit{}: {})",
-                        other.branch,
-                        other.tip,
-                        if *unlanded == 1 { "" } else { "s" },
-                        unlanded_paths_text(unlanded_paths, branch),
-                    ),
+                    } => match unlanded_paths {
+                        UnlandedPaths::Named { paths } => format!(
+                            "{} at {} ({unlanded} commit{}: {})",
+                            other.branch,
+                            other.tip,
+                            if *unlanded == 1 { "" } else { "s" },
+                            unlanded_paths_text(paths, branch),
+                        ),
+                        UnlandedPaths::PredatesPaths => format!(
+                            "{} at {} ({unlanded} commit{}; files not recorded)",
+                            other.branch,
+                            other.tip,
+                            if *unlanded == 1 { "" } else { "s" },
+                        ),
+                    },
                     LandingCommits::Indeterminate { reason } => {
                         format!("{} at {} (unmeasured: {reason})", other.branch, other.tip)
                     }

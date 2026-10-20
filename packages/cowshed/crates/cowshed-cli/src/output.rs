@@ -91,6 +91,12 @@ impl<W: Write, E: Write> Output<W, E> {
         writeln!(self.stderr, "next: {command}")
     }
 
+    /// Emits a warning on stderr. Quiet mode never suppresses it: a warning says the result is
+    /// not clean, and a caller who asked for less noise still has to know that.
+    pub fn warning(&mut self, message: &str) -> io::Result<()> {
+        writeln!(self.stderr, "cowshed: warning: {message}")
+    }
+
     /// Emits an error on stderr. Errors are never suppressed by quiet mode.
     pub fn error(&mut self, message: &str) -> io::Result<()> {
         writeln!(self.stderr, "cowshed: {message}")

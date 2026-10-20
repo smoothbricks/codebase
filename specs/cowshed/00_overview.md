@@ -105,7 +105,10 @@ in-workspace marker (`.cowshed/workspace.json`) identifies a workspace incarnati
 database**. Each project does have one bounded, controller-owned `lifecycle-intents.json` recovery journal: it persists
 the latest create/fork/remove intent per logical workspace before mutation, but never overrides the inventory. Startup
 reconciles pending intent that no live process is executing against images, mounts, and markers, records the exact
-completed result, and retries only work whose publication is still absent.
+completed result, and retries only work whose publication is still absent. Its records are the project's history, so
+every shape an earlier build wrote reads: a field a record predates reads as that type's own "predates" state, never as
+an empty value that would claim a fact the record never held, and a record is written back without the field, as its
+build wrote it. A command that reports such a record says once, as a warning, what it does not record.
 
 The persistent processes are the cowshed daemon (one per host, the `dev.cowshed.gateway` LaunchAgent), which serves the
 gateway and the supervisor manager at `/private/cowshed/store/run/manager.sock`; the per-workspace supervisors, which

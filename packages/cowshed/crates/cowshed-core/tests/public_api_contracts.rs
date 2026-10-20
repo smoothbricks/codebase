@@ -386,18 +386,20 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
             unlanded: 4,
             landed: 541,
             behind: 673,
-            unlanded_paths: vec![
-                UnlandedPath {
-                    path: "src/gate.rs".into(),
-                    change: UnlandedChange::Conflict,
-                },
-                UnlandedPath {
-                    path: "assets/logo.png".into(),
-                    change: UnlandedChange::Unmergeable {
-                        reason: "Cannot merge binary files".into(),
+            unlanded_paths: UnlandedPaths::Named {
+                paths: vec![
+                    UnlandedPath {
+                        path: "src/gate.rs".into(),
+                        change: UnlandedChange::Conflict,
                     },
-                },
-            ],
+                    UnlandedPath {
+                        path: "assets/logo.png".into(),
+                        change: UnlandedChange::Unmergeable {
+                            reason: "Cannot merge binary files".into(),
+                        },
+                    },
+                ],
+            },
         },
         branches: BranchLandings::Measured {
             unlanded: vec![BranchLanding {
@@ -409,10 +411,12 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
                     unlanded: 2,
                     landed: 0,
                     behind: 673,
-                    unlanded_paths: vec![UnlandedPath {
-                        path: "side.txt".into(),
-                        change: UnlandedChange::Added,
-                    }],
+                    unlanded_paths: UnlandedPaths::Named {
+                        paths: vec![UnlandedPath {
+                            path: "side.txt".into(),
+                            change: UnlandedChange::Added,
+                        }],
+                    },
                 },
             }],
         },
@@ -428,13 +432,13 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
                 "unlanded": 4,
                 "landed": 541,
                 "behind": 673,
-                "unlandedPaths": [
+                "unlandedPaths": { "kind": "named", "paths": [
                     { "path": "src/gate.rs", "change": { "kind": "conflict" } },
                     {
                         "path": "assets/logo.png",
                         "change": { "kind": "unmergeable", "reason": "Cannot merge binary files" }
                     }
-                ]
+                ] }
             },
             "branches": {
                 "state": "measured",
@@ -448,7 +452,10 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
                         "unlanded": 2,
                         "landed": 0,
                         "behind": 673,
-                        "unlandedPaths": [{ "path": "side.txt", "change": { "kind": "added" } }]
+                        "unlandedPaths": {
+                            "kind": "named",
+                            "paths": [{ "path": "side.txt", "change": { "kind": "added" } }]
+                        }
                     }
                 }]
             }
@@ -495,7 +502,7 @@ fn workspace_landing_shapes_are_frozen_and_discriminated() {
             unlanded: 0,
             landed: 1,
             behind: 1,
-            unlanded_paths: Vec::new(),
+            unlanded_paths: UnlandedPaths::Named { paths: Vec::new() },
         },
         branches,
     };
@@ -969,11 +976,13 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
                 target_head: Some(GitOid::new("1".repeat(40)).unwrap()),
                 unlanded_commits: 3,
                 branches: Vec::new(),
-                preserved: vec![PreservedRef {
-                    name: "HEAD".into(),
-                    tip: GitOid::new("4".repeat(40)).unwrap(),
-                    reference: format!("refs/cowshed/raven/abandoned/{}/HEAD", "4".repeat(40)),
-                }],
+                preserved: AbandonedPreservation::Preserved {
+                    refs: vec![PreservedRef {
+                        name: "HEAD".into(),
+                        tip: GitOid::new("4".repeat(40)).unwrap(),
+                        reference: format!("refs/cowshed/raven/abandoned/{}/HEAD", "4".repeat(40)),
+                    }],
+                },
                 bundle: PathBuf::from("/store/acme/widget/sessions/.trash/raven-tip.bundle"),
             }),
         })
@@ -983,11 +992,11 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             "targetBranch":"main",
             "targetHead":"1111111111111111111111111111111111111111",
             "unlandedCommits":3,
-            "preserved":[{
+            "preserved":{ "kind": "preserved", "refs": [{
                 "name":"HEAD",
                 "tip":"4444444444444444444444444444444444444444",
                 "reference":"refs/cowshed/raven/abandoned/4444444444444444444444444444444444444444/HEAD"
-            }],
+            }] },
             "bundle":"/store/acme/widget/sessions/.trash/raven-tip.bundle"
         }})
     );

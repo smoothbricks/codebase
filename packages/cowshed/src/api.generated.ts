@@ -2,6 +2,20 @@
 import type { tags } from 'typia';
 
 /**
+ * What main's repository keeps of an abandonment's tips.
+ *
+ * Three facts are kept apart, because each tells a reader something else about where the
+ * commits are: refs main keeps, nothing to keep because main itself is what was abandoned, and a
+ * record from a build that kept no refs and so never recorded any.
+ */
+export type AbandonedPreservation =
+  | ({ readonly kind: 'preserved' } & {
+      readonly refs: ReadonlyArray<PreservedRef>;
+    })
+  | { readonly kind: 'nothingToPreserve' }
+  | { readonly kind: 'predatesPreservation' };
+
+/**
  * The commits a `--abandon` removal destroyed, and where they are kept.
  *
  * Every field is what a reader needs to *undo* the abandonment: the tip that is gone, the branch
@@ -21,11 +35,11 @@ export type AbandonedWork = {
    */
   readonly branches?: ReadonlyArray<BranchLanding>;
   /**
-   * `HEAD` and each of `branches`, as main's repository keeps them: under
-   * `refs/cowshed/<ws>/abandoned/<head>/`, written before the image is retired. Empty for
-   * main's own `--restore --abandon`, whose bundle the restored checkout keeps.
+   * What keeps the abandoned tips besides the bundle (02_workspaces.md, `rm` step 1). A record
+   * without the field is one a build before preserved refs wrote: it reads as
+   * [`AbandonedPreservation::PredatesPreservation`] and is written back without the field.
    */
-  readonly preserved: ReadonlyArray<PreservedRef>;
+  readonly preserved?: AbandonedPreservation;
   readonly bundle: string;
 };
 
@@ -1592,9 +1606,9 @@ export type LandingCommits =
       readonly targetBranch: string;
       readonly targetHead: GitOid;
       /**
-       * Commits that change one of the files the unlanded paths name: zero exactly when they
-       * name none, and zero is the only value that authorizes removing the workspace without
-       * `--abandon`.
+       * Commits the target does not hold: those changing a file `unlanded_paths` names, or for a
+       * measurement recorded before files were named, those `git cherry` found unheld. Zero is
+       * the only value that authorizes removing the workspace without `--abandon`.
        */
       readonly unlanded: number & tags.Type<'uint64'>;
       /**
@@ -1607,9 +1621,11 @@ export type LandingCommits =
        */
       readonly behind: number & tags.Type<'uint64'>;
       /**
-       * Each file whose change the target does not hold, in path order, and why.
+       * The files whose change the target does not hold, or that the measurement predates them.
+       * A record without the field is one a build before named files wrote: it reads as
+       * [`UnlandedPaths::PredatesPaths`] and is written back without the field, as it was.
        */
-      readonly unlandedPaths: ReadonlyArray<UnlandedPath>;
+      readonly unlandedPaths?: UnlandedPaths;
     })
   | ({ readonly state: 'indeterminate' } & {
       readonly reason: string;
@@ -2716,6 +2732,19 @@ export type UnlandedPath = {
   readonly path: string;
   readonly change: UnlandedChange;
 };
+
+/**
+ * Which files a landing measurement found the target lacking the change of.
+ *
+ * Three facts are kept apart: no file unheld (`Named` and empty), these files unheld (`Named`),
+ * and a measurement a build recorded before it named files (`PredatesPaths`): that build judged
+ * commits by patch identity and recorded no file, so nothing about files may be inferred from it.
+ */
+export type UnlandedPaths =
+  | ({ readonly kind: 'named' } & {
+      readonly paths: ReadonlyArray<UnlandedPath>;
+    })
+  | { readonly kind: 'predatesPaths' };
 
 /**
  * How a job's independent totals compare with what its observed processes counted as their

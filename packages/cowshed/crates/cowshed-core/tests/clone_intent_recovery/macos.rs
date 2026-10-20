@@ -1044,7 +1044,7 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
     let reference = format!("refs/cowshed/finished/abandoned/{original_head}/HEAD");
     let kept_head = json!({ "name": "HEAD", "tip": original_head, "reference": reference });
     assert!(
-        abandoned["abandoned"]["preserved"]
+        abandoned["abandoned"]["preserved"]["refs"]
             .as_array()
             .is_some_and(|kept| kept.contains(&kept_head)),
         "{abandoned}"

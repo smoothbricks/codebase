@@ -15,7 +15,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cowshed_core::api::{BranchLandings, LandingCommits, UnlandedChange, WorkspaceLanding};
+use cowshed_core::api::{
+    BranchLandings, LandingCommits, UnlandedChange, UnlandedPaths, WorkspaceLanding,
+};
 use cowshed_core::landing::{measure, resolve_target};
 use cowshed_os::fork_lock::Run as _;
 
@@ -426,10 +428,17 @@ async fn an_empty_commit_carries_no_content_and_is_landed() {
 /// The files a measurement names, each with why the target does not hold its change.
 fn unlanded_paths(landing: &WorkspaceLanding) -> Vec<(&str, &UnlandedChange)> {
     match &landing.commits {
-        LandingCommits::Measured { unlanded_paths, .. } => unlanded_paths
+        LandingCommits::Measured {
+            unlanded_paths: UnlandedPaths::Named { paths },
+            ..
+        } => paths
             .iter()
             .map(|unlanded| (unlanded.path.as_str(), &unlanded.change))
             .collect(),
+        LandingCommits::Measured {
+            unlanded_paths: UnlandedPaths::PredatesPaths,
+            ..
+        } => panic!("a live measurement names its files"),
         LandingCommits::Indeterminate { reason } => {
             panic!("expected a measurement, got indeterminate: {reason}")
         }

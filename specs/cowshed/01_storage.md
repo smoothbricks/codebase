@@ -284,12 +284,11 @@ burden with retention _conventions_, enforced by `cowshed gc`, never by a backgr
   repository under the namespace its removal used, `refs/cowshed/<ws>/abandoned/<head>/` (02_workspaces.md, `rm` step 1;
   the file name `<ws>-<head>.bundle` names both), and journaled as a `keep-abandoned-tips` deletion-log line on the
   bundle's path naming that repository and each ref; each kept tip is also said on stderr. A removal by this build
-  already kept them; a bundle an earlier build wrote gets them here. A purge keeps them the same way before its main
-  restore carries every `refs/cowshed/*` ref into the retained checkout (02_workspaces.md). A bundle whose name, tips or
-  fetch fail refuses the whole sweep as a conflict naming each, before anything is deleted. Keeping them is never hiding
-  them: a plain `gc` reports how many the trash keeps and their allocated bytes, `doctor` reports them as an
-  `abandon-bundles` info finding, and `ls --all` names each project's after its table. Naming them authorizes nothing;
-  the plain sweep's own plan still never holds one.
+  already kept them; a bundle an earlier build wrote, whose removal record says `predatesPreservation`, gets them here.
+  A purge keeps them the same way before its main fetch fail refuses the whole sweep as a conflict naming each, before
+  anything is deleted. Keeping them is never hiding them: a plain `gc` reports how many the trash keeps and their
+  allocated bytes, `doctor` reports them as an `abandon-bundles` info finding, and `ls --all` names each project's after
+  its table. Naming them authorizes nothing; the plain sweep's own plan still never holds one.
 - Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes
   one workspace-scoped cleanup plan that includes pinned checkpoints and pre-restore undo generations as well as the
   trash image and empty mountpoint. Preview and execution validate the repository, workspace, incarnation, checkpoint

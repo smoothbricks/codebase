@@ -15,16 +15,17 @@ use cowshed_apfs::image::{IMAGE_EXTENSION, ImageCapacity};
 pub use cowshed_core::api::ProjectWorkspaces;
 use cowshed_core::api::server::{ConnectionAuthority, serve_controller_connection};
 use cowshed_core::api::{
-    AdoptOptions, AttachOptions, BranchLandings, BranchName, CheckpointInfo, CheckpointOptions,
-    CheckpointResult, CommandArg, Coordinator, DefragmentResult, DoctorReport, EmptyResult,
-    ExecRequest, ExitStatus, ExpectedRefHead, Finding, FindingSeverity, ForkOptions, GatewayStatus,
-    GcOptions, GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions,
-    LandReport, LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
-    PublicationPolicy, PushOptions, PushReport, RebaseBuildVolume, RebaseOptions, RebaseReport,
-    RefLockPath, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
-    ReseedResult, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus,
-    StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
-    WorkspaceState, validate_command_argv,
+    AbandonedPreservation, AbandonedWork, AdoptOptions, AttachOptions, BranchLandings, BranchName,
+    CheckpointInfo, CheckpointOptions, CheckpointResult, CommandArg, Coordinator, DefragmentResult,
+    DoctorReport, EmptyResult, ExecRequest, ExitStatus, ExpectedRefHead, Finding, FindingSeverity,
+    ForkOptions, GatewayStatus, GcOptions, GcReason, GcReport, GitOid, GrantDelta, GrantSet,
+    JobInfo, JobStream, LandOptions, LandReport, LandingCommits, MountResult, OutputPublication,
+    ProjectGrantDelta, ProjectGrants, PublicationPolicy, PushOptions, PushReport,
+    RebaseBuildVolume, RebaseOptions, RebaseReport, RefLockPath, RemoveOptions,
+    RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult, ResizeResult,
+    ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus, StdinSource as CoreStdinSource,
+    UnlandedPaths, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath, WorkspaceState,
+    validate_command_argv,
 };
 use cowshed_core::git::GitRepository;
 use cowshed_core::metadata::{
@@ -1684,6 +1685,13 @@ where
                 output
                     .guidance(&format!("removed {}", removed.workspace))
                     .map_err(output_error)?;
+                if let Some(warning) =
+                    removed.report.abandoned.as_ref().and_then(|abandoned| {
+                        predating_warning(removed.workspace.as_str(), abandoned)
+                    })
+                {
+                    output.warning(&warning).map_err(output_error)?;
+                }
             }
             for bundle in &report.deleted_bundles {
                 output
@@ -1697,6 +1705,9 @@ where
                         abandoned.bundle.display()
                     ))
                     .map_err(output_error)?;
+                if let Some(warning) = predating_warning("main", abandoned) {
+                    output.warning(&warning).map_err(output_error)?;
+                }
             }
             Ok(success())
         }
@@ -1749,7 +1760,7 @@ where
                         ))
                         .map_err(output_error)?;
                 }
-                for kept in &abandoned.preserved {
+                for kept in abandoned.preserved.refs() {
                     output
                         .guidance(&format!(
                             "kept {} at {} in main as {}",
@@ -1760,6 +1771,9 @@ where
                 output
                     .guidance(&format!("bundled to {}", abandoned.bundle.display()))
                     .map_err(output_error)?;
+                if let Some(warning) = predating_warning(args.workspace.as_str(), abandoned) {
+                    output.warning(&warning).map_err(output_error)?;
+                }
             }
             output.hint("cowshed gc").map_err(output_error)?;
             Ok(success())
@@ -3831,6 +3845,50 @@ fn landing_row(repo_id: Option<&RepoId>, workspace: &WorkspaceInfo) -> Vec<Strin
     row.extend(landing_cells(workspace));
     row.extend(tail);
     row
+}
+/// What a reported abandonment does not record, as one warning: a journal record an earlier build
+/// wrote, before abandonments recorded what keeps their tips or measurements named files, is
+/// history read back, not a clean result (02_workspaces.md, `rm` step 1). `None` when the record
+/// is complete.
+fn predating_warning(workspace: &str, abandoned: &AbandonedWork) -> Option<String> {
+    let mut gaps = Vec::new();
+    if matches!(
+        abandoned.preserved,
+        AbandonedPreservation::PredatesPreservation
+    ) {
+        gaps.push(format!(
+            "no record of what keeps head {}: the record predates kept refs, and {} is the copy it \
+             names",
+            abandoned.head,
+            abandoned.bundle.display()
+        ));
+    }
+    let unnamed: Vec<&str> = abandoned
+        .branches
+        .iter()
+        .filter(|branch| {
+            matches!(
+                &branch.commits,
+                LandingCommits::Measured {
+                    unlanded_paths: UnlandedPaths::PredatesPaths,
+                    ..
+                }
+            )
+        })
+        .map(|branch| branch.branch.as_str())
+        .collect();
+    if !unnamed.is_empty() {
+        gaps.push(format!(
+            "branch measurements predate named files and count commits by patch identity: {}",
+            unnamed.join(", ")
+        ));
+    }
+    (!gaps.is_empty()).then(|| {
+        format!(
+            "{workspace}'s abandonment was recorded by an earlier cowshed: {}",
+            gaps.join("; ")
+        )
+    })
 }
 
 /// `-` where nothing was measured by design, `?` where the answer could not be had. Keeping those
@@ -7265,6 +7323,55 @@ mod tests {
              next: cowshed setup\n\
              next: cowshed gateway stop && cowshed gateway start\n"
         );
+    }
+
+    /// A removal report read back from an earlier build's journal record is history, not a clean
+    /// result: the warning names the head no ref keeps, the bundle the record names and each
+    /// branch whose measurement named no files. Read from the records the core's journal test
+    /// captured, so the warning answers the shapes an earlier build actually wrote.
+    #[test]
+    fn an_abandonment_an_earlier_build_recorded_warns_once_and_a_complete_one_does_not() {
+        let journal: serde_json::Value = serde_json::from_str(include_str!(
+            "../../cowshed-core/tests/fixtures/lifecycle-intents-before-preserved-refs.json"
+        ))
+        .expect("captured journal");
+        let abandoned = |name: &str| -> AbandonedWork {
+            serde_json::from_value(
+                journal["entries"][name]["completion"]["result"]["abandoned"].clone(),
+            )
+            .expect("an earlier build's abandonment reads")
+        };
+
+        let plain = abandoned("accounting-process-fence-proof");
+        let warning = predating_warning("accounting-process-fence-proof", &plain)
+            .expect("a predating record warns");
+        assert!(warning.contains(plain.head.as_str()), "{warning}");
+        assert!(
+            warning.contains(&plain.bundle.display().to_string()),
+            "{warning}"
+        );
+        assert!(!warning.contains("branch measurements"), "{warning}");
+
+        let branched = abandoned("nx-cache-advisor");
+        let warning =
+            predating_warning("nx-cache-advisor", &branched).expect("a predating record warns");
+        assert!(
+            warning.contains("predate named files")
+                && warning.contains(&branched.branches[0].branch),
+            "{warning}"
+        );
+
+        let kept = AbandonedWork {
+            preserved: AbandonedPreservation::Preserved { refs: Vec::new() },
+            branches: Vec::new(),
+            ..plain.clone()
+        };
+        assert_eq!(predating_warning("raven", &kept), None);
+        let main = AbandonedWork {
+            preserved: AbandonedPreservation::NothingToPreserve,
+            ..plain
+        };
+        assert_eq!(predating_warning("main", &main), None);
     }
 }
 

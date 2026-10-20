@@ -24,20 +24,20 @@ use std::{
 
 use cowshed_core::{
     api::{
-        AbandonedWork, BinaryData, BranchLandings, CarrySide, CheckpointInfo, CommandArg,
-        CpuMicros, CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode, EgressRule, ExecClass,
-        ExecScope, ExitStatus, Finding, FindingSeverity, GcCandidate, GcDeferred, GcReason,
-        GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId, JobInfo,
-        JobLeafAttribution, JobProcessLeaf, JobResourceSample, JobState, JobStreamWatermark,
-        JobVolumeUsage, LandReport, LandingCommits, OneCoreCpuPercent, OneCoreCpuPermille,
-        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, PreservedRef, ProcessCoverage,
-        ProcessCoverageGap, ProtectedOutput, PushReport, RebaseBuildVolume, RebaseCarrySkip,
-        RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult, ResizeVolume,
-        Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamBytes, StreamInfo, StreamLines,
-        TraceContext, TraceId, UnlandedChange, UnlandedPath, UsageReconciliation, UtcTimestamp,
-        VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta, WallMicros, WorkspaceIncarnation,
-        WorkspaceInfo, WorkspaceLanding, WorkspaceName, WorkspacePath, WorkspaceRole,
-        WorkspaceState,
+        AbandonedPreservation, AbandonedWork, BinaryData, BranchLandings, CarrySide,
+        CheckpointInfo, CommandArg, CpuMicros, CpuMicrosDelta, CpuTotals, DoctorReport, EgressMode,
+        EgressRule, ExecClass, ExecScope, ExitStatus, Finding, FindingSeverity, GcCandidate,
+        GcDeferred, GcReason, GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId,
+        JobInfo, JobLeafAttribution, JobProcessLeaf, JobResourceSample, JobState,
+        JobStreamWatermark, JobVolumeUsage, LandReport, LandingCommits, OneCoreCpuPercent,
+        OneCoreCpuPermille, OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, PreservedRef,
+        ProcessCoverage, ProcessCoverageGap, ProtectedOutput, PushReport, RebaseBuildVolume,
+        RebaseCarrySkip, RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult,
+        ResizeVolume, Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamBytes, StreamInfo,
+        StreamLines, TraceContext, TraceId, UnlandedChange, UnlandedPath, UnlandedPaths,
+        UsageReconciliation, UtcTimestamp, VolumeUnavailable, VolumeUsage, VolumeUsedBytesDelta,
+        WallMicros, WorkspaceIncarnation, WorkspaceInfo, WorkspaceLanding, WorkspaceName,
+        WorkspacePath, WorkspaceRole, WorkspaceState,
     },
     repository::RepoId,
 };
@@ -679,18 +679,20 @@ fn workspace_infos() -> BTreeMap<&'static str, Value> {
                 unlanded: 3,
                 landed: 1,
                 behind: 5,
-                unlanded_paths: vec![
-                    UnlandedPath {
-                        path: "src/gate.rs".to_owned(),
-                        change: UnlandedChange::Missing,
-                    },
-                    UnlandedPath {
-                        path: "assets/logo.png".to_owned(),
-                        change: UnlandedChange::Unmergeable {
-                            reason: "Cannot merge binary files".to_owned(),
+                unlanded_paths: UnlandedPaths::Named {
+                    paths: vec![
+                        UnlandedPath {
+                            path: "src/gate.rs".to_owned(),
+                            change: UnlandedChange::Missing,
                         },
-                    },
-                ],
+                        UnlandedPath {
+                            path: "assets/logo.png".to_owned(),
+                            change: UnlandedChange::Unmergeable {
+                                reason: "Cannot merge binary files".to_owned(),
+                            },
+                        },
+                    ],
+                },
             },
             branches: BranchLandings::Measured {
                 unlanded: Vec::new(),
@@ -1019,13 +1021,15 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             target_head: Some(oid("6666666666666666666666666666666666666666")),
             unlanded_commits: 4,
             branches: Vec::new(),
-            preserved: vec![PreservedRef {
+            preserved: AbandonedPreservation::Preserved {
+                refs: vec![PreservedRef {
                 name: "HEAD".to_owned(),
                 tip: oid("5555555555555555555555555555555555555555"),
                 reference:
                     "refs/cowshed/cs-seam/abandoned/5555555555555555555555555555555555555555/HEAD"
                         .to_owned(),
             }],
+            },
             bundle: PathBuf::from("/Users/fixture/Dev/.cowshed/abandoned/cs-seam.bundle"),
         }),
     };

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cowshed_core::api::{AdoptOptions, RemoveOptions, RemoveReport};
+use cowshed_core::api::{
+    AbandonedPreservation, AdoptOptions, LandingCommits, RemoveOptions, RemoveReport, UnlandedPaths,
+};
 use cowshed_core::metadata::{WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::storage::recovery::{
     IntentLease, KeptAbandonBundles, LIFECYCLE_INTENTS_FILE, LifecycleIntent,
@@ -111,6 +113,59 @@ fn historical_create_and_fork_tags_remain_readable_without_public_aliases() {
     let old_fork = serde_json::json!({ "kind": "fork", "source": "main", "destination": "raven" });
     let fork: LifecycleIntent = serde_json::from_value(old_fork.clone()).expect("historical fork");
     assert_eq!(serde_json::to_value(fork).unwrap(), old_fork);
+}
+
+/// Records already on disk are the store's history, so every shape an earlier build wrote reads.
+/// The fixture is two retire records copied verbatim from a project journal a build wrote before
+/// abandonments kept refs and before measurements named files: one plain abandonment, one whose
+/// abandoned branches carry measurements. Each reads as predating both fields — never as "kept
+/// nothing" or "no file unheld" — and the journal written back holds each record as it was, so the
+/// fields a record predates are not invented on its behalf (00_overview.md, 02_workspaces.md).
+#[test]
+fn a_journal_an_earlier_build_wrote_reads_as_predating_and_is_written_back_as_it_was() {
+    const FIXTURE: &str = include_str!("fixtures/lifecycle-intents-before-preserved-refs.json");
+    let root = TestRoot::new("predating-journal");
+    let path = root.path().join(LIFECYCLE_INTENTS_FILE);
+    fs::write(&path, FIXTURE).expect("write the captured journal");
+
+    let journal = LifecycleIntentJournal::load(&path).expect("an earlier build's journal reads");
+    let mut measured_branches = 0;
+    for name in ["accounting-process-fence-proof", "nx-cache-advisor"] {
+        let record = journal.get(&workspace(name)).expect("captured record");
+        let Some(LifecycleIntentCompletion::Retire(report)) = record.completion.as_ref() else {
+            panic!("{name} is a completed retirement: {record:?}");
+        };
+        let abandoned = report.abandoned.as_ref().expect("an abandonment");
+        assert_eq!(
+            abandoned.preserved,
+            AbandonedPreservation::PredatesPreservation,
+            "{name}"
+        );
+        for branch in &abandoned.branches {
+            let LandingCommits::Measured { unlanded_paths, .. } = &branch.commits else {
+                panic!(
+                    "{name}'s {} was measured: {:?}",
+                    branch.branch, branch.commits
+                );
+            };
+            assert_eq!(unlanded_paths, &UnlandedPaths::PredatesPaths, "{name}");
+            measured_branches += 1;
+        }
+    }
+    assert!(
+        measured_branches > 0,
+        "the fixture carries a branch measurement"
+    );
+
+    LifecycleIntentJournal::update(&path, |_| Ok(())).expect("write the journal back");
+    let written: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("read the written journal"))
+            .expect("the written journal is JSON");
+    let captured: serde_json::Value = serde_json::from_str(FIXTURE).expect("captured JSON");
+    assert_eq!(
+        written, captured,
+        "a record keeps the shape its build wrote"
+    );
 }
 
 #[test]

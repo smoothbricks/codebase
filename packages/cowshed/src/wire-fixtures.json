@@ -2570,13 +2570,16 @@
       "abandoned": {
         "bundle": "/Users/fixture/Dev/.cowshed/abandoned/cs-seam.bundle",
         "head": "5555555555555555555555555555555555555555",
-        "preserved": [
-          {
-            "name": "HEAD",
-            "reference": "refs/cowshed/cs-seam/abandoned/5555555555555555555555555555555555555555/HEAD",
-            "tip": "5555555555555555555555555555555555555555"
-          }
-        ],
+        "preserved": {
+          "kind": "preserved",
+          "refs": [
+            {
+              "name": "HEAD",
+              "reference": "refs/cowshed/cs-seam/abandoned/5555555555555555555555555555555555555555/HEAD",
+              "tip": "5555555555555555555555555555555555555555"
+            }
+          ]
+        },
         "targetBranch": "main",
         "targetHead": "6666666666666666666666666666666666666666",
         "unlandedCommits": 4
@@ -2647,21 +2650,24 @@
           "targetBranch": "main",
           "targetHead": "89abcdef0123456789abcdef0123456789abcdef",
           "unlanded": 3,
-          "unlandedPaths": [
-            {
-              "change": {
-                "kind": "missing"
+          "unlandedPaths": {
+            "kind": "named",
+            "paths": [
+              {
+                "change": {
+                  "kind": "missing"
+                },
+                "path": "src/gate.rs"
               },
-              "path": "src/gate.rs"
-            },
-            {
-              "change": {
-                "kind": "unmergeable",
-                "reason": "Cannot merge binary files"
-              },
-              "path": "assets/logo.png"
-            }
-          ]
+              {
+                "change": {
+                  "kind": "unmergeable",
+                  "reason": "Cannot merge binary files"
+                },
+                "path": "assets/logo.png"
+              }
+            ]
+          }
         },
         "dirtyFiles": 2
       },
@@ -2712,21 +2718,24 @@
             "targetBranch": "main",
             "targetHead": "89abcdef0123456789abcdef0123456789abcdef",
             "unlanded": 3,
-            "unlandedPaths": [
-              {
-                "change": {
-                  "kind": "missing"
+            "unlandedPaths": {
+              "kind": "named",
+              "paths": [
+                {
+                  "change": {
+                    "kind": "missing"
+                  },
+                  "path": "src/gate.rs"
                 },
-                "path": "src/gate.rs"
-              },
-              {
-                "change": {
-                  "kind": "unmergeable",
-                  "reason": "Cannot merge binary files"
-                },
-                "path": "assets/logo.png"
-              }
-            ]
+                {
+                  "change": {
+                    "kind": "unmergeable",
+                    "reason": "Cannot merge binary files"
+                  },
+                  "path": "assets/logo.png"
+                }
+              ]
+            }
           },
           "dirtyFiles": 2
         },

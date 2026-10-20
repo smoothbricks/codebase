@@ -28,7 +28,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::api::dto::{BranchLanding, BranchLandings, GitOid, LandingCommits, WorkspaceLanding};
+use crate::api::dto::{
+    BranchLanding, BranchLandings, GitOid, LandingCommits, UnlandedPaths, WorkspaceLanding,
+};
 use crate::git::{ContentNotHeld, GitRepository};
 
 /// The branch a workspace's work has to reach, resolved live, with the object store that holds it.
@@ -353,6 +355,8 @@ async fn counted(
         unlanded: unheld.commits,
         landed,
         behind,
-        unlanded_paths: unheld.paths,
+        unlanded_paths: UnlandedPaths::Named {
+            paths: unheld.paths,
+        },
     })
 }
