@@ -2,12 +2,18 @@ import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { RUNTIME_INPUT_SCRIPT, runtimeInput, shellWord } from './runtime-input.js';
+import {
+  commandPrograms,
+  hostPrograms,
+  RUNTIME_INPUT_FAILURES,
+  runtimeInputFailureReports,
+} from './runtime-input-policy.js';
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(packageRoot));
@@ -130,11 +136,18 @@ describe('a planted runtime input failure through real Nx', () => {
         expect(good.status, good.output).toBe(0);
         expect(existsSync(join(workspace, 'good.ran'))).toBe(true);
 
+        const started = Date.now();
         const planted = nx(workspace, env, 'probe:planted');
         expect(planted.status, planted.output).toBe(1);
         expect(planted.output).toContain('invalid utf-8 sequence');
+        // Nx's message names neither the command nor its cause; the retained report names both.
+        expect(planted.output).not.toContain('planted-cause');
         expect(existsSync(join(workspace, 'planted.ran'))).toBe(false);
         const record = await failureRecord(workspace);
+        const reports = runtimeInputFailureReports(workspace, started);
+        expect(reports).toHaveLength(1);
+        expect(reports[0]).toContain(`${join(record, 'report')}:\nruntime input exited 3: sh -c`);
+        expect(reports[0]).toContain('planted-cause');
         expect(await readFile(join(record, 'argv'))).toEqual(Buffer.from('sh\0-c\0echo planted-cause >&2; exit 3\0'));
         expect(await readFile(join(record, 'stderr'), 'utf8')).toBe('planted-cause\n');
         expect(await readFile(join(record, 'exit-status'), 'utf8')).toBe('3\n');
@@ -199,6 +212,102 @@ describe('runtime inputs of this repository', () => {
       for (const literal of source.match(/\{\s*runtime:\s*[`'"]/g) ?? []) offenders.push(`src/${file}: ${literal}`);
     }
     expect(offenders).toEqual([]);
+  });
+
+  it('name only programs the workspace declares', async () => {
+    const search = { path: process.env.PATH ?? '', root: repoRoot, home: homedir() };
+    const offenders: string[] = [];
+    const declared = (file: string, value: unknown): void => {
+      if (Array.isArray(value)) {
+        for (const item of value) declared(file, item);
+      } else if (value !== null && typeof value === 'object') {
+        for (const [key, item] of Object.entries(value)) {
+          if (key !== 'runtime' || typeof item !== 'string') declared(file, item);
+          else
+            for (const host of hostPrograms(item, search))
+              offenders.push(`${file}: ${host.program} (${host.found ?? 'not on PATH'})`);
+        }
+      }
+    };
+    const tracked = spawnSync(
+      'git',
+      ['ls-files', '-z', 'nx.json', 'package.json', '**/package.json', '**/project.json'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+      },
+    );
+    expect(tracked.status, tracked.stderr).toBe(0);
+    for (const file of tracked.stdout.split('\0').filter(Boolean)) {
+      declared(file, JSON.parse(await readFile(join(repoRoot, file), 'utf8')));
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe('runtime input programs', () => {
+  it("are each simple command's program, through the wrapper, env, sh -c and substitutions, without builtins", () => {
+    expect(commandPrograms(`sh ${RUNTIME_INPUT_SCRIPT} shasum -a 256 packages/x/y.wasm`)).toEqual(['sh', 'shasum']);
+    expect(
+      commandPrograms(
+        `sh ${RUNTIME_INPUT_SCRIPT} sh -c 'if [ -n "\${SRC:-}" ]; then cd "$SRC" && export A=/dev/null && git rev-parse HEAD && changes=$(git status --porcelain) && printf "%s\\n" "$changes" | shasum -a 256; else echo installed; fi'`,
+      ),
+    ).toEqual(['sh', 'sh', 'git', 'shasum', 'git']);
+    expect(
+      commandPrograms(
+        'env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c core.excludesFile=/dev/null ls-files -z',
+      ),
+    ).toEqual(['env', 'git']);
+    expect(commandPrograms("bun -e 'console.log(1)' >/dev/null 2>&1 </dev/null")).toEqual(['bun']);
+    expect(commandPrograms('x=`cut -d: -f1 list` && command -v tr; exec date')).toEqual(['date', 'cut']);
+    expect(commandPrograms('for f in a b; do stat "$f"; done # head')).toEqual(['stat']);
+    expect(commandPrograms("sh tooling/identity.sh rustc 'sh -c awk'")).toEqual(['sh']);
+  });
+
+  it('that the host supplies, or nothing supplies, are refused by name', async () => {
+    const scratch = await mkdtemp(join(tmpdir(), 'runtime-input-programs-'));
+    try {
+      const host = join(scratch, 'usr-bin');
+      const root = join(scratch, 'checkout');
+      await mkdir(host, { recursive: true });
+      await mkdir(join(root, 'node_modules', '.bin'), { recursive: true });
+      for (const file of [join(host, 'shasum'), join(root, 'node_modules', '.bin', 'tool')]) {
+        await writeFile(file, '#!/bin/sh\n');
+        await chmod(file, 0o755);
+      }
+      // A file that is not executable provides nothing.
+      await writeFile(join(host, 'absent'), '');
+      const search = { path: `${host}:${join(root, 'node_modules', '.bin')}`, root, home: join(scratch, 'home') };
+      const command = 'shasum -a 256 f && tool && tooling/x.sh && /nix/store/0-a/bin/a && absent; /usr/bin/env true';
+      expect(hostPrograms(`${command}; /usr/bin/shasum`, search)).toEqual([
+        { program: 'shasum', found: join(host, 'shasum') },
+        { program: 'absent', found: undefined },
+        { program: '/usr/bin/shasum', found: '/usr/bin/shasum' },
+      ]);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('retained runtime input failure reports', () => {
+  it('are read back from a time on, oldest first, naming a record whose report is missing', async () => {
+    await withWrapperWorkspace(async (workspace) => {
+      const failures = join(workspace, RUNTIME_INPUT_FAILURES);
+      const record = async (name: string, at: number, report?: string): Promise<void> => {
+        await mkdir(join(failures, name), { recursive: true });
+        if (report !== undefined) await writeFile(join(failures, name, 'report'), report);
+        await utimes(join(failures, name), at / 1000, at / 1000);
+      };
+      expect(runtimeInputFailureReports(workspace, 0)).toEqual([]);
+      await record('failure.old', 1_000_000, 'old\n');
+      await record('failure.second', 3_000_000, 'second\n');
+      await record('failure.first', 2_000_000);
+      expect(runtimeInputFailureReports(workspace, 2_000_000)).toEqual([
+        `${join(failures, 'failure.first')}: no report; its evidence is incomplete\n`,
+        `${join(failures, 'failure.second', 'report')}:\nsecond\n`,
+      ]);
+    });
   });
 });
 

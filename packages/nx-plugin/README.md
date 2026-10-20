@@ -315,6 +315,10 @@ The reliable diagnostic after a daemon or headless gate's decoder error is:
 cat .runtime-input-failures/*/report
 ```
 
+`smoo github-ci nx-smart`, `nx-run-many` and `nx-deploy` print every report retained during a failed Nx run
+(`runtimeInputFailureReports(root, sinceMs)`, `@smoothbricks/nx-plugin/runtime-input-policy`), so a CI log names the
+command and its cause beside Nx's decoder error, which names neither.
+
 Each readable `report` names the command, its indexed arguments, working directory, exit status and original stderr.
 `argv` retains the exact NUL-delimited argument vector (including empty arguments), `stderr` retains the original bytes
 (including trailing newlines), and `exit-status` retains the decimal status. The wrapper also attempts a stderr summary
@@ -328,6 +332,18 @@ Successful commands still emit only their original stdout bytes, discard stderr 
 evidence path, timestamp or diagnostic enters a successful key. `runtime-input.test.ts` compares that byte stream and
 its hash with the previous success path, and plants a failure through real Nx (daemon and daemonless) to prove both
 refusal and retained evidence.
+
+A runtime input runs only programs the workspace declares: devenv's Nix profile, the checkout's `node_modules/.bin` and
+its own scripts. Nx hashes on a developer's Mac, on a NixOS CI runner and inside cowshed's sandbox, and only those are
+the same in all three. A program the host's operating system ships is not: `shasum` is a Perl script that macOS ships in
+`/usr/bin`, not coreutils, and no devenv profile provides it, so an input that named it hashed on every Mac and exited
+127 on a NixOS runner. Hash a file with Bun, as the plugin's own file inputs do (`Bun.CryptoHasher`); devenv's coreutils
+provide `sha256sum` where a pipeline needs one. The only host paths admitted are `/bin/sh` and `/usr/bin/env`, which
+NixOS keeps too. `@smoothbricks/nx-plugin/runtime-input-policy` exports `hostPrograms(command, { path, root, home })`:
+each program the command runs (through the wrapper, `env`, `exec`, `command`, `sh -c` and command substitutions; a
+script file it runs is that script's own concern) that PATH finds outside `/nix`, the checkout and the home, or that
+nothing on PATH provides. `runtime-input.test.ts` refuses one in this repository's declared inputs; a consumer judges
+its own declarations with the same export.
 
 An input that runs inside a cowshed workspace's sandboxed daemon gets the client's environment, a host shell's `HOME`
 included, but not the client's filesystem view (cowshed `04_sandbox.md`). An input that reads the operator's home fails

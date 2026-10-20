@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { PERMANENT_DEPLOY_TAG, STAGING_DEPLOY_TAG, stageDeploysProject } from '@smoothbricks/nx-plugin/deploy-policy';
+import { runtimeInputFailureReports } from '@smoothbricks/nx-plugin/runtime-input-policy';
 import { PLATFORM_TARGET_GLOBS, RELEASE_CONFIGURATION } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import typia from 'typia';
 import {
@@ -12,7 +13,7 @@ import {
   parseStringArrayText,
   readSmooGithub,
 } from '../lib/json.js';
-import { printCommandOutput, run, runStatus, runText } from '../lib/run.js';
+import { printCommandOutput, runStatus, runText } from '../lib/run.js';
 import { type ProjectTargets, readProjectTargets } from '../nx/index.js';
 import { type DeploymentStage, isPullRequestStage, parseDeploymentStage, pullRequestStage } from '../wrangler/stage.js';
 import { ciApiContext, ciApiRequest } from './api.js';
@@ -75,6 +76,21 @@ export function nxSmartArgs(
   return args;
 }
 
+/**
+ * Runs Nx and, when it fails, prints the report of each runtime input failure runtime-input.sh retained during the run.
+ * Nx 23.2.1 names a failed runtime input only as `invalid utf-8 sequence of 1 bytes from index N` and drops its stderr,
+ * and a CI job has no terminal for the wrapper's own notice: without this, the record naming the command and its
+ * cause stays on the runner.
+ */
+async function runNxStatus(args: string[], root: string): Promise<number> {
+  const started = Date.now();
+  const status = await runStatus('nx', args, root);
+  if (status !== 0) {
+    for (const report of runtimeInputFailureReports(root, started)) console.error(report);
+  }
+  return status;
+}
+
 export async function githubCiNxSmart(
   root: string,
   options: {
@@ -92,7 +108,7 @@ export async function githubCiNxSmart(
   await createGithubStatus(name, step);
   const mode = resolveNxSmartMode(options.mode ?? 'auto');
   const nxArgs = nxSmartArgs(options.target, mode, options.configuration, options.stage, options.streamOutput);
-  const status = await runStatus('nx', nxArgs, root);
+  const status = await runNxStatus(nxArgs, root);
   await updateGithubStatus(name, status === 0 ? 'success' : 'failure', step);
   if (status !== 0) {
     throw new Error(`nx ${nxArgs.join(' ')} failed with exit code ${status}`);
@@ -267,7 +283,12 @@ export async function githubCiNxRunMany(
     console.log(`No Nx targets matched target glob(s): ${expanded.unmatchedGlobs.join(', ')}; skipping.`);
   }
   if (expanded.runs.length > 0) {
-    const runNx = dependencies.runNx ?? ((args: string[], commandRoot: string) => run('nx', args, commandRoot));
+    const runNx =
+      dependencies.runNx ??
+      (async (args: string[], commandRoot: string) => {
+        const status = await runNxStatus(args, commandRoot);
+        if (status !== 0) throw new Error(`nx ${args.join(' ')} failed with exit code ${status}`);
+      });
     await runNx(nxRunManyBatchArgs(expanded.runs, options.configuration), root);
   }
   if (options.collectOutputs) {
@@ -380,7 +401,7 @@ export async function githubCiNxDeploy(
       state === 'pending' ? createGithubStatus(name, step) : updateGithubStatus(name, state, step));
   const mode = resolveNxSmartMode(options.mode ?? 'run-many');
   const listProjects = dependencies.listProjects ?? listNxDeployProjects;
-  const runNx = dependencies.runNx ?? ((args: string[], commandRoot: string) => runStatus('nx', args, commandRoot));
+  const runNx = dependencies.runNx ?? runNxStatus;
   const projects = await listProjects(root, mode, stage, options.selectTag);
   if (projects.length === 0) {
     console.log(`No ${mode} deploy projects; skipping ${stage}.`);

@@ -1101,6 +1101,14 @@ map, and the probe's bookkeeping must not reach either candidate image.
   through `@smoothbricks/nx-plugin`'s `runtime-input.sh`, which makes a failed input an Nx error.
   - **Enforced by**: `packages/nx-plugin/src/runtime-input.test.ts`, which plants a failing input through real Nx, with
     and without the daemon, and refuses a runtime input in this repository that bypasses the wrapper.
+    - **Runtime inputs run only declared programs.** Nx hashes on a developer's Mac, on a NixOS runner and in the
+      sandbox; only devenv's Nix profile and the checkout's own programs are the same in all three, with `/bin/sh` and
+      `/usr/bin/env`, which NixOS keeps. A host-shipped program such as macOS's `shasum` (Perl, not coreutils) hashes on
+      a Mac and exits 127 on NixOS, which Nx 23.2.1 reports only as `invalid utf-8 sequence of 1 bytes from index 0`.
+      `smoo github-ci` prints the reports runtime-input.sh retained after a failed Nx run.
+  - **Enforced by**: `packages/nx-plugin/src/runtime-input.test.ts`, which refuses a program in this repository's
+    declared runtime inputs that PATH finds outside `/nix`, the checkout and the home (`hostPrograms`,
+    `@smoothbricks/nx-plugin/runtime-input-policy`), and reads a planted failure's report back after real Nx refuses it.
 
 ### One Cargo environment on every path
 

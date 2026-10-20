@@ -117,6 +117,12 @@
       "import": "./dist/cargo-toolchain-policy.js",
       "default": "./dist/cargo-toolchain-policy.js"
     },
+    "./runtime-input-policy": {
+      "types": "./dist/runtime-input-policy.d.ts",
+      "development": "./src/runtime-input-policy.ts",
+      "import": "./dist/runtime-input-policy.js",
+      "default": "./dist/runtime-input-policy.js"
+    },
     "./cargo-dev-profile": {
       "types": "./dist/cargo-dev-profile.d.ts",
       "development": "./src/cargo-dev-profile.ts",
