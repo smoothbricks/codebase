@@ -744,12 +744,19 @@ moment its last job ends, usually before its client has read the end: the client
 next supervisor by its number, through `sealed` and `logRead`, and reads on from the bytes it already holds.
 
 Until a draining supervisor retires, a command of the new build that reaches it is refused by name: `exec` and every
-other verb that would run work there, because they cannot speak its protocol. A lifecycle verb that must change the
-workspace's substrate — `detach`, `rm`, `restore`, `resize`, `mv` — does not wait for it, since a drain lasts as long as
-its longest job. A lifecycle verb stops admission with `drain` and identifies the serving process from that exact
-connection's kernel peer credential, cross-checking the reply's pid. TERM and, after the existing grace, KILL go only
-through that non-reusable identity: a macOS audit token or Linux peer pidfd (kernel 6.5 or newer), never a later process
-that reused the pid. A host lacking that identity primitive gets a typed refusal, not a raw-pid fallback.
+other verb that would run work there, because they cannot speak its protocol — except a land step (`exec --class gate`,
+`rebase`, `land`, the commands a land is made of), which waits for it. An install mid-train leaves the old build's
+supervisor serving whatever job ran then, and a land that failed on it would fail on a job that has nothing to do with
+the land: measured 2026-10-20, a land's `rebase` met main's supervisor of the replaced build serving a 16-minute job.
+The land step asks it to `drain` (already draining when this build's daemon recovered it), says on stderr which socket
+and pid it waits for, and waits on the exit watch registered before that `drain`, never a poll. The wait has one ceiling
+per step, an hour, which bounds only the step: past it the step refuses naming the pid, and the supervisor and its jobs
+run on. Neither the wait nor its refusal ends a job. A lifecycle verb that must change the workspace's substrate —
+`detach`, `rm`, `restore`, `resize`, `mv` — does not wait for it, since a drain lasts as long as its longest job. A
+lifecycle verb stops admission with `drain` and identifies the serving process from that exact connection's kernel peer
+credential, cross-checking the reply's pid. TERM and, after the existing grace, KILL go only through that non-reusable
+identity: a macOS audit token or Linux peer pidfd (kernel 6.5 or newer), never a later process that reused the pid. A
+host lacking that identity primitive gets a typed refusal, not a raw-pid fallback.
 
 The owner exit watch is registered before sending `drain` or a termination signal. On macOS, registration is followed by
 an actual kernel pid-version match, never a guessed numeric-pid or signal-zero probe; on Linux the watch duplicates the
@@ -760,8 +767,8 @@ live process remains attached and is refused even after its original creator die
 
 Once the supervisor exits, the verb reconciles its group ledger as above and unlinks the socket unless something serves
 it again; unresolved group evidence is retained. The jobs' records remain unterminated until the next supervisor seals
-them. `exec` does not replace another build as a side effect: its refusal names the lifecycle step that owns the
-cutover.
+them. `exec` does not replace another build as a side effect: its refusal names the serving pid and says its jobs end
+when it exits, so `kill <pid>` is the immediate cutover; `cowshed detach` is no general answer, since main refuses it.
 
 **Recovering at daemon start.** The manager lists every supervisor socket under `<store>/run` before the daemon's
 control socket binds, and recovers them once it is bound: asks each who serves it, drains each of another build, watches

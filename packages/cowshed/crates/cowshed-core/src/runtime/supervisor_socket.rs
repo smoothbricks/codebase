@@ -1585,13 +1585,30 @@ fn decode_hello(path: &Path, value: serde_json::Value) -> Result<Hello> {
     let ours = BuildId::current()?;
     let theirs = value.get("build").and_then(serde_json::Value::as_str);
     if theirs != Some(ours.as_str()) {
+        let pid = value.get("pid").and_then(serde_json::Value::as_u64);
+        let (serving, hint) = match pid {
+            Some(pid) => (
+                format!(" (pid {pid})"),
+                format!(
+                    "it admits nothing more and retires once its running jobs end, and a land step \
+                     waits for that; to end its jobs now, `kill {pid}`: they end when it exits, \
+                     and the next command starts a supervisor of this build"
+                ),
+            ),
+            None => (
+                String::new(),
+                "it admits nothing more and retires once its running jobs end; \
+                 `cowshed doctor --json` names its process"
+                    .to_owned(),
+            ),
+        };
         return Err(CowshedError::conflict(
             format!(
-                "the workspace supervisor at {} is cowshed build {}; this cowshed is build {ours}",
+                "the workspace supervisor at {}{serving} is cowshed build {}; this cowshed is build {ours}",
                 path.display(),
                 theirs.unwrap_or("(unnamed)")
             ),
-            "let the supervisor drain, or stop it with `cowshed detach`, so this cowshed starts its own",
+            hint,
         ));
     }
     let hello: HelloWire = decode(value)?;
@@ -1670,6 +1687,70 @@ pub async fn drain(path: &Path) -> Result<Drained> {
         )));
     }
     Ok(Drained { process, exit })
+}
+
+/// The longest a land step waits for supervisors of another build to drain and retire
+/// ([`await_other_build_retired`]). No bound on their jobs, which run on past it: the step then
+/// refuses naming the supervisor, so whoever runs the land learns which job holds it.
+pub const OTHER_BUILD_DRAIN_CEILING: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// When a supervisor of another cowshed build serves `path`, wait until `deadline` for it to
+/// retire (11_shell.md, "Draining a supervisor of another build"): ask it to drain, which it
+/// already does when this build's daemon recovered it, say on stderr which process and build this
+/// waits for, and wait on the exit watch [`drain`] registered. Past `deadline` it refuses, naming
+/// the process; it never ends one. Answers at once when nothing of another build serves `path`,
+/// and leaves whatever else is wrong there to the command's own `hello`.
+pub async fn await_other_build_retired(path: &Path, deadline: std::time::Instant) -> Result<()> {
+    match hello_if_present(path).await {
+        // Only another build's hello is a conflict (`decode_hello`).
+        Err(refusal) if refusal.code == crate::error::ErrorCode::Conflict => {}
+        _ => return Ok(()),
+    }
+    let drained = drain(path).await?;
+    let pid = drained.pid();
+    let started = std::time::Instant::now();
+    eprintln!(
+        "cowshed: the workspace supervisor at {} (pid {pid}) is of another cowshed build and \
+         drains its running jobs; waiting for it to retire, for at most {}s",
+        path.display(),
+        deadline.saturating_duration_since(started).as_secs()
+    );
+    let exit = drained.exit;
+    let ceiling = deadline.saturating_duration_since(started);
+    let retired = tokio::task::spawn_blocking(move || exit.within(ceiling))
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("waiting for supervisor pid {pid} failed: {error}"))
+        })?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot wait for the workspace supervisor at {} (pid {pid}) to exit: {error}",
+                    path.display()
+                ),
+                "retry once it has exited; its jobs and ledger are retained",
+            )
+        })?;
+    if !retired {
+        return Err(CowshedError::conflict(
+            format!(
+                "the workspace supervisor at {} (pid {pid}) of another cowshed build still runs \
+                 jobs after {}s of waiting for it to retire",
+                path.display(),
+                started.elapsed().as_secs()
+            ),
+            format!(
+                "wait for its jobs to end, or end them now with `kill {pid}`: its jobs end when \
+                 it exits, and the next command starts a supervisor of this build"
+            ),
+        ));
+    }
+    eprintln!(
+        "cowshed: the workspace supervisor at {} (pid {pid}) retired after {}s",
+        path.display(),
+        started.elapsed().as_secs()
+    );
+    Ok(())
 }
 
 /// Ask the supervisor at `path` to serve under its workspace's current grants; the authority

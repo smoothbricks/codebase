@@ -2317,6 +2317,10 @@ struct StorageProjectRuntimeHost<H: RuntimeStorageHost> {
     served: std::collections::BTreeMap<WorkspaceName, ServedSupervisor>,
     /// Who runs the workspace supervisors this host's commands reach.
     supervisors_run_in: SupervisorHome,
+    /// Set by a land step (`exec --class gate`, `rebase`, `land`) when it starts: until this
+    /// instant, a supervisor of another build that the step meets is waited for to retire rather
+    /// than refused (11_shell.md, "Draining a supervisor of another build").
+    other_build_wait_until: Option<std::time::Instant>,
     /// With a sink of the host's own: per supervisor socket, the task forwarding that
     /// supervisor's commitments into it. `None` when the host's default sink already has them.
     forwarders: Option<std::collections::BTreeMap<PathBuf, tokio::task::JoinHandle<()>>>,
@@ -3640,6 +3644,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             supervisors: std::collections::BTreeMap::new(),
             served: std::collections::BTreeMap::new(),
             supervisors_run_in,
+            other_build_wait_until: None,
             forwarders: if forwards_commitments {
                 Some(std::collections::BTreeMap::new())
             } else {
@@ -7612,6 +7617,14 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         self.ensure_supervisor_for(current).await
     }
 
+    /// This command is a land step: from now until
+    /// [`super::supervisor_socket::OTHER_BUILD_DRAIN_CEILING`] has passed, a supervisor of another
+    /// build it meets is waited for to retire.
+    fn wait_for_other_builds_as_a_land_step(&mut self) {
+        self.other_build_wait_until =
+            Some(std::time::Instant::now() + super::supervisor_socket::OTHER_BUILD_DRAIN_CEILING);
+    }
+
     /// The one-time owned-link migration of a workspace whose marker predates the current
     /// revision. The donor is the sidecar's own project root; the protected marker must name it,
     /// the repository and the incarnation, or the migration refuses before walking anything.
@@ -7740,6 +7753,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             grant_revision: grants.revision,
             lifecycle_revision: current.derived.workspace.revision().get(),
         };
+        // A land step waits out a supervisor of another build serving this workspace instead of
+        // failing the land on it; it is past the drain by the time it asks for its own.
+        if let Some(deadline) = self.other_build_wait_until {
+            super::supervisor_socket::await_other_build_retired(&socket, deadline).await?;
+        }
         if self.supervisors_run_in == SupervisorHome::Daemon {
             let ensured = cowshed_os::timing::spanned(
                 "supervisor",
@@ -12175,6 +12193,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         into: Option<WorkspaceTarget>,
         options: RebaseOptions,
     ) -> Result<RebaseReport> {
+        self.wait_for_other_builds_as_a_land_step();
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         require_single_destination(options.onto.as_ref(), into.as_ref())?;
         self.validate_binding().await?;
@@ -12271,6 +12290,7 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         into: Option<WorkspaceTarget>,
         options: LandOptions,
     ) -> Result<LandReport> {
+        self.wait_for_other_builds_as_a_land_step();
         let store_root = &std::sync::Arc::clone(self.git.store_root());
         timed_async("land", "binding", self.validate_binding()).await?;
         let current = timed_async("land", "source", self.current(&workspace)).await?;
@@ -13404,6 +13424,9 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         request: ExecRequest,
         source: AdmissionSource,
     ) -> Result<JobId> {
+        if request.class == crate::api::dto::ExecClass::Gate {
+            self.wait_for_other_builds_as_a_land_step();
+        }
         let current = self.current(&workspace).await?;
         Self::require_exact_incarnation(&current, &incarnation)?;
         let token = self.session(&workspace, &session).cloned();

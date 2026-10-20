@@ -1429,7 +1429,8 @@ mod tests {
     const OTHER_BUILD_SOCKET: &str = "COWSHED_TEST_OTHER_BUILD_SOCKET";
 
     /// Not a test: the separate process a supervisor of another build runs as, for
-    /// [`a_verb_stops_a_supervisor_of_another_build_and_the_jobs_it_left`]. It answers every
+    /// [`a_verb_stops_a_supervisor_of_another_build_and_the_jobs_it_left`] and
+    /// [`a_land_step_waits_for_a_supervisor_of_another_build_and_never_ends_it`]. It answers every
     /// request as `drain` does, with its own pid, and serves until it is killed.
     #[test]
     #[ignore = "helper process of a_verb_stops_a_supervisor_of_another_build_and_the_jobs_it_left"]
@@ -1544,6 +1545,83 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["other.sock.lock"], "no socket file is left behind");
+        std::fs::remove_dir_all(store).expect("cleanup");
+    }
+
+    /// A land step that meets a supervisor of another build waits on that process's exit: past
+    /// its ceiling it refuses naming the pid and leaves the supervisor running, and once the
+    /// supervisor exits the wait answers at once.
+    #[tokio::test]
+    async fn a_land_step_waits_for_a_supervisor_of_another_build_and_never_ends_it() {
+        let store = PathBuf::from("/tmp").join(format!(
+            "cowshed-wait-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(store.join("run")).expect("run directory");
+        let socket = store.join("run/other.sock");
+        let mut supervisor =
+            tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "runtime::supervisor_manager::tests::serves_as_a_supervisor_of_another_build",
+                    "--ignored",
+                ])
+                .env(OTHER_BUILD_SOCKET, &socket)
+                .stdout(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn_locked()
+                .expect("start the supervisor of another build");
+        while UnixStream::connect(&socket).await.is_err() {
+            if let Some(status) = supervisor.try_wait().expect("poll the supervisor") {
+                panic!("the supervisor of another build exited before serving: {status}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = supervisor.id().expect("it runs");
+
+        let ceiling = Duration::from_millis(300);
+        let refused = supervisor_socket::await_other_build_retired(
+            &socket,
+            std::time::Instant::now() + ceiling,
+        )
+        .await
+        .expect_err("past its ceiling the step refuses");
+        assert_eq!(refused.code, ErrorCode::Conflict);
+        assert!(
+            refused.message.contains(&format!("pid {pid}"))
+                && refused.hint.contains(&format!("kill {pid}")),
+            "the refusal names the supervisor and the command that ends its jobs: {refused:?}"
+        );
+        assert!(
+            supervisor.try_wait().expect("poll").is_none(),
+            "the refusal leaves the supervisor and its jobs running"
+        );
+
+        let started = std::time::Instant::now();
+        let waited = tokio::spawn({
+            let socket = socket.clone();
+            async move {
+                supervisor_socket::await_other_build_retired(
+                    &socket,
+                    std::time::Instant::now() + Duration::from_secs(60),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !waited.is_finished(),
+            "the step waits while the supervisor runs"
+        );
+        supervisor.start_kill().expect("end the supervisor");
+        waited
+            .await
+            .expect("the wait")
+            .expect("the step goes on once the supervisor has exited");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the exit event ends the wait, not its ceiling"
+        );
         std::fs::remove_dir_all(store).expect("cleanup");
     }
 }
