@@ -20,10 +20,17 @@
 # exit status, the byte is redundant and can go.
 #
 # Nx drops runtime stderr, so it is not a reliable diagnostic channel. Failures
-# retain private argv, byte-exact stderr, status and a readable report below
-# $PWD/.runtime-input-failures/, outside Nx and temporary state. Read them with
-# `cat .runtime-input-failures/*/report` after a decoder error. Stderr and a
-# controlling /dev/tty also name the failure where those channels are visible.
+# retain private argv, byte-exact stdout and stderr, status and a readable
+# report below $PWD/.runtime-input-failures/, outside Nx and temporary state.
+# Read them with `cat .runtime-input-failures/*/report` after a decoder error.
+# Stderr and a controlling /dev/tty also name the failure where those channels
+# are visible.
+#
+# A failed command's own stdout never reaches the hasher either: it is
+# captured to a file from the start, retained in the failure record, and the
+# only byte this script emits on failure is the 0xFF poison above. Nothing
+# from a failure path flows into the hash as input bytes. Successful stdout
+# is replayed from the capture file byte-exact.
 #
 # The command's stderr is not part of the value; it surfaces only on failure.
 # Diagnostics name temp paths, process ids and the boundary the input ran in
@@ -35,15 +42,17 @@ if [ "$#" -eq 0 ]; then
   printf '\377'
   exit 64
 fi
-if diagnostic=$(mktemp "${TMPDIR:-/tmp}/nx-runtime-input.XXXXXXXXXX"); then
+if diagnostic=$(mktemp "${TMPDIR:-/tmp}/nx-runtime-input-stderr.XXXXXXXXXX") &&
+  captured=$(mktemp "${TMPDIR:-/tmp}/nx-runtime-input-stdout.XXXXXXXXXX"); then
   :
 else
-  printf 'runtime input could not capture stderr: %s\n' "$*" >&2
+  printf 'runtime input could not capture streams: %s\n' "$*" >&2
   printf '\377'
   exit 73
 fi
-if "$@" 2>"$diagnostic"; then
-  rm -f "$diagnostic"
+if "$@" >"$captured" 2>"$diagnostic"; then
+  cat "$captured"
+  rm -f "$diagnostic" "$captured"
   exit 0
 else
   status=$?
@@ -53,7 +62,8 @@ if record=$(umask 077; mkdir -p "$PWD/.runtime-input-failures" &&
   mktemp -d "$PWD/.runtime-input-failures/failure.XXXXXXXXXX"); then
   if printf '%s\000' "$@" >"$record/argv" &&
     printf '%s\n' "$status" >"$record/exit-status" &&
-    mv "$diagnostic" "$record/stderr" && {
+    mv "$diagnostic" "$record/stderr" &&
+    mv "$captured" "$record/stdout" && {
       printf 'runtime input exited %s: %s\n' "$status" "$*"
       printf 'working directory: %s\n' "$PWD"
       index=0
@@ -64,6 +74,8 @@ if record=$(umask 077; mkdir -p "$PWD/.runtime-input-failures" &&
       done
       printf 'original stderr:\n'
       cat "$record/stderr"
+      printf 'original stdout (never hashed):\n'
+      cat "$record/stdout"
     } >"$record/report"; then
     printf '\nruntime input exited %s: %s; evidence: %s/report\n' "$status" "$*" "$record" >&2
     # A detached daemon may have no terminal. Preserve that error too, rather

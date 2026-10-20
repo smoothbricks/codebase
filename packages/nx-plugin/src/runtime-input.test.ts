@@ -81,11 +81,14 @@ describe('runtime-input.sh', () => {
       ];
       const ran = wrapped(workspace, ...command);
       expect(ran.status).toBe(3);
-      expect(ran.stdout).toEqual(Buffer.from([...Buffer.from('partial\n'), 0xff]));
+      // The failed command's partial stdout is evidence, never input bytes:
+      // the only byte the hasher sees is the poison.
+      expect(ran.stdout).toEqual(Buffer.from([0xff]));
       const record = await failureRecord(workspace);
       expect((await stat(record)).mode & 0o777).toBe(0o700);
       expect(await readFile(join(record, 'argv'))).toEqual(Buffer.from(`${command.join('\0')}\0`));
       expect(await readFile(join(record, 'stderr'))).toEqual(Buffer.from('the-cause\0raw\n\n'));
+      expect(await readFile(join(record, 'stdout'))).toEqual(Buffer.from('partial\n'));
       expect(await readFile(join(record, 'exit-status'), 'utf8')).toBe('3\n');
       const report = await readFile(join(record, 'report'), 'utf8');
       expect(report).toContain('runtime input exited 3: sh -c');

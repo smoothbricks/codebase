@@ -571,6 +571,7 @@ describe('test-walk-policy', () => {
       git('update-ref', '-d', 'refs/remotes/origin/main');
       const missing = upstreamBase(root);
       expect(missing.ok).toBe(false);
+      expect(missing.ok ? '' : missing.reason).toContain('no main ref in this shed');
       expect(missing.ok ? '' : missing.reason).toContain('export NX_BASE');
       process.env.NX_BASE = base;
       expect(upstreamBase(root)).toEqual({ ok: true, value: base });

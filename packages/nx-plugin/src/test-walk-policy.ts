@@ -682,6 +682,19 @@ export function upstreamBase(root: string): GitAnswer<string> {
         break;
       }
     }
+    if (upstream === 'main') {
+      // No upstream ref answered: say so as its own reason rather than letting
+      // merge-base fail against a local main that may not exist (a fresh shed
+      // has none until it fetches).
+      const local = exists('main');
+      if (!local.ok) return local;
+      if (!local.value)
+        return {
+          ok: false,
+          reason:
+            'no main ref in this shed: neither refs/remotes/main/main, refs/remotes/origin/main nor a local main exists (fetch main, set refs/remotes/main/main, or export NX_BASE)',
+        };
+    }
   }
   const args = ['merge-base', 'HEAD', upstream];
   const result = git(root, args);
