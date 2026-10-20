@@ -16,6 +16,13 @@ import typia from 'typia';
 export const PUBLIC_DENYLIST_CONFIG_KEY = 'smoothbricks.publicDenylist';
 
 /**
+ * Git config key: one pattern per value, judged only against a commit message (the commit-msg
+ * hook), never against staged lines or pushed trees. A repository may commit it through its
+ * included workspace git config: some text belongs in files but not in history messages.
+ */
+export const COMMIT_MESSAGE_DENYLIST_CONFIG_KEY = 'smoothbricks.commitMessageDenylist';
+
+/**
  * Local git config key naming the one public tracking ref (a full `refs/remotes/...` ref) whose
  * history is already public. Clone-local on purpose: a tree cannot declare its own exemption.
  */
@@ -190,16 +197,23 @@ type Allowlist = {
 
 const parseWorkspaceMarker = typia.json.createValidateParse<{ projectRoot: string }>();
 
-function configuredPatterns(root: string, env: Environment): { patterns: string[] } | { failure: string } {
-  const config = git(root, ['config', '--get-all', PUBLIC_DENYLIST_CONFIG_KEY], env);
+function gitConfigPatterns(root: string, key: string, env: Environment): { patterns: string[] } | { failure: string } {
+  const config = git(root, ['config', '--get-all', key], env);
   // An unset key is the only nonzero status that means no configuration.
   if (config.exitCode !== 0 && config.exitCode !== 1) {
-    return { failure: `git config --get-all ${PUBLIC_DENYLIST_CONFIG_KEY}: ${config.stderr}` };
+    return { failure: `git config --get-all ${key}: ${config.stderr}` };
   }
+  return { patterns: config.stdout.split('\n').filter((line) => line.trim().length > 0) };
+}
+
+function configuredPatterns(root: string, env: Environment): { patterns: string[] } | { failure: string } {
+  const config = gitConfigPatterns(root, PUBLIC_DENYLIST_CONFIG_KEY, env);
+  if ('failure' in config) return config;
   return {
-    patterns: [...config.stdout.split('\n'), ...(env[PUBLIC_DENYLIST_ENV] ?? '').split('\n')].filter(
-      (line) => line.trim().length > 0,
-    ),
+    patterns: [
+      ...config.patterns,
+      ...(env[PUBLIC_DENYLIST_ENV] ?? '').split('\n').filter((line) => line.trim().length > 0),
+    ],
   };
 }
 
@@ -210,8 +224,12 @@ export async function scanPublicCommitDenylist(
   env: Environment = process.env,
 ): Promise<PublicDenylistScan> {
   try {
-    const configured = configuredPatterns(root, env);
-    if ('failure' in configured) return { outcome: 'failed', reason: configured.failure };
+    const shared = configuredPatterns(root, env);
+    if ('failure' in shared) return { outcome: 'failed', reason: shared.failure };
+    const messageOnly =
+      subject.kind === 'message' ? gitConfigPatterns(root, COMMIT_MESSAGE_DENYLIST_CONFIG_KEY, env) : { patterns: [] };
+    if ('failure' in messageOnly) return { outcome: 'failed', reason: messageOnly.failure };
+    const configured = { patterns: [...shared.patterns, ...messageOnly.patterns] };
     const siblings = await siblingPatterns(root, env);
     if ('failure' in siblings) return { outcome: 'failed', reason: siblings.failure };
     const allowlist = readAllowlist(root, env);

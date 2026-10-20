@@ -184,4 +184,50 @@ describe('managed public denylist commit hooks', () => {
     expect(result.stderr).toContain('public denylist check did not run');
     expect(result.stderr).toContain('missing closing parenthesis');
   });
+
+  describe('message-only patterns', () => {
+    // Stand-ins for a repository's own list: a local store path, an absolute workspace path, and a
+    // case-sensitive generated name (judged under `git grep -i`, so the pattern opts out with (?-i)).
+    const patterns = [
+      'private-store/',
+      '/[.]cowshed/|/cowshed/store/',
+      '(?-i)(?<![A-Za-z0-9_])Seat[A-Z][A-Za-z0-9]*(?![A-Za-z0-9_])',
+    ];
+    beforeEach(() => {
+      for (const pattern of patterns) git('config', '--add', 'smoothbricks.commitMessageDenylist', pattern);
+    });
+
+    it('refuses a commit message that trips each pattern', async () => {
+      await stage('neutral content\n');
+      for (const line of ['see private-store/receipt.md', 'ran in /work/.cowshed/unit-a', 'asked SeatReviewer']) {
+        const head = git('rev-parse', 'HEAD');
+        const result = runGit(root, 'commit', '-m', 'fix: neutral summary', '-m', line);
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain(`message:3:${line}`);
+        expect(git('rev-parse', 'HEAD')).toBe(head);
+      }
+    });
+
+    it('passes a relative package path and the same words outside the pattern shapes', async () => {
+      await stage('neutral content\n');
+      const result = runGit(
+        root,
+        'commit',
+        '-m',
+        'fix: neutral summary',
+        '-m',
+        'packages/cowshed/src/lib.rs and .cowshed/workspace.json; a seat reviewer read it',
+      );
+      expect(result.stderr).toBe('');
+      expect(result.exitCode).toBe(0);
+    });
+
+    it('never judges added lines: staged text with all three shapes commits under a neutral message', async () => {
+      await stage('private-store/receipt.md\n/work/.cowshed/unit-a\nSeatReviewer\n');
+      const result = runGit(root, 'commit', '-m', 'fix: neutral summary');
+      expect(result.stderr).toBe('');
+      expect(result.exitCode).toBe(0);
+      expect(git('show', 'HEAD:notes.txt')).toBe('private-store/receipt.md\n/work/.cowshed/unit-a\nSeatReviewer');
+    });
+  });
 });

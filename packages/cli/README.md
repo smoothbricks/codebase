@@ -869,6 +869,14 @@ After conventional formatting, the commit-msg hook runs
 `smoo monorepo check-public-denylist --commit-message <commit-msg-file>` with the same sibling and `HOME` rules. It
 reports offending message lines before refusing the commit, so private references cannot enter new history.
 
+A message can also be held to patterns that do not apply to files: each value of `smoothbricks.commitMessageDenylist` is
+judged against the commit message only, never against staged lines or pushed trees. Use it for text a repository's files
+may name (a local evidence path, a generated agent name) but its history messages must not. Unlike
+`smoothbricks.publicDenylist`, the list may be committed, through the workspace git config the shell includes
+(`tooling/workspace.gitconfig`), because it guards a private repository's own history rather than publication. Patterns
+are judged by `git grep -i -P` like the others; one that must be case-sensitive starts with `(?-i)`. A pattern git
+cannot compile refuses the commit.
+
 The generated pre-push hook runs two gates. The first runs on every OS and guards a public repository against naming
 what is private to the people working on it:
 
