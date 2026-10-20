@@ -618,8 +618,11 @@ mod tests {
     use crate::runtime::process_tree::BirthToken;
     use crate::temp_root::TempRoot;
 
+    /// Replay keeps every emitted row, in order, and a gap-only batch adds none. The writer gathers
+    /// the batches of one seal interval into one segment (13_telemetry.md, "Process segments"), so
+    /// the health read seals all three rows together.
     #[tokio::test]
-    async fn trace_replay_preserves_emitted_batches_and_gap_only_batches_seal_nothing() {
+    async fn trace_replay_preserves_emitted_rows_in_order_and_gap_only_batches_add_none() {
         let root = TempRoot::new("cowshed-process-batch-replay");
         let publisher = JobSpanPublisher::start(root.to_path_buf());
         let parent = ProcessIdentity {
@@ -674,21 +677,19 @@ mod tests {
             }
         }
         let health = publisher.health().await.unwrap();
-        assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
-        let mut paths = std::fs::read_dir(root.join("1970-01-01"))
+        assert_eq!((health.recorded, health.failed), (1, 0), "{health:?}");
+        let paths = std::fs::read_dir(root.join("1970-01-01"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
-        paths.sort();
-        assert_eq!(paths.len(), 2);
-        let first = read_process_segment(&paths[0]).unwrap();
-        let second = read_process_segment(&paths[1]).unwrap();
-        assert_eq!((first.len(), second.len()), (2, 1));
-        assert_eq!(first[0].columns.proc_pid, Some(41));
-        assert_eq!(first[1].columns.proc_pid, Some(42));
-        assert_eq!(second[0].columns.proc_pid, Some(43));
-        assert_eq!(first[1].parent_span_id, first[0].span_id);
-        assert_eq!(second[0].parent_span_id, first[0].span_id);
+        assert_eq!(paths.len(), 1);
+        let rows = read_process_segment(&paths[0]).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].columns.proc_pid, Some(41));
+        assert_eq!(rows[1].columns.proc_pid, Some(42));
+        assert_eq!(rows[2].columns.proc_pid, Some(43));
+        assert_eq!(rows[1].parent_span_id, rows[0].span_id);
+        assert_eq!(rows[2].parent_span_id, rows[0].span_id);
     }
 
     #[tokio::test]

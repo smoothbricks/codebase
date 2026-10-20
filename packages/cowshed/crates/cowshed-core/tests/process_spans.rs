@@ -282,6 +282,8 @@ struct TracedJob {
     start: Instant,
     wall: SystemTime,
     batches: usize,
+    /// The process rows recorded so far, in the order the writer gathers them.
+    rows: usize,
 }
 
 impl TracedJob {
@@ -303,6 +305,7 @@ impl TracedJob {
             // 2026-10-07T00:00:00Z.
             wall: UNIX_EPOCH + Duration::from_secs(1_791_331_200),
             batches: 0,
+            rows: 0,
         }
     }
 
@@ -350,8 +353,13 @@ impl TracedJob {
                 )
             })
             .collect();
-        if projected.iter().any(|row| matches!(row, Ok(Some(_)))) {
+        let rows = projected
+            .iter()
+            .filter(|row| matches!(row, Ok(Some(_))))
+            .count();
+        if rows > 0 {
             self.batches += 1;
+            self.rows += rows;
         }
         self.publisher.record_process(projected);
     }
@@ -579,7 +587,7 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
         }),
     };
     job.blocked(6_000, second, Some(lock));
-    let locked_batch = job.batches;
+    let through_lock = job.rows;
     job.blocked(7_000, second, Some(ProcessBlockedOn::None));
     job.blocked(8_000, second, None);
 
@@ -629,27 +637,25 @@ async fn a_job_s_process_tree_is_three_parented_process_run_spans_over_fourteen_
         },
     );
 
+    // Every batch fell inside one seal interval, and the health read seals what the writer
+    // gathered: one segment, its rows in the order the batches were recorded (13_telemetry.md,
+    // "Process segments").
+    assert!(job.batches > 1, "the job emitted several batches");
     let health = job.publisher.health().await.unwrap();
     assert_eq!(
         (health.recorded, health.failed),
-        (u64::try_from(job.batches).unwrap(), 0),
-        "one sealed segment per batch that added rows: {health:?}"
+        (1, 0),
+        "the interval's batches are one sealed segment: {health:?}"
     );
 
     let segments = sealed_segments(&telemetry, "process-");
-    assert_eq!(segments.len(), job.batches);
-    let writer = &segments[0].0["process-00000000000000000001-".len()..];
-    let mut rows = Vec::new();
-    let mut through_lock = 0;
-    for (order, (name, batch)) in segments.iter().enumerate() {
-        assert_eq!(*name, format!("process-{:020}-{writer}", order + 1));
-        exact_schema(&batch.schema(), &spec_process_columns())
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-        rows.extend(decode(batch));
-        if order + 1 == locked_batch {
-            through_lock = rows.len();
-        }
-    }
+    assert_eq!(segments.len(), 1);
+    let (name, batch) = &segments[0];
+    assert!(name.starts_with("process-00000000000000000001-"), "{name}");
+    exact_schema(&batch.schema(), &spec_process_columns())
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+    let rows = decode(batch);
+    assert_eq!(rows.len(), job.rows);
 
     // Three spans in the job span's thread -- its durable key's, not the workspace-local job id
     // -- and trace: the shell under the job span, both children under the shell.
@@ -1015,7 +1021,7 @@ async fn a_job_s_charged_memory_and_its_process_s_resident_memory_are_recorded_a
         let job_rows = if charged.is_some() { 2 } else { 3 };
         assert_eq!(
             (health.recorded, health.failed),
-            (u64::try_from(job.batches + job_rows).unwrap(), 0),
+            (u64::try_from(1 + job_rows).unwrap(), 0),
             "{label}: process segments, job edges and any unattributed row: {health:?}"
         );
 
@@ -1043,7 +1049,11 @@ async fn a_job_s_charged_memory_and_its_process_s_resident_memory_are_recorded_a
 
         // The process spans: exactly the fourteen columns, in the job span's trace and thread.
         let segments = sealed_segments_among_kinds(&telemetry, "process-");
-        assert_eq!(segments.len(), job.batches);
+        assert_eq!(
+            segments.len(),
+            1,
+            "{label}: the interval's batches are one segment"
+        );
         let mut rows = Vec::new();
         for (name, batch) in &segments {
             exact_schema(&batch.schema(), &spec_process_columns())

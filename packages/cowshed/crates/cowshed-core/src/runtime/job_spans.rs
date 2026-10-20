@@ -19,8 +19,9 @@
 //!
 //! The job's processes are `process.run` spans of the same thread, hanging from the job span.
 //! The native observer projects each emitted fold batch through [`super::process_spans`] and
-//! hands it to [`JobSpanPublisher::record_process`], which seals one
-//! `process-<order:020>-<writer>.arrow` segment through the same writer and order as the job rows.
+//! hands it to [`JobSpanPublisher::record_process`]. The writer gathers those rows and seals them
+//! as one `process-<order:020>-<writer>.arrow` segment per [`PROCESS_SEAL_INTERVAL`], through the
+//! same writer and order as the job rows ([`write_rows`]).
 //!
 //! Telemetry never gates a job. The actor hands a row to [`JobSpanPublisher::record`], which
 //! queues it without waiting; one writer task seals segments in order, off the actor and off the
@@ -29,11 +30,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow_array::RecordBatch;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::api::dto::{ExitStatus, JobId, JobInfo, JobState, TraceContext};
@@ -64,6 +66,20 @@ pub const JOB_SPAN_ID: u32 = 1;
 /// admissions and terminals far beyond what a workspace's actor queue admits at once. A full queue
 /// refuses segments rather than delaying the actor.
 const QUEUE_CAPACITY: usize = 256;
+
+/// How long a writer gathers process rows before it seals them as one segment. A process fold
+/// batch is not a durability event: sealing one is a full-drive flush of the segment and of its
+/// directory (`Durability::PowerLoss`), and one seal per fold batch made 26 seals and about 52
+/// `F_FULLFSYNC`s a second host-wide, 5-8 s of flushing per wall second at 0.10-0.16 s each,
+/// which saturated the drive under every other process on it (measured 2026-10-21). So the writer
+/// seals on this interval, and the durability of each seal is unchanged. Rows still waiting
+/// when the process dies are lost, as the gateway's one-batch audit window is (13_telemetry.md,
+/// "Process segments").
+pub const PROCESS_SEAL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The most process rows a writer gathers before it seals early, so a burst of events cannot
+/// hold an unbounded segment in memory until the interval ends.
+const PROCESS_SEAL_ROWS: usize = 16_384;
 
 /// The lmao thread a job's spans are written on: the first eight bytes of a domain-separated
 /// BLAKE3 of the job's durable key `(repo_id, workspace_incarnation, job_id)` (13_telemetry.md,
@@ -322,8 +338,9 @@ impl JobSpanPublisher {
         }))));
     }
 
-    /// Queue all projected rows of one emitted fold batch as one segment. Each refused event
-    /// is counted and contributes no row; successful rows remain in the same batch.
+    /// Queue all projected rows of one emitted fold batch for the writer, which seals them with
+    /// the other rows of its interval ([`PROCESS_SEAL_INTERVAL`]). Each refused event is counted
+    /// and contributes no row; successful rows remain in the same batch.
     pub fn record_process(
         &self,
         projected: impl IntoIterator<Item = Result<Option<ProcessSpanRow>, ProcessSpanError>>,
@@ -386,38 +403,96 @@ fn refuse(health: &Mutex<TraceHealth>, reason: String) {
     health.last_failure = Some(reason);
 }
 
-/// Seal each segment in queue order. Sealing syncs files and directories, so it runs on the
-/// blocking pool; the order advances on every attempt, so a name a failed attempt may have
-/// published is never reused.
+/// Seal segments in queue order. Job rows seal as they come; process rows are gathered and sealed
+/// together once [`PROCESS_SEAL_INTERVAL`] has passed since the first of them, or once
+/// [`PROCESS_SEAL_ROWS`] wait. Whatever is gathered seals first, before a job row, before a health
+/// answer, which promises every row queued before it, and when the queue closes, so segments
+/// keep queue order and nothing queued is left behind by a writer that ends in order. Sealing
+/// syncs files and directories, so it runs on the blocking pool; the order advances on every
+/// attempt, so a name a failed attempt may have published is never reused.
 async fn write_rows(
     root: PathBuf,
     writer: Uuid,
     mut receiver: mpsc::Receiver<Request>,
     health: Arc<Mutex<TraceHealth>>,
 ) {
-    let mut order: u64 = 1;
-    while let Some(request) = receiver.recv().await {
+    let mut sealer = Sealer {
+        root,
+        writer,
+        order: 1,
+        health,
+    };
+    let mut gathered: Vec<ProcessSpanRow> = Vec::new();
+    let mut due: Option<Instant> = None;
+    loop {
+        let request = tokio::select! {
+            request = receiver.recv() => request,
+            () = tokio::time::sleep_until(due.unwrap_or_else(Instant::now)), if due.is_some() => {
+                sealer.seal_gathered(&mut gathered).await;
+                due = None;
+                continue;
+            }
+        };
         match request {
-            Request::Seal(segment) => {
-                let root = root.clone();
-                let sealed =
-                    tokio::task::spawn_blocking(move || seal(&root, writer, order, &segment)).await;
-                order = order.saturating_add(1);
-                match sealed {
-                    Ok(Ok(())) => {
-                        let mut health = lock(&health);
-                        health.recorded = health.recorded.saturating_add(1);
-                    }
-                    Ok(Err(error)) => refuse(&health, error.to_string()),
-                    Err(error) => {
-                        refuse(&health, format!("the job span seal task failed: {error}"))
-                    }
+            Some(Request::Seal(Segment::Processes(rows))) => {
+                due.get_or_insert_with(|| Instant::now() + PROCESS_SEAL_INTERVAL);
+                gathered.extend(rows);
+                if gathered.len() >= PROCESS_SEAL_ROWS {
+                    sealer.seal_gathered(&mut gathered).await;
+                    due = None;
                 }
             }
-            Request::Health { reply } => {
-                // A caller that stopped waiting has nothing left to tell.
-                let _ = reply.send(lock(&health).clone());
+            Some(Request::Seal(job)) => {
+                sealer.seal_gathered(&mut gathered).await;
+                due = None;
+                sealer.seal(job).await;
             }
+            Some(Request::Health { reply }) => {
+                sealer.seal_gathered(&mut gathered).await;
+                due = None;
+                // A caller that stopped waiting has nothing left to tell.
+                let _ = reply.send(lock(&sealer.health).clone());
+            }
+            None => {
+                sealer.seal_gathered(&mut gathered).await;
+                return;
+            }
+        }
+    }
+}
+
+/// One writer's sealing state: where its segments go, its name and its next order.
+struct Sealer {
+    root: PathBuf,
+    writer: Uuid,
+    order: u64,
+    health: Arc<Mutex<TraceHealth>>,
+}
+
+impl Sealer {
+    /// Seal the gathered process rows as one segment, if there are any.
+    async fn seal_gathered(&mut self, gathered: &mut Vec<ProcessSpanRow>) {
+        if !gathered.is_empty() {
+            self.seal(Segment::Processes(std::mem::take(gathered)))
+                .await;
+        }
+    }
+
+    async fn seal(&mut self, segment: Segment) {
+        let (root, writer, order) = (self.root.clone(), self.writer, self.order);
+        let sealed =
+            tokio::task::spawn_blocking(move || seal(&root, writer, order, &segment)).await;
+        self.order = self.order.saturating_add(1);
+        match sealed {
+            Ok(Ok(())) => {
+                let mut health = lock(&self.health);
+                health.recorded = health.recorded.saturating_add(1);
+            }
+            Ok(Err(error)) => refuse(&self.health, error.to_string()),
+            Err(error) => refuse(
+                &self.health,
+                format!("the job span seal task failed: {error}"),
+            ),
         }
     }
 }
@@ -662,6 +737,113 @@ mod tests {
         assert_eq!(decoded[0].message, "process.run");
         assert_eq!(decoded[0].columns.proc_argv.as_deref(), Some("/bin/cat"));
         assert_eq!(decoded[0].parent_span_id, JOB_SPAN_ID);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The seal interval is a budget, not a lossy buffer: every fold batch queued inside one
+    /// interval seals as exactly one segment once it ends, with no reader asking, and a batch
+    /// after it seals as a second. A process fold batch is not a durability event; one seal per
+    /// batch saturated the drive with full flushes (`PROCESS_SEAL_INTERVAL`).
+    #[tokio::test(start_paused = true)]
+    async fn fold_batches_within_one_interval_seal_once_and_a_later_batch_seals_again() {
+        use crate::api::dto::{CommandArg, UtcTimestamp};
+        use crate::api::process::{JobProcessEvent, JobProcessSample};
+        use crate::runtime::process_spans::{
+            ProcessSpanProjection, RetainedProcessEvent, read_process_segment,
+        };
+        use crate::runtime::process_tree::{BirthToken, ProcessIdentity};
+
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-span-interval-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let publisher = JobSpanPublisher::start(root.clone());
+        let mut projection = ProcessSpanProjection::new("trace", 9);
+        let mut born = |pid: u32| {
+            let process = JobProcessSample {
+                pid,
+                ppid: 1,
+                program: "/bin/cat".to_owned(),
+                argv: vec![CommandArg::from("/bin/cat")],
+                truncated: false,
+                born_at: UtcTimestamp::new("2026-10-12T00:00:00Z").unwrap(),
+                usage: None,
+                blocked_on: None,
+                exit: None,
+            };
+            projection.project(
+                RetainedProcessEvent {
+                    event: &JobProcessEvent::Born {
+                        index: pid - 1,
+                        process,
+                    },
+                    identity: Some(ProcessIdentity {
+                        pid,
+                        birth: BirthToken(u64::from(pid)),
+                    }),
+                    parent: None,
+                },
+                UNIX_EPOCH + Duration::from_secs(3),
+            )
+        };
+        let segments = |root: &Path| -> Vec<PathBuf> {
+            let mut found: Vec<_> = std::fs::read_dir(root.join("1970-01-01"))
+                .map(|entries| {
+                    entries
+                        .map(|entry| entry.unwrap().path())
+                        .filter(|path| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| name.starts_with("process-"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            found.sort();
+            found
+        };
+        // Lets the writer task take what is queued, without advancing the paused clock.
+        let settle = || async {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+        };
+
+        for pid in 1..=5 {
+            publisher.record_process([born(pid)]);
+            tokio::time::advance(PROCESS_SEAL_INTERVAL / 10).await;
+        }
+        settle().await;
+        assert!(
+            segments(&root).is_empty(),
+            "five batches inside the interval wait for it to end"
+        );
+
+        tokio::time::advance(PROCESS_SEAL_INTERVAL).await;
+        // The seal runs on the blocking pool. Waiting through the runtime's own timer lets it park
+        // and drive the writer; the paused clock moves only by the interval already advanced and
+        // these short steps, never another whole interval. Real time bounds the wait.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while segments(&root).is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let first = segments(&root);
+        assert_eq!(
+            first.len(),
+            1,
+            "the interval's five batches are one seal; health {:?}",
+            publisher.health().await
+        );
+        assert_eq!(read_process_segment(&first[0]).unwrap().len(), 5);
+
+        publisher.record_process([born(6)]);
+        let health = publisher.health().await.unwrap();
+        assert_eq!((health.recorded, health.failed), (2, 0), "{health:?}");
+        let both = segments(&root);
+        assert_eq!(both.len(), 2, "a batch after the interval is a second seal");
+        assert_eq!(read_process_segment(&both[1]).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
