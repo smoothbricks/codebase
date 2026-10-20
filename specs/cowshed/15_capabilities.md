@@ -179,7 +179,11 @@ Each detector returns data through one `CapabilityContribution`:
   repairs developer-link registry replacements, and a link an observed install removed, are restored to their snapshot.
   The wrapper records an install in a per-job marker the supervisor creates before launch and removes at cleanup. A
   different live developer binding is preserved, with no new grant or attestation. A link absent with no observed
-  install produces a `developer-link-ambiguous` finding in the job's stderr and stays absent.
+  install produces a `developer-link-ambiguous` finding in the job's stderr and stays absent. Restoration plans every
+  leaf before changing any link. Adjacent siblings in the captured path order share one no-follow parent-directory
+  capability during that planning pass; a new parent is validated and opened anew, and no directory observation survives
+  the call. This reuses the snapshot's order, not a second inventory of links. Mutation still opens its parents
+  independently and syncs each changed parent once.
 
 - **HOME probes:** the sandboxed supervisor repeats detection beneath the HOME-wide read deny (04_sandbox.md), so every
   HOME path a detector inspects is also one it grants read: each bootstrap candidate beneath HOME as its literal program

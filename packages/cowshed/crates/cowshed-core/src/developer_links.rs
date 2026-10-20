@@ -184,6 +184,7 @@ enum Current<'a> {
     Link(&'a [u8]),
 }
 
+#[derive(Debug, Eq, PartialEq)]
 enum Plan {
     Keep,
     Restore,
@@ -413,10 +414,7 @@ impl DeveloperLinks {
         }
         // Phase one plans every link before any mutation, so alias and owner decisions read the
         // installer's pre-restore state.
-        let mut decisions = Vec::with_capacity(self.links.len());
-        for link in &self.links {
-            decisions.push(plan(root, &self.stores, &self.links, link, mode)?);
-        }
+        let decisions = plan_links(root, &self.stores, &self.links, mode)?;
         let mut findings = Vec::new();
         let mut restores = Vec::new();
         for (link, decision) in self.links.iter().zip(decisions) {
@@ -540,20 +538,48 @@ fn unreadable(error: &io::Error, mode: CaptureMode) -> bool {
     mode == CaptureMode::Job && error.kind() == io::ErrorKind::PermissionDenied
 }
 
-/// Phase one reads every captured leaf before any mutation, so executable preservation
-/// is decided from the installer's pre-restore state rather than restoration order.
+/// Phase one reads every captured leaf before any mutation. Capture already sorts the paths,
+/// so adjacent siblings share a parent capability rather than reopening its whole chain for
+/// every leaf. The capability is dropped at the next parent; nothing is cached across jobs.
+fn plan_links(
+    root: &Path,
+    stores: &PackageStores,
+    links: &[DeveloperLink],
+    mode: RestoreMode,
+) -> Result<Vec<Plan>> {
+    let mut decisions = Vec::with_capacity(links.len());
+    let mut buffer = [0u8; 4096];
+    for group in links.chunk_by(|left, right| left.at.parent() == right.at.parent()) {
+        let mut at = root.join(group[0].at.parent().expect("a package link has a parent"));
+        crate::storage::verify_no_symlinks(root, &at).map_err(|error| link_error(&at, error))?;
+        let directory = match AnchoredDirectory::open(&at) {
+            Ok(directory) => Some(directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(link_error(&at, error)),
+        };
+        for link in group {
+            at.push(link.at.file_name().expect("a package link has a name"));
+            let current = match &directory {
+                Some(directory) => current_leaf(directory, &at, &mut buffer)?,
+                None => Current::ParentAbsent,
+            };
+            decisions.push(plan(root, stores, links, link, &at, current, mode)?);
+            at.pop();
+        }
+    }
+    Ok(decisions)
+}
+
+/// Decide from the observed leaf while all restoration is still pending.
 fn plan(
     root: &Path,
     stores: &PackageStores,
     links: &[DeveloperLink],
     link: &DeveloperLink,
+    at: &Path,
+    current: Current<'_>,
     mode: RestoreMode,
 ) -> Result<Plan> {
-    let at = root.join(&link.at);
-    let parent = at.parent().expect("a package link has a parent");
-    crate::storage::verify_no_symlinks(root, parent).map_err(|error| link_error(parent, error))?;
-    let mut buffer = [0u8; 4096];
-    let current = current_leaf(parent, &at, &mut buffer)?;
     let target = link.target.as_os_str().as_bytes();
     Ok(match (mode, current) {
         (_, Current::Link(current)) if current == target => Plan::Keep,
@@ -585,13 +611,12 @@ fn plan(
     })
 }
 
-fn current_leaf<'a>(parent: &Path, at: &Path, buffer: &'a mut [u8]) -> Result<Current<'a>> {
+fn current_leaf<'a>(
+    directory: &AnchoredDirectory,
+    at: &Path,
+    buffer: &'a mut [u8],
+) -> Result<Current<'a>> {
     let name = leaf_name(at)?;
-    let directory = match AnchoredDirectory::open(parent) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Current::ParentAbsent),
-        Err(error) => return Err(link_error(parent, error)),
-    };
     match directory.read_link(&name, buffer) {
         Ok(target) => Ok(Current::Link(target)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Current::Absent),
@@ -1950,5 +1975,258 @@ mod tests {
             "denied-relink-repaired\n",
             "the child reached its assertions"
         );
+    }
+
+    /// The previous per-link traversal, retained only as a differential and timing oracle.
+    fn plan_per_link(
+        root: &Path,
+        snapshot: &DeveloperLinks,
+        mode: RestoreMode,
+    ) -> Result<Vec<Plan>> {
+        snapshot
+            .links
+            .iter()
+            .map(|link| {
+                let at = root.join(&link.at);
+                let parent = at.parent().expect("a package link has a parent");
+                crate::storage::verify_no_symlinks(root, parent)
+                    .map_err(|error| link_error(parent, error))?;
+                let mut buffer = [0u8; 4096];
+                let current = match AnchoredDirectory::open(parent) {
+                    Ok(directory) => current_leaf(&directory, &at, &mut buffer)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Current::ParentAbsent,
+                    Err(error) => return Err(link_error(parent, error)),
+                };
+                plan(
+                    root,
+                    &snapshot.stores,
+                    &snapshot.links,
+                    link,
+                    &at,
+                    current,
+                    mode,
+                )
+            })
+            .collect()
+    }
+
+    fn planning_fixture(root: &Path, count: usize, separate_parents: bool) -> DeveloperLinks {
+        let mut links = Vec::with_capacity(count);
+        for index in 0..count {
+            let parent = if separate_parents {
+                format!("node_modules/@scope-{index:04}")
+            } else {
+                "node_modules/@scope".to_owned()
+            };
+            let at = PathBuf::from(parent).join(format!("link-{index:04}"));
+            fs::create_dir_all(root.join(at.parent().unwrap())).unwrap();
+            let target = PathBuf::from("../../product");
+            symlink(&target, root.join(&at)).unwrap();
+            links.push(DeveloperLink {
+                at,
+                target,
+                binding: Binding::Unclassified,
+            });
+        }
+        DeveloperLinks {
+            links,
+            ..DeveloperLinks::default()
+        }
+    }
+
+    #[test]
+    fn grouped_planning_matches_per_link_reads_in_every_restore_mode() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-planning");
+        let root = fs::canonicalize(&*scratch).unwrap();
+        let mut snapshot = planning_fixture(&root, 5, false);
+        // Unchanged, missing, replaced file, replaced directory, and a retargeted link.
+        for link in &snapshot.links[1..] {
+            fs::remove_file(root.join(&link.at)).unwrap();
+        }
+        fs::write(root.join(&snapshot.links[2].at), "replacement").unwrap();
+        fs::create_dir(root.join(&snapshot.links[3].at)).unwrap();
+        symlink("../../other", root.join(&snapshot.links[4].at)).unwrap();
+        snapshot.links.push(DeveloperLink {
+            at: PathBuf::from("node_modules/absent-parent/link"),
+            target: PathBuf::from("../../product"),
+            binding: Binding::Unclassified,
+        });
+        snapshot
+            .links
+            .sort_unstable_by(|left, right| left.at.cmp(&right.at));
+        for mode in [
+            RestoreMode::CoveredInstall,
+            RestoreMode::JobTerminal,
+            RestoreMode::JobTerminalObservedInstall,
+        ] {
+            let expected = plan_per_link(&root, &snapshot, mode).unwrap();
+            let actual = plan_links(&root, &snapshot.stores, &snapshot.links, mode).unwrap();
+            assert_eq!(actual, expected, "{mode:?}");
+            assert_eq!(
+                actual
+                    .iter()
+                    .filter(|plan| matches!(plan, Plan::Keep))
+                    .count(),
+                1
+            );
+            let findings = actual
+                .iter()
+                .filter(|plan| matches!(plan, Plan::Finding(_)))
+                .count();
+            assert_eq!(
+                findings,
+                if mode == RestoreMode::JobTerminal {
+                    2
+                } else {
+                    0
+                }
+            );
+        }
+        // No parent or leaf observation survives a call.
+        fs::remove_file(root.join(&snapshot.links[0].at)).unwrap();
+        let actual = plan_links(
+            &root,
+            &snapshot.stores,
+            &snapshot.links,
+            RestoreMode::JobTerminal,
+        )
+        .unwrap();
+        assert_eq!(
+            actual,
+            plan_per_link(&root, &snapshot, RestoreMode::JobTerminal).unwrap()
+        );
+        assert!(matches!(actual[0], Plan::Finding(_)));
+    }
+
+    #[test]
+    fn grouped_planning_refuses_substituted_parents_before_any_restore() {
+        let scratch = crate::temp_root::TempRoot::new("developer-links-planning-refusal");
+        let root = fs::canonicalize(&*scratch).unwrap();
+        let snapshot = planning_fixture(&root, 2, true);
+        let first = root.join(&snapshot.links[0].at);
+        fs::remove_file(&first).unwrap();
+        fs::write(&first, "installer payload").unwrap();
+        let parent = root.join(snapshot.links[1].at.parent().unwrap());
+        let moved = root.join("moved");
+        fs::rename(&parent, &moved).unwrap();
+        symlink(&moved, &parent).unwrap();
+        let expected = plan_per_link(&root, &snapshot, RestoreMode::CoveredInstall).unwrap_err();
+        let actual = snapshot
+            .restore(&root, RestoreMode::CoveredInstall)
+            .unwrap_err();
+        assert_eq!(actual.code, expected.code);
+        assert_eq!(actual.message, expected.message);
+        assert_eq!(fs::read_to_string(&first).unwrap(), "installer payload");
+        // A non-directory parent also refuses; it is not reported as a missing link.
+        fs::remove_file(&parent).unwrap();
+        fs::write(&parent, "not a directory").unwrap();
+        assert!(
+            plan_links(
+                &root,
+                &snapshot.stores,
+                &snapshot.links,
+                RestoreMode::JobTerminal
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn measure_planning(label: &str, root: &Path, snapshot: &DeveloperLinks) {
+        use std::time::{Duration, Instant};
+        let run = |grouped| {
+            if grouped {
+                plan_links(
+                    root,
+                    &snapshot.stores,
+                    &snapshot.links,
+                    RestoreMode::JobTerminal,
+                )
+                .unwrap()
+            } else {
+                plan_per_link(root, snapshot, RestoreMode::JobTerminal).unwrap()
+            }
+        };
+        for _ in 0..4 {
+            assert_eq!(run(false), run(true));
+        }
+        let mut samples = [Vec::with_capacity(1_000), Vec::with_capacity(1_000)];
+        for job in 0..1_000 {
+            let mut results = [Vec::new(), Vec::new()];
+            for arm in [job % 2, 1 - job % 2] {
+                let started = Instant::now();
+                results[arm] = std::hint::black_box(run(arm == 1));
+                samples[arm].push(started.elapsed());
+            }
+            assert_eq!(results[0], results[1]);
+        }
+        let totals = samples
+            .each_ref()
+            .map(|sample| sample.iter().sum::<Duration>().as_secs_f64() * 1_000.0);
+        let syscalls = [false, true].map(|grouped| {
+            let before = own_syscalls().unwrap();
+            std::hint::black_box(run(grouped));
+            let after = own_syscalls().unwrap();
+            counter_delta(before.0, after.0).unwrap()
+        });
+        for sample in &mut samples {
+            sample.sort_unstable();
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "scope": label,
+                "jobsPerArm": 1000,
+                "links": snapshot.links.len(),
+                "parents": snapshot.links.iter().map(|link| link.at.parent().unwrap()).collect::<BTreeSet<_>>().len(),
+                "beforePerJobMicros": totals[0],
+                "afterPerJobMicros": totals[1],
+                "before1000JobsMillis": totals[0],
+                "after1000JobsMillis": totals[1],
+                "medianBeforeMicros": samples[0][500].as_secs_f64() * 1_000_000.0,
+                "medianAfterMicros": samples[1][500].as_secs_f64() * 1_000_000.0,
+                "unixSyscallsBefore": syscalls[0],
+                "unixSyscallsAfter": syscalls[1],
+            })
+        );
+    }
+
+    /// Read-only component timing; every arm plans the same snapshot, never restores a link.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "opt-in real-checkout component benchmark"]
+    fn terminal_planning_benchmark() {
+        let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+        let root = fs::canonicalize(manifest.ancestors().nth(4).unwrap()).unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let mut capture = Vec::with_capacity(9);
+        let mut snapshot = DeveloperLinks::default();
+        for _ in 0..9 {
+            let started = std::time::Instant::now();
+            snapshot = DeveloperLinks::capture_job(&root, PackageStores::from_home(&home).unwrap())
+                .unwrap();
+            capture.push(started.elapsed());
+        }
+        capture.sort_unstable();
+        println!(
+            "{}",
+            serde_json::json!({
+                "scope": "unchanged-admission-capture",
+                "samples": capture.len(),
+                "medianMicros": capture[4].as_secs_f64() * 1_000_000.0,
+                "links": snapshot.links.len(),
+            })
+        );
+        measure_planning("real-checkout", &root, &snapshot);
+        for count in [0, 1, 2, 8, 64] {
+            let scratch = crate::temp_root::TempRoot::new("developer-links-planning-bench");
+            let root = fs::canonicalize(&*scratch).unwrap();
+            let snapshot = planning_fixture(&root, count, false);
+            measure_planning("siblings", &root, &snapshot);
+        }
+        let scratch = crate::temp_root::TempRoot::new("developer-links-planning-distinct");
+        let root = fs::canonicalize(&*scratch).unwrap();
+        let snapshot = planning_fixture(&root, 64, true);
+        measure_planning("distinct-parents", &root, &snapshot);
     }
 }
