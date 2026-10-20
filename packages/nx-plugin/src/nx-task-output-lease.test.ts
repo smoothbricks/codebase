@@ -1,6 +1,7 @@
 import { expect, it } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { channel } from 'node:diagnostics_channel';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readlinkSync, realpathSync } from 'node:fs';
 import { mkdir, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Subprocess } from 'bun';
@@ -349,6 +350,34 @@ it('does not hand an idle helper that died to the next acquire', async () => {
       () => 'no successor helper',
     );
     await releaseNext();
+  } finally {
+    await leases.close();
+  }
+});
+
+/** The descriptors process `pid` holds open on `file`: /proc on Linux, lsof elsewhere, both naming its real path. */
+function openDescriptors(pid: number, file: string): number {
+  const path = realpathSync(file);
+  const proc = `/proc/${pid}/fd`;
+  if (existsSync(proc)) return readdirSync(proc).filter((fd) => readlinkSync(join(proc, fd)) === path).length;
+  const listed = spawnSync('lsof', ['-nP', '-p', String(pid), '-Fn'], { encoding: 'utf8' });
+  if (listed.status !== 0 && listed.stdout === '') throw new Error(`lsof -p ${pid} failed: ${listed.stderr}`);
+  return listed.stdout.split('\n').filter((line) => line === `n${path}`).length;
+}
+
+it('keeps one lock descriptor per lock file in a helper across acquires', async () => {
+  const leases = new TaskOutputLeases(1, null, 'output');
+  const task = leaseTask('repeated');
+  try {
+    const counts: number[] = [];
+    for (let round = 0; round < 5; round++) {
+      const pathEvent = nextLeasePath();
+      const release = await leases.acquire([task]);
+      const path = await pathEvent;
+      counts.push(openDescriptors(await leaseHolder(path), path));
+      await release();
+    }
+    expect(counts).toEqual([1, 1, 1, 1, 1]);
   } finally {
     await leases.close();
   }

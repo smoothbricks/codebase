@@ -140,14 +140,23 @@ is never handed out. Without this, one failed acquire in a one-worker pool (`--p
 holding the only slot and every later acquire waiting forever, the client and its helper both idle with no lock wait. No
 deadline stands in for these events.
 
+A released lock does not imply a finished writer. A helper that dies holding a lease releases the kernel lock while the
+task may still be writing its outputs, so another client can take the target then; the task fails only at release time,
+with the helper's exit named.
+
+A helper keeps one `FileLock` per lock file for its lifetime and locks and unlocks it again on each acquire. Nx's
+`FileLock` has no close, so opening one per acquire kept every descriptor until garbage collection: one helper held 27
+descriptors for 14 lock files, growing with every task until `EMFILE`.
+
 `packages/nx-plugin/src/nx-task-output-lease.test.ts` exercises two actual Nx clients against one output tree, pauses
 the real cache capture while another producer attempts to publish, checks both complete byte-exact artifacts, then
 restores one through a dependent runtime-input hash. Binary file content is hashed as bytes by its producer; the
 runtime-input wrapper's deliberate non-UTF-8 failure sentinel is unchanged. The suite also starts two cold continuous
 clients at the same barrier, requires one real producer and one shared waiter while that producer is alive, and requires
 both clients to complete after it exits. Its pool cases kill a helper holding a lease, make a helper reply with an
-error, and kill an idle helper; each next acquire must take the freed slot. Drop these hunks only when the installed
-upstream orchestrator protects the same complete lifetime and atomic startup, retaining the regressions.
+error, and kill an idle helper; each next acquire must take the freed slot. A helper that acquires one target five times
+must hold one descriptor on its lock file. Drop these hunks only when the installed upstream orchestrator protects the
+same complete lifetime and atomic startup, retaining the regressions.
 
 ## Non-workspace file packages
 

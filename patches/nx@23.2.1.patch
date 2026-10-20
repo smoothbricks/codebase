@@ -3262,10 +3262,10 @@ index 0000000000000000000000000000000000000000..ab141ad0de874122b363f2fd1894dcbd
 +}
 diff --git a/dist/src/tasks-runner/task-output-lease.js b/dist/src/tasks-runner/task-output-lease.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..129f933b5cadc7a8735b4f9454fdc67870c9c818
+index 0000000000000000000000000000000000000000..df3e705647a8a38b28125df16ef0c73472b20df3
 --- /dev/null
 +++ b/dist/src/tasks-runner/task-output-lease.js
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,233 @@
 +"use strict";
 +const { channel } = require("node:diagnostics_channel");
 +const { writeFileSync } = require("node:fs");
@@ -3281,12 +3281,20 @@ index 0000000000000000000000000000000000000000..129f933b5cadc7a8735b4f9454fdc678
 +// lock files are never unlinked or replaced.
 +if (process.argv[2] === "--nx-task-output-lease-worker") {
 +    let held = [];
++    // One FileLock, so one descriptor, per lock file for the helper's life:
++    // FileLock has no close, and a fresh one per acquire kept every descriptor
++    // until garbage collection.
++    const locks = new Map();
 +    process.on("disconnect", () => process.exit(0));
 +    process.on("message", (message) => {
 +        try {
 +            if (message.type === "acquire") {
 +                for (const path of message.paths) {
-+                    const lock = new FileLock(path);
++                    let lock = locks.get(path);
++                    if (!lock) {
++                        lock = new FileLock(path);
++                        locks.set(path, lock);
++                    }
 +                    lock.lock();
 +                    held.push({ lock, path });
 +                    writeFileSync(path, JSON.stringify({ pid: process.pid, clientPid: process.ppid, purpose: message.purpose, targets: message.targets }));
