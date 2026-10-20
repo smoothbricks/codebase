@@ -92,7 +92,7 @@ describe('release version graph diagnostics', () => {
       );
       await git(root, ['add', '-A']);
       await git(root, ['commit', '-m', 'chore: fixture workspace']);
-      const env = fixtureNxEnv(root, { daemon: false }, await publishFixtureSocketDirectory(root));
+      const env = fixtureNxEnv(root, { daemon: 'off' }, await publishFixtureSocketDirectory(root));
 
       await expect(
         smoo(root, env, ['release', 'version', '--bump', 'patch', '--projects', 'all', '--dry-run', 'false']),

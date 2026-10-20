@@ -878,6 +878,16 @@ the shared record. A host shell's client, which has no such variable, that canno
 its own, which overwrites the record and so retires the daemon it replaced (pinned Nx 23.2.1, `daemon/client/client.js`
 and `daemon/server/server.js`).
 
+One escape exists, for tests only: a test whose subject is a daemon's retirement must be able to create what it retires.
+A fixture `nx` spawned with the named `FIXTURE_STARTS_ITS_OWN_DAEMON` option
+(`packages/cli/src/release/__tests__/helpers/fixture-repo.ts`) runs without `NX_DAEMON_START`, so its client starts the
+fixture's own daemon; that one child alone, never the job or any other fixture `nx`, which keep the rule. The daemon is
+started with `SMOO_FIXTURE_NX_DAEMON` naming its fixture root, and the test proves the daemon it retires carries it, so
+it cannot pass on a daemon some other run left. The escape is named at every call site because an invisible one would
+become the leak the rule exists to stop, and a companion test proves that without it a fixture under the rule starts no
+daemon. `nx daemon --start` is an explicit start and is not covered by the variable: the client starts a daemon whatever
+it says, so a job must never run it.
+
 One Nx state per checkout. Every job of an Nx project (`nx.json`, 15_capabilities.md), read-write or read-only, gets
 `NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` naming the checkout's own `<project>/.nx/workspace-data` and
 `<project>/.nx/cache` — the directories a host shell's Nx uses — and a caller's values never pass. The two move
@@ -937,9 +947,9 @@ it is the `node` `execvp` would find on the job's own bootstrap PATH (the capabi
 anywhere on that PATH (`ENOENT`, or `EACCES` when one exists but cannot execute) — admits no job and is named on the
 supervisor's stderr when its reason changes; each probe repeats the lookup (`stat`s only), and the first that finds a
 `node` starts it. A lookup that cannot tell (a directory it may not read) runs `node`, bounded below. A daemon that
-served and then stopped — idle, or a kept daemon that stopped for its successor — is followed by a successor at the
-next probe and is no failure. Any other failed start (its job ended, or was refused admission, with no daemon live and
-none seen live while it ran) is reported there too and tried again at the next probe, at most 3 in a row: an exit status
+served and then stopped — idle, or a kept daemon that stopped for its successor — is followed by a successor at the next
+probe and is no failure. Any other failed start (its job ended, or was refused admission, with no daemon live and none
+seen live while it ran) is reported there too and tried again at the next probe, at most 3 in a row: an exit status
 cannot classify it, since `sandbox-exec` exits 71 both for an `execvp` it could not make and for a child that exited 71.
 After 3 the keeper starts none for 60 s, then one; each further failure doubles the pause, up to 15 min. So a failure
 that does not clear costs at most 3 starts and then one per pause, and never halts the keeper: a halted keeper would
@@ -947,13 +957,12 @@ leave every host client to start its own daemon outside the sandbox. A daemon fo
 pause and resets it to 60 s. Each change of pause is said on the supervisor's stderr with its failures, its length and
 the cap, and the supervisor answers the refusal or the pause (failures, time left, length, cap) to whoever asks the
 keeper's state. A stop of an idle shed's live daemon that fails is likewise tried at most 3 times in a row, and again
-only after a probe finds it gone. A host client finds the daemon through the shared record and connects to it instead
-of starting one outside the sandbox. Main's supervisor keeps no daemon: main is the operator's checkout, and its daemon
-is the host's. A fork deletes the record from the build volume; a land deletes the landing workspace's and gives the
+only after a probe finds it gone. A host client finds the daemon through the shared record and connects to it instead of
+starting one outside the sandbox. Main's supervisor keeps no daemon: main is the operator's checkout, and its daemon is
+the host's. A fork deletes the record from the build volume; a land deletes the landing workspace's and gives the
 adopted volume the target's record of a live unsandboxed daemon in its place (16_build_volumes.md). A repository shell
 that exports either directory unconditionally replaces the checkout's, like any export, and splits the state again; a
-repository shell that sets them keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them
-unset.
+repository shell that sets them keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
 
 A kept daemon costs its host a resident Node process, about six plugin workers and a file watcher that recomputes the
 project graph on every change in the tree, per shed. Stock Nx stops a daemon after three hours without a request or a

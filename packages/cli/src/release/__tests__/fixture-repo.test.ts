@@ -23,6 +23,10 @@ import {
 } from '../core.js';
 import { completeReleaseAtHead, type ReleaseRepairShell, repairPendingTargets } from '../orchestration.js';
 import {
+  FIXTURE_DAEMON_MARKER,
+  FIXTURE_STARTS_ITS_OWN_DAEMON,
+  type FixtureNxOptions,
+  fixtureDaemonOwnedBy,
   fixtureNxEnv,
   git,
   gitIsAncestor,
@@ -134,20 +138,30 @@ describe('release planning with fixture git repositories', () => {
     };
     // Named before the inherited variables are planted: the fixture's directory is its own, not derived from them.
     const socketDirectory = fixtureSocketDirectory(root);
-    const outer = Object.fromEntries(Object.keys(inherited).map((key) => [key, process.env[key]]));
-    Object.assign(process.env, inherited);
+    const outer = Object.fromEntries(
+      [...Object.keys(inherited), 'NX_DAEMON_START', FIXTURE_DAEMON_MARKER].map((key) => [key, process.env[key]]),
+    );
+    // As every cowshed job runs, plus a marker a fixture must never inherit.
+    Object.assign(process.env, inherited, { NX_DAEMON_START: 'never', [FIXTURE_DAEMON_MARKER]: shared });
     try {
-      for (const daemon of [false, true]) {
-        const env = fixtureNxEnv(root, { daemon }, socketDirectory);
+      for (const [options, daemon] of [
+        [{ daemon: 'off' }, { NX_DAEMON: 'false' }],
+        [{ daemon: 'job-rule' }, { NX_DAEMON: 'true', NX_DAEMON_START: 'never' }],
+        [FIXTURE_STARTS_ITS_OWN_DAEMON, { NX_DAEMON: 'true', [FIXTURE_DAEMON_MARKER]: root }],
+      ] satisfies [FixtureNxOptions, Record<string, string>][]) {
+        const env = fixtureNxEnv(root, options, socketDirectory);
         expect(Object.entries(env).filter(([, value]) => value.includes(shared))).toEqual([]);
         expect(env).toMatchObject({
-          NX_DAEMON: String(daemon),
+          ...daemon,
           NX_WORKSPACE_ROOT_PATH: root,
           NX_SOCKET_DIR: socketDirectory,
           NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
           NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
         });
+        // The escape lifts the job's rule for its one child alone, never for anything else.
+        expect('NX_DAEMON_START' in env).toBe(options.daemon !== 'fixture-owned');
       }
+      expect(process.env.NX_DAEMON_START).toBe('never');
     } finally {
       for (const [key, value] of Object.entries(outer)) {
         if (value === undefined) delete process.env[key];
@@ -201,40 +215,48 @@ describe('release planning with fixture git repositories', () => {
   it('leaves no process of its Nx daemon running once the fixture retires', async () => {
     let fixtureRoot = '';
     let daemonPids: number[] = [];
+    let daemonOwned = false;
     await withFixtureRepo(async (root) => {
       fixtureRoot = root;
       await writeWorkspace(root);
       await writeBuildablePackage(root, '@scope/a', 'packages/a');
-      await runFixtureNx(root, ['show', 'projects'], { daemon: true });
+      await runFixtureNx(root, ['show', 'projects'], FIXTURE_STARTS_ITS_OWN_DAEMON);
       daemonPids = (await nxDaemonProcesses(root)).map((entry) => entry.pid);
+      // The fixture's own daemon, by the marker its escaped client started it with.
+      daemonOwned = daemonPids[0] !== undefined && (await fixtureDaemonOwnedBy(daemonPids[0], root));
     });
 
     // The daemon and its plugin workers; fewer would prove nothing.
     expect(daemonPids.length).toBeGreaterThan(1);
+    expect(daemonOwned).toBe(true);
     expect(await survivors(fixtureRoot, daemonPids)).toEqual([]);
   });
 
   it('leaves no process of its Nx daemon running once a fixture body throws', async () => {
     let fixtureRoot = '';
     let daemonPids: number[] = [];
+    let daemonOwned = false;
     const thrown = withFixtureRepo(async (root) => {
       fixtureRoot = root;
       await writeWorkspace(root);
       await writeBuildablePackage(root, '@scope/a', 'packages/a');
-      await runFixtureNx(root, ['show', 'projects'], { daemon: true });
+      await runFixtureNx(root, ['show', 'projects'], FIXTURE_STARTS_ITS_OWN_DAEMON);
       daemonPids = (await nxDaemonProcesses(root)).map((entry) => entry.pid);
+      daemonOwned = daemonPids[0] !== undefined && (await fixtureDaemonOwnedBy(daemonPids[0], root));
       throw new Error('the fixture body failed on purpose');
     });
 
     await expect(thrown).rejects.toThrow('the fixture body failed on purpose');
     expect(daemonPids.length).toBeGreaterThan(1);
+    expect(daemonOwned).toBe(true);
     expect(await survivors(fixtureRoot, daemonPids)).toEqual([]);
   });
 
   it('stops the Nx daemon of a fixture whose test finished without its body', async () => {
     const { root, pids } = await abandonFixture(`
-      await runFixtureNx(root, ['show', 'projects'], { daemon: true });
+      await runFixtureNx(root, ['show', 'projects'], FIXTURE_STARTS_ITS_OWN_DAEMON);
       const daemon = await nxDaemonProcesses(root);
+      if (!(await fixtureDaemonOwnedBy(daemon[0]?.pid ?? 0, root))) throw new Error('not the fixture daemon');
       console.log('ABANDONED_FIXTURE_PIDS ' + daemon.map((entry) => entry.pid).join(' '));
     `);
 
@@ -249,7 +271,7 @@ describe('release planning with fixture git repositories', () => {
     // and its log the only signal it gives, so the body polls for it. The
     // retirement kills the client, hence the catch.
     const { root } = await abandonFixture(`
-      void runFixtureNx(root, ['daemon', '--start'], { daemon: true }).catch(() => {});
+      void runFixtureNx(root, ['daemon', '--start'], FIXTURE_STARTS_ITS_OWN_DAEMON).catch(() => {});
       const log = join(root, '.nx', 'workspace-data', 'd', 'daemon.log');
       while (!(existsSync(log) && readFileSync(log, 'utf8').includes('Starting new daemon server in background'))) {
         await Bun.sleep(5);
@@ -257,6 +279,24 @@ describe('release planning with fixture git repositories', () => {
     `);
 
     expect(await survivors(root, [])).toEqual([]);
+  });
+
+  /**
+   * The product contract the escape exists beside: under the rule every cowshed job runs with
+   * (`NX_DAEMON_START=never`), a fixture `nx` asked for a daemon, without the escape, starts none,
+   * and the fixture leaves no daemon behind. Nothing covered this before the rule was installed,
+   * which is how three retirement tests that relied on a client starting one went unnoticed.
+   */
+  it('starts no daemon without the escape, under the rule every job runs with', async () => {
+    let recorded: number[] = [];
+    await withFixtureRepo(async (root) => {
+      await writeWorkspace(root);
+      await writeBuildablePackage(root, '@scope/a', 'packages/a');
+      await runFixtureNx(root, ['show', 'projects'], { daemon: 'job-rule' });
+      recorded = (await nxDaemonProcesses(root)).map((entry) => entry.pid);
+      expect(existsSync(join(root, '.nx', 'workspace-data', 'd', 'server-process.json'))).toBe(false);
+    });
+    expect(recorded).toEqual([]);
   });
 
   it('repairs multiple fetched remote targets from a runner clone, building each at its own checkout', async () => {
@@ -501,7 +541,14 @@ async function abandonFixture(body: string): Promise<{ root: string; pids: numbe
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { nxDaemonProcesses } from ${testing};
-import { runFixtureNx, withFixtureRepo, writeBuildablePackage, writeWorkspace } from ${helper};
+import {
+  FIXTURE_STARTS_ITS_OWN_DAEMON,
+  fixtureDaemonOwnedBy,
+  runFixtureNx,
+  withFixtureRepo,
+  writeBuildablePackage,
+  writeWorkspace,
+} from ${helper};
 
 test('returns without its fixture body', async () => {
   const started = Promise.withResolvers();

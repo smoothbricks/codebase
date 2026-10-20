@@ -2,9 +2,9 @@
 // Inherited CI paths can corrupt the outer graph or name another job's sockets.
 // Every Nx a test starts — `runFixtureNx`, or our own code shelling out to `nx` or
 // loading a fixture's graph — runs without a daemon: a daemonless Nx leaves nothing
-// running once it exits. A test whose subject is the daemon asks for one by name
-// (`runFixtureNx(root, args, { daemon: true })`, or `NX_DAEMON=true` in the child's
-// environment), and its fixture stops that daemon before its root is deleted.
+// running once it exits. A test whose subject is the daemon starts one by name
+// (`runFixtureNx(root, args, FIXTURE_STARTS_ITS_OWN_DAEMON)`, the one escape from the
+// job's `NX_DAEMON_START=never`), and its fixture stops that daemon before its root is deleted.
 delete process.env.NX_CACHE_DIRECTORY;
 delete process.env.NX_WORKSPACE_DATA_DIRECTORY;
 delete process.env.NX_WORKSPACE_ROOT_PATH;

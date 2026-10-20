@@ -262,12 +262,31 @@ async function streamBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Arr
 }
 
 /**
- * Whether a fixture `nx` runs a daemon. Off unless the daemon is what the test
- * is about: a daemonless Nx leaves nothing running once it exits.
+ * Whether and how a fixture `nx` runs a daemon:
+ *
+ * - `off`: no daemon. A daemonless Nx leaves nothing running once it exits.
+ * - `job-rule`: a daemon under the rule every cowshed job runs under, `NX_DAEMON_START=never`
+ *   (specs/cowshed/04_sandbox.md), set for the fixture whatever started this process: the
+ *   client uses a daemon its record names while that runs and never starts one.
+ * - `fixture-owned`: {@link FIXTURE_STARTS_ITS_OWN_DAEMON}, the one escape from that rule.
  */
 export interface FixtureNxOptions {
-  readonly daemon: boolean;
+  readonly daemon: 'off' | 'job-rule' | 'fixture-owned';
 }
+
+/**
+ * The escape for a test whose subject is the daemon's retirement: that test must be able to create
+ * what it retires. Only the one `nx` spawned with these options runs without `NX_DAEMON_START`, so
+ * its client starts a daemon; the surrounding job, this process and every other fixture `nx` keep
+ * the job's rule. The daemon it starts inherits {@link FIXTURE_DAEMON_MARKER} naming the fixture
+ * root, so the test can prove the daemon it sees is that fixture's own ({@link fixtureDaemonOwnedBy})
+ * and never passes on a daemon some other run left. Spelled out at the call site so the escape is
+ * visible: an invisible one would become the leak the rule exists to stop.
+ */
+export const FIXTURE_STARTS_ITS_OWN_DAEMON: FixtureNxOptions = { daemon: 'fixture-owned' };
+
+/** The variable a fixture-owned daemon is started with, naming its fixture root. */
+export const FIXTURE_DAEMON_MARKER = 'SMOO_FIXTURE_NX_DAEMON';
 
 /**
  * `nx` against a fixture root, with {@link fixtureNxEnv}. The root must lie in
@@ -277,7 +296,7 @@ export interface FixtureNxOptions {
 export async function runFixtureNx(
   root: string,
   args: string[],
-  options: FixtureNxOptions = { daemon: false },
+  options: FixtureNxOptions = { daemon: 'off' },
 ): Promise<void> {
   const fixture = [...liveFixtures].find((live) => root === live.root || root.startsWith(`${live.root}/`));
   if (fixture === undefined) {
@@ -309,15 +328,47 @@ export function fixtureNxEnv(root: string, options: FixtureNxOptions, socketDire
   const env = definedProcessEnv();
   delete env.NX_SOCKET_DIR;
   delete env.NX_DAEMON_SOCKET_DIR;
+  delete env[FIXTURE_DAEMON_MARKER];
+  const daemon: Record<string, string> =
+    options.daemon === 'off'
+      ? { NX_DAEMON: 'false' }
+      : options.daemon === 'job-rule'
+        ? { NX_DAEMON: 'true', NX_DAEMON_START: 'never' }
+        : { NX_DAEMON: 'true', [FIXTURE_DAEMON_MARKER]: root };
+  if (options.daemon === 'fixture-owned') {
+    delete env.NX_DAEMON_START;
+  }
   return {
     ...env,
-    NX_DAEMON: options.daemon ? 'true' : 'false',
+    ...daemon,
     NX_WORKSPACE_ROOT_PATH: root,
     NX_SOCKET_DIR: socketDirectory,
     NX_CACHE_DIRECTORY: join(root, '.nx', 'cache'),
     NX_WORKSPACE_DATA_DIRECTORY: join(root, '.nx', 'workspace-data'),
     ...FIXTURE_NX_DIAGNOSTICS,
   };
+}
+
+/**
+ * Whether process `pid` was started with {@link FIXTURE_DAEMON_MARKER} naming `root`: the daemon a
+ * {@link FIXTURE_STARTS_ITS_OWN_DAEMON} `nx` of that fixture started. Reads the environment the
+ * process was started with: `/proc/<pid>/environ` on Linux, `ps -E` (this user's processes only)
+ * on macOS. A process that has exited is no fixture's daemon.
+ */
+export async function fixtureDaemonOwnedBy(pid: number, root: string): Promise<boolean> {
+  const variable = `${FIXTURE_DAEMON_MARKER}=${root}`;
+  if (process.platform === 'linux') {
+    const environ = await readFile(`/proc/${pid}/environ`, 'utf8').catch((error: unknown) => {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+      throw error;
+    });
+    return environ?.split('\0').includes(variable) ?? false;
+  }
+  // `ps -E` follows the command line with the start environment as space-separated words; the
+  // variable is a word of its own, so what follows it is a space or the end of the line.
+  const ps = Bun.spawnSync(['/bin/ps', '-E', '-ww', '-o', 'command=', '-p', String(pid)]);
+  const line = ` ${decode(ps.stdout).trimEnd()} `;
+  return line.includes(` ${variable} `);
 }
 
 function spawnFixtureNx(
@@ -359,7 +410,7 @@ function stopFixtureNxDaemon(root: string): Promise<void> {
   return stopNxDaemon(root, () =>
     expectNxSuccess(
       ['daemon', '--stop'],
-      spawnFixtureNx(root, ['daemon', '--stop'], { daemon: true }, fixtureSocketDirectory(root)),
+      spawnFixtureNx(root, ['daemon', '--stop'], { daemon: 'job-rule' }, fixtureSocketDirectory(root)),
     ),
   );
 }
