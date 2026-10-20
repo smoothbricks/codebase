@@ -926,21 +926,23 @@ spawned itself would run outside the job, and a land skips adopting a volume who
 (16_build_volumes.md, Land step 4), discarding the gate's whole cache for an ordinary plugin rebuild. A daemon a client
 started outside a keeper, such as main's host daemon, keeps restarting itself, since no keeper would. In a shed whose
 shell is activated, `node` is the one that shell declares (15_capabilities.md, "Bootstrap executables"); in one without,
-it is the javascript capability's bootstrap `node`, run by its absolute path. A start that can never run — no shell and
-no bootstrap `node`, or a bootstrap `node` that is missing (`ENOENT`) or not executable (`EACCES`) — is refused before
-any job, once, and named on the supervisor's stderr. Any other failed start (its job ended, or was refused admission,
-and no daemon is live) is reported there too and tried again at the next probe, at most 3 in a row: an exit status
-cannot classify it, since `sandbox-exec` exits 71 both for an `execvp` it could not make and for a child that exited 71.
-A refused or exhausted keeper starts no daemon until a probe finds one live, which forgives the failures before it, or
-the supervisor restarts; meanwhile a client that finds no daemon starts its own, as Nx does without a keeper. A stop of
-an idle shed's live daemon that fails is likewise tried at most 3 times in a row, and again only after a probe finds it
-gone. A host client finds the daemon through the shared record and connects to it instead of starting one outside the
-sandbox. Main's supervisor keeps no daemon: main is the operator's checkout, and its daemon is the host's. A fork
-deletes the record from the build volume; a land deletes the landing workspace's and gives the adopted volume the
-target's record of a live unsandboxed daemon in its place
-(16_build_volumes.md). A repository shell that exports either directory unconditionally replaces the checkout's, like
-any export, and splits the state again; a repository shell that sets them keeps a value already present
-(`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
+it is the `node` `execvp` would find on the job's own bootstrap PATH (the capability `tools/bin` links, the workspace's
+`.cowshed/bin`, the system directories), run by its absolute path. A start that can never run — no executable `node`
+anywhere on that PATH (`ENOENT`, or `EACCES` when one exists but cannot execute) — is refused before any job, once, and
+named on the supervisor's stderr; a lookup that cannot tell (a directory it may not read) runs `node` and is bounded
+below. Any other failed start (its job ended, or was refused admission, and no daemon is live) is reported there too and
+tried again at the next probe, at most 3 in a row: an exit status cannot classify it, since `sandbox-exec` exits 71 both
+for an `execvp` it could not make and for a child that exited 71. A refused or exhausted keeper starts no daemon until a
+probe finds one live, which forgives the failures before it, or the supervisor restarts; the supervisor answers its
+reason to whoever asks the keeper's state, and meanwhile a client that finds no daemon starts its own, as Nx does
+without a keeper. A stop of an idle shed's live daemon that fails is likewise tried at most 3 times in a row, and again
+only after a probe finds it gone. A host client finds the daemon through the shared record and connects to it instead
+of starting one outside the sandbox. Main's supervisor keeps no daemon: main is the operator's checkout, and its daemon
+is the host's. A fork deletes the record from the build volume; a land deletes the landing workspace's and gives the
+adopted volume the target's record of a live unsandboxed daemon in its place (16_build_volumes.md). A repository shell
+that exports either directory unconditionally replaces the checkout's, like any export, and splits the state again; a
+repository shell that sets them keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them
+unset.
 
 A kept daemon costs its host a resident Node process, about six plugin workers and a file watcher that recomputes the
 project graph on every change in the tree, per shed. Stock Nx stops a daemon after three hours without a request or a

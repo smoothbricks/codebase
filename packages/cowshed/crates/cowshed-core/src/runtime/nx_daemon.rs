@@ -24,6 +24,7 @@
 //! stop and wait for that job; the supervisor also releases any daemon its keeper watched.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
@@ -37,7 +38,7 @@ use crate::api::dto::{
     CommandArg, ExecCommand, ExecRequest, ExitStatus, JobId, JobInfo, RunSandboxMode, StdinSource,
     WorkspacePath,
 };
-use crate::capabilities::{CapabilityContribution, nx};
+use crate::capabilities::nx;
 use crate::error::{CowshedError, Result};
 use crate::metadata::WorkspaceRole;
 use crate::sandbox::SandboxConfig;
@@ -342,14 +343,14 @@ pub(crate) fn kept_project(read_write: &SandboxConfig) -> Option<&Path> {
 /// between them, so it holds none (05_gateway.md "A resident holds no token"): keeping it costs
 /// the shed none of its share of the host.
 ///
-/// Every error is permanent for the supervisor's capabilities: a start that can never run is
-/// refused here, named, before any job exists.
+/// Every error is permanent for the supervisor's sandbox: a start that can never run is refused
+/// here, named, before any job exists.
 fn start_request(
     workspace_root: &Path,
     project_root: &Path,
-    capabilities: &CapabilityContribution,
+    node: NodeSource<'_>,
 ) -> Result<ExecRequest> {
-    let node = daemon_node(capabilities).map_err(|why| {
+    let node = daemon_node(node).map_err(|why| {
         CowshedError::environment_missing(
             format!(
                 "the Nx daemon of {} cannot start: {why}",
@@ -402,37 +403,70 @@ fn start_request(
     })
 }
 
-/// The `node` a start job runs, or why none can run. A shed whose shell is activated runs the
-/// toolchain that shell declares (15_capabilities.md, "Bootstrap executables"), so `node` is
-/// whatever the activated PATH names and only the start job can tell. A shed without one reaches
-/// no `node` but the javascript capability's bootstrap program, so the job runs that program by
-/// its absolute path, and a program that is missing or cannot execute is named here -- its
-/// `ENOENT` or `EACCES` -- rather than met as `sandbox-exec`'s exit 71 at every probe.
-fn daemon_node(capabilities: &CapabilityContribution) -> std::result::Result<CommandArg, String> {
-    if capabilities.shell.is_some() {
+/// What a shed's Nx daemon keeper has decided, as its supervisor answers it after a probe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NxKeeperState {
+    /// The start job the keeper waits on.
+    pub starting: Option<JobId>,
+    /// Why the keeper starts no daemon however much the shed wants one: a start that can never
+    /// run, or [`START_ATTEMPTS`] in a row that left none live. Lifted when a probe finds a
+    /// daemon live.
+    pub halted: Option<String>,
+}
+
+/// Where a start job's `node` comes from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NodeSource<'a> {
+    /// The shed activates a shell, which declares its own toolchain (15_capabilities.md,
+    /// "Bootstrap executables"): `node` is whatever the activated PATH names, which only the job
+    /// can tell.
+    Shell,
+    /// The shed activates none: the job's PATH is this bootstrap PATH and nothing else.
+    Path(&'a OsStr),
+}
+
+/// The `node` a start job runs, or why none can run. In a shed that activates a shell, `node`.
+/// In one that activates none, `node` as `execvp` would find it on the job's own bootstrap
+/// `path`, by its absolute path: the first executable `node` along it, past ones that cannot
+/// execute. When the lookup cannot tell -- a directory it may not read -- the job runs `node`
+/// and its start is a failure bounded by [`START_ATTEMPTS`]. When the lookup proves no `node`
+/// along the PATH can run, its `ENOENT`, or `EACCES` when one exists but cannot execute, is named
+/// here rather than met as `sandbox-exec`'s exit 71 at every probe.
+pub(crate) fn daemon_node(node: NodeSource<'_>) -> std::result::Result<CommandArg, String> {
+    let path = match node {
+        NodeSource::Shell => return Ok(CommandArg::from("node")),
+        NodeSource::Path(path) => path,
+    };
+    let mut unexecutable = false;
+    let mut undecided = false;
+    for candidate in std::env::split_paths(path).map(|directory| directory.join("node")) {
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
+                return Ok(CommandArg::new(candidate));
+            }
+            Ok(_) => unexecutable = true,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => unexecutable = true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(_) => undecided = true,
+        }
+    }
+    if undecided {
         return Ok(CommandArg::from("node"));
     }
-    let Some(program) = capabilities
-        .bootstrap_programs
-        .iter()
-        .find(|program| program.name == "node")
-    else {
-        return Err(
-            "the shed activates no shell and no capability resolved a `node` program".to_owned(),
-        );
+    let errno = if unexecutable {
+        libc::EACCES
+    } else {
+        libc::ENOENT
     };
-    let target = &program.target;
-    match std::fs::metadata(target) {
-        Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
-            Ok(CommandArg::new(target.clone()))
-        }
-        Ok(_) => Err(format!(
-            "its `node` {} is not an executable file: {}",
-            target.display(),
-            io::Error::from_raw_os_error(libc::EACCES)
-        )),
-        Err(error) => Err(format!("its `node` {}: {error}", target.display())),
-    }
+    Err(format!(
+        "no executable `node` on its PATH {}: {}",
+        path.display(),
+        io::Error::from_raw_os_error(errno)
+    ))
 }
 
 /// How the start job `job` ended, as the keeper says it; `None` for an exit 0.
@@ -515,23 +549,31 @@ impl NxDaemonKeeper {
     }
 
     /// The start job to admit for the Nx project at `project_root` in the workspace at
-    /// `workspace_root`, whose jobs have `capabilities`; none while the keeper is halted. A start
+    /// `workspace_root`, running the `node` from `node`; none while the keeper is halted. A start
     /// that can never run ([`start_request`]) halts it, named, so it is tried once.
     pub(crate) fn start(
         &mut self,
         workspace_root: &Path,
         project_root: &Path,
-        capabilities: &CapabilityContribution,
+        node: NodeSource<'_>,
     ) -> Option<ExecRequest> {
         if self.halted.is_some() {
             return None;
         }
-        match start_request(workspace_root, project_root, capabilities) {
+        match start_request(workspace_root, project_root, node) {
             Ok(request) => Some(request),
             Err(error) => {
                 self.halt(format!("{} (next: {})", error.message, error.hint));
                 None
             }
+        }
+    }
+
+    /// What the keeper has decided: the start job it waits on, and why it starts none.
+    pub(crate) fn state(&self) -> NxKeeperState {
+        NxKeeperState {
+            starting: self.starting,
+            halted: self.halted.clone(),
         }
     }
 
@@ -589,7 +631,7 @@ impl NxDaemonKeeper {
 
     /// Start no daemon, for `why`, until a probe finds one live. Said once, here: an Nx client
     /// that finds no daemon meanwhile starts its own, as Nx does without a keeper.
-    fn halt(&mut self, why: String) {
+    pub(crate) fn halt(&mut self, why: String) {
         eprintln!(
             "cowshed: {why}; the shed's supervisor starts no Nx daemon until it finds one live or \
              restarts"
@@ -1004,36 +1046,21 @@ mod tests {
         assert!(keeper.settled, "the next probe finds it gone");
     }
 
-    fn scratch() -> PathBuf {
+    /// A scratch tree with two PATH directories, `a` and `b`, and the PATH that lists them.
+    fn scratch() -> (PathBuf, std::ffi::OsString) {
         let root = std::env::temp_dir().join(format!(
             "cs-nxk-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
-        std::fs::create_dir_all(root.join("bin")).expect("scratch");
-        root
+        std::fs::create_dir_all(root.join("a")).expect("scratch");
+        std::fs::create_dir_all(root.join("b")).expect("scratch");
+        let path = std::env::join_paths([root.join("a"), root.join("b")]).expect("PATH");
+        (root, path)
     }
 
-    /// A shed with no shell activation whose javascript capability resolved `node` to `target`.
-    fn bootstrap_node(target: PathBuf) -> CapabilityContribution {
-        CapabilityContribution {
-            bootstrap_programs: vec![crate::capabilities::BootstrapProgram {
-                name: "node",
-                target,
-            }],
-            ..CapabilityContribution::default()
-        }
-    }
-
-    /// A shed whose shell is activated, which declares its own toolchain.
-    fn activated(directory: &Path) -> CapabilityContribution {
-        CapabilityContribution {
-            shell: Some(crate::capabilities::ShellActivation {
-                directory: directory.to_path_buf(),
-                script: "",
-                label: "test",
-            }),
-            ..CapabilityContribution::default()
-        }
+    fn plant(node: &Path, mode: u32) {
+        std::fs::write(node, b"#!/bin/sh\n").expect("node");
+        std::fs::set_permissions(node, std::fs::Permissions::from_mode(mode)).expect("mode");
     }
 
     fn program(request: &ExecRequest) -> &std::ffi::OsStr {
@@ -1048,66 +1075,73 @@ mod tests {
     fn probe_and_start(
         keeper: &mut NxDaemonKeeper,
         root: &Path,
-        capabilities: &CapabilityContribution,
+        node: NodeSource<'_>,
     ) -> Option<ExecRequest> {
         keeper.observe(Probe::Unrecorded);
-        keeper.start(root, root, capabilities)
+        keeper.start(root, root, node)
     }
 
-    /// The 2026-10-20 incident: no shell activates the shed, so its start runs the bootstrap
-    /// `node`, and that program does not exist. `sandbox-exec` met it as exit 71 at every probe,
-    /// 272 starts in 1,361 s. The keeper now names the `ENOENT` at its first probe and tries no
-    /// more: the program appearing afterwards is not seen, because nothing is attempted again
-    /// until a daemon is found live, whose start then runs that `node` by its absolute path.
+    /// The 2026-10-20 incident: no shell activates the shed and no `node` lies on the job's
+    /// bootstrap PATH. `sandbox-exec` met it as exit 71 at every probe, 272 starts in 1,361 s.
+    /// The keeper now names the `ENOENT` and the PATH at its first probe and admits nothing more:
+    /// a `node` appearing afterwards is not seen until a daemon is found live, and the start
+    /// then runs that `node` by its absolute path.
     #[tokio::test(start_paused = true)]
-    async fn a_start_whose_node_is_missing_is_refused_once_with_its_enoent_named() {
-        let root = scratch();
-        let node = root.join("bin/node");
-        let capabilities = bootstrap_node(node.clone());
+    async fn a_start_with_no_node_on_its_path_is_refused_once_with_its_enoent_named() {
+        let (root, path) = scratch();
+        let node = NodeSource::Path(&path);
         let mut keeper = keeper();
 
-        assert!(probe_and_start(&mut keeper, &root, &capabilities).is_none());
+        assert!(probe_and_start(&mut keeper, &root, node).is_none());
         let halted = keeper
+            .state()
             .halted
-            .clone()
             .expect("the first probe halts the keeper");
-        assert!(halted.contains(&node.display().to_string()), "{halted}");
+        assert!(
+            halted.contains(&root.join("a").display().to_string()),
+            "{halted}"
+        );
         assert!(
             halted.contains(&io::Error::from_raw_os_error(libc::ENOENT).to_string()),
             "the refusal names ENOENT: {halted}"
         );
 
         // A keeper that tried again would now admit a start.
-        std::fs::write(&node, b"#!/bin/sh\n").expect("node");
-        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        plant(&root.join("b/node"), 0o755);
         for _ in 1..272 {
             assert!(
-                probe_and_start(&mut keeper, &root, &capabilities).is_none(),
+                probe_and_start(&mut keeper, &root, node).is_none(),
                 "a halted keeper attempts nothing"
             );
         }
-        assert_eq!(keeper.halted.as_deref(), Some(halted.as_str()));
+        assert_eq!(keeper.state().halted.as_deref(), Some(halted.as_str()));
 
         keeper.observe(Probe::Live);
-        assert_eq!(keeper.halted, None, "a live daemon lifts the halt");
+        assert_eq!(keeper.state().halted, None, "a live daemon lifts the halt");
         let request = keeper
-            .start(&root, &root, &capabilities)
+            .start(&root, &root, node)
             .expect("a start once lifted");
-        assert_eq!(program(&request), node.as_os_str(), "never a bare `node`");
+        assert_eq!(program(&request), root.join("b/node").as_os_str());
         std::fs::remove_dir_all(&root).expect("remove scratch");
     }
 
-    /// A `node` that exists but cannot execute is refused at once with its `EACCES` named.
+    /// `node` is found as `execvp` finds it on the job's PATH: one that cannot execute is passed
+    /// over for one further on, and when none further on can run, its `EACCES` is named at once.
     #[tokio::test(start_paused = true)]
-    async fn a_start_whose_node_cannot_execute_is_refused_once_with_its_eacces_named() {
-        let root = scratch();
-        let node = root.join("bin/node");
-        std::fs::write(&node, b"").expect("node");
-        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o644)).expect("mode");
+    async fn a_start_whose_only_node_cannot_execute_is_refused_once_with_its_eacces_named() {
+        let (root, path) = scratch();
+        let node = NodeSource::Path(&path);
+        plant(&root.join("a/node"), 0o644);
+        plant(&root.join("b/node"), 0o755);
+        let request = keeper()
+            .start(&root, &root, node)
+            .expect("the executable `node` further on the PATH starts");
+        assert_eq!(program(&request), root.join("b/node").as_os_str());
+
+        std::fs::remove_file(root.join("b/node")).expect("remove");
         let mut keeper = keeper();
-        assert!(probe_and_start(&mut keeper, &root, &bootstrap_node(node.clone())).is_none());
-        let halted = keeper.halted.clone().expect("halted");
-        assert!(halted.contains(&node.display().to_string()), "{halted}");
+        assert!(probe_and_start(&mut keeper, &root, node).is_none());
+        let halted = keeper.state().halted.expect("halted");
         assert!(
             halted.contains(&io::Error::from_raw_os_error(libc::EACCES).to_string()),
             "the refusal names EACCES: {halted}"
@@ -1115,23 +1149,13 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("remove scratch");
     }
 
-    /// A shed that activates no shell and resolved no `node` can never start a daemon, which is
-    /// said once. A shed whose shell is activated runs the `node` that shell declares
-    /// (15_capabilities.md), which only its start job can find.
+    /// A shed whose shell is activated runs the `node` that shell declares (15_capabilities.md),
+    /// which only its start job can find, whatever the bootstrap PATH holds.
     #[tokio::test(start_paused = true)]
-    async fn a_shed_without_a_node_is_refused_once_and_an_activated_shell_names_its_own() {
-        let root = scratch();
-        let mut keeper = keeper();
-        assert!(probe_and_start(&mut keeper, &root, &CapabilityContribution::default()).is_none());
-        let halted = keeper.halted.clone().expect("halted");
-        assert!(
-            halted.contains("no capability resolved a `node`"),
-            "{halted}"
-        );
-
-        let request = super::NxDaemonKeeper::for_role(WorkspaceRole::Workspace)
-            .expect("a shed keeps a daemon")
-            .start(&root, &root, &activated(&root))
+    async fn an_activated_shell_names_its_own_node() {
+        let (root, _) = scratch();
+        let request = keeper()
+            .start(&root, &root, NodeSource::Shell)
             .expect("an activated shed starts");
         assert_eq!(program(&request), "node");
         std::fs::remove_dir_all(&root).expect("remove scratch");
@@ -1144,13 +1168,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_start_that_ran_and_failed_is_tried_again_up_to_its_bound() {
         let root = Path::new(NO_PROJECT);
-        let capabilities = activated(root);
         let job = JobId::new(1).expect("job id");
         let mut keeper = keeper();
         for _ in 1..START_ATTEMPTS {
             keeper.start_ended(job, Some("exited 71".to_owned()), root, Probe::Dead);
             assert!(
-                keeper.start(root, root, &capabilities).is_some(),
+                keeper.start(root, root, NodeSource::Shell).is_some(),
                 "below the bound"
             );
         }
@@ -1159,16 +1182,20 @@ mod tests {
         for _ in 1..START_ATTEMPTS {
             keeper.start_ended(job, Some("exited 1".to_owned()), root, Probe::Refused);
         }
-        assert_eq!(keeper.halted, None, "the live daemon reset the count");
+        assert_eq!(
+            keeper.state().halted,
+            None,
+            "the live daemon reset the count"
+        );
 
         keeper.start_ended(job, None, root, Probe::Unrecorded);
-        let halted = keeper.halted.clone().expect("halted at the bound");
+        let halted = keeper.state().halted.expect("halted at the bound");
         assert!(
             halted.contains("exited 0") && halted.contains("3 starts in a row"),
             "{halted}"
         );
         assert!(
-            keeper.start(root, root, &capabilities).is_none(),
+            keeper.start(root, root, NodeSource::Shell).is_none(),
             "at the bound"
         );
     }

@@ -6516,12 +6516,19 @@ async fn a_linux_job_s_sample_names_its_missing_accounting_source() {
     reap(command);
 }
 
-/// Workspace `name`'s supervisor config, in an Nx project no daemon serves.
+/// Workspace `name`'s supervisor config, in an Nx project no daemon serves. No shell activates
+/// it, so its jobs' PATH is the bootstrap PATH, and the `node` there is the workspace's own shim
+/// ([`fixture_node`]), as a shed's keeper finds it (04_sandbox.md).
 fn nx_project(name: &str) -> (WorkspaceSupervisorConfig, TempRoot) {
     let (mut supervisor_config, root) = isolated_config(&format!("nx-daemon-{name}"));
     supervisor_config.authority.workspace = WorkspaceName::new(name).unwrap();
     supervisor_config.default_cwd = None;
     std::fs::write(supervisor_config.workspace_root.join("nx.json"), "{}").unwrap();
+    let node = fixture_node(&supervisor_config.workspace_root);
+    std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+    std::fs::write(&node, b"#!/bin/sh\n").unwrap();
+    let executable = <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755);
+    std::fs::set_permissions(&node, executable).unwrap();
     supervisor_config
         .sandbox
         .configure_capabilities()
@@ -6529,11 +6536,17 @@ fn nx_project(name: &str) -> (WorkspaceSupervisorConfig, TempRoot) {
     (supervisor_config, root)
 }
 
-/// The argv that starts the daemon of the Nx project at `project`: the project's own `nx`, kept, so the daemon
-/// leaves its restart to the keeper.
+/// The `node` on the bootstrap PATH of the workspace at `project`: its `.cowshed/bin` shim.
+fn fixture_node(project: &Path) -> PathBuf {
+    project.join(".cowshed/bin/node")
+}
+
+/// The argv that starts the daemon of the Nx project at `project`: the project's own `nx`, run
+/// by the `node` its keeper found on the job's PATH, kept, so the daemon leaves its restart to
+/// the keeper.
 fn nx_daemon_start(project: &Path) -> Vec<OsString> {
     vec![
-        OsString::from("node"),
+        fixture_node(project).into_os_string(),
         project
             .join("node_modules/nx/dist/src/daemon/server/start.js")
             .into_os_string(),
@@ -7269,6 +7282,44 @@ async fn main_leaves_its_nx_daemon_to_the_host() {
             .await
             .is_err(),
         "main's supervisor started a job of its own"
+    );
+}
+
+/// A shed whose jobs can reach no `node` can never start its daemon: its keeper says why once,
+/// at its first probe, to anyone who asks it, and admits no start job -- never one per probe
+/// that `sandbox-exec` fails with exit 71.
+#[tokio::test(start_paused = true)]
+async fn a_shed_with_no_node_refuses_its_nx_daemon_once_with_its_enoent_named() {
+    let (supervisor_config, _root) = nx_project("nodeless");
+    std::fs::remove_file(fixture_node(&supervisor_config.workspace_root)).unwrap();
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let keeper = h
+        .handle
+        .nx_daemon_keeper()
+        .await
+        .unwrap()
+        .expect("a shed keeps a daemon");
+    assert_eq!(keeper.starting, None);
+    let halted = keeper.halted.expect("the keeper refused the start");
+    assert!(
+        halted.contains("no executable `node` on its PATH")
+            && halted.contains(&std::io::Error::from_raw_os_error(libc::ENOENT).to_string()),
+        "{halted}"
+    );
+    assert!(
+        tokio::time::timeout(NX_PROBES, h.spawned.recv())
+            .await
+            .is_err(),
+        "the refused keeper admitted a start job"
+    );
+    assert_eq!(
+        h.handle
+            .nx_daemon_keeper()
+            .await
+            .unwrap()
+            .and_then(|keeper| keeper.halted),
+        Some(halted),
+        "the refusal stands, said once"
     );
 }
 

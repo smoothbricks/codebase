@@ -2287,6 +2287,12 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
                 "idleness is asked of an in-process supervisor only",
             )));
         }
+        Command::NxDaemonKeeper { reply } => {
+            // The keeper's state has no wire form: the process running the supervisor asks it.
+            let _ = reply.send(Err(CowshedError::internal(
+                "the Nx daemon keeper's state is asked of an in-process supervisor only",
+            )));
+        }
     }
 }
 

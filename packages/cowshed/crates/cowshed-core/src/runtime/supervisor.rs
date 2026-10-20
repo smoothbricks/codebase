@@ -3277,6 +3277,14 @@ impl WorkspaceSupervisorHandle {
         self.call(|reply| Command::Idle { reply }).await
     }
 
+    /// What the shed's Nx daemon keeper decided at its next probe ([`super::NxKeeperState`]): the
+    /// start job it waits on, and why it starts none -- a start that can never run, or one bound
+    /// reached, named. `None` once the supervisor keeps no daemon: main's, or one retiring. Asked
+    /// of the supervisor in this process; a remote handle refuses it.
+    pub async fn nx_daemon_keeper(&self) -> Result<Option<super::NxKeeperState>> {
+        self.call(|reply| Command::NxDaemonKeeper { reply }).await
+    }
+
     pub async fn retire(&self, nx_daemon: NxDaemonRetirement) -> Result<()> {
         self.call(|reply| Command::Retire {
             authority: self.authority.clone(),
@@ -3411,6 +3419,7 @@ impl WorkspaceSupervisor {
             named_sessions: BTreeMap::new(),
             quiesce_waiters: Vec::new(),
             retire_waiters: Vec::new(),
+            nx_keeper_waiters: Vec::new(),
             command_lane_closed: false,
             nx_daemon,
             labelled_build: None,
@@ -3579,6 +3588,10 @@ pub(super) enum Command {
     #[cfg(target_os = "macos")]
     Idle {
         reply: oneshot::Sender<Result<bool>>,
+    },
+    /// The keeper's decision at its next probe.
+    NxDaemonKeeper {
+        reply: oneshot::Sender<Result<Option<super::NxKeeperState>>>,
     },
 }
 
@@ -4187,6 +4200,9 @@ struct SupervisorActor {
     named_sessions: BTreeMap<String, u64>,
     quiesce_waiters: Vec<oneshot::Sender<Result<()>>>,
     retire_waiters: Vec<oneshot::Sender<Result<()>>>,
+    /// Callers of [`WorkspaceSupervisorHandle::nx_daemon_keeper`], answered after the next
+    /// probe, or with `None` once no keeper is left.
+    nx_keeper_waiters: Vec<oneshot::Sender<Result<Option<super::NxKeeperState>>>>,
     command_lane_closed: bool,
     /// A shed's keeper of its sandboxed Nx daemon ([`super::nx_daemon`]); main keeps none.
     nx_daemon: Option<NxDaemonKeeper>,
@@ -4298,6 +4314,7 @@ impl SupervisorActor {
                         && !self.command_lane_closed =>
                 {
                     self.keep_nx_daemon().await;
+                    self.answer_nx_keeper_waiters();
                 }
             }
             self.finish_ready_jobs().await;
@@ -4305,8 +4322,19 @@ impl SupervisorActor {
                 self.release_kept_nx_daemon().await;
             }
             self.finish_lifecycle_waiters();
+            if self.nx_daemon.is_none() {
+                self.answer_nx_keeper_waiters();
+            }
         }
         self.labelling.abort_all();
+    }
+
+    /// Answer every caller waiting on the keeper's decision with what it is now.
+    fn answer_nx_keeper_waiters(&mut self) {
+        let state = self.nx_daemon.as_ref().map(NxDaemonKeeper::state);
+        for waiter in self.nx_keeper_waiters.drain(..) {
+            let _ = waiter.send(Ok(state.clone()));
+        }
     }
 
     /// End the Nx daemon this supervisor's keeper kept when it retires.
@@ -4702,6 +4730,17 @@ impl SupervisorActor {
                     && self.nx_daemon.as_ref().is_none_or(|keeper| keeper.settled);
                 let _ = reply.send(Ok(idle));
             }
+            // Answered after the next probe, or now when no probe is coming.
+            Command::NxDaemonKeeper { reply } => match &self.nx_daemon {
+                Some(_)
+                    if self.lifecycle == ActorLifecycle::Running && !self.command_lane_closed =>
+                {
+                    self.nx_keeper_waiters.push(reply);
+                }
+                keeper => {
+                    let _ = reply.send(Ok(keeper.as_ref().map(NxDaemonKeeper::state)));
+                }
+            },
         }
     }
 
@@ -5737,11 +5776,26 @@ impl SupervisorActor {
         if daemon == Probe::Live || running {
             return;
         }
-        let Some(request) = keeper.start(
-            &self.workspace_root,
-            &project_root,
-            &read_write.capabilities.contribution,
-        ) else {
+        // The job's `node` is found as its own exec would find it: on the PATH it gets.
+        let path = match read_write.capabilities.contribution.shell {
+            Some(_) => None,
+            None => match bootstrap_path(read_write) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    keeper.halt(format!(
+                        "the Nx daemon of {} cannot start: {}",
+                        project_root.display(),
+                        error.message
+                    ));
+                    return;
+                }
+            },
+        };
+        let node = path.as_deref().map_or(
+            super::nx_daemon::NodeSource::Shell,
+            super::nx_daemon::NodeSource::Path,
+        );
+        let Some(request) = keeper.start(&self.workspace_root, &project_root, node) else {
             return;
         };
         let authority = self.authority.clone();
