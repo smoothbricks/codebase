@@ -599,11 +599,13 @@ A test pays its setup once and asserts after each step; two cases that test one 
 repositories enforce this in their root Nx lint with the `smoo-nx-test-walks` bin. The bin judges only pairs with a case
 changed since the upstream merge base. Among those pairs it reports each case's nearest refusing partner and its nearest
 advisory partner separately, so an advisory pair never hides a refusal. Existing pairs therefore need no allowance
-table. `smoo-nx-test-walks --base` prints that base for the target's runtime input, because the verdict depends on it
-and no file hash names it. `upstreamBase` picks the upstream in this order: `NX_BASE` (refused when it names no commit),
-`refs/remotes/main/main`, the local main's upstream branch, `refs/remotes/origin/main`, then `main`.
-`findDuplicateScenarios(root, files, changes)`, `formatDuplicateScenario`, `diffScope` and `upstreamBase` are exported
-from `@smoothbricks/nx-plugin/test-walk-policy`, and git failures come back as `GitAnswer` values.
+table. The verdict depends on that base and no file hash names it, so the plugin resolves it as a run precondition
+before Nx hashes any task (`assertUpstreamBasePrecondition`, from its pre-tasks hook): a checkout without a main ref
+refuses the run with the check's own reason rather than carrying the base through a runtime input. `upstreamBase` picks
+the upstream in this order: `NX_BASE` (refused when it names no commit), `refs/remotes/main/main`, the local main's
+upstream branch, `refs/remotes/origin/main`, then `main`. `findDuplicateScenarios(root, files, changes)`,
+`formatDuplicateScenario`, `diffScope` and `upstreamBase` are exported from `@smoothbricks/nx-plugin/test-walk-policy`,
+and git failures come back as `GitAnswer` values.
 
 The policy reads bun:test `test`/`it` cases in test files and `#[test]`-family fns in any Rust file. A body that is one
 wrapper call, `await withHarness(memoryBackend, async (h) => { … })` or `runtime().block_on(async { … })`, walks the
