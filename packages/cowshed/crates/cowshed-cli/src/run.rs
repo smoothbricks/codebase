@@ -79,7 +79,9 @@ impl InterruptPolicy {
 /// Run one CLI invocation inside a host process. `arguments` excludes argv[0].
 ///
 /// Returns the process exit code and never touches signal dispositions, because an in-process
-/// host must keep its own and be allowed to flush and unwind normally.
+/// host must keep its own and be allowed to flush and unwind normally. Exception: `subtree-root`
+/// explicitly takes ownership of its named inherited descriptor and execs, replacing the entire
+/// host process after publishing admission. It does not return on successful exec.
 pub async fn run(arguments: Vec<OsString>) -> i32 {
     run_with(arguments, InterruptPolicy::LeaveToHost)
         .await
@@ -187,6 +189,16 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     // disk-command it is answered before anything asks the daemon.
     if let args::Command::LandTurn(land) = &parsed.command {
         return Ok(crate::land_turn::dispatch(land, &mut output, interrupts).await);
+    }
+    // These verbs address the already-running job supervisor directly. In particular, admission
+    // authenticates this wrapper before exec replaces its image without changing its life.
+    if let args::Command::SubtreeRoot(root) = &parsed.command {
+        let outcome = crate::subtree::root(root).await;
+        return Ok(finish(outcome, &mut output, json));
+    }
+    if let args::Command::RetireDescendants(retire) = &parsed.command {
+        let outcome = crate::subtree::retire(retire, &mut output).await;
+        return Ok(finish(outcome, &mut output, json));
     }
     if let args::Command::Skill(skill_args) = &parsed.command {
         let outcome = skill::dispatch(skill_args, &parsed.global, &mut output);

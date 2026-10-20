@@ -121,6 +121,9 @@ fn running_job() -> JobInfo {
         scope: cowshed_core::api::ExecScope::Workspace,
         cpu_tokens: None,
         nice: None,
+        containment: None,
+        outlived: Vec::new(),
+        outlived_incomplete: false,
     }
 }
 

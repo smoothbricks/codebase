@@ -244,6 +244,9 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         scope: ExecScope::Workspace,
         nice: None,
         cpu_tokens: None,
+        containment: None,
+        outlived: Vec::new(),
+        outlived_incomplete: false,
     };
 
     let running_cpu = CpuTotals {
@@ -340,6 +343,9 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         scope: ExecScope::Workspace,
         nice: Some(10),
         cpu_tokens: NonZeroUsize::new(4),
+        containment: None,
+        outlived: Vec::new(),
+        outlived_incomplete: false,
     };
 
     // An exited job with inline stdin.
@@ -374,6 +380,9 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         scope: ExecScope::Workspace,
         nice: Some(5),
         cpu_tokens: NonZeroUsize::new(8),
+        containment: None,
+        outlived: Vec::new(),
+        outlived_incomplete: false,
     };
     // A supervisor configured with no volume sampled it: its volumes say so.
     let exited = JobInfo {
@@ -421,6 +430,9 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         scope: ExecScope::Workspace,
         nice: Some(10),
         cpu_tokens: NonZeroUsize::new(2),
+        containment: None,
+        outlived: Vec::new(),
+        outlived_incomplete: false,
     };
     // A platform with no used-bytes stat for the workspace volume, and a build volume that shrank.
     let signaled = JobInfo {
@@ -471,6 +483,9 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         scope: ExecScope::Workspace,
         nice: Some(10),
         cpu_tokens: NonZeroUsize::new(1),
+        containment: None,
+        outlived: Vec::new(),
+        outlived_incomplete: false,
     };
 
     // A cancelled job may die from a signal or exit normally after handling it.
@@ -603,6 +618,63 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         ..resident.clone()
     };
 
+    // A job whose leader has ended while the rest of its process membership is being retired:
+    // nonterminal, so it owns its process and states no exit, duration or receipt yet.
+    let draining = JobInfo {
+        job_id: JobId::new(14).expect("fixture job id"),
+        state: JobState::Draining,
+        pid: Some(4249),
+        grant_revision: 7,
+        ..queued.clone()
+    };
+
+    // The kernel retired the membership and nothing outlived the leader: a containment, and no
+    // survivor list on the wire.
+    let retired_kernel = JobInfo {
+        job_id: JobId::new(15).expect("fixture job id"),
+        resources: None,
+        containment: Some(cowshed_core::api::JobContainment::Kernel),
+        ..exited.clone()
+    };
+
+    // An observer's retirement names what it lacked and each process it ended, one whose position
+    // and image it knew and one whose it did not.
+    let retired_observed = JobInfo {
+        job_id: JobId::new(16).expect("fixture job id"),
+        resources: None,
+        containment: Some(cowshed_core::api::JobContainment::Observed {
+            lost: vec![ProcessCoverageGap::UnreadImage { pid: 4247 }],
+        }),
+        outlived: vec![
+            cowshed_core::api::OutlivedProcess {
+                index: Some(2),
+                pid: 4247,
+                image: Some("/bin/sleep".to_owned()),
+                signal: 9,
+            },
+            cowshed_core::api::OutlivedProcess {
+                index: None,
+                pid: 4248,
+                image: None,
+                signal: 9,
+            },
+        ],
+        ..signaled.clone()
+    };
+
+    // Empty membership can be proven even when native retirement could not name all members it ended.
+    let retired_kernel_incomplete = JobInfo {
+        job_id: JobId::new(17).expect("fixture job id"),
+        outlived_incomplete: true,
+        ..retired_kernel.clone()
+    };
+    let retired_kernel_incomplete_with_rows = JobInfo {
+        job_id: JobId::new(18).expect("fixture job id"),
+        containment: Some(cowshed_core::api::JobContainment::Kernel),
+        outlived_incomplete: true,
+        ..retired_observed.clone()
+    };
+
     let list = vec![queued.clone(), running.clone()];
 
     BTreeMap::from([
@@ -628,6 +700,17 @@ fn job_infos() -> BTreeMap<&'static str, Value> {
         (
             "interactiveResident",
             document("job status", &interactive_resident),
+        ),
+        ("draining", document("job status", &draining)),
+        ("retiredKernel", document("job status", &retired_kernel)),
+        ("retiredObserved", document("job status", &retired_observed)),
+        (
+            "retiredKernelIncomplete",
+            document("job status", &retired_kernel_incomplete),
+        ),
+        (
+            "retiredKernelIncompleteWithRows",
+            document("job status", &retired_kernel_incomplete_with_rows),
         ),
         ("list", document("job list", &list)),
     ])
@@ -1566,6 +1649,7 @@ fn every_job_state_appears_in_the_corpus() {
     for state in [
         JobState::Queued,
         JobState::Running,
+        JobState::Draining,
         JobState::Exited,
         JobState::Signaled,
         JobState::Killed,
@@ -1739,5 +1823,51 @@ fn every_scheduling_fact_appears_in_the_corpus() {
     assert!(
         documents.iter().any(|document| document["nice"] == 0),
         "a gate's observed nice zero is a real observation"
+    );
+}
+
+/// Every retirement fact a job can carry is in the corpus: both containments, a survivor whose
+/// index and image were observed and one whose were not, and a job that states no receipt at all.
+/// A value absent from it is one the TypeScript side is unverified against.
+#[test]
+fn every_retirement_fact_appears_in_the_corpus() {
+    let documents: Vec<Value> = job_infos()
+        .values()
+        .flat_map(|value| match value {
+            Value::Array(items) => items.clone(),
+            single => vec![single.clone()],
+        })
+        .collect();
+    for kind in ["kernel", "observed"] {
+        assert!(
+            documents
+                .iter()
+                .any(|document| document["containment"]["kind"] == kind),
+            "no job states a {kind} containment, so types.ts is unverified for it"
+        );
+    }
+    let survivors: Vec<&Value> = documents
+        .iter()
+        .flat_map(|document| document["outlived"].as_array().into_iter().flatten())
+        .collect();
+    for field in ["index", "image"] {
+        assert!(
+            survivors
+                .iter()
+                .any(|survivor| survivor.get(field).is_some()),
+            "no survivor names its {field}"
+        );
+        assert!(
+            survivors
+                .iter()
+                .any(|survivor| survivor.get(field).is_none()),
+            "no survivor omits its {field}"
+        );
+    }
+    assert!(
+        documents.iter().any(|document| {
+            document.get("containment").is_none() && document.get("outlived").is_none()
+        }),
+        "no job states no receipt"
     );
 }

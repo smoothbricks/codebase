@@ -34,7 +34,11 @@ use crate::api::dto::{
     JobJournalCursor, JobTailLimits, OutputPublication, RunSandboxMode, ScriptCommand,
     Sha256Digest, StdinSource, TraceContext, WorkspacePath,
 };
-use crate::api::process::JobProcessEvent;
+#[cfg(not(target_os = "macos"))]
+use crate::api::process::JobSubtreeRefusal;
+use crate::api::process::{
+    JobProcessEvent, JobSubtreeAdmission, JobSubtreeHandle, JobSubtreeRetirement,
+};
 use crate::api::resources::SampleInterval;
 use crate::api::server::codec::Demand;
 use crate::error::{CowshedError, Result};
@@ -170,6 +174,25 @@ pub fn socket_path(
         .join(format!("{}.sock", &digest[..32]))
 }
 
+/// Only the membership endpoint is exported to admitted children, never coordinator authority.
+pub const MEMBERSHIP_SOCKET_ENV: &str = "COWSHED_SUPERVISOR_SOCKET";
+
+pub fn membership_socket_path(supervisor: &Path) -> PathBuf {
+    supervisor.with_extension("members.sock")
+}
+
+/// This separate closed grammar is the endpoint's authority boundary. New coordinator methods
+/// cannot silently become callable by a sandbox job.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+enum MembershipRequest {
+    SubtreeHandle,
+    #[serde(rename_all = "camelCase")]
+    RetireDescendants {
+        handle: JobSubtreeHandle,
+        grace_ms: u64,
+    },
+}
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 enum Request {
@@ -867,16 +890,23 @@ pub async fn serve(
     advances: Option<Advances>,
     feed: Option<super::commitment_feed::CommitmentFeed>,
 ) -> Result<()> {
+    let membership = bind(&membership_socket_path(&socket.path)).await?;
     let streams: Streams = Arc::default();
     let retired = Arc::new(tokio::sync::Notify::new());
     let owed = Arc::new(DrainReads::default());
     let (release, mut released) = mpsc::channel::<(UnixStream, serde_json::Value, Bytes)>(1);
     loop {
-        let (stream, _) = tokio::select! {
-            accepted = socket.listener.accept() => accepted.map_err(|error| {
+        let (stream, is_membership) = tokio::select! {
+            accepted = socket.listener.accept() => accepted.map(|(stream, _)| (stream, false)).map_err(|error| {
                 CowshedError::environment_missing(
                     format!("workspace supervisor socket stopped accepting: {error}"),
                     "retry; cowshed restarts the workspace supervisor",
+                )
+            })?,
+            accepted = membership.listener.accept() => accepted.map(|(stream, _)| (stream, true)).map_err(|error| {
+                CowshedError::environment_missing(
+                    format!("workspace membership socket stopped accepting: {error}"),
+                    "retain membership claims and restart the workspace supervisor",
                 )
             })?,
             response = released.recv() => {
@@ -886,6 +916,7 @@ pub async fn serve(
                 // A successful retirement reply proves replacement admission can acquire the
                 // socket fence already: no acknowledgement-before-listener-release race.
                 drop(socket);
+                drop(membership);
                 write_json(&mut stream, &Response::Ok { value, bytes: bytes.len() }).await?;
                 if !bytes.is_empty() {
                     write_frame(&mut stream, &bytes, MAX_BYTES_FRAME).await?;
@@ -905,13 +936,14 @@ pub async fn serve(
         let release = release.clone();
         let socket_path = socket.path.clone();
         tokio::spawn(async move {
-            match serve_call(
+            match serve_endpoint_call(
                 stream,
                 &supervisor,
                 &streams,
                 advances.as_ref(),
                 feed.as_ref(),
                 &owed,
+                is_membership,
             )
             .await
             {
@@ -1234,6 +1266,108 @@ impl DrainReads {
     }
 }
 
+async fn serve_endpoint_call(
+    stream: UnixStream,
+    supervisor: &WorkspaceSupervisorHandle,
+    streams: &Streams,
+    advances: Option<&Advances>,
+    feed: Option<&super::commitment_feed::CommitmentFeed>,
+    owed: &DrainReads,
+    membership: bool,
+) -> Result<Retirement> {
+    if membership {
+        serve_membership_call(stream, supervisor).await
+    } else {
+        serve_call(stream, supervisor, streams, advances, feed, owed).await
+    }
+}
+
+async fn serve_membership_call(
+    mut stream: UnixStream,
+    supervisor: &WorkspaceSupervisorHandle,
+) -> Result<Retirement> {
+    verify_peer(&stream)?;
+    let request = match read_json::<MembershipRequest>(&mut stream).await {
+        Ok(request) => request,
+        Err(error) => {
+            // Unknown operations are named in the serde refusal, not ignored or forwarded.
+            write_json(&mut stream, &Response::Err(error)).await?;
+            return Ok(Retirement::Serving);
+        }
+    };
+    let outcome = membership_request(&stream, supervisor, request).await;
+    let response = match outcome {
+        Ok(value) => Response::Ok { value, bytes: 0 },
+        Err(error) => Response::Err(error),
+    };
+    write_json(&mut stream, &response).await?;
+    Ok(Retirement::Serving)
+}
+
+async fn membership_request(
+    stream: &UnixStream,
+    supervisor: &WorkspaceSupervisorHandle,
+    request: MembershipRequest,
+) -> Result<serde_json::Value> {
+    #[cfg(target_os = "macos")]
+    {
+        let peer = super::job_groups::Process::of_socket_peer(stream).map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot authenticate membership socket peer: {error}"),
+                "request a subtree capability while its process is alive",
+            )
+        })?;
+        match request {
+            MembershipRequest::SubtreeHandle => to_value(&supervisor.subtree_handle(peer).await?),
+            MembershipRequest::RetireDescendants { handle, grace_ms } => to_value(
+                &supervisor
+                    .retire_descendants(peer, handle, std::time::Duration::from_millis(grace_ms))
+                    .await?,
+            ),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (stream, supervisor);
+        match request {
+            MembershipRequest::SubtreeHandle => to_value(&JobSubtreeAdmission::Refused {
+                reason: JobSubtreeRefusal::FoldUnavailable,
+            }),
+            MembershipRequest::RetireDescendants { .. } => {
+                to_value(&JobSubtreeRetirement::Refused {
+                    reason: JobSubtreeRefusal::FoldUnavailable,
+                })
+            }
+        }
+    }
+}
+
+/// Ask about this connection's own live process, never a pid supplied by the caller.
+pub async fn subtree_handle(path: &Path) -> Result<JobSubtreeAdmission> {
+    let (value, _) = exchange(path, &MembershipRequest::SubtreeHandle, Bytes::new()).await?;
+    decode(value)
+}
+
+/// Spend a root-issued capability from a live peer of the same admitted job.
+pub async fn retire_descendants(
+    path: &Path,
+    handle: JobSubtreeHandle,
+    grace: std::time::Duration,
+) -> Result<JobSubtreeRetirement> {
+    let grace_ms = u64::try_from(grace.as_millis()).map_err(|_| {
+        CowshedError::usage(
+            "subtree TERM grace exceeds the wire range",
+            "use a grace in milliseconds representable by u64",
+        )
+    })?;
+    let (value, _) = exchange(
+        path,
+        &MembershipRequest::RetireDescendants { handle, grace_ms },
+        Bytes::new(),
+    )
+    .await?;
+    decode(value)
+}
 async fn serve_call(
     mut stream: UnixStream,
     supervisor: &WorkspaceSupervisorHandle,
@@ -2115,7 +2249,7 @@ async fn round_trip(
 
 async fn exchange(
     path: &Path,
-    request: &Request,
+    request: &impl Serialize,
     payload: Bytes,
 ) -> Result<(serde_json::Value, Bytes)> {
     let mut stream = UnixStream::connect(path)
@@ -2127,7 +2261,7 @@ async fn exchange(
 async fn exchange_on(
     stream: &mut UnixStream,
     path: &Path,
-    request: &Request,
+    request: &impl Serialize,
     payload: Bytes,
 ) -> Result<(serde_json::Value, Bytes)> {
     write_json(stream, request).await?;
@@ -2303,6 +2437,20 @@ pub async fn hold(
 async fn forward(path: Arc<PathBuf>, command: Command) {
     let path = path.as_path();
     match command {
+        #[cfg(target_os = "macos")]
+        Command::SubtreeHandle { reply, .. } => {
+            let _ = reply.send(Err(CowshedError::conflict(
+                "an authenticated membership peer cannot be forwarded through coordinator authority",
+                "connect directly to the membership-only endpoint",
+            )));
+        }
+        #[cfg(target_os = "macos")]
+        Command::RetireDescendants { reply, .. } => {
+            let _ = reply.send(Err(CowshedError::conflict(
+                "an authenticated membership peer cannot be forwarded through coordinator authority",
+                "connect directly to the membership-only endpoint",
+            )));
+        }
         Command::AdvanceAuthority { reply, .. } => {
             // Only the serving runtime can rebuild the sandbox from controller-owned grants.
             // Remote callers request that through the manager's advance exchange (11_shell.md).

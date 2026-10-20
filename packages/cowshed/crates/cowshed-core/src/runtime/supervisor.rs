@@ -26,7 +26,11 @@ use crate::api::dto::{
 };
 use crate::api::journal_tail::tail_journals;
 use crate::api::process::JobLeafAttribution;
-use crate::api::process::JobProcessTree;
+use crate::api::process::{JobProcessRetirement, JobProcessTree};
+#[cfg(target_os = "macos")]
+use crate::api::process::{
+    JobSubtreeAdmission, JobSubtreeHandle, JobSubtreeRefusal, JobSubtreeRetirement,
+};
 #[cfg(target_os = "macos")]
 use crate::api::resources::UsageReconciliation;
 use crate::api::resources::{
@@ -134,6 +138,9 @@ pub struct WorkspaceSupervisorConfig {
     /// Where the supervisor keeps the process groups of its running jobs for whoever finds it
     /// gone ([`super::job_groups`]); `None` keeps no ledger.
     pub group_ledger: Option<PathBuf>,
+    /// The membership-only endpoint served beside the privileged coordinator socket.
+    /// Only this endpoint is admitted into child sandboxes and exported to their environment.
+    pub membership_socket: Option<PathBuf>,
     /// The host telemetry root the supervisor seals each job's span under
     /// ([`super::job_spans`]); `None` writes no job spans.
     pub telemetry_root: Option<PathBuf>,
@@ -327,6 +334,7 @@ impl Default for WorkspaceSupervisorConfig {
             shell_host: None,
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
             group_ledger: None,
+            membership_socket: None,
             telemetry_root: None,
             inherited_groups: Vec::new(),
             volume_labels: None,
@@ -845,6 +853,12 @@ pub enum ProcessEvent {
         job_id: JobId,
         exit: ExitStatus,
     },
+    /// The native membership owner joined every retained member, or refused without
+    /// releasing its authority. The leader's exit alone never supplies this proof.
+    Retired {
+        job_id: JobId,
+        retirement: Result<JobProcessRetirement>,
+    },
     /// `wait(2)` did not report how the child died. Carries the failure instead of a status so
     /// no consumer can mistake an unreaped child for a terminated one.
     WaitFailed {
@@ -1087,6 +1101,9 @@ impl ArtifactSink for ArtifactStoreSink {
                 failure: record.failure,
                 duration_ms: record.duration_ms,
                 resources: record.resources.clone(),
+                containment: record.containment.clone(),
+                outlived: record.outlived.clone(),
+                outlived_incomplete: record.outlived_incomplete,
                 output_limit: record.output_limit.clone(),
                 stdout: record.stdout.clone(),
                 stderr: record.stderr.clone(),
@@ -3277,6 +3294,30 @@ impl WorkspaceSupervisorHandle {
         })
         .await
     }
+    #[cfg(target_os = "macos")]
+    pub(super) async fn subtree_handle(
+        &self,
+        peer: super::job_groups::Process,
+    ) -> Result<JobSubtreeAdmission> {
+        self.call(|reply| Command::SubtreeHandle { peer, reply })
+            .await
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) async fn retire_descendants(
+        &self,
+        peer: super::job_groups::Process,
+        handle: JobSubtreeHandle,
+        grace: Duration,
+    ) -> Result<JobSubtreeRetirement> {
+        self.call(|reply| Command::RetireDescendants {
+            peer,
+            handle,
+            grace,
+            reply,
+        })
+        .await
+    }
 
     /// The job `key` admitted in this workspace incarnation, or proven absence in its durable
     /// records: answered after the exec's reply was lost, even by a supervisor that did not run it.
@@ -3574,7 +3615,7 @@ impl WorkspaceSupervisor {
         commitments: Box<dyn CommitmentSink>,
     ) -> Result<WorkspaceSupervisorHandle> {
         config.validate()?;
-        let policy = SandboxPolicy::render(config.sandbox)?;
+        let policy = job_sandbox_policy(config.sandbox, config.membership_socket.as_deref())?;
         let next_job_id = artifacts.next_job_id()?;
         let (commands, receiver) = mpsc::channel(config.actor_capacity);
         let (events, event_receiver) = mpsc::channel(config.event_capacity);
@@ -3595,6 +3636,7 @@ impl WorkspaceSupervisor {
             workspace_volume: config.workspace_volume,
             credential_env_names: config.credential_env_names,
             group_ledger: config.group_ledger.map(super::job_groups::Recorder::new),
+            membership_socket: config.membership_socket,
             job_spans,
             inherited_groups: config.inherited_groups,
             term_grace: config.term_grace,
@@ -3604,6 +3646,7 @@ impl WorkspaceSupervisor {
             commands: receiver,
             events,
             event_receiver,
+            membership_changed: Arc::new(tokio::sync::Notify::new()),
             spawner,
             artifacts,
             commitments,
@@ -3705,6 +3748,18 @@ pub(super) enum Command {
         job_id: JobId,
         every: SampleInterval,
         reply: oneshot::Sender<Result<JobProcessStream>>,
+    },
+    #[cfg(target_os = "macos")]
+    SubtreeHandle {
+        peer: super::job_groups::Process,
+        reply: oneshot::Sender<Result<JobSubtreeAdmission>>,
+    },
+    #[cfg(target_os = "macos")]
+    RetireDescendants {
+        peer: super::job_groups::Process,
+        handle: JobSubtreeHandle,
+        grace: Duration,
+        reply: oneshot::Sender<Result<JobSubtreeRetirement>>,
     },
     TraceHealth {
         authority: WorkspaceAuthoritySnapshot,
@@ -4181,6 +4236,7 @@ struct JobStateRecord {
     info: JobInfo,
     started_at: Instant,
     process: Option<Box<dyn RunningProcess>>,
+    retirement: RetirementState,
     /// Admission owns membership even while the job is queued or its spawn was refused.
     #[cfg(target_os = "linux")]
     cgroup: Option<Arc<super::job_cgroup::JobCgroup>>,
@@ -4233,6 +4289,14 @@ struct JobStateRecord {
     cpu: CpuStanding,
     /// Why the job failed before any status of its own could say, when it did.
     failure: Option<JobFailure>,
+}
+
+/// Process, volume and CPU claims remain held through draining and every refusal.
+enum RetirementState {
+    Unstarted,
+    Draining,
+    Ended,
+    Refused(CowshedError),
 }
 
 /// The complete authored environment's identity, before session or activation overlays. Values
@@ -4386,6 +4450,7 @@ fn process_observation_unavailable(job_id: JobId) -> CowshedError {
 struct SupervisorActor {
     authority: WorkspaceAuthoritySnapshot,
     group_ledger: Option<super::job_groups::Recorder>,
+    membership_socket: Option<PathBuf>,
     /// See [`WorkspaceSupervisorConfig::telemetry_root`].
     job_spans: Option<JobSpanPublisher>,
     inherited_groups: Vec<super::job_groups::UnresolvedGroup>,
@@ -4407,6 +4472,7 @@ struct SupervisorActor {
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<ProcessEvent>,
     event_receiver: mpsc::Receiver<ProcessEvent>,
+    membership_changed: Arc<tokio::sync::Notify>,
     spawner: Box<dyn SpawnSink>,
     artifacts: Box<dyn ArtifactSink>,
     commitments: Box<dyn CommitmentSink>,
@@ -4439,37 +4505,228 @@ struct SupervisorActor {
     admissions: tokio::task::JoinSet<(JobId, Result<JobCpuGrant>)>,
 }
 
-/// The actor's run loop ends only once every job is terminal, so an actor dropped with a job still
-/// running was torn down with the runtime that hosts it. No later controller knows that job: it
-/// would run on unobserved and uncancellable, so its process tree ends here with its record.
-///
-/// It ends by the protocol every kill follows — SIGTERM, the term grace, then SIGKILL — so a job
-/// that stops its own children on SIGTERM (Nx's task runner stops task trees it keeps in their
-/// own sessions, beyond this group) gets to. Nothing runs after a drop, so the grace is waited out
-/// here, blocking, and only when a job was still running. A host that wants its jobs' cleanup to
-/// be asynchronous cancels them before it drops the runtime. The leaders are released only after
-/// the last signal, when the job handles drop with the actor: releasing first would free a
-/// leader's id and leave nothing to prove the group the job's. Any failure to signal is reported,
-/// because the job then outlives its supervisor.
+/// Runtime teardown transfers the same jobs to one retirement worker. The actor joins for a
+/// bounded interval; the worker retains the actual parents and resource claims through native
+/// retirement. A refusal stays in the existing ledger for recovery, never a terminal record.
 impl Drop for SupervisorActor {
     fn drop(&mut self) {
-        let grace = self.term_grace;
-        let mut running = self
-            .jobs
-            .iter_mut()
-            .filter(|(_, job)| !job.terminal())
-            .filter_map(|(id, job)| job.process.as_mut().map(|process| (*id, process)))
-            .collect::<Vec<_>>();
-        if running.is_empty() {
+        if self.jobs.values().all(JobStateRecord::terminal) {
             return;
         }
-        for (id, process) in &mut running {
+        self.record_groups();
+        let jobs = std::mem::take(&mut self.jobs);
+        #[cfg(target_os = "macos")]
+        let observed: Vec<_> = jobs
+            .iter()
+            .filter_map(|(id, job)| job.monitor.as_ref().map(|monitor| (*id, monitor.clone())))
+            .collect();
+        #[cfg(target_os = "linux")]
+        let contained: Vec<_> = jobs
+            .iter()
+            .filter_map(|(id, job)| job.cgroup.as_ref().map(|cgroup| (*id, Arc::clone(cgroup))))
+            .collect();
+        let report_retained = || {
+            #[cfg(target_os = "macos")]
+            for (id, monitor) in &observed {
+                cowshed_os::eprintln!(
+                    "cowshed: retained job {} observed lives {:?}",
+                    id.get(),
+                    monitor.running_lives()
+                );
+            }
+            #[cfg(target_os = "linux")]
+            for (id, cgroup) in &contained {
+                cowshed_os::eprintln!(
+                    "cowshed: retained job {} cgroup {:?} at {}",
+                    id.get(),
+                    cgroup.identity(),
+                    cgroup.path().display()
+                );
+            }
+        };
+        let ledger = self.group_ledger.take();
+        let inherited = std::mem::take(&mut self.inherited_groups);
+        let grace = self.term_grace;
+        let bound = grace
+            .saturating_add(grace.max(Duration::from_secs(1)).saturating_mul(2))
+            .saturating_add(Duration::from_secs(1));
+        let held = Arc::new(std::sync::Mutex::new(Some((jobs, ledger, inherited))));
+        let worker = held.clone();
+        let (done, joined) = std::sync::mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("cowshed-retire-jobs".into())
+            .spawn(move || {
+                let (jobs, ledger, inherited) = worker
+                    .lock()
+                    .expect("retirement handoff mutex poisoned")
+                    .take()
+                    .expect("one retirement worker");
+                let result = retire_dropped_jobs(jobs, ledger.as_ref(), inherited, grace);
+                let _ = done.send(result);
+            }) {
+            Ok(_worker) => match joined.recv_timeout(bound) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => cowshed_os::eprintln!(
+                    "cowshed: supervisor drop left unproven job membership in its ledger: {error}"
+                ),
+                Err(error) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: supervisor drop could not join membership retirement within {bound:?}: {error}; the retirement worker retains the jobs and their ledger claims"
+                    );
+                    report_retained();
+                }
+            },
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: cannot start membership retirement during supervisor drop: {error}; retaining native claims and the ownership ledger"
+                );
+                report_retained();
+                // No worker took the claims. Releasing their parent handles here would turn an
+                // allocation failure into permission to release unproven membership.
+                std::mem::forget(
+                    held.lock()
+                        .expect("retirement handoff mutex poisoned")
+                        .take(),
+                );
+            }
+        }
+    }
+}
+
+/// Publish every job whose group may still run, with the lives its observation holds outside the
+/// group: borrowed from the jobs and their published observations, never collected first.
+fn record_job_groups(
+    recorder: &super::job_groups::Recorder,
+    jobs: &BTreeMap<JobId, JobStateRecord>,
+    inherited: &[super::job_groups::UnresolvedGroup],
+) -> std::io::Result<super::job_groups::Recorded> {
+    let groups = jobs
+        .iter()
+        // A job sealed after a wait failure may have left its group running: nothing saw it
+        // end, so the ledger keeps it for whoever finds this supervisor gone.
+        .filter(|(_, job)| !job.sealed() || job.wait_failure.is_some())
+        .filter_map(|(job_id, job)| {
+            let leader = job.birth.as_ref()?.leader()?;
+            #[cfg(target_os = "macos")]
+            let members = job.monitor.as_ref().map(ProcessMonitor::running_lives);
+            #[cfg(not(target_os = "macos"))]
+            let members = None;
+            Some(super::job_groups::JobGroupClaim {
+                job_id: job_id.get(),
+                leader,
+                members,
+            })
+        });
+    recorder.record(groups, inherited)
+}
+
+/// The sole ledger writer after actor teardown. No process is released before either native
+/// exit proof or a successful durable handoff of its refreshed observed membership.
+fn retire_dropped_jobs(
+    mut jobs: BTreeMap<JobId, JobStateRecord>,
+    ledger: Option<&super::job_groups::Recorder>,
+    inherited: Vec<super::job_groups::UnresolvedGroup>,
+    grace: Duration,
+) -> std::io::Result<()> {
+    let mut refused: Vec<String> = Vec::new();
+    let mut non_native = Vec::new();
+    let ids: Vec<_> = jobs.keys().copied().collect();
+    for id in ids {
+        let job = jobs.get(&id).expect("the retained job exists");
+        if job.terminal() {
+            jobs.remove(&id);
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(cgroup) = &job.cgroup {
+            let retired = cgroup.retire(grace).and_then(|_| cgroup.finish());
+            match retired {
+                Ok(_) => {
+                    jobs.remove(&id);
+                }
+                Err(error) => {
+                    cowshed_os::eprintln!(
+                        "cowshed: job {} membership remains unproven during supervisor drop: {error}; retained cgroup {:?} at {}",
+                        id.get(),
+                        cgroup.identity(),
+                        cgroup.path().display()
+                    );
+                    refused.push(format!(
+                        "job {}: {error} (cgroup {:?} at {})",
+                        id.get(),
+                        cgroup.identity(),
+                        cgroup.path().display()
+                    ));
+                }
+            }
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        if let (Some(monitor), Some(birth)) = (&job.monitor, &job.birth) {
+            match monitor.retire(birth.clone(), grace) {
+                Ok(_) => {
+                    jobs.remove(&id);
+                }
+                Err(error) => {
+                    let lives = monitor.running_lives();
+                    cowshed_os::eprintln!(
+                        "cowshed: job {} membership remains unproven during supervisor drop: {}; retained lives {lives:?}",
+                        id.get(),
+                        error.message
+                    );
+                    refused.push(format!(
+                        "job {}: {} (lives {lives:?})",
+                        id.get(),
+                        error.message
+                    ));
+                }
+            }
+            continue;
+        }
+        non_native.push(id);
+    }
+    for id in &non_native {
+        if let Some(process) = jobs.get_mut(id).and_then(|job| job.process.as_mut()) {
             report_unsignalled(*id, process.signal_process_tree(ProcessSignal::Term));
         }
+    }
+    if !non_native.is_empty() {
         std::thread::sleep(grace);
-        for (id, process) in &mut running {
-            report_unsignalled(*id, process.signal_process_tree(ProcessSignal::Kill));
+    }
+    for id in non_native {
+        if let Some(process) = jobs.get_mut(&id).and_then(|job| job.process.as_mut()) {
+            report_unsignalled(id, process.signal_process_tree(ProcessSignal::Kill));
         }
+    }
+    if let Some(recorder) = ledger {
+        match record_job_groups(recorder, &jobs, &inherited) {
+            Ok(recorded) => {
+                for error in recorded.uninspected {
+                    cowshed_os::eprintln!(
+                        "cowshed: inherited membership remains uninspected during supervisor drop: {error}"
+                    );
+                }
+            }
+            Err(error) => {
+                cowshed_os::eprintln!(
+                    "cowshed: cannot hand unproven membership to {}: {error}; native claims remain held",
+                    recorder.path().display()
+                );
+                std::mem::forget(jobs);
+                return Err(error);
+            }
+        }
+    } else if !refused.is_empty() {
+        std::mem::forget(jobs);
+        return Err(std::io::Error::other(format!(
+            "no ownership ledger can receive unproven membership: {}",
+            refused.join("; ")
+        )));
+    }
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(refused.join("; ")))
     }
 }
 
@@ -4503,6 +4760,7 @@ impl SupervisorActor {
                         },
                     }
                 }
+                _ = self.membership_changed.notified() => self.record_groups(),
                 event = self.event_receiver.recv() => {
                     match event {
                         Some(event) => self.handle_event(event),
@@ -4740,6 +4998,83 @@ impl SupervisorActor {
                     .and_then(sample_job);
                 let _ = reply.send(result);
             }
+            #[cfg(target_os = "macos")]
+            Command::SubtreeHandle { peer, reply } => {
+                let monitors: Vec<_> = self
+                    .jobs
+                    .values()
+                    .filter(|job| !job.terminal())
+                    .filter_map(|job| job.monitor.clone())
+                    .collect();
+                tokio::task::spawn_blocking(move || {
+                    let outcome = (|| {
+                        let Some(peer) = membership_peer(&peer)? else {
+                            return Ok(JobSubtreeAdmission::Refused {
+                                reason: JobSubtreeRefusal::NotMember,
+                            });
+                        };
+                        for monitor in monitors {
+                            match monitor.subtree_handle(peer)? {
+                                admitted @ JobSubtreeAdmission::Admitted { .. } => {
+                                    return Ok(admitted);
+                                }
+                                JobSubtreeAdmission::Refused {
+                                    reason: JobSubtreeRefusal::NotMember,
+                                } => {}
+                                refused => return Ok(refused),
+                            }
+                        }
+                        Ok(JobSubtreeAdmission::Refused {
+                            reason: JobSubtreeRefusal::NotMember,
+                        })
+                    })();
+                    let _ = reply.send(outcome);
+                });
+            }
+            #[cfg(target_os = "macos")]
+            Command::RetireDescendants {
+                peer,
+                handle,
+                grace,
+                reply,
+            } => {
+                // A child may shorten, but never extend, its owner's termination bound.
+                let grace = grace.min(self.term_grace);
+                let Some(job) = self.jobs.get(&handle.job_id) else {
+                    let _ = reply.send(Ok(JobSubtreeRetirement::Refused {
+                        reason: JobSubtreeRefusal::ForeignHandle,
+                    }));
+                    return;
+                };
+                if job.terminal() {
+                    let _ = reply.send(Ok(JobSubtreeRetirement::Refused {
+                        reason: JobSubtreeRefusal::JobEnded,
+                    }));
+                    return;
+                }
+                let Some(monitor) = job.monitor.clone() else {
+                    let _ = reply.send(Ok(JobSubtreeRetirement::Refused {
+                        reason: JobSubtreeRefusal::FoldUnavailable,
+                    }));
+                    return;
+                };
+                tokio::task::spawn_blocking(move || {
+                    let outcome = (|| {
+                        let Some(peer) = membership_peer(&peer)? else {
+                            return Ok(JobSubtreeRetirement::Refused {
+                                reason: JobSubtreeRefusal::NotMember,
+                            });
+                        };
+                        if !monitor.owns_live(peer)? {
+                            return Ok(JobSubtreeRetirement::Refused {
+                                reason: JobSubtreeRefusal::NotMember,
+                            });
+                        }
+                        monitor.retire_subtree(handle, grace)
+                    })();
+                    let _ = reply.send(outcome);
+                });
+            }
             Command::Processes {
                 authority,
                 job_id,
@@ -4878,6 +5213,14 @@ impl SupervisorActor {
                     let _ = reply.send(Err(error));
                 } else if self.lifecycle == ActorLifecycle::Retired {
                     let _ = reply.send(Ok(()));
+                } else if let Some(error) = self.jobs.values().find_map(|job| {
+                    if let RetirementState::Refused(error) = &job.retirement {
+                        Some(error.clone())
+                    } else {
+                        None
+                    }
+                }) {
+                    let _ = reply.send(Err(error));
                 } else {
                     self.close_admission();
                     self.quiesce_waiters.push(reply);
@@ -4968,15 +5311,7 @@ impl SupervisorActor {
         let Some(path) = &self.group_ledger else {
             return;
         };
-
-        let groups = self
-            .jobs
-            .iter()
-            // A job sealed after a wait failure may have left its group running: nothing saw it
-            // end, so the ledger keeps it for whoever finds this supervisor gone.
-            .filter(|(_, job)| !job.sealed() || job.wait_failure.is_some())
-            .filter_map(|(job_id, job)| Some((job_id.get(), job.birth.as_ref()?.leader()?)));
-        match path.record(groups, &self.inherited_groups) {
+        match record_job_groups(path, &self.jobs, &self.inherited_groups) {
             Ok(recorded) => {
                 for error in &recorded.uninspected {
                     cowshed_os::eprintln!(
@@ -5034,7 +5369,7 @@ impl SupervisorActor {
             ));
         }
         // Rendered here, once for the new authority; every job admitted under it shares it.
-        let policy = SandboxPolicy::render(sandbox)?;
+        let policy = job_sandbox_policy(sandbox, self.membership_socket.as_deref())?;
         if authority != self.authority {
             self.sessions.clear();
             self.named_sessions.clear();
@@ -5538,6 +5873,20 @@ impl SupervisorActor {
         // in the caller's environment would hand the workspace the very bytes the host kept out
         // of it, so it is dropped here — at the one place every job's environment is settled.
         merged_env.retain(|name, _| !self.credential_env_names.contains(name));
+        // Callers cannot redirect a job's capability requests to another endpoint.
+        merged_env.remove(super::supervisor_socket::MEMBERSHIP_SOCKET_ENV);
+        if let Some(socket) = &self.membership_socket {
+            let socket = socket.to_str().ok_or_else(|| {
+                CowshedError::integrity(
+                    "membership endpoint path is not UTF-8",
+                    "use a UTF-8 controller store path",
+                )
+            })?;
+            merged_env.insert(
+                super::supervisor_socket::MEMBERSHIP_SOCKET_ENV.to_owned(),
+                socket.to_owned(),
+            );
+        }
         if let Some(marker) = &install_observation {
             merged_env.insert(
                 crate::developer_links::INSTALL_OBSERVED_ENV.to_owned(),
@@ -5627,6 +5976,9 @@ impl SupervisorActor {
             scope: scheduling.scope(),
             nice: None,
             cpu_tokens: None,
+            containment: None,
+            outlived: Vec::new(),
+            outlived_incomplete: false,
         };
         // The admission's own view of the volumes, for a job that ends before it spawns; the
         // spawn reads them again immediately before the first process is dispatched.
@@ -5690,6 +6042,7 @@ impl SupervisorActor {
             info,
             started_at: Instant::now(),
             process: None,
+            retirement: RetirementState::Unstarted,
             #[cfg(target_os = "linux")]
             cgroup,
             stdout: VecDeque::new(),
@@ -5852,6 +6205,14 @@ impl SupervisorActor {
         #[cfg(target_os = "macos")]
         {
             job.monitor = process.observations().cloned();
+            if let Some(monitor) = &job.monitor
+                && let Err(error) = monitor.ledger_changes(self.membership_changed.clone())
+            {
+                cowshed_os::eprintln!(
+                    "cowshed: cannot observe job {} membership for its ledger: {error}",
+                    job_id.get()
+                );
+            }
             if let (Some(monitor), Some(publisher)) = (&job.monitor, &self.job_spans)
                 && let Err(error) = monitor.trace(publisher.clone(), &job.info)
             {
@@ -6320,6 +6681,8 @@ impl SupervisorActor {
         };
         if job.terminal() {
             let _ = reply.send(job.terminal_outcome());
+        } else if let RetirementState::Refused(error) = &job.retirement {
+            let _ = reply.send(Err(error.clone()));
         } else {
             job.waiters.push(reply);
         }
@@ -6514,6 +6877,40 @@ impl SupervisorActor {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.exit = Some(exit);
                     end_job_stdin(job);
+                }
+                // A descendant may still hold stdout/stderr open. Drain at leader exit, not
+                // after EOF; sealing still waits for both streams and membership proof.
+                self.retire_membership(job_id);
+            }
+            ProcessEvent::Retired { job_id, retirement } => {
+                let Some(job) = self.jobs.get_mut(&job_id) else {
+                    return;
+                };
+                if !matches!(job.retirement, RetirementState::Draining) {
+                    return;
+                }
+                let retirement = retirement.and_then(|receipt| {
+                    if job.info.pid.is_none()
+                        && (!receipt.outlived.is_empty() || receipt.outlived_incomplete)
+                    {
+                        Err(CowshedError::integrity(
+                            "membership retirement ended processes without an admitted child birth",
+                            "retain the job claim and inspect the native spawn handshake",
+                        ))
+                    } else {
+                        Ok(receipt)
+                    }
+                });
+                match retirement {
+                    Ok(receipt) => {
+                        if job.info.pid.is_some() {
+                            job.info.containment = Some(receipt.containment);
+                            job.info.outlived = receipt.outlived;
+                            job.info.outlived_incomplete = receipt.outlived_incomplete;
+                        }
+                        job.retirement = RetirementState::Ended;
+                    }
+                    Err(error) => self.refuse_membership(job_id, error),
                 }
             }
             ProcessEvent::WaitFailed { job_id, error } => {
@@ -6757,12 +7154,13 @@ impl SupervisorActor {
         if job.terminal() {
             return Ok(());
         }
+        // Only an explicit cancellation or retirement retries a refused native operation.
+        if matches!(job.retirement, RetirementState::Refused(_)) {
+            job.retirement = RetirementState::Unstarted;
+        }
         let initiate = job.kill_reason.is_none();
         if initiate || reason == KillReason::OutputLimit {
             job.kill_reason = Some(reason);
-        }
-        if !initiate {
-            return Ok(());
         }
         // A job still waiting for its CPU grant has nothing to signal: withdrawing its request
         // leaves the gateway's queue, and the job ends without a command.
@@ -6777,6 +7175,21 @@ impl SupervisorActor {
             end_job_stdin(job);
             return Ok(());
         }
+        #[cfg(target_os = "linux")]
+        if job.cgroup.is_some() {
+            self.retire_membership(job_id);
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        if job.monitor.is_some() && job.birth.is_some() {
+            // Retirement takes the membership snapshot before sending a signal, so a process
+            // ended by cancellation cannot disappear from the job's outlived receipt.
+            self.retire_membership(job_id);
+            return Ok(());
+        }
+        if !initiate {
+            return Ok(());
+        }
         if let Some(process) = job.process.as_mut() {
             process.signal_process_tree(ProcessSignal::Term)?;
         }
@@ -6787,6 +7200,100 @@ impl SupervisorActor {
         Ok(())
     }
 
+    /// Retire membership off the actor while retaining the actual parent's handle, unreaped
+    /// leader and all resource claims. Resident jobs use this same boundary when their own
+    /// foreground leader ends; another job's terminal never ends the resident.
+    fn retire_membership(&mut self, job_id: JobId) -> bool {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return false;
+        };
+        match &job.retirement {
+            RetirementState::Ended => return true,
+            RetirementState::Draining | RetirementState::Refused(_) => return false,
+            RetirementState::Unstarted => {}
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(cgroup) = &job.cgroup {
+            let cgroup = Arc::clone(cgroup);
+            let grace = self.term_grace;
+            let events = self.events.clone();
+            job.retirement = RetirementState::Draining;
+            if job.info.pid.is_some() {
+                job.info.state = JobState::Draining;
+            }
+            tokio::spawn(async move {
+                let retirement = tokio::task::spawn_blocking(move || {
+                    let members = cgroup.retire(grace).map_err(cgroup_error)?;
+                    Ok(JobProcessRetirement {
+                        containment: crate::api::process::JobContainment::Kernel,
+                        outlived: members
+                            .members
+                            .iter()
+                            .map(|member| crate::api::process::OutlivedProcess {
+                                index: None,
+                                pid: member.pid,
+                                image: member.image.clone(),
+                                signal: member.signal,
+                            })
+                            .collect(),
+                        outlived_incomplete: members.metadata_gap,
+                    })
+                })
+                .await
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
+                let _ = events
+                    .send(ProcessEvent::Retired { job_id, retirement })
+                    .await;
+            });
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        if let (Some(monitor), Some(birth)) = (&job.monitor, &job.birth) {
+            let monitor = monitor.clone();
+            let birth = birth.clone();
+            let grace = self.term_grace;
+            let events = self.events.clone();
+            job.retirement = RetirementState::Draining;
+            job.info.state = JobState::Draining;
+            tokio::spawn(async move {
+                let retirement = tokio::task::spawn_blocking(move || monitor.retire(birth, grace))
+                    .await
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
+                let _ = events
+                    .send(ProcessEvent::Retired { job_id, retirement })
+                    .await;
+            });
+            return false;
+        }
+        // A refused start owns no membership. Non-native SpawnSinks supply their own process
+        // lifecycle; neither case invents a native containment receipt.
+        job.retirement = RetirementState::Ended;
+        true
+    }
+
+    fn refuse_membership(&mut self, job_id: JobId, error: CowshedError) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        cowshed_os::eprintln!(
+            "cowshed: job {} membership retirement refused; process and volume claims retained: {}",
+            job_id.get(),
+            error.message
+        );
+        for waiter in job.waiters.drain(..) {
+            let _ = waiter.send(Err(error.clone()));
+        }
+        for waiter in job.kill_waiters.drain(..) {
+            let _ = waiter.send(Err(error.clone()));
+        }
+        for waiter in self.retire_waiters.drain(..) {
+            let _ = waiter.send(Err(error.clone()));
+        }
+        for waiter in self.quiesce_waiters.drain(..) {
+            let _ = waiter.send(Err(error.clone()));
+        }
+        job.retirement = RetirementState::Refused(error);
+    }
     async fn finish_ready_jobs(&mut self) {
         let ready = self
             .jobs
@@ -6808,6 +7315,9 @@ impl SupervisorActor {
     }
 
     async fn finalize_job(&mut self, job_id: JobId, forced_state: Option<JobState>) {
+        if !self.retire_membership(job_id) {
+            return;
+        }
         let (links, observation) = match self.jobs.get_mut(&job_id) {
             Some(job) if !job.terminal() => (
                 std::mem::take(&mut job.developer_links),
@@ -6927,6 +7437,16 @@ impl SupervisorActor {
                 job.monitor.as_ref(),
             )
         });
+        #[cfg(target_os = "linux")]
+        if let Some(cgroup) = &job.cgroup {
+            // Final accounting precedes removing the hierarchy. A refused finish retains all
+            // claims and remains nonterminal; only an explicit request retries retirement.
+            if let Err(error) = cgroup.finish() {
+                self.refuse_membership(job_id, cgroup_error(error));
+                return;
+            }
+            job.cgroup = None;
+        }
         // State the terminal sample while the admitted build volume is still held. A missing
         // sample stays absent: no fresh boundary read invents host or volume facts for it.
         if let Some(job_spans) = &self.job_spans {
@@ -6946,6 +7466,9 @@ impl SupervisorActor {
             failure,
             cpu_tokens: job.info.cpu_tokens,
             nice: job.info.nice,
+            containment: job.info.containment.clone(),
+            outlived: job.info.outlived.clone(),
+            outlived_incomplete: job.info.outlived_incomplete,
         };
         let seal_span = cowshed_os::timing::span("seal", "record");
         let sealed = self.artifacts.seal(
@@ -6955,10 +7478,9 @@ impl SupervisorActor {
             job.stderr_copy.take(),
         );
         drop(seal_span);
-        // The child's end is a fact whatever becomes of its record, so the job concludes on
-        // every path below and every waiter is answered. A job left running after its artifact
-        // was consumed has nobody to finish it: later waits and kills queue forever and
-        // retirement never sees the workspace idle.
+        // The membership and direct child have ended whatever becomes of their record, so the
+        // job concludes on every path below and every waiter is answered. The claim was held
+        // through the native proof, not merely through a successful artifact write.
         let conclusion = match sealed {
             Ok(seal) => {
                 let commitment = cowshed_os::timing::spanned(
@@ -9338,6 +9860,7 @@ mod lifecycle_commitment_tests {
             shell_host: None,
             shell_pool: defaults.shell_pool,
             group_ledger: None,
+            membership_socket: None,
             telemetry_root: None,
             inherited_groups: Vec::new(),
             volume_labels: None,
@@ -10502,4 +11025,39 @@ mod install_observation_tests {
             error.message
         );
     }
+}
+
+/// Both initial admission and grant advance add exactly the controller's narrow endpoint.
+fn job_sandbox_policy(
+    mut sandbox: SandboxConfig,
+    membership_socket: Option<&Path>,
+) -> Result<SandboxPolicy> {
+    if let Some(socket) = membership_socket
+        && !sandbox
+            .allowed_unix_sockets
+            .iter()
+            .any(|allowed| allowed == socket)
+    {
+        sandbox.allowed_unix_sockets.push(socket.to_owned());
+    }
+    SandboxPolicy::render(sandbox)
+}
+
+#[cfg(target_os = "macos")]
+fn membership_peer(
+    peer: &super::job_groups::Process,
+) -> Result<Option<super::process_tree::ProcessIdentity>> {
+    peer.record()
+        .map(|record| {
+            record.map(|record| super::process_tree::ProcessIdentity {
+                pid: record.pid,
+                birth: super::process_tree::BirthToken(record.unique_id),
+            })
+        })
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot authenticate membership endpoint peer: {error}"),
+                "retain the subtree claim and retry while the requesting process is alive",
+            )
+        })
 }

@@ -1273,6 +1273,18 @@ export type JobAccounting =
     });
 
 /**
+ * What held a job's process membership while its retirement proved the membership empty, which
+ * fixes how far that proof reaches. A job states one only when an owner that held its
+ * membership retired it: a job that never spawned, or that ran under a spawn sink with no
+ * native membership, states none rather than a proof it lacks.
+ */
+export type JobContainment =
+  | { readonly kind: 'kernel' }
+  | ({ readonly kind: 'observed' } & {
+      readonly lost: ReadonlyArray<ProcessCoverageGap>;
+    });
+
+/**
  * Why a job failed when no command's own status explains it.
  */
 export type JobFailure = 'scriptSyntax' | 'supervisorLost' | 'cpuAdmission' | 'priority';
@@ -1303,6 +1315,9 @@ export type JobInfoRef = {
   readonly scope: ExecScope;
   readonly nice?: number & tags.Type<'int32'>;
   readonly cpuTokens?: number & tags.Type<'uint64'> & tags.Minimum<1>;
+  readonly containment?: JobContainment;
+  readonly outlived?: ReadonlyArray<OutlivedProcess>;
+  readonly outlivedIncomplete?: boolean;
 } & (
   | { readonly argv: ReadonlyArray<CommandArg>; readonly script?: never }
   | { readonly script: ScriptCommand; readonly argv?: never }
@@ -1403,6 +1418,21 @@ export type JobProcessLeaf = {
    * Whether that argv was cut to its bounds, as a process sample's says.
    */
   readonly truncated: boolean;
+};
+
+/**
+ * What retiring process membership proved: what held it and the live members it signalled,
+ * including a live leader or subtree root. Empty `outlived` means no process was ended only
+ * when `outlived_incomplete` is false. Kernel-proven empty membership does not prove exhaustive
+ * metadata: an atomic kill can end members no identity-fenced read named.
+ */
+export type JobProcessRetirement = {
+  readonly containment: JobContainment;
+  readonly outlived: ReadonlyArray<OutlivedProcess>;
+  /**
+   * Retirement may have ended members absent from `outlived`; never a weaker emptiness proof.
+   */
+  readonly outlivedIncomplete?: boolean;
 };
 
 /**
@@ -1542,7 +1572,7 @@ export type JobResourceSample = {
   readonly stderr: JobStreamWatermark;
 };
 
-export type JobState = 'queued' | 'running' | 'exited' | 'signaled' | 'killed' | 'outputLimit' | 'failed';
+export type JobState = 'queued' | 'running' | 'draining' | 'exited' | 'signaled' | 'killed' | 'outputLimit' | 'failed';
 
 /**
  * Which captured stream a log read walks.
@@ -1557,6 +1587,40 @@ export type JobStreamWatermark = {
   readonly bytes: StreamBytes;
   readonly lines: StreamLines;
 };
+
+export type JobSubtreeAdmission =
+  | ({ readonly kind: 'admitted' } & {
+      readonly handle: JobSubtreeHandle;
+    })
+  | ({ readonly kind: 'refused' } & {
+      readonly reason: JobSubtreeRefusal;
+    });
+
+/**
+ * An opaque reference to one retained process life in one monitor. Neither its pid nor a client
+ * birth identity is authority: the monitor authenticates the live peer before issuing this.
+ */
+export type JobSubtreeHandle = {
+  readonly jobId: JobId;
+  readonly index: number & tags.Type<'uint32'>;
+  /**
+   * A random 32-lower-hex nonce issued for this retained root, not a process birth identity.
+   */
+  readonly incarnation: string;
+};
+
+/**
+ * Why a monitor cannot admit or retire this subtree; native operational errors remain errors.
+ */
+export type JobSubtreeRefusal = 'foldUnavailable' | 'notMember' | 'foreignHandle' | 'spentHandle' | 'jobEnded';
+
+export type JobSubtreeRetirement =
+  | ({ readonly kind: 'retired' } & {
+      readonly retirement: JobProcessRetirement;
+    })
+  | ({ readonly kind: 'refused' } & {
+      readonly reason: JobSubtreeRefusal;
+    });
 
 /**
  * A bounded raw slice of each stream and the cursor that continues after it. A slice after a
@@ -1886,6 +1950,33 @@ export type OtherBuild = {
    * The build the request named; `None` for a request that named none.
    */
   readonly caller?: BuildId;
+};
+
+/**
+ * A live member retirement signalled before proving its scoped membership empty. This includes
+ * a live leader on cancellation or a live subtree root; a member already ended is not signalled.
+ * A successful receipt names processes already ended, never survivors left running.
+ */
+export type OutlivedProcess = {
+  /**
+   * Its position in [`JobProcessTree::processes`] when the hold retained its life. Absent
+   * means the hold could not say (a cgroup keeps no birth order): unknown, never "no index".
+   */
+  readonly index?: number & tags.Type<'uint32'>;
+  /**
+   * Its pid when retirement signalled it: display only, as [`JobProcessSample::pid`].
+   */
+  readonly pid: number & tags.Type<'uint32'>;
+  /**
+   * The executable it last ran, when an identity-fenced read named it. Absent when no read
+   * could (it exited first, or the kernel refused the read): never an empty or guessed
+   * program.
+   */
+  readonly image?: string;
+  /**
+   * The last signal retirement delivered to it.
+   */
+  readonly signal: number & tags.Type<'int32'>;
 };
 
 export type OutputLimitInfo = {
@@ -2553,36 +2644,25 @@ export type ScriptValue = { readonly word: string } | { readonly words: Readonly
  * which [`JobInfo`], whose start, cwd, trace and stdin only the running supervisor knew, cannot
  * describe once that supervisor is gone.
  */
-export type SealedJob = {
+export type SealedJob = SealedJobRef;
+
+export type SealedJobRef = {
   readonly jobId: JobId;
   readonly state: JobState;
   readonly exit: ExitStatus | null;
   readonly failure: JobFailure | null;
   readonly durationMs: (number & tags.Type<'uint64'>) | null;
-  /**
-   * The job's terminal resource sample, exactly as its last [`JobInfo::resources`]; absent
-   * for a job that never owned a process.
-   */
   readonly resources?: JobResourceSample;
   readonly outputLimit: OutputLimitInfo | null;
   readonly stdout: StreamInfo;
   readonly stderr: StreamInfo;
-  /**
-   * The class the job was admitted under, as JobInfo.class.
-   */
   readonly class: ExecClass;
-  /**
-   * Where the job's command ran, as JobInfo.scope.
-   */
   readonly scope: ExecScope;
-  /**
-   * The nice the job's command was observed at, as JobInfo.nice.
-   */
   readonly nice?: number & tags.Type<'int32'>;
-  /**
-   * The CPU tokens the job's grant held, as JobInfo.cpu_tokens.
-   */
   readonly cpuTokens?: number & tags.Type<'uint64'> & tags.Minimum<1>;
+  readonly containment?: JobContainment;
+  readonly outlived?: ReadonlyArray<OutlivedProcess>;
+  readonly outlivedIncomplete?: boolean;
 };
 
 export type SessionRequest = {

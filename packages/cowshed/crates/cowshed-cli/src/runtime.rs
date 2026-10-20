@@ -250,6 +250,8 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Gateway(_)
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
+        | Command::SubtreeRoot(_)
+        | Command::RetireDescendants(_)
         | Command::Controller
         | Command::Credential(_)
         | Command::Identity(_)
@@ -315,6 +317,8 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Gateway(_)
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
+        | Command::SubtreeRoot(_)
+        | Command::RetireDescendants(_)
         | Command::Controller
         | Command::Credential(_)
         | Command::Identity(_)
@@ -421,6 +425,8 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::Gateway(_)
         | Command::DiskCommand(_)
         | Command::LandTurn(_)
+        | Command::SubtreeRoot(_)
+        | Command::RetireDescendants(_)
         | Command::Controller
         | Command::Sccache(_)
         | Command::Skill(_)
@@ -2161,6 +2167,9 @@ where
         )),
         Command::LandTurn(_) => Err(CowshedError::internal(
             "land-turn names no project and is dispatched before the runtime bridge",
+        )),
+        Command::SubtreeRoot(_) | Command::RetireDescendants(_) => Err(CowshedError::internal(
+            "subtree commands use the native supervisor socket before the runtime bridge",
         )),
         Command::Controller => Err(CowshedError::internal(
             "the controller verb serves its own connection and is dispatched before the runtime bridge",

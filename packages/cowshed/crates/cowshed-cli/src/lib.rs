@@ -23,6 +23,7 @@ pub mod run;
 pub mod runtime;
 pub mod setup_service;
 pub mod skill;
+mod subtree;
 pub mod workspace_supervisor;
 
 #[cfg(test)]

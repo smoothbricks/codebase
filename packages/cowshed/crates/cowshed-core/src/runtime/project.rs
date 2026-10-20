@@ -8398,6 +8398,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // use: a spare activated ahead of demand is the next command's warm shell.
             shell_pool: super::shell_pool::ShellPoolConfig::default(),
             group_ledger: Some(super::job_groups::ledger_path(&socket)),
+            membership_socket: Some(super::supervisor_socket::membership_socket_path(&socket)),
             // Each job's span is sealed beside the controller's commitments.
             telemetry_root: Some(self.telemetry_root.clone()),
             // Filled from the lost predecessor's ledger once this process holds the socket.
@@ -20809,7 +20810,10 @@ mod unresolved_retirement_tests {
             .unwrap();
         let birth = super::super::job_groups::GroupLeader::observe(child.id()).unwrap();
         super::super::job_groups::Recorder::new(ledger.clone())
-            .record([(9, birth)].into_iter(), &[])
+            .record(
+                [super::super::job_groups::JobGroupClaim::group(9, birth)].into_iter(),
+                &[],
+            )
             .unwrap();
         let mut release = child.stdin.take().unwrap();
         let mut output = std::io::BufReader::new(child.stdout.take().unwrap());

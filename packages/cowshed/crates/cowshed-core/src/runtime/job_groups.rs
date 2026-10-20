@@ -1,31 +1,31 @@
-//! The process groups a served supervisor's running jobs lead, kept beside its socket so that
-//! whoever finds the supervisor gone can end them (11_shell.md "Supervisor recovery").
+//! A served supervisor's job groups and observed process lives, kept beside its socket so
+//! whoever finds the supervisor gone can retire them (11_shell.md "Supervisor recovery").
 //!
-//! The ledger is a complete snapshot, replaced whole (write a temporary, rename) each time a
-//! job's group starts or its job is sealed, so a reader never sees half a write. Each group
-//! carries its leader's birth time as the job's parent observed it before it could reap the
-//! leader ([`Birth`]), never observed again: a later observation could record a process that has
-//! since reused the pid.
+//! The ledger is a complete snapshot, replaced whole (write a temporary, rename) when a job
+//! starts, its observed membership changes, or it seals. Each group carries its leader's
+//! birth time as the job's parent observed it before reaping ([`Birth`]), never renewed from
+//! the pid. Observed lives carry their kernel identity and boot session separately.
 //!
-//! Whoever reads the ledger is not the parent of the processes it names, so it cannot stop them
-//! being reaped and their ids reused, and `killpg` on a recorded id could reach a stranger's group
-//! that took the id the instant after any check. So no group is signalled as a whole. The group's
-//! processes are read while the recorded leader -- running, or exited but not yet reaped -- is
-//! seen holding the group id both before and after: no process can be given the leader's pid
-//! while it exists, so no other group could have had the id meanwhile, and every process read was
-//! the job's. Each is then signalled through the identity the kernel never reissues -- its pid
-//! and that pid's version ([`Member`]) -- so a signal reaches that process or nothing. Once the
-//! leader is reaped nothing proves the processes still holding the id the job's: such a group is
-//! never signalled, and the ledger that names it is kept, and reported, until nothing holds the
-//! id.
+//! Recovery is not the parent and cannot prevent pid reuse. It therefore never signals a
+//! recorded group with killpg. Group discovery requires the recorded leader to hold the group
+//! id both before and after the read; each discovered member is signalled through its kernel
+//! pid version ([`Member`]). Once that leader is reaped, the group id alone proves no ownership:
+//! an unresolved group is retained and reported until its id is empty.
+//!
+//! Independently retained, boot-fenced process lives remain owned after setsid, reparenting,
+//! exec, or leader release. Recovery signals only a matching unique life, refreshing its pid
+//! version across exec without renewing its identity. Their exit proof is required before
+//! those claims leave the same ledger; a reused pid or a different boot grants no authority.
 
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::process_tree::ProcessIdentity;
 use crate::api::dto::ExitStatus;
 
 /// How often a group signalled with SIGKILL is read again for processes still running in it,
@@ -54,7 +54,7 @@ struct Ledger {
     unresolved: Vec<UnresolvedGroup>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Group {
     job_id: u64,
@@ -69,14 +69,46 @@ struct Group {
     /// processes. Only read, so their ledgers stay recoverable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     leader_birth: Option<u64>,
+    /// Boot-fenced observed lives remain ours after setsid, reparenting and leader release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    members: Option<RecordedMembers>,
 }
 
-/// A group a lost supervisor recorded whose leader was gone when a later supervisor took the
-/// workspace, while processes still held its id. They may be the job's surviving processes, or a
-/// stranger's group that took the id after the job's group had ended: nothing distinguishes the
-/// two, so the group is never signalled. It is not forgotten either -- every later ledger of the
-/// workspace carries it, and `doctor` reports it -- until nothing holds the id.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Observed Darwin identities are unique within one boot, never across a reboot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordedMembers {
+    boot_session: String,
+    lives: Vec<ProcessIdentity>,
+}
+
+/// One job's group and observed lives, written by the supervisor that already owns both. The
+/// lives are the job's published process observation, shared with it rather than copied.
+#[derive(Clone, Debug)]
+pub struct JobGroupClaim {
+    pub job_id: u64,
+    pub leader: GroupLeader,
+    /// `None` when nothing observes lives outside the group's proof.
+    pub members: Option<Arc<[ProcessIdentity]>>,
+}
+
+impl JobGroupClaim {
+    /// A claim on the group alone, with no observed lives.
+    pub fn group(job_id: u64, leader: GroupLeader) -> Self {
+        Self {
+            job_id,
+            leader,
+            members: None,
+        }
+    }
+}
+
+/// A recorded group whose vanished leader no longer proves ownership of its current members.
+/// The id could now name a stranger's group, so it is never signalled as a whole. Independently
+/// retained exact lives can still be retired under their own boot-fenced authority. Every later
+/// ledger carries the unresolved group, and doctor reports it, until its id and owned lives are
+/// empty.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UnresolvedGroup {
     /// The supervisor process that recorded the group and was lost.
@@ -109,7 +141,8 @@ impl UnresolvedGroup {
     /// Whether processes still hold the id. Anything else -- the id held by nobody, or led by a
     /// process that is not the recorded leader -- means the job's group has ended.
     fn still_held(&self) -> io::Result<bool> {
-        Ok(!matches!(ownership(&self.group)?, Ownership::NotOwned))
+        Ok(!matches!(ownership(&self.group)?, Ownership::NotOwned)
+            || recorded_members_alive(&self.group)?)
     }
 }
 
@@ -237,44 +270,54 @@ pub struct Recorded {
     pub uninspected: Vec<io::Error>,
 }
 
-/// The two paths of the supervisor's atomic group publication, prepared once when it starts.
-/// No group state is retained here: every publication borrows the actor's current records.
+/// The two paths of the supervisor's atomic group publication, prepared once when it starts,
+/// and the boot session its observed lives are fenced by, read once when the first is
+/// published. No group state is retained here: every publication borrows the actor's current
+/// claims.
 pub struct Recorder {
     path: PathBuf,
     temporary: PathBuf,
+    boot_session: OnceLock<String>,
 }
 
 impl Recorder {
     pub fn new(path: PathBuf) -> Self {
         let temporary = path.with_extension(format!("groups.{}", std::process::id()));
-        Self { path, temporary }
+        Self {
+            path,
+            temporary,
+            boot_session: OnceLock::new(),
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Replace the ledger with the current groups and inherited unresolved groups not seen
+    /// Replace the ledger with the current claims and inherited unresolved groups not seen
     /// released. An inspection failure keeps its group and is reported to the supervisor.
     pub fn record<I>(&self, groups: I, inherited: &[UnresolvedGroup]) -> io::Result<Recorded>
     where
-        I: Iterator<Item = (u64, GroupLeader)> + Clone,
+        I: Iterator<Item = JobGroupClaim> + Clone,
     {
         let mut carried = Vec::with_capacity(inherited.len());
         let mut uninspected = Vec::new();
         for group in inherited {
             match group.still_held() {
                 Ok(false) => {}
-                Ok(true) => carried.push(*group),
+                Ok(true) => carried.push(group.clone()),
                 Err(error) => {
-                    carried.push(*group);
+                    carried.push(group.clone());
                     uninspected.push(error);
                 }
             }
         }
         let ledger = Publication {
             supervisor: std::process::id(),
-            groups: Groups(groups),
+            groups: Groups {
+                claims: groups,
+                boot_session: &self.boot_session,
+            },
             ended: false,
             unresolved: &carried,
         };
@@ -297,27 +340,71 @@ struct Publication<'a, G> {
     unresolved: &'a [UnresolvedGroup],
 }
 
-struct Groups<I>(I);
+struct Groups<'a, I> {
+    claims: I,
+    boot_session: &'a OnceLock<String>,
+}
 
-impl<I> Serialize for Groups<I>
+impl<I> Serialize for Groups<'_, I>
 where
-    I: Iterator<Item = (u64, GroupLeader)> + Clone,
+    I: Iterator<Item = JobGroupClaim> + Clone,
 {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.0.clone().map(|(job_id, leader)| Group {
-            job_id,
-            pgid: leader.pgid,
-            leader_start: Some(leader.start),
-            leader_birth: None,
-        }))
+        use serde::ser::{Error as _, SerializeSeq as _};
+        let mut groups = serializer.serialize_seq(None)?;
+        for claim in self.claims.clone() {
+            let members = match claim.members.as_deref() {
+                Some(lives) if !lives.is_empty() => Some(MembersView {
+                    boot_session: boot_session(self.boot_session).map_err(S::Error::custom)?,
+                    lives,
+                }),
+                _ => None,
+            };
+            groups.serialize_element(&GroupView {
+                job_id: claim.job_id,
+                pgid: claim.leader.pgid,
+                leader_start: claim.leader.start,
+                members,
+            })?;
+        }
+        groups.end()
     }
+}
+
+/// A [`Group`] as a publication writes it: the leader's start, never an earlier build's birth.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupView<'a> {
+    job_id: u64,
+    pgid: i32,
+    leader_start: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    members: Option<MembersView<'a>>,
+}
+
+/// [`RecordedMembers`] borrowed from the claim and the recorder.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MembersView<'a> {
+    boot_session: &'a str,
+    lives: &'a [ProcessIdentity],
+}
+
+/// The boot session, read from the kernel once per recorder: it cannot change while this
+/// process lives.
+fn boot_session(cell: &OnceLock<String>) -> io::Result<&str> {
+    if let Some(session) = cell.get() {
+        return Ok(session);
+    }
+    let session = cowshed_apfs::attach_budget::boot()?.session;
+    Ok(cell.get_or_init(|| session))
 }
 
 fn still_held(groups: &[UnresolvedGroup]) -> io::Result<Vec<UnresolvedGroup>> {
     let mut held = Vec::with_capacity(groups.len());
     for group in groups {
         if group.still_held()? {
-            held.push(*group);
+            held.push(group.clone());
         }
     }
     Ok(held)
@@ -403,6 +490,12 @@ pub fn take_lost(path: &Path, grace: Duration) -> io::Result<Vec<UnresolvedGroup
     };
     // A prior signaling pass is not authority to discard a still-live group's evidence.
     let (_, newly) = end_groups(&ledger.groups, grace)?;
+    let inherited: Vec<_> = ledger
+        .unresolved
+        .iter()
+        .map(|claim| claim.group.clone())
+        .collect();
+    end_groups(&inherited, grace)?;
     let mut unresolved = still_held(&ledger.unresolved)?;
     unresolved.extend(newly.into_iter().map(|group| UnresolvedGroup {
         lost_supervisor: ledger.supervisor,
@@ -456,29 +549,175 @@ enum Ownership {
     Unidentified,
 }
 
-/// TERM the owned groups' processes, wait `grace`, prove ownership again, then KILL those still
-/// running, reading the group again after each KILL until nothing in it runs: a process that
-/// forked between a read and its own KILL leaves a child the next read finds. Returns the jobs
-/// signalled and the groups left unresolved: their recorded leader is gone -- before TERM, or
-/// after it -- while processes still hold the id, so they are not signalled. A failed inspection
-/// or signal, or a group still running after every KILL round, is an error and leaves the
-/// caller's original ledger available for retry.
+/// Retire the provable groups, then the boot-fenced lives retained independently of each group.
+/// Any refusal leaves the original ledger available; a lost leader never revokes a known life.
 fn end_groups(groups: &[Group], grace: Duration) -> io::Result<(Vec<u64>, Vec<Group>)> {
     let mut running = Vec::with_capacity(groups.len());
     let mut unresolved = Vec::new();
     for group in groups {
         match ownership(group)? {
             Ownership::Owned(members) if members.is_empty() => {}
-            Ownership::Owned(members) => running.push((*group, members)),
+            Ownership::Owned(members) => running.push((group.clone(), members)),
             Ownership::NotOwned => {}
-            Ownership::Unidentified => unresolved.push(*group),
+            Ownership::Unidentified => unresolved.push(group.clone()),
         }
     }
-    let (signalled, lost) = end_running(&running, grace)?;
+    let groups_ended = end_running(&running, grace);
+    let members_ended = end_recorded_members(groups, grace);
+    let (mut signalled, lost) = match (groups_ended, members_ended) {
+        (Ok((mut signalled, lost)), Ok(members)) => {
+            for job in members {
+                if !signalled.contains(&job) {
+                    signalled.push(job);
+                }
+            }
+            (signalled, lost)
+        }
+        (Err(groups), Err(members)) => {
+            return Err(io::Error::new(
+                groups.kind(),
+                format!("group retirement: {groups}; recorded member retirement: {members}"),
+            ));
+        }
+        (Err(error), _) | (_, Err(error)) => return Err(error),
+    };
     unresolved.extend(lost);
-    Ok((signalled, unresolved))
+    let mut retained = Vec::new();
+    for group in unresolved {
+        if !matches!(ownership(&group)?, Ownership::NotOwned) || recorded_members_alive(&group)? {
+            retained.push(group);
+        }
+    }
+    signalled.sort_unstable();
+    Ok((signalled, retained))
 }
 
+/// A different boot proves the recorded Darwin lives ended, without consulting recycled pids.
+#[cfg(target_os = "macos")]
+fn recorded_members_alive(group: &Group) -> io::Result<bool> {
+    let Some(members) = &group.members else {
+        return Ok(false);
+    };
+    if members.boot_session != cowshed_apfs::attach_budget::boot()?.session {
+        return Ok(false);
+    }
+    for life in &members.lives {
+        if recorded_life(*life)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn recorded_members_alive(group: &Group) -> io::Result<bool> {
+    if group
+        .members
+        .as_ref()
+        .is_some_and(|members| !members.lives.is_empty())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this kernel cannot inspect recorded Darwin process identities",
+        ));
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn recorded_life(life: ProcessIdentity) -> io::Result<Option<Process>> {
+    let pid = i32::try_from(life.pid).map_err(io::Error::other)?;
+    if pid <= 0 || life.birth.0 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recorded process life needs a positive pid and unique id",
+        ));
+    }
+    Ok(running_info(pid)?
+        .filter(|info| info.unique.unique_id == life.birth.0)
+        .map(|info| Process {
+            pid,
+            version: info.unique.id_version.cast_unsigned(),
+        }))
+}
+
+#[cfg(target_os = "macos")]
+fn end_recorded_members(groups: &[Group], grace: Duration) -> io::Result<Vec<u64>> {
+    if groups.iter().all(|group| group.members.is_none()) {
+        return Ok(Vec::new());
+    }
+    let boot = cowshed_apfs::attach_budget::boot()?.session;
+    let mut watched = Vec::new();
+    let mut signalled = BTreeSet::new();
+    for group in groups {
+        let Some(members) = group
+            .members
+            .as_ref()
+            .filter(|members| members.boot_session == boot)
+        else {
+            continue;
+        };
+        for &life in &members.lives {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while let Some(process) = recorded_life(life)? {
+                match process.watch_exit() {
+                    Ok(exit) => {
+                        watched.push((group.job_id, life, exit, false));
+                        break;
+                    }
+                    Err(error) => {
+                        let current = recorded_life(life)?;
+                        match current {
+                            None => break,
+                            Some(now)
+                                if now.version != process.version
+                                    && std::time::Instant::now() < deadline =>
+                            {
+                                continue;
+                            }
+                            Some(_) => return Err(error),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (job, life, _, _) in &watched {
+        if signal_life(life.pid, life.birth.0, libc::SIGTERM)? {
+            signalled.insert(*job);
+        }
+    }
+    let deadline = std::time::Instant::now() + grace;
+    for (_, _, exit, ended) in &mut watched {
+        *ended = exit.within(deadline.saturating_duration_since(std::time::Instant::now()))?;
+    }
+    for (job, life, _, ended) in &watched {
+        if !ended && signal_life(life.pid, life.birth.0, libc::SIGKILL)? {
+            signalled.insert(*job);
+        }
+    }
+    let deadline = std::time::Instant::now() + grace.max(Duration::from_secs(1));
+    for (_, life, exit, ended) in watched {
+        if !ended && !exit.within(deadline.saturating_duration_since(std::time::Instant::now()))? {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "recorded process {} (unique id {}) has no exit proof after SIGKILL; its ledger claim is retained",
+                    life.pid, life.birth.0
+                ),
+            ));
+        }
+    }
+    Ok(signalled.into_iter().collect())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn end_recorded_members(groups: &[Group], _grace: Duration) -> io::Result<Vec<u64>> {
+    for group in groups {
+        recorded_members_alive(group)?;
+    }
+    Ok(Vec::new())
+}
 /// TERM each group's processes as they were read, wait `grace` once for them all, then KILL
 /// whatever of each group still runs as the job's. A TERM that reached none of a group's
 /// processes does not spare it the KILL: on macOS a process that execs takes a new pid version,
@@ -510,7 +749,7 @@ fn end_running(
         }
         if killed.end == KillEnd::Unidentified {
             // The leader died and was reaped while processes held on.
-            unresolved.push(*group);
+            unresolved.push(group.clone());
         }
     }
     Ok((signalled, unresolved))
@@ -627,6 +866,24 @@ pub fn group_has_live_members(pgid: i32) -> io::Result<bool> {
 /// process, processes holding the id of a leader gone, a membership not read in full -- is an
 /// error, never a guessed or empty membership.
 pub fn job_members(leader: &Birth) -> io::Result<Vec<Process>> {
+    proven_members(leader, members_of)
+}
+
+/// [`job_members`]'s membership as the kernel records each member: its pid, parent and the
+/// unique ids no other process is given, read under the same held-leader proof.
+#[cfg(target_os = "macos")]
+pub(crate) fn job_member_records(leader: &Birth) -> io::Result<Vec<ProcessRecord>> {
+    proven_members(leader, |pgid| {
+        Ok(running_in_group(pgid)?.iter().map(record_of).collect())
+    })
+}
+
+/// The processes `members` reads holding the group id, proven the job's as [`job_members`]
+/// describes.
+fn proven_members<T>(
+    leader: &Birth,
+    members: impl Fn(i32) -> io::Result<Vec<T>>,
+) -> io::Result<Vec<T>> {
     let pgid = i32::try_from(leader.pid()).map_err(io::Error::other)?;
     // `Some(true)` while the leader holds its pid, `Some(false)` while another process does,
     // `None` once no process holds it.
@@ -636,7 +893,7 @@ pub fn job_members(leader: &Birth) -> io::Result<Vec<Process>> {
     if let Birth::Observed(leader) = leader {
         match holds(*leader)? {
             Some(true) => {
-                let members = members_of(pgid)?;
+                let members = members(pgid)?;
                 if holds(*leader)? == Some(true) {
                     return Ok(members);
                 }
@@ -652,7 +909,7 @@ pub fn job_members(leader: &Birth) -> io::Result<Vec<Process>> {
             None => {}
         }
     }
-    if members_of(pgid)?.is_empty() {
+    if members(pgid)?.is_empty() {
         return Ok(Vec::new());
     }
     Err(io::Error::new(
@@ -838,6 +1095,18 @@ unsafe extern "C" {
 /// Every running process that holds the group id, each with the identity it had when read.
 #[cfg(target_os = "macos")]
 fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
+    Ok(running_in_group(pgid)?
+        .iter()
+        .map(|info| Process {
+            pid: info.bsd.pbi_pid.cast_signed(),
+            version: info.unique.id_version.cast_unsigned(),
+        })
+        .collect())
+}
+
+/// The record of every running process that holds the group id, each read in one call.
+#[cfg(target_os = "macos")]
+fn running_in_group(pgid: i32) -> io::Result<Vec<BsdInfoWithUniqueId>> {
     let mut members = Vec::new();
     for pid in group_pids(pgid)? {
         // Exited (an unreaped process answers ESRCH too) or gone: nothing to signal.
@@ -847,13 +1116,36 @@ fn members_of(pgid: i32) -> io::Result<Vec<Process>> {
         // One call read both, so the group is this very process's: one the id now names a
         // newer process for would have answered with that process's version.
         if i32::try_from(info.bsd.pbi_pgid).ok() == Some(pgid) {
-            members.push(Process {
-                pid,
-                version: info.unique.id_version.cast_unsigned(),
-            });
+            members.push(info);
         }
     }
     Ok(members)
+}
+
+/// Signal the life `pid` holds while the kernel's unique id for it is `unique_id`; `false` once
+/// that life no longer runs. Its pid version is read in the same call as that id, so a signal
+/// reaches that life or nothing: a later process given the pid has another id. An exec gives the
+/// life a new version and turns the signal away (`ESRCH`); the life is then read again by its
+/// id, never renewed from the pid alone. A refusal under the version just read means the life
+/// is exiting.
+#[cfg(target_os = "macos")]
+pub(crate) fn signal_life(pid: u32, unique_id: u64, signal: libc::c_int) -> io::Result<bool> {
+    let pid = i32::try_from(pid).map_err(io::Error::other)?;
+    let mut refused = None;
+    loop {
+        let Some(info) = running_info(pid)?.filter(|info| info.unique.unique_id == unique_id)
+        else {
+            return Ok(false);
+        };
+        let version = info.unique.id_version.cast_unsigned();
+        if refused == Some(version) {
+            return Ok(false);
+        }
+        if (Process { pid, version }).signal(signal)? {
+            return Ok(true);
+        }
+        refused = Some(version);
+    }
 }
 
 /// The BSD record and pid version of the process `pid` names now, read in one call; `None` once
@@ -1748,6 +2040,164 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recovery_retires_recorded_detached_lives_after_leader_reap_without_pid_guessing() {
+        use super::super::process_tree::{BirthToken, ProcessIdentity};
+        use std::io::{Read as _, Write as _};
+
+        struct Root(Option<std::process::Child>);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.0 {
+                    // SAFETY: this fixture still holds its unreaped group leader.
+                    unsafe {
+                        libc::killpg(i32::try_from(child.id()).unwrap(), libc::SIGKILL);
+                    }
+                    child.wait().expect("reap fixture root");
+                }
+            }
+        }
+        for case in ["exact", "different-life", "different-boot"] {
+            let (scratch, ledger) = scratch();
+            let socket = scratch.join("child.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let script = r#"
+import os, signal, socket, struct, sys
+if os.fork() == 0:
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    peer = socket.socket(socket.AF_UNIX)
+    peer.connect(sys.argv[1])
+    peer.sendall(struct.pack("!II", os.getpid(), os.getppid()))
+    peer.recv(1)
+    os._exit(0)
+os.read(0, 1)
+os._exit(0)
+"#;
+            let mut root = Root(Some(
+                Command::new("python3")
+                    .args(["-c", script])
+                    .arg(&socket)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .process_group(0)
+                    .spawn_locked()
+                    .unwrap(),
+            ));
+            let parent = root.0.as_ref().unwrap().id();
+            let birth = leader(parent);
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut report = [0_u8; 8];
+            peer.read_exact(&mut report).unwrap();
+            let child = u32::from_be_bytes(report[..4].try_into().unwrap());
+            assert_eq!(u32::from_be_bytes(report[4..].try_into().unwrap()), parent);
+            let life = super::process_record(i32::try_from(child).unwrap())
+                .unwrap()
+                .unwrap();
+            let parent_life = super::process_record(i32::try_from(parent).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (life.ppid, life.parent_unique_id),
+                (parent, parent_life.unique_id)
+            );
+            let exit = super::Process::observe(i32::try_from(child).unwrap())
+                .unwrap()
+                .unwrap()
+                .watch_exit()
+                .unwrap();
+            super::Recorder::new(ledger.clone())
+                .record(
+                    [super::JobGroupClaim {
+                        job_id: 41,
+                        leader: birth,
+                        members: Some(
+                            vec![ProcessIdentity {
+                                pid: child,
+                                birth: BirthToken(if case == "different-life" {
+                                    life.unique_id + 1
+                                } else {
+                                    life.unique_id
+                                }),
+                            }]
+                            .into(),
+                        ),
+                    }]
+                    .into_iter(),
+                    &[],
+                )
+                .unwrap();
+            if case == "different-boot" {
+                let mut recorded = super::read(&ledger).unwrap().unwrap();
+                recorded.groups[0].members.as_mut().unwrap().boot_session =
+                    "a-different-boot".into();
+                super::replace(&ledger, &recorded).unwrap();
+            }
+            root.0
+                .as_mut()
+                .unwrap()
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+            assert!(root.0.take().unwrap().wait().unwrap().success());
+            assert!(!super::group_has_live_members(i32::try_from(parent).unwrap()).unwrap());
+            assert_eq!(
+                super::process_record(i32::try_from(child).unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .unique_id,
+                life.unique_id
+            );
+            let recovered = take_lost(&ledger, Duration::from_millis(20)).unwrap();
+            assert!(recovered.is_empty());
+            assert!(!ledger.exists());
+            let still_live = super::process_record(i32::try_from(child).unwrap())
+                .unwrap()
+                .is_some_and(|now| now.unique_id == life.unique_id);
+            // Closing our fixture capability is the only cleanup for either refused identity.
+            drop(peer);
+            exit.wait().unwrap();
+            assert_eq!(still_live, case != "exact", "{case}");
+        }
+    }
+
+    /// A life is signalled only under its own kernel unique id, read with its pid version in one
+    /// call: the same pid under another id is never reached, and a life that exited -- held
+    /// unreaped, so its pid names nothing else -- is reached by nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_life_is_signalled_only_under_its_own_unique_id() {
+        let group = OwnedGroup(job_group());
+        let pid = group.0.id();
+        let leader_pid = i32::try_from(pid).unwrap();
+        let records = super::job_member_records(&super::Birth::Observed(leader(pid))).unwrap();
+        let ours = records
+            .iter()
+            .find(|record| record.pid == pid)
+            .copied()
+            .expect("the running leader is a member of its group");
+        assert!(!super::signal_life(pid, ours.unique_id.wrapping_add(1), libc::SIGTERM).unwrap());
+        assert!(
+            super::process_record(leader_pid)
+                .unwrap()
+                .is_some_and(|now| now.unique_id == ours.unique_id),
+            "a signal under another unique id reached the leader"
+        );
+        assert!(super::signal_life(pid, ours.unique_id, libc::SIGTERM).unwrap());
+        assert_eq!(
+            super::await_exit_unreaped(leader_pid).unwrap(),
+            crate::api::dto::ExitStatus::Signaled {
+                signal: libc::SIGTERM,
+                core_dumped: false,
+            }
+        );
+        assert!(!super::signal_life(pid, ours.unique_id, libc::SIGKILL).unwrap());
+    }
+
     /// A group led by `sh` whose child is `script`'s last background job: the leader, held
     /// unreaped by the test, and the child's pid, which `script` prints. The leader's stdin is a
     /// pipe the returned leader holds open, for a child that waits on it.
@@ -1969,7 +2419,10 @@ mod tests {
         assert_eq!(ready.trim(), "READY");
         let (_scratch, ledger) = scratch();
         super::Recorder::new(ledger.clone())
-            .record([(9, leader(group.0.id()))].into_iter(), &[])
+            .record(
+                [super::JobGroupClaim::group(9, leader(group.0.id()))].into_iter(),
+                &[],
+            )
             .unwrap();
         group.0.kill().unwrap();
         // The leader exited; this test holds it unreaped, so its start time still answers.
@@ -2013,7 +2466,10 @@ mod tests {
         let pgid = i32::try_from(job.id()).unwrap();
         let (_scratch, ledger) = scratch();
         super::Recorder::new(ledger.clone())
-            .record([(7, leader(job.id()))].into_iter(), &[])
+            .record(
+                [super::JobGroupClaim::group(7, leader(job.id()))].into_iter(),
+                &[],
+            )
             .unwrap();
         assert!(group_alive(pgid));
 
@@ -2039,7 +2495,10 @@ mod tests {
         let pgid = i32::try_from(job.id()).unwrap();
         let (_scratch, ledger) = scratch();
         super::Recorder::new(ledger.clone())
-            .record([(3, leader(job.id()))].into_iter(), &[])
+            .record(
+                [super::JobGroupClaim::group(3, leader(job.id()))].into_iter(),
+                &[],
+            )
             .unwrap();
 
         let other_supervisor = std::process::id() + 1;
@@ -2076,7 +2535,10 @@ mod tests {
 
         let mut job = job_group();
         super::Recorder::new(ledger.clone())
-            .record([(4, leader(job.id()))].into_iter(), &[])
+            .record(
+                [super::JobGroupClaim::group(4, leader(job.id()))].into_iter(),
+                &[],
+            )
             .unwrap();
         assert!(names_groups(&ledger, own).unwrap());
         assert!(names_groups(&ledger, Writer::Any).unwrap());
@@ -2092,14 +2554,28 @@ mod tests {
     /// ending the ledger signal it.
     #[test]
     fn a_rewrite_never_adopts_a_process_that_reused_the_job_s_pid() {
-        let mut gone = job_group();
-        let first_seen = leader(gone.id());
-        let gone_pgid = i32::try_from(gone.id()).unwrap();
-        // SAFETY: the unreaped test child leads this group.
-        unsafe { libc::killpg(gone_pgid, libc::SIGKILL) };
-        let _ = gone.wait();
+        fn end_fixture(child: &mut std::process::Child) {
+            let pgid = i32::try_from(child.id()).unwrap();
+            let exits: Vec<_> = super::members_of(pgid)
+                .unwrap()
+                .iter()
+                .map(|member| member.watch_exit().unwrap())
+                .collect();
+            // SAFETY: the unreaped test child leads this group; both members are pipe-held.
+            assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
+            child.wait().unwrap();
+            for exit in exits {
+                assert!(exit.within(Duration::from_secs(2)).unwrap());
+            }
+        }
 
-        let mut stranger = job_group();
+        let (mut gone, _) =
+            group_with_child("exec 3<&0\n/bin/sh -c 'echo $$; read line' <&3 &\nwait");
+        let first_seen = leader(gone.id());
+        end_fixture(&mut gone);
+
+        let (mut stranger, _) =
+            group_with_child("exec 3<&0\n/bin/sh -c 'echo $$; read line' <&3 &\nwait");
         let stranger_pgid = i32::try_from(stranger.id()).unwrap();
         let stranger_leader = leader(stranger.id());
         // The job started before the stranger that took its pid. Linux counts starts in clock
@@ -2113,10 +2589,10 @@ mod tests {
         assert_ne!(reused, stranger_leader);
         let (_scratch, ledger) = scratch();
         super::Recorder::new(ledger.clone())
-            .record([(5, reused)].into_iter(), &[])
+            .record([super::JobGroupClaim::group(5, reused)].into_iter(), &[])
             .unwrap();
         super::Recorder::new(ledger.clone())
-            .record([(5, reused)].into_iter(), &[])
+            .record([super::JobGroupClaim::group(5, reused)].into_iter(), &[])
             .unwrap();
 
         assert_eq!(
@@ -2128,9 +2604,7 @@ mod tests {
             group_alive(stranger_pgid),
             "the stranger's group was signalled"
         );
-        // SAFETY: the unreaped test child leads this group.
-        unsafe { libc::killpg(stranger_pgid, libc::SIGKILL) };
-        let _ = stranger.wait();
+        end_fixture(&mut stranger);
     }
 
     /// A job-shaped process tree whose leader has finished starting: an exec gives a process a
@@ -2217,6 +2691,7 @@ mod tests {
             pgid,
             leader_start: super::start_time(pgid).unwrap(),
             leader_birth: None,
+            members: None,
         };
         let super::Ownership::Owned(read) = super::ownership(&group).unwrap() else {
             panic!("the running leader proves its group");
@@ -2403,6 +2878,7 @@ mod tests {
                         pgid,
                         leader_start,
                         leader_birth,
+                        members: None,
                     }],
                     unresolved: Vec::new(),
                 },
@@ -2489,6 +2965,7 @@ mod tests {
             pgid: HOLDER,
             leader_start,
             leader_birth,
+            members: None,
         };
         assert!(matches!(
             super::ownership(&group(Some(started + 1), None)).unwrap(),
@@ -2551,7 +3028,10 @@ mod tests {
             let pgid = i32::try_from(group.0.id()).unwrap();
             let (_scratch, ledger) = scratch();
             super::Recorder::new(ledger.clone())
-                .record([(7, leader(group.0.id()))].into_iter(), &[])
+                .record(
+                    [super::JobGroupClaim::group(7, leader(group.0.id()))].into_iter(),
+                    &[],
+                )
                 .unwrap();
             if previously_ended {
                 let mut recorded = super::read(&ledger).unwrap().unwrap();

@@ -138,6 +138,9 @@ fn finished_job(cwd: Option<WorkspacePath>) -> JobInfo {
         scope: ExecScope::Workspace,
         nice: Some(10),
         cpu_tokens: NonZeroUsize::new(1),
+        containment: None,
+        outlived: Vec::new(),
+        outlived_incomplete: false,
     }
 }
 
@@ -1832,6 +1835,9 @@ fn sealed_job_and_cpu_failures_keep_their_exact_wire_spellings() {
         scope: ExecScope::HostGate,
         nice: None,
         cpu_tokens: NonZeroUsize::new(12),
+        containment: None,
+        outlived: Vec::new(),
+        outlived_incomplete: false,
     };
     let value = serde_json::to_value(&sealed).expect("sealed JSON");
     assert_eq!(value["failure"], json!("priority"));
@@ -1856,6 +1862,480 @@ fn sealed_job_and_cpu_failures_keep_their_exact_wire_spellings() {
         serde_json::to_value(ExecScope::default()).unwrap(),
         json!("workspace")
     );
+}
+
+/// What retiring a job's process membership found is stated exactly on the wire, and only where
+/// the job can have one: absent, never `kernel` and never an empty list, for a job that retired
+/// nothing; a receipt the job cannot have is refused in both directions; and `draining` is a state
+/// no job ends in.
+#[test]
+fn a_job_states_its_retirement_receipt_exactly_and_only_where_it_can_have_one() {
+    let observed = JobContainment::Observed {
+        lost: vec![ProcessCoverageGap::UncountedFork { pid: 4242 }],
+    };
+    let survivors = vec![
+        OutlivedProcess {
+            index: Some(1),
+            pid: 4243,
+            image: Some("/bin/sleep".into()),
+            signal: 9,
+        },
+        OutlivedProcess {
+            index: None,
+            pid: 4244,
+            image: None,
+            signal: 9,
+        },
+    ];
+
+    // No receipt is absent on the wire, and an absent one decodes as none, never as `kernel`.
+    let mut info = finished_job(None);
+    let bare = serde_json::to_value(&info).expect("job JSON");
+    assert!(bare.get("containment").is_none());
+    assert!(bare.get("outlived").is_none());
+    let read = serde_json::from_value::<JobInfo>(bare).expect("a job without a receipt decodes");
+    assert_eq!((read.containment, read.outlived), (None, Vec::new()));
+
+    info.containment = Some(observed.clone());
+    info.outlived = survivors.clone();
+    let value = serde_json::to_value(&info).expect("retired job JSON");
+    assert_eq!(
+        value["containment"],
+        json!({"kind": "observed", "lost": [{"kind": "uncountedFork", "pid": 4242}]})
+    );
+    assert_eq!(
+        value["outlived"],
+        json!([
+            {"index": 1, "pid": 4243, "image": "/bin/sleep", "signal": 9},
+            {"pid": 4244, "signal": 9},
+        ]),
+        "an index or image nobody observed is absent: unknown, never zero or empty"
+    );
+    assert_eq!(
+        serde_json::from_value::<JobInfo>(value).expect("decode"),
+        info
+    );
+
+    // A receipt that found nothing alive states its containment and no survivors.
+    info.containment = Some(JobContainment::Kernel);
+    info.outlived = Vec::new();
+    let value = serde_json::to_value(&info).expect("kernel job JSON");
+    assert_eq!(value["containment"], json!({"kind": "kernel"}));
+    assert!(value.get("outlived").is_none());
+    assert_eq!(
+        serde_json::from_value::<JobInfo>(value).expect("decode"),
+        info
+    );
+
+    // Draining is no end: the leader is gone and its membership is being retired.
+    for state in [JobState::Queued, JobState::Running, JobState::Draining] {
+        assert!(!state.is_terminal(), "{state:?} is no end");
+    }
+    for state in [
+        JobState::Exited,
+        JobState::Signaled,
+        JobState::Killed,
+        JobState::OutputLimit,
+        JobState::Failed,
+    ] {
+        assert!(state.is_terminal(), "{state:?} is an end");
+    }
+    assert_eq!(
+        serde_json::to_value(JobState::Draining).unwrap(),
+        json!("draining")
+    );
+    let mut draining = finished_job(None);
+    draining.state = JobState::Draining;
+    draining.duration_ms = None;
+    draining.exit = None;
+    draining
+        .validate()
+        .expect("a draining job owns a process and has no end");
+    draining.containment = Some(JobContainment::Kernel);
+    draining
+        .validate()
+        .expect("a draining job may already hold its proof");
+    let mut ended = draining.clone();
+    ended.exit = Some(ExitStatus::Exited { code: 0 });
+    assert!(ended.validate().is_err(), "a draining job has no exit yet");
+    let mut ended = draining;
+    ended.duration_ms = Some(1);
+    assert!(ended.validate().is_err(), "a draining job has no duration");
+
+    // A job that has retired nothing, or never owned a process, has no receipt to state.
+    for state in [JobState::Queued, JobState::Running] {
+        let mut early = finished_job(None);
+        early.state = state;
+        early.duration_ms = None;
+        early.exit = None;
+        early.resources = None;
+        early.nice = None;
+        early
+            .validate()
+            .unwrap_or_else(|error| panic!("a {state:?} job: {error}"));
+        early.containment = Some(JobContainment::Kernel);
+        assert!(
+            early.validate().is_err(),
+            "a {state:?} job has retired nothing"
+        );
+    }
+    let mut refused = finished_job(None);
+    refused.state = JobState::Failed;
+    refused.pid = None;
+    refused.exit = None;
+    refused.resources = None;
+    refused.nice = None;
+    refused.cpu_tokens = None;
+    refused
+        .validate()
+        .expect("a start refused before its command ran states no receipt");
+    refused.containment = Some(JobContainment::Kernel);
+    assert!(
+        refused.validate().is_err(),
+        "a job that never owned a process retired no membership"
+    );
+
+    // Survivors need the containment that found them, and name an image or none.
+    let mut orphaned = finished_job(None);
+    orphaned.outlived = survivors.clone();
+    assert!(orphaned.validate().is_err());
+    let mut wire = serde_json::to_value(finished_job(None)).expect("job JSON");
+    wire["outlived"] = json!([{"pid": 4243, "signal": 9}]);
+    assert!(
+        serde_json::from_value::<JobInfo>(wire).is_err(),
+        "survivors without their containment are refused on decode too"
+    );
+    let mut unnamed = finished_job(None);
+    unnamed.containment = Some(JobContainment::Kernel);
+    unnamed.outlived = vec![OutlivedProcess {
+        image: Some(String::new()),
+        ..survivors[0].clone()
+    }];
+    assert!(
+        unnamed.validate().is_err(),
+        "an empty image stands for no image, which is absent"
+    );
+
+    // The sealed projection carries the same two facts, absent when there is no receipt.
+    let sealed = SealedJob {
+        job_id: JobId::new(7).unwrap(),
+        state: JobState::Signaled,
+        exit: Some(ExitStatus::Signaled {
+            signal: 9,
+            core_dumped: false,
+        }),
+        failure: None,
+        duration_ms: Some(3),
+        resources: None,
+        output_limit: None,
+        stdout: stream(".cowshed/job/7/out", 0, ""),
+        stderr: stream(".cowshed/job/7/err", 0, ""),
+        class: ExecClass::Background,
+        scope: ExecScope::Workspace,
+        nice: None,
+        cpu_tokens: None,
+        containment: Some(observed.clone()),
+        outlived: survivors.clone(),
+        outlived_incomplete: false,
+    };
+    let value = serde_json::to_value(&sealed).expect("sealed JSON");
+    assert_eq!(value["containment"]["kind"], json!("observed"));
+    assert_eq!(value["outlived"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        serde_json::from_value::<SealedJob>(value).expect("decode"),
+        sealed
+    );
+    let unreceipted = SealedJob {
+        containment: None,
+        outlived: Vec::new(),
+        outlived_incomplete: false,
+        ..sealed
+    };
+    let value = serde_json::to_value(&unreceipted).expect("sealed JSON");
+    assert!(value.get("containment").is_none());
+    assert!(value.get("outlived").is_none());
+    assert_eq!(
+        serde_json::from_value::<SealedJob>(value).expect("decode"),
+        unreceipted
+    );
+
+    // The retirement itself is one value: its containment is tagged, and an observed one names
+    // what it lacks even when that is nothing.
+    let retirement = JobProcessRetirement {
+        containment: observed,
+        outlived: survivors,
+        outlived_incomplete: false,
+    };
+    let value = serde_json::to_value(&retirement).expect("retirement JSON");
+    assert_eq!(value["containment"]["kind"], json!("observed"));
+    assert_eq!(
+        serde_json::from_value::<JobProcessRetirement>(value).expect("decode"),
+        retirement
+    );
+    assert!(
+        serde_json::from_value::<JobContainment>(json!({"kind": "observed"})).is_err(),
+        "an observed containment states its lost list, empty or not"
+    );
+}
+
+/// An empty survivor list with incomplete metadata is a real receipt, not evidence of no kills.
+/// The marker defaults to false and only true crosses the public wire.
+#[test]
+fn incomplete_retirement_metadata_round_trips_and_refuses_impossible_job_receipts() {
+    let mut info = finished_job(None);
+    info.containment = Some(JobContainment::Kernel);
+    info.outlived_incomplete = true;
+    let value = serde_json::to_value(&info).unwrap();
+    assert_eq!(value["outlivedIncomplete"], json!(true));
+    assert!(value.get("outlived").is_none());
+    assert_eq!(
+        serde_json::from_value::<JobInfo>(value.clone()).unwrap(),
+        info
+    );
+
+    info.outlived_incomplete = false;
+    let complete = serde_json::to_value(&info).unwrap();
+    assert!(complete.get("outlivedIncomplete").is_none());
+    assert!(
+        !serde_json::from_value::<JobInfo>(complete)
+            .unwrap()
+            .outlived_incomplete
+    );
+
+    for state in [JobState::Queued, JobState::Running] {
+        let mut early = info.clone();
+        early.state = state;
+        early.duration_ms = None;
+        early.exit = None;
+        early.resources = None;
+        early.nice = None;
+        early.outlived_incomplete = true;
+        assert!(early.validate().is_err());
+        assert!(serde_json::to_value(&early).is_err());
+        let mut wire = value.clone();
+        wire["state"] = serde_json::to_value(state).unwrap();
+        wire.as_object_mut().unwrap().remove("durationMs");
+        wire.as_object_mut().unwrap().remove("exit");
+        wire.as_object_mut().unwrap().remove("resources");
+        wire.as_object_mut().unwrap().remove("nice");
+        assert!(serde_json::from_value::<JobInfo>(wire).is_err());
+    }
+    let mut draining = info.clone();
+    draining.state = JobState::Draining;
+    draining.duration_ms = None;
+    draining.exit = None;
+    draining.outlived_incomplete = true;
+    let wire = serde_json::to_value(&draining).unwrap();
+    assert_eq!(serde_json::from_value::<JobInfo>(wire).unwrap(), draining);
+
+    // A refused/never-born job cannot acquire a receipt just by claiming metadata was missed.
+    let mut never_born = info.clone();
+    never_born.state = JobState::Failed;
+    never_born.pid = None;
+    never_born.exit = None;
+    never_born.resources = None;
+    never_born.nice = None;
+    never_born.cpu_tokens = None;
+    never_born.containment = None;
+    never_born.validate().unwrap();
+    let never_born_wire = serde_json::to_value(&never_born).unwrap();
+    for containment in [None, Some(JobContainment::Kernel)] {
+        never_born.containment = containment.clone();
+        never_born.outlived_incomplete = true;
+        assert!(never_born.validate().is_err());
+        assert!(serde_json::to_value(&never_born).is_err());
+        let mut wire = never_born_wire.clone();
+        wire["outlivedIncomplete"] = json!(true);
+        if let Some(containment) = containment {
+            wire["containment"] = serde_json::to_value(containment).unwrap();
+        }
+        assert!(serde_json::from_value::<JobInfo>(wire).is_err());
+    }
+    info.containment = None;
+    info.outlived_incomplete = true;
+    assert!(info.validate().is_err());
+    assert!(serde_json::to_value(info).is_err());
+    let mut orphaned = value.clone();
+    orphaned.as_object_mut().unwrap().remove("containment");
+    assert!(serde_json::from_value::<JobInfo>(orphaned).is_err());
+    for bad_marker in [json!(null), json!("true"), json!(1)] {
+        let mut malformed = value.clone();
+        malformed["outlivedIncomplete"] = bad_marker;
+        assert!(serde_json::from_value::<JobInfo>(malformed).is_err());
+    }
+}
+
+#[test]
+fn sealed_receipts_preserve_incomplete_metadata_and_refuse_orphaned_markers() {
+    let sealed = SealedJob {
+        job_id: JobId::new(7).unwrap(),
+        state: JobState::Signaled,
+        exit: Some(ExitStatus::Signaled {
+            signal: 9,
+            core_dumped: false,
+        }),
+        failure: None,
+        duration_ms: Some(3),
+        resources: None,
+        output_limit: None,
+        stdout: stream(".cowshed/job/7/out", 0, ""),
+        stderr: stream(".cowshed/job/7/err", 0, ""),
+        class: ExecClass::Background,
+        scope: ExecScope::Workspace,
+        nice: None,
+        cpu_tokens: None,
+        containment: Some(JobContainment::Kernel),
+        outlived: Vec::new(),
+        outlived_incomplete: true,
+    };
+    let value = serde_json::to_value(&sealed).unwrap();
+    assert_eq!(value["outlivedIncomplete"], json!(true));
+    assert!(value.get("outlived").is_none());
+    assert_eq!(
+        serde_json::from_value::<SealedJob>(value.clone()).unwrap(),
+        sealed
+    );
+    let complete = SealedJob {
+        outlived_incomplete: false,
+        ..sealed.clone()
+    };
+    let wire = serde_json::to_value(&complete).unwrap();
+    assert!(wire.get("outlivedIncomplete").is_none());
+    assert_eq!(serde_json::from_value::<SealedJob>(wire).unwrap(), complete);
+    for malformed in [
+        SealedJob {
+            containment: None,
+            ..sealed.clone()
+        },
+        SealedJob {
+            state: JobState::Running,
+            ..sealed.clone()
+        },
+        SealedJob {
+            state: JobState::Draining,
+            ..sealed.clone()
+        },
+    ] {
+        assert!(malformed.validate().is_err());
+        assert!(serde_json::to_value(malformed).is_err());
+    }
+    let mut orphaned = value.clone();
+    orphaned.as_object_mut().unwrap().remove("containment");
+    assert!(serde_json::from_value::<SealedJob>(orphaned).is_err());
+    for state in [JobState::Queued, JobState::Running, JobState::Draining] {
+        let mut early = value.clone();
+        early["state"] = serde_json::to_value(state).unwrap();
+        assert!(serde_json::from_value::<SealedJob>(early).is_err());
+    }
+    let mut unknown = value;
+    unknown["inventedProof"] = json!(true);
+    assert!(serde_json::from_value::<SealedJob>(unknown).is_err());
+}
+
+#[test]
+fn subtree_dtos_keep_opaque_handles_and_closed_admission_and_retirement_outcomes() {
+    let handle = JobSubtreeHandle {
+        job_id: JobId::new(7).unwrap(),
+        index: 2,
+        incarnation: "0123456789abcdef0123456789abcdef".into(),
+    };
+    let handle_wire = json!({
+        "jobId": 7, "index": 2, "incarnation": "0123456789abcdef0123456789abcdef",
+    });
+    assert_eq!(serde_json::to_value(&handle).unwrap(), handle_wire);
+    let admission = JobSubtreeAdmission::Admitted {
+        handle: handle.clone(),
+    };
+    let admitted = json!({"kind": "admitted", "handle": handle_wire});
+    assert_eq!(serde_json::to_value(&admission).unwrap(), admitted);
+    assert_eq!(
+        serde_json::from_value::<JobSubtreeAdmission>(admitted.clone()).unwrap(),
+        admission
+    );
+    for (reason, spelling) in [
+        (JobSubtreeRefusal::FoldUnavailable, "foldUnavailable"),
+        (JobSubtreeRefusal::NotMember, "notMember"),
+        (JobSubtreeRefusal::ForeignHandle, "foreignHandle"),
+        (JobSubtreeRefusal::JobEnded, "jobEnded"),
+        (JobSubtreeRefusal::SpentHandle, "spentHandle"),
+    ] {
+        let expected = json!({"kind": "refused", "reason": spelling});
+        let admission = JobSubtreeAdmission::Refused { reason };
+        let retirement = JobSubtreeRetirement::Refused { reason };
+        assert_eq!(serde_json::to_value(&admission).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<JobSubtreeAdmission>(expected.clone()).unwrap(),
+            admission
+        );
+        assert_eq!(serde_json::to_value(&retirement).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<JobSubtreeRetirement>(expected).unwrap(),
+            retirement
+        );
+    }
+    let retirement = JobProcessRetirement {
+        containment: JobContainment::Kernel,
+        outlived: Vec::new(),
+        outlived_incomplete: true,
+    };
+    let receipt =
+        json!({"containment": {"kind": "kernel"}, "outlived": [], "outlivedIncomplete": true});
+    assert_eq!(serde_json::to_value(&retirement).unwrap(), receipt);
+    assert_eq!(
+        serde_json::from_value::<JobProcessRetirement>(receipt.clone()).unwrap(),
+        retirement
+    );
+    let retired = JobSubtreeRetirement::Retired {
+        retirement: retirement.clone(),
+    };
+    let retired_wire = json!({"kind": "retired", "retirement": receipt});
+    assert_eq!(serde_json::to_value(&retired).unwrap(), retired_wire);
+    assert_eq!(
+        serde_json::from_value::<JobSubtreeRetirement>(retired_wire.clone()).unwrap(),
+        retired
+    );
+    let complete = JobProcessRetirement {
+        outlived_incomplete: false,
+        ..retirement
+    };
+    let wire = serde_json::to_value(&complete).unwrap();
+    assert!(wire.get("outlivedIncomplete").is_none());
+    assert_eq!(
+        serde_json::from_value::<JobProcessRetirement>(wire).unwrap(),
+        complete
+    );
+
+    let mut unknown_handle = handle_wire;
+    unknown_handle["pid"] = json!(4242);
+    assert!(serde_json::from_value::<JobSubtreeHandle>(unknown_handle.clone()).is_err());
+    assert!(
+        serde_json::from_value::<JobSubtreeAdmission>(
+            json!({"kind": "admitted", "handle": unknown_handle})
+        )
+        .is_err()
+    );
+    for malformed in [
+        json!({"kind": "admitted"}),
+        json!({"kind": "refused"}),
+        json!({"kind": "refused", "reason": "unknown"}),
+        json!({"kind": "refused", "reason": "jobEnded", "handle": handle}),
+        json!({"kind": "admitted", "handle": admitted["handle"], "reason": "notMember"}),
+    ] {
+        assert!(serde_json::from_value::<JobSubtreeAdmission>(malformed).is_err());
+    }
+    for malformed in [
+        json!({"kind": "retired"}),
+        json!({"kind": "retired", "retirement": {"outlived": [], "outlivedIncomplete": true}}),
+        json!({"kind": "retired", "retirement": {"containment": {"kind": "kernel"}}}),
+        json!({"kind": "retired", "retirement": retired_wire["retirement"], "reason": "jobEnded"}),
+        json!({"kind": "refused", "reason": "unknown"}),
+        json!({"kind": "refused", "reason": "foreignHandle", "retirement": retired_wire["retirement"]}),
+    ] {
+        assert!(serde_json::from_value::<JobSubtreeRetirement>(malformed).is_err());
+    }
+    let mut unknown_receipt = retired_wire["retirement"].clone();
+    unknown_receipt["inventedProof"] = json!(true);
+    assert!(serde_json::from_value::<JobProcessRetirement>(unknown_receipt).is_err());
 }
 
 /// Admission records in every scope contain only public tool and identity names

@@ -182,6 +182,12 @@ impl JobProcessFold {
         &self.tree
     }
 
+    /// Native control metadata is mutated only by the observer's sole writer.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn lives_mut(&mut self) -> &mut ProcessTreeFold {
+        &mut self.tree
+    }
+
     /// The start proven by the life's first usage read, fencing every later native read.
     pub fn usage_start(
         &self,

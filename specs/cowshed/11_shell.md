@@ -44,16 +44,35 @@ process group and is the only process that creates it (two creations of one grou
 never signals a group not yet made. A child that cannot lead its group says why on the job's stderr and exits 126. The
 child resets every signal the host handles to its default as an exec would, holds the job's descriptors as 0, 1 and 2,
 builds a brush interpreter from the already-activated environment (no activation, no rc files) with job control off,
-runs the program and exits with its status. Every external command and descendant the script starts is in the job's
-group, so a kill reaches all of them and never the host; a killed script dies by the signal and reports it exactly;
-`cd`, `umask`, `ulimit`, `trap` and `exec` end with the child. The interpreter lives only in the host binary (the
-`cowshed-shell` crate), not in the supervisor library or its Node addon.
+runs the program and exits with its status. External commands inherit the job's group, so a group signal never reaches
+the host. A descendant can leave that group with `setsid` or `setpgid`; group membership alone is therefore not a
+descendant-ownership proof. A killed script dies by the signal and reports it exactly; `cd`, `umask`, `ulimit`, `trap`
+and `exec` end with the child. The interpreter lives only in the host binary (the `cowshed-shell` crate), not in the
+supervisor library or its Node addon.
 
-Complete-group termination means every retained running member receives the group signal and reaches an observed exit;
-it does not mean the caller may reap processes whose parent is another process. An exited, unreaped zombie still answers
-`kill(pid, 0)`, so a null signal is not evidence that a killed descendant survived. Consumers retain a kernel
-identity-fenced exit watch while the member is running, then wait for that member's actual exit event. The actual parent
-alone reaps its children; the command leader stays unreaped until release, and the independent host must remain usable.
+Retirement means every retained running member reaches an observed exit; it does not mean the caller may reap processes
+whose parent is another process. An exited, unreaped zombie still answers `kill(pid, 0)`, so a null signal is not
+evidence that a killed descendant survived. Consumers retain a kernel identity-fenced exit watch while the member is
+running, then wait for that member's actual exit event. The actual parent alone reaps its children; the command leader
+stays unreaped until release, and the independent host must remain usable.
+
+Leader exit and both output EOFs begin nonterminal `draining`, not terminal publication. The actor retains the process,
+CPU and volume claims while its native membership operation snapshots the outliving processes, sends TERM, waits the
+existing grace, ends survivors and joins their exits. Only a successful retirement reply permits sealing the terminal
+record and releasing the leader. A refusal keeps the claims and the nonterminal job, and reaches waiters as an error; an
+explicit cancellation or retirement can retry it. The durable `containment`, `outlived` and `outlivedIncomplete` receipt
+names the proof, the live members retirement signalled (including a live leader on cancellation), and whether native
+retirement may have ended members it could not name. Rows preserve each known observed-tree index, pid, image and last
+signal; a successful receipt leaves no scoped survivors. The marker defaults false and is omitted on the wire when
+false. Empty rows prove no member was ended only when the marker is false. A never-born job has no containment, empty
+rows and a false marker. Kernel-proven emptiness is not an exhaustive metadata census.
+
+On Darwin membership is the held leader's group plus the existing observer's retained running lives, including lives
+that called `setsid`. The receipt is always `observed`, never `kernel`: `NOTE_FORK` can coalesce, and a forked child can
+leave before observation attaches it. `lost` records detected attachment/parent-read gaps; an empty `lost` is not a
+completeness claim. Age, quiet output and zero CPU are not authority to retire a running job. A keeper-owned foreground
+Resident is a separate declared job and survives another job's conclusion; its own leader exit uses the same draining
+rule. Client detachment neither creates OS-process ownership nor transfers it.
 
 **A command that cannot start is named.** A failed `execvp` names the program it was given, whatever was missing:
 macOS's `sandbox-exec` prints `execvp() of 'tooling/codegraph' failed: No such file or directory` and exits 71 both when
@@ -69,11 +88,12 @@ still runs the interpreter, and `$0` and `BASH_SOURCE` stay the script's.
 **Process identity and signal ownership.** The process that creates a command's group observes its leader's immutable
 birth identity before anything can reap it, including a leader that exits immediately. One-shot commands and activation
 hosts are direct children held by a parent-owned reap/signal fence. A job's leader is observed exiting **without
-reaping** (`WNOWAIT`) and remains held until the complete job concludes: descendants can outlive the leader and keep its
-output pipes open. A later `kill`, quota stop, or retirement therefore still reaches their exact group. Only after both
-pipes end and the terminal outcome is established does the parent release and reap the leader. Signals and reaping
-serialize on the fence, without holding a blocking lock across an await; a released/reaped id grants no future signal
-rights. Birth-observation failure never becomes a ledger claim, but the actual parent's unreaped child remains its own.
+reaping** (`WNOWAIT`) and remains held until the complete job concludes: descendants can outlive the leader, with or
+without keeping its output pipes open. A later `kill`, quota stop, or retirement therefore still owns their exact group
+and retained observed lives. Only after both pipes end and membership retirement succeeds does the parent release and
+reap the leader. Signals and reaping serialize on the fence, without holding a blocking lock across an await; a
+released/reaped id grants no future signal rights. Birth-observation failure never becomes a ledger claim, but the
+actual parent's unreaped child remains its own.
 
 A warm command's signals are framed `REQUEST_SIGNAL`s to its actual parent host. The host reports the observed birth
 with `REPLY_STARTED`, and its exact typed exit with `REPLY_EXITED`, while keeping the leader unreaped. It continues
@@ -240,6 +260,13 @@ socket with a datagram connection; wrong-type or connected means a socket remain
 inherited after its creator exited. Only a proven unattached socket is removed under the lease. New listeners bind
 privately in mode `0600` and publish with one exclusive rename. Cleanup removes only the bound listener's own inode
 while holding the lease. Retirement releases the listener and lease **before** acknowledging success.
+
+The same serving actor also binds `<digest>.members.sock` under its own listener lease, with the same framing and uid
+check but a separate closed request grammar: exactly `subtreeHandle` and `retireDescendants`. Unknown operations are
+refused by name. Only this membership endpoint is granted to job sandboxes and exported as `COWSHED_SUPERVISOR_SOCKET`;
+the privileged coordinator endpoint remains inaccessible. Caller-provided values cannot redirect the exported endpoint.
+Initial policy and grant advancement use the same endpoint grant. Retirement closes both listeners before acknowledging
+the supervisor's retirement.
 
 A spawn copies every descriptor of the spawning process into the child, which holds the copies until its `exec` closes
 the close-on-exec ones; a listener or lease closed meanwhile by another thread is not released — the socket stays
@@ -466,7 +493,7 @@ unique across checkpoint copies and recycled workspace names.
 monitoring executor requests detached admission immediately; a long-running command never moves to another execution
 mechanism because a caller stops waiting. Foreground CLI presentation is an attached view of that same job. A caller
 disconnect, dropped handle, soft deadline, or progress-subscription close does not terminate it. Explicit cancellation,
-quota enforcement, and workspace retirement terminate the owned group; a soft timeout does not. An embedding executor
+quota enforcement, and workspace retirement terminate owned membership; a soft timeout does not. An embedding executor
 persists its operation-to-`(repoId, workspaceIncarnation, jobId)` binding before acknowledging admission and reopens
 that job by its number after it restarts; reopening never executes the command again. The admission contract closes the
 spawn-before-reply crash window as specified in 07_api.md.
@@ -556,6 +583,43 @@ never substitute a summary or merge stdout and stderr.
 
 An unavailable kernel sample reports a typed operational error with its cause; missing CPU, RSS, membership, load, or
 volume evidence never becomes invented zeroes. Job output and the actual exit status remain preserved.
+
+### Scoped descendant retirement capabilities
+
+A bounded command inside an admitted job does not acquire authority from a pid, cwd, temporary directory, process age,
+or CPU silence. `cowshed subtree-root --handle-fd N -- <argv...>` asks the membership endpoint about its own live
+connection peer. Darwin's audit peer token fences that read; the monitor must already retain the exact unique life in
+this job's immutable ancestry. The wrapper writes a newline-delimited admitted/refused JSON value to the inherited
+writable descriptor, closes it, then execs the command without changing pid or life. Operational failures are errors; a
+typed coverage refusal still runs the command without a RAM lease.
+
+An admitted value carries an opaque `{jobId,index,incarnation}` capability. The random root-issued nonce is retained on
+that fold life, not inferred from its index or supplied birth data. `cowshed retire-descendants --grace-ms N` reads only
+the inner handle JSON from stdin and asks from its own live connection. That peer must belong to the same admitted job
+even if it possesses another job's capability. The requested grace may shorten, never exceed, the supervisor's
+termination grace. A successful retirement spends the capability; replay is typed `SpentHandle`, unknown or forged
+handles are `ForeignHandle`, and an operational failure retains the capability for explicit retry.
+
+The existing monitor writer retires the root and its retained descendants, including children reparented after the root
+exited. It never expands a subtree into the whole job group: sibling commands stay alive. A naturally ended subtree's
+first retirement succeeds with no signal rows and then spends its capability. TERM/grace/KILL joins native exits before
+success. The receipt is `Observed { lost }`, never a Darwin completeness claim; its `outlived` rows name the lives
+signalled, not survivors. Those rows also remain in the whole job's later terminal receipt. The same
+`outlivedIncomplete` vocabulary distinguishes incomplete native kill metadata from membership proof.
+
+Linux currently returns typed `FoldUnavailable`: whole-job cgroup membership is not retained per-command ancestry. The
+caller takes no RAM lease and reports that fact, just as on a no-supervisor runner. A cwd/TMPDIR census remains a
+failure-only diagnostic; it cannot signal processes, refuse a gate, or become a fallback ownership authority.
+
+#### Separate unit: Linux per-command cgroup admission (LINUX-COMMAND-CGROUP)
+
+This independently scoped unit admits a controller-owned child cgroup for a bounded command before its wrapper execs,
+under the existing job's cgroup owner. It must issue a job-bound unforgeable capability, preserve membership through
+fork, setsid and double-fork, retire only that child cgroup, and join kernel emptiness before releasing the RAM lease.
+Acceptance requires a sibling command and an unrelated same-cwd process to survive, foreign/spent capabilities to be
+refused, and cancellation/refused-start cleanup to leave no members. It must reuse the existing cgroup owner and ledger;
+live parent-chain reconstruction and whole-job kill used as subtree retirement are forbidden. Until that unit is
+implemented and verified on Linux, `FoldUnavailable` and the explicit no-lease path remain the supported behavior.
 
 ### Readiness and attachment stdin
 
@@ -739,8 +803,11 @@ A supervisor that ends without retiring — killed, crashed — leaves its jobs'
 admitted but never sealed. Two things put that right:
 
 - **The group ledger.** A served supervisor keeps `<store>/run/<digest>.groups` beside its socket: each job's process
-  group and the leader's immutable birth identity observed by its parent before reaping, naming the supervisor that
-  wrote it. Every rewrite carries that original observation; it never samples an old pid again to renew a claim. A
+  group and the leader's immutable birth identity observed by its parent before reaping, plus the existing Darwin
+  observer's retained running lives. Each life carries its pid and `p_uniqueid` under `kern.bootsessionuuid`: a reboot
+  ends those lives, and a reused pid under another unique id is never signalled. The existing actor remains the sole
+  ledger writer; observer membership changes wake it without a periodic sweep. Every rewrite carries original
+  identities, never a fresh pid observation used to renew an old claim. The ledger names the supervisor that wrote it. A
   watcher acts only on its own lost supervisor's ledger, never one a newer supervisor has written. New writers record
   the leader's start time as `sysctl(KERN_PROC_PID)` reports it on macOS (`/proc/<pid>/stat` on Linux), which the kernel
   answers for every process of any owner, running or exited and unreaped, so a pid another user's process now holds is
@@ -748,21 +815,24 @@ admitted but never sealed. Two things put that right:
   readable, but the kernel reads that birth back only for the caller's own processes: one whose pid another owner now
   holds cannot be compared and stays a refusal, whatever process now holds that pid.
 
-  Recovery proves that the recorded leader held its id throughout the membership snapshot. Only those proven members are
-  signalled, through a kernel identity that cannot target a later process: the pid/version audit token on macOS, a pidfd
-  on Linux. It sends TERM, waits the existing grace, proves ownership again, then sends KILL to still-owned members. A
-  TERM that reaches none of a group's snapshot members is no proof the group ended -- a macOS member that execs after
-  the snapshot runs on under a new pid version -- so every group the snapshot found running gets the KILL pass. No
-  ledger operation signals a numeric pid or group after an ownership check. A reused live leader is left alone. A reaped
-  or never-identified leader with surviving members is unresolved, never signalled or silently dropped. A full
-  membership buffer is not absence evidence; inspection and signal failures retain the ledger and report the operational
-  error. KILL is followed by bounded membership verification; live survivors or inspection errors retain the ledger
-  rather than claiming release. A sealed failed-wait record is not process-release proof, so its still-unaccounted-for
-  group remains recorded. Failed inspection of an inherited group likewise retains that entry while recording new
-  groups. A macOS audit-token signal permission denial retains the native cause and reports the expected pid/version,
-  caller EUID, and a separately labeled post-failure kernel UID/flags/current version or inspection error. This cold
-  observation never renews signal authority or proves exit. The error explicitly says no exit watch was held at that
-  signal boundary; it never registers a late watch and presents it as prior exit evidence.
+  Group recovery proves that the recorded leader held its id throughout the membership snapshot. Those proven members,
+  and the separately retained exact lives from this boot, are signalled through kernel identities that cannot target a
+  later process: the pid/version audit token on macOS, a pidfd on Linux. It sends TERM, waits the existing grace, proves
+  ownership again, then sends KILL to still-owned members. A TERM that reaches none of a group's snapshot members is no
+  proof the group ended -- a macOS member that execs after the snapshot runs on under a new pid version -- so every
+  group the snapshot found running gets the KILL pass. No ledger operation signals a numeric pid or group after an
+  ownership check. A reused live leader is left alone. A reaped or never-identified leader with surviving unrecorded
+  group members is unresolved, never signalled or silently dropped. A retained life remains owned after `setsid`, leader
+  reap, reparenting or exec; recovery refreshes its pid version only while the same unique id still names that life,
+  registers its exit watch before signalling, and joins kernel exit before discarding its claim. A full membership
+  buffer is not absence evidence; inspection and signal failures retain the ledger and report the operational error.
+  KILL is followed by bounded membership verification; live survivors or inspection errors retain the ledger rather than
+  claiming release. A sealed failed-wait record is not process-release proof, so its still-unaccounted-for group remains
+  recorded. Failed inspection of an inherited group likewise retains that entry while recording new groups. A macOS
+  audit-token signal permission denial retains the native cause and reports the expected pid/version, caller EUID, and a
+  separately labeled post-failure kernel UID/flags/current version or inspection error. This cold observation never
+  renews signal authority or proves exit. The error explicitly says no exit watch was held at that signal boundary; it
+  never registers a late watch and presents it as prior exit evidence.
 
   Every replacement supervisor inherits unresolved entries with their original job, group, and lost supervisor. Each
   subsequent ledger rewrite carries them while the group remains unaccounted for, and drops only entries proven
@@ -770,10 +840,17 @@ admitted but never sealed. Two things put that right:
   through `doctor`; they do not prevent a new supervisor from serving safe commands.
 
   Publication borrows the current job-group iterator and the inspected inherited entries directly into the existing JSON
-  field order; it does not materialize a second group inventory. The actor prepares the destination and temporary paths
-  once. Ordinary publications without inherited groups allocate only their JSON output buffer; inherited recovery still
-  owns the carried entries and inspection errors it returns. This does not add an active-job frontier or change which
-  unsealed and failed-wait groups remain recorded.
+  field order; it does not materialize a second group inventory. A claim's observed member lives are shared from the
+  job's published process observation, not copied, and the boot session that fences them is read once per supervisor.
+  The actor prepares the destination and temporary paths once. Ordinary publications without inherited groups allocate
+  only their JSON output buffer; inherited recovery still owns the carried entries and inspection errors it returns.
+  This does not add an active-job frontier or change which unsealed and failed-wait groups remain recorded.
+
+  Runtime teardown uses the same native retirement, not a legacy group signal followed by unconditional claim release.
+  The actor transfers all parent handles and resource claims to one retirement worker and joins for a bounded interval.
+  A slow retirement keeps running with those handles retained; a refusal refreshes the same ledger with the known member
+  identities before handing it to recovery. Failure to write that handoff retains the native claims and names the
+  failure. Neither destructor completion nor an earlier terminal/sealed record is membership proof.
 
 - **Sealing.** The next supervisor binds the workspace socket first, reconciles the predecessor's groups, then seals
   every admitted but unterminated record of the current incarnation as `failed` with `failure: supervisorLost` and a
@@ -995,14 +1072,18 @@ variables. No ordinary workspace sandbox is widened. The single sandbox builder 
 in the gateway-derived workspace CPU-pool scope, not directory data, file writes, socket binding, the global control
 socket or another workspace's pool.
 
-Job records use layout12: layout10's cpu_class, cpu_want, cpu_wait_ms, cpu_tokens, cpu_nice and cpu_scope columns remain
-an exact prefix, followed by layout11's admission_env_sha256 for the complete non-withheld authored environment and
-layout12's admission_want, the want a keyed request named (07_api.md, "Keyed admission and restart attachment").
-cpu_want is the want its admission resolved. cpu_wait_ms is retired since gate admission lost its bound (05_gateway.md,
-"No admission deadline, for any class"): layouts grow only by trailing columns, so it stays, written null; an earlier
-record's positive bound still reads, a zero one is damage, and no bound is read into the record. JobAdmission.env is the
-public plaintext projection only for every scope; keyed Env comparison uses the digest, including after restart. Records
-retain typed cpuAdmission/priority failures. Earlier histories are retained untouched and set aside. Per 07_api.md Keyed
+Job records use layout14: layout10's cpu_class, cpu_want, cpu_wait_ms, cpu_tokens, cpu_nice and cpu_scope columns remain
+an exact prefix, followed by layout11's admission_env_sha256 for the complete non-withheld authored environment,
+layout12's admission_want, the want a keyed request named (07_api.md, "Keyed admission and restart attachment"),
+layout13's nullable retirement_containment and retirement_outlived wire-JSON columns, and layout14's nullable boolean
+retirement_outlived_incomplete. Those three are all null without a receipt or all present with one; any partial receipt
+is damaged. An empty list with a true marker remains an honest receipt of proven-empty membership with incomplete
+metadata. Layout13 and earlier stores are set aside whole, never decoded with an invented false marker. cpu_want is the
+want its admission resolved. cpu_wait_ms is retired since gate admission lost its bound (05_gateway.md, "No admission
+deadline, for any class"): layouts grow only by trailing columns, so it stays, written null; an earlier record's
+positive bound still reads, a zero one is damage, and no bound is read into the record. JobAdmission.env is the public
+plaintext projection only for every scope; keyed Env comparison uses the digest, including after restart. Records retain
+typed cpuAdmission/priority failures. Earlier histories are retained untouched and set aside. Per 07_api.md Keyed
 admission, existing incarnations must be renewed before new keyed exec: unverifiable historical keys are refused as
 unprovable, never migrated into an attestation they did not record. Unkeyed operator CLI exec remains available.
 Controller-only discovery runs locate-project/metadata --no-deps --offline under its ordinary child sandbox outside job

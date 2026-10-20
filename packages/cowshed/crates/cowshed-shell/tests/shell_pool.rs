@@ -262,6 +262,7 @@ impl Workspace {
             shell_host: None,
             shell_pool: ShellPoolConfig::default(),
             group_ledger: None,
+            membership_socket: None,
             telemetry_root: None,
             inherited_groups: Vec::new(),
             volume_labels: None,

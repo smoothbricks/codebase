@@ -40,12 +40,14 @@ use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::api::dto::{JobId, UtcTimestamp};
 use crate::api::process::{JobProcessEvent, JobProcessTree, ProcessCoverageGap};
 use crate::error::CowshedError;
-use crate::runtime::job_groups::{ProcessRecord, process_record};
+use crate::runtime::job_groups::{
+    Birth, ProcessRecord, job_member_records, process_record, signal_life,
+};
 use crate::runtime::process_stream::{JobProcessFold, JobProcessFoldError, JobProcessObservation};
 use crate::runtime::process_tree::{
     BirthToken, ProcessIdentity, ProcessImage, ProcessObservation, ProcessTreeFold,
@@ -160,6 +162,12 @@ pub trait ProcessReads {
         start: Option<StartStamp>,
         at: Instant,
     ) -> Result<Sampled, SampleError>;
+    /// The running members of the job's group `leader` leads, read while its parent holds the
+    /// leader unreaped ([`crate::runtime::job_groups::job_members`]'s proof): never a guess.
+    fn group(&self, leader: &Birth) -> io::Result<Vec<ProcessRecord>>;
+    /// Send `signal` to `process` while its pid still holds that life; `false` once it no longer
+    /// runs. A later process given the pid is never reached.
+    fn signal(&self, process: ProcessIdentity, signal: libc::c_int) -> io::Result<bool>;
 }
 
 /// The running kernel.
@@ -212,6 +220,14 @@ impl ProcessReads for Darwin {
     ) -> Result<Sampled, SampleError> {
         crate::runtime::process_usage::sample(start, process, at)
     }
+
+    fn group(&self, leader: &Birth) -> io::Result<Vec<ProcessRecord>> {
+        job_member_records(leader)
+    }
+
+    fn signal(&self, process: ProcessIdentity, signal: libc::c_int) -> io::Result<bool> {
+        signal_life(process.pid, process.birth.0, signal)
+    }
 }
 
 /// `proc_listchildpids`, its failure told apart from an empty list. libproc's `proc_listpids`
@@ -250,6 +266,10 @@ pub struct KqueueObserver<P = Darwin> {
     events: Vec<JobProcessEvent>,
     /// Every life with a registration: its events are the only ones the observer folds.
     registered: HashSet<ProcessIdentity>,
+    /// Each adoption the observer saw it miss: a fork whose children could not be listed before
+    /// its parent's life ended, or a listed child that could not be watched. Such a child may run
+    /// on outside every registration; a retirement reports these as its `lost`.
+    missed: Vec<ProcessCoverageGap>,
 }
 
 impl<P> AsRawFd for KqueueObserver<P> {
@@ -292,6 +312,7 @@ impl<P: ProcessReads> KqueueObserver<P> {
             fold: JobProcessFold::new(job_id, Instant::now()),
             events: Vec::new(),
             registered: HashSet::new(),
+            missed: Vec::new(),
         })
     }
 
@@ -320,6 +341,10 @@ impl<P: ProcessReads> KqueueObserver<P> {
 
     pub fn fold(&self) -> &ProcessTreeFold {
         self.fold.lives()
+    }
+
+    pub(crate) fn fold_mut(&mut self) -> &mut ProcessTreeFold {
+        self.fold.lives_mut()
     }
 
     pub(crate) fn attribution_summary(
@@ -379,6 +404,11 @@ impl<P: ProcessReads> KqueueObserver<P> {
     }
 
     pub fn gap(&mut self, reason: ProcessCoverageGap) -> Result<(), ObserveError> {
+        // An explicit event-source loss can hide births as well as exits. Keep it in the
+        // containment receipt even if an earlier metadata gap already set tree coverage.
+        if reason == ProcessCoverageGap::EventsLost {
+            self.missed.push(reason);
+        }
         self.observe(ProcessObservation::Lost(reason))
     }
 
@@ -440,11 +470,155 @@ impl<P: ProcessReads> KqueueObserver<P> {
     /// Wait for at least one event, then fold every event queued. An `Err` is what
     /// [`KqueueObserver::drain`] returns.
     pub fn wait(&mut self) -> Result<(), ObserveError> {
+        self.wait_within(None)
+    }
+
+    /// [`KqueueObserver::wait`], returning with nothing folded once `within` passes with no
+    /// event. The kernel's own wait bounds it; no timer runs beside it.
+    pub fn wait_within(&mut self, within: Option<Duration>) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
-        if self.collect(None, &mut failures).is_some() {
+        let timeout = within.map(|within| libc::timespec {
+            tv_sec: libc::time_t::try_from(within.as_secs()).unwrap_or(libc::time_t::MAX),
+            tv_nsec: libc::c_long::from(within.subsec_nanos()),
+        });
+        if self
+            .collect(timeout.as_ref(), &mut failures)
+            .is_some_and(|ready| ready > 0)
+        {
             self.drain_into(&mut failures);
         }
         failures.into_result()
+    }
+
+    /// Every life the job owns now (11_shell.md, "Complete-group termination"): each running
+    /// member of the group `leader` leads, read under the held leader's proof, and each life the
+    /// fold holds running, inside the group or not. A group member the fold does not hold is
+    /// adopted first -- through its parent's unique id when the fold holds that parent running,
+    /// otherwise as a root whose birth went unobserved -- so its exit is joined like any other.
+    /// A membership that cannot be read, a member that cannot be watched, or a running life with
+    /// no exit registration is an `Err`: ownership is never guessed and no exit is presumed.
+    pub(crate) fn owned(&mut self, leader: &Birth) -> Result<Vec<ProcessIdentity>, ObserveError> {
+        let members = self
+            .reads
+            .group(leader)
+            .map_err(|source| kernel("proc_listpgrppids", leader.pid(), source))?;
+        for member in members {
+            if !self.fold.lives().holds(identity(&member)) {
+                self.adopt_member(member)?;
+            }
+        }
+        self.watched(self.fold.lives().running().collect())
+    }
+
+    /// Subtree membership comes only from retained birth ancestry, never from group membership.
+    pub(crate) fn subtree(
+        &self,
+        root: ProcessIdentity,
+    ) -> Result<Vec<ProcessIdentity>, ObserveError> {
+        self.watched(
+            self.fold
+                .lives()
+                .running()
+                .filter(|&process| self.fold.lives().in_subtree(root, process))
+                .collect(),
+        )
+    }
+
+    fn watched(&self, owned: Vec<ProcessIdentity>) -> Result<Vec<ProcessIdentity>, ObserveError> {
+        if let Some(unwatched) = owned.iter().find(|life| !self.registered.contains(life)) {
+            return Err(kernel(
+                "kevent(EVFILT_PROC)",
+                unwatched.pid,
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "a running life of the job holds no exit registration",
+                ),
+            ));
+        }
+        Ok(owned)
+    }
+
+    /// Authenticate the exact life retained and watched here, not the current holder of a pid.
+    pub(crate) fn retained_live(&self, process: ProcessIdentity) -> Result<bool, ObserveError> {
+        if self.fold.lives().live(process.pid) != Some(process)
+            || !self.registered.contains(&process)
+        {
+            return Ok(false);
+        }
+        Ok(self.current(process)?.is_some())
+    }
+
+    /// Adopt a member of the job's group the fold does not hold. The group proof makes it the
+    /// job's; the registration is that life's only when its unique id still holds the pid after
+    /// it ([`KqueueObserver::attach`]).
+    fn adopt_member(&mut self, member: ProcessRecord) -> Result<(), ObserveError> {
+        if let Some(parent) = self
+            .fold
+            .lives()
+            .live(member.ppid)
+            .filter(|parent| parent.birth.0 == member.parent_unique_id)
+        {
+            return self.adopt(parent, member.pid);
+        }
+        let Some(record) = self.attach(member)? else {
+            // It exited: the group no longer holds it.
+            return Ok(());
+        };
+        let process = identity(&record);
+        let image = match self.image(process) {
+            Ok(Some(image)) => image,
+            ended_or_failed => {
+                // Its life ended around the read, or the read failed: withdraw the registration
+                // unadopted. A life that still runs is read again by the next membership read.
+                self.change(process, libc::EV_DELETE)?;
+                self.registered.remove(&process);
+                return ended_or_failed.map(|_| ());
+            }
+        };
+        self.observe(ProcessObservation::Lost(
+            ProcessCoverageGap::UnobservedBirth { pid: process.pid },
+        ))?;
+        self.observe(ProcessObservation::Root {
+            process,
+            ppid: record.ppid,
+            at: utc_at_second(record.started_seconds)?,
+            image,
+        })?;
+        self.adopt_children(process)
+    }
+
+    /// Adopt every child a retained parent has now. Retirement calls this after posting STOP;
+    /// admission may call it to cover a queued fork notification. Neither assumes quiescence.
+    /// The outer Err is the child list's failure; the inner names failed, missed adoptions.
+    pub(crate) fn descendants(
+        &mut self,
+        parent: ProcessIdentity,
+    ) -> Result<Result<(), ObserveError>, ObserveError> {
+        Ok(match self.children(parent)? {
+            Some(children) => self.adopt_each(parent, children),
+            // Its life ended; its exit is joined from its own registration.
+            None => Ok(()),
+        })
+    }
+
+    /// Send `signal` to `process` while the fold holds it running and its pid still holds that
+    /// life; `false` when it no longer runs. A life whose exit was folded is never signalled.
+    pub(crate) fn signal(
+        &self,
+        process: ProcessIdentity,
+        signal: libc::c_int,
+    ) -> Result<bool, ObserveError> {
+        if self.fold.lives().live(process.pid) != Some(process) {
+            return Ok(false);
+        }
+        self.reads
+            .signal(process, signal)
+            .map_err(|source| kernel("proc_signal_with_audittoken", process.pid, source))
+    }
+
+    /// Every adoption this observer saw it miss, in the order it missed them.
+    pub(crate) fn missed(&self) -> &[ProcessCoverageGap] {
+        &self.missed
     }
 
     fn drain_into(&mut self, failures: &mut Failures) {
@@ -626,12 +800,21 @@ impl<P: ProcessReads> KqueueObserver<P> {
         failures.into_result()
     }
 
-    /// `parent` forked an uncounted number of children: adopt every one it has now.
+    /// `parent` forked an uncounted number of children: adopt every one it has now. Children
+    /// that could not be listed -- the parent's life ended first, or the read failed -- were
+    /// forked and may run on unwatched: a missed adoption.
     fn forked(&mut self, parent: ProcessIdentity) -> Result<(), ObserveError> {
         self.observe(ProcessObservation::Lost(
             ProcessCoverageGap::UncountedFork { pid: parent.pid },
         ))?;
-        self.adopt_children(parent)
+        match self.children(parent) {
+            Ok(Some(children)) => self.adopt_each(parent, children),
+            unlisted => {
+                self.missed
+                    .push(ProcessCoverageGap::UncountedFork { pid: parent.pid });
+                unlisted.map(|_| ())
+            }
+        }
     }
 
     /// Adopt every child `parent` has now that the tree does not hold, each one even after
@@ -641,9 +824,24 @@ impl<P: ProcessReads> KqueueObserver<P> {
             // It exited; its children went to another parent. The fork gap covers them.
             return Ok(());
         };
+        self.adopt_each(parent, children)
+    }
+
+    /// Adopt each listed child, each one even after another failed. A child whose adoption
+    /// failed before the tree held it is a missed adoption.
+    fn adopt_each(
+        &mut self,
+        parent: ProcessIdentity,
+        children: Vec<u32>,
+    ) -> Result<(), ObserveError> {
         let mut failures = Failures::default();
         for child in children {
-            failures.note(self.adopt(parent, child));
+            let adopted = self.adopt(parent, child);
+            if adopted.is_err() && self.fold.lives().live(child).is_none() {
+                self.missed
+                    .push(ProcessCoverageGap::UnobservedBirth { pid: child });
+            }
+            failures.note(adopted);
         }
         failures.into_result()
     }
@@ -1085,6 +1283,10 @@ mod tests {
         children: std::cell::RefCell<
             std::collections::HashMap<u32, std::collections::VecDeque<io::Result<Vec<u32>>>>,
         >,
+        /// Each membership read of the job's group, in order.
+        groups: std::cell::RefCell<std::collections::VecDeque<io::Result<Vec<ProcessRecord>>>>,
+        /// Every signal the observer sent, each answered as reaching its life.
+        signalled: std::cell::RefCell<Vec<(ProcessIdentity, libc::c_int)>>,
         /// The reader's effective uid; root unless a test sets it.
         reader: u32,
     }
@@ -1123,6 +1325,11 @@ mod tests {
                 .entry(pid)
                 .or_default()
                 .push_back(answer);
+            self
+        }
+
+        fn group(self, answer: io::Result<Vec<ProcessRecord>>) -> Self {
+            self.groups.borrow_mut().push_back(answer);
             self
         }
 
@@ -1168,6 +1375,18 @@ mod tests {
         ) -> Result<Sampled, SampleError> {
             // These metadata/error controls provide no native counter proof.
             Ok(Sampled::Unproven)
+        }
+
+        fn group(&self, leader: &Birth) -> io::Result<Vec<ProcessRecord>> {
+            self.groups
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| panic!("an unscripted group read of leader {}", leader.pid()))
+        }
+
+        fn signal(&self, process: ProcessIdentity, signal: libc::c_int) -> io::Result<bool> {
+            self.signalled.borrow_mut().push((process, signal));
+            Ok(true)
         }
     }
 
@@ -1217,6 +1436,7 @@ mod tests {
             fold: fold.fold,
             events: fold.events,
             registered: registered.iter().copied().collect(),
+            missed: Vec::new(),
         }
     }
 
@@ -1342,6 +1562,154 @@ mod tests {
         assert!(observer.registered.contains(&life(pid, 40)));
         assert!(observer.change(life(pid, 40), libc::EV_DELETE).unwrap());
         release(child);
+    }
+
+    #[test]
+    fn subtree_selection_never_reads_a_group_and_requires_exit_registrations() {
+        let (mut fold, root, old, sibling) = reused_pid_fold();
+        let child = life(901, 4);
+        let at = utc_at_second(1_700_000_001).unwrap();
+        fold.apply(ProcessObservation::Forked {
+            process: child,
+            parent: old,
+            at: at.clone(),
+        })
+        .unwrap();
+        fold.apply(ProcessObservation::Exited {
+            process: old,
+            status: ExitStatus::Exited { code: 0 },
+            at,
+        })
+        .unwrap();
+        let mut observer = scripted(Scripted::default(), fold, &[root, sibling, child]);
+        // Scripted has no group-read answers: any accidental group expansion panics.
+        assert_eq!(observer.subtree(old).unwrap(), [child]);
+        observer.registered.remove(&child);
+        assert_eq!(
+            failed(&observer.subtree(old).unwrap_err()),
+            ("kevent(EVFILT_PROC)", child.pid, None)
+        );
+    }
+
+    #[test]
+    fn live_admission_requires_retained_registration_and_current_exact_identity() {
+        let (fold, root, old, current) = reused_pid_fold();
+        let reads = Scripted::default()
+            .record(
+                current.pid,
+                &[
+                    Some(record(current.pid, 99, 1)),
+                    Some(record(current.pid, current.birth.0, 1)),
+                ],
+            )
+            .record_failure(current.pid, libc::EIO);
+        let mut observer = scripted(reads, fold, &[root, old, current]);
+        assert!(
+            !observer.retained_live(old).unwrap(),
+            "a stale retained life is not a peer"
+        );
+        assert!(
+            !observer.retained_live(current).unwrap(),
+            "a different native life holds this pid"
+        );
+        assert!(observer.retained_live(current).unwrap());
+        assert_eq!(
+            failed(&observer.retained_live(current).unwrap_err()),
+            ("proc_pidinfo", current.pid, Some(libc::EIO))
+        );
+        observer.registered.remove(&current);
+        assert!(!observer.retained_live(current).unwrap());
+    }
+
+    /// A member of the job's group the fold never saw born is adopted, watched and owned
+    /// before anything signals it, and the tree says its birth went unobserved. A membership
+    /// that cannot be read is an error, never an empty ownership, and a life whose exit was
+    /// folded is never signalled again.
+    #[test]
+    fn a_group_member_the_fold_never_saw_is_adopted_before_it_is_owned() {
+        let (child, pid) = held_process();
+        let member = record(pid, 40, 99);
+        let process = life(pid, 40);
+        let reads = Scripted::default()
+            .group(Ok(vec![member]))
+            .record(pid, &[Some(member); 5])
+            .image(pid, Ok(shell_image("/bin/cat")))
+            .children(pid, Ok(Vec::new()))
+            .group(Err(io::Error::from_raw_os_error(libc::EPERM)));
+        let mut observer = scripted(reads, TestFold::default(), &[]);
+        let leader = Birth::Unobserved {
+            pid,
+            reason: "scripted".to_owned(),
+        };
+        assert_eq!(observer.owned(&leader).unwrap(), [process]);
+        assert!(observer.registered.contains(&process));
+        assert_eq!(
+            observer
+                .fold()
+                .image(process)
+                .map(|image| image.program.as_str()),
+            Some("/bin/cat")
+        );
+        assert_eq!(
+            observer.fold().coverage(),
+            &ProcessCoverage::Gap {
+                reason: ProcessCoverageGap::UnobservedBirth { pid }
+            }
+        );
+        assert!(observer.missed().is_empty(), "{:?}", observer.missed());
+        let refused = observer.owned(&leader).expect_err("an unread membership");
+        assert_eq!(
+            failed(&refused),
+            ("proc_listpgrppids", pid, Some(libc::EPERM))
+        );
+
+        assert!(observer.signal(process, libc::SIGTERM).unwrap());
+        observer
+            .observe(ProcessObservation::Exited {
+                process,
+                status: ExitStatus::Exited { code: 0 },
+                at: utc_at_second(1_700_000_001).unwrap(),
+            })
+            .unwrap();
+        assert!(!observer.signal(process, libc::SIGKILL).unwrap());
+        assert_eq!(
+            *observer.reads.signalled.borrow(),
+            [(process, libc::SIGTERM)]
+        );
+        assert!(observer.change(process, libc::EV_DELETE).unwrap());
+        release(child);
+    }
+
+    /// A fork whose children could not be listed, and a listed child that could not be
+    /// watched, are the adoptions a retirement reports lost.
+    #[test]
+    fn a_fork_the_observer_could_not_follow_is_a_missed_adoption() {
+        let (fold, root, _, _) = reused_pid_fold();
+        let reads = Scripted::default().record(800, &[None]);
+        let mut observer = scripted(reads, fold, &[root]);
+        observer
+            .handle(&event(root, libc::NOTE_FORK, 0))
+            .expect("a parent gone before its list is no read failure");
+        assert_eq!(
+            observer.missed(),
+            [ProcessCoverageGap::UncountedFork { pid: 800 }]
+        );
+
+        let (fold, root, _, _) = reused_pid_fold();
+        let ours = Some(record(800, 1, 0));
+        let reads = Scripted::default()
+            .record(800, &[ours, ours])
+            .children(800, Ok(vec![901]))
+            .record_failure(901, libc::EIO);
+        let mut observer = scripted(reads, fold, &[root]);
+        let error = observer
+            .handle(&event(root, libc::NOTE_FORK, 0))
+            .expect_err("the child's record read failed");
+        assert_eq!(failed(&error), ("proc_pidinfo", 901, Some(libc::EIO)));
+        assert_eq!(
+            observer.missed(),
+            [ProcessCoverageGap::UnobservedBirth { pid: 901 }]
+        );
     }
 
     /// An image or child list read while the pid changed life is a stranger's and is never

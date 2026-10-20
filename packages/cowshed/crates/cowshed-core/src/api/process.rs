@@ -318,6 +318,118 @@ pub enum ProcessCoverageGap {
     UnreadFinalUsage { pid: u32 },
 }
 
+/// What held a job's process membership while its retirement proved the membership empty, which
+/// fixes how far that proof reaches. A job states one only when an owner that held its
+/// membership retired it: a job that never spawned, or that ran under a spawn sink with no
+/// native membership, states none rather than a proof it lacks.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum JobContainment {
+    /// The kernel's own membership (a Linux cgroup) held every descendant, including those that
+    /// left the process group. Empty membership is proven, not exhaustive process metadata.
+    Kernel,
+    /// The observer's retained process fold held the scope (macOS has no kernel membership).
+    /// Whole-job retirement also holds the unreaped leader's group; subtree retirement uses only
+    /// the retained root and its immutable descendants, never the whole group or its siblings.
+    /// Unobserved escaped descendants are outside this proof. `lost` names observations known
+    /// missing; an empty `lost` still never asserts completeness.
+    Observed { lost: Vec<ProcessCoverageGap> },
+}
+
+/// A live member retirement signalled before proving its scoped membership empty. This includes
+/// a live leader on cancellation or a live subtree root; a member already ended is not signalled.
+/// A successful receipt names processes already ended, never survivors left running.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutlivedProcess {
+    /// Its position in [`JobProcessTree::processes`] when the hold retained its life. Absent
+    /// means the hold could not say (a cgroup keeps no birth order): unknown, never "no index".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    /// Its pid when retirement signalled it: display only, as [`JobProcessSample::pid`].
+    pub pid: u32,
+    /// The executable it last ran, when an identity-fenced read named it. Absent when no read
+    /// could (it exited first, or the kernel refused the read): never an empty or guessed
+    /// program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// The last signal retirement delivered to it.
+    pub signal: i32,
+}
+
+impl OutlivedProcess {
+    /// Whether it names its image honestly: a program a read named, or none. An empty string
+    /// stands for neither, so no record carries one.
+    pub fn consistent(&self) -> bool {
+        self.image.as_deref() != Some("")
+    }
+}
+
+/// What retiring process membership proved: what held it and the live members it signalled,
+/// including a live leader or subtree root. Empty `outlived` means no process was ended only
+/// when `outlived_incomplete` is false. Kernel-proven empty membership does not prove exhaustive
+/// metadata: an atomic kill can end members no identity-fenced read named.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobProcessRetirement {
+    pub containment: JobContainment,
+    pub outlived: Vec<OutlivedProcess>,
+    /// Retirement may have ended members absent from `outlived`; never a weaker emptiness proof.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outlived_incomplete: bool,
+}
+
+/// An opaque reference to one retained process life in one monitor. Neither its pid nor a client
+/// birth identity is authority: the monitor authenticates the live peer before issuing this.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobSubtreeHandle {
+    pub job_id: JobId,
+    pub index: u32,
+    /// A random 32-lower-hex nonce issued for this retained root, not a process birth identity.
+    pub incarnation: String,
+}
+
+/// Why a monitor cannot admit or retire this subtree; native operational errors remain errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub enum JobSubtreeRefusal {
+    FoldUnavailable,
+    NotMember,
+    ForeignHandle,
+    /// A successful retirement already consumed this root's capability.
+    SpentHandle,
+    JobEnded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum JobSubtreeAdmission {
+    Admitted { handle: JobSubtreeHandle },
+    Refused { reason: JobSubtreeRefusal },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum JobSubtreeRetirement {
+    Retired { retirement: JobProcessRetirement },
+    Refused { reason: JobSubtreeRefusal },
+}
 /// The process a job's CPU went to most: its pid and the image it last ran.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

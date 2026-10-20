@@ -199,7 +199,7 @@ pub struct TraceContext { pub trace_id: TraceId, pub span_id: SpanId } // valida
 /// in Rust, JSON, and N-API/JavaScript `number`.
 pub struct JobId(u64); // constructed with JobId::new; 1..=2^53-1
 
-pub enum JobState { Queued, Running, Exited, Signaled, Killed, OutputLimit, Failed }
+pub enum JobState { Queued, Running, Draining, Exited, Signaled, Killed, OutputLimit, Failed }
 
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ExitStatus {
@@ -257,6 +257,9 @@ pub struct JobArtifactRecord {
     pub exit: Option<ExitStatus>,           // terminal records whose end was observed
     pub duration_ms: Option<u64>,           // terminal records whose end was observed
     pub resources: Option<JobResourceSample>,
+    pub containment: Option<JobContainment>,
+    pub outlived: Vec<OutlivedProcess>,
+    pub outlived_incomplete: bool,
     pub admission: Option<JobAdmission>,   // raw key and authored identity, present on every keyed job record
 }
 pub struct JobAdmission {
@@ -342,7 +345,7 @@ pub enum ControllerCommitment {
     Restore(RestoreCommitment),
 }
 
-For queued/running `JobInfo`, `StreamInfo` is a current bounded view; its artifact becomes authoritative only when the
+For queued/running/draining `JobInfo`, `StreamInfo` is a current bounded view; its artifact becomes authoritative only when the
 corresponding protected batch/file is complete and sealed. Background acknowledgement and checkpointing force any
 memory-only prefix to `File`. Terminal state freezes `storage`, `bytes`, and `sha256`.
 
@@ -359,6 +362,9 @@ pub struct JobInfo {
     pub started: UtcTimestamp,
     pub duration_ms: Option<u64>,
     pub resources: Option<JobResourceSample>, // absent before spawn, never a fabricated zero sample
+    pub containment: Option<JobContainment>,
+    pub outlived: Vec<OutlivedProcess>,        // omitted on the wire when empty
+    pub outlived_incomplete: bool,           // defaults false, omitted on the wire when false
     pub exit: Option<ExitStatus>,
     pub stdout: StreamInfo,
     pub stderr: StreamInfo,
@@ -1172,10 +1178,10 @@ only moves counters does not. A live process whose usage no record restated for 
 heartbeat restating its whole record; a blocker change restates no usage, so it does not postpone one. A read taken
 after a process exited is withheld from every record until its `Exited` event carries it, once, as final usage: from
 that read the process is no longer live, so no heartbeat restates it, no blocker read of it is accepted, and a late exec
-event still shows the usage read before the exit. Nothing about that process follows its exit. The job's terminal
-accounting boundary does not close observation of a still-live descendant; its stream ends after the last retained
-registration ends. Closing a reader never kills the process. Consumers use these observed facts without declaring or
-deriving an expectation from a command's argv. Events name a process by `index`, its record's position in
+event still shows the usage read before the exit. Nothing about that process follows its exit. Before terminal
+publication, the job enters nonterminal `draining` and ends its owned membership; its stream ends after the last
+retained registration ends. Closing a reader never kills the process. Consumers use these observed facts without
+declaring or deriving an expectation from a command's argv. Events name a process by `index`, its record's position in
 birth-observation order, never by a pid that another life may reuse. The generated sparse delta changes exactly one
 field, usage or blocker; absent is unchanged. A blocker observed afresh, `none` included, is SET, and a blocker no
 longer observed is CLEAR. Because lock detail lives inside `Lock`, setting any other blocker leaves no stale path or
@@ -1406,7 +1412,7 @@ supervisor that ran the job retires.
   the plan under the same sweep options before the first effect. `abandonedBundle` names a regular recovery bundle in
   `sessions/.trash` only when `GcOptions.abandoned` is explicitly true; a default sweep never names or reclaims one.
 - `JobId` is a positive integer no greater than `2^53-1`.
-  `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, resources?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
+  `JobInfo = { repoId, workspaceIncarnation, jobId, state, pid?, grantRevision, argv | script, failure?, cwd, started, durationMs?, resources?, containment?, outlived?, outlivedIncomplete?, exit?, stdout, stderr, trace, outputLimit?, stdin }`.
   The command is flattened: exactly one of `argv` and `script` is present, and an `ExecRequest` carries the same field.
   `script = { parts: string[], values: ({word:string} | {words:string[]})[] }` obeys the `ScriptCommand` bounds above.
   `failure` is present only on a `failed` job: `"scriptSyntax"` when its script did not parse (exit
@@ -1428,7 +1434,30 @@ supervisor that ran the job retires.
   invariants. `cwd` is required but nullable on the wire: `null` means the workspace mount root and a string means
   exactly one validated, normalized workspace-relative `WorkspacePath`. Decoders reject an omitted `cwd`; neither `""`
   nor `"."` is a root sentinel, and the same `Option<WorkspacePath>` is preserved by Rust, JSON, CLI, N-API, MCP, and
-  Arrow.
+  Arrow. `draining` is nonterminal: the direct child may have exited, but the actor still holds the process, CPU and
+  volume claims until membership retirement succeeds.
+  `containment = {kind:"kernel"} | {kind:"observed",lost:ProcessCoverageGap[]}` records the successful membership proof,
+  not a promise at admission. Darwin always reports `observed`; even an empty `lost` cannot prove that coalesced fork
+  events missed no life. `outlived` records the live members retirement signalled, including a live leader on
+  cancellation or a live subtree root, as `{index?:number,pid:number,image?:string,signal:number}`. A successful receipt
+  names processes already ended, never survivors left running. `index` absent means its observed-tree index is unknown,
+  not that it had no index; `image` absent means no identity-fenced image read succeeded. No synthetic index or empty
+  image fills either gap. `signal` is the last delivered retirement signal. `outlivedIncomplete` defaults to false and
+  is omitted when false; true means retirement may have ended members absent from `outlived`. Kernel-proven empty
+  membership does not prove exhaustive metadata. An empty `outlived` means the operation ended no processes only when
+  this marker is false. A true marker requires containment and, where the DTO carries one, a spawned pid; receipts are
+  stated only while draining or terminal. A refused/never-spawned job has no containment, no rows and a false marker,
+  never an invented kernel proof. The sealed record retains the receipt unchanged.
+  `JobSubtreeHandle = {jobId,index,incarnation}` is opaque: the monitor issues a random 32-lower-hex nonce for the
+  authenticated retained root, not a client birth identity. Changing its job, index or nonce cannot select another root.
+  `JobSubtreeAdmission = {kind:"admitted",handle} | {kind:"refused",reason}` and
+  `JobSubtreeRetirement = {kind:"retired",retirement:JobProcessRetirement} | {kind:"refused",reason}` are closed tagged
+  unions; reasons are `foldUnavailable`, `notMember`, `foreignHandle`, `jobEnded` and `spentHandle`. A successful
+  retirement consumes the root capability; replay is `spentHandle`, while native failure remains an error and can be
+  retried. A naturally ended, previously unspent subtree returns an empty receipt on first retirement. Subtree scope is
+  the retained root and its descendants through immutable parent identities, not siblings or an expanded whole-job
+  process group. Linux without an observed fold refuses with `foldUnavailable`; no RAM lease substitutes for one. Every
+  subtree DTO denies unknown fields.
 - `StreamInfo = { storage, bytes, sha256, summary }` with the exact discriminated unions above. JSON decoders reject
   unknown/multiple discriminants, invalid digest hex, inline data over `MAX_INLINE_OUTPUT_BYTES`, a protected file path
   outside `.cowshed/job/**`, or a redirect source outside the writable workspace. Complete output bytes never appear in
@@ -1863,7 +1892,10 @@ One boundary answer, no ambiguity:
   Both are valid in `JobInfo` and `ExecRecord`; neither may omit the observed exit status. A job killed before its
   command existed — withdrawn while queued for its CPU grant (11_shell.md, "Server-owned CPU admission and nice
   placement") — never ran: its `JobInfo` is `Killed` with no `pid` and no `exit`. A killed `JobInfo` with a `pid` and no
-  `exit` is refused, so "never ran" and "ran and was killed" never share a projection.
+  `exit` is refused, so "never ran" and "ran and was killed" never share a projection. Cancellation uses the same
+  membership retirement as spontaneous leader exit: snapshot, TERM, existing grace, KILL where necessary, and native
+  exit proof. A retirement refusal is an error, not permission to release the claim or publish terminal state. Neither
+  quiet output, elapsed age nor zero CPU authorizes cancellation.
 - **Binary stdin** is supported without shell interpolation: `ExecOptions.stdin` accepts inline `Uint8Array`,
   backpressured `AsyncIterable<Uint8Array>`, or a workspace-relative file object with the canonical no-follow open.
 - **Stdin lifecycle is observable.** Open occurs after `JobId` allocation; EOF closes child stdin once, cancellation
@@ -1938,13 +1970,15 @@ JobInfo and SealedJob expose admitted class/scope, actual cpuTokens and observed
 CowshedError carries typed cpuAdmission (the gateway's refusal, an invalid request or a protocol failure) and priority
 (actual pid, requested/observed nice and errno). A failed or absent observation is never fabricated.
 
-Records now use layout12: layout11's columns remain an exact prefix, followed by nullable UInt64 admission_want, the
-want a keyed request named, null for one that named none and for every unkeyed record. Layout11 appended nullable Binary
-admission_env_sha256 to layout10, exactly 32 bytes and present exactly for keyed job records. Earlier histories are
-retained untouched and set aside, not migrated or re-keyed. On an existing incarnation that may have served keyed work,
-new keyed exec is refused as unprovable until the incarnation is renewed. **Operators must renew existing incarnations
-before keyed exec after upgrading.** Unkeyed operator CLI exec remains available. This is the existing strict
-history-attestation contract, not silent compatibility.
+Records now use layout14: layout13's columns remain an exact prefix, followed by the nullable boolean
+retirement_outlived_incomplete marker. Layout13 appended the nullable retirement_containment and retirement_outlived
+wire-JSON receipt columns (11_shell.md, "Server-owned CPU admission and nice placement"). Layout12 appended nullable
+UInt64 admission_want, the want a keyed request named, null for one that named none and for every unkeyed record.
+Layout11 appended nullable Binary admission_env_sha256 to layout10, exactly 32 bytes and present exactly for keyed job
+records. Earlier histories are retained untouched and set aside, not migrated or re-keyed. On an existing incarnation
+that may have served keyed work, new keyed exec is refused as unprovable until the incarnation is renewed. **Operators
+must renew existing incarnations before keyed exec after upgrading.** Unkeyed operator CLI exec remains available. This
+is the existing strict history-attestation contract, not silent compatibility.
 
 ## CLI and API exec parity
 

@@ -1530,7 +1530,10 @@ mod tests {
         let ledger = super::super::job_groups::ledger_path(&socket);
         let leader = super::super::job_groups::GroupLeader::observe(group).expect("leader");
         super::super::job_groups::Recorder::new(ledger.clone())
-            .record([(7, leader)].into_iter(), &[])
+            .record(
+                [super::super::job_groups::JobGroupClaim::group(7, leader)].into_iter(),
+                &[],
+            )
             .expect("ledger");
         let foreign = std::fs::symlink_metadata(&socket)
             .expect("its socket")

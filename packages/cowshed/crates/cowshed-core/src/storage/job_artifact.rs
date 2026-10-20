@@ -33,6 +33,7 @@ use crate::api::dto::{
     WorkspaceIntroducedCommitment, WorkspacePath, WorkspaceRetiredCommitment,
     validate_command_argv,
 };
+use crate::api::process::{JobContainment, OutlivedProcess};
 use crate::api::resources::{
     ChargedMemoryBytes, ChargedMemoryUsage, CpuMicros, CpuTotals, HostLoadSample, JobAccounting,
     JobResourceSample, JobStreamWatermark, JobVolumeUsage, OneCoreCpuPercent, ResidentBytes,
@@ -89,10 +90,10 @@ const JOB_FLOOR: CounterFile = CounterFile {
     magic: b"CSJOB001",
     what: "job id floor",
 };
-/// Layout 12 keeps every column of layout 11, which kept every column of layout 10 and appended
-/// `admission_env_sha256`, and appends `admission_want`. A store holding a record in an earlier
-/// layout is set aside whole ([`SetAsideStore`]), never read or migrated.
-const RECORD_SCHEMA_VERSION: u64 = 12;
+/// Layout 14 keeps every column of layout 13 and appends the incomplete-metadata boolean to
+/// [`RETIREMENT_COLUMNS`]. A store holding a record in an earlier layout is set aside whole
+/// ([`SetAsideStore`]), never read or migrated.
+const RECORD_SCHEMA_VERSION: u64 = 14;
 /// The first layout whose job records carry admission keys. A store in it or a later layout set
 /// aside while serving an incarnation took that incarnation's keyed admissions along, so the
 /// keys it named can no longer be proven absent ([`AdmissionLookup::Unprovable`]).
@@ -192,6 +193,18 @@ const ADMISSION_ENV_SHA256_COLUMN: usize = CPU_COLUMN + CPU_COLUMNS.len();
 /// none. `cpu_want` holds the want its admission resolved, which may differ from one supervisor to
 /// the next for the same unnamed request; keyed identity is the request as named.
 const ADMISSION_WANT_COLUMN: usize = ADMISSION_ENV_SHA256_COLUMN + 1;
+/// What retiring the job's process membership proved. Layout 13 appended containment and
+/// outlived wire JSON after `admission_want`; layout 14 adds a boolean marking members
+/// retirement may have ended without a row. All three are null without a receipt, and all are
+/// present with one, including `[]` and false for a complete empty receipt. Earlier layouts
+/// are set aside, never decoded into a metadata-completeness claim.
+const RETIREMENT_COLUMNS: [&str; 3] = [
+    "retirement_containment",
+    "retirement_outlived",
+    "retirement_outlived_incomplete",
+];
+/// The first of [`RETIREMENT_COLUMNS`].
+const RETIREMENT_COLUMN: usize = ADMISSION_WANT_COLUMN + 1;
 /// [`JobAccounting::LinuxCgroupV2`] in its source column: its wire kind.
 const CGROUP_SOURCE: &str = "linuxCgroupV2";
 #[cfg(unix)]
@@ -434,6 +447,14 @@ pub struct JobArtifactRecord {
     /// The nice value the job's owned command was observed at right after its spawn set it; only
     /// the terminal record of a job whose command was observed. Never inferred.
     pub nice: Option<i32>,
+    /// What held the job's process membership while its retirement proved it empty; only the
+    /// terminal record of a job whose membership an owner retired. Never inferred.
+    pub containment: Option<JobContainment>,
+    /// The live members retirement signalled, including a live leader on cancellation; empty without
+    /// `containment`.
+    pub outlived: Vec<OutlivedProcess>,
+    /// Retirement may have ended members absent from `outlived`; false without `containment`.
+    pub outlived_incomplete: bool,
 }
 
 /// A keyed exec's admission: its key and every part of its request a repeat under the key must
@@ -776,7 +797,14 @@ impl JobArtifactRecord {
         if self.failure.is_some() && self.state != JobState::Failed {
             return Err(integrity(0, "only a failed job record names a failure"));
         }
-        if matches!(self.state, JobState::Queued | JobState::Running)
+        if self.state == JobState::Draining {
+            return Err(integrity(
+                0,
+                "a draining job has no durable record: its terminal record is sealed after its \
+                 membership is retired",
+            ));
+        }
+        if !self.state.is_terminal()
             && (self.exit.is_some() || self.duration_ms.is_some() || self.resources.is_some())
         {
             return Err(integrity(
@@ -785,12 +813,31 @@ impl JobArtifactRecord {
                  resource sample",
             ));
         }
-        if matches!(self.state, JobState::Queued | JobState::Running)
-            && (self.cpu_tokens.is_some() || self.nice.is_some())
-        {
+        if !self.state.is_terminal() && (self.cpu_tokens.is_some() || self.nice.is_some()) {
             return Err(integrity(
                 0,
                 "only a terminal job record names its granted CPU tokens or its observed nice",
+            ));
+        }
+        if !self.state.is_terminal()
+            && (self.containment.is_some() || !self.outlived.is_empty() || self.outlived_incomplete)
+        {
+            return Err(integrity(
+                0,
+                "only a terminal job record names what retiring its process membership found",
+            ));
+        }
+        if self.containment.is_none() && (!self.outlived.is_empty() || self.outlived_incomplete) {
+            return Err(integrity(
+                0,
+                "a job record names outlived processes or incomplete metadata only with the \
+                 containment that retired them",
+            ));
+        }
+        if !self.outlived.iter().all(OutlivedProcess::consistent) {
+            return Err(integrity(
+                0,
+                "an outlived process names its image or none: an empty one stands for neither",
             ));
         }
         // A resident is granted no tokens (05_gateway.md, "A resident holds no token"), so its
@@ -862,6 +909,14 @@ pub struct JobEnding {
     pub cpu_tokens: Option<NonZeroUsize>,
     /// The nice its command was observed at; `None` when no command was observed.
     pub nice: Option<i32>,
+    /// What held the job's process membership while its retirement proved it empty; `None` when
+    /// no owner retired a native membership (it never spawned, or ran under a spawn sink).
+    pub containment: Option<JobContainment>,
+    /// The live members retirement signalled, including a live leader on cancellation; empty without
+    /// `containment`.
+    pub outlived: Vec<OutlivedProcess>,
+    /// Retirement may have ended members absent from `outlived`; false without `containment`.
+    pub outlived_incomplete: bool,
 }
 
 /// An ending of which nothing is known beyond its state: a job refused before its command ran.
@@ -875,6 +930,9 @@ impl From<JobState> for JobEnding {
             failure: None,
             cpu_tokens: None,
             nice: None,
+            containment: None,
+            outlived: Vec::new(),
+            outlived_incomplete: false,
         }
     }
 }
@@ -1047,7 +1105,7 @@ impl CheckpointManifestRecord {
                     message: "checkpoint manifest contains a duplicate job".into(),
                 });
             }
-            if matches!(job.state, JobState::Queued | JobState::Running)
+            if !job.state.is_terminal()
                 && (!job.stdout.storage_kind.is_file() || !job.stderr.storage_kind.is_file())
             {
                 return Err(ArtifactError::Integrity {
@@ -1248,7 +1306,7 @@ impl ArtifactStore {
                 continue;
             };
             if record.workspace_incarnation == workspace_incarnation
-                && !matches!(record.state, JobState::Queued | JobState::Running)
+                && record.state.is_terminal()
                 && committed_jobs
                     .insert(record.job_id, record.clone())
                     .is_some()
@@ -1414,7 +1472,7 @@ impl ArtifactStore {
         for frame in &recovery.frames {
             if let ProtectedRecord::Job(record) = &frame.record
                 && record.workspace_incarnation == self.workspace_incarnation
-                && !matches!(record.state, JobState::Queued | JobState::Running)
+                && record.state.is_terminal()
                 && !self.committed_jobs.contains_key(&record.job_id)
             {
                 new_terminals.insert(record.job_id, record.clone());
@@ -1491,6 +1549,9 @@ impl ArtifactStore {
             scheduling,
             cpu_tokens: None,
             nice: None,
+            containment: None,
+            outlived: Vec::new(),
+            outlived_incomplete: false,
         };
         self.append_record(record)?;
         let replaced = self.live_jobs.insert(
@@ -1543,7 +1604,7 @@ impl ArtifactStore {
             .filter_map(|frame| match &frame.record {
                 ProtectedRecord::Job(record)
                     if record.workspace_incarnation == self.workspace_incarnation
-                        && matches!(record.state, JobState::Queued | JobState::Running)
+                        && !record.state.is_terminal()
                         && !self.committed_jobs.contains_key(&record.job_id)
                         && !self.live_jobs.contains_key(&record.job_id) =>
                 {
@@ -1586,7 +1647,7 @@ impl ArtifactStore {
         let path = records_path(&self.workspace_root);
         let lock = RecordsLock::acquire(&path)?;
         self.refresh_under_lock(&lock)?;
-        let duplicate_terminal = !matches!(record.state, JobState::Queued | JobState::Running)
+        let duplicate_terminal = record.state.is_terminal()
             && record.workspace_incarnation == self.workspace_incarnation
             && self.committed_jobs.contains_key(&record.job_id);
         if duplicate_terminal {
@@ -1615,7 +1676,7 @@ impl ArtifactStore {
         if let Some(admission) = &record.admission {
             self.admissions.admit(&record, admission);
         }
-        if !matches!(record.state, JobState::Queued | JobState::Running) {
+        if record.state.is_terminal() {
             self.committed_jobs.insert(record.job_id, record.clone());
         }
         self.records_seen = RecordsIdentity::of(&path)?;
@@ -2053,6 +2114,9 @@ impl ArtifactStore {
             failure,
             cpu_tokens,
             nice,
+            containment,
+            outlived,
+            outlived_incomplete,
         } = ending.into();
         self.validate_token(&token)?;
         let mut live =
@@ -2070,7 +2134,7 @@ impl ArtifactStore {
                     message: "job artifact stream failed; abort was required",
                 });
             }
-            if matches!(state, JobState::Queued | JobState::Running) {
+            if !state.is_terminal() {
                 return Err(ArtifactError::InvalidTerminalState(
                     "finish requires a terminal job state",
                 ));
@@ -2105,6 +2169,9 @@ impl ArtifactStore {
                 scheduling: live.scheduling,
                 cpu_tokens,
                 nice,
+                containment,
+                outlived,
+                outlived_incomplete,
             };
             let (record, terminal_batch_sha256) = self.append_record(record)?;
             Ok(SealedJobArtifacts {
@@ -2860,7 +2927,7 @@ fn validate_recovered_files_since(
         match &frame.record {
             ProtectedRecord::Job(record)
                 if &record.workspace_incarnation == current_incarnation
-                    && !matches!(record.state, JobState::Queued | JobState::Running) =>
+                    && record.state.is_terminal() =>
             {
                 if !terminal_jobs.insert(record.job_id) {
                     return Err(integrity(
@@ -3811,7 +3878,7 @@ fn recover_records_with_budget_under_lock(
                     });
                 }
                 previous_job = Some(current.clone());
-                if !matches!(current.state, JobState::Queued | JobState::Running)
+                if current.state.is_terminal()
                     && !terminal_jobs
                         .insert((current.workspace_incarnation.clone(), current.job_id))
                 {
@@ -4220,6 +4287,9 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field(CPU_COLUMNS[5], DataType::Utf8, true),
         field("admission_env_sha256", DataType::Binary, true),
         field("admission_want", DataType::UInt64, true),
+        field(RETIREMENT_COLUMNS[0], DataType::Utf8, true),
+        field(RETIREMENT_COLUMNS[1], DataType::Utf8, true),
+        field(RETIREMENT_COLUMNS[2], DataType::Boolean, true),
     ]))
 }
 
@@ -4627,6 +4697,19 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
             .map(token_column)
             .transpose()?,
     ])));
+    let receipt =
+        record.containment.is_some() || !record.outlived.is_empty() || record.outlived_incomplete;
+    columns.extend([
+        Arc::new(StringArray::from(vec![
+            record.containment.as_ref().map(wire_json).transpose()?,
+        ])) as ArrayRef,
+        Arc::new(StringArray::from(vec![
+            receipt.then(|| wire_json(&record.outlived)).transpose()?,
+        ])),
+        Arc::new(BooleanArray::from(vec![
+            receipt.then_some(record.outlived_incomplete),
+        ])),
+    ]);
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
@@ -4722,6 +4805,7 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
     let resources = decode_resources(batch, job_id)?;
     let admission = decode_admission(batch, ADMISSION_COLUMN)?;
     let (scheduling, cpu_tokens, nice) = decode_cpu(batch, CPU_COLUMN)?;
+    let (containment, outlived, outlived_incomplete) = decode_retirement(batch, RETIREMENT_COLUMN)?;
     Ok(JobArtifactRecord {
         repo_id,
         workspace_incarnation,
@@ -4741,6 +4825,9 @@ fn batch_to_job_record(batch: &RecordBatch) -> Result<JobArtifactRecord, Artifac
         scheduling,
         cpu_tokens,
         nice,
+        containment,
+        outlived,
+        outlived_incomplete,
     })
 }
 
@@ -4834,6 +4921,29 @@ fn decode_cpu(
         .then(|| int32(batch, first + 4).map(|column| column.value(0)))
         .transpose()?;
     Ok((scheduling, cpu_tokens, nice))
+}
+
+/// The current layout's receipt is wholly absent or wholly present, including its completeness
+/// marker. Missing metadata is not a missing receipt, and a partial receipt is always damage.
+fn decode_retirement(
+    batch: &RecordBatch,
+    first: usize,
+) -> Result<(Option<JobContainment>, Vec<OutlivedProcess>, bool), ArtifactError> {
+    match (
+        batch.column(first).is_null(0),
+        batch.column(first + 1).is_null(0),
+        batch.column(first + 2).is_null(0),
+    ) {
+        (true, true, true) => Ok((None, Vec::new(), false)),
+        (false, false, false) => Ok((
+            Some(from_wire_json(batch, first, "job containment")?),
+            from_wire_json(batch, first + 1, "list of outlived processes")?,
+            boolean(batch, first + 2)?.value(0),
+        )),
+        _ => Err(ArtifactError::Arrow(
+            "retirement columns must all be null or all present".into(),
+        )),
+    }
 }
 
 /// The terminal resource sample of a current-layout job batch: absent when every one of
@@ -5735,6 +5845,7 @@ pub(crate) fn state_name(state: JobState) -> &'static str {
     match state {
         JobState::Queued => "queued",
         JobState::Running => "running",
+        JobState::Draining => "draining",
         JobState::Exited => "exited",
         JobState::Signaled => "signaled",
         JobState::Killed => "killed",
@@ -5747,6 +5858,7 @@ fn parse_state(value: &str) -> Result<JobState, ArtifactError> {
     match value {
         "queued" => Ok(JobState::Queued),
         "running" => Ok(JobState::Running),
+        "draining" => Ok(JobState::Draining),
         "exited" => Ok(JobState::Exited),
         "signaled" => Ok(JobState::Signaled),
         "killed" => Ok(JobState::Killed),
@@ -7347,6 +7459,9 @@ mod tests {
             scheduling: JobScheduling::default(),
             cpu_tokens: None,
             nice: None,
+            containment: None,
+            outlived: Vec::new(),
+            outlived_incomplete: false,
         }
     }
 
@@ -7875,9 +7990,7 @@ mod tests {
         };
         let batch = job_record_to_batch(&named).unwrap();
         let schema = batch.schema();
-        assert_eq!(RECORD_SCHEMA_VERSION, 12);
         assert_eq!(ADMISSION_WANT_COLUMN, 85);
-        assert_eq!(schema.fields().len(), ADMISSION_WANT_COLUMN + 1);
         assert_eq!(
             schema.field(ADMISSION_WANT_COLUMN),
             &field("admission_want", DataType::UInt64, true)
@@ -7927,6 +8040,510 @@ mod tests {
             "layout 11 remains the exact prefix"
         );
         assert_damage(&prior, "layout 11 cannot say whether its want was named");
+    }
+
+    /// Layout 13 appends the retirement receipt after layout 12's named want: the containment
+    /// that held the membership and the processes that outlived the leader, each as its wire
+    /// JSON, both null in a record without a receipt. Layout 12 stays the exact prefix.
+    #[test]
+    fn layout_thirteen_appends_the_retirement_columns_after_the_complete_layout_twelve_prefix() {
+        let record = JobArtifactRecord {
+            exit: Some(ExitStatus::Exited { code: 0 }),
+            duration_ms: Some(1234),
+            containment: Some(JobContainment::Observed {
+                lost: vec![ProcessCoverageGap::UncountedFork { pid: 4242 }],
+            }),
+            outlived: vec![
+                OutlivedProcess {
+                    index: Some(2),
+                    pid: 4243,
+                    image: Some("/bin/sleep".into()),
+                    signal: 9,
+                },
+                OutlivedProcess {
+                    index: None,
+                    pid: 4244,
+                    image: None,
+                    signal: 9,
+                },
+            ],
+            ..valid_job_record(9)
+        };
+        let batch = job_record_to_batch(&record).unwrap();
+        let schema = batch.schema();
+        assert_eq!(RETIREMENT_COLUMNS.len(), 3);
+        assert_eq!(RETIREMENT_COLUMN, 86);
+        assert_eq!(
+            schema.fields().len(),
+            RETIREMENT_COLUMN + RETIREMENT_COLUMNS.len()
+        );
+        assert_eq!(
+            schema.field(RETIREMENT_COLUMN - 1),
+            &field("admission_want", DataType::UInt64, true)
+        );
+        for (offset, name) in RETIREMENT_COLUMNS[..2].iter().enumerate() {
+            assert_eq!(
+                schema.field(RETIREMENT_COLUMN + offset),
+                &field(name, DataType::Utf8, true)
+            );
+        }
+        assert_eq!(
+            round_trip(&record),
+            record,
+            "the containment and every outlived process survive"
+        );
+        let wire = |column: usize| -> serde_json::Value {
+            serde_json::from_str(string(&batch, column).unwrap().value(0)).unwrap()
+        };
+        assert_eq!(
+            wire(RETIREMENT_COLUMN),
+            serde_json::json!({
+                "kind": "observed",
+                "lost": [{ "kind": "uncountedFork", "pid": 4242 }],
+            })
+        );
+        assert_eq!(
+            wire(RETIREMENT_COLUMN + 1),
+            serde_json::json!([
+                { "index": 2, "pid": 4243, "image": "/bin/sleep", "signal": 9 },
+                { "pid": 4244, "signal": 9 },
+            ]),
+            "an index or image nothing observed is absent, never a zero or an empty string"
+        );
+
+        // A receipt that found nothing alive is `[]`, present: unlike the null of no receipt.
+        let kernel = JobArtifactRecord {
+            containment: Some(JobContainment::Kernel),
+            ..valid_job_record(9)
+        };
+        let kernel_batch = admitted(&kernel);
+        let text = |column: usize| string(&kernel_batch, column).unwrap().value(0);
+        assert_eq!(text(RETIREMENT_COLUMN), r#"{"kind":"kernel"}"#);
+        assert_eq!(text(RETIREMENT_COLUMN + 1), "[]");
+        assert_eq!(round_trip(&kernel), kernel);
+        let unreceipted = admitted(&valid_job_record(9));
+        assert!(unreceipted.column(RETIREMENT_COLUMN).is_null(0));
+        assert!(unreceipted.column(RETIREMENT_COLUMN + 1).is_null(0));
+        let read = round_trip(&valid_job_record(9));
+        assert_eq!((read.containment, read.outlived), (None, Vec::new()));
+
+        let prefix_schema = Arc::new(Schema::new(schema.fields()[..RETIREMENT_COLUMN].to_vec()));
+        let mut prefix_columns = batch.columns()[..RETIREMENT_COLUMN].to_vec();
+        prefix_columns[1] = Arc::new(UInt64Array::from(vec![12]));
+        let prior = RecordBatch::try_new(prefix_schema, prefix_columns).unwrap();
+        assert_eq!(
+            earlier_layout(&prior),
+            Some(12),
+            "layout 12 remains the exact prefix"
+        );
+        assert_damage(&prior, "layout 12 cannot attest to a retirement receipt");
+    }
+
+    /// Layout 13's receipt cannot attest to exhaustive metadata; layout 14 appends a boolean
+    /// without changing any prior column and never decodes a layout 13 receipt as complete.
+    #[test]
+    fn layout_fourteen_appends_incomplete_metadata_after_the_complete_layout_thirteen_prefix() {
+        assert_eq!(RECORD_SCHEMA_VERSION, 14);
+        let record = JobArtifactRecord {
+            containment: Some(JobContainment::Kernel),
+            outlived_incomplete: true,
+            ..valid_job_record(9)
+        };
+        let batch = admitted(&record);
+        assert_eq!(RETIREMENT_COLUMN + 2, 88);
+        assert_eq!(batch.num_columns(), 89);
+        assert_eq!(
+            batch.schema().field(RETIREMENT_COLUMN + 2),
+            &field("retirement_outlived_incomplete", DataType::Boolean, true),
+        );
+        assert_eq!(
+            string(&batch, RETIREMENT_COLUMN + 1).unwrap().value(0),
+            "[]"
+        );
+        assert!(boolean(&batch, RETIREMENT_COLUMN + 2).unwrap().value(0));
+        assert_eq!(round_trip(&record), record);
+        let complete = JobArtifactRecord {
+            outlived_incomplete: false,
+            ..record.clone()
+        };
+        let complete_batch = admitted(&complete);
+        assert!(
+            !boolean(&complete_batch, RETIREMENT_COLUMN + 2)
+                .unwrap()
+                .value(0)
+        );
+        assert_eq!(round_trip(&complete), complete);
+        let unreceipted = valid_job_record(9);
+        assert!(
+            admitted(&unreceipted)
+                .column(RETIREMENT_COLUMN + 2)
+                .is_null(0)
+        );
+        assert!(!round_trip(&unreceipted).outlived_incomplete);
+
+        let prior = earlier_batch(&record, 1, 13);
+        assert_eq!(prior.num_columns(), RETIREMENT_COLUMN + 2);
+        assert_eq!(
+            &prior.schema().fields()[..],
+            &batch.schema().fields()[..RETIREMENT_COLUMN + 2],
+        );
+        assert_eq!(earlier_layout(&prior), Some(13));
+        assert_damage(
+            &prior,
+            "layout 13 cannot attest to complete retirement metadata",
+        );
+    }
+
+    #[test]
+    fn incomplete_retirement_metadata_needs_a_whole_terminal_receipt() {
+        let record = JobArtifactRecord {
+            containment: Some(JobContainment::Kernel),
+            outlived_incomplete: true,
+            ..valid_job_record(9)
+        };
+        let batch = admitted(&record);
+        // Every nonempty proper subset is damaged, whether the marker alone, either JSON
+        // column alone, or either pair is present.
+        for present in 1_u8..7 {
+            let mut partial = batch.clone();
+            for offset in 0..RETIREMENT_COLUMNS.len() {
+                if present & (1 << offset) == 0 {
+                    partial = null_column(&partial, RETIREMENT_COLUMN + offset);
+                }
+            }
+            assert_damage(&partial, "a partial retirement receipt");
+        }
+        for malformed in [
+            JobArtifactRecord {
+                containment: None,
+                ..record.clone()
+            },
+            JobArtifactRecord {
+                state: JobState::Queued,
+                ..record.clone()
+            },
+            JobArtifactRecord {
+                state: JobState::Running,
+                ..record.clone()
+            },
+            JobArtifactRecord {
+                state: JobState::Draining,
+                ..record.clone()
+            },
+        ] {
+            assert!(malformed.validate().is_err());
+            let batch = job_record_to_batch(&malformed).unwrap();
+            assert!(
+                batch_to_protected_record(&batch)
+                    .and_then(|record| record.validate())
+                    .is_err()
+            );
+        }
+        let with_rows = JobArtifactRecord {
+            outlived: vec![OutlivedProcess {
+                index: None,
+                pid: 4243,
+                image: None,
+                signal: 9,
+            }],
+            ..record
+        };
+        assert_eq!(round_trip(&with_rows), with_rows);
+    }
+
+    /// The retirement columns are null together or present together, and what is present is a
+    /// whole receipt: half of one, a containment that is no containment, or an outlived process
+    /// with no signal is damage, never a receipt read as far as it goes.
+    #[test]
+    fn the_retirement_columns_decode_only_a_whole_receipt() {
+        let receipt = JobArtifactRecord {
+            containment: Some(JobContainment::Kernel),
+            outlived: vec![OutlivedProcess {
+                index: Some(1),
+                pid: 4243,
+                image: Some("/bin/sleep".into()),
+                signal: 9,
+            }],
+            ..valid_job_record(9)
+        };
+        let batch = admitted(&receipt);
+        assert_damage(
+            &null_column(&batch, RETIREMENT_COLUMN),
+            "outlived processes without their containment",
+        );
+        assert_damage(
+            &null_column(&batch, RETIREMENT_COLUMN + 1),
+            "a containment without its list of outlived processes",
+        );
+        for (column, text, what) in [
+            (
+                RETIREMENT_COLUMN,
+                r#"{"kind":"observed"}"#,
+                "an observed containment with no lost list",
+            ),
+            (
+                RETIREMENT_COLUMN,
+                r#"{"kind":"kernel""#,
+                "a truncated containment",
+            ),
+            (
+                RETIREMENT_COLUMN + 1,
+                r#"{"pid":4243}"#,
+                "an outlived list that is no list",
+            ),
+            (
+                RETIREMENT_COLUMN + 1,
+                r#"[{"pid":4243}]"#,
+                "an outlived process with no signal",
+            ),
+        ] {
+            let damaged = replace_column(
+                &batch,
+                column,
+                Arc::new(StringArray::from(vec![Some(text)])),
+            );
+            assert_damage(&damaged, what);
+        }
+    }
+
+    /// Only a terminal record names a receipt, its survivors need the containment that found
+    /// them and name an image or none, and a draining job is never a durable record.
+    #[test]
+    fn only_a_terminal_record_names_a_receipt_and_draining_is_never_durable() {
+        let survivor = OutlivedProcess {
+            index: Some(1),
+            pid: 4243,
+            image: Some("/bin/sleep".into()),
+            signal: 9,
+        };
+        let refused = |record: JobArtifactRecord| {
+            matches!(record.validate(), Err(ArtifactError::Integrity { .. }))
+        };
+        for state in [JobState::Queued, JobState::Running, JobState::Draining] {
+            assert!(
+                refused(JobArtifactRecord {
+                    state,
+                    containment: Some(JobContainment::Kernel),
+                    ..valid_job_record(9)
+                }),
+                "a {state:?} record has retired nothing"
+            );
+        }
+        assert!(
+            refused(JobArtifactRecord {
+                state: JobState::Draining,
+                ..valid_job_record(9)
+            }),
+            "draining is a supervisor's state, never a durable record"
+        );
+        assert!(
+            refused(JobArtifactRecord {
+                outlived: vec![survivor.clone()],
+                ..valid_job_record(9)
+            }),
+            "survivors need the containment that found them"
+        );
+        assert!(
+            refused(JobArtifactRecord {
+                containment: Some(JobContainment::Kernel),
+                outlived: vec![OutlivedProcess {
+                    image: Some(String::new()),
+                    ..survivor.clone()
+                }],
+                ..valid_job_record(9)
+            }),
+            "an empty image stands for no image, which is `None`"
+        );
+        for state in [
+            JobState::Exited,
+            JobState::Signaled,
+            JobState::Killed,
+            JobState::Failed,
+        ] {
+            JobArtifactRecord {
+                state,
+                containment: Some(JobContainment::Kernel),
+                outlived: vec![survivor.clone()],
+                ..valid_job_record(9)
+            }
+            .validate()
+            .unwrap_or_else(|error| panic!("a {state:?} record names its receipt: {error}"));
+        }
+    }
+
+    /// What retiring a job's membership found rides its ending into the sealed record and out of
+    /// a reopened store; an ending that knows only its state seals no receipt.
+    #[test]
+    fn an_ending_keeps_its_retirement_receipt_across_seal_and_reopen() {
+        let root = temp_root("retirement-receipt");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        let begin = |store: &mut ArtifactStore| {
+            let job_id = store.next_job_id().unwrap();
+            let token = store
+                .begin_job(
+                    job_id,
+                    1,
+                    &argv_true(),
+                    None,
+                    JobScheduling::default(),
+                    OutputTargets::default(),
+                )
+                .unwrap();
+            (job_id, token)
+        };
+        let containment = JobContainment::Observed {
+            lost: vec![ProcessCoverageGap::UnreadImage { pid: 4243 }],
+        };
+        let outlived = vec![OutlivedProcess {
+            index: Some(1),
+            pid: 4243,
+            image: None,
+            signal: 9,
+        }];
+        let (ran, token) = begin(&mut store);
+        let sealed = store
+            .finish(
+                token,
+                JobEnding {
+                    state: JobState::Signaled,
+                    exit: Some(ExitStatus::Signaled {
+                        signal: 9,
+                        core_dumped: false,
+                    }),
+                    duration_ms: Some(5),
+                    resources: None,
+                    failure: None,
+                    cpu_tokens: None,
+                    nice: None,
+                    containment: Some(containment.clone()),
+                    outlived: outlived.clone(),
+                    outlived_incomplete: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(sealed.record.containment.as_ref(), Some(&containment));
+        assert_eq!(sealed.record.outlived, outlived);
+        assert!(!sealed.record.outlived_incomplete);
+        let (incomplete, token) = begin(&mut store);
+        let sealed = store
+            .finish(
+                token,
+                JobEnding {
+                    containment: Some(JobContainment::Kernel),
+                    outlived_incomplete: true,
+                    ..JobEnding::from(JobState::Killed)
+                },
+            )
+            .unwrap();
+        assert!(sealed.record.outlived.is_empty());
+        assert!(sealed.record.outlived_incomplete);
+        let (refused, token) = begin(&mut store);
+        let sealed = store.finish(token, JobState::Failed).unwrap();
+        assert_eq!(
+            (sealed.record.containment, sealed.record.outlived),
+            (None, Vec::new())
+        );
+        drop(store);
+
+        let mut reopened = store_at(&root, ArtifactConfig::default());
+        let read = reopened
+            .sealed(ran)
+            .unwrap()
+            .expect("the ended job's record");
+        assert_eq!(read.containment.as_ref(), Some(&containment));
+        assert_eq!(read.outlived, outlived);
+        assert!(!read.outlived_incomplete);
+        let read = reopened
+            .sealed(incomplete)
+            .unwrap()
+            .expect("the incomplete receipt");
+        assert_eq!(read.containment, Some(JobContainment::Kernel));
+        assert!(read.outlived.is_empty());
+        assert!(read.outlived_incomplete);
+        let read = reopened
+            .sealed(refused)
+            .unwrap()
+            .expect("the refused job's record");
+        assert_eq!((read.containment.as_ref(), read.outlived.len()), (None, 0));
+        assert!(!read.outlived_incomplete);
+        drop(reopened);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A layout 12 history holds no receipt and none is made up for it: its store stays
+    /// byte-for-byte archived, nothing of it is decoded, and a job it held answers as unprovable
+    /// history, never as one the kernel, or anything, retired.
+    #[test]
+    fn a_layout_twelve_history_is_set_aside_and_projects_no_retirement_receipt() {
+        let root = temp_root("layout-twelve-no-receipt");
+        drop(store_at(&root, ArtifactConfig::default()));
+        let historical = JobArtifactRecord {
+            exit: Some(ExitStatus::Exited { code: 0 }),
+            duration_ms: Some(7),
+            ..valid_job_record(5)
+        };
+        append_batch(
+            &root,
+            &earlier_batch(&historical, RETIREMENT_COLUMNS.len(), 12),
+        );
+        let old_records = fs::read(records_path(&root)).unwrap();
+        let set_aside = root
+            .join(PROTECTED_DIRECTORY)
+            .join(JOB_DIRECTORY)
+            .join(SET_ASIDE_DIRECTORY)
+            .join("layout-12");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        assert_eq!(
+            store.recovery().set_aside,
+            Some(SetAsideStore {
+                layout: 12,
+                path: set_aside.clone(),
+            })
+        );
+        assert!(
+            store.recovery().frames.is_empty(),
+            "nothing of layout 12 is decoded"
+        );
+        assert!(matches!(
+            store.sealed(JobId::new(5).unwrap()),
+            Err(ArtifactError::HistoryUnprovable { set_aside: ref path }) if path == &set_aside
+        ));
+        assert_eq!(fs::read(set_aside.join(RECORDS_FILE)).unwrap(), old_records);
+        drop(store);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_layout_thirteen_history_is_set_aside_without_inventing_metadata_completeness() {
+        let root = temp_root("layout-thirteen-no-completeness");
+        drop(store_at(&root, ArtifactConfig::default()));
+        let historical = JobArtifactRecord {
+            containment: Some(JobContainment::Kernel),
+            ..valid_job_record(5)
+        };
+        append_batch(&root, &earlier_batch(&historical, 1, 13));
+        let old_records = fs::read(records_path(&root)).unwrap();
+        let set_aside = root
+            .join(PROTECTED_DIRECTORY)
+            .join(JOB_DIRECTORY)
+            .join(SET_ASIDE_DIRECTORY)
+            .join("layout-13");
+        let mut store = store_at(&root, ArtifactConfig::default());
+        assert_eq!(
+            store.recovery().set_aside,
+            Some(SetAsideStore {
+                layout: 13,
+                path: set_aside.clone(),
+            })
+        );
+        assert!(store.recovery().frames.is_empty());
+        assert!(matches!(
+            store.sealed(JobId::new(5).unwrap()),
+            Err(ArtifactError::HistoryUnprovable { set_aside: ref path }) if path == &set_aside
+        ));
+        assert_eq!(fs::read(set_aside.join(RECORDS_FILE)).unwrap(), old_records);
+        drop(store);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// A commitment carries the full authored identity without persisting private names or values
@@ -8044,7 +8661,10 @@ mod tests {
             admission: Some(admission.clone()),
             ..valid_job_record(5)
         };
-        append_batch(&root, &earlier_batch(&historical, 2, 10));
+        append_batch(
+            &root,
+            &earlier_batch(&historical, 2 + RETIREMENT_COLUMNS.len(), 10),
+        );
         let old_records = fs::read(records_path(&root)).unwrap();
         let set_aside = root
             .join(PROTECTED_DIRECTORY)
@@ -8353,6 +8973,9 @@ mod tests {
                     failure: None,
                     cpu_tokens: NonZeroUsize::new(6),
                     nice: Some(0),
+                    containment: None,
+                    outlived: Vec::new(),
+                    outlived_incomplete: false,
                 },
             )
             .unwrap();
@@ -8986,6 +9609,9 @@ mod tests {
             failure: None,
             cpu_tokens,
             nice: Some(10),
+            containment: None,
+            outlived: Vec::new(),
+            outlived_incomplete: false,
         };
         let begin = |store: &mut ArtifactStore, scheduling| {
             let job_id = store.next_job_id().unwrap();

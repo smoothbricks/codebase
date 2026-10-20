@@ -1,3 +1,4 @@
+use crate::api::process::{JobContainment, OutlivedProcess};
 use crate::error::CowshedError;
 use crate::land_turn::Ticket;
 use crate::metadata::DetachedWorkspaceMetadata;
@@ -1098,6 +1099,11 @@ pub struct GcReport {
 pub enum JobState {
     Queued,
     Running,
+    /// The job's leader has ended and the supervisor is retiring the rest of its process
+    /// membership. Not terminal: a waiter keeps waiting, and no exit, duration or frozen sample
+    /// is published until the membership is proven empty. Draining lives only in a supervisor's
+    /// memory; a durable record is never draining.
+    Draining,
     Exited,
     Signaled,
     Killed,
@@ -1106,9 +1112,14 @@ pub enum JobState {
 }
 
 impl JobState {
-    /// Whether the job has ended: every state but `Queued` and `Running` is final.
+    /// Whether the job has ended: `Exited`, `Signaled`, `Killed`, `OutputLimit` and `Failed` are
+    /// final, while `Queued`, `Running` and `Draining` are not. The match is exhaustive, so a new
+    /// state has to say which it is.
     pub fn is_terminal(self) -> bool {
-        !matches!(self, Self::Queued | Self::Running)
+        match self {
+            Self::Queued | Self::Running | Self::Draining => false,
+            Self::Exited | Self::Signaled | Self::Killed | Self::OutputLimit | Self::Failed => true,
+        }
     }
 }
 
@@ -1950,13 +1961,9 @@ impl ControllerCommitment {
             ));
         }
         match self {
-            Self::Terminal(value)
-                if matches!(value.state, JobState::Queued | JobState::Running) =>
-            {
-                Err(DtoError::InvalidJobProjection(
-                    "terminal commitment must contain a terminal state",
-                ))
-            }
+            Self::Terminal(value) if !value.state.is_terminal() => Err(
+                DtoError::InvalidJobProjection("terminal commitment must contain a terminal state"),
+            ),
             Self::Terminal(value)
                 if value.output_limit.is_some() != matches!(value.state, JobState::OutputLimit) =>
             {
@@ -2154,6 +2161,18 @@ pub struct JobInfo {
     /// The CPU tokens the job's gateway grant held. Absent until a grant is held, and for a
     /// resident, which holds none.
     pub cpu_tokens: Option<NonZeroUsize>,
+    /// What held the job's process membership while its retirement proved the membership empty,
+    /// and so how far that proof reaches ([`JobContainment`]). Stated once retirement has begun
+    /// and its proof exists: `draining` or terminal. Absent while the job queues or runs, for a
+    /// job that never owned a process, and for one whose supervisor owns no native membership:
+    /// absence is no proof, and never stands for `kernel`.
+    pub containment: Option<JobContainment>,
+    /// The live members retirement signalled, including a live leader on cancellation, before the
+    /// membership was proven empty. Empty proves none were ended only when `outlived_incomplete`
+    /// is false; always empty without `containment`.
+    pub outlived: Vec<OutlivedProcess>,
+    /// Retirement may have ended members absent from `outlived`; false without `containment`.
+    pub outlived_incomplete: bool,
 }
 
 impl JobInfo {
@@ -2169,7 +2188,7 @@ impl JobInfo {
                 "a queued job owns no command to observe a nice for",
             ));
         }
-        let terminal = !matches!(self.state, JobState::Queued | JobState::Running);
+        let terminal = self.state.is_terminal();
         if terminal != self.duration_ms.is_some() {
             return Err(DtoError::InvalidJobProjection(
                 "durationMs must be present exactly for terminal states",
@@ -2178,6 +2197,36 @@ impl JobInfo {
         if matches!(self.state, JobState::OutputLimit) != self.output_limit.is_some() {
             return Err(DtoError::InvalidJobProjection(
                 "outputLimit must be present exactly for the outputLimit state",
+            ));
+        }
+        // A job states what retiring its process membership found only once that retirement has
+        // begun, and only if it owned a process (a pid): a queued or running job has retired
+        // nothing, and one that never spawned has no membership to retire.
+        let retirement_begun = match self.state {
+            JobState::Queued | JobState::Running => false,
+            JobState::Draining
+            | JobState::Exited
+            | JobState::Signaled
+            | JobState::Killed
+            | JobState::OutputLimit
+            | JobState::Failed => true,
+        };
+        if (self.containment.is_some() || !self.outlived.is_empty() || self.outlived_incomplete)
+            && !(retirement_begun && self.pid.is_some())
+        {
+            return Err(DtoError::InvalidJobProjection(
+                "containment, outlived and outlivedIncomplete are stated only for a job that owned a process and \
+                 has begun retiring its membership",
+            ));
+        }
+        if self.containment.is_none() && (!self.outlived.is_empty() || self.outlived_incomplete) {
+            return Err(DtoError::InvalidJobProjection(
+                "outlived processes and incomplete metadata need the containment that retired them",
+            ));
+        }
+        if !self.outlived.iter().all(OutlivedProcess::consistent) {
+            return Err(DtoError::InvalidJobProjection(
+                "an outlived process names its image or none: an empty one stands for neither",
             ));
         }
         if let Some(resources) = &self.resources {
@@ -2206,7 +2255,7 @@ impl JobInfo {
             // SIGTERM and exit normally. Preserve the actual wait status.
             | (JobState::Killed, Some(_))
             | (JobState::OutputLimit | JobState::Failed, _)
-            | (JobState::Queued | JobState::Running, None) => {}
+            | (JobState::Queued | JobState::Running | JobState::Draining, None) => {}
             // Killed before its command existed -- withdrawn while queued for its CPU grant
             // (11_shell.md "Server-owned CPU admission and nice placement"): it never ran, so it
             // has no status. A job that owned a process has a pid and keeps the status it ended
@@ -2260,6 +2309,12 @@ struct JobInfoRef<'a> {
     nice: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_tokens: Option<NonZeroUsize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containment: Option<&'a JobContainment>,
+    #[serde(skip_serializing_if = "<[OutlivedProcess]>::is_empty")]
+    outlived: &'a [OutlivedProcess],
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    outlived_incomplete: bool,
 }
 
 #[derive(Deserialize)]
@@ -2301,6 +2356,12 @@ struct JobInfoWire {
     nice: Option<i32>,
     #[serde(default)]
     cpu_tokens: Option<NonZeroUsize>,
+    #[serde(default)]
+    containment: Option<JobContainment>,
+    #[serde(default)]
+    outlived: Vec<OutlivedProcess>,
+    #[serde(default)]
+    outlived_incomplete: bool,
 }
 
 /// The wire's two mutually exclusive command spellings, `argv` and `script`, as one command.
@@ -2334,6 +2395,9 @@ impl Serialize for JobInfo {
             scope: self.scope,
             nice: self.nice,
             cpu_tokens: self.cpu_tokens,
+            containment: self.containment.as_ref(),
+            outlived: &self.outlived,
+            outlived_incomplete: self.outlived_incomplete,
         }
         .serialize(serializer)
     }
@@ -2373,6 +2437,9 @@ impl<'de> Deserialize<'de> for JobInfo {
             scope: wire.scope,
             nice: wire.nice,
             cpu_tokens: wire.cpu_tokens,
+            containment: wire.containment,
+            outlived: wire.outlived,
+            outlived_incomplete: wire.outlived_incomplete,
         };
         value.validate().map_err(serde::de::Error::custom)?;
         Ok(value)
@@ -2383,8 +2450,8 @@ impl<'de> Deserialize<'de> for JobInfo {
 /// workspace incarnation answers for a job, including one an earlier supervisor ran and sealed —
 /// which [`JobInfo`], whose start, cwd, trace and stdin only the running supervisor knew, cannot
 /// describe once that supervisor is gone.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(any(), cowshed_api(wire = "SealedJobRef"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedJob {
     pub job_id: JobId,
     pub state: JobState,
@@ -2393,7 +2460,6 @@ pub struct SealedJob {
     pub duration_ms: Option<u64>,
     /// The job's terminal resource sample, exactly as its last [`JobInfo::resources`]; absent
     /// for a job that never owned a process.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<crate::api::resources::JobResourceSample>,
     pub output_limit: Option<OutputLimitInfo>,
     pub stdout: StreamInfo,
@@ -2403,11 +2469,151 @@ pub struct SealedJob {
     /// Where the job's command ran, as JobInfo.scope.
     pub scope: ExecScope,
     /// The nice the job's command was observed at, as JobInfo.nice.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nice: Option<i32>,
     /// The CPU tokens the job's grant held, as JobInfo.cpu_tokens.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_tokens: Option<NonZeroUsize>,
+    /// What held the job's process membership while retirement proved it empty, as
+    /// JobInfo.containment: absent for a job that never owned a process, for one whose supervisor
+    /// owns no native membership, and for a record sealed without the proof.
+    pub containment: Option<JobContainment>,
+    /// The live members retirement signalled, as JobInfo.outlived.
+    pub outlived: Vec<OutlivedProcess>,
+    /// Retirement may have ended members absent from `outlived`, as JobInfo.outlived_incomplete.
+    pub outlived_incomplete: bool,
+}
+
+impl SealedJob {
+    pub fn validate(&self) -> Result<(), DtoError> {
+        if (self.containment.is_some() || !self.outlived.is_empty() || self.outlived_incomplete)
+            && !self.state.is_terminal()
+        {
+            return Err(DtoError::InvalidJobProjection(
+                "a sealed retirement receipt belongs only to a terminal job",
+            ));
+        }
+        if self.containment.is_none() && (!self.outlived.is_empty() || self.outlived_incomplete) {
+            return Err(DtoError::InvalidJobProjection(
+                "outlived processes and incomplete metadata need the containment that retired them",
+            ));
+        }
+        if !self.outlived.iter().all(OutlivedProcess::consistent) {
+            return Err(DtoError::InvalidJobProjection(
+                "an outlived process names its image or none: an empty one stands for neither",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SealedJobRef<'a> {
+    job_id: JobId,
+    state: JobState,
+    exit: &'a Option<ExitStatus>,
+    failure: Option<JobFailure>,
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resources: Option<&'a crate::api::resources::JobResourceSample>,
+    output_limit: &'a Option<OutputLimitInfo>,
+    stdout: &'a StreamInfo,
+    stderr: &'a StreamInfo,
+    class: ExecClass,
+    scope: ExecScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nice: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_tokens: Option<NonZeroUsize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    containment: Option<&'a JobContainment>,
+    #[serde(skip_serializing_if = "<[OutlivedProcess]>::is_empty")]
+    outlived: &'a [OutlivedProcess],
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    outlived_incomplete: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SealedJobWire {
+    job_id: JobId,
+    state: JobState,
+    exit: Option<ExitStatus>,
+    failure: Option<JobFailure>,
+    duration_ms: Option<u64>,
+    #[serde(default)]
+    resources: Option<crate::api::resources::JobResourceSample>,
+    output_limit: Option<OutputLimitInfo>,
+    stdout: StreamInfo,
+    stderr: StreamInfo,
+    class: ExecClass,
+    scope: ExecScope,
+    #[serde(default)]
+    nice: Option<i32>,
+    #[serde(default)]
+    cpu_tokens: Option<NonZeroUsize>,
+    #[serde(default)]
+    containment: Option<JobContainment>,
+    #[serde(default)]
+    outlived: Vec<OutlivedProcess>,
+    #[serde(default)]
+    outlived_incomplete: bool,
+}
+
+impl Serialize for SealedJob {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        SealedJobRef {
+            job_id: self.job_id,
+            state: self.state,
+            exit: &self.exit,
+            failure: self.failure,
+            duration_ms: self.duration_ms,
+            resources: self.resources.as_ref(),
+            output_limit: &self.output_limit,
+            stdout: &self.stdout,
+            stderr: &self.stderr,
+            class: self.class,
+            scope: self.scope,
+            nice: self.nice,
+            cpu_tokens: self.cpu_tokens,
+            containment: self.containment.as_ref(),
+            outlived: &self.outlived,
+            outlived_incomplete: self.outlived_incomplete,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SealedJob {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SealedJobWire::deserialize(deserializer)?;
+        let value = Self {
+            job_id: wire.job_id,
+            state: wire.state,
+            exit: wire.exit,
+            failure: wire.failure,
+            duration_ms: wire.duration_ms,
+            resources: wire.resources,
+            output_limit: wire.output_limit,
+            stdout: wire.stdout,
+            stderr: wire.stderr,
+            class: wire.class,
+            scope: wire.scope,
+            nice: wire.nice,
+            cpu_tokens: wire.cpu_tokens,
+            containment: wire.containment,
+            outlived: wire.outlived,
+            outlived_incomplete: wire.outlived_incomplete,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 #[cfg_attr(any(), cowshed_api(wire = "ExecRecordRef"))]
@@ -2434,7 +2640,7 @@ pub struct ExecRecord {
 impl ExecRecord {
     pub fn validate(&self) -> Result<(), DtoError> {
         validate_command_argv(&self.argv)?;
-        if matches!(self.state, JobState::Queued | JobState::Running) {
+        if !self.state.is_terminal() {
             return Err(DtoError::InvalidJobProjection(
                 "ExecRecord must contain a terminal job state",
             ));

@@ -783,6 +783,8 @@ mod parity_tests {
             | Command::Version
             // A read-only lint helper over the checkout's recorded volume state; no controller call.
             | Command::BuildState
+            | Command::SubtreeRoot(_)
+            | Command::RetireDescendants(_)
             | Command::Help(_) => None,
         }
     }
@@ -863,6 +865,8 @@ mod parity_tests {
         (&["help"], None),
         (&["setup"], None),
         (&["build-state"], None),
+        (&["subtree-root", "--handle-fd", "3", "--", "true"], None),
+        (&["retire-descendants", "--grace-ms", "0"], None),
         (&["--version"], None),
     ];
 

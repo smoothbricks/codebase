@@ -459,6 +459,7 @@ fn config(root: &TempRoot) -> WorkspaceSupervisorConfig {
         shell_host: None,
         shell_pool: Default::default(),
         group_ledger: None,
+        membership_socket: None,
         telemetry_root: None,
         inherited_groups: Vec::new(),
         volume_labels: None,
@@ -9531,4 +9532,791 @@ async fn cpu_the_observed_processes_never_counted_is_the_job_span_s_unattributed
         stated.unattributed
     );
     reap(leader);
+}
+
+/// A real native supervisor, including its protected credentials and ownership ledger.
+#[cfg(target_os = "macos")]
+fn native_process_fixture(
+    name: &str,
+    membership: Option<&std::path::Path>,
+) -> (WorkspaceSupervisorHandle, PathBuf, TempRoot) {
+    let (mut config, root) = isolated_config(name);
+    config.default_cwd = None;
+    config.term_grace = Duration::from_secs(1);
+    std::fs::create_dir_all(&config.sandbox.home).unwrap();
+    std::fs::create_dir_all(config.workspace_root.join(".cowshed/bin")).unwrap();
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(
+                config
+                    .workspace_root
+                    .join(cowshed_core::workspace_credentials::WORKSPACE_TOKEN_PATH),
+            )
+            .unwrap()
+            .write_all(
+                cowshed_gateway_types::WorkspaceToken::from_bytes([7; 32])
+                    .encode()
+                    .as_bytes(),
+            )
+            .unwrap();
+    }
+    let ledger = root.join("supervisor.groups");
+    config.membership_socket =
+        membership.map(cowshed_core::runtime::supervisor_socket::membership_socket_path);
+    config.group_ledger = Some(ledger.clone());
+    let commitments = cowshed_core::runtime::supervisor::CommitmentPublisher::start(
+        Box::new(cowshed_core::storage::audit::NullAuditSink),
+        8,
+    )
+    .unwrap();
+    let handle = WorkspaceSupervisor::start(config, commitments).unwrap();
+    (handle, ledger, root)
+}
+
+/// The command exits while its child is blocked on a fixture-owned socket. The child may keep
+/// its inherited output open; the socket, not a late PID kill, releases it even on panic.
+#[cfg(target_os = "macos")]
+async fn terminal_descendant_reproduction(detach: bool, cancel: bool, hold_output: bool) {
+    use cowshed_core::runtime::job_groups::{Process, group_has_live_members};
+    use cowshed_core::runtime::process_events::{Darwin, ProcessReads as _};
+    use tokio::io::AsyncReadExt as _;
+
+    let (handle, ledger, root) = native_process_fixture("terminal-descendant", None);
+    let socket = root.join("child.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let script = r#"
+import os, signal, socket, struct, sys
+if os.fork() == 0:
+    signal.signal(signal.SIGTERM, lambda *_: peer.sendall(b"t"))
+    if sys.argv[2] == "detach":
+        os.setsid()
+    peer = socket.socket(socket.AF_UNIX)
+    peer.connect(sys.argv[1])
+    peer.sendall(struct.pack("!IIII", os.getpid(), os.getppid(), os.getpgrp(), os.getsid(0)))
+    for fd in ((0,) if sys.argv[3] == "hold" else (0, 1, 2)):
+        os.close(fd)
+    peer.recv(1)
+    os._exit(0)
+os.read(0, 1)
+os._exit(0)
+"#;
+    let job = handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                command: ExecCommand::Argv(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    r#"exec python3 -c "$1" "$2" "$3" "$4""#.into(),
+                    "descendant-fixture".into(),
+                    script.into(),
+                    CommandArg::from(socket.into_os_string()),
+                    if detach { "detach" } else { "group" }.into(),
+                    if hold_output { "hold" } else { "close" }.into(),
+                ]),
+                cwd: None,
+                scope: ExecScope::HostGate,
+                env: [(
+                    "PATH".into(),
+                    std::env::var("PATH").expect("development shell supplies python3"),
+                )]
+                .into_iter()
+                .collect(),
+                ..gate(request(StdinSource::Open))
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .unwrap();
+    let (mut child_socket, _) = listener.accept().await.unwrap();
+    let mut report = [0_u8; 16];
+    child_socket.read_exact(&mut report).await.unwrap();
+    let [child, parent, group, session] = [0, 4, 8, 12]
+        .map(|offset| u32::from_be_bytes(report[offset..offset + 4].try_into().unwrap()));
+    let child_record = Darwin.record(child).unwrap().unwrap();
+    let leader = Darwin.record(parent).unwrap().unwrap();
+    assert_eq!(child_record.ppid, leader.pid);
+    assert_eq!(child_record.parent_unique_id, leader.unique_id);
+    assert!(Darwin.children(parent).unwrap().contains(&child));
+    let mut chain = vec![child_record];
+    while chain.last().unwrap().pid != std::process::id() {
+        let next = Darwin.record(chain.last().unwrap().ppid).unwrap().unwrap();
+        assert_eq!(chain.last().unwrap().parent_unique_id, next.unique_id);
+        chain.push(next);
+    }
+    assert_eq!(group, if detach { child } else { parent });
+    if detach {
+        assert_eq!(session, child, "setsid makes a new session and group");
+    }
+    let child_process = Process::observe(i32::try_from(child).unwrap())
+        .unwrap()
+        .unwrap();
+    let exit_watch = child_process.watch_exit().unwrap();
+    // Hold the parent until the runtime has attached the child's kernel life. This proves
+    // retirement of observed detached members, not completeness of Darwin's fork notifications.
+    let mut membership = handle
+        .process_events(job, cowshed_core::api::SampleInterval::new(1000).unwrap())
+        .await
+        .unwrap();
+    let child_index = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match membership.next().await.unwrap().unwrap() {
+                cowshed_core::api::process::JobProcessEvent::Born { index, process }
+                    if process.pid == child =>
+                {
+                    break index;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("runtime attaches the live child's kernel identity before parent exit");
+    let held = handle.info(job).await.unwrap();
+    assert_eq!(
+        held.state,
+        JobState::Running,
+        "a blocked live job is not a leak"
+    );
+    assert_eq!(ledger_leaders(&ledger).len(), 1);
+
+    let finishing_handle = handle.clone();
+    let finishing = tokio::spawn(async move {
+        if cancel {
+            finishing_handle.kill(job).await?;
+        } else {
+            finishing_handle
+                .stdin_write(job, 0, Bytes::from_static(b"x"))
+                .await?;
+        }
+        finishing_handle.wait(job).await
+    });
+    let mut term = [0_u8; 1];
+    tokio::time::timeout(Duration::from_secs(10), child_socket.read_exact(&mut term))
+        .await
+        .expect("retirement signals the owned descendant")
+        .unwrap();
+    assert_eq!(term, *b"t");
+    let draining = handle.info(job).await.unwrap();
+    assert_eq!(draining.state, JobState::Draining);
+    assert_eq!(draining.exit, None);
+    assert_eq!(
+        ledger_leaders(&ledger).len(),
+        1,
+        "draining retains its claim"
+    );
+    assert!(
+        !finishing.is_finished(),
+        "wait joins membership, not just the leader"
+    );
+    let ended = finishing.await.unwrap().unwrap();
+    assert_eq!(
+        ended.state,
+        if cancel {
+            JobState::Killed
+        } else {
+            JobState::Exited
+        }
+    );
+    assert_eq!(
+        ended.exit,
+        Some(if cancel {
+            ExitStatus::Signaled {
+                signal: libc::SIGTERM,
+                core_dumped: false,
+            }
+        } else {
+            ExitStatus::Exited { code: 0 }
+        })
+    );
+    let surviving = Darwin
+        .record(child)
+        .unwrap()
+        .filter(|now| now.unique_id == child_record.unique_id);
+    let group_alive = group_has_live_members(i32::try_from(group).unwrap()).unwrap();
+    cowshed_os::eprintln!(
+        "terminal-descendant detach={detach} cancel={cancel} job={} state={:?} leader={parent} child={child} \
+         group={group} session={session} group_alive={group_alive} surviving={surviving:?} \
+         parent_chain={chain:?} ledger={:?}",
+        job.get(),
+        ended.state,
+        ledger_leaders(&ledger)
+    );
+    // Close the fixture capability and join its pre-registered exit before the red assertion.
+    drop(child_socket);
+    tokio::task::spawn_blocking(move || exit_watch.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+    let config = config(&root);
+    let mut reopened = ArtifactStore::open(
+        &config.workspace_root,
+        config.owned_repo_ids,
+        config.authority.workspace_incarnation,
+        config.artifacts,
+    )
+    .unwrap();
+    let durable = reopened.sealed(job).unwrap().unwrap();
+    assert_eq!(durable.containment, ended.containment);
+    assert_eq!(durable.outlived, ended.outlived);
+    assert_eq!(durable.outlived_incomplete, ended.outlived_incomplete);
+    assert!(
+        surviving.is_none() && !group_alive,
+        "terminal job left an owned descendant alive: detach={detach}, child={child}, group={group}"
+    );
+    assert!(
+        matches!(
+            ended.containment,
+            Some(cowshed_core::api::process::JobContainment::Observed { .. })
+        ),
+        "Darwin may prove observed membership ended, never kernel containment"
+    );
+    let outlived = ended
+        .outlived
+        .iter()
+        .find(|member| member.pid == child)
+        .expect("the process actually ended must have a durable retirement receipt");
+    assert_eq!(outlived.index, Some(child_index));
+    assert_eq!(outlived.signal, libc::SIGKILL);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn terminal_reaps_a_background_descendant_with_closed_output() {
+    terminal_descendant_reproduction(false, false, false).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn terminal_reaps_a_descendant_that_started_a_new_session() {
+    terminal_descendant_reproduction(true, false, false).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn cancellation_reaps_a_background_descendant_with_closed_output() {
+    terminal_descendant_reproduction(false, true, false).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn cancellation_reaps_a_descendant_that_started_a_new_session() {
+    terminal_descendant_reproduction(true, true, false).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn terminal_reaps_a_detached_descendant_still_holding_output_open() {
+    terminal_descendant_reproduction(true, false, true).await;
+}
+
+/// Client detachment leaves the declared Resident under the supervisor's one ownership ledger.
+/// An unrelated job's conclusion may not turn that Resident into a cleanup target.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_declared_resident_survives_unrelated_terminal_and_refused_start() {
+    use cowshed_core::runtime::job_groups::Process;
+    use cowshed_core::runtime::process_events::{Darwin, ProcessReads as _};
+
+    let (handle, ledger, _root) = native_process_fixture("resident-membership", None);
+    let resident = handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                command: ExecCommand::Argv(
+                    ["/bin/sh", "-c", "printf ready; read line"]
+                        .into_iter()
+                        .map(CommandArg::from)
+                        .collect(),
+                ),
+                cwd: None,
+                scope: ExecScope::Workspace,
+                class: ExecClass::Resident,
+                ..request(StdinSource::Open)
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .unwrap();
+    let ready = handle
+        .log_read(resident, StreamKind::Stdout, 0, true)
+        .await
+        .unwrap();
+    assert_eq!(ready.bytes, Bytes::from_static(b"ready"));
+    let held = handle.info(resident).await.unwrap();
+    assert_eq!(held.class, ExecClass::Resident);
+    assert_eq!(held.cpu_tokens, None);
+    let pid = held.pid.unwrap();
+    let life = Darwin.record(pid).unwrap().unwrap();
+    let exit = Process::observe(i32::try_from(pid).unwrap())
+        .unwrap()
+        .unwrap()
+        .watch_exit()
+        .unwrap();
+    handle.detach(resident).await.unwrap();
+    let before = Darwin.children(std::process::id()).unwrap();
+
+    for (executable, state) in [
+        ("/usr/bin/true", JobState::Exited),
+        (
+            "/definitely-missing-cowshed-test-executable",
+            JobState::Failed,
+        ),
+    ] {
+        let job = handle
+            .exec(
+                None,
+                None,
+                ExecRequest {
+                    command: ExecCommand::Argv(vec![executable.into()]),
+                    cwd: None,
+                    scope: ExecScope::HostGate,
+                    ..gate(request(StdinSource::Empty))
+                },
+                AdmissionSource::Coordinator,
+            )
+            .await
+            .unwrap();
+        let ended = handle.wait(job).await.unwrap();
+        assert_eq!(
+            ended.state,
+            state,
+            "{ended:?}; stderr: {}",
+            String::from_utf8_lossy(
+                &handle
+                    .log_read(job, StreamKind::Stderr, 0, false)
+                    .await
+                    .unwrap()
+                    .bytes
+            )
+        );
+        if state == JobState::Failed {
+            assert_eq!(ended.pid, None);
+            assert_eq!(ended.containment, None);
+            assert!(ended.outlived.is_empty());
+            assert!(!ended.outlived_incomplete);
+        }
+        assert_eq!(
+            handle.info(resident).await.unwrap().state,
+            JobState::Running
+        );
+        assert_eq!(
+            Darwin.record(pid).unwrap().unwrap().unique_id,
+            life.unique_id
+        );
+        assert_eq!(
+            ledger_leaders(&ledger)
+                .into_iter()
+                .map(|(job, _)| job)
+                .collect::<Vec<_>>(),
+            vec![resident.get()],
+            "only the declared resident's claim remains"
+        );
+    }
+    assert_eq!(
+        Darwin.children(std::process::id()).unwrap(),
+        before,
+        "neither terminal nor refused start leaves a new direct child"
+    );
+    handle.kill(resident).await.unwrap();
+    tokio::task::spawn_blocking(move || exit.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ledger_leaders(&ledger).is_empty());
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_runtime_drop_retires_observed_detached_membership() {
+    use cowshed_core::runtime::job_groups::{Process, group_has_live_members};
+    use cowshed_core::runtime::process_events::{Darwin, ProcessReads as _};
+    use tokio::io::AsyncReadExt as _;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (handle, ledger, _root, peer, life, exit) = runtime.block_on(async {
+        let (handle, ledger, root) = native_process_fixture("runtime-drop-membership", None);
+        let socket = root.join("child.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let script = r#"
+import os, signal, socket, struct, sys
+if os.fork() == 0:
+    os.setsid()
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    peer = socket.socket(socket.AF_UNIX)
+    peer.connect(sys.argv[1])
+    peer.sendall(struct.pack("!II", os.getpid(), os.getppid()))
+    peer.recv(1)
+    os._exit(0)
+os.read(0, 1)
+os._exit(0)
+"#;
+        let job = handle
+            .exec(
+                None,
+                None,
+                ExecRequest {
+                    command: ExecCommand::Argv(vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "exec python3 -c \"$1\" \"$2\"".into(),
+                        "drop-fixture".into(),
+                        script.into(),
+                        CommandArg::from(socket.into_os_string()),
+                    ]),
+                    cwd: None,
+                    scope: ExecScope::HostGate,
+                    env: [("PATH".into(), std::env::var("PATH").unwrap())]
+                        .into_iter()
+                        .collect(),
+                    ..gate(request(StdinSource::Open))
+                },
+                AdmissionSource::Coordinator,
+            )
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut report = [0_u8; 8];
+        peer.read_exact(&mut report).await.unwrap();
+        let child = u32::from_be_bytes(report[..4].try_into().unwrap());
+        let parent = u32::from_be_bytes(report[4..].try_into().unwrap());
+        let life = Darwin.record(child).unwrap().unwrap();
+        let parent_life = Darwin.record(parent).unwrap().unwrap();
+        assert_eq!(
+            (life.ppid, life.parent_unique_id),
+            (parent, parent_life.unique_id)
+        );
+        assert_eq!(handle.info(job).await.unwrap().pid, Some(parent));
+        let exit = Process::observe(i32::try_from(child).unwrap())
+            .unwrap()
+            .unwrap()
+            .watch_exit()
+            .unwrap();
+        let mut observed = handle
+            .process_events(job, cowshed_core::api::SampleInterval::new(1000).unwrap())
+            .await
+            .unwrap();
+        loop {
+            if let cowshed_core::api::process::JobProcessEvent::Born { process, .. } =
+                observed.next().await.unwrap().unwrap()
+                && process.pid == child
+            {
+                break;
+            }
+        }
+        (handle, ledger, root, peer, life, exit)
+    });
+    drop(runtime);
+    let joined = exit.within(Duration::from_secs(5)).unwrap();
+    let live = Darwin
+        .record(life.pid)
+        .unwrap()
+        .is_some_and(|now| now.unique_id == life.unique_id);
+    let group_live = group_has_live_members(i32::try_from(life.pid).unwrap()).unwrap();
+    drop(peer);
+    if !joined {
+        exit.wait().unwrap();
+    }
+    drop(handle);
+    assert!(
+        joined && !live && !group_live,
+        "runtime drop left a retained setsid life running"
+    );
+    assert!(
+        ledger_leaders(&ledger).is_empty(),
+        "exit proof closes the ledger claim"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn membership_endpoint_is_job_bound_and_never_admits_coordinator_authority() {
+    use cowshed_core::api::process::{
+        JobSubtreeAdmission, JobSubtreeRefusal, JobSubtreeRetirement,
+    };
+    use cowshed_core::runtime::job_groups::{Process, group_has_live_members};
+    use cowshed_core::runtime::process_events::{Darwin, ProcessReads as _};
+    use cowshed_core::runtime::supervisor_socket;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+    let sockets = TempRoot::new_in(&temp_parent::canonical_parent(), "cs-members");
+    let socket = sockets.join("s.sock");
+    let (handle, ledger, root) = native_process_fixture("subtree-endpoint", Some(&socket));
+    let bound = supervisor_socket::bind(&socket).await.unwrap();
+    let serving = tokio::spawn(supervisor_socket::serve(bound, handle.clone(), None, None));
+    supervisor_socket::hello(&socket).await.unwrap();
+    let control_path = root.join("control.sock");
+    let children_path = root.join("children.sock");
+    let controls = tokio::net::UnixListener::bind(&control_path).unwrap();
+    let children = tokio::net::UnixListener::bind(&children_path).unwrap();
+    let script = r#"
+import json, os, signal, socket, struct, sys
+endpoint = os.environ['COWSHED_SUPERVISOR_SOCKET']
+def exact(s, n):
+    result = b''
+    while len(result) < n:
+        part = s.recv(n - len(result))
+        if not part: raise RuntimeError('membership response ended early')
+        result += part
+    return result
+def rpc(request):
+    with socket.socket(socket.AF_UNIX) as s:
+        s.connect(endpoint)
+        data = json.dumps(request).encode()
+        s.sendall(struct.pack('!I', len(data)) + data)
+        return json.loads(exact(s, struct.unpack('!I', exact(s, 4))[0]))
+if sys.argv[1] == 'foreign':
+    print(json.dumps(rpc({'retireDescendants': {'handle': json.loads(sys.argv[2]), 'graceMs': 20}})['ok']['value']))
+    sys.exit(0)
+control = socket.socket(socket.AF_UNIX)
+control.connect(sys.argv[1])
+root_read, root_write = os.pipe()
+go_read, go_write = os.pipe()
+root = os.fork()
+if root == 0:
+    control.close()
+    os.close(root_read)
+    os.close(go_write)
+    admitted = rpc('subtreeHandle')['ok']['value']
+    assert admitted['kind'] == 'admitted', admitted
+    child = os.fork()
+    if child == 0:
+        os.close(root_write)
+        os.close(go_read)
+        os.setsid()
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        peer = socket.socket(socket.AF_UNIX)
+        peer.connect(sys.argv[2])
+        peer.sendall(struct.pack('!IIII', os.getpid(), os.getppid(), os.getpgrp(), os.getsid(0)))
+        peer.recv(1)
+        os._exit(0)
+    with os.fdopen(root_write, 'w') as out:
+        out.write(json.dumps({'admission': admitted, 'root': os.getpid(), 'child': child}) + '\n')
+    os.read(go_read, 1)
+    os._exit(0)
+os.close(root_write)
+os.close(go_read)
+with os.fdopen(root_read) as inp:
+    report = json.loads(inp.readline())
+control.sendall((json.dumps(report) + '\n').encode())
+lines = control.makefile('rb')
+for line in lines:
+    command = json.loads(line)
+    if command == 'release':
+        os.write(go_write, b'x')
+        os.close(go_write)
+        os.waitpid(root, 0)
+        reply = {'released': True}
+    elif command == 'privileged':
+        reply = rpc('hello')
+    elif command == 'retire':
+        reply = rpc({'retireDescendants': {'handle': report['admission']['handle'], 'graceMs': 20}})['ok']['value']
+    elif command == 'exit':
+        break
+    else:
+        raise RuntimeError(command)
+    control.sendall((json.dumps(reply) + '\n').encode())
+"#;
+    let request_for = |arguments: Vec<CommandArg>| ExecRequest {
+        command: ExecCommand::Argv(arguments),
+        cwd: None,
+        scope: ExecScope::HostGate,
+        env: [
+            ("PATH".into(), std::env::var("PATH").unwrap()),
+            (
+                "COWSHED_SUPERVISOR_SOCKET".into(),
+                "/not-the-owned-endpoint".into(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        ..gate(request(StdinSource::Empty))
+    };
+    let job = handle
+        .exec(
+            None,
+            None,
+            request_for(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"exec python3 -c "$1" "$2" "$3""#.into(),
+                "membership-fixture".into(),
+                script.into(),
+                CommandArg::from(control_path.into_os_string()),
+                CommandArg::from(children_path.into_os_string()),
+            ]),
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .unwrap();
+    let (control, _) = tokio::time::timeout(Duration::from_secs(15), controls.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let (reader, mut writer) = control.into_split();
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    let report: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let admitted: JobSubtreeAdmission =
+        serde_json::from_value(report["admission"].clone()).unwrap();
+    let JobSubtreeAdmission::Admitted { handle: capability } = admitted else {
+        panic!("admission refused")
+    };
+    let root_pid = u32::try_from(report["root"].as_u64().unwrap()).unwrap();
+    let child_pid = u32::try_from(report["child"].as_u64().unwrap()).unwrap();
+    let (mut child_peer, _) = children.accept().await.unwrap();
+    let mut child_report = [0_u8; 16];
+    child_peer.read_exact(&mut child_report).await.unwrap();
+    let field = |at| u32::from_be_bytes(child_report[at..at + 4].try_into().unwrap());
+    assert_eq!(
+        [field(0), field(4), field(8), field(12)],
+        [child_pid, root_pid, child_pid, child_pid]
+    );
+    let root_life = Darwin.record(root_pid).unwrap().unwrap();
+    let child_life = Darwin.record(child_pid).unwrap().unwrap();
+    assert_eq!(child_life.parent_unique_id, root_life.unique_id);
+    let child = Process::observe(i32::try_from(child_pid).unwrap())
+        .unwrap()
+        .unwrap();
+    let exit = child.watch_exit().unwrap();
+    let mut events = handle
+        .process_events(job, cowshed_core::api::SampleInterval::new(1000).unwrap())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(events.next().await.unwrap().unwrap(), cowshed_core::api::process::JobProcessEvent::Born { process, .. } if process.pid == child_pid) { break; }
+        }
+    }).await.unwrap();
+
+    // The same user and exact capability do not authorize a neighbouring admitted job.
+    let foreign = handle
+        .exec(
+            None,
+            None,
+            request_for(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"exec python3 -c "$1" foreign "$2""#.into(),
+                "foreign-fixture".into(),
+                script.into(),
+                serde_json::to_string(&capability).unwrap().into(),
+            ]),
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .unwrap();
+    let foreign_end = handle.wait(foreign).await.unwrap();
+    assert_eq!(foreign_end.exit, Some(ExitStatus::Exited { code: 0 }));
+    let foreign_out = handle
+        .log_read(foreign, StreamKind::Stdout, 0, false)
+        .await
+        .unwrap();
+    let refused: JobSubtreeRetirement = serde_json::from_slice(&foreign_out.bytes).unwrap();
+    assert_eq!(
+        refused,
+        JobSubtreeRetirement::Refused {
+            reason: JobSubtreeRefusal::NotMember
+        }
+    );
+
+    writer.write_all(b"\"privileged\"\n").await.unwrap();
+    let denied: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert!(
+        denied["err"]["message"].as_str().unwrap().contains("hello"),
+        "{denied}"
+    );
+    writer.write_all(b"\"release\"\n").await.unwrap();
+    assert_eq!(
+        lines.next_line().await.unwrap().unwrap(),
+        "{\"released\": true}"
+    );
+
+    // An unrelated live process can use the same checkout without granting retirement authority.
+    struct Held(std::process::Child);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            if let Err(error) = self.0.wait() {
+                cowshed_os::eprintln!("fixture child wait: {error}");
+            }
+        }
+    }
+    let mut outsider = Held(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "printf r; read line"])
+            .current_dir(root.join("workspace"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn_locked()
+            .unwrap(),
+    );
+    let mut ready = [0_u8; 1];
+    std::io::Read::read_exact(outsider.0.stdout.as_mut().unwrap(), &mut ready).unwrap();
+    let outsider_life = Darwin.record(outsider.0.id()).unwrap().unwrap();
+
+    writer.write_all(b"\"retire\"\n").await.unwrap();
+    let retired: JobSubtreeRetirement = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(15), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let JobSubtreeRetirement::Retired { retirement } = retired else {
+        panic!("retirement refused: {retired:?}")
+    };
+    assert!(
+        retirement
+            .outlived
+            .iter()
+            .any(|member| member.pid == child_pid && member.signal == libc::SIGKILL)
+    );
+    assert!(
+        !retirement
+            .outlived
+            .iter()
+            .any(|member| member.pid == outsider_life.pid)
+    );
+    assert!(Darwin.record(child_pid).unwrap().is_none());
+    assert!(!group_has_live_members(i32::try_from(child_pid).unwrap()).unwrap());
+    assert!(exit.within(Duration::from_secs(2)).unwrap());
+    assert_eq!(
+        Darwin.record(outsider.0.id()).unwrap().unwrap().unique_id,
+        outsider_life.unique_id
+    );
+    assert_eq!(handle.info(job).await.unwrap().state, JobState::Running);
+    writer.write_all(b"\"retire\"\n").await.unwrap();
+    let spent: JobSubtreeRetirement =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(
+        spent,
+        JobSubtreeRetirement::Refused {
+            reason: JobSubtreeRefusal::SpentHandle
+        }
+    );
+    writer.write_all(b"\"exit\"\n").await.unwrap();
+    drop(writer);
+    let ended = handle.wait(job).await.unwrap();
+    assert!(ended.outlived.iter().any(|member| member.pid == child_pid));
+    assert!(ledger_leaders(&ledger).is_empty());
+    drop(child_peer);
+    drop(outsider);
+    handle.retire(NxDaemonRetirement::Recorded).await.unwrap();
+    serving.abort();
+    assert!(serving.await.unwrap_err().is_cancelled());
 }

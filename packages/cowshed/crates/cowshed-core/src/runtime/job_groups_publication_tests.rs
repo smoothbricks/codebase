@@ -47,9 +47,9 @@ fn allocations<T>(f: impl FnOnce() -> T) -> (T, (usize, usize)) {
 /// clone, JSON buffer and temporary-path construction all remain inside the measured call.
 fn legacy_record<I>(path: &Path, groups: I) -> io::Result<()>
 where
-    I: Iterator<Item = (u64, GroupLeader)>,
+    I: Iterator<Item = JobGroupClaim>,
 {
-    let groups: Vec<_> = groups.collect();
+    let groups: Vec<_> = groups.map(|claim| (claim.job_id, claim.leader)).collect();
     let carried: Vec<UnresolvedGroup> = Vec::new();
     let ledger = Ledger {
         supervisor: std::process::id(),
@@ -60,6 +60,7 @@ where
                 pgid: leader.pgid,
                 leader_start: Some(leader.start),
                 leader_birth: None,
+                members: None,
             })
             .collect(),
         ended: false,
@@ -92,6 +93,7 @@ fn borrowed_publication_is_byte_identical_to_the_owned_ledger() {
                 pgid: i32::MAX,
                 leader_start: Some(u64::MAX),
                 leader_birth: None,
+                members: None,
             },
         },
         UnresolvedGroup {
@@ -101,6 +103,13 @@ fn borrowed_publication_is_byte_identical_to_the_owned_ledger() {
                 pgid: 3,
                 leader_start: None,
                 leader_birth: Some(4),
+                members: Some(RecordedMembers {
+                    boot_session: "an-earlier-boot".into(),
+                    lives: vec![ProcessIdentity {
+                        pid: 8,
+                        birth: super::super::process_tree::BirthToken(9),
+                    }],
+                }),
             },
         },
         UnresolvedGroup {
@@ -110,16 +119,28 @@ fn borrowed_publication_is_byte_identical_to_the_owned_ledger() {
                 pgid: 7,
                 leader_start: None,
                 leader_birth: None,
+                members: None,
             },
         },
     ];
+    // Lives are published only beside a session, so every count crosses claims with and without.
+    let boot = OnceLock::from(String::from("this-boot"));
+    let lives: Arc<[ProcessIdentity]> = (1..=3)
+        .map(|pid| ProcessIdentity {
+            pid,
+            birth: super::super::process_tree::BirthToken(u64::MAX - u64::from(pid)),
+        })
+        .collect();
     for count in [0, 1, 16, 17, 1_024] {
         let groups: Vec<_> = (0..count)
-            .map(|id| {
-                (
-                    u64::MAX - id,
-                    GroupLeader::from_parts(i32::MAX, id, u64::MAX - id).unwrap(),
-                )
+            .map(|id| JobGroupClaim {
+                job_id: u64::MAX - id,
+                leader: GroupLeader::from_parts(i32::MAX, id, u64::MAX - id).unwrap(),
+                members: match id % 3 {
+                    0 => None,
+                    1 => Some(Arc::from([])),
+                    _ => Some(Arc::clone(&lives)),
+                },
             })
             .collect();
         for carried in [&inherited[..0], &inherited[..]] {
@@ -128,11 +149,19 @@ fn borrowed_publication_is_byte_identical_to_the_owned_ledger() {
                     supervisor: u32::MAX,
                     groups: groups
                         .iter()
-                        .map(|&(job_id, leader)| Group {
-                            job_id,
-                            pgid: leader.pgid,
-                            leader_start: Some(leader.start),
+                        .map(|claim| Group {
+                            job_id: claim.job_id,
+                            pgid: claim.leader.pgid,
+                            leader_start: Some(claim.leader.start),
                             leader_birth: None,
+                            members: claim
+                                .members
+                                .as_deref()
+                                .filter(|lives| !lives.is_empty())
+                                .map(|lives| RecordedMembers {
+                                    boot_session: "this-boot".into(),
+                                    lives: lives.to_vec(),
+                                }),
                         })
                         .collect(),
                     ended,
@@ -140,7 +169,10 @@ fn borrowed_publication_is_byte_identical_to_the_owned_ledger() {
                 };
                 let borrowed = Publication {
                     supervisor: u32::MAX,
-                    groups: Groups(groups.iter().copied()),
+                    groups: Groups {
+                        claims: groups.iter().cloned(),
+                        boot_session: &boot,
+                    },
                     ended,
                     unresolved: carried,
                 };
@@ -178,7 +210,7 @@ fn ordinary_publication_allocates_only_its_json_output_buffer() {
         let groups = || {
             jobs.iter()
                 .filter(|(_, active)| **active)
-                .map(|(&id, _)| (id, leader))
+                .map(|(&id, _)| JobGroupClaim::group(id, leader))
         };
         let (before, old_allocations) = allocations(|| legacy_record(&path, groups()));
         before.unwrap();
@@ -191,7 +223,10 @@ fn ordinary_publication_allocates_only_its_json_output_buffer() {
         let (encoded, buffer_allocations) = allocations(|| {
             serde_json::to_vec(&Publication {
                 supervisor: std::process::id(),
-                groups: Groups(groups()),
+                groups: Groups {
+                    claims: groups(),
+                    boot_session: &OnceLock::new(),
+                },
                 ended: false,
                 unresolved: &[],
             })

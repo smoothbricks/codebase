@@ -48,6 +48,8 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &DOCTOR,
     &DISK_COMMAND,
     &LAND_TURN,
+    &SUBTREE_ROOT,
+    &RETIRE_DESCENDANTS,
     &GATEWAY,
     &CONTROLLER,
     &CREDENTIAL,
@@ -110,6 +112,10 @@ pub enum Command {
     /// `land-turn <repo> -- <cmd...>`: one command run as its repository's land turn, in the order
     /// the lands asked, for a caller that is not cowshed: no project, no daemon, no runtime.
     LandTurn(LandTurnArgs),
+    /// Admit this live wrapper, report its handle, then replace it with the child command.
+    SubtreeRoot(SubtreeRootArgs),
+    /// Retire only the retained subtree identified by one handle on standard input.
+    RetireDescendants(RetireDescendantsArgs),
     Gateway(GatewayCommand),
     /// One coordinator controller connection, served on standard input for an embedding process.
     Controller,
@@ -168,6 +174,8 @@ impl Command {
             | Self::Gateway(_)
             | Self::DiskCommand(_)
             | Self::LandTurn(_)
+            | Self::SubtreeRoot(_)
+            | Self::RetireDescendants(_)
             | Self::Sccache(_)
             | Self::Skill(_)
             | Self::Version
@@ -176,6 +184,19 @@ impl Command {
     }
 }
 
+/// The descriptor is only a number while parsing: ownership passes at dispatch, after every
+/// argument has been validated. The command and its arguments retain their native bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubtreeRootArgs {
+    pub handle_fd: std::os::fd::RawFd,
+    pub program: OsString,
+    pub args: Vec<OsString>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetireDescendantsArgs {
+    pub grace: std::time::Duration,
+}
 /// `disk-command <diskutil|hdiutil> -- <args…>`: the tool and its argv, bytes untouched.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiskCommandArgs {
@@ -980,6 +1001,16 @@ fn cli_command() -> ClapCommand {
                 ),
         )
         .subcommand(
+            leaf("subtree-root").arg(value_once("handle-fd")).arg(
+                Arg::new("argv")
+                    .value_parser(value_parser!(OsString))
+                    .num_args(0..)
+                    .last(true)
+                    .allow_hyphen_values(true),
+            ),
+        )
+        .subcommand(leaf("retire-descendants").arg(value_once("grace-ms")))
+        .subcommand(
             leaf("gateway")
                 .subcommand_required(true)
                 .subcommand(leaf("start"))
@@ -1128,6 +1159,8 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "doctor" => parse_doctor(leaf)?,
         "disk-command" => parse_disk_command(leaf, &global)?,
         "land-turn" => parse_land_turn(leaf, &global)?,
+        "subtree-root" => parse_subtree_root(leaf, &global)?,
+        "retire-descendants" => parse_retire_descendants(leaf, &global)?,
         "controller" => Command::Controller,
         "gateway" => parse_gateway(leaf, &global)?,
         "credential" => parse_credential(leaf)?,
@@ -1626,6 +1659,104 @@ fn valid_repo_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+const SUBTREE_ROOT: CommandSpec = CommandSpec {
+    name: "subtree-root",
+    missing: "subtree-root requires --handle-fd N and a command after `--`",
+    args: "",
+    trailing: "-- <cmd...>",
+    summary: "admit as a subtree root, then exec a command",
+    about: &[
+        "Connects directly to COWSHED_SUPERVISOR_SOCKET as this live wrapper, with no project discovery or gateway bootstrap. Writes one JobSubtreeAdmission JSON record and newline to the inherited --handle-fd, closes it, then execs the command in this same process life. It creates no child process, process group, session, sandbox or cgroup. Command arguments after -- retain their exact native bytes, including cowshed flags.",
+        "The caller transfers exclusive ownership of a writable inherited descriptor numbered at least 3. Closed, read-only and close-on-exec descriptors are refused without taking ownership; malformed arguments never close a descriptor. The descriptor must not be used concurrently by an embedding host. Admission goes only to this descriptor; stdout, stderr, stdin, the environment and the working directory pass to the command.",
+        "A typed refused admission still execs the command, unleased. An absent COWSHED_SUPERVISOR_SOCKET produces the foldUnavailable refusal. Transport, admission-write and exec failures are loud nonzero errors, never an unleased fallback. The library-hosted CLI also intentionally replaces its entire host process on successful exec, without shutting down the host runtime first.",
+    ],
+    options: &[Opt {
+        spelling: "--handle-fd <N>",
+        meaning: "required before --: exclusively owned, inherited writable descriptor, N >= 3",
+    }],
+};
+
+fn parse_subtree_root(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    const USAGE: &CommandSpec = &SUBTREE_ROOT;
+    reject_project(
+        global,
+        USAGE,
+        "--project is not valid for subtree-root: it names no project",
+    )?;
+    let handle_fd = matches
+        .get_one::<OsString>("handle-fd")
+        .and_then(|value| value.to_str())
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse::<std::os::fd::RawFd>().ok())
+        .filter(|fd| *fd >= 3)
+        .ok_or_else(|| {
+            UsageError::new(
+                "--handle-fd must name an inherited writable descriptor numbered at least 3",
+                USAGE,
+            )
+        })?;
+    let mut argv = matches.get_many::<OsString>("argv").into_iter().flatten();
+    let program = argv
+        .next()
+        .filter(|program| !program.is_empty())
+        .ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    let args: Vec<OsString> = argv.cloned().collect();
+    if program.as_bytes().contains(&0) || args.iter().any(|arg| arg.as_bytes().contains(&0)) {
+        return Err(UsageError::new(
+            "subtree-root command arguments cannot contain NUL bytes",
+            USAGE,
+        ));
+    }
+    Ok(Command::SubtreeRoot(SubtreeRootArgs {
+        handle_fd,
+        program: program.clone(),
+        args,
+    }))
+}
+
+const RETIRE_DESCENDANTS: CommandSpec = CommandSpec {
+    name: "retire-descendants",
+    missing: "retire-descendants requires --grace-ms N",
+    args: "",
+    trailing: "",
+    summary: "retire the retained subtree named by a handle on stdin",
+    about: &[
+        "Reads exactly one JobSubtreeHandle JSON value from stdin through EOF, at most 65536 bytes including whitespace. Pass the handle from an admitted subtree-root response, not the surrounding admission record. It asks COWSHED_SUPERVISOR_SOCKET to retire that retained root and its descendants, not siblings or the whole job. No project discovery or gateway bootstrap runs.",
+        "Writes one bare JobSubtreeRetirement JSON record and newline on stdout, including typed refusals. An absent socket environment produces foldUnavailable. A refusal exits zero because the response carries the outcome; malformed input and operational or transport failures exit nonzero. --grace-ms is required, nonnegative milliseconds; zero requests immediate retirement without a grace interval.",
+    ],
+    options: &[Opt {
+        spelling: "--grace-ms <N>",
+        meaning: "required: nonnegative integer grace interval in milliseconds",
+    }],
+};
+
+fn parse_retire_descendants(
+    matches: &ArgMatches,
+    global: &GlobalOptions,
+) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &RETIRE_DESCENDANTS;
+    reject_project(
+        global,
+        USAGE,
+        "--project is not valid for retire-descendants: it names no project",
+    )?;
+    let millis = matches
+        .get_one::<OsString>("grace-ms")
+        .and_then(|value| value.to_str())
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or_else(|| {
+            UsageError::new(
+                "--grace-ms must be a nonnegative integer number of milliseconds",
+                USAGE,
+            )
+        })?;
+    Ok(Command::RetireDescendants(RetireDescendantsArgs {
+        grace: std::time::Duration::from_millis(millis),
+    }))
+}
 const CONTROLLER: CommandSpec = CommandSpec {
     name: "controller",
     missing: "controller requires an argument",

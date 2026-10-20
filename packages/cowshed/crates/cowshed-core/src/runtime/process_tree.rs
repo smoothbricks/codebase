@@ -26,11 +26,13 @@ use crate::api::process::{
 /// (`proc_uniqidentifierinfo`), unique while the system runs. Linux's observer chooses its own
 /// token with its event source; a stat `starttime` is not one, since a pid reused within one
 /// clock tick repeats it.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct BirthToken(pub u64);
 
 /// One life of one process.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub birth: BirthToken,
@@ -138,10 +140,20 @@ pub struct ProcessNode<'a> {
     pub exit: Option<&'a ProcessExit>,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct IssuedSubtree {
+    nonce: String,
+    spent: bool,
+}
+
 #[derive(Debug)]
 struct Life {
     identity: ProcessIdentity,
     parent: Option<usize>,
+    /// Issued once for this retained root, never copied to a sibling or a reused pid.
+    #[cfg(target_os = "macos")]
+    subtree: Option<IssuedSubtree>,
     ppid: u32,
     /// Shared with the parent until this life execs: a fork copies no argv.
     image: Arc<ProcessImage>,
@@ -321,6 +333,63 @@ impl ProcessTreeFold {
         self.by_identity.contains_key(&process)
     }
 
+    /// A root's opaque capability stays attached to its retained life after exec or exit.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn subtree_nonce(&self, index: usize) -> Option<&str> {
+        self.lives
+            .get(index)?
+            .subtree
+            .as_ref()
+            .map(|subtree| subtree.nonce.as_str())
+    }
+
+    /// Only the native writer issues capabilities, after authenticating this live index.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn issue_subtree(&mut self, index: usize, nonce: String) {
+        self.lives[index].subtree.get_or_insert(IssuedSubtree {
+            nonce,
+            spent: false,
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn subtree_spent(&self, index: usize) -> bool {
+        self.lives
+            .get(index)
+            .and_then(|life| life.subtree.as_ref())
+            .is_some_and(|subtree| subtree.spent)
+    }
+
+    /// Native success alone consumes the capability. Operational errors leave it retryable.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn spend_subtree(&mut self, index: usize) {
+        self.lives[index]
+            .subtree
+            .as_mut()
+            .expect("an issued subtree capability")
+            .spent = true;
+    }
+
+    /// Immutable birth ancestry, including the root and ancestors whose exits were folded.
+    /// Parent indices precede their children, so no current ppid or live-pid join is involved.
+    pub fn in_subtree(&self, root: ProcessIdentity, process: ProcessIdentity) -> bool {
+        let (Some(root), Some(mut index)) = (self.index(root), self.index(process)) else {
+            return false;
+        };
+        loop {
+            if index == root {
+                return true;
+            }
+            if index < root {
+                return false;
+            }
+            let Some(parent) = self.lives[index].parent else {
+                return false;
+            };
+            index = parent;
+        }
+    }
+
     pub fn coverage(&self) -> &ProcessCoverage {
         &self.coverage
     }
@@ -330,6 +399,14 @@ impl ProcessTreeFold {
     pub fn live(&self, pid: u32) -> Option<ProcessIdentity> {
         self.running
             .get(&pid)
+            .map(|&index| self.lives[index].identity)
+    }
+
+    /// Every life with no observed exit that still holds its pid in the fold: the observed
+    /// lives a job owns until each one's exit is folded.
+    pub fn running(&self) -> impl Iterator<Item = ProcessIdentity> + '_ {
+        self.running
+            .values()
             .map(|&index| self.lives[index].identity)
     }
 
@@ -378,6 +455,8 @@ impl ProcessTreeFold {
             parent,
             ppid,
             image,
+            #[cfg(target_os = "macos")]
+            subtree: None,
             image_known,
             born_at: at,
             exit: None,
@@ -536,6 +615,85 @@ mod tests {
                 exited_at: at(2),
             })
         );
+    }
+
+    /// The running lives are those with no folded exit; a late exit of a pid's earlier life
+    /// leaves the life now holding that pid running.
+    #[test]
+    fn running_lives_end_only_with_their_own_folded_exit() {
+        let mut fold = ProcessTreeFold::default();
+        let shell = id(100, 1);
+        let (old, new) = (id(101, 2), id(101, 3));
+        root(&mut fold, shell);
+        fork(&mut fold, old, shell, 1);
+        fork(&mut fold, new, shell, 2);
+        let mut running: Vec<_> = fold.running().collect();
+        running.sort_by_key(|life| life.pid);
+        assert_eq!(running, [shell, new]);
+        exit(&mut fold, old, 0, 3);
+        exit(&mut fold, shell, 0, 4);
+        assert_eq!(fold.running().collect::<Vec<_>>(), [new]);
+        exit(&mut fold, new, 0, 5);
+        assert_eq!(fold.running().next(), None);
+    }
+
+    #[test]
+    fn subtree_membership_uses_retained_birth_ancestry_after_exit_exec_and_pid_reuse() {
+        let mut fold = ProcessTreeFold::default();
+        let leader = id(100, 1);
+        let branch = id(101, 2);
+        let child = id(102, 3);
+        let sibling = id(103, 4);
+        let reused = id(101, 5);
+        root(&mut fold, leader);
+        fork(&mut fold, branch, leader, 1);
+        fork(&mut fold, child, branch, 2);
+        fork(&mut fold, sibling, leader, 3);
+        fold.apply(ProcessObservation::Exec {
+            process: branch,
+            image: image("/usr/bin/cc", &[b"cc"]),
+        })
+        .unwrap();
+        exit(&mut fold, branch, 0, 4);
+        fork(&mut fold, reused, leader, 5);
+        assert!(fold.in_subtree(branch, branch));
+        assert!(fold.in_subtree(branch, child));
+        assert!(!fold.in_subtree(branch, sibling));
+        assert!(!fold.in_subtree(branch, reused));
+        assert!(!fold.in_subtree(branch, leader));
+        assert!(!fold.in_subtree(id(101, 99), child));
+        assert_eq!(
+            fold.node_at(fold.index(child).unwrap()).unwrap().parent,
+            Some(branch)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn subtree_capability_stays_on_its_life_and_spending_cannot_be_reissued() {
+        let mut fold = ProcessTreeFold::default();
+        let first = id(101, 1);
+        let reused = id(101, 2);
+        root(&mut fold, first);
+        let index = fold.index(first).unwrap();
+        fold.issue_subtree(index, "first-root-nonce".to_owned());
+        fold.issue_subtree(index, "replacement-must-not-win".to_owned());
+        assert_eq!(fold.subtree_nonce(index), Some("first-root-nonce"));
+        assert!(!fold.subtree_spent(index));
+        fold.apply(ProcessObservation::Exec {
+            process: first,
+            image: image("/usr/bin/cc", &[b"cc"]),
+        })
+        .unwrap();
+        exit(&mut fold, first, 0, 1);
+        root(&mut fold, reused);
+        let reused_index = fold.index(reused).unwrap();
+        assert_eq!(fold.subtree_nonce(reused_index), None);
+        fold.spend_subtree(index);
+        fold.issue_subtree(index, "must-not-revive-a-spent-capability".to_owned());
+        assert!(fold.subtree_spent(index));
+        assert_eq!(fold.subtree_nonce(index), Some("first-root-nonce"));
+        assert_eq!(fold.subtree_nonce(reused_index), None);
     }
 
     #[test]

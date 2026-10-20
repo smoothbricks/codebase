@@ -1520,7 +1520,10 @@ mod tests {
         let leader = super::super::job_groups::GroupLeader::observe(child.id()).unwrap();
         let ledger = scratch.join("supervisor.groups");
         super::super::job_groups::Recorder::new(ledger.clone())
-            .record([(1, leader)].into_iter(), &[])
+            .record(
+                [super::super::job_groups::JobGroupClaim::group(1, leader)].into_iter(),
+                &[],
+            )
             .unwrap();
         ledger
     }
@@ -2082,7 +2085,10 @@ mod lifecycle_authority_tests {
         let leader = GroupLeader::observe(child.id()).expect("observe the group leader");
         let ledger = scratch.join("supervisor.groups");
         Recorder::new(ledger.clone())
-            .record([(1, leader)].into_iter(), &[])
+            .record(
+                [super::super::job_groups::JobGroupClaim::group(1, leader)].into_iter(),
+                &[],
+            )
             .expect("record the job's group");
         ledger
     }
@@ -2305,7 +2311,10 @@ mod lifecycle_authority_tests {
         let leader = GroupLeader::observe(daemon.id()).expect("observe the daemon's group leader");
         let ledger = scratch.join("supervisor.groups");
         Recorder::new(ledger.clone())
-            .record([(1, leader)].into_iter(), &[])
+            .record(
+                [super::super::job_groups::JobGroupClaim::group(1, leader)].into_iter(),
+                &[],
+            )
             .expect("record the job's group");
         let DaemonStopPlan::Owned { process, watch } =
             prepare_daemon_stop(&record_path, &ledger).expect("the plan reads")

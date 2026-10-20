@@ -600,6 +600,12 @@ export const assertJobAccountingList = typia.createAssertEquals<readonly Api.Job
 export const parseJobAccountingList = (json: string): readonly Api.JobAccounting[] =>
   assertJobAccountingList(JSON.parse(json));
 
+export const assertJobContainment = typia.createAssertEquals<Api.JobContainment>();
+export const parseJobContainment = (json: string): Api.JobContainment => assertJobContainment(JSON.parse(json));
+export const assertJobContainmentList = typia.createAssertEquals<readonly Api.JobContainment[]>();
+export const parseJobContainmentList = (json: string): readonly Api.JobContainment[] =>
+  assertJobContainmentList(JSON.parse(json));
+
 export const assertJobFailure = typia.createAssertEquals<Api.JobFailure>();
 export const parseJobFailure = (json: string): Api.JobFailure => assertJobFailure(JSON.parse(json));
 export const assertJobFailureList = typia.createAssertEquals<readonly Api.JobFailure[]>();
@@ -661,6 +667,13 @@ export const assertJobProcessLeafList = typia.createAssertEquals<readonly Api.Jo
 export const parseJobProcessLeafList = (json: string): readonly Api.JobProcessLeaf[] =>
   assertJobProcessLeafList(JSON.parse(json));
 
+export const assertJobProcessRetirement = typia.createAssertEquals<Api.JobProcessRetirement>();
+export const parseJobProcessRetirement = (json: string): Api.JobProcessRetirement =>
+  assertJobProcessRetirement(JSON.parse(json));
+export const assertJobProcessRetirementList = typia.createAssertEquals<readonly Api.JobProcessRetirement[]>();
+export const parseJobProcessRetirementList = (json: string): readonly Api.JobProcessRetirement[] =>
+  assertJobProcessRetirementList(JSON.parse(json));
+
 export const assertJobProcessSample = typia.createAssertEquals<Api.JobProcessSample>();
 export const parseJobProcessSample = (json: string): Api.JobProcessSample => assertJobProcessSample(JSON.parse(json));
 export const assertJobProcessSampleList = typia.createAssertEquals<readonly Api.JobProcessSample[]>();
@@ -701,6 +714,33 @@ export const parseJobStreamWatermark = (json: string): Api.JobStreamWatermark =>
 export const assertJobStreamWatermarkList = typia.createAssertEquals<readonly Api.JobStreamWatermark[]>();
 export const parseJobStreamWatermarkList = (json: string): readonly Api.JobStreamWatermark[] =>
   assertJobStreamWatermarkList(JSON.parse(json));
+
+export const assertJobSubtreeAdmission = typia.createAssertEquals<Api.JobSubtreeAdmission>();
+export const parseJobSubtreeAdmission = (json: string): Api.JobSubtreeAdmission =>
+  assertJobSubtreeAdmission(JSON.parse(json));
+export const assertJobSubtreeAdmissionList = typia.createAssertEquals<readonly Api.JobSubtreeAdmission[]>();
+export const parseJobSubtreeAdmissionList = (json: string): readonly Api.JobSubtreeAdmission[] =>
+  assertJobSubtreeAdmissionList(JSON.parse(json));
+
+export const assertJobSubtreeHandle = typia.createAssertEquals<Api.JobSubtreeHandle>();
+export const parseJobSubtreeHandle = (json: string): Api.JobSubtreeHandle => assertJobSubtreeHandle(JSON.parse(json));
+export const assertJobSubtreeHandleList = typia.createAssertEquals<readonly Api.JobSubtreeHandle[]>();
+export const parseJobSubtreeHandleList = (json: string): readonly Api.JobSubtreeHandle[] =>
+  assertJobSubtreeHandleList(JSON.parse(json));
+
+export const assertJobSubtreeRefusal = typia.createAssertEquals<Api.JobSubtreeRefusal>();
+export const parseJobSubtreeRefusal = (json: string): Api.JobSubtreeRefusal =>
+  assertJobSubtreeRefusal(JSON.parse(json));
+export const assertJobSubtreeRefusalList = typia.createAssertEquals<readonly Api.JobSubtreeRefusal[]>();
+export const parseJobSubtreeRefusalList = (json: string): readonly Api.JobSubtreeRefusal[] =>
+  assertJobSubtreeRefusalList(JSON.parse(json));
+
+export const assertJobSubtreeRetirement = typia.createAssertEquals<Api.JobSubtreeRetirement>();
+export const parseJobSubtreeRetirement = (json: string): Api.JobSubtreeRetirement =>
+  assertJobSubtreeRetirement(JSON.parse(json));
+export const assertJobSubtreeRetirementList = typia.createAssertEquals<readonly Api.JobSubtreeRetirement[]>();
+export const parseJobSubtreeRetirementList = (json: string): readonly Api.JobSubtreeRetirement[] =>
+  assertJobSubtreeRetirementList(JSON.parse(json));
 
 export const assertJobTail = typia.createAssertEquals<Api.JobTail>();
 export const parseJobTail = (json: string): Api.JobTail => assertJobTail(JSON.parse(json));
@@ -862,6 +902,12 @@ export const assertOtherBuild = typia.createAssertEquals<Api.OtherBuild>();
 export const parseOtherBuild = (json: string): Api.OtherBuild => assertOtherBuild(JSON.parse(json));
 export const assertOtherBuildList = typia.createAssertEquals<readonly Api.OtherBuild[]>();
 export const parseOtherBuildList = (json: string): readonly Api.OtherBuild[] => assertOtherBuildList(JSON.parse(json));
+
+export const assertOutlivedProcess = typia.createAssertEquals<Api.OutlivedProcess>();
+export const parseOutlivedProcess = (json: string): Api.OutlivedProcess => assertOutlivedProcess(JSON.parse(json));
+export const assertOutlivedProcessList = typia.createAssertEquals<readonly Api.OutlivedProcess[]>();
+export const parseOutlivedProcessList = (json: string): readonly Api.OutlivedProcess[] =>
+  assertOutlivedProcessList(JSON.parse(json));
 
 export const assertOutputLimitInfo = typia.createAssertEquals<Api.OutputLimitInfo>();
 export const parseOutputLimitInfo = (json: string): Api.OutputLimitInfo => assertOutputLimitInfo(JSON.parse(json));
@@ -1260,6 +1306,12 @@ export const assertSealedJob = typia.createAssertEquals<Api.SealedJob>();
 export const parseSealedJob = (json: string): Api.SealedJob => assertSealedJob(JSON.parse(json));
 export const assertSealedJobList = typia.createAssertEquals<readonly Api.SealedJob[]>();
 export const parseSealedJobList = (json: string): readonly Api.SealedJob[] => assertSealedJobList(JSON.parse(json));
+
+export const assertSealedJobRef = typia.createAssertEquals<Api.SealedJobRef>();
+export const parseSealedJobRef = (json: string): Api.SealedJobRef => assertSealedJobRef(JSON.parse(json));
+export const assertSealedJobRefList = typia.createAssertEquals<readonly Api.SealedJobRef[]>();
+export const parseSealedJobRefList = (json: string): readonly Api.SealedJobRef[] =>
+  assertSealedJobRefList(JSON.parse(json));
 
 export const assertSessionRequest = typia.createAssertEquals<Api.SessionRequest>();
 export const parseSessionRequest = (json: string): Api.SessionRequest => assertSessionRequest(JSON.parse(json));

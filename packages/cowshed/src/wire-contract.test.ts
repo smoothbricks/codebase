@@ -7,6 +7,12 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import typia from 'typia';
+import type {
+  JobProcessRetirement,
+  JobSubtreeAdmission,
+  JobSubtreeRefusal,
+  JobSubtreeRetirement,
+} from './api.generated.js';
 import type { JobKillArguments } from './native.generated.js';
 import type { GrantDelta } from './types.js';
 import * as validators from './validators.generated.js';
@@ -184,6 +190,74 @@ describe('napi wire contract', () => {
     const tagged = job.argv?.at(-1);
     expect(tagged?.encoding).toBe('base64');
     expect(Array.from(Buffer.from(tagged?.data ?? '', 'base64'))).toEqual([0xff, 0xfe, 0x80]);
+  });
+
+  it('states a retirement receipt only as the receipt, never as a default', () => {
+    // A job that retired nothing omits both facts, so an absent receipt can never read as `kernel`
+    // or as a survivor list that found nothing.
+    const exited = seamTypes.JobInfo.assertOne(corpus.JobInfo?.exited);
+    expect(exited).not.toHaveProperty('containment');
+    expect(exited).not.toHaveProperty('outlived');
+    expect(exited).not.toHaveProperty('outlivedIncomplete');
+
+    const kernel = seamTypes.JobInfo.assertOne(corpus.JobInfo?.retiredKernel);
+    expect(kernel.containment).toEqual({ kind: 'kernel' });
+    expect(kernel).not.toHaveProperty('outlived');
+    expect(kernel).not.toHaveProperty('outlivedIncomplete');
+
+    const incomplete = seamTypes.JobInfo.assertOne(corpus.JobInfo?.retiredKernelIncomplete);
+    expect(incomplete.containment).toEqual({ kind: 'kernel' });
+    expect(incomplete.outlivedIncomplete).toBe(true);
+    expect(incomplete).not.toHaveProperty('outlived');
+    expect(seamTypes.JobInfo.parseOne(JSON.stringify(incomplete))).toEqual(incomplete);
+    const incompleteWithRows = seamTypes.JobInfo.assertOne(corpus.JobInfo?.retiredKernelIncompleteWithRows);
+    expect(incompleteWithRows.outlivedIncomplete).toBe(true);
+    expect(incompleteWithRows.outlived).toHaveLength(2);
+    for (const outlivedIncomplete of [null, 'true', 1]) {
+      expect(() => seamTypes.JobInfo.assertOne({ ...incomplete, outlivedIncomplete })).toThrow();
+    }
+
+    const observed = seamTypes.JobInfo.assertOne(corpus.JobInfo?.retiredObserved);
+    expect(observed.containment?.kind).toBe('observed');
+    // An index or image nothing observed is absent: unknown, never zero or an empty string.
+    expect(observed.outlived?.[1]).toEqual({ pid: 4248, signal: 9 });
+    expect(() => seamTypes.JobInfo.assertOne({ ...observed, containment: { kind: 'observed' } })).toThrow();
+    expect(() => seamTypes.JobInfo.assertOne({ ...kernel, containment: { kind: 'userspace' } })).toThrow();
+
+    // Draining is a state of its own: the leader ended and its membership is being retired.
+    expect(seamTypes.JobInfo.assertOne(corpus.JobInfo?.draining).state).toBe('draining');
+  });
+
+  it('keeps subtree handles opaque and outcomes closed in generated validators', () => {
+    const handle = { jobId: 7, index: 2, incarnation: '0123456789abcdef0123456789abcdef' };
+    const admitted: JobSubtreeAdmission = { kind: 'admitted', handle };
+    expect(validators.assertJobSubtreeHandle(handle)).toEqual(handle);
+    expect(validators.parseJobSubtreeAdmission(JSON.stringify(admitted))).toEqual(admitted);
+    const reasons: readonly JobSubtreeRefusal[] = [
+      'foldUnavailable',
+      'notMember',
+      'foreignHandle',
+      'jobEnded',
+      'spentHandle',
+    ];
+    for (const reason of reasons) {
+      const refused: JobSubtreeAdmission = { kind: 'refused', reason };
+      expect(validators.assertJobSubtreeAdmission(refused)).toEqual(refused);
+      expect(validators.parseJobSubtreeRetirement(JSON.stringify(refused))).toEqual(refused);
+    }
+    const retirement: JobProcessRetirement = {
+      containment: { kind: 'kernel' },
+      outlived: [],
+      outlivedIncomplete: true,
+    };
+    const retired: JobSubtreeRetirement = { kind: 'retired', retirement };
+    expect(validators.parseJobSubtreeRetirement(JSON.stringify(retired))).toEqual(retired);
+    expect(() => validators.assertJobSubtreeHandle({ ...handle, pid: 4242 })).toThrow();
+    expect(() => validators.assertJobSubtreeAdmission({ ...admitted, reason: 'notMember' })).toThrow();
+    expect(() => validators.assertJobSubtreeAdmission({ kind: 'refused', reason: 'unknown' })).toThrow();
+    expect(() => validators.assertJobSubtreeRetirement({ kind: 'retired' })).toThrow();
+    expect(() => validators.assertJobSubtreeRetirement({ kind: 'retired', retirement: { outlived: [] } })).toThrow();
+    expect(() => validators.assertJobSubtreeRetirement({ ...retired, handle })).toThrow();
   });
 
   it('preserves the null working directory as null rather than as absent', () => {
