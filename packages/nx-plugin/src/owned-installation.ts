@@ -21,6 +21,11 @@
  * whose copy no longer holds what the host's holds is copied again. Both censuses take the hashes of files whose
  * stamps have not moved from the ones recorded beside the copy, so a run that changes nothing reads no file bytes.
  *
+ * The copy lies beneath `censusRoot`'s `node_modules`, so a census of it that resolves any package outside the copy
+ * proves nothing about it, and the copy is made again, whole, in a directory of its own (`installation-<uuid>`, named
+ * in the record beside it). A package in the copy that requires a dependency it does not
+ * declare still reaches the host's top-level `node_modules` the same way; the census binds declared edges only.
+ *
  * A test file uses its copy, on first use, for all its fixtures; retiring it fails, naming the changed nodes, if any
  * fixture wrote into it.
  */
@@ -50,11 +55,13 @@ const CENSUS_NX_JSON = { plugins: ['@smoothbricks/nx-plugin'] };
 const KEPT = join('node_modules', '.cache', 'smoothbricks-nx-plugin', 'owned-installations');
 
 /**
- * What is recorded beside a kept copy: the host closure's last census and the copy's last proven census. Only a hash
- * source for the next censuses; never a proof that the copy is current.
+ * What is recorded beside a kept copy: where it is, the host closure's last census and the copy's last proven census.
+ * Only a hash source for the next censuses; never a proof that the copy is current.
  */
 interface KeptCensuses {
-  readonly version: 1;
+  readonly version: 2;
+  /** The directory, beside this record, that holds the copy. */
+  readonly installation: string;
   readonly host: GraphInstallationCensus;
   readonly copy: GraphInstallationCensus;
 }
@@ -95,6 +102,27 @@ function provenCensus(
     onUnproved,
     previous,
   );
+}
+
+/**
+ * The proven census of the copy under `root`, or `null`, with `onUnproved` told why, for one that is unproved or
+ * that resolves a package outside the copy. The copy lies in `censusRoot`'s `node_modules/.cache`, so where that is a
+ * real directory, as on a fresh CI checkout, Node's ancestor lookup from the copy reaches the host's own
+ * `node_modules`: a copy that is missing, or lacks a link, would otherwise be proved by a census of host packages.
+ * Node also keeps every resolution for the life of the process, so once a census has resolved a host package from a
+ * copy's directory, no copy made there again can be proved in that process: a copy made whole goes to a new directory.
+ */
+function copyCensus(
+  root: string,
+  previous: GraphInstallationCensus | undefined,
+  onUnproved: (detail: string) => void,
+): GraphInstallationCensus | null {
+  const census = provenCensus(root, previous, onUnproved);
+  const escaped = census?.resolutions.find(([, , manifest]) => manifest !== null && !manifest.startsWith(`${root}/`));
+  if (escaped === undefined) return census;
+  const [from, name, manifest] = escaped;
+  onUnproved(`it resolves ${name} from ${from} to ${manifest}, outside the copy`);
+  return null;
 }
 
 /** Where the copy keeps each package root the census of `censusRoot` resolves. */
@@ -252,7 +280,6 @@ async function clearLeftovers(
 async function keptInstallation(censusRoot: string, name: string): Promise<OwnedInstallation> {
   await mkdir(join(censusRoot, KEPT, name), { recursive: true });
   const kept = await realpath(join(censusRoot, KEPT, name));
-  const root = join(kept, 'installation');
   const record = join(kept, 'censuses.json');
   const recorded = await readKept(record);
   let unread = 'no detail';
@@ -270,22 +297,29 @@ async function keptInstallation(censusRoot: string, name: string): Promise<Owned
   if (host === null) throw new Error(`the Nx installation closure of ${censusRoot} cannot be read: ${unread}`);
   const placed = await placements(host);
   const wanted = holdings(host, censusRoot, new Map([...placed].map(([source, { place }]) => [source, place])));
-  const copyPlaces = new Map([...placed.values()].map(({ place }) => [join(root, place), place]));
+  const placesIn = (root: string) => new Map([...placed.values()].map(({ place }) => [join(root, place), place]));
+  // Only a recorded copy is censused: a census of none would resolve the host's packages through the ancestor lookup.
+  const current = recorded === null ? null : join(kept, recorded.installation);
   let unproved = 'no detail';
-  const found = provenCensus(root, recorded?.copy, (detail) => {
-    unproved = detail;
-  });
-  const held = found === null ? null : holdings(found, root, copyPlaces);
+  const found =
+    current === null
+      ? null
+      : copyCensus(current, recorded?.copy, (detail) => {
+          unproved = detail;
+        });
+  const held = current === null || found === null ? null : holdings(found, current, placesIn(current));
   const stale =
     held === null || held.edges !== wanted.edges || held.packages.get('') !== wanted.packages.get('')
       ? null
       : [...placed].filter(([, { place }]) => held.packages.get(place) !== wanted.packages.get(place));
-  if (found !== null) await clearLeftovers(censusRoot, root, host);
-  if (stale !== null && stale.length === 0 && found !== null) {
-    await writeKept(record, { version: 1, host, copy: found });
-    return { root, census: found };
+  if (current !== null && stale !== null) {
+    await clearLeftovers(censusRoot, current, host);
+    if (stale.length === 0 && found !== null) {
+      await writeKept(record, { version: 2, installation: basename(current), host, copy: found });
+      return { root: current, census: found };
+    }
   }
-  if (recorded !== null || found !== null) {
+  if (current !== null) {
     const why =
       held === null
         ? `its census is unproved (${unproved})`
@@ -296,21 +330,25 @@ async function keptInstallation(censusRoot: string, name: string): Promise<Owned
               wanted,
               held,
             )}`;
-    process.stderr.write(`kept Nx installation ${root} failed its proof, copying again: ${why}\n`);
+    process.stderr.write(`kept Nx installation ${current} failed its proof, copying again: ${why}\n`);
   }
-  if (stale === null) {
-    await rm(root, { recursive: true, force: true });
-    await Promise.all([...placed].map(([source, placement]) => copyPackage(source, root, placement)));
-    await linkCopies(censusRoot, root, host, placed);
-  } else {
+  // A copy made whole goes to a directory no census in this process has resolved from (copyCensus).
+  const root = current !== null && stale !== null ? current : join(kept, `installation-${randomUUID()}`);
+  if (root === current && stale !== null) {
     for (const [, { place }] of stale) await rm(join(root, place), { recursive: true, force: true });
     await Promise.all(stale.map(([source, placement]) => copyPackage(source, root, placement)));
+  } else {
+    for (const entry of await readdir(kept)) {
+      if (entry !== 'censuses.json') await rm(join(kept, entry), { recursive: true, force: true });
+    }
+    await Promise.all([...placed].map(([source, placement]) => copyPackage(source, root, placement)));
+    await linkCopies(censusRoot, root, host, placed);
   }
-  const census = provenCensus(root, found ?? undefined, (detail) => {
+  const census = copyCensus(root, root === current ? (found ?? undefined) : undefined, (detail) => {
     unproved = detail;
   });
   if (census === null) throw new Error(`the Nx installation copied to ${root} is unproved: ${unproved}`);
-  const copied = holdings(census, root, copyPlaces);
+  const copied = holdings(census, root, placesIn(root));
   const moved = [...placed].filter(([, { place }]) => copied.packages.get(place) !== wanted.packages.get(place));
   if (copied.edges !== wanted.edges || moved.length > 0) {
     // The host's own installs relink its shared store while it is read: the copy is proved as made, and the next run
@@ -319,7 +357,7 @@ async function keptInstallation(censusRoot: string, name: string): Promise<Owned
       `the Nx installation closure of ${censusRoot} moved while ${root} copied it: ${differences(moved, wanted, copied)}\n`,
     );
   }
-  await writeKept(record, { version: 1, host, copy: census });
+  await writeKept(record, { version: 2, installation: basename(root), host, copy: census });
   return { root, census };
 }
 

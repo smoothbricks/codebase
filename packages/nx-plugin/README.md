@@ -1678,6 +1678,14 @@ work that is not the test's. Each test file names its own copy; two runs of one 
 them makes again fails the other. This package's tests bind `censusRoot` to this repository; a consumer binds it to its
 own workspace root.
 
+The copy lies beneath `censusRoot`'s `node_modules`. Where `node_modules/.cache` is a real directory, as on a fresh CI
+checkout (a cowshed build volume links it elsewhere), Node's ancestor lookup from the copy reaches the host's own
+packages, so a census of a missing or incomplete copy would resolve the host's. A census of the copy that resolves any
+package outside the copy therefore proves nothing about it: the copy is unproved and made again, and stderr names the
+resolution. Node keeps each resolution for the life of a process, so a copy made whole goes to a new directory,
+`installation-<uuid>`, which the record beside it names. The same lookup lets a package in the copy that requires a
+dependency it does not declare load the host's top-level one; the census binds declared edges only and cannot see that.
+
 ## Managed workspace files
 
 `nx generate @smoothbricks/nx-plugin:managed-files` stages the same managed files as `smoo monorepo update`, without

@@ -8,6 +8,7 @@
     "src/task-results.test.ts": 30128,
     "src/nx-daemon-claim.test.ts": 27613,
     "src/linked-snapshots.nx.test.ts": 25004,
+    "src/owned-installation.test.ts": 23810,
     "src/cargo-closure-input.test.ts": 16642,
     "src/index.test.ts": 16175,
     "src/nx-daemon-ignore-files.test.ts": 14445,
