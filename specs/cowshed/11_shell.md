@@ -304,6 +304,17 @@ kills it under the authority it serves then, and says so on its stderr.
   links, so it opens no project in-process: it runs its controller as `cowshed controller` (06_cli.md), a process of the
   host's own build, and speaks the controller protocol to it over the socket it hands that process; after an install has
   started the daemon of a new build, it starts that verb again for its new work.
+
+  Only a hello proving that nothing serves the socket starts a supervisor: no socket file, or one no socket is attached
+  to any more, whether the connection was refused or the peer ended it unanswered (a supervisor exiting closes its
+  listener with a hello in its queue). A hello that times out, a socket still attached that refuses or ends the
+  exchange, or an answer that cannot be read is no proof either way, and an ensure returns it as itself, naming what
+  happened, and starts nothing. A 10-second hello timeout on a saturated drive is indistinguishable from a dead
+  supervisor; measured 2026-10-21, an ensure that read it as a vacancy started a second supervisor beside one that had
+  served the socket since it bound (the socket file's modification time is when its listener bound), and the second
+  failed as "a supervisor or lifecycle operation owns" the socket, costing its caller a unit's time on a misleading
+  sentence.
+
 - **advance** — the supervisor re-reads its workspace's grants and serves under their revision from then on
   (Grant-change propagation, below); answered with the authority it serves afterwards.
 - **drain** — the supervisor admits nothing more, lets its running jobs finish, then retires; answered at once with its

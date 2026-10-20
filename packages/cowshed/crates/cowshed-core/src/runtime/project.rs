@@ -8328,8 +8328,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // A workspace has one supervisor, its one job allocator: when another controller
         // process already serves it under this authority, or under grants published since this
         // command read them, its commands go there.
-        match super::supervisor_socket::hello(&socket).await {
-            Ok(hello) => {
+        match super::supervisor_socket::hello_if_present(&socket).await {
+            Ok(Some(hello)) => {
                 match super::supervisor_manager::standing(&hello.authority, &config.authority) {
                     super::supervisor_manager::Standing::Serves => {
                         let handle = super::supervisor_socket::connect(socket, hello.authority);
@@ -8356,10 +8356,12 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     }
                 }
             }
-            // A supervisor of another cowshed build: refused by name.
-            Err(error) if error.code == crate::error::ErrorCode::Conflict => return Err(error),
             // Nobody serves it; this process does.
-            Err(_) => {}
+            Ok(None) => {}
+            // Another build's supervisor is refused by name. Any other failure is no proof that
+            // nothing serves: a hello that timed out on a busy host is a live supervisor, and
+            // starting a second beside it only loses the socket lease. Returned as itself.
+            Err(error) => return Err(error),
         }
         let authority = config.authority.clone();
         // The socket first: holding it is what makes this the workspace's one supervisor, so

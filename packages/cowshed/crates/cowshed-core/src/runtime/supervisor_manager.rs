@@ -441,8 +441,13 @@ impl SupervisorManager {
                 .or_default(),
         );
         let _one_at_a_time = lock.lock().await;
-        match supervisor_socket::hello(&socket).await {
-            Ok(hello) => {
+        // Only a socket proven unserved (`Ok(None)`) starts a supervisor. A hello that timed out,
+        // a live socket that refuses, or an answer that cannot be read says nothing about whether
+        // a supervisor serves: it is returned as itself. Treating it as a vacancy started a
+        // second supervisor beside a live one, which then lost the socket lease and failed as "a
+        // supervisor or lifecycle operation owns" the socket (measured 2026-10-21).
+        match supervisor_socket::hello_if_present(&socket).await {
+            Ok(Some(hello)) => {
                 let hello = match standing(&hello.authority, authority) {
                     Standing::Serves | Standing::Elsewhere => hello,
                     // A grant change since it started: it re-reads the grants and serves under
@@ -454,8 +459,8 @@ impl SupervisorManager {
                 };
                 return serving(&socket, &hello, authority);
             }
-            Err(error) if error.code == ErrorCode::Conflict => return Err(error),
-            Err(_) => {}
+            Ok(None) => {}
+            Err(error) => return Err(error),
         }
         let cannot_start = |error: io::Error| {
             CowshedError::environment_missing(
@@ -1694,5 +1699,56 @@ mod tests {
             .expect("the connecting task")
             .expect("reaches the daemon the install started");
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// Measured 2026-10-21: the manager started a second supervisor beside a live one whose hello
+    /// had timed out on a saturated drive, and the second failed as "a supervisor or lifecycle
+    /// operation owns" the socket. A hello that does not answer is no proof that nothing serves:
+    /// ensure returns that timeout as itself and starts nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_hello_that_times_out_is_returned_and_starts_no_second_supervisor() {
+        let store = PathBuf::from("/tmp").join(format!(
+            "cowshed-slow-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let authority = WorkspaceAuthoritySnapshot {
+            repo_id: crate::repository::RepoId::parse("acme/widget").unwrap(),
+            workspace: WorkspaceName::new("raven").unwrap(),
+            workspace_incarnation: crate::metadata::WorkspaceIncarnation::new(
+                "0198f2c0b7e34dc795f17b238b331c80",
+            )
+            .unwrap(),
+            grant_revision: 1,
+            lifecycle_revision: 1,
+        };
+        let socket =
+            supervisor_socket::socket_path(&store, &authority.repo_id, &authority.workspace);
+        std::fs::create_dir_all(socket.parent().unwrap()).expect("run directory");
+        // A live supervisor too busy to answer: it accepts and holds the connection, and says
+        // nothing.
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the busy supervisor");
+        let busy = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let manager = SupervisorManager::new(&store, Box::new(NoSpawner), healed());
+
+        let refused = manager
+            .ensure(Path::new("/repo"), &authority)
+            .await
+            .expect_err("a supervisor that does not answer is not a vacancy");
+
+        assert!(
+            refused.message.contains("did not answer within"),
+            "the refusal names the hello timeout: {refused:?}"
+        );
+        assert!(
+            !refused.message.contains("starts no supervisor"),
+            "no second supervisor was started: {refused:?}"
+        );
+        busy.abort();
+        std::fs::remove_dir_all(store).expect("cleanup");
     }
 }

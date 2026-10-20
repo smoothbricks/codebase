@@ -1699,10 +1699,12 @@ pub async fn hello(path: &Path) -> Result<Hello> {
     })
 }
 
-/// Absence is only no socket file, or a refused connection to one no socket is attached to any
-/// more (see `occupant`). A refusal while a socket is still attached -- a full queue, or a
-/// holder that does not accept -- a live peer's unknown response, malformed protocol, or bounded
-/// hello timeout is an error, never proof it stopped.
+/// Absence is only no socket file, or one no socket is attached to any more (see `occupant`):
+/// found by a refused connection, or after a connection the peer ended unanswered -- a supervisor
+/// exiting closes its listener with a hello in its queue. A refusal or an ended exchange while a
+/// socket is still attached -- a full queue, or a holder that does not accept or answer -- a live
+/// peer's unknown response, malformed protocol, or bounded hello timeout is an error, never proof
+/// it stopped.
 pub async fn hello_if_present(path: &Path) -> Result<Option<Hello>> {
     tokio::time::timeout(HELLO_BOUND, async {
         let mut stream = match UnixStream::connect(path).await {
@@ -1725,7 +1727,15 @@ pub async fn hello_if_present(path: &Path) -> Result<Option<Hello>> {
             }
             Err(error) => return Err(unavailable(path, &error)),
         };
-        let (value, _) = exchange_on(&mut stream, path, &Request::Hello, Bytes::new()).await?;
+        let (value, _) = match exchange_on(&mut stream, path, &Request::Hello, Bytes::new()).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                return match occupant(path) {
+                    Ok(Occupant::Absent | Occupant::Stopped) => Ok(None),
+                    Ok(Occupant::Live) | Err(_) => Err(error),
+                };
+            }
+        };
         decode_hello(path, value).map(Some)
     })
     .await
