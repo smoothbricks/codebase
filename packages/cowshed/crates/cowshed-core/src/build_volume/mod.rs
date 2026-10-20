@@ -549,6 +549,37 @@ impl BuildVolumeLayout {
         &self.project
     }
 
+    /// Journal a release of volume `id` in the project's deletion log (16_build_volumes.md,
+    /// "Garbage collection"), naming the workspace its sidecar `recorded` (the checkout that linked
+    /// it, the target whose seed it was), or nobody for one recorded unlinked or with no readable
+    /// sidecar. A release that deleted the image writes `release-build-volume` for the image; one
+    /// that found the image already gone and deleted the record writes
+    /// `release-imageless-build-volume` for the record, naming the missing image.
+    pub(crate) fn journal_release(
+        &self,
+        id: &BuildVolumeId,
+        recorded: Option<&BuildVolumeRole>,
+        image_deleted: bool,
+    ) {
+        use crate::storage::deletion_log::{DeletionKind, DeletionOp, log_deletion};
+        let (kind, workspace) = match recorded {
+            Some(BuildVolumeRole::Seed { target, .. }) => {
+                (DeletionKind::BuildSeed, target.as_str())
+            }
+            Some(BuildVolumeRole::Linked { checkout }) => {
+                (DeletionKind::BuildVolume, checkout.as_str())
+            }
+            Some(BuildVolumeRole::Unlinked) | None => (DeletionKind::BuildVolume, ""),
+        };
+        let image = self.image(id);
+        let (op, artifact) = if image_deleted {
+            (DeletionOp::ReleaseBuildVolume, image.clone())
+        } else {
+            (DeletionOp::ReleaseImagelessBuildVolume, self.record(id))
+        };
+        log_deletion(&self.project, op, kind, workspace, Some(&image), &artifact);
+    }
+
     pub fn images(&self) -> &Path {
         &self.images
     }

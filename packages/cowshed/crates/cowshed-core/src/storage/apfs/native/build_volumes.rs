@@ -512,9 +512,12 @@ where
         }
         self.backend.delete_image(&image)?;
         if present {
-            journal_release(layout, &image, recorded.as_ref());
+            layout.journal_release(id, recorded.as_ref(), true);
         }
-        remove_if_present(&layout.record(id))?;
+        // A volume whose image was already gone is retired by its record alone, said as such.
+        if remove_if_present(&layout.record(id))? && !present {
+            layout.journal_release(id, recorded.as_ref(), false);
+        }
         remove_if_present(&layout.hold_path(id))?;
         match fs::remove_dir(&mount) {
             Ok(()) => {}
@@ -684,34 +687,13 @@ fn set_written(image: &Path, written: SystemTime) -> Result<(), ApfsStorageError
         .map_err(|error| io_error("set a build volume image's modification time", image, error))
 }
 
-fn remove_if_present(path: &Path) -> Result<(), ApfsStorageError> {
+/// Whether `path` was there to remove.
+fn remove_if_present(path: &Path) -> Result<bool, ApfsStorageError> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io_error("remove build volume record", path, error)),
     }
-}
-
-/// The deletion log's line for a released build volume's image: a seed's or another volume's,
-/// naming the workspace its sidecar `recorded` (the checkout that linked it, the target whose
-/// seed it was), or nobody for one recorded unlinked or with no readable sidecar.
-fn journal_release(layout: &BuildVolumeLayout, image: &Path, recorded: Option<&BuildVolumeRole>) {
-    use crate::storage::deletion_log::{DeletionKind, DeletionOp, log_deletion};
-    let (kind, workspace) = match recorded {
-        Some(BuildVolumeRole::Seed { target, .. }) => (DeletionKind::BuildSeed, target.as_str()),
-        Some(BuildVolumeRole::Linked { checkout }) => {
-            (DeletionKind::BuildVolume, checkout.as_str())
-        }
-        Some(BuildVolumeRole::Unlinked) | None => (DeletionKind::BuildVolume, ""),
-    };
-    log_deletion(
-        layout.project_root(),
-        DeletionOp::ReleaseBuildVolume,
-        kind,
-        workspace,
-        Some(image),
-        image,
-    );
 }
 
 /// A path asked about, against the kernel's mount table. The kernel records a mount point as

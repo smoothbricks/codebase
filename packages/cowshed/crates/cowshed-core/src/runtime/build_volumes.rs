@@ -1880,7 +1880,7 @@ fn still_doomed(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(io(
-                    "inspect orphan seed image",
+                    "inspect a build volume's absent image",
                     &layout.image(&doomed.id),
                     &error,
                 ));
@@ -2052,7 +2052,8 @@ pub(crate) struct Doomed {
     pub reason: GcReason,
     pub bytes: u64,
     pub seen: Option<BuildVolumeRecord>,
-    /// An orphan sidecar: a newly appearing image makes the planned release stale.
+    /// The image was already gone when planned: the release retires the record alone, and an
+    /// image appearing since makes the planned release stale.
     pub image_missing: bool,
 }
 
@@ -2184,6 +2185,30 @@ pub(crate) fn plan(
     }
     for (id, reason, seen) in doomed {
         let image = layout.image(&id);
+        // Only absence lets a volume go without its size: an image that does not exist cannot be
+        // waiting for anything, and deferring its record deferred it on every pass forever. An
+        // image that exists but cannot be read is deferred with the error, never released on a
+        // guess (16_build_volumes.md, "Garbage collection").
+        match std::fs::symlink_metadata(&image) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                plan.doomed.push(Doomed {
+                    id,
+                    reason,
+                    bytes: 0,
+                    seen,
+                    image_missing: true,
+                });
+                continue;
+            }
+            Err(error) => {
+                plan.deferred.push((
+                    id,
+                    Deferral::SizeUnreadable(format!("{}: {error}", image.display())),
+                ));
+                continue;
+            }
+            Ok(_) => {}
+        }
         let allocated = std::fs::metadata(&image).and_then(|metadata| {
             if metadata.is_dir() {
                 crate::storage::directory::allocated_tree_bytes(&image)
@@ -3586,6 +3611,56 @@ mod tests {
         );
     }
 
+    /// A record whose image is gone is released with it, never deferred: an image that does not
+    /// exist cannot be waiting for anything, and deferring its record retried it on every pass
+    /// forever. An image that exists but whose size cannot be read is still deferred.
+    #[test]
+    fn an_absent_image_releases_its_record_and_an_unreadable_present_one_defers() {
+        let store = Store::new();
+        let absent = BuildVolumeId::mint();
+        let record = BuildVolumeRecord::new(
+            None,
+            BuildVolumeRole::Linked {
+                checkout: WorkspaceName::new("retired").unwrap(),
+            },
+        );
+        store.layout.write_record(&absent, &record).unwrap();
+        // Present, as a link, but its size is unreadable: the link names nothing.
+        let sizeless = BuildVolumeId::mint();
+        std::os::unix::fs::symlink(store.root.join("gone"), store.layout.image(&sizeless)).unwrap();
+        store
+            .layout
+            .write_record(
+                &sizeless,
+                &BuildVolumeRecord::new(None, BuildVolumeRole::Unlinked),
+            )
+            .unwrap();
+        let plan = plan(
+            &store.layout,
+            &store.layout.collection_ids().unwrap(),
+            &Links::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.doomed,
+            [Doomed {
+                id: absent,
+                reason: GcReason::UnlinkedBuildVolume,
+                bytes: 0,
+                seen: Some(record),
+                image_missing: true,
+            }],
+            "{plan:?}"
+        );
+        assert!(
+            matches!(
+                plan.deferred.as_slice(),
+                [(id, Deferral::SizeUnreadable(_))] if *id == sizeless
+            ),
+            "{plan:?}"
+        );
+    }
+
     /// The bytes the filesystem mounted at `mount` holds, as the kernel reports them.
     #[cfg(target_os = "macos")]
     fn filesystem_bytes(mount: &Path) -> u64 {
@@ -4792,6 +4867,18 @@ mod tests {
         assert_eq!(collected.reclaimed, 1);
         assert_eq!(collected.freed_bytes, 0);
         assert!(!scratch.layout.record(&seed).exists());
+        let log = fs::read_to_string(
+            scratch
+                .layout
+                .project_root()
+                .join(crate::storage::deletion_log::DELETION_LOG_FILE),
+        )
+        .unwrap();
+        assert!(
+            log.contains("release-imageless-build-volume")
+                && log.contains(&*scratch.layout.record(&seed).to_string_lossy()),
+            "the record's retirement is journaled as one whose image was gone: {log}"
+        );
         scratch.release_all();
     }
 
@@ -6845,6 +6932,78 @@ fn main() {
         assert_ne!(main_seed, first_seed);
         assert!(!scratch.layout.image(&first_seed).exists());
         assert!(!scratch.layout.image(&main_live).exists());
+        scratch.release_all();
+    }
+
+    /// GC over a record whose image is gone terminates: the record is released, journaled as
+    /// `release-imageless-build-volume` naming the record and the missing image, and the next
+    /// pass finds nothing left to decide.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_gc_releases_a_record_whose_image_is_gone_and_journals_it() {
+        use crate::storage::deletion_log::{
+            DELETION_LOG_FILE, DeletionKind, DeletionLogEntry, DeletionOp,
+        };
+        let scratch = Scratch::directory("imageless-record-gc");
+        let absent = BuildVolumeId::mint();
+        fs::create_dir_all(scratch.layout.images()).unwrap();
+        scratch
+            .layout
+            .write_record(
+                &absent,
+                &BuildVolumeRecord::new(
+                    None,
+                    BuildVolumeRole::Linked {
+                        checkout: WorkspaceName::new("retired").unwrap(),
+                    },
+                ),
+            )
+            .unwrap();
+        let ids = scratch.layout.collection_ids().unwrap();
+        assert_eq!(ids, std::slice::from_ref(&absent));
+        let collected = scratch
+            .volumes
+            .collect(ids, Links::default(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            (collected.reclaimed, collected.freed_bytes),
+            (1, 0),
+            "{:?}",
+            collected.deferred
+        );
+        assert!(collected.deferred.is_empty(), "{:?}", collected.deferred);
+        assert!(!scratch.layout.record(&absent).exists());
+        assert_eq!(
+            scratch.layout.collection_ids().unwrap(),
+            [],
+            "the next pass has nothing left to retry"
+        );
+        let log =
+            fs::read_to_string(scratch.layout.project_root().join(DELETION_LOG_FILE)).unwrap();
+        let entries = log
+            .lines()
+            .map(|line| serde_json::from_str::<DeletionLogEntry>(line).unwrap())
+            .map(|entry| {
+                (
+                    entry.op,
+                    entry.kind,
+                    entry.workspace,
+                    entry.image,
+                    entry.artifact,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            [(
+                DeletionOp::ReleaseImagelessBuildVolume,
+                DeletionKind::BuildVolume,
+                "retired".to_owned(),
+                Some(scratch.layout.image(&absent)),
+                scratch.layout.record(&absent),
+            )]
+        );
         scratch.release_all();
     }
 

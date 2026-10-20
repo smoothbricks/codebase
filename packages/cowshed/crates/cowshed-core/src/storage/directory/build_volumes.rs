@@ -146,10 +146,11 @@ fn scan_clock_entries(
     }
     Ok(())
 }
-fn remove_if_present(path: &Path) -> Result<(), ApfsStorageError> {
+/// Whether `path` was there to remove.
+fn remove_if_present(path: &Path) -> Result<bool, ApfsStorageError> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(io_error("remove build volume record", path, error)),
     }
 }
@@ -172,25 +173,6 @@ fn hold_owners(
             error,
         )
     })
-}
-
-fn journal_release(layout: &BuildVolumeLayout, image: &Path, recorded: Option<&BuildVolumeRole>) {
-    use crate::storage::deletion_log::{DeletionKind, DeletionOp, log_deletion};
-    let (kind, workspace) = match recorded {
-        Some(BuildVolumeRole::Seed { target, .. }) => (DeletionKind::BuildSeed, target.as_str()),
-        Some(BuildVolumeRole::Linked { checkout }) => {
-            (DeletionKind::BuildVolume, checkout.as_str())
-        }
-        Some(BuildVolumeRole::Unlinked) | None => (DeletionKind::BuildVolume, ""),
-    };
-    log_deletion(
-        layout.project_root(),
-        DeletionOp::ReleaseBuildVolume,
-        kind,
-        workspace,
-        Some(image),
-        image,
-    );
 }
 
 impl DirectoryExecutionHost {
@@ -518,14 +500,17 @@ impl DirectoryExecutionHost {
                 });
             }
         }
-        // Nothing holds the tree (just checked), so an unforced unmount is the whole release.
-        unbind(&image, &mount, cowshed_apfs::DetachIntent::Release)?;
+        // Nothing holds the tree (just checked), so an unforced unmount is the whole release. An
+        // image already gone has nothing to unbind: its record alone is retired, said as such.
         if present {
+            unbind(&image, &mount, cowshed_apfs::DetachIntent::Release)?;
             remove_payload_tree(&image)?;
-            journal_release(layout, &image, recorded.as_ref());
+            layout.journal_release(id, recorded.as_ref(), true);
         }
         remove_if_present(&written_mark_path(&image))?;
-        remove_if_present(&layout.record(id))?;
+        if remove_if_present(&layout.record(id))? && !present {
+            layout.journal_release(id, recorded.as_ref(), false);
+        }
         remove_if_present(&layout.hold_path(id))?;
         match mount_point_state(&mount)? {
             MountPointState::Vacant => fs::remove_dir(&mount)

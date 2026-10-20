@@ -860,7 +860,10 @@ again at any level above it.
   sidecar recorded it as a seed and `build-volume` otherwise, and the workspace that sidecar named, read before anything
   is deleted. A target's previous volume is recorded unlinked before its release, so its line names no workspace. A held
   volume is not released and leaves no line; a release that finds the image already gone deletes none and leaves none.
-  Without this journal, an `rm` that releases the volume a land has just moved main onto leaves no trace of it.
+  The record such a release retires is journaled by a line of its own, `release-imageless-build-volume`: its artifact is
+  the sidecar record it deletes (which names the volume's id) and its image the missing path, so the journal says the
+  record went because its image was absent, not because collection reclaimed it. Without this journal, an `rm` that
+  releases the volume a land has just moved main onto leaves no trace of it.
 - Each target keeps only its latest seed; a superseded seed is released when replaced, and a target's seed is released
   when the target retires. Detached seeds do not need an attach or a rename to be deleted. Main retires last, in
   `rm main --restore` (and `--restore --purge`): its unbinding collects once main's image is retired, so main's linked
@@ -868,15 +871,19 @@ again at any level above it.
   unbinding while the project is still bound (02_workspaces.md, "Checkout layouts"). With no volume left, the unbinding
   deletes `build/` (then only empty directories and zero-length holds) and the project's `.build/<owner>/<repo>` mount
   tree.
-- GC also enumerates seed sidecars whose images are already gone. Under the ordinary exclusive release claim it rechecks
-  image absence, the sidecar and live links, then deletes the orphan sidecar with zero image bytes reclaimed. An image
-  appearing or a record/link changing defers it; linked records and retained existing seed images are not relabeled or
-  collected by this rule. This includes payload-absent legacy `<id>.asif.json` seed sidecars as the explicit
-  metadata-only exception to RAW-only enumeration (01a_apfs.md §Images). A strict Seed record is required. Reuse
-  `claim_re_adopt_source` to claim the legacy image's actual hold file, then re-read record, image absence, live links
-  and forming lifecycle work under that same claim; then remove the sidecar and its obsolete hold file, and sync the
-  images directory. No legacy payload is attached, converted, relabeled or released, and an existing legacy seed image
-  remains retained evidence. Preview creates no hold file.
+- GC also enumerates sidecars whose images are already gone: every seed's, and every other record collection would
+  release with its image, one recorded unlinked or naming a checkout that no longer links it. An image that does not
+  exist cannot be waiting for anything, so deferring its record would defer it on every pass with nothing that ever ends
+  the wait. Only absence authorizes this: an image that exists but whose size cannot be read is deferred with the error,
+  never released on a guess. Under the ordinary exclusive release claim it rechecks image absence, the sidecar and live
+  links, then deletes the orphan sidecar with zero image bytes reclaimed. An image appearing or a record/link changing
+  defers it; a record a live checkout's link names and retained existing seed images are not relabeled or collected by
+  this rule. This includes payload-absent legacy `<id>.asif.json` seed sidecars as the explicit metadata-only exception
+  to RAW-only enumeration (01a_apfs.md §Images). A strict Seed record is required. Reuse `claim_re_adopt_source` to
+  claim the legacy image's actual hold file, then re-read record, image absence, live links and forming lifecycle work
+  under that same claim; then remove the sidecar and its obsolete hold file, and sync the images directory. No legacy
+  payload is attached, converted, relabeled or released, and an existing legacy seed image remains retained evidence.
+  Preview creates no hold file.
 - A fork's volume and seed exist before its workspace does: `cowshed fork` clones them into the staged checkout, which
   no other process can read, and publish the workspace afterwards. Main's first volume likewise exists before main's
   first touch links it: `cowshed adopt` mints it beside main's image, and completes its intent only once the first touch

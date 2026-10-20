@@ -19,11 +19,14 @@
 //!   take no project parameter — threading one through the [`ApfsExecutionHost`] trait would
 //!   couple every substrate caller to journal layout. When the layout is unrecognized the
 //!   entry is skipped, never guessed.
-//! * A build volume's release that deletes its image writes one line, for the image, whatever
-//!   else it deletes: the volume's sidecar record, hold file and mountpoint are its own
-//!   bookkeeping, gone with it under the release's claim. The line says whether the sidecar
-//!   recorded the volume as a seed and names the workspace it recorded, read before anything
-//!   was deleted, because that is what nothing else can tell once the volume is gone.
+//! * A build volume's release that deletes its image writes one line, for the image, whatever else
+//!   it deletes: the volume's sidecar record, hold file and mountpoint are its own bookkeeping,
+//!   gone with it under the release's claim. The line says whether the sidecar recorded the volume
+//!   as a seed and names the workspace it recorded, read before anything was deleted, because that
+//!   is what nothing else can tell once the volume is gone. A release that finds the image already
+//!   gone retires the sidecar record alone and says so in a line of its own,
+//!   `release-imageless-build-volume`, whose artifact is that record and whose image is the missing
+//!   path: a record retired because its image vanished is not a volume reclaimed.
 //! * Git facts are written where they are known, never reconstructed. A workspace retirement
 //!   (`retire-workspace`) is the one line that is not an unlink: the rename into trash is the
 //!   moment the workspace's repository stops being reachable, and the line records its head and
@@ -82,6 +85,10 @@ pub enum DeletionOp {
     RemoveOrphanMountpoint,
     #[serde(rename = "remove-abandoned-bundle")]
     RemoveAbandonedBundle,
+    /// A build volume's sidecar record retired because its image was already gone: the line's
+    /// artifact is the record, its image the path that no longer exists.
+    #[serde(rename = "release-imageless-build-volume")]
+    ReleaseImagelessBuildVolume,
     #[serde(rename = "release-build-volume")]
     ReleaseBuildVolume,
     #[serde(rename = "retire-workspace")]
@@ -103,6 +110,7 @@ impl std::fmt::Display for DeletionOp {
             Self::RemoveOrphanStagingMetadata => "remove-orphan-staging-metadata",
             Self::RemoveOrphanMountpoint => "remove-orphan-mountpoint",
             Self::RemoveAbandonedBundle => "remove-abandoned-bundle",
+            Self::ReleaseImagelessBuildVolume => "release-imageless-build-volume",
             Self::ReleaseBuildVolume => "release-build-volume",
             Self::RetireWorkspace => "retire-workspace",
             Self::KeepAbandonedTips => "keep-abandoned-tips",
