@@ -9,14 +9,19 @@
 //! do" after the fact, and so a supervising runtime can route the same records into its own
 //! durable log.
 //!
-//! Three sinks: [`ArrowAuditSink`] writes one sealed Arrow IPC segment per record under the
-//! telemetry root — private file, fsync, `rename(2)` without replace, directory sync — the
-//! standalone CLI's default (a job's admission and terminal records take one `fsync(2)` and no
-//! `F_FULLFSYNC`, see [`commitment_durability`]); [`NullAuditSink`] discards; and any external
-//! implementation of the trait a host injects (an embedding runtime routes the records into its
-//! own durable log). Segment names
-//! are `commitment-<order>-<writer>.arrow` with a writer-local, monotone `order` and a fresh
+//! Three sinks: [`ArrowAuditSink`] writes one sealed Arrow IPC segment per [`CommitmentGroup`]
+//! under the telemetry root — private file, fsync, `rename(2)` without replace, directory sync —
+//! the standalone CLI's default (a group of only job admission and terminal records takes one
+//! `fsync(2)` and no `F_FULLFSYNC`, see [`commitment_durability`]); [`NullAuditSink`] discards;
+//! and any external implementation of the trait a host injects (an embedding runtime routes the
+//! records into its own durable log). Segment names are `commitment-<order>-<writer>.arrow`,
+//! `order` being the writer-local, monotone order of the segment's first record, with a fresh
 //! writer id per process, so concurrent controllers never contend and no lock is needed.
+//!
+//! A group is the records queued together: the publisher takes every record already waiting
+//! when the previous group's sync returns, up to [`GROUP_RECORDS`], and never waits for more. One
+//! sync makes the whole group durable at the strongest durability any of its records requires,
+//! and every record of it is acknowledged only after that sync returns.
 
 use std::ffi::CString;
 use std::fmt;
@@ -37,7 +42,7 @@ use crate::api::dto::{
 };
 use crate::metadata::WorkspaceIncarnation;
 use crate::repository::RepoId;
-use crate::storage::job_artifact::write_controller_commitment;
+use crate::storage::job_artifact::write_controller_commitments;
 use crate::storage::trace_segment::TelemetryDate;
 
 use cowshed_os::fsio::{
@@ -64,7 +69,61 @@ fn commitment_durability(commitment: &ControllerCommitment) -> Durability {
     }
 }
 
+/// The durability a group's one sync gives every record in it: power loss if any record must
+/// survive it, else the device. A group never weakens the barrier any of its records requires.
+fn group_durability(commitments: &[ControllerCommitment]) -> Durability {
+    if commitments
+        .iter()
+        .any(|commitment| commitment_durability(commitment) == Durability::PowerLoss)
+    {
+        Durability::PowerLoss
+    } else {
+        Durability::Device
+    }
+}
+
+/// The most records one group, and so one segment and one sync, carries.
+pub const GROUP_RECORDS: usize = 64;
+
 const SEGMENT_PREFIX: &str = "commitment-";
+
+/// Controller acts recorded as one unit, in the order they were performed: never empty, never
+/// more than [`GROUP_RECORDS`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitmentGroup {
+    drafts: Vec<CommitmentDraft>,
+}
+
+impl CommitmentGroup {
+    /// A group of `draft` alone.
+    pub fn one(draft: CommitmentDraft) -> Self {
+        Self {
+            drafts: vec![draft],
+        }
+    }
+
+    /// Append `draft`, or hand it back when the group is full.
+    pub fn try_push(&mut self, draft: Box<CommitmentDraft>) -> Result<(), Box<CommitmentDraft>> {
+        if self.drafts.len() >= GROUP_RECORDS {
+            return Err(draft);
+        }
+        self.drafts.push(*draft);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.drafts.len()
+    }
+
+    /// Always false: a group holds at least one draft.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub fn into_drafts(self) -> Vec<CommitmentDraft> {
+        self.drafts
+    }
+}
 
 /// One controller act, before the sink assigns it a writer-local order. It crosses a supervisor
 /// socket as JSON when a controller forwards a supervisor's commitments into its own sink.
@@ -287,8 +346,9 @@ impl CommitmentDraft {
 /// sink is reported through [`AuditSinkError`] to the publisher, which counts it for `doctor`,
 /// and the act it describes has already happened.
 pub trait AuditSink: Send {
-    /// Durably record one controller act. Implementations assign their own ordering.
-    fn record(&mut self, draft: CommitmentDraft) -> Result<(), AuditSinkError>;
+    /// Durably record `group` as one unit, assigning each act its own order: `Ok` means every
+    /// record of it is durable, `Err` that none is acknowledged as recorded.
+    fn record(&mut self, group: CommitmentGroup) -> Result<(), AuditSinkError>;
 
     /// A short, stable name for reports (`arrow`, `off`, or the host's).
     fn name(&self) -> &'static str;
@@ -342,7 +402,7 @@ impl fmt::Debug for ContinuityAudit {
 pub struct NullAuditSink;
 
 impl AuditSink for NullAuditSink {
-    fn record(&mut self, _draft: CommitmentDraft) -> Result<(), AuditSinkError> {
+    fn record(&mut self, _group: CommitmentGroup) -> Result<(), AuditSinkError> {
         Ok(())
     }
 
@@ -386,12 +446,12 @@ pub enum AuditSinkError {
     Integrity { message: String },
 }
 
-/// One sealed Arrow segment per record under `<telemetry root>/<UTC date>/`.
+/// One sealed Arrow segment per [`CommitmentGroup`] under `<telemetry root>/<UTC date>/`.
 ///
 /// Writes are the only operation: a temporary file created `O_EXCL` with mode 0600, written,
-/// synced to the commitment's durability, renamed without replace to its sealed name, and — for
-/// a commitment that must survive power loss — the date directory synced. A segment that exists
-/// is complete; a crash leaves at most a temporary the next writer never reads.
+/// synced to the group's durability, renamed without replace to its sealed name, and — for a
+/// group that must survive power loss — the date directory synced. A segment that exists is
+/// complete; a crash leaves at most a temporary the next writer never reads.
 pub struct ArrowAuditSink {
     root: File,
     writer_id: Uuid,
@@ -427,8 +487,11 @@ impl ArrowAuditSink {
         self.next_order
     }
 
-    fn seal(&mut self, commitment: &ControllerCommitment) -> Result<(), AuditSinkError> {
-        let order = commitment.order();
+    fn seal(&mut self, commitments: &[ControllerCommitment]) -> Result<(), AuditSinkError> {
+        let order = commitments
+            .first()
+            .ok_or_else(|| integrity("a commitment group holds at least one record"))?
+            .order();
         let date = self
             .environment
             .utc_date()
@@ -456,11 +519,11 @@ impl ArrowAuditSink {
         let mut file = create_private_file_at(&date_directory, &temporary)
             .map_err(|source| io_failure("creating temporary commitment segment", source))?;
         let cleanup = TemporaryAt::new(&date_directory, &temporary);
-        write_controller_commitment(&mut file, commitment)
+        write_controller_commitments(&mut file, commitments)
             .map_err(|error| integrity(error.to_string()))?;
         file.flush()
             .map_err(|source| io_failure("flushing audit segment", source))?;
-        let durability = commitment_durability(commitment);
+        let durability = group_durability(commitments);
         durability
             .sync_file(&file)
             .map_err(|source| io_failure("syncing audit segment", source))?;
@@ -490,13 +553,17 @@ impl ArrowAuditSink {
 }
 
 impl AuditSink for ArrowAuditSink {
-    fn record(&mut self, draft: CommitmentDraft) -> Result<(), AuditSinkError> {
-        let order = self.next_order;
-        let commitment = draft.into_commitment(order);
-        self.seal(&commitment)?;
-        self.next_order = order
-            .checked_add(1)
-            .ok_or_else(|| integrity("audit record order overflow for this writer"))?;
+    fn record(&mut self, group: CommitmentGroup) -> Result<(), AuditSinkError> {
+        let mut commitments = Vec::with_capacity(group.len());
+        let mut order = self.next_order;
+        for draft in group.into_drafts() {
+            commitments.push(draft.into_commitment(order));
+            order = order
+                .checked_add(1)
+                .ok_or_else(|| integrity("audit record order overflow for this writer"))?;
+        }
+        self.seal(&commitments)?;
+        self.next_order = order;
         Ok(())
     }
 
@@ -518,7 +585,7 @@ impl AuditSinkEnvironment for SystemEnvironment {
     }
 }
 
-/// Sealed segment name: `commitment-<order>-<writer>.arrow`.
+/// Sealed segment name: `commitment-<order>-<writer>.arrow`, `order` being its first record's.
 pub fn segment_name(order: u64, writer: Uuid) -> String {
     format!("{SEGMENT_PREFIX}{order:020}-{}.arrow", writer.hyphenated())
 }

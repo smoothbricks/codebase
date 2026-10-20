@@ -405,18 +405,19 @@ never decodes or retrofits the earlier store's rows.
 durable when it backgrounds, sealed when it ends), the output copies it publishes, and its admission and terminal
 commitments — are written for every exec and survive the death of the process that wrote them, not power loss: each
 takes exactly one `fsync(2)` of the file it appends or creates, and no directory sync, before the job is admitted,
-backgrounded, answered as ended, or its copy reported published; the sequence counter's rename is not synced at all.
-`F_FULLFSYNC` is what survives power loss on macOS, and on a disk image it flushes every dirty block of the whole image
-— tens of milliseconds to seconds right after a build — so it stays on lifecycle and authority state only: workspace
-creation and removal, landing, checkpoint manifests, grants and policy revisions, and every lifecycle commitment. A
-checkpoint's manifest batch is appended after it makes every running prefix durable, so its one `F_FULLFSYNC` carries
-those prefixes past power loss with it. Power loss ends every job anyway, and may take any suffix of the records written
-since: a torn trailing batch is discarded as above; a counter rolled back behind the log is advanced to the log's
-highest sequence at the next open, before anything allocates; and when the next supervisor takes the workspace's socket
-— which no other supervisor then holds — it seals every job of the incarnation that has an admission and no terminal
-record `failed` with `supervisorLost`, after ending the process groups its predecessor's ledger still names, and seals a
-spill file the power took as a stream with no bytes. A job whose terminal record was lost is therefore reported lost,
-never as having succeeded.
+backgrounded, answered as ended, or its copy reported published; commitments queued together share one segment and its
+one `fsync(2)` (13_telemetry.md, "Group commit"); the sequence counter's rename is not synced at all. `F_FULLFSYNC` is
+what survives power loss on macOS, and on a disk image it flushes every dirty block of the whole image — tens of
+milliseconds to seconds right after a build — so it stays on lifecycle and authority state only: workspace creation and
+removal, landing, checkpoint manifests, grants and policy revisions, and every lifecycle commitment. A checkpoint's
+manifest batch is appended after it makes every running prefix durable, so its one `F_FULLFSYNC` carries those prefixes
+past power loss with it. Power loss ends every job anyway, and may take any suffix of the records written since: a torn
+trailing batch is discarded as above; a counter rolled back behind the log is advanced to the log's highest sequence at
+the next open, before anything allocates; and when the next supervisor takes the workspace's socket — which no other
+supervisor then holds — it seals every job of the incarnation that has an admission and no terminal record `failed` with
+`supervisorLost`, after ending the process groups its predecessor's ledger still names, and seals a spill file the power
+took as a stream with no bytes. A job whose terminal record was lost is therefore reported lost, never as having
+succeeded.
 
 Each admission and terminal job batch also records its immutable command in a required Arrow `List<Binary>` `argv`
 column. An argv job stores its arguments; a script job stores exactly two elements, `\0script` and the script's JSON — a

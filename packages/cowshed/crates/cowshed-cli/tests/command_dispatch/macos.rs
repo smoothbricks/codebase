@@ -2151,11 +2151,12 @@ fn controller_commitments(telemetry: &Path) -> Vec<cowshed_core::api::dto::Contr
             if path.is_dir() {
                 pending.push(path);
             } else if name.starts_with("commitment-") && name.ends_with(".arrow") {
-                let commitment = cowshed_core::storage::job_artifact::decode_controller_commitment(
-                    &fs::read(&path).unwrap(),
-                )
-                .unwrap();
-                found.push(commitment);
+                found.extend(
+                    cowshed_core::storage::job_artifact::decode_controller_commitment_segment(
+                        &fs::read(&path).unwrap(),
+                    )
+                    .unwrap(),
+                );
             }
         }
     }

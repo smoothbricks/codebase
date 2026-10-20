@@ -1199,7 +1199,11 @@ pub struct AuditHealth {
 }
 
 /// Dedicated owner of the audit sink: one actor serializes records in the order the controller
-/// performed the acts and absorbs sink failures into [`AuditHealth`].
+/// performed the acts and absorbs sink failures into [`AuditHealth`]. It group-commits: every
+/// record already queued when it takes one joins that record's group, up to
+/// [`crate::storage::audit::GROUP_RECORDS`], and nothing waits for more. The group is recorded
+/// off the async workers in one sink call, so records queue while its sync runs, and every
+/// record's caller is answered only once that call returns.
 pub struct CommitmentPublisher;
 
 impl CommitmentPublisher {
@@ -1231,21 +1235,58 @@ impl CommitmentPublisher {
                 sink: sink.name(),
                 ..AuditHealth::default()
             };
-            while let Some(request) = receiver.recv().await {
-                match request {
-                    CommitmentRequest::Record { draft, reply } => {
-                        match sink.record(*draft) {
-                            Ok(()) => health.recorded = health.recorded.saturating_add(1),
-                            Err(error) => {
-                                health.failed = health.failed.saturating_add(1);
-                                health.last_failure = Some(error.to_string());
-                            }
-                        }
-                        let _ = reply.send(());
-                    }
+            // A request taken while gathering a group that does not belong to it: it is served
+            // next, so requests are answered in the order they were queued.
+            let mut next: Option<CommitmentRequest> = None;
+            loop {
+                let request = match next.take() {
+                    Some(request) => request,
+                    None => match receiver.recv().await {
+                        Some(request) => request,
+                        None => break,
+                    },
+                };
+                let (draft, reply) = match request {
+                    CommitmentRequest::Record { draft, reply } => (draft, reply),
                     CommitmentRequest::Health { reply } => {
                         let _ = reply.send(health.clone());
+                        continue;
                     }
+                };
+                let mut group = crate::storage::audit::CommitmentGroup::one(*draft);
+                let mut replies = vec![reply];
+                while let Ok(request) = receiver.try_recv() {
+                    match request {
+                        CommitmentRequest::Record { draft, reply } => match group.try_push(draft) {
+                            Ok(()) => replies.push(reply),
+                            Err(draft) => {
+                                next = Some(CommitmentRequest::Record { draft, reply });
+                                break;
+                            }
+                        },
+                        asked @ CommitmentRequest::Health { .. } => {
+                            next = Some(asked);
+                            break;
+                        }
+                    }
+                }
+                let records = u64::try_from(replies.len()).expect("a group fits in u64");
+                let (returned, outcome) = tokio::task::spawn_blocking(move || {
+                    let outcome = sink.record(group);
+                    (sink, outcome)
+                })
+                .await
+                .unwrap_or_else(|failure| std::panic::resume_unwind(failure.into_panic()));
+                sink = returned;
+                match outcome {
+                    Ok(()) => health.recorded = health.recorded.saturating_add(records),
+                    Err(error) => {
+                        health.failed = health.failed.saturating_add(records);
+                        health.last_failure = Some(error.to_string());
+                    }
+                }
+                for reply in replies {
+                    let _ = reply.send(());
                 }
             }
         });
@@ -8943,7 +8984,10 @@ mod lifecycle_commitment_tests {
                     .starts_with("commitment-")
             })
             .count();
-        assert_eq!(sealed, 2, "one sealed segment per record");
+        assert_eq!(
+            sealed, 2,
+            "each record awaited alone is a group, and a segment, of one"
+        );
         drop(publisher);
 
         let mut silent =

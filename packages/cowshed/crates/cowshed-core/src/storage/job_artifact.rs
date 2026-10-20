@@ -6087,33 +6087,29 @@ pub fn controller_commitments_to_batch(
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
 }
 
-/// One commitment as a self-contained Arrow IPC stream — the byte form an
-/// external [`crate::storage::audit::AuditSink`] stores. Owned here beside
-/// the batch codec so the schema and the encoding drift together or not at
-/// all; a host that carried its own Arrow dependency would fork the version.
-pub fn write_controller_commitment<W: Write>(
+/// Commitments as one self-contained Arrow IPC stream of one batch, a row each in order — the
+/// byte form an [`crate::storage::audit::AuditSink`] stores. Owned here beside the batch codec so
+/// the schema and the encoding drift together or not at all; a host that carried its own Arrow
+/// dependency would fork the version.
+pub fn write_controller_commitments<W: Write>(
     writer: W,
-    commitment: &ControllerCommitment,
+    commitments: &[ControllerCommitment],
 ) -> Result<(), ArtifactError> {
-    write_batch(
-        writer,
-        &controller_commitments_to_batch(std::slice::from_ref(commitment))?,
-    )
+    write_batch(writer, &controller_commitments_to_batch(commitments)?)
 }
 
-/// Buffer form of [`write_controller_commitment`].
+/// One commitment in the form of [`write_controller_commitments`], as a buffer.
 pub fn encode_controller_commitment(
     commitment: &ControllerCommitment,
 ) -> Result<Vec<u8>, ArtifactError> {
     let mut payload = Vec::new();
-    write_controller_commitment(&mut payload, commitment)?;
+    write_controller_commitments(&mut payload, std::slice::from_ref(commitment))?;
     Ok(payload)
 }
 
 /// The inverse of [`encode_controller_commitment`]: exactly one commitment.
 pub fn decode_controller_commitment(bytes: &[u8]) -> Result<ControllerCommitment, ArtifactError> {
-    let batch = decode_single_batch(bytes)?;
-    let mut commitments = decode_controller_commitments(&batch)?;
+    let mut commitments = decode_controller_commitment_segment(bytes)?;
     if commitments.len() != 1 {
         return Err(ArtifactError::Arrow(format!(
             "commitment bytes hold {} rows, wanted exactly one",
@@ -6121,6 +6117,14 @@ pub fn decode_controller_commitment(bytes: &[u8]) -> Result<ControllerCommitment
         )));
     }
     Ok(commitments.remove(0))
+}
+
+/// The inverse of [`write_controller_commitments`]: every commitment of one sealed segment, in
+/// order.
+pub fn decode_controller_commitment_segment(
+    bytes: &[u8],
+) -> Result<Vec<ControllerCommitment>, ArtifactError> {
+    decode_controller_commitments(&decode_single_batch(bytes)?)
 }
 
 /// Decode one controller audit batch, validating every row on its own.

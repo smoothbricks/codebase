@@ -1,13 +1,14 @@
-//! The controller audit sink is telemetry: one sealed Arrow segment per record, never read back
-//! for a decision. These tests pin the writer's durability discipline, the record contract the
-//! segments carry, the `off` and injected-sink seams, and the publisher's health accounting.
+//! The controller audit sink is telemetry: one sealed Arrow segment per commitment group, never
+//! read back for a decision. These tests pin the writer's durability discipline, the record
+//! contract the segments carry, group commit, the `off` and injected-sink seams, and the
+//! publisher's health accounting.
 
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_ipc::reader::StreamReader;
@@ -16,12 +17,13 @@ use cowshed_core::repository::RepoId;
 use cowshed_core::runtime::supervisor::{CommitmentPublisher, CommitmentSink};
 use cowshed_core::storage::audit::{
     ArrowAuditSink, AuditSink, AuditSinkEnvironment, AuditSinkError, CommitmentDraft,
-    CommitmentPublicationPoint, ContinuityAudit, NullAuditSink,
+    CommitmentGroup, CommitmentPublicationPoint, ContinuityAudit, GROUP_RECORDS, NullAuditSink,
 };
 use cowshed_core::storage::job_artifact::{
     controller_commitment_schema, decode_controller_commitments,
 };
 use cowshed_core::storage::trace_segment::TelemetryDate;
+use parking_lot::Mutex;
 
 const INCARNATION: &str = "0198f2c0b7e34dc795f17b238b331c80";
 static SYNC_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -144,6 +146,11 @@ fn read_segment(path: &Path) -> Vec<ControllerCommitment> {
     decode_controller_commitments(&batch).unwrap()
 }
 
+/// Record `draft` alone, as a group of one.
+fn record(sink: &mut dyn AuditSink, draft: CommitmentDraft) -> Result<(), AuditSinkError> {
+    sink.record(CommitmentGroup::one(draft))
+}
+
 #[test]
 fn each_record_is_one_sealed_segment_with_the_exact_schema_and_a_writer_local_order() {
     let root = TempRoot::new("round-trip");
@@ -156,9 +163,9 @@ fn each_record_is_one_sealed_segment_with_the_exact_schema_and_a_writer_local_or
         },
     );
     assert_eq!(sink.next_order(), 1);
-    sink.record(introduced()).unwrap();
-    sink.record(admission(1)).unwrap();
-    sink.record(admission(2)).unwrap();
+    record(&mut sink, introduced()).unwrap();
+    record(&mut sink, admission(1)).unwrap();
+    record(&mut sink, admission(2)).unwrap();
     assert_eq!(sink.next_order(), 4);
 
     let segments = sealed_segments(root.path());
@@ -204,9 +211,9 @@ fn two_writers_never_contend_and_keep_their_own_sequences() {
         },
     );
     assert_ne!(first.writer_id(), second.writer_id());
-    first.record(introduced()).unwrap();
-    second.record(introduced()).unwrap();
-    first.record(admission(1)).unwrap();
+    record(&mut first, introduced()).unwrap();
+    record(&mut second, introduced()).unwrap();
+    record(&mut first, admission(1)).unwrap();
     assert_eq!((first.next_order(), second.next_order()), (3, 2));
     assert_eq!(sealed_segments(root.path()).len(), 3);
 }
@@ -224,7 +231,7 @@ fn failure_before_rename_cleans_the_temporary_and_does_not_advance() {
         },
     );
     assert!(matches!(
-        sink.record(introduced()),
+        record(&mut sink, introduced()),
         Err(AuditSinkError::Io { .. })
     ));
     assert_eq!(sink.next_order(), 1);
@@ -248,7 +255,7 @@ fn failure_after_rename_leaves_the_sealed_segment_and_does_not_advance() {
         },
     );
     assert!(matches!(
-        sink.record(introduced()),
+        record(&mut sink, introduced()),
         Err(AuditSinkError::Io { .. })
     ));
     // The segment is sealed on disk; the in-memory sequence did not advance, so the next record
@@ -264,7 +271,7 @@ fn failure_after_rename_leaves_the_sealed_segment_and_does_not_advance() {
             count_syncs: false,
         },
     );
-    healthy.record(introduced()).unwrap();
+    record(&mut healthy, introduced()).unwrap();
     assert_eq!(sealed_segments(root.path()).len(), 2);
 }
 
@@ -280,7 +287,7 @@ fn sealed_segment_is_private_and_its_directories_are_synced() {
             count_syncs: true,
         },
     );
-    sink.record(introduced()).unwrap();
+    record(&mut sink, introduced()).unwrap();
     let segments = sealed_segments(root.path());
     assert_eq!(segments.len(), 1);
     let metadata = fs::metadata(&segments[0]).unwrap();
@@ -326,28 +333,31 @@ fn a_jobs_commitments_sync_no_directory_while_lifecycle_commitments_do() {
         }),
     )
     .unwrap();
-    sink.record(introduced()).unwrap();
+    record(&mut sink, introduced()).unwrap();
     assert_eq!(directory_syncs.swap(0, Ordering::SeqCst), 2);
 
-    sink.record(admission(1)).unwrap();
-    sink.record(CommitmentDraft::Terminal {
-        repo_id: repo(),
-        workspace_incarnation: incarnation(),
-        job_id: JobId::new(1).unwrap(),
-        state: cowshed_core::api::JobState::Exited,
-        grant_revision: 3,
-        stdout_bytes: 0,
-        stdout_sha256: cowshed_core::api::Sha256Digest::compute(b""),
-        stderr_bytes: 0,
-        stderr_sha256: cowshed_core::api::Sha256Digest::compute(b""),
-        batch_sha256: cowshed_core::api::Sha256Digest::compute(b"batch"),
-        output_limit: None,
-    })
+    record(&mut sink, admission(1)).unwrap();
+    record(
+        &mut sink,
+        CommitmentDraft::Terminal {
+            repo_id: repo(),
+            workspace_incarnation: incarnation(),
+            job_id: JobId::new(1).unwrap(),
+            state: cowshed_core::api::JobState::Exited,
+            grant_revision: 3,
+            stdout_bytes: 0,
+            stdout_sha256: cowshed_core::api::Sha256Digest::compute(b""),
+            stderr_bytes: 0,
+            stderr_sha256: cowshed_core::api::Sha256Digest::compute(b""),
+            batch_sha256: cowshed_core::api::Sha256Digest::compute(b"batch"),
+            output_limit: None,
+        },
+    )
     .unwrap();
     assert_eq!(directory_syncs.load(Ordering::SeqCst), 0);
     assert_eq!(sealed_segments(root.path()).len(), 3);
 
-    sink.record(introduced()).unwrap();
+    record(&mut sink, introduced()).unwrap();
     assert_eq!(directory_syncs.load(Ordering::SeqCst), 1);
 }
 
@@ -355,7 +365,7 @@ fn a_jobs_commitments_sync_no_directory_while_lifecycle_commitments_do() {
 fn off_sink_writes_nothing_and_the_publisher_still_acknowledges() {
     let root = TempRoot::new("off");
     let mut off = NullAuditSink;
-    off.record(introduced()).unwrap();
+    record(&mut off, introduced()).unwrap();
     assert!(!root.path().exists());
     assert_eq!(off.name(), "off");
 
@@ -374,22 +384,46 @@ fn off_sink_writes_nothing_and_the_publisher_still_acknowledges() {
     });
 }
 
+/// Records every group it is handed, refusing a whole group that holds the order `fail_on`.
 struct Recording {
     seen: Arc<Mutex<Vec<ControllerCommitment>>>,
+    groups: Arc<Mutex<Vec<usize>>>,
     fail_on: Option<u64>,
     next: u64,
+    /// Released by the test before the first group returns, so later records queue meanwhile.
+    hold_first: Option<std::sync::mpsc::Receiver<()>>,
+    /// Told when the first group reaches the sink.
+    entered: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl AuditSink for Recording {
-    fn record(&mut self, draft: CommitmentDraft) -> Result<(), AuditSinkError> {
-        let order = self.next;
-        self.next += 1;
-        if self.fail_on == Some(order) {
+    fn record(&mut self, group: CommitmentGroup) -> Result<(), AuditSinkError> {
+        if let Some(entered) = self.entered.take() {
+            entered.send(()).unwrap();
+        }
+        if let Some(hold) = self.hold_first.take() {
+            hold.recv().unwrap();
+        }
+        self.groups.lock().push(group.len());
+        let first = self.next;
+        let commitments: Vec<_> = group
+            .into_drafts()
+            .into_iter()
+            .map(|draft| {
+                let order = self.next;
+                self.next += 1;
+                draft.into_commitment(order)
+            })
+            .collect();
+        if let Some(order) = self
+            .fail_on
+            .filter(|order| (first..self.next).contains(order))
+        {
             return Err(AuditSinkError::Integrity {
                 message: format!("injected refusal of record {order}"),
             });
         }
-        self.seen.lock().unwrap().push(draft.into_commitment(order));
+        self.seen.lock().extend(commitments);
         Ok(())
     }
 
@@ -403,8 +437,11 @@ fn an_injected_sink_receives_every_record_and_its_refusals_become_health_not_err
     let seen = Arc::new(Mutex::new(Vec::new()));
     let sink = Recording {
         seen: Arc::clone(&seen),
+        groups: Arc::new(Mutex::new(Vec::new())),
         fail_on: Some(2),
         next: 1,
+        hold_first: None,
+        entered: None,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -425,7 +462,7 @@ fn an_injected_sink_receives_every_record_and_its_refusals_become_health_not_err
             Some("audit sink integrity failure: injected refusal of record 2")
         );
     });
-    let seen = seen.lock().unwrap();
+    let seen = seen.lock();
     assert_eq!(seen.len(), 2);
     assert!(matches!(
         seen[0],
@@ -459,4 +496,121 @@ fn continuity_audit_reads_its_environment_variable_and_refuses_unknown_values() 
     unsafe {
         std::env::remove_var("COWSHED_CONTINUITY_AUDIT");
     }
+}
+
+/// A group is one segment whose rows carry consecutive orders, named by its first, and one sync
+/// at the strongest durability any of its records needs: job records alone sync no directory,
+/// and one lifecycle record makes the whole group's segment and directory survive power loss.
+#[test]
+fn a_group_is_one_segment_of_consecutive_orders_synced_at_its_strongest_durability() {
+    let root = TempRoot::new("group");
+    let directory_syncs = Arc::new(AtomicUsize::new(0));
+    let mut sink = ArrowAuditSink::open_with_environment(
+        root.path(),
+        Box::new(CountingEnvironment {
+            date: date(2026, 10, 20),
+            directory_syncs: Arc::clone(&directory_syncs),
+        }),
+    )
+    .unwrap();
+    let mut jobs = CommitmentGroup::one(admission(1));
+    jobs.try_push(Box::new(admission(2))).unwrap();
+    sink.record(jobs).unwrap();
+    assert_eq!(
+        directory_syncs.swap(0, Ordering::SeqCst),
+        1,
+        "the root, for the new date directory; the job records sync none"
+    );
+    let mut mixed = CommitmentGroup::one(admission(3));
+    mixed.try_push(Box::new(introduced())).unwrap();
+    sink.record(mixed).unwrap();
+    assert_eq!(
+        directory_syncs.load(Ordering::SeqCst),
+        1,
+        "the lifecycle record syncs the date directory for the whole group"
+    );
+    assert_eq!(sink.next_order(), 5);
+
+    let writer = sink.writer_id().hyphenated().to_string();
+    let segments = sealed_segments(root.path());
+    let read: Vec<_> = segments
+        .iter()
+        .map(|segment| {
+            (
+                segment.file_name().unwrap().to_str().unwrap().to_owned(),
+                read_segment(segment)
+                    .iter()
+                    .map(ControllerCommitment::order)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (format!("commitment-{:020}-{writer}.arrow", 1), vec![1, 2]),
+            (format!("commitment-{:020}-{writer}.arrow", 3), vec![3, 4]),
+        ]
+    );
+}
+
+#[test]
+fn a_group_holds_at_most_group_records() {
+    let mut group = CommitmentGroup::one(admission(1));
+    for job in 2..=GROUP_RECORDS {
+        group.try_push(Box::new(admission(job as u64))).unwrap();
+    }
+    assert_eq!(group.len(), GROUP_RECORDS);
+    let over = Box::new(admission(GROUP_RECORDS as u64 + 1));
+    assert_eq!(group.try_push(over.clone()), Err(over));
+}
+
+/// Records queued while a group's sync runs become the next group, and no record's caller hears
+/// back before the sink call carrying its record returns.
+#[test]
+fn records_queued_during_a_sync_are_committed_as_the_next_group() {
+    let groups = Arc::new(Mutex::new(Vec::new()));
+    let (release, hold) = std::sync::mpsc::channel();
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let sink = Recording {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        groups: Arc::clone(&groups),
+        fail_on: None,
+        next: 1,
+        hold_first: Some(hold),
+        entered: Some(entered_tx),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let publisher = CommitmentPublisher::start(Box::new(sink), 16).unwrap();
+        let mut first = publisher.clone();
+        let first = tokio::spawn(async move { first.record(admission(1)).await });
+        tokio::task::spawn_blocking(move || entered.recv().unwrap())
+            .await
+            .unwrap();
+        let queued: Vec<_> = (2..=6)
+            .map(|job| {
+                let mut publisher = publisher.clone();
+                tokio::spawn(async move { publisher.record(admission(job)).await })
+            })
+            .collect();
+        // The single-threaded runtime runs each spawned record until it waits for its answer.
+        tokio::task::yield_now().await;
+        assert!(
+            !first.is_finished(),
+            "the first record's sync has not returned"
+        );
+        assert!(queued.iter().all(|record| !record.is_finished()));
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        for record in queued {
+            record.await.unwrap().unwrap();
+        }
+        let health = publisher.health().await.unwrap();
+        assert_eq!((health.recorded, health.failed), (6, 0));
+    });
+    assert_eq!(*groups.lock(), [1, 5]);
 }

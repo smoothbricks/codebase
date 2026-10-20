@@ -87,10 +87,12 @@ Controller audit records are telemetry. Every controller act — workspace intro
 state, checkpoint, fork, restore — is emitted as one typed record carrying existence, lifecycle/status, a writer-local
 order, lineage, grant revision, byte counts, stream SHA-256 digests, and terminal-batch digest, never inline bytes,
 spill paths, or duplicated raw payload. Nothing reads them for a decision. The sink is chosen when the project opens
-(`COWSHED_CONTINUITY_AUDIT`): `arrow` (the standalone default) writes one sealed Arrow IPC segment per record under
-`/private/cowshed/store/telemetry/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow` — private mode, fsync,
-create-new rename, directory sync, no lock and no global order because names are unique per writer; `off` writes
-nothing; and a runtime that supervises the controller injects its own sink through
+(`COWSHED_CONTINUITY_AUDIT`): `arrow` (the standalone default) group-commits records into sealed Arrow IPC segments
+under `/private/cowshed/store/telemetry/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow` — every record already
+queued joins one segment, up to 64, with no added wait; one fsync (and, when a record must survive power loss,
+`F_FULLFSYNC` plus a directory sync) covers the segment, and each record is acknowledged only after it; private mode,
+create-new rename, no lock and no global order because names are unique per writer, `order` being the segment's first
+record's; `off` writes nothing; and a runtime that supervises the controller injects its own sink through
 `ProjectRuntime::open_existing_with_audit`, routing the same records into its durable log instead of files. A sink that
 refuses a record is an `audit-sink` finding in `cowshed doctor`, never a failed act. Rollback and omission are therefore
 after-the-fact questions for the audit trail: a restore is a controller verb a workspace cannot perform on itself, so no

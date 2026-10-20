@@ -438,19 +438,36 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   admission, terminal and checkpoint records come from the workspace supervisors, which are processes of their own
   (11_shell.md): each records to the host's default sink, and a controller with a sink of its own reads each
   supervisor's records after the last cursor it forwarded, records them, and acknowledges them by cursor.
-- **Arrow audit segments** — one Arrow IPC batch containing one row per segment at
+- **Arrow audit segments** — one Arrow IPC batch holding one row per record, one to 64 records per segment, at
   `<host-telemetry-root>/<yyyy-mm-dd>/commitment-<order:020>-<writer_uuid>.arrow`, where the UTC partition is an exact
   calendar date, `writer_uuid` is the lowercase hyphenated UUID of the controller process that wrote it, and `order` is
-  that writer's own monotone sequence from 1. A completed segment is mode `0600`, sealed by create-new atomic rename,
-  parent-directory-fsynced, and never reopened, replaced, or shared for append; a crash leaves at most an unsealed
-  dot-prefixed temporary that nothing reads. Concurrent controllers never contend: names are unique by writer, so no
-  lock and no global order exist. Partitioning by day is a query/retention layout, not shared-file append. This rule
-  does not describe the separately locked protected `.cowshed/job/records.arrow` framed stream above.
+  the segment's first record's place in that writer's own monotone sequence from 1; its rows carry consecutive orders in
+  `commitment_order`. A completed segment is mode `0600`, sealed by create-new atomic rename, and never reopened,
+  replaced, or shared for append; a crash leaves at most an unsealed dot-prefixed temporary that nothing reads.
+  Concurrent controllers never contend: names are unique by writer, so no lock and no global order exist. Partitioning
+  by day is a query/retention layout, not shared-file append. This rule does not describe the separately locked
+  protected `.cowshed/job/records.arrow` framed stream above.
+- **Group commit** — the commitment publisher takes every record already queued when it takes one, up to 64
+  (`GROUP_RECORDS`, `cowshed-core` `storage/audit.rs`), and seals them as one segment with one sync; it never waits for
+  more, so a group adds no delay, and it grows only while the previous group's sync runs. The group is synced at the
+  strongest durability any of its records requires, never less: `fsync(2)` of the segment when it holds only job
+  admission and terminal records (11_shell.md, "Durability of a job's own records"), otherwise `F_FULLFSYNC` of the
+  segment and of its date directory. Every record of a group is acknowledged only after that sync returns; a failed
+  group counts each of its records as refused. Group commit changes how many records one sync carries, not which barrier
+  any record gets, and there is no cheaper barrier to give them: `F_BARRIERFSYNC` (`<sys/fcntl.h>`: "fsync + issue
+  barrier to drive") orders writes but persists nothing, and Apple's `fsync(2)` page names `F_FULLFSYNC` as the call
+  that makes data persistent on the drive. A lone producer, which waits for each acknowledgment before its next record,
+  always forms groups of one; grouping comes only from concurrent producers. A process that dies mid-group acknowledged
+  none of it, so no caller acted on a reply for any of its records: before the rename they are lost in an unsealed
+  temporary nothing reads, after it they are sealed whole but unanswered. Grouping changes when queued records are
+  written, not which a crash can take. A lost record stays lost — a job's terminal record is sealed before its
+  commitment, so the next supervisor does not re-seal that job — while the inventory and the protected records still
+  hold the facts, and nothing reads commitments for a decision.
 - **Controller producer capability delivery** — each controller telemetry producer receives a dedicated IPC channel or
   inherited write-only capability/FD. It is close-on-exec/non-inheritable before any workspace child starts and is never
   named by a workspace-readable path or token. Audit records are recorded in the order the controller performed the
-  acts, each acknowledged by the sink before the next; the short-timer one-batch crash window applies to diagnostic
-  events; gateway decision boundaries retain the flush policy below.
+  acts, each acknowledged only once it is durable (Group commit, above); the short-timer one-batch crash window applies
+  to diagnostic events; gateway decision boundaries retain the flush policy below.
 - **The one text-file survivor** — `~/Library/Logs/cowshed/daemon-stderr.log`, the launchd `StandardErrorPath` target,
   exists only for crashes before tracer initialization. It lives off the `/private/cowshed/store` mountpoint so reboot
   remount cannot be masked. `doctor` flags it when non-empty. The gateway, every workspace supervisor and their children
