@@ -3047,6 +3047,7 @@ fn remove_directory_if_empty(directory: &Path) -> Result<()> {
 }
 
 /// An unbound project's store owner goes with its last project, marker and all.
+#[cfg(target_os = "macos")]
 fn remove_store_owner_if_projectless(owner: &Path) -> Result<()> {
     crate::storage::bootstrap::remove_owner_if_projectless(owner).map_err(|error| {
         CowshedError::environment_missing(
