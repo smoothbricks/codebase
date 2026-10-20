@@ -9,7 +9,6 @@ import { useFixtureCargoHome } from './__tests__/fixture-cargo-home.js';
 import { testFileInstallation } from './__tests__/owned-installation.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
 import type { NxTaskContext } from './executors/bounded-exec/executor.js';
-import { hostLeaseProcesses } from './executors/bounded-exec/ram-temp.js';
 import type { BoundedExecOptions } from './executors/bounded-exec/schema.js';
 import {
   type BoundedExecRecord,
@@ -20,6 +19,7 @@ import {
 } from './executors/bounded-exec/verdict.js';
 import { createNodesV2ForPlatform } from './index.js';
 import { NEXTEST_EXTRACTION_DIRECTORY, nextestArchiveKey } from './nextest-extraction.js';
+import { censusDiagnostic } from './testing.js';
 
 useFixtureCargoHome();
 
@@ -143,25 +143,19 @@ function caseBody(body: () => Promise<void>): () => Promise<void> {
  *
  * A case's deadline abandons its body mid-`await`, so nothing it started may outlive the case. In order:
  * `ending` makes every later `runTracked` refuse to spawn, and makes a captured-only child still running print its
- * capture instead of returning it; each plain child's process
- * group is killed; then the lease owner ends every process still working in the fixture, a driver first,
- * with SIGTERM so its bounded executor relays the stop and releases its lease. Only once every child's exit has
- * settled and the body has settled does the barrier report. A child whose exit was not confirmed, or any
- * process left working, is returned by name, not hidden.
+ * capture instead of returning it. The barrier then ends the children it started, and only those: a plain child's
+ * process group is killed, and a graceful driver gets SIGTERM so its bounded executor relays the stop to what it runs.
+ * Only once every child's exit has settled and the body has settled does the barrier report. A child whose exit was
+ * not confirmed is returned by name, not hidden. What the host census still finds in the fixture is printed to stderr
+ * as a diagnostic, never signalled and never a failure, since ownership is the supervisor's process tree.
  */
 async function settle(): Promise<string[]> {
   ending = true;
   const open = [...openChildren];
   openChildren.clear();
   for (const [child, entry] of open) {
-    if (!entry.graceful) killProcessGroup(child);
-  }
-  let leftovers: string[];
-  try {
-    leftovers = fixtureRoot === undefined ? [] : await hostLeaseProcesses.stopWorkingIn(fixtureRoot);
-  } catch (error) {
-    barrierFailure = `the lease owner could not end its processes: ${String(error)}`;
-    throw error;
+    if (entry.graceful) child.kill('SIGTERM');
+    else killProcessGroup(child);
   }
   // Each close either resolved, so its child ended, or rejected, so its exit was never confirmed and it is named.
   const exits = await Promise.all(
@@ -175,12 +169,13 @@ async function settle(): Promise<string[]> {
     }),
   );
   await Promise.allSettled([bodyDone]);
+  const left = fixtureRoot === undefined ? null : await censusDiagnostic(fixtureRoot);
+  if (left !== null) process.stderr.write(`${left}\n`);
   const problems: string[] = [];
   const unconfirmed = exits.filter((line): line is string => line !== null);
   if (unconfirmed.length > 0) {
     problems.push(`child processes whose exit was not confirmed:\n${unconfirmed.join('\n')}`);
   }
-  if (leftovers.length > 0) problems.push(`processes left working in the fixture:\n${leftovers.join('\n')}`);
   if (problems.length > 0) barrierFailure = problems.join('\n');
   return problems;
 }
@@ -191,9 +186,9 @@ afterEach(async () => {
 });
 
 /**
- * Removes the one fixture root, after the same barrier every case runs. If the barrier cannot account for
- * every process, or the lease owner errors, the root is kept and the error names it, so the processes it
- * names still have their directory.
+ * Removes the one fixture root, after the same barrier every case runs. If the barrier fails, the root is kept
+ * and the error names it, so a child whose exit was not confirmed still has its directory. What the census
+ * finds never keeps the root: it is printed as a diagnostic only.
  */
 afterAll(async () => {
   if (fixtureRoot === undefined) return;
@@ -201,7 +196,7 @@ afterAll(async () => {
   try {
     await settle();
   } catch (error) {
-    throw new Error(`kept fixture ${root}: the lease owner could not end its processes: ${String(error)}`);
+    throw new Error(`kept fixture ${root}: the barrier failed: ${String(error)}`);
   }
   if (barrierFailure !== undefined) throw new Error(`kept fixture ${root}:\n${barrierFailure}`);
   fixtureRoot = undefined;
@@ -469,7 +464,7 @@ async function run(root: string, args: string[], overlay: Record<string, string>
 }
 
 /**
- * The built production executor, in a driver process whose runner group the lease owner can end.
+ * The built production executor, in a driver process the barrier stops with SIGTERM so it relays the stop.
  * The test target already depends on build: do not compile the TypeScript project again in every driver.
  */
 const EXECUTOR_MODULE = fileURLToPath(new URL('../dist/executors/bounded-exec/executor.js', import.meta.url));

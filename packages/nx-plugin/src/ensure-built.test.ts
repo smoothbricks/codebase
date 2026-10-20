@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { chmod, cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
@@ -37,7 +38,7 @@ import {
   workspaceFileChanges,
 } from './ensure-built.js';
 import { managedAssetsRoot } from './managed-assets.js';
-import { NX_LONGEST_SOCKET_NAME, ownedSocketDirectory, pidsWorkingIn } from './testing.js';
+import { censusDiagnostic, NX_LONGEST_SOCKET_NAME, ownedSocketDirectory } from './testing.js';
 
 function task(overrides: Partial<Task> & Pick<Task, 'id'>): Task {
   const [project, target] = overrides.id.split(':');
@@ -1446,18 +1447,16 @@ console.log(JSON.stringify(await ensureBuilt({ target: 'app:build', cwd: process
       await rm(directory, { recursive: true, force: true });
     }
     // The fixture retires on every exit path of its body, a throwing one
-    // included: once it has, nothing works in its root.
-    const leftovers = root === '' ? [] : await pidsWorkingIn(root);
+    // included: once it has, its root is gone. What the census still finds
+    // there is named only to explain a failure.
     if (failure === null) {
-      expect(leftovers).toEqual([]);
-    } else if (leftovers.length === 0) {
-      throw failure.error;
+      expect(root === '' || !existsSync(root)).toBe(true);
     } else {
+      const left = root === '' ? null : await censusDiagnostic(root);
+      if (left === null) throw failure.error;
       // A cause, not an AggregateError: the test harness prints an aggregate's
       // inner errors without its message.
-      throw new Error(`processes ${leftovers.join(', ')} still work in ${root} after its body failed`, {
-        cause: failure.error,
-      });
+      throw new Error(`${left} after its body failed`, { cause: failure.error });
     }
   });
 });

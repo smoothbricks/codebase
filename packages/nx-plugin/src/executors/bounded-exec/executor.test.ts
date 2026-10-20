@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, jest } from 'bun:test';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { closeSync } from 'node:fs';
 import { access, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
@@ -17,9 +18,10 @@ import {
   scripted,
 } from '../../__tests__/gateway-stand-in.js';
 import { onProgressClock } from '../../__tests__/progress-clock.js';
+import { type StandInMode, standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
 import { processGroupHasMembers } from '../../process-group.js';
-import { ownedSocketDirectory } from '../../testing.js';
+import { ownedSocketDirectory, pidsWorkingIn, processTable } from '../../testing.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool, type InheritedCpuPool, readInheritedCpuPool } from './cpu-pool.js';
 import { CPU_TOKENS_ENV, type CpuBudget, gatewayCpuBudget, type TokenGrant } from './cpu-tokens.js';
 import {
@@ -33,6 +35,7 @@ import {
 } from './executor.js';
 import type { HangDiagnostics } from './hang-diagnostics.js';
 import { createNoSpaceWatch } from './no-space.js';
+import { cowshedSubtreeOwner, type SubtreeOwner } from './owned-subtree.js';
 import type { RamTempAcquisition, RamTempError, RamTempLease, Result } from './ram-temp.js';
 import { readRecord, type TempVolumeSpace, VERDICT_FILE } from './verdict.js';
 
@@ -955,7 +958,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       '/v/8-ghijkl archived at /v/.archive/0001792505574623-8-ghijkl: kept until 2 newer archives replace it';
     const volume = scriptedVolume({
       ok: true,
-      value: { kind: 'leased', lease: leaseAt(directory), held: [held], reaped: [], retained: [retained] },
+      value: { kind: 'leased', lease: leaseAt(directory), held: [held], reaped: [], gaps: [], retained: [retained] },
     });
 
     const result = await runBoundedExec(
@@ -964,6 +967,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
+      null,
+      undefined,
+      undefined,
+      await standInOwner(workspace.root),
     );
 
     expect(result.success).toBe(true);
@@ -971,8 +978,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     expect(result.terminalOutput).toContain(`RAM temp volume: dead lease ${held}\n`);
     expect(result.terminalOutput).toContain(`RAM temp volume: dead lease ${retained}\n`);
     expect(volume.released).toEqual([directory]);
-    // A passing run's scratch is not evidence anyone needs: the lease is released to be deleted.
-    expect(volume.order).toEqual([`reap ${directory}`, `release ${directory}`]);
+    // A passing run's scratch is not evidence anyone needs: the lease is released to be deleted. The handle's record
+    // lands whenever the admission does, which no output line orders.
+    expect(volume.order.filter((step) => !step.startsWith('record '))).toEqual([`release ${directory}`]);
   });
 
   it("releases a failed run's lease to be archived, and says where its scratch went", async () => {
@@ -981,7 +989,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     await mkdir(directory);
     const volume = scriptedVolume({
       ok: true,
-      value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: [], retained: [] },
+      value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: [], gaps: [], retained: [] },
     });
 
     const result = await runBoundedExec(
@@ -990,34 +998,112 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
+      null,
+      undefined,
+      undefined,
+      await standInOwner(workspace.root),
     );
 
     expect(result.success).toBe(false);
-    expect(volume.order).toEqual([`reap ${directory}`, `release ${directory} (kept)`]);
+    expect(volume.order.filter((step) => !step.startsWith('record '))).toEqual([`release ${directory} (kept)`]);
     expect(result.terminalOutput).toContain(`RAM temp volume: lease ${directory} archived by the scripted volume\n`);
   });
 
-  it('stops what the command left working in its lease before the lease ends, and says so', async () => {
+  it("retires what the command left running through its supervisor, names a dead task's retired subtree, then ends the lease", async () => {
     const workspace = await createWorkspace();
     const directory = join(workspace.root, 'lease');
     await mkdir(directory);
-    const volume = scriptedVolume(
-      {
-        ok: true,
-        value: {
-          kind: 'leased',
-          lease: leaseAt(directory),
-          held: [],
-          reaped: ['4242 (nx daemon of a dead task)'],
-          retained: [],
-        },
+    const volume = scriptedVolume({
+      ok: true,
+      value: {
+        kind: 'leased',
+        lease: leaseAt(directory),
+        held: [],
+        reaped: ['4242 (nx)'],
+        gaps: ['/v/9-abcdef: unobservedExit (pid 4243)'],
+        retained: [],
       },
-      null,
-      ['31337 (bun nx daemon --start)'],
-    );
+    });
+    const leftover = join(workspace.root, 'leftover.pid');
 
     const result = await runBoundedExec(
-      { command: 'node -e "0"', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+      { command: `sleep 600 & echo $! > ${leftover}`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+      workspace.context,
+      createProcessTreeKiller(),
+      volume,
+      null,
+      null,
+      undefined,
+      undefined,
+      await standInOwner(workspace.root),
+    );
+
+    const pid = Number(await readFile(leftover, 'utf8'));
+    expect(result.success, result.terminalOutput).toBe(true);
+    expect(result.terminalOutput).toContain(
+      `cowshed: the supervisor stopped ${pid} (sleep), which the command left running\n`,
+    );
+    expect(await live([pid])).toEqual([]);
+    expect(result.terminalOutput).toContain(
+      "RAM temp volume: the supervisor stopped 4242 (nx), which a dead task's command left running\n",
+    );
+    expect(result.terminalOutput).toContain(
+      "RAM temp volume: the supervisor's view of a dead task's command has a gap: /v/9-abcdef: unobservedExit (pid 4243)\n",
+    );
+    // The handle is recorded beside the lease once the supervisor admits the command, and the lease ends only after
+    // the subtree it names was retired.
+    expect(volume.order).toHaveLength(2);
+    expect(volume.order[0]?.startsWith(`record ${directory} {"jobId":1,"index":`)).toBe(true);
+    expect(volume.order[1]).toBe(`release ${directory}`);
+  });
+
+  it("retires only the command's own subtree: a bystander working in its directory, which the census named, survives", async () => {
+    const workspace = await createWorkspace();
+    const leftover = join(workspace.root, 'leftover.pid');
+    // No task started it; it only works where the command works, as an editor, an indexer or another job's process can.
+    const bystander = spawn('sleep', ['600'], { cwd: workspace.root, detached: true, stdio: 'ignore' });
+    const bystanderExited = once(bystander, 'exit');
+    try {
+      const bystanderPid = bystander.pid ?? 0;
+      // Before: the census that used to decide what a command's end killed names the bystander with the command's own.
+      expect(await pidsWorkingIn(workspace.root)).toContain(bystanderPid);
+
+      const result = await runBoundedExec(
+        { command: `sleep 600 & echo $! > ${leftover}`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        null,
+        null,
+        undefined,
+        undefined,
+        await standInOwner(workspace.root),
+      );
+
+      // After: the supervisor ends exactly what its tree records under the command, and the bystander is not in it.
+      const pid = Number(await readFile(leftover, 'utf8'));
+      expect(result.success, result.terminalOutput).toBe(true);
+      expect(result.terminalOutput).toContain(
+        `cowshed: the supervisor stopped ${pid} (sleep), which the command left running\n`,
+      );
+      expect(await live([pid])).toEqual([]);
+      expect(await live([bystanderPid])).toEqual([bystanderPid]);
+    } finally {
+      bystander.kill('SIGKILL');
+      await bystanderExited;
+    }
+  });
+
+  it('takes no RAM lease without a supervisor to own what the command leaves, and says which path ran', async () => {
+    const workspace = await createWorkspace();
+    const directory = join(workspace.root, 'lease');
+    const volume = scriptedVolume({
+      ok: true,
+      value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: [], gaps: [], retained: [] },
+    });
+
+    const result = await runBoundedExec(
+      { command: `node -e 'console.log("tmp=" + process.env.TMPDIR)'`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
       workspace.context,
       createProcessTreeKiller(),
       volume,
@@ -1026,12 +1112,60 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
     expect(result.success).toBe(true);
     expect(result.terminalOutput).toContain(
-      'RAM temp volume: stopped 31337 (bun nx daemon --start), which the command left working in its lease\n',
+      "RAM temp volume not leased: no cowshed supervisor owns this command's processes (COWSHED_SUPERVISOR_SOCKET is unset)",
     );
+    expect(result.terminalOutput).not.toContain(`tmp=${directory}`);
+    expect(volume.order).toEqual([]);
+  });
+
+  it('runs a command the supervisor refused to admit, unowned, and says nothing will retire what it leaves', async () => {
+    const workspace = await createWorkspace();
+    const directory = join(workspace.root, 'lease');
+    await mkdir(directory);
+    const volume = scriptedVolume({
+      ok: true,
+      value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: [], gaps: [], retained: [] },
+    });
+    const marker = join(workspace.root, 'ran');
+
+    const result = await runBoundedExec(
+      { command: `touch ${marker}`, timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+      workspace.context,
+      createProcessTreeKiller(),
+      volume,
+      null,
+      null,
+      undefined,
+      undefined,
+      await standInOwner(workspace.root, { admission: 'notMember', retire: 'retire' }),
+    );
+
+    expect(result.success).toBe(true);
+    expect(await exists(marker)).toBe(true);
     expect(result.terminalOutput).toContain(
-      'RAM temp volume: stopped 4242 (nx daemon of a dead task), which a dead task left working in its lease\n',
+      'cowshed: the command ran without an owned subtree (supervisor: notMember); nothing retires what it left running\n',
     );
-    expect(volume.order).toEqual([`reap ${directory}`, `release ${directory}`]);
+    expect(volume.order).toEqual([`release ${directory}`]);
+  });
+
+  it('fails a run whose leftovers the supervisor client could not retire, and names why', async () => {
+    const workspace = await createWorkspace();
+
+    const result = await runBoundedExec(
+      { command: 'node -e 0', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+      workspace.context,
+      createProcessTreeKiller(),
+      null,
+      null,
+      null,
+      undefined,
+      undefined,
+      await standInOwner(workspace.root, { admission: 'admitted', retire: 'fail' }),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.terminalOutput).toContain("cowshed: could not retire the command's processes: ");
+    expect(result.terminalOutput).toContain('exited 1: stand-in: the supervisor socket is unreachable\n');
   });
 
   it('keeps the inherited TMPDIR inside a sandbox and says so once', async () => {
@@ -1048,6 +1182,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
+      null,
+      undefined,
+      undefined,
+      await standInOwner(workspace.root),
     );
 
     expect(result.success).toBe(true);
@@ -1070,6 +1208,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
+      null,
+      undefined,
+      undefined,
+      await standInOwner(workspace.root),
     );
 
     expect(result.success).toBe(false);
@@ -1082,7 +1224,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const directory = join(workspace.root, 'lease');
     await mkdir(directory);
     const volume = scriptedVolume(
-      { ok: true, value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: [], retained: [] } },
+      { ok: true, value: { kind: 'leased', lease: leaseAt(directory), held: [], reaped: [], gaps: [], retained: [] } },
       { kind: 'volume-full', mountpoint: workspace.root, capacityBytes: 1024 * 1024 * 1024, freeBytes: 1024 * 1024 },
     );
 
@@ -1092,6 +1234,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
+      null,
+      undefined,
+      undefined,
+      await standInOwner(workspace.root),
     );
 
     expect(result.success).toBe(false);
@@ -1109,9 +1255,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const lease = leaseAt(directory);
     const space = { lease: directory, mountpoint: workspace.root, capacityBytes: lease.capacityBytes, freeBytes: 4096 };
     const volume = scriptedVolume(
-      { ok: true, value: { kind: 'leased', lease, held: [], reaped: [], retained: [] } },
+      { ok: true, value: { kind: 'leased', lease, held: [], reaped: [], gaps: [], retained: [] } },
       null,
-      [],
       space,
     );
     const record = { task: { id: 'compiler:test-10', hash: 'h' }, directory: join(workspace.root, 'record') };
@@ -1123,6 +1268,10 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       createProcessTreeKiller(),
       volume,
       null,
+      null,
+      undefined,
+      undefined,
+      await standInOwner(workspace.root),
     );
 
     expect(result.success).toBe(false);
@@ -1137,8 +1286,12 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       hash: 'h',
       verdict: { outcome: 'no-space', exitCode: 1, tests: [], line, volume: space },
     });
-    // Read while the lease was still the task's, before it was reaped and released.
-    expect(volume.order).toEqual(['space', `reap ${directory}`, `release ${directory} (kept)`]);
+    // Read while the lease was still the task's, before its subtree was retired and the lease released to be archived.
+    // The handle's record lands whenever the admission does, which no output line orders.
+    expect(volume.order.filter((step) => !step.startsWith('record '))).toEqual([
+      'space',
+      `release ${directory} (kept)`,
+    ]);
   });
 
   it('keeps inherited nextest and Cargo ceilings under oversized grants', async () => {
@@ -1662,8 +1815,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   describe('a leg that runs bun', () => {
     const declaresBun = JSON.stringify({ name: 'workspace', packageManager: 'bun@1.4.3' });
-    // No test here needs a program from the host: each PATH names only the fixture's directory and each command is its
-    // `bun` or a shell builtin. A host's /usr/bin and /bin differ (a NixOS runner has no `touch` in either).
+    const systemPath = ':/usr/bin:/bin';
 
     it('is refused before it asks for RAM or CPU when its first bun is another version, and records why', async () => {
       const workspace = await createWorkspace();
@@ -1671,7 +1823,14 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       const bun = await fakeBun(join(workspace.root, 'bin'), '1.4.2');
       const volume = scriptedVolume({
         ok: true,
-        value: { kind: 'leased', lease: leaseAt(join(workspace.root, 'lease')), held: [], reaped: [], retained: [] },
+        value: {
+          kind: 'leased',
+          lease: leaseAt(join(workspace.root, 'lease')),
+          held: [],
+          reaped: [],
+          gaps: [],
+          retained: [],
+        },
       });
       const asked: number[] = [];
       const budget: CpuBudget = {
@@ -1685,7 +1844,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       const result = await runBoundedExec(
         {
           command: 'bun run.js',
-          env: { PATH: join(workspace.root, 'bin') },
+          env: { PATH: join(workspace.root, 'bin') + systemPath },
           timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         },
         { ...workspace.context, record },
@@ -1719,7 +1878,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       const result = await runBoundedExec(
         {
           command: 'bun run.js',
-          env: { PATH: join(workspace.root, 'bin') },
+          env: { PATH: join(workspace.root, 'bin') + systemPath },
           timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         },
         workspace.context,
@@ -1739,8 +1898,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
       const result = await runBoundedExec(
         {
-          command: ': > ran.marker',
-          env: { PATH: join(workspace.root, 'bin') },
+          command: 'touch ran.marker',
+          env: { PATH: join(workspace.root, 'bin') + systemPath },
           timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
         },
         workspace.context,
@@ -1759,7 +1918,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
       await workspace.write('package.json', declaresBun);
       await fakeBun(join(workspace.root, 'bin'), '1.4.2');
       const inherited = process.env.PATH;
-      process.env.PATH = join(workspace.root, 'bin');
+      process.env.PATH = join(workspace.root, 'bin') + systemPath;
 
       try {
         const result = await runBoundedExec(
@@ -2122,13 +2281,12 @@ function leaseAt(directory: string): RamTempLease {
 }
 
 /**
- * A temp volume whose answers are fixed, recording which leases were reaped and released, each release marked
- * `(kept)` when its scratch was to be archived, and when space was read.
+ * A temp volume whose answers are fixed, recording which handles were recorded, which leases released, each release
+ * marked `(kept)` when its scratch was to be archived, and when space was read.
  */
 function scriptedVolume(
   acquisition: Result<RamTempAcquisition, RamTempError>,
   full: RamTempError | null = null,
-  leftovers: string[] = [],
   space: TempVolumeSpace | null = null,
 ): TempVolume & { released: string[]; order: string[] } {
   const released: string[] = [];
@@ -2137,9 +2295,9 @@ function scriptedVolume(
     released,
     order,
     acquire: () => Promise.resolve(acquisition),
-    reap(lease) {
-      order.push(`reap ${lease.directory}`);
-      return Promise.resolve({ ok: true, value: leftovers });
+    record(lease, handle) {
+      order.push(`record ${lease.directory} ${JSON.stringify(handle)}`);
+      return Promise.resolve({ ok: true, value: undefined });
     },
     release(lease, keep) {
       released.push(lease.directory);
@@ -2152,6 +2310,20 @@ function scriptedVolume(
       return Promise.resolve(space);
     },
   };
+}
+
+/** The command's owner: the installed cowshed's subtree verbs, answered by a stand-in that speaks their wire shapes. */
+async function standInOwner(
+  root: string,
+  mode: StandInMode = { admission: 'admitted', retire: 'retire' },
+): Promise<SubtreeOwner> {
+  return cowshedSubtreeOwner(await standInCowshed(join(root, `stand-in-${mode.admission}-${mode.retire}`), mode));
+}
+
+/** Which of `pids` still run, a zombie counting as exited: a reparented one waits on its reaper, not on anything here. */
+async function live(pids: readonly number[]): Promise<number[]> {
+  const table = await processTable();
+  return pids.filter((pid) => table.some((entry) => entry.pid === pid && !entry.stat.startsWith('Z')));
 }
 
 function captureWrite(chunks: string[], onChunk?: (text: string) => void): typeof process.stdout.write {

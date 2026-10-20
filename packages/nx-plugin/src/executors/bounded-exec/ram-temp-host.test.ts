@@ -21,8 +21,10 @@ import { fileURLToPath } from 'node:url';
 import type { OpContextBinding } from '@smoothbricks/lmao';
 import { useTestSpan } from '@smoothbricks/lmao/testing/bun';
 import { whenChanged } from '../../__tests__/path-change.js';
+import { standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
-import { processTable, terminate } from '../../testing.js';
+import { pidsWorkingIn, terminate } from '../../testing.js';
+import { cowshedSubtreeOwner, type SubtreeOwner, type SubtreeRetirement } from './owned-subtree.js';
 import {
   ARCHIVES_KEPT,
   archiveDeletions,
@@ -31,10 +33,8 @@ import {
   describeRamTempError,
   detachRamDisk,
   type HostCommands,
-  leaseProcessesOn,
   mountsBelow,
   operationDisk,
-  pidsInLease,
   type RamDisk,
   type RamTempError,
   type RamTempPaths,
@@ -44,6 +44,16 @@ import {
 import { registryDevice } from './ram-temp-fixtures.js';
 
 const MIB = 1024 * 1024;
+
+/** The owner of a case that only provisions: it creates the volume, so it finds no dead lease to settle. */
+const provisionOnly: SubtreeOwner = {
+  rootArgv() {
+    throw new Error('a provisioning case spawns no command');
+  },
+  async retire() {
+    throw new Error('a provisioning case finds no dead lease to settle');
+  },
+};
 
 /**
  * A volume of its own for one test: a lock beside it, and a name and a size no other test
@@ -167,60 +177,26 @@ async function nativeRamVolume(): Promise<void> {
   const trace = useTestSpan<OpContextBinding>();
   const caseStartedAt = Date.now();
   process.stderr.write(`RAM lifecycle case started pid=${process.pid} wallAtMs=${caseStartedAt}\n`);
-  const processes = leaseProcessesOn({
-    async workingIn(directory) {
-      const startedAt = Date.now();
-      const starting = JSON.stringify({
-        phase: 'lease-census-start',
-        directory,
-        pid: process.pid,
-        wallAtMs: startedAt,
-        caseElapsedMs: startedAt - caseStartedAt,
-      });
-      trace.log.info(starting);
-      process.stderr.write(`${starting}\n`);
-      try {
-        const pids = await pidsInLease(directory);
-        const endedAt = Date.now();
-        const finished = JSON.stringify({
-          phase: 'lease-census-end',
-          directory,
-          pid: process.pid,
-          wallAtMs: endedAt,
-          elapsedMs: endedAt - startedAt,
-          caseElapsedMs: endedAt - caseStartedAt,
-          pids,
-        });
-        trace.log.info(finished);
-        process.stderr.write(`${finished}\n`);
-        return pids;
-      } catch (error) {
-        const endedAt = Date.now();
-        const details = typeof error === 'object' && error !== null ? error : {};
-        const failed = JSON.stringify(
-          {
-            phase: 'lease-census-error',
-            directory,
-            pid: process.pid,
-            wallAtMs: endedAt,
-            elapsedMs: endedAt - startedAt,
-            caseElapsedMs: endedAt - caseStartedAt,
-            message: error instanceof Error ? error.message : String(error),
-            code: 'code' in details ? details.code : null,
-            signal: 'signal' in details ? details.signal : null,
-            killed: 'killed' in details ? details.killed : null,
-          },
-          null,
-          2,
-        );
-        trace.log.info(failed);
-        process.stderr.write(`${failed}\n`);
-        throw error;
+  // The supervisor every lease settles through: the stand-in cowshed's subtree verbs, whose tree is a process group
+  // (`__tests__/stand-in-cowshed.ts`). A handle this test marks foreign is a live job of another task's, answered by
+  // `foreignAnswers` in turn, as the supervisor answers a caller that is not that job's member.
+  const standIn = cowshedSubtreeOwner(
+    await standInCowshed(join(parent, 'supervisor'), { admission: 'admitted', retire: 'retire' }),
+  );
+  const foreignAnswers: SubtreeRetirement[] = [];
+  const subtrees: SubtreeOwner = {
+    rootArgv: (command) => standIn.rootArgv(command),
+    async retire(handle, graceMs) {
+      if (handle.foreign !== true) {
+        return standIn.retire(handle, graceMs);
       }
+      const answer = foreignAnswers.shift();
+      if (answer === undefined) {
+        throw new Error('a foreign handle was retired more often than this test answers for it');
+      }
+      return answer;
     },
-    table: processTable,
-    signal: terminate,
-  });
+  };
   // A readonly directory outside every lease. Each lease links to it: removal must unlink the
   // link and never follow it, leaving this directory's mode and contents as they were.
   const outside = join(parent, 'outside');
@@ -290,8 +266,8 @@ async function nativeRamVolume(): Promise<void> {
     },
   };
   const alive = new Set([101, 202]);
-  const first = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
-  const second = new RamTempVolume(paths, capacity, commands, 202, (pid) => alive.has(pid), processes);
+  const first = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
+  const second = new RamTempVolume(paths, capacity, commands, 202, (pid) => alive.has(pid));
   const run = async (file: string, args: string[]): Promise<string> => {
     const output = await host.run(file, args);
     if (output.status !== 0) {
@@ -299,7 +275,7 @@ async function nativeRamVolume(): Promise<void> {
     }
     return output.stdout;
   };
-  const volume = new RamTempVolume(paths, capacity, host, undefined, undefined, processes);
+  const volume = new RamTempVolume(paths, capacity, host);
   try {
     // The debris: a volume mounted at the mountpoint by a creator that died before its marker
     // (the order this module used to create in), and a RAM disk whose deadlined attach finished
@@ -307,7 +283,7 @@ async function nativeRamVolume(): Promise<void> {
     const sectors = `ram://${capacity / 512}`;
     const orphan = await host.run('/usr/bin/hdiutil', ['attach', '-nomount', sectors]);
     if (orphan.status !== 0) {
-      const acquired = await volume.acquire();
+      const acquired = await volume.acquire(subtrees);
       expect(acquired.ok).toBe(false);
       if (!acquired.ok) {
         expectSandboxed(acquired.error);
@@ -328,7 +304,7 @@ async function nativeRamVolume(): Promise<void> {
     // An unmarked volume that carries a lease is someone's TMPDIR: it is named, not detached.
     const lease = join(paths.mountpoint, `${process.pid}-abcdef`);
     mkdirSync(lease);
-    const refused = await volume.acquire();
+    const refused = await volume.acquire(subtrees);
     expect(refused).toEqual({
       ok: false,
       error: {
@@ -340,7 +316,7 @@ async function nativeRamVolume(): Promise<void> {
     expect(existsSync(lease)).toBe(true);
     rmdirSync(lease);
 
-    const a = await first.acquire();
+    const a = await first.acquire(subtrees);
     if (!a.ok || a.value.kind !== 'leased') {
       throw new Error(`lease over the debris failed: ${JSON.stringify(a)}`);
     }
@@ -353,7 +329,7 @@ async function nativeRamVolume(): Promise<void> {
     expect((await attachedDisks(paths, capacity)).map((disk) => disk.mountpoints)).toEqual([[paths.mountpoint]]);
 
     const leaseA = a.value.lease;
-    const b = await second.acquire();
+    const b = await second.acquire(subtrees);
     if (!b.ok || b.value.kind !== 'leased') {
       throw new Error(`second lease failed: ${JSON.stringify(b)}`);
     }
@@ -369,7 +345,7 @@ async function nativeRamVolume(): Promise<void> {
     symlinkSync(outside, join(leaseA.directory, 'outside-link'));
 
     // A passing run's lease is deleted, not archived.
-    expect(await first.release(leaseA, false)).toEqual({ ok: true, value: [] });
+    expect(await first.release(leaseA, false, subtrees)).toEqual({ ok: true, value: [] });
     expect(existsSync(leaseA.directory)).toBe(false);
     expectUntouched(outside);
     expect(statSync(leaseB.directory).dev).not.toBe(statSync(parent).dev);
@@ -380,11 +356,11 @@ async function nativeRamVolume(): Promise<void> {
     alive.delete(202);
     const image = join(leaseB.directory, 'store', 'main.dmg');
     attachedBelow.image = image;
-    const third = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
+    const third = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
     // A failed acquire must not leave its new live-pid lease or reclaim claim behind. Reuse
     // this mounted volume: no extra attach is needed to cover the failed-publication path.
     attachedBelow.failInventory = true;
-    const failedAcquire = await third.acquire();
+    const failedAcquire = await third.acquire(subtrees);
     expect(failedAcquire).toMatchObject({
       ok: false,
       error: { kind: 'provision-failed', step: 'ioreg (attached disk images)' },
@@ -397,7 +373,7 @@ async function nativeRamVolume(): Promise<void> {
       lifecycle: null,
       claims: [],
     });
-    const c = await third.acquire();
+    const c = await third.acquire(subtrees);
     if (!c.ok || c.value.kind !== 'leased') {
       throw new Error(`third lease failed: ${JSON.stringify(c)}`);
     }
@@ -410,7 +386,7 @@ async function nativeRamVolume(): Promise<void> {
     expect(statSync(join(leaseB.directory, 'tree', 'inner')).mode & 0o777).toBe(0o500);
     expect(existsSync(join(leaseB.directory, 'tree', 'inner', 'deep'))).toBe(true);
     expectUntouched(outside);
-    expect(await third.release(c.value.lease, false)).toEqual({ ok: true, value: [] });
+    expect(await third.release(c.value.lease, false, subtrees)).toEqual({ ok: true, value: [] });
     expect(existsSync(c.value.lease.directory)).toBe(false);
     expect(statSync(leaseB.directory).dev).not.toBe(statSync(parent).dev);
     expect(statSync(join(leaseB.directory, 'tree')).mode & 0o777).toBe(0o555);
@@ -418,11 +394,17 @@ async function nativeRamVolume(): Promise<void> {
     // Once its owner has detached the image, the next task reclaims the lease, and its release,
     // the last, detaches the volume. The dead task left a writer behind, as a test's ttsc plugin
     // build is left: working elsewhere, writing into the lease through its TMPDIR, with a child.
-    // The pid the lease is named after is dead; the writer is stopped before the lease is reclaimed,
-    // so its archive never gains a file after the lease was judged dead. A second dead lease, that
-    // nothing works in, is reclaimed beside it. Both are dead tasks' scratch, so both are archived.
+    // The task recorded its supervisor's handle on that subtree beside the lease before it died, so
+    // the supervisor ends the writer and its child before the lease is reclaimed, and its archive
+    // never gains a file after the lease was judged dead. A bystander that only works in the lease
+    // is in no such subtree: the census that used to decide names it, and nothing signals it now.
+    // A second dead lease records no handle, and nothing of its task still runs. Both are dead
+    // tasks' scratch, so both are archived. A third records a handle of a job that is still another
+    // task's: it is kept until that job ends.
+    // The writer rewrites one file rather than making new ones: archived scratch stays on the volume, and a new file
+    // per iteration filled this 64 MiB volume's metadata before the next acquire could make its lease (ENOSPC).
     attachedBelow.image = null;
-    const writer = spawn('sh', ['-c', 'sleep 600 & echo $!; i=0; while :; do i=$((i+1)); : > "$TMPDIR/w$i"; done'], {
+    const writer = spawn('sh', ['-c', 'sleep 600 & echo $!; while :; do : > "$TMPDIR/w1"; done'], {
       cwd: parent,
       env: { ...process.env, TMPDIR: leaseB.directory },
       detached: true,
@@ -430,24 +412,53 @@ async function nativeRamVolume(): Promise<void> {
     });
     const writerExited = once(writer, 'close');
     const writerChild = Number(String((await once(writer.stdout, 'data'))[0]).trim());
+    const bystander = spawn('sleep', ['600'], { cwd: leaseB.directory, detached: true, stdio: 'ignore' });
+    const bystanderExited = once(bystander, 'exit');
+    expect(
+      await second.record(leaseB, {
+        jobId: 1,
+        index: writer.pid ?? 0,
+        incarnation: '0123456789abcdef0123456789abcdef',
+      }),
+    ).toEqual({ ok: true, value: undefined });
     const quiet = join(paths.mountpoint, '303-quiet1');
     mkdirSync(quiet);
     writeFileSync(join(quiet, 'left'), 'by a task nothing of which still runs');
+    const foreign = join(paths.mountpoint, '404-forgn1');
+    mkdirSync(foreign);
+    writeFileSync(`${foreign}.subtree`, `${JSON.stringify({ foreign: true })}\n`);
+    foreignAnswers.push(
+      { kind: 'refused', reason: 'foreignHandle' },
+      { kind: 'refused', reason: 'foreignHandle' },
+      { kind: 'refused', reason: 'jobEnded' },
+    );
     try {
       // Ends on the watch event that creates the writer's `w1` in the lease, not on a poll.
       await whenChanged(leaseB.directory, () => existsSync(join(leaseB.directory, 'w1')));
-      const fourth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
-      const d = await fourth.acquire();
+      expect(await pidsWorkingIn(leaseB.directory)).toContain(bystander.pid ?? 0);
+      const fourth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
+      const d = await fourth.acquire(subtrees);
       if (!d.ok || d.value.kind !== 'leased') {
         throw new Error(`fourth lease failed: ${JSON.stringify(d)}`);
       }
-      expect(d.value.held).toEqual([]);
+      expect(d.value.held).toEqual([
+        `${foreign} is kept: its subtree is not this task's to retire (supervisor: foreignHandle); it goes once that subtree's job ends`,
+      ]);
       expect(d.value.reaped.map((entry) => Number(entry.split(' ')[0])).sort((a, b) => a - b)).toEqual(
         [writer.pid ?? 0, writerChild].sort((a, b) => a - b),
       );
+      expect(d.value.gaps).toEqual([]);
+      expect(bystander.exitCode).toBeNull();
+      expect(bystander.signalCode).toBeNull();
       expect(existsSync(leaseB.directory)).toBe(false);
+      expect(existsSync(`${leaseB.directory}.subtree`)).toBe(false);
       expect(existsSync(quiet)).toBe(false);
+      expect(existsSync(foreign)).toBe(true);
       expectUntouched(outside);
+      // The bystander moved with the lease's directory into the archive; on the volume it would hold the volume from
+      // detaching, so it is this test's to end, as it is its owner's on a real host.
+      bystander.kill('SIGKILL');
+      await bystanderExited;
 
       // Each dead lease's scratch was renamed whole into the archive on the volume: its files, and its readonly tree
       // with its modes, are there to read.
@@ -478,13 +489,14 @@ async function nativeRamVolume(): Promise<void> {
           .sort(),
       );
 
-      // A third dead lease's archive rotates the oldest out at once, by rename; its deletion runs in the background.
+      // A later dead lease's archive rotates the oldest out at once, by rename; its deletion runs in the background.
+      // The foreign job is still live, so its lease is kept again.
       const oldest = [archivedB, archivedQuiet].sort()[0];
       const later = join(paths.mountpoint, '505-later1');
       mkdirSync(later);
       writeFileSync(join(later, 'left'), 'by a task that died after the others');
-      const fifth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid), processes);
-      const e = await fifth.acquire();
+      const fifth = new RamTempVolume(paths, capacity, commands, 101, (pid) => alive.has(pid));
+      const e = await fifth.acquire(subtrees);
       if (!e.ok || e.value.kind !== 'leased') {
         throw new Error(`fifth lease failed: ${JSON.stringify(e)}`);
       }
@@ -493,26 +505,34 @@ async function nativeRamVolume(): Promise<void> {
       expect(readFileSync(join(archive, archiveOf(later), 'left'), 'utf8')).toBe(
         'by a task that died after the others',
       );
+      expect(existsSync(foreign)).toBe(true);
       await archiveDeletions();
       expect(readdirSync(join(archive, '.deleting'))).toEqual([]);
 
       // A failed run's own scratch is archived too, unless less than half the volume is free when it arrives: then the
-      // volume keeps no archive at all, since live leases need the space more than evidence does.
+      // volume keeps no archive at all, since live leases need the space more than evidence does. The foreign job has
+      // ended by this pass, so its lease is reclaimed in it, and deleted with the rest.
       const volumeNow = await statfs(paths.mountpoint);
       const fill = volumeNow.bavail * volumeNow.bsize - Math.floor((volumeNow.blocks * volumeNow.bsize) / 2) + MIB;
       writeFileSync(join(e.value.lease.directory, 'fill'), Buffer.alloc(fill));
-      const crowded = await fifth.release(e.value.lease, true);
-      expect(crowded.ok ? crowded.value.map((line) => line.replace(/\d+ MiB/g, 'N MiB')) : crowded).toEqual([
-        `${e.value.lease.directory} deleted: the volume has N MiB free, below the N MiB under which it keeps no archive`,
-      ]);
+      const crowded = await fifth.release(e.value.lease, true, subtrees);
+      expect(crowded.ok ? crowded.value.map((line) => line.replace(/\d+ MiB/g, 'N MiB')).sort() : crowded).toEqual(
+        [e.value.lease.directory, foreign]
+          .map(
+            (lease) => `${lease} deleted: the volume has N MiB free, below the N MiB under which it keeps no archive`,
+          )
+          .sort(),
+      );
       expect(archives()).toEqual([]);
+      expect(existsSync(foreign)).toBe(false);
       await archiveDeletions();
       expect(readdirSync(join(archive, '.deleting'))).toEqual([]);
-      expect(await fourth.release(d.value.lease, false)).toEqual({ ok: true, value: [] });
+      expect(await fourth.release(d.value.lease, false, subtrees)).toEqual({ ok: true, value: [] });
     } finally {
       terminate(writer.pid ?? 0, 'SIGKILL');
       terminate(writerChild, 'SIGKILL');
-      await writerExited;
+      bystander.kill('SIGKILL');
+      await Promise.all([writerExited, bystanderExited]);
     }
     expect(existsSync(paths.mountpoint)).toBe(false);
     expect(await attachedDisks(paths, capacity)).toEqual([]);
@@ -576,7 +596,7 @@ async function aFailedStepLeavesNoNamedVolume(): Promise<void> {
       },
     };
     try {
-      const refused = await new RamTempVolume(paths, capacity, commands).acquire();
+      const refused = await new RamTempVolume(paths, capacity, commands).acquire(provisionOnly);
       const refusal = JSON.stringify({ injected, refused }, null, 2);
       trace.log.info(refusal);
       process.stderr.write(`${refusal}\n`);

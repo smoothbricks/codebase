@@ -20,18 +20,16 @@ import { Socket } from 'node:net';
 import { basename, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DEADLINE_PATIENCE, describeMembersLeft, killProcessGroup } from '../../process-group.js';
-import {
-  awaitExit,
-  type ProcessEntry,
-  pidsWithTempIn,
-  pidsWorkingIn,
-  processTable,
-  terminate,
-  withDescendants,
-} from '../../testing.js';
 import { isRecord } from '../../type-guards.js';
 import { diskClassOf, type PhaseShare, recordedShare, takeDiskLease } from './disk-lease.js';
 import { GATEWAY_SOCKET } from './gateway-lease.js';
+import {
+  type CoverageGap,
+  parseHandle,
+  type SignalledProcess,
+  type SubtreeHandle,
+  type SubtreeOwner,
+} from './owned-subtree.js';
 import {
   captureHeldVerdict,
   type HeldCandidate,
@@ -218,143 +216,26 @@ export interface HostCommands {
 }
 
 /**
- * How long a process a task left in its lease gets to exit on SIGTERM before it gets SIGKILL: the
- * time a daemon takes to stop its watcher and its plugin workers, and well under the grace a
+ * How long a process a task left in its subtree gets to exit on SIGTERM before it gets SIGKILL:
+ * the time a daemon takes to stop its watcher and its plugin workers, and well under the grace a
  * bounded leg gives its own command.
  */
-const LEFTOVER_GRACE_MS = 5_000;
+export const LEFTOVER_GRACE_MS = 5_000;
 
-/**
- * The processes still working in a lease directory once its task is over, and how they end. A
- * seam so the volume's state machine is testable without any.
- */
-export interface LeaseProcesses {
-  /**
-   * End every process that works in `directory` — its working directory or the `TMPDIR` it was
-   * started with is there — and everything those started, and answer each as `<pid> (<command>)`.
-   * Every one has exited when this settles; one that would not rejects with its name.
-   */
-  stopWorkingIn(directory: string): Promise<string[]>;
+/** A lease's subtree handle file: beside the lease on the volume, never in it, so the command cannot remove it. */
+function subtreeRecordPath(directory: string): string {
+  return `${directory}.subtree`;
 }
 
-/** The host reads and signals cleanup uses; a seam for process ordering and signal failures. */
-export interface ProcessHost {
-  /** The processes whose working directory, or the `TMPDIR` they were started with, is `directory` or lies beneath it. */
-  workingIn(directory: string): Promise<number[]>;
-  /** Every process on the host. */
-  table(): Promise<ProcessEntry[]>;
-  signal(pid: number, signal: NodeJS.Signals): void;
+/** One coverage gap the supervisor reported for a subtree it retired, as text. */
+export function describeCoverageGap(gap: CoverageGap): string {
+  return gap.pid === null ? gap.kind : `${gap.kind} (pid ${gap.pid})`;
 }
 
-/** A `ps` state in which a process starts nothing: stopped (`T`, `t` when traced) or exited (`Z`). */
-const STARTS_NOTHING = /^[TtZ]/;
-
-/**
- * The processes `host` reads. A lease belongs to one task and its command is gone by the time the
- * lease ends, so what still works in it is what the command left behind. Most of that works in the
- * lease only through `TMPDIR`, never by working directory: a test's ttsc plugin build copies the
- * typescript-go sources into `$TMPDIR` from a process working in its project, and a Bun or Node
- * process writes its compile cache there as it exits. Neither is known to the task's pid, and
- * whichever outlived that pid would write into a lease being removed (measured 2026-10-18: `rm`
- * failing ENOTEMPTY under a ttsc copy whose task had died). A fixture's Nx daemon is another: Nx
- * detaches it into a session of its own, so the process-group kill that ends a timed-out command
- * never reaches it, and a test process that is killed runs no teardown of its own. Deleting the
- * lease asks such a daemon to leave only by deleting its record, which it notices within a second
- * when it is idle and not at all while it is wedged; a signal does not depend on the daemon
- * noticing, and a process left on the volume is what keeps it from detaching.
- *
- * A leftover keeps running while it is looked for, and a child it starts after the process table
- * was read is in no table that was. So each one found is held with SIGSTOP and the table is read
- * again, until a read names nothing that the read before did not already show stopped: a stopped
- * process starts nothing, and whatever it started before it stopped is in every table read after.
- * Discovery waits for stopped-census readiness; the exit grace starts only after SIGTERM.
- * Only then does each get SIGTERM, and SIGCONT to act on it. A child whose parent exited before it
- * could be held has lost its ancestry, so once the stopped-table barrier holds, the lease is asked
- * again what works in it, including when that table names nothing, to recover reparented children.
- */
-export function leaseProcessesOn(host: ProcessHost): LeaseProcesses {
-  return {
-    async stopWorkingIn(directory) {
-      let working = (await host.workingIn(directory)).filter((pid) => pid !== process.pid);
-      if (working.length === 0) {
-        return [];
-      }
-      const known = new Map<number, ProcessEntry>();
-      let held = new Set<number>();
-      let failures: unknown[] | undefined;
-      try {
-        for (;;) {
-          const roots = [...working, ...known.keys()];
-          const current = withDescendants(await host.table(), roots).filter((entry) => entry.pid !== process.pid);
-          for (const entry of current) {
-            known.set(entry.pid, entry);
-          }
-          if (current.every((entry) => held.has(entry.pid) && STARTS_NOTHING.test(entry.stat))) {
-            working = (await host.workingIn(directory)).filter((pid) => pid !== process.pid);
-            if (working.every((pid) => held.has(pid))) {
-              break;
-            }
-          }
-          for (const entry of current) {
-            host.signal(entry.pid, 'SIGSTOP');
-          }
-          held = new Set(current.filter((entry) => STARTS_NOTHING.test(entry.stat)).map((entry) => entry.pid));
-        }
-        for (const entry of known.values()) {
-          host.signal(entry.pid, 'SIGTERM');
-        }
-      } catch (error) {
-        failures = [error];
-      } finally {
-        // SIGTERM is pending while stopped. One failed resume must not strand the other holds.
-        for (const entry of known.values()) {
-          try {
-            host.signal(entry.pid, 'SIGCONT');
-          } catch (error) {
-            failures ??= [];
-            failures.push(
-              new Error(
-                `${entry.pid} (${entry.command}): SIGCONT failed: ${error instanceof Error ? error.message : String(error)}`,
-                { cause: error },
-              ),
-            );
-          }
-        }
-      }
-      if (failures !== undefined) {
-        if (failures.length === 1) {
-          throw failures[0];
-        }
-        throw new AggregateError(
-          failures,
-          `processes working in ${directory}: ${failures.map((error) => (error instanceof Error ? error.message : String(error))).join('; ')}`,
-        );
-      }
-      const leftovers = [...known.values()];
-      try {
-        await awaitExit(leftovers, `processes working in ${directory}`, LEFTOVER_GRACE_MS);
-      } catch {
-        for (const entry of leftovers) {
-          host.signal(entry.pid, 'SIGKILL');
-        }
-        await awaitExit(leftovers, `processes working in ${directory} after SIGKILL`, LEFTOVER_GRACE_MS);
-      }
-      return leftovers.map((entry) => `${entry.pid} (${entry.command.slice(0, 160)})`);
-    },
-  };
+/** One process a retirement signalled, as `<pid> (<image>)`. */
+export function describeSignalled(entry: SignalledProcess): string {
+  return `${entry.pid} (${entry.image ?? 'unknown image'})`;
 }
-
-/** What works in `directory` on this host: by working directory, and by the `TMPDIR` it was started with. */
-export async function pidsInLease(directory: string): Promise<number[]> {
-  const [working, temp] = await Promise.all([pidsWorkingIn(directory), pidsWithTempIn(directory)]);
-  return [...new Set([...working, ...temp])];
-}
-
-export const hostLeaseProcesses: LeaseProcesses = leaseProcessesOn({
-  workingIn: pidsInLease,
-  table: processTable,
-  signal: terminate,
-});
 
 export interface RamTempPaths {
   /**
@@ -421,13 +302,15 @@ export interface RamTempLease {
 export type RamTempAcquisition =
   /**
    * `held`: dead leases that could not be reclaimed, each with what still holds it. `reaped`: the
-   * processes of dead leases that were still working there and were stopped before the lease went.
+   * processes the supervisor retired from dead leases' recorded subtrees before those leases went,
+   * as `<pid> (<image>)`. `gaps`: where the supervisor's view of those subtrees may have missed one.
    */
   | {
       kind: 'leased';
       lease: RamTempLease;
       held: string[];
       reaped: string[];
+      gaps: string[];
       /** What became of each dead lease's scratch this acquire reclaimed: archived and kept, or deleted and why. */
       retained: string[];
     }
@@ -518,9 +401,11 @@ interface MountedVolume {
 /**
  * One acquire or release. `claimed`: the ledger as it last published holds one of its claims.
  * `made`: the lease directory an acquire made, with its identity, until the caller has it.
+ * `subtrees`: the supervisor this caller asks to retire a dead lease's recorded subtree.
  */
 interface Operation {
   readonly owner: ClaimOwner;
+  readonly subtrees: SubtreeOwner;
   claimed: boolean;
   made: { readonly directory: string; readonly identity: string } | null;
 }
@@ -555,11 +440,12 @@ interface Claimed {
   readonly candidates: readonly Candidate[];
 }
 
-/** What settling claimed leases found: those kept, the processes stopped, and the verdicts to publish. */
+/** What settling claimed leases found: those kept, the processes retired, the gaps, and the verdicts to publish. */
 interface Settled {
   readonly held: readonly HeldLease[];
   readonly reaped: readonly string[];
   readonly retained: readonly string[];
+  readonly gaps: readonly string[];
   readonly verdicts: readonly HeldEntry[];
 }
 
@@ -623,15 +509,17 @@ export class RamTempVolume {
     private readonly commands: HostCommands,
     private readonly pid: number = process.pid,
     private readonly isAlive: (pid: number) => boolean = processIsAlive,
-    private readonly processes: LeaseProcesses = hostLeaseProcesses,
   ) {
     this.sectors = Math.ceil(capacityBytes / SECTOR_BYTES);
     this.ledgerPath = `${paths.lockFile}.ledger`;
   }
 
-  /** Take a lease: create the volume if no task holds one, and a private directory on it. */
-  async acquire(): Promise<Result<RamTempAcquisition, RamTempError>> {
-    const op: Operation = { owner: { pid: this.pid, token: randomUUID() }, claimed: false, made: null };
+  /**
+   * Take a lease: create the volume if no task holds one, and a private directory on it. A dead
+   * lease found on the way is settled through `subtrees`, the supervisor that owns the caller.
+   */
+  async acquire(subtrees: SubtreeOwner): Promise<Result<RamTempAcquisition, RamTempError>> {
+    const op: Operation = { owner: { pid: this.pid, token: randomUUID() }, subtrees, claimed: false, made: null };
     let result: Result<RamTempAcquisition, LockedError>;
     try {
       result = await this.lease(op);
@@ -785,6 +673,7 @@ export class RamTempVolume {
               held: [...value.held, ...settled.value.held].map((lease) => lease.text),
               reaped: [...settled.value.reaped],
               retained: [...settled.value.retained],
+              gaps: [...settled.value.gaps],
             },
           };
         }
@@ -835,37 +724,32 @@ export class RamTempVolume {
         held: [],
         reaped: [],
         retained: [],
+        gaps: [],
       },
     };
   }
 
   /**
-   * Stop what the task left working in its lease, before the lease ends: the processes whose
-   * working directory is in it and everything they started, answered as `<pid> (<command>)`.
-   * Runs outside the volume's lock, which one lease's leftovers must not hold up the others
-   * behind, and costs a scan of every process only when the lease still holds anything.
+   * Record the supervisor's handle on the subtree whose command uses `lease`, beside the lease, so
+   * that if this task dies before it retires that subtree, whoever settles the dead lease can hand
+   * the handle back to the supervisor instead of guessing from a census who worked there.
    */
-  async reap(lease: RamTempLease): Promise<Result<string[], RamTempError>> {
+  async record(lease: RamTempLease, handle: SubtreeHandle): Promise<Result<void, RamTempError>> {
     try {
-      const entries = await readdir(lease.directory).catch((error: unknown) => {
-        if (errorCode(error) === 'ENOENT') return [];
-        throw error;
-      });
-      if (entries.length === 0) {
-        return { ok: true, value: [] };
-      }
-      return { ok: true, value: await this.processes.stopWorkingIn(lease.directory) };
+      await writeFile(subtreeRecordPath(lease.directory), `${JSON.stringify(handle)}\n`, { mode: 0o600 });
+      return { ok: true, value: undefined };
     } catch (error) {
-      return failed('reap', errorText(error));
+      return failed('record subtree', errorText(error));
     }
   }
 
   /**
    * End a lease; the last lease detaches the volume, returning its RAM. `keep` archives the lease's scratch instead of
-   * deleting it: its run did not pass. Answers what became of every scratch this release reclaimed, its own included.
+   * deleting it: its run did not pass. A dead lease found on the way is settled through `subtrees`. Answers what became
+   * of every scratch this release reclaimed, its own included.
    */
-  async release(lease: RamTempLease, keep: boolean): Promise<Result<string[], RamTempError>> {
-    const op: Operation = { owner: { pid: this.pid, token: randomUUID() }, claimed: false, made: null };
+  async release(lease: RamTempLease, keep: boolean, subtrees: SubtreeOwner): Promise<Result<string[], RamTempError>> {
+    const op: Operation = { owner: { pid: this.pid, token: randomUUID() }, subtrees, claimed: false, made: null };
     let result: Result<string[], LockedError>;
     try {
       result = await this.releaseLease(op, basename(lease.directory), keep);
@@ -1185,12 +1069,12 @@ export class RamTempVolume {
   }
 
   /**
-   * Outside the lock: settle the leases this caller claimed. The processes every dead one still
-   * runs are stopped first, and only then is the pass's one inventory read, so no inventory older
-   * than a lease's settled census approves its removal. Anything attached from below a lease keeps
-   * it: an image backed by a file there would be left pinned to a deleted file, and detaching it
-   * here would race the owner that releases it under its own lease; a mount there is backed
-   * elsewhere — a cowshed workspace adopted from a fixture checkout, say — and `rm -r` would
+   * Outside the lock: settle the leases this caller claimed. Every dead one's recorded subtree is
+   * handed back to the supervisor first, and only then is the pass's one inventory read, so no
+   * inventory older than a lease's retirement approves its removal. Anything attached from below a
+   * lease keeps it: an image backed by a file there would be left pinned to a deleted file, and
+   * detaching it here would race the owner that releases it under its own lease; a mount there is
+   * backed elsewhere — a cowshed workspace adopted from a fixture checkout, say — and `rm -r` would
    * delete its contents through the mount. A kept lease gets a verdict to publish, when its
    * holders have cheap lifetime keys. A lease nothing holds is reclaimed once the lock confirms it
    * is as claimed: a kept one's scratch is renamed into the archive (`retain`), any other deleted.
@@ -1201,25 +1085,60 @@ export class RamTempVolume {
     candidates: readonly Candidate[],
   ): Promise<Result<Settled, LockedError>> {
     if (candidates.length === 0) {
-      return { ok: true, value: { held: [], reaped: [], retained: [], verdicts: [] } };
+      return { ok: true, value: { held: [], reaped: [], gaps: [], retained: [], verdicts: [] } };
     }
     const reaped: string[] = [];
+    const gaps: string[] = [];
+    const held: HeldLease[] = [];
     for (const candidate of candidates) {
-      // Its task is gone, so what works in it is what that task left: stopped before the lease is
-      // removed, even where the removal is refused below. An empty lease is asked too: a leftover
-      // that has not written yet writes once it runs again. A task reaps its own (`reap`).
-      if (!candidate.own) {
-        reaped.push(...(await this.processes.stopWorkingIn(candidate.directory)));
+      // A task retires its own subtree before it releases; a dead one could not. Its subtree is the
+      // supervisor's to end, named by the handle the task recorded — never by who works in the lease
+      // (specs/cowshed/07_api.md, `JobSubtreeHandle`). A lease with no readable handle recorded none
+      // to retire: its task died before its command was admitted, or that admission was refused.
+      if (candidate.own) {
+        continue;
+      }
+      const recorded = await readFile(subtreeRecordPath(candidate.directory), 'utf8').catch((error: unknown) => {
+        if (errorCode(error) === 'ENOENT') return null;
+        throw error;
+      });
+      const handle = recorded === null ? null : parseHandle(recorded);
+      if (handle === null) {
+        continue;
+      }
+      const retired = await op.subtrees.retire(handle, LEFTOVER_GRACE_MS);
+      switch (retired.kind) {
+        case 'retired':
+          reaped.push(...retired.signalled.map(describeSignalled));
+          if (retired.signalledIncomplete) {
+            gaps.push(`${candidate.directory}: the supervisor may have ended processes it could not name`);
+          }
+          gaps.push(...retired.gaps.map((gap) => `${candidate.directory}: ${describeCoverageGap(gap)}`));
+          break;
+        case 'refused':
+          // An ended job's supervisor retired its whole tree as it ended, and a spent handle was
+          // already retired: either way nothing of that subtree is left to end.
+          if (retired.reason !== 'jobEnded' && retired.reason !== 'spentHandle') {
+            held.push({
+              name: candidate.name,
+              text: `${candidate.directory} is kept: its subtree is not this task's to retire (supervisor: ${retired.reason}); it goes once that subtree's job ends`,
+            });
+          }
+          break;
+        case 'failed':
+          return failed('retire', `${candidate.directory}: ${retired.detail}`);
       }
     }
     const inventory = await this.readInventory();
     if (!inventory.ok) {
       return inventory;
     }
-    const held: HeldLease[] = [];
     const verdicts: HeldEntry[] = [];
     const removable: Candidate[] = [];
     for (const candidate of candidates) {
+      if (held.some((lease) => lease.name === candidate.name)) {
+        continue;
+      }
       const below = candidatesBelow(inventory.value, `${candidate.directory}/`);
       if (below.length === 0) {
         removable.push(candidate);
@@ -1247,6 +1166,8 @@ export class RamTempVolume {
         return confirmed;
       }
       for (const candidate of confirmed.value) {
+        // Its subtree was retired above, or had ended: the handle beside the lease is spent either way.
+        await rm(subtreeRecordPath(candidate.directory), { force: true });
         if (candidate.keep) {
           // One rename on the volume: the scratch stays whole and readable, and nothing waits on a deletion.
           const archive = `${String(Date.now()).padStart(13, '0')}-${candidate.name}`;
@@ -1262,7 +1183,7 @@ export class RamTempVolume {
       }
     }
     const retained = archived.length === 0 ? [] : await this.retain(volume, archived);
-    return { ok: true, value: { held, reaped, retained, verdicts } };
+    return { ok: true, value: { held, reaped, gaps, retained, verdicts } };
   }
 
   /**

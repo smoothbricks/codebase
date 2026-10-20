@@ -100,6 +100,7 @@
     "src/executors/bounded-exec/run-cpu-pool.test.ts": 23,
     "src/executors/cargo-zigbuild/executor.test.ts": 22,
     "src/nx-daemon-idle-cpu.test.ts": 21,
+    "src/executors/bounded-exec/owned-subtree.test.ts": 19,
     "src/bun-file-packages.test.ts": 17,
     "src/disk-command-policy.test.ts": 17,
     "src/executors/clean-outputs/executor.test.ts": 17,

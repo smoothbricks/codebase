@@ -16,7 +16,6 @@ import {
   ownedFixtureRoot,
   ownedWorkspaceSocketDirectory,
   type ProcessEntry,
-  pidsWorkingIn,
   processTable,
   publishFixtureSocketDirectory,
   retireFixtureSocketDirectory,
@@ -122,22 +121,20 @@ it('stops the Nx daemon of a fixture whose body throws, and deletes its socket a
   await expect(thrown).rejects.toThrow('the fixture body failed on purpose');
   expect(daemon).not.toEqual([]);
   expect(await stillRunning(daemon)).toEqual([]);
-  expect(await pidsWorkingIn(root)).toEqual([]);
   expect(existsSync(root)).toBe(false);
   expect(lstatSync(alias, { throwIfNoEntry: false })).toBeUndefined();
 });
 
-it('ends owned Nx processes before daemon publication and after daemon exit', async () => {
-  let root = '';
+it('stops a recorded daemon and its tree, and signals nothing it finds only by census', async () => {
   await withNxFixture('daemon-orphan-', async (fixture) => {
-    root = fixture.root;
     const { workspace } = fixture;
     const record = join(workspace, '.nx', 'workspace-data', 'd', 'server-process.json');
     for (const recorded of [false, true]) {
       const phase = recorded ? 'recorded' : 'unrecorded';
       const pidFile = join(workspace, `${phase}-orphan.pid`);
       const workerFile = join(workspace, `${phase}-worker.pid`);
-      // The daemon's last act starts an orphan, so each cleanup path must rescan its owned cwd.
+      // The daemon's last act starts an orphan that leaves the daemon's tree, so only the job's supervisor
+      // may end it: the fixture leaves it running.
       const daemon = Bun.spawn(
         [
           'sh',
@@ -174,13 +171,18 @@ it('ends owned Nx processes before daemon publication and after daemon exit', as
           await daemon.exited;
         });
         expect(stopCalls).toBe(recorded ? 1 : 0);
-        expect(await pidsWorkingIn(workspace)).toEqual([]);
-        const orphan = Number(await readFile(pidFile, 'utf8'));
-        expect(orphan).toBeGreaterThan(0);
-        // A zombie has exited already; a signal probe would still count it as running.
-        expect((await processTable()).filter((entry) => entry.pid === orphan && !entry.stat.startsWith('Z'))).toEqual(
-          [],
-        );
+        // The orphan's trap wrote its pid before the daemon exited. It was started after stopNxDaemon
+        // signalled the daemon, so it is outside the daemon's tree and must survive.
+        const orphan = existsSync(pidFile) ? Number(await readFile(pidFile, 'utf8')) : 0;
+        if (recorded) {
+          expect(orphan).toBeGreaterThan(0);
+          expect(isRunning(orphan)).toBe(true);
+          // The worker was in the daemon's tree before the stop, so stopNxDaemon ended it.
+          const worker = Number(await readFile(workerFile, 'utf8'));
+          // A zombie has exited already; a signal probe would still count it as running.
+          const live = (await processTable()).filter((entry) => entry.pid === worker && !entry.stat.startsWith('Z'));
+          expect(live).toEqual([]);
+        }
       } finally {
         // Assert before retiring this probe, but release every real child on a failed oracle too.
         terminate(daemon.pid);
@@ -197,7 +199,6 @@ it('ends owned Nx processes before daemon publication and after daemon exit', as
       }
     }
   });
-  expect(await pidsWorkingIn(root)).toEqual([]);
 });
 
 it('binds and connects through its short alias without granting the long fixture root a socket namespace', async () => {
@@ -377,7 +378,7 @@ async function plantSocketAlias(workspace: string): Promise<string> {
   return directory;
 }
 
-it("reclaims a dead run's Nx daemon, helper processes and socket aliases, and nothing of a live run", async () => {
+it('deletes a dead run and its socket aliases without signalling what still works there, and nothing of a live run', async () => {
   // A suite of its own, so this process's first fixture of it is the one that sweeps.
   const suite = `sweep-regression-${process.pid}`;
   const suiteDirectory = join(await realpath(tmpdir()), 'smoothbricks-fixtures', suite);
@@ -397,33 +398,16 @@ it("reclaims a dead run's Nx daemon, helper processes and socket aliases, and no
   const abandonedAlias = dirname(abandonedDirectory);
   const keptAlias = dirname(await plantSocketAlias(kept));
   const vanishedAlias = dirname(await plantSocketAlias(vanished));
-  // When the sweep signals the dead run's processes, it has not yet touched the run's aliases.
-  const aliasAtSignal = join(suiteDirectory, 'alias-at-signal');
-  const witness = Bun.spawn(
-    [
-      'sh',
-      '-c',
-      `trap 'if [ -L "$0" ]; then echo present; else echo gone; fi > "$1"; exit 0' TERM; while :; do sleep 1; done`,
-      abandonedAlias,
-      aliasAtSignal,
-    ],
-    { cwd: abandoned },
-  );
-  let daemon: ProcessEntry[] = [];
+  // A stand-in for a helper process (watcher, client) working in the dead run's root. The sweep deletes
+  // the run but signals nothing there, so the helper survives it.
   const helper = Bun.spawn(['sleep', '600'], { cwd: abandoned });
   const bystander = Bun.spawn(['sleep', '600'], { cwd: kept });
   try {
-    // A real daemon, as a killed test leaves it, beside a stand-in for the
-    // helper processes (watchers, clients) that work in the same root.
-    daemon = await startDaemon(abandoned, abandonedDirectory);
-
     const fresh = await ownedFixtureRoot(tmpdir(), suite, 'fresh-');
 
-    expect(await stillRunning(daemon)).toEqual([]);
-    expect(await helper.exited).not.toBe(0);
-    expect(helper.signalCode).toBe('SIGTERM');
-    expect(await witness.exited).toBe(0);
-    expect(await readFile(aliasAtSignal, 'utf8')).toBe('present\n');
+    expect(helper.exitCode).toBeNull();
+    expect(helper.signalCode).toBeNull();
+    expect(isRunning(helper.pid)).toBe(true);
     expect(existsSync(deadRun)).toBe(false);
     expect(lstatSync(abandonedAlias, { throwIfNoEntry: false })).toBeUndefined();
     expect(lstatSync(vanishedAlias, { throwIfNoEntry: false })).toBeUndefined();
@@ -434,10 +418,10 @@ it("reclaims a dead run's Nx daemon, helper processes and socket aliases, and no
     expect(await realpath(keptAlias)).toBe(join(await realpath(kept), '.nx', 'sockets'));
     expect(fresh.startsWith(join(suiteDirectory, `run-${process.pid}`, 'fresh-'))).toBe(true);
   } finally {
-    for (const entry of [...daemon, { pid: helper.pid }, { pid: bystander.pid }, { pid: witness.pid }]) {
-      terminate(entry.pid);
+    for (const pid of [helper.pid, bystander.pid]) {
+      terminate(pid);
     }
-    await Promise.all([helper.exited, bystander.exited, witness.exited]);
+    await Promise.all([helper.exited, bystander.exited]);
     for (const workspace of [abandoned, kept, vanished]) {
       await retireFixtureSocketDirectory(workspace);
     }
@@ -445,7 +429,7 @@ it("reclaims a dead run's Nx daemon, helper processes and socket aliases, and no
   }
 });
 
-it('stops what works in every run it owns when the process is signalled, then dies of the signal', async () => {
+it('deletes every run it owns when the process is signalled, signals nothing it finds there, then dies of the signal', async () => {
   const suite = `signal-regression-${process.pid}`;
   const suiteDirectory = join(await realpath(tmpdir()), 'smoothbricks-fixtures', suite);
   // A second parent for the same suite: the owner holds a run in each, and one signal has to reclaim both.
@@ -453,8 +437,8 @@ it('stops what works in every run it owns when the process is signalled, then di
   const otherSuiteDirectory = join(otherParent, 'smoothbricks-fixtures', suite);
   const script = join(suiteDirectory, 'owner.ts');
   await mkdir(suiteDirectory, { recursive: true });
-  // A detached stand-in for a fixture daemon in each run: its own session, so only the
-  // owner's handler, not a process-group signal, can stop it. The interval
+  // A detached stand-in for a fixture daemon in each run: its own session, and outside every tree the
+  // owner holds, so the owner leaves it to the job's supervisor. The interval
   // keeps the owner alive until it is signalled.
   await writeFile(
     script,
@@ -497,12 +481,18 @@ setInterval(() => {}, 1 << 30);
     await owner.exited;
 
     expect(owner.signalCode, await new Response(owner.stderr).text()).toBe('SIGTERM');
-    expect(await stillRunning(helpers.map((pid) => ({ pid, ppid: 0, stat: '', command: 'sleep 600' })))).toEqual([]);
+    for (const helper of helpers) {
+      expect(isRunning(helper)).toBe(true);
+    }
     for (const run of runs) {
       expect(existsSync(run), run).toBe(false);
     }
   } finally {
     for (const helper of helpers) terminate(helper);
+    await awaitExit(
+      helpers.map((pid) => ({ pid, ppid: 0, stat: '', command: 'sleep 600' })),
+      'signal regression helpers',
+    );
     owner.kill('SIGKILL');
     await owner.exited;
     await rm(suiteDirectory, { recursive: true, force: true });

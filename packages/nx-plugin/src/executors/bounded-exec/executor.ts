@@ -3,7 +3,7 @@ import { accessSync, constants } from 'node:fs';
 import { availableParallelism, userInfo } from 'node:os';
 import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
-import { Duplex } from 'node:stream';
+import { Duplex, Readable } from 'node:stream';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 import {
   DEADLINE_PATIENCE,
@@ -12,6 +12,7 @@ import {
   processGroupHasMembers,
   signalProcessGroup,
 } from '../../process-group.js';
+import { censusDiagnostic } from '../../testing.js';
 
 import {
   CPU_POOL_ENV,
@@ -39,11 +40,22 @@ import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import type { LockWait } from './lock-wait.js';
 import { createNoSpaceWatch } from './no-space.js';
+import {
+  cowshedSubtreeOwner,
+  HANDLE_FD,
+  readAdmission,
+  SUPERVISOR_SOCKET_ENV,
+  type SubtreeAdmission,
+  type SubtreeOwner,
+} from './owned-subtree.js';
 import { createRunProgress, withProgressReport } from './progress.js';
 import {
   COWSHED_EXECUTABLE_ENV,
   createHostCommands,
+  describeCoverageGap,
   describeRamTempError,
+  describeSignalled,
+  LEFTOVER_GRACE_MS,
   RAM_TEMP_CAPACITY_BYTES,
   type RamTempLease,
   RamTempVolume,
@@ -118,6 +130,8 @@ interface RunState {
   forceKillNeeded: boolean;
   /** The sub-pool's close error when it did not close cleanly: the run fails. */
   poolCloseError: string | null;
+  /** Why the command's subtree could not be retired, when the supervisor's client failed: the run fails. */
+  retireError: string | null;
   /** The first output line that said ENOSPC, with the task's volume read when it arrived. */
   noSpace: Promise<NoSpaceSighting> | null;
   /** The lock waits the expiry's snapshot named: empty unless that capture completed. Judged with the expiry. */
@@ -131,7 +145,7 @@ export interface ProcessTreeKiller {
 }
 
 /** Where the command's TMPDIR comes from; `null` leaves the inherited one. */
-export type TempVolume = Pick<RamTempVolume, 'acquire' | 'release' | 'fullness' | 'space' | 'reap'>;
+export type TempVolume = Pick<RamTempVolume, 'acquire' | 'release' | 'fullness' | 'space' | 'record'>;
 
 /** Workspace-provided cowshed launchers, in the order a workspace that provides one names them. */
 const WORKSPACE_COWSHED_LAUNCHERS = [
@@ -213,10 +227,23 @@ export function runDefaultBoundedExec(
           createHostCommands(undefined, undefined, undefined, cowshed),
         )
       : null;
+  // The command's processes are owned by the supervisor that serves this job, when one does
+  // (specs/cowshed/07_api.md, `JobSubtreeHandle`); with none, nothing here may end what it leaves.
+  const owner = process.env[SUPERVISOR_SOCKET_ENV] === undefined ? null : cowshedSubtreeOwner(cowshed ?? 'cowshed');
   // A command a parent's CPU pool started draws its tokens from that pool. The pool is named by the environment the
   // parent set for this command; a run no parent started has none.
   const inherited = readInheritedCpuPool(process.env);
-  return runBoundedExec(run, context, createProcessTreeKiller(), tempVolume, gatewayCpuBudget(), inherited);
+  return runBoundedExec(
+    run,
+    context,
+    createProcessTreeKiller(),
+    tempVolume,
+    gatewayCpuBudget(),
+    inherited,
+    captureHangDiagnostics,
+    wallClock,
+    owner,
+  );
 }
 
 /**
@@ -301,6 +328,7 @@ export async function runBoundedExec(
   inherited: InheritedCpuPool | null = null,
   captureDiagnostics: typeof captureHangDiagnostics = captureHangDiagnostics,
   retryClock: RetryClock = wallClock,
+  owner: SubtreeOwner | null = null,
 ): Promise<BoundedExecResult> {
   const cwd = resolveCwd(options.cwd, context.root);
   const directory = context.record?.directory ?? null;
@@ -318,6 +346,7 @@ export async function runBoundedExec(
     expiry: null,
     forceKillNeeded: false,
     poolCloseError: null,
+    retireError: null,
     noSpace: null,
     lockWaits: [],
   };
@@ -364,8 +393,14 @@ export async function runBoundedExec(
   }
 
   let lease: RamTempLease | null = null;
-  if (tempVolume !== null) {
-    const acquired = await tempVolume.acquire();
+  // A lease is removed when its command ends, so it is taken only where whatever the command leaves
+  // in it can be ended by its owner first: the supervisor's subtree retirement, never a census.
+  if (tempVolume !== null && owner === null) {
+    appendStderr(
+      `RAM temp volume not leased: no cowshed supervisor owns this command's processes (${SUPERVISOR_SOCKET_ENV} is unset); TMPDIR stays ${process.env.TMPDIR ?? '(unset)'}\n`,
+    );
+  } else if (tempVolume !== null && owner !== null) {
+    const acquired = await tempVolume.acquire(owner);
     if (!acquired.ok) {
       const message = `${describeRamTempError(acquired.error)}\n`;
       process.stderr.write(message);
@@ -377,7 +412,10 @@ export async function runBoundedExec(
         appendStderr(`RAM temp volume: dead lease ${held}\n`);
       }
       for (const reaped of acquired.value.reaped) {
-        appendStderr(`RAM temp volume: stopped ${reaped}, which a dead task left working in its lease\n`);
+        appendStderr(`RAM temp volume: the supervisor stopped ${reaped}, which a dead task's command left running\n`);
+      }
+      for (const gap of acquired.value.gaps) {
+        appendStderr(`RAM temp volume: the supervisor's view of a dead task's command has a gap: ${gap}\n`);
       }
       for (const retained of acquired.value.retained) {
         appendStderr(`RAM temp volume: dead lease ${retained}\n`);
@@ -388,30 +426,63 @@ export async function runBoundedExec(
       );
     }
   }
+  // The supervisor's answer to the command's own admission, once it is spawned as an owned subtree root, and once
+  // any lease has recorded the handle for whoever settles that lease should this task die first.
+  let admission: Promise<SubtreeAdmission> | null = null;
+  const retireSubtree = async (): Promise<void> => {
+    if (admission === null || owner === null) {
+      return;
+    }
+    const answer = await admission;
+    admission = null;
+    if (answer.kind !== 'admitted') {
+      appendStderr(
+        `cowshed: the command ran without an owned subtree (${answer.kind === 'refused' ? `supervisor: ${answer.reason}` : answer.detail}); nothing retires what it left running\n`,
+      );
+      return;
+    }
+    // What the command left running is a leak, whichever way the command ended: its supervisor ends exactly the
+    // processes its tree records under the command, before any lease goes, and each is said so its owner fixes it.
+    const retired = await owner.retire(answer.handle, LEFTOVER_GRACE_MS);
+    switch (retired.kind) {
+      case 'retired':
+        for (const entry of retired.signalled) {
+          appendStderr(`cowshed: the supervisor stopped ${describeSignalled(entry)}, which the command left running\n`);
+        }
+        if (retired.signalledIncomplete) {
+          appendStderr("cowshed: the supervisor may have stopped processes of the command's that it could not name\n");
+        }
+        for (const gap of retired.gaps) {
+          appendStderr(
+            `cowshed: the supervisor's view of the command's processes has a gap: ${describeCoverageGap(gap)}\n`,
+          );
+        }
+        return;
+      case 'refused':
+        appendStderr(`cowshed: the supervisor refused to retire the command's processes (${retired.reason})\n`);
+        return;
+      case 'failed':
+        state.retireError = retired.detail;
+        appendStderr(`cowshed: could not retire the command's processes: ${retired.detail}\n`);
+        return;
+    }
+  };
   // `keep`: the run did not pass, so its scratch is archived on the volume rather than deleted (ram-temp.ts, `retain`).
   const releaseLease = async (keep: boolean): Promise<void> => {
-    if (lease === null) {
+    await retireSubtree();
+    if (lease === null || owner === null) {
       return;
     }
     const held = lease;
     lease = null;
-    // What the command left working in its lease is a leak, whichever way the command ended; it
-    // is stopped before the lease goes, so the volume can detach, and said, so its owner fixes it.
-    const reaped = await tempVolume?.reap(held);
-    if (reaped?.ok) {
-      for (const leftover of reaped.value) {
-        appendStderr(`RAM temp volume: stopped ${leftover}, which the command left working in its lease\n`);
-      }
-    } else if (reaped) {
-      appendStderr(`${describeRamTempError(reaped.error)}\n`);
-    }
-    const released = await tempVolume?.release(held, keep);
+    const released = await tempVolume?.release(held, keep || state.retireError !== null, owner);
     if (released?.ok) {
       for (const retained of released.value) {
         appendStderr(`RAM temp volume: lease ${retained}\n`);
       }
     } else if (released) {
-      appendStderr(`${describeRamTempError(released.error)}\n`);
+      const left = await censusDiagnostic(held.directory);
+      appendStderr(`${describeRamTempError(released.error)}\n${left === null ? '' : `${left}\n`}`);
     }
   };
 
@@ -584,19 +655,47 @@ export async function runBoundedExec(
   let lifecycleFailure: string | null = null;
   const isTesting = (): boolean => lifecycleFailure !== null || (lifecycle?.isTesting() ?? true);
   const startedAt = Date.now();
+  // With a supervisor, `cowshed subtree-root` asks it for a handle on itself, writes the answer to the handle
+  // descriptor, and execs `/bin/sh -c command` in the same process: the command's pid, group and life are unchanged.
+  const shellCommand = hooked?.command ?? command;
+  const root = owner?.rootArgv(shellCommand);
   let child: ChildProcess;
   try {
-    child = spawn(hooked?.command ?? command, [], {
-      cwd,
-      env: mergeEnv(lease, env),
-      shell: true,
-      stdio: hooked === null ? 'pipe' : ['pipe', 'pipe', 'pipe', 'pipe'],
-      detached: process.platform !== 'win32',
-      windowsHide: true,
-    });
+    // fd 3 is the runner lifecycle's duplex socket when the command is hooked; the subtree admission takes fd 4, which
+    // `cowshed subtree-root` closes before it execs, so fd 3 reaches the shell unchanged.
+    child =
+      root === undefined
+        ? spawn(shellCommand, [], {
+            cwd,
+            env: mergeEnv(lease, env),
+            shell: true,
+            stdio: hooked === null ? 'pipe' : ['pipe', 'pipe', 'pipe', 'pipe'],
+            detached: process.platform !== 'win32',
+            windowsHide: true,
+          })
+        : spawn(root.file, root.args, {
+            cwd,
+            env: mergeEnv(lease, env),
+            stdio: ['pipe', 'pipe', 'pipe', hooked === null ? 'ignore' : 'pipe', 'pipe'],
+            detached: process.platform !== 'win32',
+            windowsHide: true,
+          });
   } catch (error) {
     // Nothing started, so nothing runs under the grant: it goes back here, with the RAM lease.
     return refuse(`cowshed: could not start the command: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+  if (root !== undefined) {
+    const channel = child.stdio[HANDLE_FD];
+    const leased = lease;
+    admission = readAdmission(channel instanceof Readable ? channel : null).then(async (answer) => {
+      if (answer.kind === 'admitted' && leased !== null && tempVolume !== null) {
+        const recorded = await tempVolume.record(leased, answer.handle);
+        if (!recorded.ok) {
+          appendStderr(`${describeRamTempError(recorded.error)}\n`);
+        }
+      }
+      return answer;
+    });
   }
 
   // Progress is a finished test, not output: a runner's SLOW warnings and a hung test's heartbeat keep printing.
@@ -995,11 +1094,10 @@ export async function runBoundedExec(
   }
   await releaseLease(code !== 0 || state.expiry !== null || state.poolCloseError !== null || lifecycleFailure !== null);
 
-  // Broken resource ownership or a lost native lifecycle fails even if a shell branch later exited 0:
-  // its verdict is an ordinary operational failure, never a successful or silently unbounded run.
-  const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null;
+  // Broken resource ownership, a lost native lifecycle, or leftovers that could not be retired fail even if a shell
+  // branch later exited 0: its verdict is an ordinary operational failure, never a successful or silently unbounded run.
+  const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null || state.retireError !== null;
   await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen, state.lockWaits);
-
   return {
     success: !operationalFailure && state.expiry === null && code === 0,
     terminalOutput: outputChunks.join(''),

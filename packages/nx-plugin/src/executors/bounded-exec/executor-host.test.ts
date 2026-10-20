@@ -5,9 +5,13 @@ import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { standInCowshed } from '../../__tests__/stand-in-cowshed.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from '../../bounded-test-policy.js';
 import { CPU_POOL_ENV, type CpuPool, createCpuPool } from './cpu-pool.js';
 import { CPU_TOKENS_ENV } from './cpu-tokens.js';
+import { resolveCowshedExecutable } from './executor.js';
+import { SUPERVISOR_SOCKET_ENV } from './owned-subtree.js';
+import { COWSHED_EXECUTABLE_ENV } from './ram-temp.js';
 import type { BoundedExecOptions } from './schema.js';
 import { VERDICT_FILE } from './verdict.js';
 
@@ -192,11 +196,29 @@ describe('@smoothbricks/nx-plugin:bounded-exec host proofs', () => {
       // Five requests leave four contended opens beside the holder. Blocking opens consume all
       // four libuv workers, so even the holder's marker read cannot finish. The one-token pool
       // still serializes actual commands: five lease requests are not five runnable commands.
-      const run = startChild(script, childEnv({ ...pool.environment, UV_THREADPOOL_SIZE: '4' }));
+      // A lease is taken only for a command a supervisor owns, so each run's cowshed is a stand-in
+      // that admits its command and retires what it leaves, and runs every other verb on the real one.
+      const cowshed = await standInCowshed(join(root, 'stand-in'), {
+        admission: 'admitted',
+        retire: 'retire',
+        others:
+          resolveCowshedExecutable(root, undefined, process.env[COWSHED_EXECUTABLE_ENV], process.env.PATH, root) ??
+          'cowshed',
+      });
+      const run = startChild(
+        script,
+        childEnv({
+          ...pool.environment,
+          UV_THREADPOOL_SIZE: '4',
+          [COWSHED_EXECUTABLE_ENV]: cowshed,
+          [SUPERVISOR_SOCKET_ENV]: join(root, 'supervisor.sock'),
+        }),
+      );
       expect(await run.exited, run.stderr()).toBe(0);
       expect(run.stdout().match(/^lease$/gm)).toHaveLength(5);
       expect(run.stdout()).toContain('leases-complete');
       expect([...run.stderr().matchAll(/inherited=true tokens=1\/1/g)]).toHaveLength(5);
+      expect(run.stderr()).not.toContain('RAM temp volume not leased');
     });
   });
 

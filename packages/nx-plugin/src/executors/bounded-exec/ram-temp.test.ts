@@ -1,25 +1,15 @@
 import { describe, expect, it } from 'bun:test';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { once } from 'node:events';
-import {
-  closeSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { closeSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { readFile, writeFile } from 'node:fs/promises';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { churnScript, openForProbe, writerRemains } from '../../__tests__/churn-group.js';
-import { whenChanged } from '../../__tests__/path-change.js';
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS } from '../../bounded-test-policy.js';
-import { awaitExit, ownedSocketDirectory, pidsWorkingIn, processTable, terminate } from '../../testing.js';
+import { awaitExit, ownedSocketDirectory } from '../../testing.js';
 import {
   type AttachedRamDisk,
   COWSHED_EXECUTABLE_ENV,
@@ -28,9 +18,7 @@ import {
   describeRamTempError,
   detachRamDisk,
   diskCommand,
-  hostLeaseProcesses,
   imagesBackedUnder,
-  leaseProcessesOn,
   mountsBelow,
   operationDisk,
   RAM_TEMP_CAPACITY_BYTES,
@@ -153,7 +141,16 @@ describe('the root the RAM temp volume mounts below', () => {
           },
         });
         const error: RamTempError = { kind: 'root-unready', root, detail };
-        expect(await volume.acquire()).toEqual({ ok: false, error });
+        expect(
+          await volume.acquire({
+            rootArgv() {
+              throw new Error('root refusal must precede command admission');
+            },
+            async retire() {
+              throw new Error('root refusal must precede subtree retirement');
+            },
+          }),
+        ).toEqual({ ok: false, error });
         expect(describeRamTempError(error)).toBe(
           `RAM temp volume: ${root} ${detail}; run "cowshed setup", which makes it a directory of yours with mode 0700`,
         );
@@ -557,358 +554,5 @@ describe('detaching a RAM disk an inventory found', () => {
       },
     });
     expect(calls).toHaveLength(1);
-  });
-});
-
-describe('processes a task left working in its RAM lease', () => {
-  it('skips only empty or absent lease directories and reports missing census tools as inspection failures', async () => {
-    const directory = mkdtempSync(join(realpathSync(tmpdir()), 'lease-reap-errors-'));
-    let scans = 0;
-    let failure = Object.assign(new Error('spawn /usr/sbin/lsof ENOENT'), { code: 'ENOENT' });
-    const volume = new RamTempVolume(
-      ramTempPaths({ uid: 0 }),
-      1,
-      {
-        async run() {
-          throw new Error('reap must not provision a disk');
-        },
-      },
-      undefined,
-      undefined,
-      {
-        async stopWorkingIn() {
-          scans += 1;
-          throw failure;
-        },
-      },
-    );
-    const lease = { directory, mountpoint: directory, capacityBytes: 1 };
-    try {
-      expect(await volume.reap(lease)).toEqual({ ok: true, value: [] });
-      await rm(directory, { recursive: true });
-      expect(await volume.reap(lease)).toEqual({ ok: true, value: [] });
-      expect(scans).toBe(0);
-      await mkdir(directory);
-      await writeFile(join(directory, 'owned-file'), 'still requires inspection');
-      for (const code of ['ENOENT', 'EACCES']) {
-        failure = Object.assign(new Error(`spawn /usr/sbin/lsof ${code}`), { code });
-        expect(await volume.reap(lease)).toEqual({
-          ok: false,
-          error: { kind: 'provision-failed', step: 'reap', detail: failure.message },
-        });
-      }
-      expect(scans).toBe(2);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  const scratch = (): string => mkdtempSync(join(realpathSync(tmpdir()), 'lease-leftovers-'));
-
-  /**
-   * A fixture's Nx daemon, as Nx leaves it: its own session, working in the fixture, with a child of
-   * its own (a plugin worker), so the command's process-group kill never reaches it. It starts the
-   * child once a line can be read from `gate`, and prints the child's pid once it has.
-   */
-  function detachedDaemon(lease: string, gate: string) {
-    const daemon = spawn('sh', ['-c', 'read go < "$1"; sleep 600 & echo $!; wait', 'daemon', gate], {
-      cwd: lease,
-      detached: true,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    const pid = daemon.pid;
-    if (pid === undefined) {
-      throw new Error('sh did not start');
-    }
-    const childPid = once(daemon.stdout, 'data').then(([line]) => Number(String(line).trim()));
-    const exited = once(daemon, 'close');
-    return { daemon, pid, childPid, exited };
-  }
-
-  async function liveAmong(pids: readonly number[]): Promise<number[]> {
-    const live = (await processTable()).filter((entry) => !entry.stat.startsWith('Z')).map((entry) => entry.pid);
-    return pids.filter((pid) => live.includes(pid));
-  }
-
-  it('stops a detached process working in the lease and what it started, and names them', async () => {
-    const lease = scratch();
-    const gate = join(lease, 'gate');
-    execFileSync('mkfifo', [gate]);
-    const { pid, childPid, exited } = detachedDaemon(lease, gate);
-    let child = 0;
-    try {
-      await writeFile(gate, 'go\n');
-      child = await childPid;
-
-      const owned = [pid, child];
-      let cwdReads = 0;
-      let consecutiveStopped = 0;
-      const processes = leaseProcessesOn({
-        workingIn: async (directory) => {
-          if (cwdReads > 0) {
-            expect(consecutiveStopped).toBeGreaterThanOrEqual(2);
-          }
-          cwdReads += 1;
-          return pidsWorkingIn(directory);
-        },
-        signal: terminate,
-        async table() {
-          const table = await processTable();
-          const rows = table.filter((entry) => owned.includes(entry.pid));
-          const bothStopped = rows.length === owned.length && rows.every((entry) => /^[TtZ]/.test(entry.stat));
-          consecutiveStopped = bothStopped ? consecutiveStopped + 1 : 0;
-          return table;
-        },
-      });
-
-      const stopped = await processes.stopWorkingIn(lease);
-
-      expect(stopped.map((entry) => Number(entry.split(' ')[0])).sort((a, b) => a - b)).toEqual(
-        [pid, child].sort((a, b) => a - b),
-      );
-      expect(await liveAmong([pid, child])).toEqual([]);
-    } finally {
-      terminate(pid, 'SIGKILL');
-      if (child !== 0) {
-        terminate(child, 'SIGKILL');
-      }
-      await exited;
-      rmSync(lease, { recursive: true, force: true });
-    }
-  });
-
-  it('stops what a process starts after the process table was read, before it was signalled', async () => {
-    const lease = scratch();
-    const gate = join(lease, 'gate');
-    execFileSync('mkfifo', [gate]);
-    const { pid, childPid, exited } = detachedDaemon(lease, gate);
-    let child = 0;
-    // The daemon starts its child right after the table is read, so the table cannot name it.
-    let reads = 0;
-    const processes = leaseProcessesOn({
-      workingIn: pidsWorkingIn,
-      signal: terminate,
-      async table() {
-        const table = await processTable();
-        reads += 1;
-        if (reads === 1) {
-          expect(table.some((entry) => entry.ppid === pid)).toBe(false);
-          await writeFile(gate, 'go\n');
-          child = await childPid;
-        }
-        return table;
-      },
-    });
-    try {
-      const stopped = await processes.stopWorkingIn(lease);
-
-      expect(child).not.toBe(0);
-      expect(await liveAmong([pid, child])).toEqual([]);
-      expect(stopped.map((entry) => Number(entry.split(' ')[0])).sort((a, b) => a - b)).toEqual(
-        [pid, child].sort((a, b) => a - b),
-      );
-    } finally {
-      terminate(pid, 'SIGKILL');
-      if (child !== 0) {
-        terminate(child, 'SIGKILL');
-      }
-      await exited;
-      rmSync(lease, { recursive: true, force: true });
-    }
-  });
-
-  it('finds a child whose lease root exits before the process table is read', async () => {
-    const lease = scratch();
-    const gate = join(lease, 'gate');
-    execFileSync('mkfifo', [gate]);
-    const { daemon, pid, childPid, exited } = detachedDaemon(lease, gate);
-    let child = 0;
-    let reads = 0;
-    const processes = leaseProcessesOn({
-      workingIn: pidsWorkingIn,
-      signal: terminate,
-      async table() {
-        reads += 1;
-        if (reads === 1) {
-          await writeFile(gate, 'go\n');
-          child = await childPid;
-          const ended = once(daemon, 'exit');
-          terminate(pid, 'SIGKILL');
-          await ended;
-        }
-        return processTable();
-      },
-    });
-    try {
-      const stopped = await processes.stopWorkingIn(lease);
-      expect(stopped.map((entry) => Number(entry.split(' ')[0]))).toEqual([child]);
-      expect(await liveAmong([pid, child])).toEqual([]);
-    } finally {
-      terminate(pid, 'SIGKILL');
-      if (child !== 0) {
-        terminate(child, 'SIGKILL');
-      }
-      await exited;
-      rmSync(lease, { recursive: true, force: true });
-    }
-  });
-
-  it('resumes a process held during discovery when a host read fails', async () => {
-    const lease = scratch();
-    const gate = join(lease, 'gate');
-    execFileSync('mkfifo', [gate]);
-    const { pid, childPid, exited } = detachedDaemon(lease, gate);
-    let child = 0;
-    let observedStopped = false;
-    const failed = new Error('process table unavailable after SIGSTOP');
-    const processes = leaseProcessesOn({
-      workingIn: pidsWorkingIn,
-      signal: terminate,
-      async table() {
-        const table = await processTable();
-        if (table.some((entry) => entry.pid === pid && entry.stat.startsWith('T'))) {
-          observedStopped = true;
-          throw failed;
-        }
-        return table;
-      },
-    });
-    try {
-      await expect(processes.stopWorkingIn(lease)).rejects.toBe(failed);
-      expect(observedStopped).toBe(true);
-      // Reading the FIFO and starting the child requires the daemon to have resumed.
-      await writeFile(gate, 'go\n');
-      child = await childPid;
-      expect(child).toBeGreaterThan(0);
-    } finally {
-      terminate(pid, 'SIGKILL');
-      if (child !== 0) {
-        terminate(child, 'SIGKILL');
-      }
-      await exited;
-      rmSync(lease, { recursive: true, force: true });
-    }
-  });
-
-  it('attempts every resume and preserves discovery failure when the first SIGCONT fails', async () => {
-    const lease = scratch();
-    const gate = join(lease, 'gate');
-    execFileSync('mkfifo', [gate]);
-    const { pid, childPid, exited } = detachedDaemon(lease, gate);
-    let child = 0;
-    const continued: number[] = [];
-    const failedRead = new Error('process table unavailable after SIGSTOP');
-    const failedResume = new Error('SIGCONT denied');
-    const processes = leaseProcessesOn({
-      workingIn: pidsWorkingIn,
-      async table() {
-        const table = await processTable();
-        if (table.some((entry) => entry.pid === pid && entry.stat.startsWith('T'))) {
-          throw failedRead;
-        }
-        return table;
-      },
-      signal(processId, signal) {
-        if (signal === 'SIGCONT') {
-          continued.push(processId);
-          if (continued.length === 1) {
-            throw failedResume;
-          }
-        }
-        terminate(processId, signal);
-      },
-    });
-    try {
-      await writeFile(gate, 'go\n');
-      child = await childPid;
-      const cleanup = processes.stopWorkingIn(lease);
-      await expect(cleanup).rejects.toBeInstanceOf(AggregateError);
-      await expect(cleanup).rejects.toMatchObject({
-        errors: [failedRead, expect.objectContaining({ cause: failedResume })],
-      });
-      expect(continued.slice().sort((a, b) => a - b)).toEqual([pid, child].sort((a, b) => a - b));
-      await expect(cleanup).rejects.toThrow(`${continued[0]} (`);
-    } finally {
-      terminate(pid, 'SIGKILL');
-      if (child !== 0) {
-        terminate(child, 'SIGKILL');
-      }
-      await exited;
-      rmSync(lease, { recursive: true, force: true });
-    }
-  });
-
-  it('stops what writes into the lease through its TMPDIR from elsewhere, so the lease can be removed', async () => {
-    const lease = scratch();
-    const elsewhere = scratch();
-    // As a dead task's ttsc plugin build leaves it: working in its project, writing into `$TMPDIR`
-    // as fast as it can (shell builtins only, so it forks nothing), with a child of its own. macOS
-    // spells TMPDIR with a trailing slash.
-    const writer = spawn('sh', ['-c', 'sleep 600 & echo $!; i=0; while :; do i=$((i+1)); : > "$TMPDIR/w$i"; done'], {
-      cwd: elsewhere,
-      env: { ...process.env, TMPDIR: `${lease}/` },
-      detached: true,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    // Another, started on its own with a TMPDIR beneath the lease.
-    mkdirSync(join(lease, 'nested'));
-    const nested = spawn('sleep', ['600'], {
-      cwd: elsewhere,
-      env: { ...process.env, TMPDIR: join(lease, 'nested') },
-      detached: true,
-      stdio: 'ignore',
-    });
-    const exited = [once(writer, 'close'), once(nested, 'close')];
-    const pids = [writer.pid ?? 0, nested.pid ?? 0];
-    let child = 0;
-    try {
-      child = Number(String((await once(writer.stdout, 'data'))[0]).trim());
-      // Ends on the watch event that brings the lease to two entries: `nested`, and the writer's first file.
-      await whenChanged(lease, () => readdirSync(lease).length >= 2);
-      // None of them works in the lease by its working directory.
-      expect(await pidsWorkingIn(lease)).toEqual([]);
-
-      const stopped = await hostLeaseProcesses.stopWorkingIn(lease);
-
-      expect(stopped.map((entry) => Number(entry.split(' ')[0])).sort((a, b) => a - b)).toEqual(
-        [...pids, child].sort((a, b) => a - b),
-      );
-      expect(await liveAmong([...pids, child])).toEqual([]);
-      // Nothing writes there any more: the lease goes whole, with no ENOTEMPTY.
-      await rm(lease, { recursive: true });
-    } finally {
-      for (const pid of [...pids, child]) {
-        if (pid !== 0) {
-          terminate(pid, 'SIGKILL');
-        }
-      }
-      await Promise.all(exited);
-      rmSync(lease, { recursive: true, force: true });
-      rmSync(elsewhere, { recursive: true, force: true });
-    }
-  });
-
-  it('stops nothing in a lease no process works in, and nothing that works elsewhere', async () => {
-    const lease = scratch();
-    const elsewhere = scratch();
-    const bystander = spawn('sleep', ['600'], { cwd: elsewhere, detached: true, stdio: 'ignore' });
-    // A TMPDIR that only starts with the lease's name is another directory.
-    const sibling = spawn('sleep', ['600'], {
-      cwd: elsewhere,
-      env: { ...process.env, TMPDIR: `${lease}x` },
-      detached: true,
-      stdio: 'ignore',
-    });
-    try {
-      expect(await hostLeaseProcesses.stopWorkingIn(lease)).toEqual([]);
-      for (const left of [bystander, sibling]) {
-        expect(left.exitCode === null && left.signalCode === null).toBe(true);
-      }
-    } finally {
-      bystander.kill('SIGKILL');
-      sibling.kill('SIGKILL');
-      rmSync(lease, { recursive: true, force: true });
-      rmSync(elsewhere, { recursive: true, force: true });
-    }
   });
 });

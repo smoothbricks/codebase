@@ -95,12 +95,18 @@ allowlist. The shards of one suite must share one cwd and every argument but `--
 `--flag=value`, and use no shell syntax beyond quoting; a shard command that breaks this fails graph construction,
 because the files it runs could only be guessed.
 
-Real Nx fixtures own their cache and workspace-data directories and stop their daemon before removing the fixture.
-Retirement also drains processes whose working directory is inside the fixture when no daemon record exists: startup may
-not have published its record yet, so an absent record never proves the fixture is empty. Fixtures that intentionally
-strip caller directory overrides declare `cacheDirectory: ".nx/cache"` in their own `nx.json`; this keeps the native
-task database local too, rather than leaving a new `~/.nx/<repoKey>` behind. Offline, path-only Cargo fixtures likewise
-own a temporary `CARGO_HOME`; production commands still keep the caller's Cargo home.
+Real Nx fixtures own their cache and workspace-data directories and stop their daemon before removing the fixture. The
+daemon is the process its workspace record names, and its descendants in the process table; those get SIGTERM and are
+awaited. Nothing is signalled because it works in the fixture: a host census of working directories and `TMPDIR` cannot
+tell a fixture's orphan from an editor, an indexer or another job's process there, so it decides nothing
+(`specs/cowshed/11_shell.md`, "Process identity and signal ownership"). A process that left the daemon's tree (a child
+its last act started, reparented when it exited) stays in the tree the job's supervisor observes, and is retired with
+the test command's subtree when that command ends (`bounded-exec`, below). The census only names what still works in a
+fixture on stderr (`censusDiagnostic`): after a daemon stop, when a dead run is reclaimed, and when a signalled test
+process deletes its own runs. Fixtures that intentionally strip caller directory overrides declare
+`cacheDirectory: ".nx/cache"` in their own `nx.json`; this keeps the native task database local too, rather than leaving
+a new `~/.nx/<repoKey>` behind. Offline, path-only Cargo fixtures likewise own a temporary `CARGO_HOME`; production
+commands still keep the caller's Cargo home.
 
 Fixture sockets and loopback listeners live where a Cowshed sandbox admits them, never at a literal `/tmp` path or on
 port 0. A fixture's short socket parent alias lives beside the Nx socket directory the job supplies (the parent of
@@ -120,9 +126,9 @@ in use, and port 0 outside a block. A client that must be refused gets `claimRef
 service port the test holds, which nothing binds (`specs/cowshed/08_testing.md`), never a port bound and closed, which
 the next allocator in the block binds.
 
-On macOS the working-directory holder census invokes `/usr/sbin/lsof` explicitly, independent of a test or devenv
-`PATH`. A missing or inaccessible census tool fails cleanup with its command error; it never means no holders. Only
-lsof's exit-1 process-disappearance race retains the partial inventory it produced.
+On macOS the working-directory census invokes `/usr/sbin/lsof` explicitly, independent of a test or devenv `PATH`. A
+census that cannot be read says so in its diagnostic instead of naming no process; it never fails cleanup, since it
+decides nothing. Only lsof's exit-1 process-disappearance race retains the partial inventory it produced.
 
 The provider-real-Nx snapshot walk uses asynchronous children so its case timer can run while a producer or capture is
 active. Its 60 s case guard covers one provider, daemon lifecycle and all provenance/refusal checks; it does not split
@@ -1522,22 +1528,15 @@ from its cause. A Bun other than the declared one passes startup, and on Bun 1.4
 refuses, so a child's JSON document reaches the parent that reads it cut mid-string while the child exits 0: the leg
 fails three layers from the cause as `JSON Parse error: Unterminated string`. The check is not made on Windows.
 
-On a macOS host, every `bounded-exec` task runs with its own `TMPDIR` lease: a directory on one RAM-backed APFS volume
-per user, so test temp files never reach the SSD. The volume is created lazily by the first task that needs it and
-detached when the last live lease ends, since its pages return only on detach. It is a legacy DiskImages RAM disk, so it
-spends none of the AppleDiskImages2 attach budget cowshed counts (`specs/cowshed/01a_apfs.md`, "How the APFS host
-degrades"). A lease whose task died is reclaimed by the next task, unless an image is still attached from a file below
-it or a mount sits below it: those belong to whoever attached them, so the lease and the volume are kept and every new
-task names them. The task's pid dying does not end what its command started, so before a lease is removed every process
-working in it is stopped, with everything it started: a process counts when its working directory or the `TMPDIR` it was
-started with lies in the lease. Most leftovers write there only through `TMPDIR` (a ttsc plugin build copying its Go
-sources, a Bun or Node compile cache written at exit), and a working-directory census alone let them write into a lease
-while it was removed, failing the next task's lease with `ENOTEMPTY`. A target's own `env.TMPDIR` wins over the lease.
-Inside a cowshed sandbox, which cannot write the lock in `/private/tmp`, the task keeps its inherited `TMPDIR` and says
-so once.
+On a macOS host, a `bounded-exec` task whose processes a cowshed supervisor owns runs with its own `TMPDIR` lease: a
+directory on one RAM-backed APFS volume per user, so test temp files never reach the SSD. The volume is created lazily
+by the first task that needs it and detached when the last live lease ends, since its pages return only on detach. It is
+a legacy DiskImages RAM disk, so it spends none of the AppleDiskImages2 attach budget cowshed counts
+(`specs/cowshed/01a_apfs.md`, "How the APFS host degrades"). A target's own `env.TMPDIR` wins over the lease. Inside a
+cowshed sandbox, which cannot write the lock in `/private/tmp`, the task keeps its inherited `TMPDIR` and says so once.
 
-The lease is the default for every `bounded-exec` target, every test target included, so a test's scratch lives on the
-RAM volume unless its target names `env.TMPDIR`. Reclamation never deletes the scratch of a run that did not pass: a
+The lease is the default for every owned `bounded-exec` target, every test target included, so a test's scratch lives on
+the RAM volume unless its target names `env.TMPDIR`. Reclamation never deletes the scratch of a run that did not pass: a
 lease whose task died, or whose own run failed, timed out or was signalled, is renamed whole into
 `/private/var/folders/cowshed/<uid>/ram3/.archive/<archived at, epoch ms>-<lease>`, on the same volume, so the move is
 one `rename(2)` and copies nothing (the build-volume trash does the same, `specs/cowshed/16_build_volumes.md`, "Garbage
@@ -1558,9 +1557,45 @@ and lease, and the volume's free space read when that line arrived, and records 
 usually removes what it half-wrote before it exits, so the volume no longer looks full by then. A failed task that
 printed no such line but left the volume nearly full names the volume.
 
+What a command leaves running is ended by its owner, never chosen by where it works (`specs/cowshed/11_shell.md`,
+"Process identity and signal ownership"; `specs/cowshed/07_api.md`, `JobSubtreeHandle`). When the job's supervisor
+serves `COWSHED_SUPERVISOR_SOCKET`, the command runs as `cowshed subtree-root --handle-fd 4 -- /bin/sh -c <command>`:
+the wrapper asks the supervisor for a handle on itself while it is alive, writes the answer to descriptor 4, and execs
+the shell in the same process, so the command's pid, process group and life are unchanged; descriptor 3, the runner
+lifecycle's socket, reaches the shell as it would without the wrapper. When the command ends, however it ended, the
+executor pipes the handle to `cowshed retire-descendants --grace-ms 5000`: the supervisor sends TERM to every live
+member its observed tree records under that root (a fixture's Nx daemon in a session of its own and a ttsc build writing
+through `TMPDIR` included), KILL after the grace, and joins their exits. Each is named on stderr
+(`cowshed: the supervisor stopped <pid> (<image>), which the command left running`), as are the supervisor's coverage
+gaps (`… has a gap: <kind> (pid <pid>)`) and a receipt that may have ended processes it could not name: the line is the
+leak check, and a suite that prints it has a fixture to fix. A process that only works in the command's directory or
+lease, and that the command did not start, is in no such tree and is never signalled. A typed refusal of the admission
+(`foldUnavailable`, `notMember`, `foreignHandle`, `jobEnded`, `spentHandle`) still runs the command, unowned, and says
+nothing will retire what it leaves; a client that cannot reach the supervisor at retirement fails the run, naming why,
+and its lease is archived. Only then does the lease go. Without a supervisor socket nothing could end what the command
+leaves in a lease before it is reclaimed, so no lease is taken and the run says so
+(`RAM temp volume not leased: no cowshed supervisor owns this command's processes`). The host census of working
+directories and `TMPDIR` survives only as a diagnostic: when a lease cannot be released, it names what still works there
+and signals nothing.
+
+A task records its handle beside its lease (`<lease>.subtree`, on the volume, outside the command's reach) once the
+supervisor admits the command. A lease whose task died is reclaimed by the next task: it hands the recorded handle back
+to its own supervisor first and archives the lease once that retirement is joined. An ended job's supervisor retired the
+whole job as it ended (`jobEnded`), and a spent handle was already retired: either way the lease is reclaimed. A handle
+of a job that is still another task's (`foreignHandle`, `notMember`, `foldUnavailable`) keeps the lease, named on every
+new task's stderr, until that job ends. A lease with no readable handle recorded none: its task died before its command
+was admitted, or the admission was refused. An image still attached from a file below a dead lease, or a mount below it,
+belongs to whoever attached it, so the lease and the volume are kept and every new task names them.
+
 Outside macOS, the executor never provisions an APFS RAM disk: it keeps the inherited `TMPDIR`, or uses the target's
-`env.TMPDIR` override, without reclaiming either directory. The host temp-directory proof runs the real default executor
-for that contract on Linux; on macOS it exercises RAM-volume recovery, shared leases and final detach.
+`env.TMPDIR` override, without reclaiming either directory; a supervisor that serves the socket still owns and retires
+the command's subtree. On Linux the supervisor admits a subtree only with an observed fold, and refuses with
+`foldUnavailable` otherwise. In CI the same rule decides: a job that runs `nx` outside a cowshed job (`ubuntu-latest`
+for a fork's pull request, a GitHub macOS runner) has no `COWSHED_SUPERVISOR_SOCKET`, so its commands run directly,
+nothing retires what they leave beyond the runner's own job teardown, and on macOS no RAM lease is taken, which every
+run says. The self-hosted NixOS runner gets ownership exactly when its `nx` runs inside a cowshed job whose supervisor
+serves the socket. The host temp-directory proof runs the real default executor for that contract on Linux; on macOS it
+exercises RAM-volume recovery, shared leases and final detach.
 
 The volume's kernel `O_EXLOCK` admits ledger mutations and releases on process death. It is held only for cheap lease
 and operation claims and their publication: host-wide process and disk-inventory probes, directory cleanup, provisioning
@@ -1585,28 +1620,30 @@ Each reclaim pass reads at most one I/O Registry and mount-table snapshot, not o
 mounted filesystems keeps a positive verdict with stable mount and lease identities. A valid positive still names and
 retains it without another host-wide probe; an unmount exposes the underlying RAM device and triggers a fresh probe.
 Image-backed and otherwise unkeyable holds stay uncached: device-node reuse has no proven cheap incarnation key. Every
-pass that claims such a lease probes it again, with a process census and the pass's inventory, which take seconds on a
-busy host; that latency falls on the claiming task, outside the lock. A negative verdict is never cached, probe errors
-never stand in for an empty holder set, and held directories stay unchanged.
+pass that claims such a lease probes it again, with the pass's inventory, which takes seconds on a busy host; that
+latency falls on the claiming task, outside the lock. A negative verdict is never cached, probe errors never stand in
+for an empty holder set, and held directories stay unchanged.
 
 Contended lock opens also use `O_NONBLOCK` and yield for 50 ms, avoiding a separate latent filesystem-worker deadlock
 when one Node process makes five concurrent requests with four workers. The observed gate failures instead came from
 cross-process waits behind long host-wide probes under the RAM lock. Real nested and sibling default-executor proofs run
 with background single-lease processes to cover that shape. No case or target timeout is raised.
 
-Once the process and holder checks permit removal, a lease to delete, and an archive being deleted, has owner
+Once the retirement and holder checks permit removal, a lease to delete, and an archive being deleted, has owner
 read/write/search permission restored on its directories through no-follow directory handles first. Read-only fixture
 directories cannot strand a dead lease and block later tasks. File modes and symlink targets stay untouched; a directory
 on another device refuses cleanup instead of changing an attached volume. Held leases undergo no permission changes.
 
 The real RAM-volume regression walks one volume's lifecycle in a single test: unmarked debris and a live-lease refusal,
 recovery over the debris, concurrent leases, failed-acquire lease/claim rollback, read-only cleanup, a held dead lease,
-owner detach and reclaim of that lease while a writer the dead task left still writes into it through `TMPDIR` (stopped,
-then archived whole, readonly tree and modes included) beside a dead lease nothing works in, a third dead lease whose
-archive rotates the oldest out and is deleted in the background, a failed run's own lease archived below the half-volume
-floor and so deleted with every other archive, and the final detach. External symlink targets and held directory modes
-stay unchanged, without duplicate provision and teardown; its 60 s case bound is unchanged and its target has the
-progress bound.
+owner detach and reclaim of that lease while a writer the dead task left still writes into it through `TMPDIR` (retired
+through its recorded handle, then archived whole, readonly tree and modes included) and a bystander works in it (named
+by the census, never signalled), beside a dead lease that recorded no handle and one whose handle another live job holds
+(kept, then reclaimed once that job ends), a later dead lease whose archive rotates the oldest out and is deleted in the
+background, a failed run's own lease archived below the half-volume floor and so deleted with every other archive, and
+the final detach. Its supervisor is a stand-in speaking the subtree verbs' wire shapes, whose tree is the root's process
+group (`src/__tests__/stand-in-cowshed.ts`). External symlink targets and held directory modes stay unchanged, without
+duplicate provision and teardown; its 60 s case bound is unchanged and its target has the progress bound.
 
 The host target names both owned files with `./` paths: Bun otherwise interprets a bare path as a filter over recursive
 test discovery. This changes no selected case or timeout. The failed-provisioning regression keeps its exact injected
@@ -1619,29 +1656,9 @@ A refused rollback also records the kernel mount and read-only filesystem/device
 Each observation has a one-second wait bound and retains its status and stderr; an incomplete probe is not an empty
 holder set. These observations do not prove which holder caused `EBUSY`, and change no case or target bound.
 
-The native lifecycle walk also observes its real working-directory census through the existing process-host seam,
-retaining start/end times and the original error's exit code, signal and killed flag before rethrowing it unchanged.
-This locates whether a census was outstanding at a case timeout without substituting a fake process inventory. Its real
-host-command delegate records the same timestamps from case entry, retaining the actual argv, requested deadline and
-result without changing them; this covers the work before the first process census. Observation before delegation is
-timed separately from the delegate's wait, so logging cost is never presented as child execution time.
-
-Whatever still works in a lease when its task ends is a leak, and is stopped before the lease goes. The usual one is a
-fixture's Nx daemon: Nx detaches it into a session of its own, so the process-group kill that ends a timed-out command
-never reaches it, and a test process that is killed runs no teardown. Deleting its root asks the daemon to leave only by
-deleting its record, which an idle daemon notices within a second and a wedged one never does, and a process left on the
-volume keeps it from detaching. So the task's own release, and the next task's reclaim of a dead lease, first hold
-discovered processes with SIGSTOP and rescan their descendants and lease working directories until a stopped census is
-stable. A process can fork after a table read but before its signal; only a table read after it is stopped closes that
-gap. Discovery failures attempt to resume every held process; one denied SIGCONT cannot strand the rest. Errors retain
-the original discovery failure and name any denied continuation with its PID and command. The settled census gets
-SIGTERM then SIGCONT, SIGKILL if anything has not exited five seconds later, and names each PID once on stderr
-(`stopped <pid> (<command>), which the command left working in its lease`). A lease with nothing in it costs no scan.
-Discovery follows stopped-census readiness under the enclosing operation's existing bound; the five-second exit grace
-does not include discovery or fixture readiness. The lease's working directories are read again only after the same
-census is stopped in consecutive process tables, including an empty one, which recovers children reparented out of the
-tree. This avoids host-wide cwd scans while stopped-table quiescence is still being established. The line is the leak
-check: a suite that prints it has a fixture to fix.
+The native lifecycle walk's real host-command delegate records start/end timestamps from case entry, retaining the
+actual argv, requested deadline and result without changing them. Observation before delegation is timed separately from
+the delegate's wait, so logging cost is never presented as child execution time.
 
 The volume mounts at `/private/var/folders/cowshed/<uid>/ram3`. The parent is the per-user root `cowshed setup` makes,
 `/private/var/folders/cowshed/<uid>`, a 0700 directory of the user's; the leaf carries the protocol's revision, so two
