@@ -1,0 +1,1 @@
+Fixture caveat: a shed shell sets TMPDIR under /private/cowshed. Core detection then grants this bash probe's fixture-home candidate paths there, and a test supervisor refuses to start with "intersects protected path". Run these fixtures with a TMPDIR outside the store (the host-controller lane's private TMPDIR is fine); the refusal is the fixture's environment, not this unit.
