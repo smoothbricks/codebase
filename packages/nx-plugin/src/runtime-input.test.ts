@@ -2,14 +2,27 @@ import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fixtureNxEnv, withNxFixture } from './__tests__/fixture-nx-env.js';
 import { RUNTIME_INPUT_SCRIPT, runtimeInput, shellWord } from './runtime-input.js';
 import {
   commandPrograms,
+  hostProgramReason,
   hostPrograms,
   RUNTIME_INPUT_FAILURES,
   runtimeInputFailureReports,
@@ -214,8 +227,24 @@ describe('runtime inputs of this repository', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('name only programs the workspace declares', async () => {
-    const search = { path: process.env.PATH ?? '', root: repoRoot, home: homedir() };
+  it('name only programs the workspace declares, on the PATH it declares', async () => {
+    // Nx hands a runtime input its own process environment unchanged (nx task-env.js getTaskSpecificEnv), and this
+    // repository composes that PATH with tooling/direnv/repo-path, in its devenv shell and on CI (`--github-path`): the
+    // devenv profile and the checkout's own directories, no /usr/bin or /bin. Judged on that PATH alone, an input that
+    // needs a program the host's directories supply fails here on every OS, as it fails on the NixOS runner.
+    const composed = spawnSync('bash', [join(repoRoot, 'tooling', 'direnv', 'repo-path'), '--print'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+    });
+    expect(composed.status, composed.stderr).toBe(0);
+    const path = composed.stdout.trim().split('\n').join(delimiter);
+    const venv = process.env.VIRTUAL_ENV === undefined ? undefined : join(process.env.VIRTUAL_ENV, 'bin');
+    expect(
+      path
+        .split(delimiter)
+        .filter((entry) => !entry.startsWith('/nix/') && !entry.startsWith(`${repoRoot}/`) && entry !== venv),
+    ).toEqual([]);
+    const search = { path, root: repoRoot, home: homedir() };
     const offenders: string[] = [];
     const declared = (file: string, value: unknown): void => {
       if (Array.isArray(value)) {
@@ -223,9 +252,7 @@ describe('runtime inputs of this repository', () => {
       } else if (value !== null && typeof value === 'object') {
         for (const [key, item] of Object.entries(value)) {
           if (key !== 'runtime' || typeof item !== 'string') declared(file, item);
-          else
-            for (const host of hostPrograms(item, search))
-              offenders.push(`${file}: ${host.program} (${host.found ?? 'not on PATH'})`);
+          else for (const host of hostPrograms(item, search)) offenders.push(`${file}: ${hostProgramReason(host)}`);
         }
       }
     };
@@ -264,25 +291,46 @@ describe('runtime input programs', () => {
     expect(commandPrograms("sh tooling/identity.sh rustc 'sh -c awk'")).toEqual(['sh']);
   });
 
-  it('that the host supplies, or nothing supplies, are refused by name', async () => {
+  it('that the host supplies, nothing supplies, or only a workspace build supplies, are refused by name', async () => {
     const scratch = await mkdtemp(join(tmpdir(), 'runtime-input-programs-'));
     try {
       const host = join(scratch, 'usr-bin');
       const root = join(scratch, 'checkout');
+      const bin = join(root, 'node_modules', '.bin');
       await mkdir(host, { recursive: true });
-      await mkdir(join(root, 'node_modules', '.bin'), { recursive: true });
-      for (const file of [join(host, 'shasum'), join(root, 'node_modules', '.bin', 'tool')]) {
+      await mkdir(bin, { recursive: true });
+      await mkdir(join(root, 'packages', 'tool', 'dist'), { recursive: true });
+      await mkdir(join(root, 'node_modules', '.bun', 'ext', 'bin'), { recursive: true });
+      for (const file of [
+        join(host, 'shasum'),
+        join(bin, 'tool'),
+        join(root, 'packages', 'tool', 'dist', 'built.js'),
+        join(root, 'node_modules', '.bun', 'ext', 'bin', 'ext.js'),
+      ]) {
         await writeFile(file, '#!/bin/sh\n');
         await chmod(file, 0o755);
       }
+      // A workspace package's bin links into its build output; an installed package's into node_modules.
+      await symlink('../../packages/tool/dist/built.js', join(bin, 'built'));
+      await symlink('../.bun/ext/bin/ext.js', join(bin, 'ext'));
       // A file that is not executable provides nothing.
       await writeFile(join(host, 'absent'), '');
-      const search = { path: `${host}:${join(root, 'node_modules', '.bin')}`, root, home: join(scratch, 'home') };
-      const command = 'shasum -a 256 f && tool && tooling/x.sh && /nix/store/0-a/bin/a && absent; /usr/bin/env true';
-      expect(hostPrograms(`${command}; /usr/bin/shasum`, search)).toEqual([
-        { program: 'shasum', found: join(host, 'shasum') },
-        { program: 'absent', found: undefined },
-        { program: '/usr/bin/shasum', found: '/usr/bin/shasum' },
+      const search = { path: `${host}:${bin}`, root, home: join(scratch, 'home') };
+      const command = 'shasum -a 256 f && tool && ext && tooling/x.sh && /nix/store/0-a/bin/a && absent; built';
+      const refused = hostPrograms(`${command}; /usr/bin/env true; /usr/bin/shasum`, search);
+      const built = await realpath(join(root, 'packages', 'tool', 'dist', 'built.js'));
+      expect(refused).toEqual([
+        { program: 'shasum', refusal: 'host', found: join(host, 'shasum') },
+        { program: 'absent', refusal: 'absent' },
+        { program: 'built', refusal: 'workspace-bin', found: join(bin, 'built'), target: built },
+        { program: '/usr/bin/shasum', refusal: 'host', found: '/usr/bin/shasum' },
+      ]);
+      expect(refused.map(hostProgramReason)).toEqual([
+        `PATH finds shasum at ${join(host, 'shasum')}, a host program no devenv profile declares`,
+        'nothing on PATH provides absent',
+        `PATH finds built at ${join(bin, 'built')}, a link to this checkout's build output ${built}, which an ` +
+          'install that runs before the build does not create; run that file with node or bun instead',
+        'PATH finds /usr/bin/shasum at /usr/bin/shasum, a host program no devenv profile declares',
       ]);
     } finally {
       await rm(scratch, { recursive: true, force: true });

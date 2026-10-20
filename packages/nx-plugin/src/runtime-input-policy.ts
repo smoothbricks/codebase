@@ -1,5 +1,5 @@
-import { accessSync, constants, readdirSync, readFileSync, statSync } from 'node:fs';
-import { delimiter, isAbsolute, join, relative, resolve } from 'node:path';
+import { accessSync, constants, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { RUNTIME_INPUT_SCRIPT } from './runtime-input.js';
 
 /**
@@ -265,12 +265,18 @@ export interface ProgramSearch {
   readonly home: string;
 }
 
-/** A program a runtime input runs that the workspace does not declare. */
-export interface HostProgram {
-  readonly program: string;
-  /** The host file PATH finds first, outside /nix, the checkout, the home and /bin/sh or /usr/bin/env; absent when nothing on PATH provides it. */
-  readonly found: string | undefined;
-}
+/** A program a runtime input runs that the workspace does not declare, and why it is refused. */
+export type HostProgram =
+  /** PATH finds it outside /nix, the checkout, the home and /bin/sh or /usr/bin/env. */
+  | { readonly program: string; readonly refusal: 'host'; readonly found: string }
+  /** Nothing on PATH provides it. */
+  | { readonly program: string; readonly refusal: 'absent' }
+  /**
+   * PATH finds it in the checkout's `node_modules/.bin` as a link to a build output of a package in this checkout. Bun
+   * links a workspace package's bin only when its target exists at install time, and a fresh checkout installs before
+   * it builds, so the name is absent there while every checkout that built first has it.
+   */
+  | { readonly program: string; readonly refusal: 'workspace-bin'; readonly found: string; readonly target: string };
 
 function within(directory: string, file: string): boolean {
   const path = relative(directory, file);
@@ -305,8 +311,22 @@ function onPath(program: string, path: string): string | undefined {
  */
 const GUARANTEED_HOST_PROGRAMS: ReadonlySet<string> = new Set(['/bin/sh', '/usr/bin/env']);
 /**
+ * The build output of a package in this checkout that `found`, a link in the checkout's `node_modules/.bin`, names;
+ * undefined for any other file, an installed package's bin included.
+ */
+function workspaceBuildOutput(found: string, root: string): string | undefined {
+  if (!within(join(root, 'node_modules', '.bin'), found)) return undefined;
+  const physicalRoot = realpathSync(root);
+  const target = realpathSync(found);
+  return within(physicalRoot, target) && !relative(physicalRoot, target).split(sep).includes('node_modules')
+    ? target
+    : undefined;
+}
+
+/**
  * Every program `command` runs that the workspace does not declare: one PATH finds outside the Nix store, the
- * checkout, the home and the guaranteed host paths, or one nothing on PATH provides. A relative path names a file in the checkout.
+ * checkout, the home and the guaranteed host paths, one nothing on PATH provides, or one only a workspace package's
+ * build output provides. A relative path names a file in the checkout.
  */
 export function hostPrograms(command: string, search: ProgramSearch): HostProgram[] {
   const declared = (file: string): boolean =>
@@ -315,9 +335,31 @@ export function hostPrograms(command: string, search: ProgramSearch): HostProgra
     within(search.root, file) ||
     within(search.home, file);
   return [...new Set(commandPrograms(command))].flatMap((program): HostProgram[] => {
-    const found = program.includes('/') ? resolve(search.root, program) : onPath(program, search.path);
-    return found !== undefined && declared(found) ? [] : [{ program, found }];
+    if (program.includes('/')) {
+      const found = resolve(search.root, program);
+      return declared(found) ? [] : [{ program, refusal: 'host', found }];
+    }
+    const found = onPath(program, search.path);
+    if (found === undefined) return [{ program, refusal: 'absent' }];
+    if (!declared(found)) return [{ program, refusal: 'host', found }];
+    const target = workspaceBuildOutput(found, search.root);
+    return target === undefined ? [] : [{ program, refusal: 'workspace-bin', found, target }];
   });
+}
+
+/** Why `host` is refused, naming where PATH found it and what to run instead. */
+export function hostProgramReason(host: HostProgram): string {
+  switch (host.refusal) {
+    case 'host':
+      return `PATH finds ${host.program} at ${host.found}, a host program no devenv profile declares`;
+    case 'absent':
+      return `nothing on PATH provides ${host.program}`;
+    case 'workspace-bin':
+      return (
+        `PATH finds ${host.program} at ${host.found}, a link to this checkout's build output ${host.target}, ` +
+        'which an install that runs before the build does not create; run that file with node or bun instead'
+      );
+  }
 }
 
 /** The directory under the workspace root where runtime-input.sh retains each failed input. */

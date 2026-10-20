@@ -341,9 +341,17 @@ the same in all three. A program the host's operating system ships is not: `shas
 provide `sha256sum` where a pipeline needs one. The only host paths admitted are `/bin/sh` and `/usr/bin/env`, which
 NixOS keeps too. `@smoothbricks/nx-plugin/runtime-input-policy` exports `hostPrograms(command, { path, root, home })`:
 each program the command runs (through the wrapper, `env`, `exec`, `command`, `sh -c` and command substitutions; a
-script file it runs is that script's own concern) that PATH finds outside `/nix`, the checkout and the home, or that
-nothing on PATH provides. `runtime-input.test.ts` refuses one in this repository's declared inputs; a consumer judges
-its own declarations with the same export.
+script file it runs is that script's own concern) that PATH finds outside `/nix`, the checkout and the home, that
+nothing on PATH provides, or that only a link in the checkout's `node_modules/.bin` to a build output of one of its own
+packages provides. Bun links a workspace package's bin only when its target exists at install time, and a fresh checkout
+installs before it builds, so such a name is absent on a fresh runner and present in every checkout that built first;
+run the file instead (`node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-cargo-hash.js`, as the plugin's own
+Cargo input does). A consumer's installed package ships its build, so its bins are not refused. Each refusal is a tagged
+`HostProgram`, and `hostProgramReason` says it. `runtime-input.test.ts` judges this repository's declared inputs on
+`tooling/direnv/repo-path --print`, the PATH entries the devenv shell and CI give Nx (which hands a runtime input its
+own environment): the devenv profile and the checkout's directories, with no `/usr/bin` or `/bin`, so a program only the
+host provides fails on macOS as it does on the NixOS runner. A consumer judges its own declarations with the same
+export.
 
 An input that runs inside a cowshed workspace's sandboxed daemon gets the client's environment, a host shell's `HOME`
 included, but not the client's filesystem view (cowshed `04_sandbox.md`). An input that reads the operator's home fails

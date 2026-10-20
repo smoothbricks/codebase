@@ -19,7 +19,7 @@
     ],
     "externalRustCrates": [
       {
-        "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh smoo-nx-cargo-hash"
+        "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh node node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-cargo-hash.js"
       }
     ],
     "rustWorkspace": [
