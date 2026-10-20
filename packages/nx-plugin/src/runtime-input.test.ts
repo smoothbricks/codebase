@@ -146,6 +146,24 @@ describe('a planted runtime input failure through real Nx', () => {
       });
     });
   }
+
+  it('is an error on a cold cache too, before anything has run', async () => {
+    // The two cases above warm the fixture's cache and daemon with a good run
+    // first. A fresh shed meets the failure cold: no cache, no daemon, and the
+    // refusal must still stop the run before the task executes.
+    await withNxFixture('runtime-input-cold-', async ({ workspace, socketDirectory }) => {
+      await writeProbeWorkspace(workspace);
+      const env = { ...fixtureNxEnv(workspace, socketDirectory), NX_DAEMON: 'false' };
+
+      const planted = nx(workspace, env, 'probe:planted');
+      expect(planted.status, planted.output).toBe(1);
+      expect(planted.output).toContain('invalid utf-8 sequence');
+      expect(existsSync(join(workspace, 'planted.ran'))).toBe(false);
+      const record = await failureRecord(workspace);
+      expect(await readFile(join(record, 'exit-status'), 'utf8')).toBe('3\n');
+      expect(await readFile(join(record, 'report'), 'utf8')).toContain('runtime input exited 3: sh -c');
+    });
+  });
 });
 
 describe('runtime inputs of this repository', () => {
