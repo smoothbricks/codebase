@@ -266,11 +266,11 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64"
+          "command": "napi build --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-build-inputs.js --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/debug/cowshed.d --output dist/bin/darwin-arm64"
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64"
+            "command": "napi build --release --bin cowshed --target aarch64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-arm64 && node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-build-inputs.js --manifest-path crates/cowshed-cli/Cargo.toml --dep-info aarch64-apple-darwin/release/cowshed.d --output dist/bin/darwin-arm64"
           }
         }
       },
@@ -297,11 +297,11 @@
         ],
         "options": {
           "cwd": "packages/cowshed",
-          "command": "napi build --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64"
+          "command": "napi build --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-build-inputs.js --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/debug/cowshed.d --output dist/bin/darwin-x64"
         },
         "configurations": {
           "production": {
-            "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64"
+            "command": "napi build --release --bin cowshed --target x86_64-apple-darwin --manifest-path crates/cowshed-cli/Cargo.toml --package cowshed-cli --output-dir dist/bin/darwin-x64 && node ../../node_modules/@smoothbricks/nx-plugin/dist/bin/smoo-nx-build-inputs.js --manifest-path crates/cowshed-cli/Cargo.toml --dep-info x86_64-apple-darwin/release/cowshed.d --output dist/bin/darwin-x64"
           }
         }
       },

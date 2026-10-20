@@ -1,11 +1,21 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { realpathSync } from 'node:fs';
 import { chmod, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { readJsonFile } from 'nx/src/devkit-exports.js';
 
+import {
+  type BuildInputRecord,
+  buildInputRecord,
+  gitWorkspaceRoot,
+  globPathspec,
+  pathspecFiles,
+  workspacePath,
+  writeBuildInputs,
+} from '../../build-inputs.js';
 import type { TypeScriptEmitOptions } from './schema.js';
 
 interface TypeScriptEmitContext {
@@ -18,6 +28,9 @@ interface TypeScriptEmitResult {
 
 interface TsConfigJson {
   references?: unknown;
+  include?: unknown;
+  exclude?: unknown;
+  compilerOptions?: { outDir?: unknown };
 }
 
 export interface CompilerInvocation {
@@ -56,6 +69,8 @@ export async function runTypeScriptEmit(
     ...(Array.isArray(tsConfig.references) ? { references: tsConfig.references } : {}),
   };
 
+  // Taken before the emit, so a source edited while it runs is recorded with its earlier bytes and reads as changed.
+  const inputs = typeScriptInputs(tsConfigPath, tsConfig);
   await writeFile(overlayPath, `${JSON.stringify(overlay, null, 2)}\n`, { flag: 'wx' });
   try {
     const javascriptSucceeded = await runner({
@@ -68,11 +83,57 @@ export async function runTypeScriptEmit(
     }
 
     await makePackageBinsExecutable(cwd, options.executableOutputs ?? []);
+    if (inputs !== null) writeBuildInputs(inputs.outputDirectory, inputs.record);
 
     return { success: true };
   } finally {
     await rm(overlayPath, { force: true });
   }
+}
+
+const TYPESCRIPT_SOURCES = ['ts', 'tsx', 'mts', 'cts'];
+
+/**
+ * The emit's input record (build-inputs.ts) for its outDir, which is the target's Nx output: the tracked and untracked
+ * files the config's `include` matches less its `exclude`, and the config. `complete` carries the same pathspecs, so a
+ * source added since this emit is an input the consumer finds missing from the record. A config without a literal
+ * outDir or include gets none, and its consumers judge it by modification time.
+ */
+function typeScriptInputs(
+  tsConfigPath: string,
+  tsConfig: TsConfigJson,
+): { readonly outputDirectory: string; readonly record: BuildInputRecord } | null {
+  const outDir = tsConfig.compilerOptions?.outDir;
+  const strings = (value: unknown) =>
+    Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+  const include = strings(tsConfig.include);
+  if (typeof outDir !== 'string' || include.length === 0) return null;
+  const configDirectory = realpathSync(dirname(tsConfigPath));
+  const workspaceRoot = gitWorkspaceRoot(configDirectory);
+  if (workspaceRoot === null) return null;
+  const prefix = workspacePath(workspaceRoot, configDirectory);
+  // tsconfig names a directory to mean the TypeScript sources under it.
+  const globs = (entry: string) =>
+    /[*?[]/.test(entry) || /\.[a-z]+$/.test(entry)
+      ? [entry]
+      : TYPESCRIPT_SOURCES.map((extension) => `${entry.replace(/\/$/, '')}/**/*.${extension}`);
+  const spec = (entry: string, exclude: boolean) =>
+    globs(entry).map((glob) => globPathspec(prefix === '.' ? glob : `${prefix}/${glob}`, exclude));
+  const complete = [
+    ...include.flatMap((entry) => spec(entry, false)),
+    ...strings(tsConfig.exclude).flatMap((entry) => spec(entry, true)),
+  ];
+  return {
+    outputDirectory: resolve(configDirectory, outDir),
+    record: buildInputRecord(
+      workspaceRoot,
+      [
+        ...pathspecFiles(workspaceRoot, complete),
+        workspacePath(workspaceRoot, join(configDirectory, basename(tsConfigPath))),
+      ],
+      complete,
+    ),
+  };
 }
 
 async function makePackageBinsExecutable(cwd: string, outputs: readonly string[]): Promise<void> {

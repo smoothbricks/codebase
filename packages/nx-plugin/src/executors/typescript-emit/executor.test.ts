@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import typescriptEmitExecutor from './executor.js';
+import type { BuildInputRecord } from '../../build-inputs.js';
+import typescriptEmitExecutor, { runTypeScriptEmit } from './executor.js';
 
 async function fixture(source: string) {
   const root = await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-'));
@@ -79,5 +82,101 @@ describe('@smoothbricks/nx-plugin TypeScript emit executor', () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+const GIT_IDENTITY = ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test'];
+
+/** A workspace's `packages/lib`: a config that emits its `src` less the tests, a source and a test. */
+const LIB = {
+  'packages/lib/tsconfig.lib.json': JSON.stringify({
+    compilerOptions: { outDir: 'dist' },
+    include: ['src'],
+    exclude: ['src/**/*.test.ts'],
+  }),
+  'packages/lib/src/index.ts': 'export const index = 1;\n',
+  'packages/lib/src/index.test.ts': "import { index } from './index.js';\n\nexport const checked = index;\n",
+};
+
+function git(root: string, ...args: string[]): void {
+  execFileSync('git', ['-C', root, ...GIT_IDENTITY, ...args], { stdio: 'pipe' });
+}
+
+function sha256(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+/** Runs `body` in a Git work tree of `LIB`, committed, in a new physical temp directory removed however it ends. */
+async function inLibWorkspace(body: (root: string) => unknown): Promise<void> {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'smoo-typescript-emit-inputs-')));
+  try {
+    for (const [path, text] of Object.entries(LIB)) {
+      await mkdir(dirname(join(root, path)), { recursive: true });
+      await writeFile(join(root, path), text);
+    }
+    git(root, 'init', '-q');
+    git(root, 'add', '.');
+    git(root, 'commit', '-qm', 'fixture');
+    await body(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+describe('@smoothbricks/nx-plugin TypeScript emit build input record', () => {
+  it('records the sources and config the emit reads, and the pathspecs that complete them', async () => {
+    await inLibWorkspace(async (root) => {
+      const lib = join(root, 'packages/lib');
+      const options = { cwd: lib, tsConfig: 'tsconfig.lib.json' };
+      expect(await runTypeScriptEmit(options, { root }, async () => true)).toEqual({ success: true });
+      const record: BuildInputRecord = JSON.parse(await readFile(join(lib, 'dist/.build-inputs.json'), 'utf8'));
+      expect(record.version).toBe(1);
+      expect(record.files).toEqual({
+        'packages/lib/src/index.ts': sha256(LIB['packages/lib/src/index.ts']),
+        'packages/lib/tsconfig.lib.json': sha256(LIB['packages/lib/tsconfig.lib.json']),
+      });
+      expect(record.complete).toContain(':(glob)packages/lib/src/**/*.ts');
+      expect(record.complete).toContain(':(exclude,glob)packages/lib/src/**/*.test.ts');
+    });
+  });
+
+  it('records the bytes the emit began with when a source is edited while it runs', async () => {
+    await inLibWorkspace(async (root) => {
+      const lib = join(root, 'packages/lib');
+      const options = { cwd: lib, tsConfig: 'tsconfig.lib.json' };
+      const edited = 'export const index = 2;\n';
+      const editDuringEmit = async () => {
+        await writeFile(join(lib, 'src/index.ts'), edited);
+        return true;
+      };
+      expect(await runTypeScriptEmit(options, { root }, editDuringEmit)).toEqual({ success: true });
+      expect(await readFile(join(lib, 'src/index.ts'), 'utf8')).toBe(edited);
+      const record: BuildInputRecord = JSON.parse(await readFile(join(lib, 'dist/.build-inputs.json'), 'utf8'));
+      expect(record.files['packages/lib/src/index.ts']).toBe(sha256(LIB['packages/lib/src/index.ts']));
+    });
+  });
+
+  it('records the files that exist when a tracked source was deleted without staging it', async () => {
+    await inLibWorkspace(async (root) => {
+      const lib = join(root, 'packages/lib');
+      const options = { cwd: lib, tsConfig: 'tsconfig.lib.json' };
+      await writeFile(join(lib, 'src/old.ts'), 'export const old = 1;\n');
+      git(root, 'add', '.');
+      git(root, 'commit', '-qm', 'old');
+      // What a plain `rm` leaves: gone from the work tree, still in the index.
+      await rm(join(lib, 'src/old.ts'));
+      expect(await runTypeScriptEmit(options, { root }, async () => true)).toEqual({ success: true });
+      const record: BuildInputRecord = JSON.parse(await readFile(join(lib, 'dist/.build-inputs.json'), 'utf8'));
+      expect(Object.keys(record.files)).toEqual(['packages/lib/src/index.ts', 'packages/lib/tsconfig.lib.json']);
+    });
+  });
+
+  it('writes no record when the compiler fails', async () => {
+    await inLibWorkspace(async (root) => {
+      const lib = join(root, 'packages/lib');
+      const options = { cwd: lib, tsConfig: 'tsconfig.lib.json' };
+      expect(await runTypeScriptEmit(options, { root }, async () => false)).toEqual({ success: false });
+      await expect(stat(join(lib, 'dist/.build-inputs.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    });
   });
 });

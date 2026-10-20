@@ -233,7 +233,8 @@
     "smoo-nx-bound-failures": "./dist/bin/smoo-nx-bound-failures.js",
     "smoo-nx-failures": "./dist/bin/smoo-nx-failures.js",
     "smoo-nx-test-walks": "./dist/bin/smoo-nx-test-walks.js",
-    "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js"
+    "smoo-nx-test-clocks": "./dist/bin/smoo-nx-test-clocks.js",
+    "smoo-nx-build-inputs": "./dist/bin/smoo-nx-build-inputs.js"
   },
   "generators": "./generators.json",
   "executors": "./executors.json",

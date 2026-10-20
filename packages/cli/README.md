@@ -720,6 +720,14 @@ Existing forms keep working unchanged as explicit moving opt-ins. A directory st
 fresh attested snapshot at each install or shell entry, not a fixed pin. Managed-file drift checks keep their own rules:
 pinning fixes the bytes they inspect rather than accepting differences from a moving branch.
 
+A live link runs what its checkout last built, so it refuses a checkout whose build no longer describes its sources: the
+refusal names each build unit, the input that moved and `cd <checkout> && nx run <project>:build`, and leaves the alias
+as it was. The `@smoothbricks/nx-plugin` TypeScript emit and its inferred macOS napi targets (and a native target whose
+command runs `smoo-nx-build-inputs`) write `.build-inputs.json` into their output directory with the SHA-256 of every
+input; Nx restores it on a cache hit, so the cached build is the whole remedy and a branch switch that rewrites files
+with their own bytes refuses nothing. Outputs without that record (Linux cross builds among them) are judged by
+modification time, which also refuses such a same-bytes rewrite, and say so.
+
 Each key is a package name, scoped or not. Every directory is relative to the project checkout. For live links and
 capture, a project-contained declaration resolves within the current checkout, including a cowshed workspace, and
 rejects symlink escapes even before the declared directory exists. A genuine sibling declaration stays anchored to the

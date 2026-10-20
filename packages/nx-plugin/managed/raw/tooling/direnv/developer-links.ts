@@ -104,6 +104,8 @@
  * the command keep the same links.
  */
 
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   type Dirent,
   existsSync,
@@ -124,11 +126,13 @@ import path from 'node:path';
 import type { KeepDeveloperLinksOptions } from '@smoothbricks/nx-plugin/managed-assets';
 import {
   type ProducerProbe,
+  packedFiles,
   pinnedSnapshot,
   pluginProbe,
   recordedSnapshot,
   type SealedSnapshot,
   type SnapshotDeclaration,
+  SnapshotRefusal,
   snapshotBinding,
 } from './linked-snapshots.ts';
 
@@ -468,6 +472,13 @@ export async function planDeclaredLinks(root: string): Promise<DeclaredLinksPlan
       continue;
     }
     let binding: DeclaredBinding = { kind: 'checkout', target: source };
+    // A live checkout runs whatever its last build wrote. Linking one whose build is older than its sources would say
+    // the checkout runs while older code does, so the link is refused and nothing is changed (a snapshot carries its
+    // own producer provenance instead).
+    if (snapshot === undefined) {
+      const stale = staleBuilds(name, source);
+      if (stale.length > 0) throw new Error(staleBuildsRefusal(stale));
+    }
     if (snapshot !== undefined) {
       const outcome = await snapshotBinding(root, name, source, snapshot, probe);
       if (outcome.kind === 'refused') {
@@ -742,6 +753,315 @@ function unavailableReason(target: string): string | null {
     }
     throw error;
   }
+}
+
+/**
+ * A build unit of a linked package that does not describe its current sources: what an alias to the live checkout
+ * would actually run. A unit with an input record is judged by content: one of its inputs has other bytes than the
+ * build read, was removed, or was added since. A unit without one is judged by modification time (`builtAt` is null
+ * for a published unit that was never built), which also refuses a file rewritten with its own bytes.
+ */
+export type StaleBuild = {
+  readonly packageName: string;
+  readonly directory: string;
+  readonly unit: string;
+  /** The command that rewrites the unit's outputs, run in `workspaceRoot`. */
+  readonly rebuild: string;
+  readonly workspaceRoot: string;
+} & (
+  | { readonly basis: 'recorded'; readonly input: string; readonly change: 'changed' | 'removed' | 'added' }
+  | {
+      readonly basis: 'modification-time';
+      readonly builtAt: { readonly path: string; readonly time: Date } | null;
+      readonly newestInput: { readonly path: string; readonly time: Date };
+    }
+);
+
+/**
+ * The input record a producer writes into each output directory and Nx restores with it (`.build-inputs.json`; the
+ * producer side is the nx-plugin's build-inputs.ts): `files` maps each workspace-relative input to the SHA-256 of the
+ * bytes the build read, and `complete`, when present, holds Git pathspecs whose every match is an input.
+ */
+const BUILD_INPUTS_FILE = '.build-inputs.json';
+
+/** The first input whose bytes differ from what the build recorded, or null when the record describes the sources. */
+function recordedChange(
+  workspaceRoot: string,
+  record: string,
+): { readonly input: string; readonly change: 'changed' | 'removed' | 'added' } | null {
+  const parsed: unknown = JSON.parse(readFileSync(path.join(workspaceRoot, record), 'utf8'));
+  const files = typeof parsed === 'object' && parsed !== null ? Reflect.get(parsed, 'files') : undefined;
+  const complete = typeof parsed === 'object' && parsed !== null ? Reflect.get(parsed, 'complete') : undefined;
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    Reflect.get(parsed, 'version') !== 1 ||
+    typeof files !== 'object' ||
+    files === null ||
+    !Object.values(files).every((hash) => typeof hash === 'string') ||
+    (complete !== undefined &&
+      (!Array.isArray(complete) || !complete.every((spec): spec is string => typeof spec === 'string')))
+  )
+    throw new Error(`${path.join(workspaceRoot, record)} is not a version 1 build input record`);
+  const recorded = new Map(Object.entries(files).map(([file, hash]) => [file, String(hash)]));
+  for (const [file, hash] of recorded) {
+    const at = path.join(workspaceRoot, file);
+    if (!existsSync(at)) return { input: file, change: 'removed' };
+    if (createHash('sha256').update(readFileSync(at)).digest('hex') !== hash) return { input: file, change: 'changed' };
+  }
+  if (Array.isArray(complete) && complete.length > 0) {
+    const current = gitText(workspaceRoot, [
+      'ls-files',
+      '-z',
+      '--cached',
+      '--others',
+      '--exclude-standard',
+      '--',
+      ...complete,
+    ]);
+    // As the producer lists them: a tracked file deleted in the working tree is no input.
+    for (const file of current.split('\0').filter(Boolean)) {
+      if (!recorded.has(file) && existsSync(path.join(workspaceRoot, file))) return { input: file, change: 'added' };
+    }
+  }
+  return null;
+}
+
+/** One build of a linked package: the outputs it writes and the files it reads. */
+interface BuildUnit {
+  readonly label: string;
+  readonly outputs: readonly string[];
+  readonly inputs: readonly string[];
+  /** Published, so absent outputs mean it was never built rather than not built for this host. */
+  readonly expected: boolean;
+}
+
+/** A platform directory as packages name their per-host builds (`dist/bin/darwin-arm64`). */
+const PLATFORM_SEGMENT = /^(?:darwin|linux|win32|freebsd)-(?:arm64|x64|ia32|arm)(?:-[a-z0-9]+)?$/;
+
+/**
+ * The build units of the package at `directory` that do not describe its current sources.
+ *
+ * A unit is first each output directory holding an input record: it is current exactly while every recorded input
+ * still has the recorded bytes and no source the record's pathspecs match has been added. The producer writes the
+ * record as part of its Nx outputs, so a cached build restores the record describing the outputs it restores, and a
+ * file rewritten with its own bytes (a branch switch, a stash) changes nothing.
+ *
+ * Outputs no record covers fall back to modification time, per unit, so a `.md` edit or a Rust change cannot make a
+ * TypeScript build stale:
+ *
+ * - the TypeScript project `tsconfig.lib.json` builds: the published, untracked files under its `outDir` less build
+ *   info, read from the tracked files its `include` matches less its `exclude`, and the config itself;
+ * - each target the package manifest's `nx.targets` declares with outputs among those files: its declared file
+ *   inputs (`{projectRoot}` and `{workspaceRoot}` globs, `!` negations; named and runtime inputs are not files);
+ * - every other published, untracked file, read from the package's tracked files less documentation and tests.
+ *
+ * A fallback unit was built when its newest output was written. Not its oldest: an emit that leaves unchanged outputs
+ * in place keeps their old times. Not a `.tsbuildinfo`: the build emits with `incremental: false`, so one under
+ * `outDir` is a leftover no build rewrites. The fallback cannot tell a rewrite with the same bytes from a change, and
+ * its refusal says so.
+ *
+ * Output directories built for another host (`darwin-x64` on an arm64 Mac) are skipped: nothing here runs them.
+ * The remedy is the package's cached Nx build. A cached build that leaves a recorded unit stale is a cache-key defect
+ * of that build (its inputs miss something its outputs depend on), never a reason to skip the cache.
+ */
+export function staleBuilds(packageName: string, directory: string): StaleBuild[] {
+  const manifest: unknown = JSON.parse(readFileSync(path.join(directory, 'package.json'), 'utf8'));
+  const manifestRecord = typeof manifest === 'object' && manifest !== null ? manifest : {};
+  // A package that publishes no files and declares no TypeScript build or Nx target builds nothing that could be
+  // stale. Every other one needs Git to tell its sources from its builds, and refuses without it.
+  const nxDeclared = Reflect.get(manifestRecord, 'nx');
+  if (
+    Reflect.get(manifestRecord, 'files') === undefined &&
+    !existsSync(path.join(directory, 'tsconfig.lib.json')) &&
+    (typeof nxDeclared !== 'object' || nxDeclared === null || Reflect.get(nxDeclared, 'targets') === undefined)
+  )
+    return [];
+  const workspaceRoot = realpathSync(gitText(directory, ['rev-parse', '--show-toplevel']));
+  const tracked = new Set(gitText(workspaceRoot, ['ls-files', '-z']).split('\0').filter(Boolean));
+  const packagePath = path.relative(workspaceRoot, realpathSync(directory));
+  const host = `${process.platform}-${process.arch}`;
+  let published: string[];
+  try {
+    published = packedFiles(directory, manifestRecord);
+  } catch (error) {
+    if (!(error instanceof SnapshotRefusal)) throw error;
+    published = [];
+  }
+  const built = published
+    .map((file) => path.relative(workspaceRoot, file))
+    .filter((file) => !tracked.has(file))
+    .filter((file) => file.split(path.sep).every((segment) => !PLATFORM_SEGMENT.test(segment) || segment === host));
+  const claimed = new Set<string>();
+  const claim = (files: readonly string[]) => {
+    const mine = files.filter((file) => !claimed.has(file));
+    for (const file of mine) claimed.add(file);
+    return mine;
+  };
+  const under = (prefix: string) => built.filter((file) => file === prefix || file.startsWith(`${prefix}${path.sep}`));
+  const trackedMatching = (patterns: readonly string[]) => {
+    const include = patterns.filter((pattern) => !pattern.startsWith('!')).map((pattern) => new Bun.Glob(pattern));
+    const exclude = patterns
+      .filter((pattern) => pattern.startsWith('!'))
+      .map((pattern) => new Bun.Glob(pattern.slice(1)));
+    return [...tracked].filter(
+      (file) => include.some((glob) => glob.match(file)) && !exclude.some((glob) => glob.match(file)),
+    );
+  };
+  const nx = Reflect.get(manifestRecord, 'nx');
+  const nxName = typeof nx === 'object' && nx !== null ? Reflect.get(nx, 'name') : undefined;
+  const project = typeof nxName === 'string' ? nxName : packageName;
+  const rebuild = `nx run ${project}:build`;
+  const stale: StaleBuild[] = [];
+  const recordedDirectories: string[] = [];
+  for (const record of built.filter((file) => path.basename(file) === BUILD_INPUTS_FILE)) {
+    const unit = path.dirname(record);
+    recordedDirectories.push(unit);
+    claim(under(unit));
+    const change = recordedChange(workspaceRoot, record);
+    if (change !== null)
+      stale.push({ basis: 'recorded', packageName, directory, unit, rebuild, workspaceRoot, ...change });
+  }
+  // An outDir at or inside a recorded directory is judged by its record; one enclosing a record (outDir `dist`, a
+  // native record under `dist/native/host`) still judges its other files, the record's being claimed above.
+  const recorded = (prefix: string) =>
+    recordedDirectories.some((unit) => unit === prefix || prefix.startsWith(`${unit}${path.sep}`));
+  const units: BuildUnit[] = [];
+
+  const configPath = path.join(directory, 'tsconfig.lib.json');
+  if (existsSync(configPath)) {
+    const parsed: unknown = Bun.JSONC.parse(readFileSync(configPath, 'utf8'));
+    const config: object = typeof parsed === 'object' && parsed !== null ? parsed : {};
+    const compilerOptions: unknown = Reflect.get(config, 'compilerOptions');
+    const options: object = typeof compilerOptions === 'object' && compilerOptions !== null ? compilerOptions : {};
+    const outDir: unknown = Reflect.get(options, 'outDir');
+    if (typeof outDir === 'string' && !recorded(path.join(packagePath, outDir))) {
+      const relativeOut = path.join(packagePath, outDir);
+      const globs = (key: string) => {
+        const value: unknown = Reflect.get(config, key);
+        return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+      };
+      const files = Reflect.get(manifestRecord, 'files');
+      const publishes =
+        Array.isArray(files) &&
+        files.some((entry) => typeof entry === 'string' && (outDir === entry || outDir.startsWith(`${entry}/`)));
+      units.push({
+        label: `${path.join(packagePath, 'tsconfig.lib.json')} (outDir ${outDir})`,
+        // Claimed with the unit, so a leftover build info is judged by no unit at all.
+        outputs: claim(under(relativeOut)).filter((file) => !file.endsWith('.tsbuildinfo')),
+        inputs: [
+          ...trackedMatching([
+            ...globs('include').map((glob) => path.join(packagePath, glob)),
+            ...globs('exclude').map((glob) => `!${path.join(packagePath, glob)}`),
+          ]),
+          path.join(packagePath, 'tsconfig.lib.json'),
+        ],
+        expected: publishes,
+      });
+    }
+  }
+
+  const targets = typeof nx === 'object' && nx !== null ? Reflect.get(nx, 'targets') : undefined;
+  const resolve = (pattern: string) =>
+    pattern
+      .replaceAll('{projectRoot}', packagePath)
+      .replaceAll('{workspaceRoot}/', '')
+      .replaceAll('{workspaceRoot}', '');
+  for (const [target, definition] of Object.entries(typeof targets === 'object' && targets !== null ? targets : {})) {
+    if (typeof definition !== 'object' || definition === null) continue;
+    const strings = (key: string) => {
+      const value = Reflect.get(definition, key);
+      return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+    };
+    const outputs = claim(strings('outputs').flatMap((output) => under(path.normalize(resolve(output)))));
+    if (outputs.length === 0) continue;
+    const fileInputs = strings('inputs').filter(
+      (input) => input.includes('{projectRoot}') || input.includes('{workspaceRoot}'),
+    );
+    units.push({
+      label: `nx target ${target}`,
+      outputs,
+      inputs: trackedMatching(
+        fileInputs.map((input) => (input.startsWith('!') ? `!${resolve(input.slice(1))}` : resolve(input))),
+      ),
+      expected: false,
+    });
+  }
+
+  const rest = claim(built);
+  if (rest.length > 0)
+    units.push({
+      label: 'other built files',
+      outputs: rest,
+      inputs: trackedMatching([
+        path.join(packagePath, '**'),
+        `!${path.join(packagePath, '**/*.md')}`,
+        `!${path.join(packagePath, '**/*.test.*')}`,
+        `!${path.join(packagePath, '**/*.spec.*')}`,
+        `!${path.join(packagePath, '**/__tests__/**')}`,
+        `!${path.join(packagePath, 'package.json')}`,
+      ]),
+      expected: false,
+    });
+
+  // A tracked input deleted in the working tree has no time; the files that remain decide.
+  const modified = (file: string) => statSync(path.join(workspaceRoot, file), { throwIfNoEntry: false })?.mtime;
+  for (const unit of units) {
+    if (unit.inputs.length === 0) continue;
+    let newestInput = { path: unit.inputs[0] ?? '', time: new Date(0) };
+    for (const input of unit.inputs) {
+      const time = modified(input);
+      if (time !== undefined && time > newestInput.time) newestInput = { path: input, time };
+    }
+    let builtAt: { readonly path: string; readonly time: Date } | null = null;
+    for (const output of unit.outputs) {
+      const time = modified(output);
+      if (time !== undefined && (builtAt === null || time > builtAt.time)) builtAt = { path: output, time };
+    }
+    if (builtAt === null && !unit.expected) continue;
+    if (builtAt !== null && newestInput.time <= builtAt.time) continue;
+    stale.push({
+      basis: 'modification-time',
+      packageName,
+      directory,
+      unit: unit.label,
+      builtAt,
+      newestInput,
+      rebuild,
+      workspaceRoot,
+    });
+  }
+  return stale;
+}
+
+/** The refusal for `stale` builds: what each unit no longer describes, and the cached build that rewrites them. */
+export function staleBuildsRefusal(stale: readonly StaleBuild[]): string {
+  const lines = stale.map((build) => {
+    if (build.basis === 'recorded') {
+      const how =
+        build.change === 'changed'
+          ? 'has other bytes than the build read'
+          : build.change === 'removed'
+            ? 'was removed since the build'
+            : 'was added since the build';
+      return `  - ${build.packageName}: ${build.unit} is stale: input ${build.input} ${how} (its ${BUILD_INPUTS_FILE})`;
+    }
+    const fallback = `no ${BUILD_INPUTS_FILE}, so judged by modification time, where a file rewritten with its own bytes also counts`;
+    return build.builtAt === null
+      ? `  - ${build.packageName}: ${build.unit} was never built (newest input ${build.newestInput.path} at ${build.newestInput.time.toISOString()}; ${fallback})`
+      : `  - ${build.packageName}: ${build.unit} was built at ${build.builtAt.time.toISOString()} (${build.builtAt.path}), but ${build.newestInput.path} changed at ${build.newestInput.time.toISOString()} (${fallback})`;
+  });
+  const commands = [...new Set(stale.map((build) => `cd ${JSON.stringify(build.workspaceRoot)} && ${build.rebuild}`))];
+  return `refusing developer link(s) to a live checkout whose build does not describe its sources; the link would run the old build:\n${lines.join('\n')}\nRebuild: ${commands.join('; ')}`;
+}
+
+function gitText(cwd: string, args: readonly string[]): string {
+  const run = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+  if (run.error !== undefined || run.status !== 0)
+    throw new Error(
+      `cannot read the build state of ${cwd}: git ${args.join(' ')}: ${run.error?.message ?? run.stderr.trim()}`,
+    );
+  return run.stdout.trim();
 }
 
 /** A package name as npm spells one: `name` or `@scope/name`, one segment each. */

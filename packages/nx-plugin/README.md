@@ -744,7 +744,12 @@ Concrete targets come from concrete files:
 
 - `tsc-js` emits transformed JavaScript through a temporary JS-only `ttsc` config, restores execute bits on outputs
   declared by `package.json#bin`, then emits declarations and declaration maps from the original project with native
-  `tsc`. Direct project references and every cached output lane are preserved.
+  `tsc`. Direct project references and every cached output lane are preserved. It writes `.build-inputs.json` into the
+  `outDir`: the SHA-256 of every file the config's `include` matches less its `exclude`, taken before the emit, and
+  those globs as Git pathspecs. The macOS napi targets write the same record from rustc's dep-info file through
+  `smoo-nx-build-inputs --manifest-path <Cargo.toml> --dep-info <path under the target directory> --output <dir>`. The
+  record is inside the target's outputs, so a cache hit restores it with them; a live developer link
+  (`@smoothbricks/cli`, "Declared Links") checks it to tell a current build from a stale one by content.
 - `typecheck` is inferred from `tsconfig.lib.json` and runs the native compiler `SMOO_TYPECHECK_TSC` names (built by
   `devenv.smoo.nix` from a pinned TypeScript revision) as `-p tsconfig.lib.json --noEmit`, directly rather than through
   `ttsc`. Transform plugins' diagnostics are enforced by `tsc-js`, which runs them.

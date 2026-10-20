@@ -18,6 +18,7 @@ import { parse as parseToml } from 'smol-toml';
 import { type ParsedCommandLine, parseJsonConfigFileContent, readConfigFile, sys as typescriptSys } from 'typescript';
 
 import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './bounded-test-policy.js';
+import { BUILD_INPUTS_BIN } from './build-inputs.js';
 import {
   CARGO_CLOSURE_INPUT,
   type CargoClosureSource,
@@ -2235,6 +2236,19 @@ function createNapiTargets(
   // Nx's root-only PATH cannot resolve that package's napi CLI.
   const napiCommand = repoRooted ? posix.join(projectRoot, 'node_modules/.bin/napi') : 'napi';
   const outputPath = (projectOutput: string) => (repoRooted ? posix.join(projectRoot, projectOutput) : projectOutput);
+  // After a build, the step that writes its input record (build-inputs.ts) into the output directory from the dep-info
+  // rustc wrote for the addon (`target/[<triple>/]<profile>/lib<crate>.d`). The record is inside the target's
+  // outputs, so Nx restores it with the addon it describes. Relative to the runner's cwd, so the hashed command is
+  // the same in every checkout.
+  const recordInputs = (triple: string | null, profile: CargoProfile, outputDirectory: string): string => {
+    const depInfo = posix.join(
+      ...(triple === null ? [] : [triple]),
+      CARGO_PROFILE_OUTPUT_DIR[profile],
+      `lib${config.cargoPackage.replaceAll('-', '_')}.d`,
+    );
+    const bin = posix.join(posix.relative(cargoCwd, '.'), BUILD_INPUTS_BIN);
+    return ` && node ${bin} --manifest-path ${config.manifestPath} --dep-info ${depInfo} --output ${outputDirectory}`;
+  };
   const hasHostPlatformTarget = config.targets.some((triple) => {
     const convention = NAPI_TARGET_CONVENTIONS[triple];
     return convention !== undefined && sameNapiPlatform(convention, hostPlatform);
@@ -2269,7 +2283,7 @@ function createNapiTargets(
     // platform-suffixed filename from dist/native/<platform-dir> after
     // dist/native/host.
     const hostBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('dist/native/host')}`;
+      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.napi.d.ts ${commonCommand} --output-dir ${outputPath('dist/native/host')}${recordInputs(null, profile, outputPath('dist/native/host'))}`;
     targets['cargo-napi'] = {
       executor: 'nx:run-commands',
       cache: true,
@@ -2314,7 +2328,7 @@ function createNapiTargets(
     // macOS addons need Apple's SDK, which zig does not carry: the napi CLI
     // drives the host's own toolchain and writes the platform `.d.ts`.
     const platformBuild = (profile: CargoProfile): string =>
-      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple} ${commonCommand} --output-dir ${outputPath(outputDirectory)}`;
+      `${napiCommand} build${CARGO_PROFILE_FLAG[profile]} --platform --no-js --dts ${config.binaryName}.${convention.outputName}.d.ts --target ${triple} ${commonCommand} --output-dir ${outputPath(outputDirectory)}${recordInputs(triple, profile, outputPath(outputDirectory))}`;
     targets[targetName] = {
       executor: 'nx:run-commands',
       cache: true,
