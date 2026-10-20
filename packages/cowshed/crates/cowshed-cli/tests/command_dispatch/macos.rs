@@ -290,6 +290,14 @@ impl Project<'_> {
 /// template, it lives in the runner's template directory and is written aside and moved in
 /// whole, so the next run's sweep reclaims it and a writer killed halfway leaves no template.
 fn checkout_template(project: Project<'_>) -> PathBuf {
+    materialized_template(
+        &checkout_template_directory(),
+        &format!("checkout-{}", project.key()),
+        |aside| project.write(aside),
+    )
+}
+
+fn checkout_template_directory() -> PathBuf {
     // SAFETY: `getppid` has no preconditions and cannot fail.
     let run = unsafe { libc::getppid() };
     let directory = PathBuf::from(format!(
@@ -298,16 +306,20 @@ fn checkout_template(project: Project<'_>) -> PathBuf {
     ));
     fs::create_dir_all(&directory)
         .unwrap_or_else(|error| panic!("template directory {}: {error}", directory.display()));
-    let key = project.key();
-    let template = directory.join(format!("checkout-{key}"));
-    let lock = directory.join(format!("checkout-{key}.lock"));
+    directory
+}
+
+/// Publish one immutable tree for this runner, under the same lock used by its readers.
+fn materialized_template(directory: &Path, key: &str, write: impl FnOnce(&Path)) -> PathBuf {
+    let template = directory.join(key);
+    let lock = directory.join(format!("{key}.lock"));
     let _writing = scratch_apfs::lock_exclusive(&lock)
         .unwrap_or_else(|error| panic!("template lock {}: {error}", lock.display()));
     if !template.exists() {
-        let aside = directory.join(format!("checkout-{key}.{}", std::process::id()));
-        project.write(&aside);
+        let aside = directory.join(format!("{key}.{}", std::process::id()));
+        write(&aside);
         fs::rename(&aside, &template).unwrap_or_else(|error| {
-            panic!("publish checkout template {}: {error}", template.display())
+            panic!("publish fixture template {}: {error}", template.display())
         });
     }
     template
@@ -1531,11 +1543,63 @@ fn nx_install_closure(nx: &Path) -> std::collections::BTreeMap<String, PathBuf> 
 /// installed Nx carry that proof; what it keeps proving is everything downstream of an
 /// installed Nx, with byte-identical product files.
 fn clone_repository_nx_install(checkout: &Path, nx: &Path) {
+    clone_nx_namespace(
+        &checkout_template_directory(),
+        &checkout.join("node_modules"),
+        |installed| write_repository_nx_install(installed, nx),
+    );
+}
+
+/// Every checkout shape clones one published install; only its first writer crosses volumes.
+fn clone_nx_namespace(templates: &Path, destination: &Path, write: impl FnOnce(&Path)) {
+    let installed = materialized_template(templates, "nx-install", write);
+    clone_tree(&installed, destination);
+}
+
+#[test]
+fn directory_nx_install_is_materialized_once_across_checkout_templates() {
+    let scratch = scratch_directory::ScratchRoot::new("nx-install-template").expect("scratch root");
+    let templates = scratch.path().join("templates");
+    fs::create_dir(&templates).unwrap();
+    let source = scratch.path().join("installed");
+    fs::create_dir_all(source.join("nx")).unwrap();
+    fs::write(source.join("nx/product"), b"immutable installed bytes").unwrap();
+    std::os::unix::fs::symlink("nx/product", source.join("entry")).unwrap();
+    let copies = std::cell::Cell::new(0);
+    let write = |destination: &Path| {
+        copies.set(copies.get() + 1);
+        assert_eq!(
+            copies.get(),
+            1,
+            "a second checkout template must not reread or recopy the installed namespace"
+        );
+        clone_tree(&source, destination);
+    };
+    let first = scratch.path().join("nx-declared");
+    clone_nx_namespace(&templates, &first, write);
+    // The source is no longer available. The second checkout must clone the already-published
+    // immutable namespace, not rediscover or copy the repository's installation again.
+    fs::remove_dir_all(&source).unwrap();
+    let second = scratch.path().join("build-nx");
+    clone_nx_namespace(&templates, &second, write);
+    assert_eq!(copies.get(), 1);
+    for checkout in [first, second] {
+        assert_eq!(
+            fs::read(checkout.join("entry")).unwrap(),
+            b"immutable installed bytes"
+        );
+        assert_eq!(
+            fs::read_link(checkout.join("entry")).unwrap(),
+            Path::new("nx/product")
+        );
+    }
+}
+
+fn write_repository_nx_install(installed: &Path, nx: &Path) {
     let bun_root = nx
         .ancestors()
         .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new(".bun")))
         .expect("the repository's Nx sits in its Bun install namespace");
-    let installed = checkout.join("node_modules");
     let bun_destination = installed.join(".bun");
     fs::create_dir_all(&bun_destination).unwrap();
     // The store entries the closure reaches, by entry directory name: cloning an entry
