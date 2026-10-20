@@ -176,7 +176,12 @@ describe('managed files in a consumer whose formatter disagrees with the generat
 describe('which formatter owns a managed target', () => {
   it('leaves the extensions the commit hook routes to Biome untouched', async () => {
     const config = Bun.YAML.parse(await readFile(GIT_FORMAT_STAGED_CONFIG, 'utf8'));
-    const patterns = typia.assert<{ formatters: { biome: { patterns: string[] } } }>(config).formatters.biome.patterns;
+    const formatters = typia.assert<{ formatters: Record<string, { command: string; patterns: string[] }> }>(
+      config,
+    ).formatters;
+    const patterns = Object.values(formatters)
+      .filter((formatter) => formatter.command.startsWith('biome '))
+      .flatMap((formatter) => formatter.patterns);
 
     expect([...BIOME_OWNED_EXTENSIONS].sort()).toEqual(patterns.map((pattern) => pattern.replace('*', '')).sort());
   });

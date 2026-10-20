@@ -9,9 +9,16 @@ formatters:
       - '!.*' # Exclude hidden files
 
   # Biome for JS/TS family (including CommonJS/CTS and ESM .mjs/.mts)
-  # Biome check --fix silently succeeds on unparsable stdin; format must refuse it.
-  biome:
-    command: "biome format --files-ignore-unknown=true --use-editorconfig=true '--stdin-file-path={}'"
+  # At commit it may rewrite exactly: formatting, import order (assist/source/organizeImports) and string
+  # concatenation to template literals (lint/style/useTemplate, an unsafe fix, so --unsafe with --only).
+  # Those two are the land gate's autofixable refusals; every other rule stays a lint finding.
+  # Biome check --write silently passes unparsable stdin through; the final biome format refuses it,
+  # and the pipeline's status is that format's.
+  biome-scripts:
+    command:
+      "biome check --write --unsafe --files-ignore-unknown=true --use-editorconfig=true
+      --only=assist/source/organizeImports --only=lint/style/useTemplate '--stdin-file-path={}' | biome format
+      --files-ignore-unknown=true --use-editorconfig=true '--stdin-file-path={}'"
     patterns:
       - '*.js'
       - '*.cjs'
@@ -21,6 +28,12 @@ formatters:
       - '*.mts'
       - '*.jsx'
       - '*.tsx'
+
+  # Biome for data and markup. smoo's JSON writer runs this exact command (biomeHookArguments), so a
+  # file it writes is a fixed point of the hook; a test pins the two together.
+  biome:
+    command: "biome format --files-ignore-unknown=true --use-editorconfig=true '--stdin-file-path={}'"
+    patterns:
       - '*.json'
       - '*.jsonc'
       - '*.html'
