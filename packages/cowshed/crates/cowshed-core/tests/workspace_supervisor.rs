@@ -8320,7 +8320,7 @@ async fn a_resident_holds_one_token_until_its_warm_command_starts_and_none_after
 /// A one-shot spawn -- a direct `/bin/sh`, no warm host -- reports no `Started`: its command has
 /// started when the spawn returns its process. Its stake returns then, never held for the
 /// resident's life (measured 2026-10-20: a direct ticker resident held the stake, the one
-/// background token of a three-token ledger, and starved the land's check job behind it).
+/// background token of a three-token ledger, and starved the work admitted after it).
 #[tokio::test]
 async fn a_one_shot_resident_returns_its_stake_when_its_spawn_returns() {
     let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-one-shot", false);
