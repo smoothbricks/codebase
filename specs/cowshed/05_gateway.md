@@ -227,8 +227,9 @@ them before it binds anything ("Startup contract" step 2) and serves each on its
 connections included. Only this user's processes may give or take, and the store deny keeps every sandbox off the
 socket. Every failure is what a restart was without the handoff: no install serving the socket, an old gateway that
 predates the handoff, an install that dies (the kernel closes its copies), or a failed take, after which the install
-closes its copies before the new gateway binds. Linux binds no TCP workspace listener, so it carries none. A queued CPU
-request and an exec client of the replaced build are other clients a restart still cuts off.
+closes its copies before the new gateway binds. Linux binds no TCP workspace listener, so it carries none. An exec
+client of the replaced build reads its job's end from its own drained supervisor (11_shell.md "Draining a supervisor of
+another build"); a queued CPU request is a client a restart still cuts off.
 
 **Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
 the new build's and the one it replaced is removed. The replaced build stays one install longer: a workspace supervisor

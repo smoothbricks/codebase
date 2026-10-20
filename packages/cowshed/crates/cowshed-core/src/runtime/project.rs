@@ -2366,9 +2366,9 @@ enum SupervisorHome {
 const LOST_JOB_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long a served supervisor stays idle (no named session, no running job, and its keeper
-/// holds no Nx daemon) before it retires; the next command starts another.
-#[cfg(target_os = "macos")]
-const SUPERVISOR_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// holds no Nx daemon) before it retires; the next command starts another. A draining supervisor
+/// whose ended jobs nobody reads gives up on them after as long with no client call.
+pub(crate) const SUPERVISOR_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// What the supervisor process's serving loop woke for.
 #[cfg(target_os = "macos")]

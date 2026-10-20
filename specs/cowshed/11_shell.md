@@ -760,9 +760,19 @@ admitted but never sealed. Two things put that right:
 — including one that names no build at all — to drain: it admits nothing more, lets its running jobs finish, and
 retires, and the next command for its workspace gets a supervisor of the new build. `drain` is the one request whose
 shape never changes across builds, so any later daemon can retire any earlier supervisor. A supervisor of the daemon's
-own build keeps serving across a daemon restart and retires on its own when idle. A draining supervisor retires the
-moment its last job ends, usually before its client has read the end: the client reaches that job from the workspace's
-next supervisor by its number, through `sealed` and `logRead`, and reads on from the bytes it already holds.
+own build keeps serving across a daemon restart and retires on its own when idle.
+
+A draining supervisor serves the ends of the jobs it ran before it retires. Their clients are of its own build, and the
+workspace's next supervisor is of another, whose protocol they cannot speak: measured 2026-10-20, an exec client of the
+replaced build came back for its job's end after the job had ended, found its supervisor retired, and was refused by the
+new build's daemon, so a job that succeeded reported failure. So once its last job has ended, a draining supervisor
+keeps answering its clients; it admits nothing, since `drain` closed admission. Each job running when it was asked to
+drain is owed until a client has read its end (a `wait`, `hold` or `sealed` answer carried it) and read to EOF every
+stream that client was reading through `logRead`. The supervisor retires once every owed job is read, or once 30 minutes
+pass with no client call at all (the idle retirement's bound), so a job nobody reads, a detached one, cannot keep it
+serving. Its retirement says on stderr which jobs' ends were read and which went unread. This holds only when the
+supervisor being replaced already contains it: a supervisor of a build from before it still retires the moment its last
+job ends, so the first install of a build with this rule is not covered by it, and its clients are refused as before.
 
 Until a draining supervisor retires, a command of the new build that reaches it is refused by name: `exec` and every
 other verb that would run work there, because they cannot speak its protocol — except a land step (`exec --class gate`,
@@ -772,12 +782,13 @@ the land: measured 2026-10-20, a land's `rebase` met main's supervisor of the re
 The land step asks it to `drain` (already draining when this build's daemon recovered it), says on stderr which socket
 and pid it waits for, and waits on the exit watch registered before that `drain`, never a poll. The wait has one ceiling
 per step, an hour, which bounds only the step: past it the step refuses naming the pid, and the supervisor and its jobs
-run on. Neither the wait nor its refusal ends a job. A lifecycle verb that must change the workspace's substrate —
-`detach`, `rm`, `restore`, `resize`, `mv` — does not wait for it, since a drain lasts as long as its longest job. A
-lifecycle verb stops admission with `drain` and identifies the serving process from that exact connection's kernel peer
-credential, cross-checking the reply's pid. TERM and, after the existing grace, KILL go only through that non-reusable
-identity: a macOS audit token or Linux peer pidfd (kernel 6.5 or newer), never a later process that reused the pid. A
-host lacking that identity primitive gets a typed refusal, not a raw-pid fallback.
+run on. Neither the wait nor its refusal ends a job. The wait includes the supervisor's read-out after its last job
+(above), at most the 30-minute bound when a job's end goes unread. A lifecycle verb that must change the workspace's
+substrate — `detach`, `rm`, `restore`, `resize`, `mv` — does not wait for it, since a drain lasts as long as its longest
+job. A lifecycle verb stops admission with `drain` and identifies the serving process from that exact connection's
+kernel peer credential, cross-checking the reply's pid. TERM and, after the existing grace, KILL go only through that
+non-reusable identity: a macOS audit token or Linux peer pidfd (kernel 6.5 or newer), never a later process that reused
+the pid. A host lacking that identity primitive gets a typed refusal, not a raw-pid fallback.
 
 The owner exit watch is registered before sending `drain` or a termination signal. On macOS, registration is followed by
 an actual kernel pid-version match, never a guessed numeric-pid or signal-zero probe; on Linux the watch duplicates the

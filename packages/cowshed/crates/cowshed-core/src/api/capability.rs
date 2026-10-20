@@ -2369,7 +2369,7 @@ impl WorkspaceHandle {
     /// [`JobHandle::logs`] reads its sealed output from any offset. Answered for any job of this
     /// incarnation that has ended — including one an earlier supervisor ran and sealed, which
     /// [`Self::job`] and [`JobHandle::status`] answer only while that supervisor serves: a drained
-    /// supervisor of another build retires the moment its last job ends.
+    /// supervisor of another build retires once its jobs' ends were read, or after 30 idle minutes.
     pub async fn sealed(&self, id: JobId) -> Result<(SealedJob, JobHandle)> {
         let sealed =
             invoke::<operations::JobSealed>(&*self.runtime, &self.authority.job(id)).await?;

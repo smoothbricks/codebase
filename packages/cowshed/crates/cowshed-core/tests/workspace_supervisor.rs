@@ -1811,8 +1811,8 @@ async fn a_fresh_supervisor_continues_the_durable_barrier_sequence() {
 /// A job an earlier supervisor of the workspace incarnation ran and sealed is answered by the next
 /// one from the durable records — its terminal facts, and its output from any offset — although
 /// only the supervisor that ran a job answers its status. A client whose supervisor retired (a
-/// drained supervisor of another build retires the moment its last job ends) still reaches the job
-/// by its number, and reads on from the bytes it already holds.
+/// drained supervisor of another build retires once its jobs' ends were read, or after 30 idle
+/// minutes) still reaches the job by its number, and reads on from the bytes it already holds.
 #[tokio::test]
 async fn a_fresh_supervisor_answers_for_a_job_its_predecessor_sealed() {
     let (supervisor_config, _root) = isolated_config("sealed-predecessor");
@@ -4982,6 +4982,59 @@ async fn a_drained_supervisor_finishes_its_jobs_admits_none_and_stops_serving() 
     server
         .await
         .expect("it stops serving once its jobs ended")
+        .unwrap();
+}
+
+/// Measured 2026-10-20: an exec client of the replaced build came back for its job's end after the
+/// job had ended, found its drained supervisor retired, and the new build's daemon refused it, so
+/// work that succeeded reported failure. A drained supervisor now serves the end to that client:
+/// it keeps serving after its last job ends, and retires once the end has been read.
+#[tokio::test]
+async fn a_drained_supervisor_serves_a_job_s_end_to_a_client_that_comes_back_for_it() {
+    use cowshed_core::runtime::supervisor_socket;
+    let (mut h, _root) = harness(1, 1024, false, false);
+    let path = PathBuf::from("/tmp").join(format!(
+        "cowshed-sock-{}/s",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
+    let listener = supervisor_socket::bind(&path).await.unwrap();
+    let server = tokio::spawn(supervisor_socket::serve(
+        listener,
+        h.handle.clone(),
+        None,
+        None,
+    ));
+    let remote = supervisor_socket::connect(path.clone(), authority());
+    let job = remote
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+    supervisor_socket::drain(&path).await.unwrap();
+
+    // The job ends while no client waits on it.
+    complete(&spawned, b"done", b"", ExitStatus::Exited { code: 0 }).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !server.is_finished(),
+        "the job's end is unread, so the drained supervisor still serves"
+    );
+    supervisor_socket::hello(&path)
+        .await
+        .expect("its client still reaches it");
+
+    assert_eq!(
+        remote.wait(job).await.expect("the end").state,
+        JobState::Exited
+    );
+    server
+        .await
+        .expect("it retires once the end was read")
         .unwrap();
 }
 

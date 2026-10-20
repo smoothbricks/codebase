@@ -872,6 +872,7 @@ pub async fn serve(
 ) -> Result<()> {
     let streams: Streams = Arc::default();
     let retired = Arc::new(tokio::sync::Notify::new());
+    let owed = Arc::new(DrainReads::default());
     let (release, mut released) = mpsc::channel::<(UnixStream, serde_json::Value, Bytes)>(1);
     loop {
         let (stream, _) = tokio::select! {
@@ -896,12 +897,16 @@ pub async fn serve(
             }
             () = retired.notified() => return Ok(()),
         };
+        // Any call is a client still there: a draining supervisor's idle bound starts over.
+        owed.called.notify_one();
         let supervisor = supervisor.clone();
         let streams = Arc::clone(&streams);
         let retired = Arc::clone(&retired);
+        let owed = Arc::clone(&owed);
         let advances = advances.clone();
         let feed = feed.clone();
         let release = release.clone();
+        let socket_path = socket.path.clone();
         tokio::spawn(async move {
             match serve_call(
                 stream,
@@ -909,6 +914,7 @@ pub async fn serve(
                 &streams,
                 advances.as_ref(),
                 feed.as_ref(),
+                &owed,
             )
             .await
             {
@@ -929,9 +935,27 @@ pub async fn serve(
                         return;
                     };
                     let current = supervisor.with_authority(authority);
-                    if current.quiesce().await.is_ok()
-                        && current.retire(NxDaemonRetirement::Recorded).await.is_ok()
-                    {
+                    let Ok(jobs) = current.list().await else {
+                        return;
+                    };
+                    // A second `drain` finds the first one's reckoning under way.
+                    let running = jobs
+                        .iter()
+                        .filter(|job| !job.state.is_terminal())
+                        .map(|job| job.job_id);
+                    if !owed.begin(running) {
+                        return;
+                    }
+                    if current.quiesce().await.is_err() {
+                        return;
+                    }
+                    let settled = owed.settle(super::project::SUPERVISOR_IDLE).await;
+                    eprintln!(
+                        "cowshed: workspace supervisor {} of build {} retires after draining; {settled}",
+                        socket_path.display(),
+                        BuildId::current().map_or("(unnamed)", BuildId::as_str),
+                    );
+                    if current.retire(NxDaemonRetirement::Recorded).await.is_ok() {
                         retired.notify_one();
                     }
                 }
@@ -952,12 +976,123 @@ enum Retirement {
     Draining,
 }
 
+/// What a draining supervisor still owes its clients (11_shell.md "Draining a supervisor of
+/// another build"): each job that ran when it was asked to drain, until a client has read its end
+/// and every stream it was reading to EOF. The next supervisor is another build, whose protocol
+/// the job's client cannot speak, so the end is read from this one or not at all.
+#[derive(Default)]
+struct DrainReads {
+    /// `None` until the supervisor drains.
+    owed: std::sync::Mutex<Option<BTreeMap<JobId, Owed>>>,
+    /// Every call, and every read: progress to check, and the idle bound starting over.
+    called: tokio::sync::Notify,
+}
+
+/// One job's reads, as a client of a draining supervisor makes them.
+#[derive(Default)]
+struct Owed {
+    /// A `wait`, `hold` or `sealed` answer carried the job's end.
+    end: bool,
+    /// Per stream (stdout, stderr): a `logRead` was answered, and whether one answered EOF.
+    /// A client that reads no stream owes none.
+    reading: [bool; 2],
+    eof: [bool; 2],
+}
+
+impl Owed {
+    fn read(&self) -> bool {
+        self.end && (0..2).all(|stream| !self.reading[stream] || self.eof[stream])
+    }
+}
+
+/// Which jobs' ends were read before a draining supervisor retired, and which it gave up on.
+struct Settled {
+    read: Vec<JobId>,
+    unread: Vec<JobId>,
+    bound: std::time::Duration,
+}
+
+impl std::fmt::Display for Settled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ids = |jobs: &[JobId]| {
+            jobs.iter()
+                .map(|job| job.get().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        write!(formatter, "read by a client: [{}]", ids(&self.read))?;
+        if !self.unread.is_empty() {
+            write!(
+                formatter,
+                "; unread after {} minutes with no client call: [{}]",
+                self.bound.as_secs() / 60,
+                ids(&self.unread)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl DrainReads {
+    fn owed(&self) -> std::sync::MutexGuard<'_, Option<BTreeMap<JobId, Owed>>> {
+        self.owed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Start owing `running`; `false` when a drain already began.
+    fn begin(&self, running: impl Iterator<Item = JobId>) -> bool {
+        let mut owed = self.owed();
+        if owed.is_some() {
+            return false;
+        }
+        *owed = Some(running.map(|job| (job, Owed::default())).collect());
+        true
+    }
+
+    /// Record what a served call told its client about `job`, while draining.
+    fn record(&self, job: JobId, update: impl FnOnce(&mut Owed)) {
+        if let Some(entry) = self.owed().as_mut().and_then(|owed| owed.get_mut(&job)) {
+            update(entry);
+        }
+        self.called.notify_one();
+    }
+
+    /// Wait until every owed job is read, or until `bound` passes with no client call at all.
+    async fn settle(&self, bound: std::time::Duration) -> Settled {
+        loop {
+            let all_read = self
+                .owed()
+                .as_ref()
+                .is_none_or(|owed| owed.values().all(Owed::read));
+            if all_read {
+                break;
+            }
+            if tokio::time::timeout(bound, self.called.notified())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        let owed = self.owed();
+        let (read, unread): (Vec<_>, Vec<_>) =
+            owed.iter().flatten().partition(|(_, owed)| owed.read());
+        Settled {
+            read: read.into_iter().map(|(job, _)| *job).collect(),
+            unread: unread.into_iter().map(|(job, _)| *job).collect(),
+            bound,
+        }
+    }
+}
+
 async fn serve_call(
     mut stream: UnixStream,
     supervisor: &WorkspaceSupervisorHandle,
     streams: &Streams,
     advances: Option<&Advances>,
     feed: Option<&super::commitment_feed::CommitmentFeed>,
+    owed: &DrainReads,
 ) -> Result<Retirement> {
     verify_peer(&stream)?;
     let request: Request = read_json(&mut stream).await?;
@@ -1054,9 +1189,22 @@ async fn serve_call(
         return Ok(Retirement::Serving);
     }
     if let Call::Hold { job_id } = *call {
-        serve_hold(stream, supervisor, &caller, job_id).await?;
+        serve_hold(stream, supervisor, &caller, job_id, owed).await?;
         return Ok(Retirement::Serving);
     }
+    // What this call can tell a draining supervisor's client about its job's end: `None` for
+    // the end itself, else the stream (stdout 0, stderr 1) a log read advanced.
+    let reads = match &*call {
+        Call::Wait { job_id } | Call::Sealed { job_id } => Some((*job_id, None)),
+        Call::LogRead { job_id, stream, .. } => Some((
+            *job_id,
+            Some(match stream {
+                StreamWire::Stdout => 0,
+                StreamWire::Stderr => 1,
+            }),
+        )),
+        _ => None,
+    };
     let retiring = matches!(*call, Call::Retire { .. });
     let (value, bytes) = match answer(&caller, streams, *call, payload).await {
         Ok(answer) => answer,
@@ -1073,6 +1221,10 @@ async fn serve_call(
             bytes,
         });
     }
+    let eof = value
+        .get("eof")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let answered = async {
         write_json(
             &mut stream,
@@ -1088,6 +1240,17 @@ async fn serve_call(
         Ok::<(), CowshedError>(())
     }
     .await;
+    if answered.is_ok()
+        && let Some((job, stream)) = reads
+    {
+        owed.record(job, |owed| match stream {
+            None => owed.end = true,
+            Some(stream) => {
+                owed.reading[stream] = true;
+                owed.eof[stream] |= eof;
+            }
+        });
+    }
     answered.map(|()| Retirement::Serving)
 }
 
@@ -1122,6 +1285,7 @@ async fn serve_hold(
     supervisor: &WorkspaceSupervisorHandle,
     caller: &WorkspaceSupervisorHandle,
     job_id: JobId,
+    owed: &DrainReads,
 ) -> Result<()> {
     if let Err(error) = caller.info(job_id).await {
         return write_json(&mut stream, &Response::Err(error)).await;
@@ -1138,11 +1302,16 @@ async fn serve_hold(
     tokio::select! {
         biased;
         ended = caller.wait(job_id) => {
+            let delivered_end = ended.is_ok();
             let response = match ended {
                 Ok(info) => Response::Ok { value: to_value(&info)?, bytes: 0 },
                 Err(error) => Response::Err(error),
             };
-            write_json(&mut writer, &response).await
+            let written = write_json(&mut writer, &response).await;
+            if delivered_end && written.is_ok() {
+                owed.record(job_id, |owed| owed.end = true);
+            }
+            written
         }
         demand = read_json::<HoldDemand>(&mut reader) => match demand {
             Ok(HoldDemand::Release) => {
@@ -2893,5 +3062,61 @@ mod admission_source_tests {
             .expect("an object")
             .remove("source");
         assert!(serde_json::from_value::<Call>(unrouted).is_err());
+    }
+}
+
+#[cfg(test)]
+mod drain_read_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn job(id: u64) -> JobId {
+        JobId::new(id).expect("a job id")
+    }
+
+    /// A job is read once its end reached a client and every stream that client was reading
+    /// reached EOF: the end alone leaves the tail of a relayed stream unread.
+    #[tokio::test]
+    async fn a_job_is_read_once_its_end_and_every_stream_being_read_reached_a_client() {
+        let owed = DrainReads::default();
+        assert!(owed.begin([job(1), job(2)].into_iter()));
+        assert!(
+            !owed.begin([job(3)].into_iter()),
+            "a second drain owes nothing new"
+        );
+        owed.record(job(1), |owed| owed.reading[0] = true);
+        owed.record(job(1), |owed| owed.end = true);
+        owed.record(job(2), |owed| owed.end = true);
+        let unread = |owed: &DrainReads| {
+            owed.owed()
+                .iter()
+                .flatten()
+                .filter(|(_, owed)| !owed.read())
+                .map(|(job, _)| *job)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(unread(&owed), [job(1)], "job 1's stdout tail is still owed");
+        owed.record(job(1), |owed| owed.eof[0] = true);
+        let settled = owed.settle(Duration::from_secs(60 * 60)).await;
+        assert_eq!(settled.read, [job(1), job(2)]);
+        assert!(settled.unread.is_empty());
+        assert_eq!(settled.to_string(), "read by a client: [1, 2]");
+    }
+
+    /// A job nobody reads, a detached one, cannot keep a drained supervisor serving: past the
+    /// bound with no client call it retires, and says which ends went unread.
+    #[tokio::test(start_paused = true)]
+    async fn an_end_nobody_reads_is_given_up_after_the_idle_bound_and_named() {
+        let owed = DrainReads::default();
+        owed.begin([job(7)].into_iter());
+        let bound = Duration::from_secs(30 * 60);
+        let settled = owed.settle(bound).await;
+        assert!(settled.read.is_empty());
+        assert_eq!(settled.unread, [job(7)]);
+        assert_eq!(
+            settled.to_string(),
+            "read by a client: []; unread after 30 minutes with no client call: [7]"
+        );
     }
 }
