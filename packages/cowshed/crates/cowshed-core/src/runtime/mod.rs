@@ -39,7 +39,7 @@ pub mod supervisor_manager;
 pub mod supervisor_socket;
 pub mod volume_usage;
 
-pub use nx_daemon::NxKeeperState;
+pub use nx_daemon::{NxKeeperHold, NxKeeperState};
 pub use project::{
     ClonePurpose, JobAnswer, ProjectDescriptor, ProjectRuntime, ProjectRuntimeHost, RecoveryScope,
     RuntimeLogChunk, WorkspaceSnapshot,

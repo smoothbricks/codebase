@@ -927,15 +927,20 @@ spawned itself would run outside the job, and a land skips adopting a volume who
 started outside a keeper, such as main's host daemon, keeps restarting itself, since no keeper would. In a shed whose
 shell is activated, `node` is the one that shell declares (15_capabilities.md, "Bootstrap executables"); in one without,
 it is the `node` `execvp` would find on the job's own bootstrap PATH (the capability `tools/bin` links, the workspace's
-`.cowshed/bin`, the system directories), run by its absolute path. A start that can never run — no executable `node`
-anywhere on that PATH (`ENOENT`, or `EACCES` when one exists but cannot execute) — is refused before any job, once, and
-named on the supervisor's stderr; a lookup that cannot tell (a directory it may not read) runs `node` and is bounded
-below. Any other failed start (its job ended, or was refused admission, and no daemon is live) is reported there too and
-tried again at the next probe, at most 3 in a row: an exit status cannot classify it, since `sandbox-exec` exits 71 both
-for an `execvp` it could not make and for a child that exited 71. A refused or exhausted keeper starts no daemon until a
-probe finds one live, which forgives the failures before it, or the supervisor restarts; the supervisor answers its
-reason to whoever asks the keeper's state, and meanwhile a client that finds no daemon starts its own, as Nx does
-without a keeper. A stop of an idle shed's live daemon that fails is likewise tried at most 3 times in a row, and again
+`.cowshed/bin`, the system directories), run by its absolute path. A start that cannot run — no executable `node`
+anywhere on that PATH (`ENOENT`, or `EACCES` when one exists but cannot execute) — admits no job and is named on the
+supervisor's stderr when its reason changes; each probe repeats the lookup (`stat`s only), and the first that finds a
+`node` starts it. A lookup that cannot tell (a directory it may not read) runs `node`, bounded below. A daemon that
+served and then stopped — idle, or a kept daemon that stopped for its successor — is followed by a successor at the
+next probe and is no failure. Any other failed start (its job ended, or was refused admission, with no daemon live and
+none seen live while it ran) is reported there too and tried again at the next probe, at most 3 in a row: an exit status
+cannot classify it, since `sandbox-exec` exits 71 both for an `execvp` it could not make and for a child that exited 71.
+After 3 the keeper starts none for 60 s, then one; each further failure doubles the pause, up to 15 min. So a failure
+that does not clear costs at most 3 starts and then one per pause, and never halts the keeper: a halted keeper would
+leave every host client to start its own daemon outside the sandbox. A daemon found live, whoever started it, ends the
+pause and resets it to 60 s. Each change of pause is said on the supervisor's stderr with its failures, its length and
+the cap, and the supervisor answers the refusal or the pause (failures, time left, length, cap) to whoever asks the
+keeper's state. A stop of an idle shed's live daemon that fails is likewise tried at most 3 times in a row, and again
 only after a probe finds it gone. A host client finds the daemon through the shared record and connects to it instead
 of starting one outside the sandbox. Main's supervisor keeps no daemon: main is the operator's checkout, and its daemon
 is the host's. A fork deletes the record from the build volume; a land deletes the landing workspace's and gives the

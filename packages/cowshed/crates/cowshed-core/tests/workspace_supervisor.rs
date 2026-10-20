@@ -7285,42 +7285,53 @@ async fn main_leaves_its_nx_daemon_to_the_host() {
     );
 }
 
-/// A shed whose jobs can reach no `node` can never start its daemon: its keeper says why once,
-/// at its first probe, to anyone who asks it, and admits no start job -- never one per probe
-/// that `sandbox-exec` fails with exit 71.
+/// A shed whose jobs can reach no `node` cannot start its daemon: its keeper says why at its
+/// first probe, to anyone who asks it, and admits no start job -- never one per probe that
+/// `sandbox-exec` fails with exit 71. It looks again at each probe, so the `node` that appears
+/// is started at the next one, by its absolute path.
 #[tokio::test(start_paused = true)]
-async fn a_shed_with_no_node_refuses_its_nx_daemon_once_with_its_enoent_named() {
+async fn a_shed_with_no_node_refuses_its_nx_daemon_with_its_enoent_named_until_one_appears() {
+    use cowshed_core::runtime::NxKeeperHold;
+
     let (supervisor_config, _root) = nx_project("nodeless");
-    std::fs::remove_file(fixture_node(&supervisor_config.workspace_root)).unwrap();
+    let project = supervisor_config.workspace_root.clone();
+    let node = fixture_node(&project);
+    std::fs::remove_file(&node).unwrap();
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
-    let keeper = h
-        .handle
-        .nx_daemon_keeper()
-        .await
-        .unwrap()
-        .expect("a shed keeps a daemon");
-    assert_eq!(keeper.starting, None);
-    let halted = keeper.halted.expect("the keeper refused the start");
+    let refused = |keeper: Option<cowshed_core::runtime::NxKeeperState>| {
+        let keeper = keeper.expect("a shed keeps a daemon");
+        assert_eq!(keeper.starting, None);
+        match keeper.held {
+            Some(NxKeeperHold::Refused { why }) => why,
+            held => panic!("the keeper refused the start, not {held:?}"),
+        }
+    };
+    let why = refused(h.handle.nx_daemon_keeper().await.unwrap());
     assert!(
-        halted.contains("no executable `node` on its PATH")
-            && halted.contains(&std::io::Error::from_raw_os_error(libc::ENOENT).to_string()),
-        "{halted}"
-    );
-    assert!(
-        tokio::time::timeout(NX_PROBES, h.spawned.recv())
-            .await
-            .is_err(),
-        "the refused keeper admitted a start job"
+        why.contains("no executable `node` on its PATH")
+            && why.contains(&std::io::Error::from_raw_os_error(libc::ENOENT).to_string()),
+        "{why}"
     );
     assert_eq!(
-        h.handle
-            .nx_daemon_keeper()
-            .await
-            .unwrap()
-            .and_then(|keeper| keeper.halted),
-        Some(halted),
-        "the refusal stands, said once"
+        refused(h.handle.nx_daemon_keeper().await.unwrap()),
+        why,
+        "the next probe refuses the same way"
     );
+    assert!(
+        h.spawned.try_recv().is_err(),
+        "the refused keeper admitted a start job"
+    );
+
+    std::fs::write(&node, b"#!/bin/sh\n").unwrap();
+    let executable = <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755);
+    std::fs::set_permissions(&node, executable).unwrap();
+    let start = h.spawned.recv().await.unwrap();
+    let SpawnCommand::Argv(argv) = &start.request.command else {
+        panic!("the daemon start is an argv");
+    };
+    assert_eq!(argv, &nx_daemon_start(&project));
+    complete(&start, b"", b"", ExitStatus::Exited { code: 1 }).await;
+    h.handle.wait(start.request.job_id).await.unwrap();
 }
 
 /// The unattributed-usage cells of a sealed job-span row: null on every row but that one.

@@ -50,14 +50,26 @@ use crate::sandbox::SandboxConfig;
 /// runs.
 pub(crate) const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How many start jobs in a row may end with no daemon live before the keeper starts no more.
-/// A start that can never run -- no `node` for it, or one that does not exist or cannot execute
-/// -- is refused before its first job ([`daemon_node`]), once. This bounds what no exit status
-/// classifies: `sandbox-exec` exits 71 both for an `execvp` it could not make and for a child that
-/// exited 71, a shell host's 127 is also a program's own, and Node's failures are the program's.
-/// Each failed start is one probe interval apart, so the bound is about 15 s of starts, never a
-/// run's lifetime. A slow start is never counted: no probe starts another while one runs.
+/// How many start jobs in a row may leave no daemon live before the keeper pauses its starts
+/// ([`FIRST_PAUSE`]). A start that can never run -- no executable `node` on the job's PATH -- is
+/// refused before any job ([`daemon_node`]). This bounds what no exit status classifies:
+/// `sandbox-exec` exits 71 both for an `execvp` it could not make and for a child that exited 71,
+/// a shell host's 127 is also a program's own, and Node's failures are the program's. A slow start
+/// is never counted (no probe starts another while one runs), and neither is a daemon that served
+/// and then stopped (a kept daemon whose installation changed stops so its keeper starts the
+/// successor): that start succeeded.
 pub(crate) const START_ATTEMPTS: u32 = 3;
+
+/// How long the keeper starts nothing once [`START_ATTEMPTS`] starts in a row failed; after it, one
+/// start is tried, and each further failure doubles the pause up to [`PAUSE_CAP`]. A keeper that
+/// halted instead would leave every host client to start its own daemon outside the sandbox, the
+/// very thing it exists to prevent; one that tried at every probe would turn a failure that does
+/// not clear into a start every 5 s for the life of the shed. A live daemon, whoever started it,
+/// closes the pause and resets it to this.
+pub(crate) const FIRST_PAUSE: Duration = Duration::from_secs(60);
+
+/// The longest pause between the keeper's starts after failures: at most one start per this long.
+pub(crate) const PAUSE_CAP: Duration = Duration::from_secs(15 * 60);
 
 /// How many stops of an idle shed's live daemon may fail in a row before no probe tries again
 /// while that daemon stays live. A failed stop is a daemon that outlived its `SIGTERM` hang guard
@@ -408,10 +420,37 @@ fn start_request(
 pub struct NxKeeperState {
     /// The start job the keeper waits on.
     pub starting: Option<JobId>,
-    /// Why the keeper starts no daemon however much the shed wants one: a start that can never
-    /// run, or [`START_ATTEMPTS`] in a row that left none live. Lifted when a probe finds a
-    /// daemon live.
-    pub halted: Option<String>,
+    /// Why the keeper starts no daemon now, however much the shed wants one.
+    pub held: Option<NxKeeperHold>,
+}
+
+/// Why a shed's Nx daemon keeper starts no daemon now.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NxKeeperHold {
+    /// No start can run as the sandbox stands -- no executable `node` on the job's PATH, named
+    /// with its `ENOENT` or `EACCES`. No job is admitted; each probe looks again, and the first
+    /// that finds one starts it.
+    Refused { why: String },
+    /// `failures` starts in a row left no daemon live, the last as `why`: none starts for
+    /// `resumes_in`, then one does. `pause` is how long this pause is, `cap` the longest any is.
+    Paused {
+        why: String,
+        failures: u32,
+        resumes_in: Duration,
+        pause: Duration,
+        cap: Duration,
+    },
+}
+
+/// The keeper's own record of why it starts nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Hold {
+    Refused(String),
+    Paused {
+        why: String,
+        until: Instant,
+        pause: Duration,
+    },
 }
 
 /// Where a start job's `node` comes from.
@@ -499,14 +538,15 @@ pub(crate) struct NxDaemonKeeper {
     /// Whether the last probe found the shed unused for [`IDLE`] and no daemon live: nothing is
     /// left for the supervisor to wait for.
     pub(super) settled: bool,
-    /// Start jobs and admissions in a row that left no daemon live ([`START_ATTEMPTS`]).
+    /// Starts in a row that left no daemon live, since a probe last found one live.
     failed_starts: u32,
-    /// Why the keeper starts no daemon although the shed may want one: a start that can never
-    /// run, or [`START_ATTEMPTS`] in a row that left none live. Said once, when it is set. A probe
-    /// that finds a daemon live -- one a client started -- lifts it, so the keeper keeps that one
-    /// and starts again only after it is gone; nothing else does before the supervisor restarts,
-    /// because nothing else changes what its start would meet.
-    halted: Option<String>,
+    /// Whether a probe found a daemon live while the current start job ran: its ending is then a
+    /// daemon that served and stopped, never a failed start.
+    starting_served: bool,
+    /// Why the keeper starts nothing now. Said each time it changes.
+    hold: Option<Hold>,
+    /// The length of the next pause ([`FIRST_PAUSE`], doubling to [`PAUSE_CAP`]).
+    next_pause: Duration,
     /// Stops of the idle shed's live daemon in a row that failed ([`STOP_ATTEMPTS`]); a probe
     /// that finds no daemon live clears it.
     failed_stops: u32,
@@ -541,7 +581,9 @@ impl NxDaemonKeeper {
                     last_look: None,
                     settled: false,
                     failed_starts: 0,
-                    halted: None,
+                    starting_served: false,
+                    hold: None,
+                    next_pause: FIRST_PAUSE,
                     failed_stops: 0,
                 })
             }
@@ -549,46 +591,92 @@ impl NxDaemonKeeper {
     }
 
     /// The start job to admit for the Nx project at `project_root` in the workspace at
-    /// `workspace_root`, running the `node` from `node`; none while the keeper is halted. A start
-    /// that can never run ([`start_request`]) halts it, named, so it is tried once.
+    /// `workspace_root`, running the `node` from `node`; none while a pause runs, or while no
+    /// start can run. That is looked up afresh at each call -- a few `stat`s, no job -- so a
+    /// `node` that appears is started at the next probe; the refusal is said when it changes.
     pub(crate) fn start(
         &mut self,
         workspace_root: &Path,
         project_root: &Path,
         node: NodeSource<'_>,
     ) -> Option<ExecRequest> {
-        if self.halted.is_some() {
-            return None;
+        if let Some(Hold::Paused { until, .. }) = &self.hold {
+            if Instant::now() < *until {
+                return None;
+            }
+            eprintln!(
+                "cowshed: the Nx daemon keeper of {}'s pause is over; trying one start",
+                project_root.display()
+            );
+            self.hold = None;
         }
         match start_request(workspace_root, project_root, node) {
-            Ok(request) => Some(request),
+            Ok(request) => {
+                if let Some(Hold::Refused(_)) = self.hold.take() {
+                    eprintln!(
+                        "cowshed: the Nx daemon of {} can start now; starting it",
+                        project_root.display()
+                    );
+                }
+                Some(request)
+            }
             Err(error) => {
-                self.halt(format!("{} (next: {})", error.message, error.hint));
+                self.refuse(format!("{} (next: {})", error.message, error.hint));
                 None
             }
         }
+    }
+
+    /// Start nothing while no start can run, for `why`; said once for each new reason.
+    pub(crate) fn refuse(&mut self, why: String) {
+        if self.hold != Some(Hold::Refused(why.clone())) {
+            eprintln!(
+                "cowshed: {why}; the shed's supervisor starts no Nx daemon until one can run, \
+                 looking again at every probe"
+            );
+        }
+        self.hold = Some(Hold::Refused(why));
     }
 
     /// What the keeper has decided: the start job it waits on, and why it starts none.
     pub(crate) fn state(&self) -> NxKeeperState {
         NxKeeperState {
             starting: self.starting,
-            halted: self.halted.clone(),
+            held: self.hold.as_ref().map(|hold| match hold {
+                Hold::Refused(why) => NxKeeperHold::Refused { why: why.clone() },
+                Hold::Paused { why, until, pause } => NxKeeperHold::Paused {
+                    why: why.clone(),
+                    failures: self.failed_starts,
+                    resumes_in: until.saturating_duration_since(Instant::now()),
+                    pause: *pause,
+                    cap: PAUSE_CAP,
+                },
+            }),
         }
     }
 
     /// A probe found the daemon `daemon`. A live one, whoever started it, proves a start can
-    /// succeed: the failures before it are forgiven and a halt is lifted.
-    pub(crate) fn observe(&mut self, daemon: Probe) {
-        if daemon == Probe::Live {
-            self.failed_starts = 0;
-            self.halted = None;
+    /// succeed: the failures before it are forgiven, a pause ends and the next is
+    /// [`FIRST_PAUSE`] again.
+    pub(crate) fn observe(&mut self, daemon: Probe, project_root: &Path) {
+        if daemon != Probe::Live {
+            return;
+        }
+        self.starting_served |= self.starting.is_some();
+        self.failed_starts = 0;
+        self.next_pause = FIRST_PAUSE;
+        if let Some(Hold::Paused { .. }) = self.hold.take() {
+            eprintln!(
+                "cowshed: the Nx daemon of {} is live; its keeper's pause is closed",
+                project_root.display()
+            );
         }
     }
 
     /// The start job `job_id` ended as `ending` (`None`: it exited 0), and the probe after it
-    /// found the daemon `daemon`. Said on the supervisor's stderr unless it exited 0 and left the
-    /// daemon live; one that left no daemon live is a failed start.
+    /// found the daemon `daemon`. A daemon that served and then stopped -- idle, or kept and its
+    /// installation changed -- is followed by a successor at once, and is no failure. One that
+    /// never served and left no daemon live is a failed start.
     pub(crate) fn start_ended(
         &mut self,
         job_id: JobId,
@@ -596,6 +684,7 @@ impl NxDaemonKeeper {
         project_root: &Path,
         daemon: Probe,
     ) {
+        let served = std::mem::take(&mut self.starting_served);
         let what = |ending: &str| {
             format!(
                 "Nx daemon start job {} for {} {ending}, and the daemon is {daemon}",
@@ -606,6 +695,14 @@ impl NxDaemonKeeper {
         match (ending, daemon) {
             (None, Probe::Live) => {}
             (Some(ending), Probe::Live) => eprintln!("cowshed: {}", what(&ending)),
+            (ending, Probe::Unrecorded | Probe::Unreadable | Probe::Dead | Probe::Refused)
+                if served =>
+            {
+                eprintln!(
+                    "cowshed: {} after it served; starting its successor",
+                    what(ending.as_deref().unwrap_or("exited 0"))
+                );
+            }
             (ending, Probe::Unrecorded | Probe::Unreadable | Probe::Dead | Probe::Refused) => {
                 self.start_failed(what(ending.as_deref().unwrap_or("exited 0")));
             }
@@ -613,7 +710,8 @@ impl NxDaemonKeeper {
     }
 
     /// A start that left no daemon live, `what` saying how: another follows at the next probe
-    /// until [`START_ATTEMPTS`] have failed in a row, and then none does.
+    /// until [`START_ATTEMPTS`] have failed in a row; then starts pause, said with the failures,
+    /// the pause and its cap, and one start follows each pause.
     pub(crate) fn start_failed(&mut self, what: String) {
         self.failed_starts += 1;
         if self.failed_starts < START_ATTEMPTS {
@@ -624,19 +722,20 @@ impl NxDaemonKeeper {
             );
             return;
         }
-        self.halt(format!(
-            "{what}; {START_ATTEMPTS} starts in a row left no daemon live"
-        ));
-    }
-
-    /// Start no daemon, for `why`, until a probe finds one live. Said once, here: an Nx client
-    /// that finds no daemon meanwhile starts its own, as Nx does without a keeper.
-    pub(crate) fn halt(&mut self, why: String) {
+        let pause = self.next_pause;
+        self.next_pause = (pause * 2).min(PAUSE_CAP);
         eprintln!(
-            "cowshed: {why}; the shed's supervisor starts no Nx daemon until it finds one live or \
-             restarts"
+            "cowshed: {what}; {} starts in a row left no daemon live, so the keeper starts none \
+             for {}s, then one (pauses double to {}s); a live daemon ends the pause",
+            self.failed_starts,
+            pause.as_secs(),
+            PAUSE_CAP.as_secs()
         );
-        self.halted = Some(why);
+        self.hold = Some(Hold::Paused {
+            why: what,
+            until: Instant::now() + pause,
+            pause,
+        });
     }
 
     /// Judge one probe of the Nx project at `project_root`, whose daemon the probe found
@@ -1077,58 +1176,54 @@ mod tests {
         root: &Path,
         node: NodeSource<'_>,
     ) -> Option<ExecRequest> {
-        keeper.observe(Probe::Unrecorded);
+        keeper.observe(Probe::Unrecorded, root);
         keeper.start(root, root, node)
+    }
+
+    fn refused(keeper: &NxDaemonKeeper) -> String {
+        match keeper.state().held {
+            Some(NxKeeperHold::Refused { why }) => why,
+            held => panic!("the keeper holds its start as refused, not {held:?}"),
+        }
     }
 
     /// The 2026-10-20 incident: no shell activates the shed and no `node` lies on the job's
     /// bootstrap PATH. `sandbox-exec` met it as exit 71 at every probe, 272 starts in 1,361 s.
-    /// The keeper now names the `ENOENT` and the PATH at its first probe and admits nothing more:
-    /// a `node` appearing afterwards is not seen until a daemon is found live, and the start
-    /// then runs that `node` by its absolute path.
+    /// The keeper now names the `ENOENT` and the PATH at its first probe and admits no job; it
+    /// looks again at every probe, so the probe after a `node` appears starts it by its
+    /// absolute path.
     #[tokio::test(start_paused = true)]
-    async fn a_start_with_no_node_on_its_path_is_refused_once_with_its_enoent_named() {
+    async fn a_start_with_no_node_on_its_path_is_refused_without_a_job_until_one_appears() {
         let (root, path) = scratch();
         let node = NodeSource::Path(&path);
         let mut keeper = keeper();
 
         assert!(probe_and_start(&mut keeper, &root, node).is_none());
-        let halted = keeper
-            .state()
-            .halted
-            .expect("the first probe halts the keeper");
+        let why = refused(&keeper);
+        assert!(why.contains(&root.join("a").display().to_string()), "{why}");
         assert!(
-            halted.contains(&root.join("a").display().to_string()),
-            "{halted}"
+            why.contains(&io::Error::from_raw_os_error(libc::ENOENT).to_string()),
+            "the refusal names ENOENT: {why}"
         );
-        assert!(
-            halted.contains(&io::Error::from_raw_os_error(libc::ENOENT).to_string()),
-            "the refusal names ENOENT: {halted}"
-        );
-
-        // A keeper that tried again would now admit a start.
-        plant(&root.join("b/node"), 0o755);
         for _ in 1..272 {
             assert!(
                 probe_and_start(&mut keeper, &root, node).is_none(),
-                "a halted keeper attempts nothing"
+                "no job while no `node` can run"
             );
         }
-        assert_eq!(keeper.state().halted.as_deref(), Some(halted.as_str()));
+        assert_eq!(refused(&keeper), why, "the same refusal stands");
 
-        keeper.observe(Probe::Live);
-        assert_eq!(keeper.state().halted, None, "a live daemon lifts the halt");
-        let request = keeper
-            .start(&root, &root, node)
-            .expect("a start once lifted");
+        plant(&root.join("b/node"), 0o755);
+        let request = probe_and_start(&mut keeper, &root, node).expect("the next probe starts it");
         assert_eq!(program(&request), root.join("b/node").as_os_str());
+        assert_eq!(keeper.state().held, None);
         std::fs::remove_dir_all(&root).expect("remove scratch");
     }
 
     /// `node` is found as `execvp` finds it on the job's PATH: one that cannot execute is passed
     /// over for one further on, and when none further on can run, its `EACCES` is named at once.
     #[tokio::test(start_paused = true)]
-    async fn a_start_whose_only_node_cannot_execute_is_refused_once_with_its_eacces_named() {
+    async fn a_start_whose_only_node_cannot_execute_is_refused_with_its_eacces_named() {
         let (root, path) = scratch();
         let node = NodeSource::Path(&path);
         plant(&root.join("a/node"), 0o644);
@@ -1141,10 +1236,10 @@ mod tests {
         std::fs::remove_file(root.join("b/node")).expect("remove");
         let mut keeper = keeper();
         assert!(probe_and_start(&mut keeper, &root, node).is_none());
-        let halted = keeper.state().halted.expect("halted");
+        let why = refused(&keeper);
         assert!(
-            halted.contains(&io::Error::from_raw_os_error(libc::EACCES).to_string()),
-            "the refusal names EACCES: {halted}"
+            why.contains(&io::Error::from_raw_os_error(libc::EACCES).to_string()),
+            "the refusal names EACCES: {why}"
         );
         std::fs::remove_dir_all(&root).expect("remove scratch");
     }
@@ -1161,43 +1256,103 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("remove scratch");
     }
 
-    /// A start that ran and left no daemon live is a failure no exit status classifies, so it is
-    /// tried again at the next probe up to [`START_ATTEMPTS`] in a row, and then not. A start that
-    /// left the daemon live, whatever its exit, is no failure, and a live daemon forgives the
-    /// failures before it.
-    #[tokio::test(start_paused = true)]
-    async fn a_start_that_ran_and_failed_is_tried_again_up_to_its_bound() {
+    /// One start as the supervisor makes it, its job ending as `ending` while the probe after it
+    /// finds the daemon `daemon`; `served` whether a probe found it live while it ran.
+    fn one_start(keeper: &mut NxDaemonKeeper, served: bool, ending: Option<&str>, daemon: Probe) {
         let root = Path::new(NO_PROJECT);
+        keeper
+            .start(root, root, NodeSource::Shell)
+            .expect("a start is admitted");
         let job = JobId::new(1).expect("job id");
-        let mut keeper = keeper();
-        for _ in 1..START_ATTEMPTS {
-            keeper.start_ended(job, Some("exited 71".to_owned()), root, Probe::Dead);
-            assert!(
-                keeper.start(root, root, NodeSource::Shell).is_some(),
-                "below the bound"
-            );
+        keeper.starting = Some(job);
+        if served {
+            keeper.observe(Probe::Live, root);
         }
-        keeper.observe(Probe::Live);
-        keeper.start_ended(job, Some("exited 1".to_owned()), root, Probe::Live);
-        for _ in 1..START_ATTEMPTS {
-            keeper.start_ended(job, Some("exited 1".to_owned()), root, Probe::Refused);
+        keeper.observe(daemon, root);
+        keeper.starting = None;
+        keeper.start_ended(job, ending.map(str::to_owned), root, daemon);
+    }
+
+    /// The pause the keeper holds its starts in: failures, time left, length and cap.
+    fn paused(keeper: &NxDaemonKeeper) -> (u32, Duration, Duration, Duration) {
+        match keeper.state().held {
+            Some(NxKeeperHold::Paused {
+                why,
+                failures,
+                resumes_in,
+                pause,
+                cap,
+            }) => {
+                assert!(
+                    why.contains("exited 71"),
+                    "the pause names its failure: {why}"
+                );
+                (failures, resumes_in, pause, cap)
+            }
+            held => panic!("the keeper holds its starts paused, not {held:?}"),
+        }
+    }
+
+    /// A start that ran and left no daemon live is a failure no exit status classifies: up to
+    /// [`START_ATTEMPTS`] in a row are tried at successive probes, then starts pause for
+    /// [`FIRST_PAUSE`], and one start follows each pause, which doubles after every failure up
+    /// to [`PAUSE_CAP`]. The pause is answered with its failures, time left, length and cap. A
+    /// live daemon closes it and the next pause is [`FIRST_PAUSE`] again.
+    #[tokio::test(start_paused = true)]
+    async fn failed_starts_pause_after_their_bound_and_a_live_daemon_resets_the_pause() {
+        let root = Path::new(NO_PROJECT);
+        let mut keeper = keeper();
+        for _ in 0..START_ATTEMPTS {
+            assert_eq!(keeper.state().held, None, "below the bound");
+            one_start(&mut keeper, false, Some("exited 71"), Probe::Dead);
         }
         assert_eq!(
-            keeper.state().halted,
-            None,
-            "the live daemon reset the count"
+            paused(&keeper),
+            (START_ATTEMPTS, FIRST_PAUSE, FIRST_PAUSE, PAUSE_CAP)
         );
 
-        keeper.start_ended(job, None, root, Probe::Unrecorded);
-        let halted = keeper.state().halted.expect("halted at the bound");
-        assert!(
-            halted.contains("exited 0") && halted.contains("3 starts in a row"),
-            "{halted}"
+        let mut pause = FIRST_PAUSE;
+        for failures in START_ATTEMPTS + 1..START_ATTEMPTS + 7 {
+            tokio::time::advance(pause - Duration::from_secs(1)).await;
+            assert!(
+                keeper.start(root, root, NodeSource::Shell).is_none(),
+                "no start while the pause runs"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            one_start(&mut keeper, false, Some("exited 71"), Probe::Dead);
+            pause = (pause * 2).min(PAUSE_CAP);
+            assert_eq!(paused(&keeper), (failures, pause, pause, PAUSE_CAP));
+        }
+        assert_eq!(pause, PAUSE_CAP, "the pause stops doubling at its cap");
+
+        keeper.observe(Probe::Live, root);
+        assert_eq!(keeper.state().held, None, "a live daemon closes the pause");
+        for _ in 0..START_ATTEMPTS {
+            one_start(&mut keeper, false, Some("exited 71"), Probe::Dead);
+        }
+        assert_eq!(
+            paused(&keeper),
+            (START_ATTEMPTS, FIRST_PAUSE, FIRST_PAUSE, PAUSE_CAP),
+            "a live daemon reset the doubling"
         );
-        assert!(
-            keeper.start(root, root, NodeSource::Shell).is_none(),
-            "at the bound"
-        );
+    }
+
+    /// A kept daemon whose installation changed stops, deleting its record and exiting 0, so its
+    /// keeper starts the successor. That daemon served: its start succeeded, and no number of
+    /// such stops counts toward [`START_ATTEMPTS`]. Nor does a start whose job ended while the
+    /// daemon is live.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_served_and_stopped_is_followed_by_its_successor_never_counted() {
+        let mut keeper = keeper();
+        for _ in 0..START_ATTEMPTS * 3 {
+            one_start(&mut keeper, true, None, Probe::Unrecorded);
+            assert_eq!(keeper.state().held, None);
+        }
+        for _ in 0..START_ATTEMPTS * 3 {
+            one_start(&mut keeper, false, Some("exited 1"), Probe::Live);
+            assert_eq!(keeper.state().held, None);
+        }
+        assert_eq!(keeper.failed_starts, 0);
     }
 
     /// An idle shed's live daemon whose stop fails is stopped again at the next probe up to

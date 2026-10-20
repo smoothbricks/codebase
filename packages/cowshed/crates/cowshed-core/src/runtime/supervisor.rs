@@ -5732,10 +5732,11 @@ impl SupervisorActor {
     /// developer activity, report its terminal failure, then judge whether the shed still
     /// wants a daemon ([`NxDaemonKeeper::judge`]), stopping one it no longer wants; start the
     /// daemon, inside the sandbox, when the shed wants one, the probe finds none live and the
-    /// keeper is not halted. Nobody waits for the start, so a failure is said where the
-    /// supervisor's own failures go. A start that can never run is refused once, named, and
-    /// halts the keeper; one that failed otherwise is tried again at the next probe, up to
-    /// [`super::nx_daemon::START_ATTEMPTS`] in a row.
+    /// keeper holds no start. Nobody waits for the start, so a failure is said where the
+    /// supervisor's own failures go. A start that can never run is refused, named, and looked at
+    /// again at each probe without a job; one that failed otherwise is tried again at the next
+    /// probe, up to [`super::nx_daemon::START_ATTEMPTS`] in a row, then after each pause
+    /// ([`super::nx_daemon::FIRST_PAUSE`] doubling to [`super::nx_daemon::PAUSE_CAP`]).
     async fn keep_nx_daemon(&mut self) {
         let Some(keeper) = &mut self.nx_daemon else {
             return;
@@ -5753,7 +5754,7 @@ impl SupervisorActor {
         let running = keeper
             .starting
             .is_some_and(|id| self.jobs.get(&id).is_some_and(|job| !job.terminal()));
-        keeper.observe(daemon);
+        keeper.observe(daemon, &project_root);
         if !running && let Some(job_id) = keeper.starting.take() {
             let job = self.jobs.get(&job_id).map(|job| &job.info);
             keeper.start_ended(
@@ -5782,7 +5783,7 @@ impl SupervisorActor {
             None => match bootstrap_path(read_write) {
                 Ok(path) => Some(path),
                 Err(error) => {
-                    keeper.halt(format!(
+                    keeper.refuse(format!(
                         "the Nx daemon of {} cannot start: {}",
                         project_root.display(),
                         error.message
