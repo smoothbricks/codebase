@@ -194,6 +194,19 @@ is left. A gateway that does not answer `cpu-budget` is not waited on, and the i
 nothing (no daemon answers, or the refresh finds the agent current) does not wait. The restart and its refusals
 themselves are unchanged.
 
+**A land step holds the install slot.** The ledger shows a land only while one of its gates runs, and a land is several
+cowshed commands with none running between them: measured 2026-10-20, an install found the ledger empty as a land's
+first gate ended and restarted the gateway as its host gate started, and that gate's `cowshed exec` failed with the
+daemon's socket refusing the connection, failing the land. So every command a land runs — `exec --class gate`, `rebase`
+and `land` — holds the install slot ("The install slot", below) shared from before it asks the daemon anything until it
+ends. An install takes the slot exclusive, so it waits for every land step in flight, and a land step that starts while
+an install holds the slot waits for that install and then reaches the gateway it installed, saying on stderr that it
+waits and for which file. Between two steps a land waits for an install; it is never cut off by one. The ledger is never
+this guard, however its entries are kept: between two of a land's commands no process of that land holds anything the
+gateway records, so an install that asks the ledger whether a land runs is answered "no" mid-land. Ordinary work does
+not hold the slot: a long-lived background exec would hold every install back. Status reads the slot without taking it,
+so land steps alone never read as a pending install.
+
 **Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
 the new build's and the one it replaced is removed. The replaced build stays one install longer: a workspace supervisor
 of that build, still draining its jobs (11_shell.md "Draining a supervisor of another build"), starts the shells those

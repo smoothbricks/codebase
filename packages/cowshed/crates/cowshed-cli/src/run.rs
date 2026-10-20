@@ -15,8 +15,8 @@ use cowshed_gateway::{GATEWAY_GIT_FETCH_HELPER_ARG, run_gateway_git_fetch_helper
 
 use crate::capabilities::sccache;
 use crate::{
-    args, controller_service, credential_service, gateway_service, help, identity_service, output,
-    runtime, setup_service, skill,
+    args, controller_service, credential_service, gateway_service, help, identity_service,
+    install_basis, output, runtime, setup_service, skill,
 };
 
 /// How one invocation ends.
@@ -224,6 +224,22 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             setup_service::dispatch_native(setup_args, parsed.global.json, &mut output).await;
         return Ok(finish(outcome, &mut output, json));
     }
+    // A land step holds the install slot shared until it ends, so no install restarts the gateway
+    // under it, and one that holds the slot now is waited for (`install_basis::LandHold`). Taken
+    // before the build check, so the step judges the daemon the install it waited for left.
+    let _land_hold = if is_land_step(&parsed.command) {
+        let held = async {
+            let home = cowshed_core::gateway_sessions::canonical_home()?;
+            install_basis::LandHold::take(&cowshed_core::host_dirs::support_directory(&home)).await
+        }
+        .await;
+        match held {
+            Ok(hold) => Some(hold),
+            Err(error) => return Ok(finish(Err(error), &mut output, json)),
+        }
+    } else {
+        None
+    };
     // The daemon refuses another build's cowshed at the first supervisor a verb asks for, which
     // is after the verb's first step. Ask it now, before anything is changed.
     if let Err(error) = runtime::require_daemon_of_this_build(&parsed.command).await {
@@ -366,6 +382,17 @@ fn runtime_dispatch(command: &args::Command) -> RuntimeDispatch {
     }
 }
 
+/// The commands a land runs, each of which an install must neither cut off nor start under:
+/// its gates (`exec --class gate`), its rebase and its land. Ordinary work is not one: a
+/// long-lived background exec must not hold every install back.
+fn is_land_step(command: &args::Command) -> bool {
+    match command {
+        args::Command::Exec(exec) => exec.class == cowshed_core::api::dto::ExecClass::Gate,
+        args::Command::Rebase(_) | args::Command::Land(_) => true,
+        _ => false,
+    }
+}
+
 /// Turn one command's outcome into this process's exit code, reporting a failure in whichever
 /// format the caller asked for. Every dispatch path ends here so none of them can grow its own
 /// idea of how an error is written.
@@ -421,6 +448,27 @@ fn write_error<W: io::Write, E: io::Write>(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn a_lands_gates_rebase_and_land_hold_the_install_slot_and_ordinary_work_does_not() {
+        let step = |argv: &[&str]| {
+            is_land_step(
+                &args::parse_args(argv.iter().map(OsString::from))
+                    .expect("valid command")
+                    .command,
+            )
+        };
+        assert!(step(&[
+            "exec", "raven", "--class", "gate", "--host", "--", "gate"
+        ]));
+        assert!(step(&["rebase", "raven", "--gate"]));
+        assert!(step(&["land", "raven"]));
+        assert!(!step(&["exec", "raven", "--", "build"]));
+        assert!(!step(&[
+            "exec", "raven", "--class", "resident", "--", "serve"
+        ]));
+        assert!(!step(&["ls"]));
+    }
 
     #[tokio::test]
     async fn parser_invalid_invocations_never_invoke_a_service() {
