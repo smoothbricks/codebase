@@ -30,7 +30,7 @@ use cowshed_core::{
         GcReport, GitOid, GrantSet, HostLoadSample, JobAccounting, JobId, JobInfo,
         JobLeafAttribution, JobProcessLeaf, JobResourceSample, JobState, JobStreamWatermark,
         JobVolumeUsage, LandReport, LandingCommits, OneCoreCpuPercent, OneCoreCpuPermille,
-        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, ProcessCoverage,
+        OutputLimitInfo, OutputStorage, OutputSummary, PortBlock, PreservedRef, ProcessCoverage,
         ProcessCoverageGap, ProtectedOutput, PushReport, RebaseBuildVolume, RebaseCarrySkip,
         RebaseReport, RemoveReport, RepoRule, ResidentBytes, ResizeResult, ResizeVolume,
         Sha256Digest, SimVerb, SpanId, StdinInfo, StdinKind, StreamBytes, StreamInfo, StreamLines,
@@ -1019,6 +1019,13 @@ fn reports() -> BTreeMap<&'static str, BTreeMap<&'static str, Value>> {
             target_head: Some(oid("6666666666666666666666666666666666666666")),
             unlanded_commits: 4,
             branches: Vec::new(),
+            preserved: vec![PreservedRef {
+                name: "HEAD".to_owned(),
+                tip: oid("5555555555555555555555555555555555555555"),
+                reference:
+                    "refs/cowshed/cs-seam/abandoned/5555555555555555555555555555555555555555/HEAD"
+                        .to_owned(),
+            }],
             bundle: PathBuf::from("/Users/fixture/Dev/.cowshed/abandoned/cs-seam.bundle"),
         }),
     };

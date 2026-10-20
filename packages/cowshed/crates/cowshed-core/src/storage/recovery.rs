@@ -16,11 +16,12 @@ use cowshed_os::fork_lock::Fenced;
 pub const STAGING_NAMESPACE: &str = ".staging";
 pub const TRASH_NAMESPACE: &str = ".trash";
 /// Extension of the recovery bundle a removal verifies and writes into the trash before it
-/// abandons unlanded work: `sessions/.trash/<ws>-<tip>.bundle`. It is the only copy of those
-/// commits, so only a sweep explicitly authorized for them reclaims it.
+/// abandons unlanded work: `sessions/.trash/<ws>-<tip>.bundle`. Its tips are also kept as refs in
+/// main's repository (02_workspaces.md, `rm` step 1), which a sweep re-asserts before it reclaims
+/// one; only a sweep explicitly authorized for them reclaims it.
 pub const ABANDON_BUNDLE_EXTENSION: &str = "bundle";
 
-/// What a project's trash keeps of `rm --abandon`: its abandon bundles, the only copy of the
+/// What a project's trash keeps of `rm --abandon`: its abandon bundles, recovery files for the
 /// commits each removal gave up, which only an explicit `gc --abandoned` deletes. The surfaces
 /// that never otherwise show the trash — `ls --all`, plain `gc`, `doctor` — name them with this.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,8 +110,8 @@ impl std::fmt::Display for KeptAbandonBundles {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{} keeps {} abandon {} totalling {} bytes, the only copy of the commits \
-             `rm --abandon` gave up, which no plain gc deletes",
+            "{} keeps {} abandon {} totalling {} bytes of the commits `rm --abandon` gave up, \
+             which no plain gc deletes",
             self.trash.display(),
             self.count,
             if self.count == 1 { "bundle" } else { "bundles" },

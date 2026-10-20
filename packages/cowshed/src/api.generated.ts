@@ -2,11 +2,11 @@
 import type { tags } from 'typia';
 
 /**
- * The commits a `--abandon` removal destroyed, and where their bundle went.
+ * The commits a `--abandon` removal destroyed, and where they are kept.
  *
  * Every field is what a reader needs to *undo* the abandonment: the tip that is gone, the branch
- * it never reached and where that branch stood, how much history went with it, and the bundle to
- * fetch from.
+ * it never reached and where that branch stood, how much history went with it, the refs main's
+ * repository keeps it under, and the bundle to fetch from.
  */
 export type AbandonedWork = {
   readonly head: GitOid;
@@ -20,6 +20,12 @@ export type AbandonedWork = {
    * The local branches besides `head` whose unheld commits went into the bundle as refs.
    */
   readonly branches?: ReadonlyArray<BranchLanding>;
+  /**
+   * `HEAD` and each of `branches`, as main's repository keeps them: under
+   * `refs/cowshed/<ws>/abandoned/<head>/`, written before the image is retired. Empty for
+   * main's own `--restore --abandon`, whose bundle the restored checkout keeps.
+   */
+  readonly preserved: ReadonlyArray<PreservedRef>;
   readonly bundle: string;
 };
 
@@ -987,8 +993,8 @@ export type GcDeferred = {
 export type GcOptions = {
   readonly dryRun?: boolean;
   /**
-   * Also reclaim the project trash's abandon bundles — `sessions/.trash/<ws>-<tip>.bundle`,
-   * the only copy of the commits `rm --abandon` gave up (02_workspaces.md). Never implied.
+   * Also reclaim the project trash's abandon bundles — `sessions/.trash/<ws>-<tip>.bundle` —
+   * once main's repository keeps each one's tips (01_storage.md). Never implied.
    */
   readonly abandoned?: boolean;
 };
@@ -1758,6 +1764,21 @@ export type PendingInstall = {
 export type PortBlock = {
   readonly base: number & tags.Type<'uint32'> & tags.Maximum<65535>;
   readonly size: number & tags.Type<'uint32'> & tags.Maximum<65535>;
+};
+
+/**
+ * One tip an abandonment kept in main's repository.
+ */
+export type PreservedRef = {
+  /**
+   * `HEAD`, or the branch's short name.
+   */
+  readonly name: string;
+  readonly tip: GitOid;
+  /**
+   * The full ref name in main's repository that holds `tip`.
+   */
+  readonly reference: string;
 };
 
 /**

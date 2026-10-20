@@ -24,6 +24,12 @@
 //!   bookkeeping, gone with it under the release's claim. The line says whether the sidecar
 //!   recorded the volume as a seed and names the workspace it recorded, read before anything
 //!   was deleted, because that is what nothing else can tell once the volume is gone.
+//! * Git facts are written where they are known, never reconstructed. A workspace retirement
+//!   (`retire-workspace`) is the one line that is not an unlink: the rename into trash is the
+//!   moment the workspace's repository stops being reachable, and the line records its head and
+//!   every local branch with what keeps each tip — a ref in main's repository, or the target
+//!   that held it. Keeping an abandon bundle's tips before `gc --abandoned` deletes it
+//!   (`keep-abandoned-tips`) records the refs the same way, under the bundle's path.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -76,6 +82,10 @@ pub enum DeletionOp {
     RemoveAbandonedBundle,
     #[serde(rename = "release-build-volume")]
     ReleaseBuildVolume,
+    #[serde(rename = "retire-workspace")]
+    RetireWorkspace,
+    #[serde(rename = "keep-abandoned-tips")]
+    KeepAbandonedTips,
 }
 
 impl std::fmt::Display for DeletionOp {
@@ -90,6 +100,8 @@ impl std::fmt::Display for DeletionOp {
             Self::RemoveOrphanMountpoint => "remove-orphan-mountpoint",
             Self::RemoveAbandonedBundle => "remove-abandoned-bundle",
             Self::ReleaseBuildVolume => "release-build-volume",
+            Self::RetireWorkspace => "retire-workspace",
+            Self::KeepAbandonedTips => "keep-abandoned-tips",
         };
         formatter.write_str(tag)
     }
@@ -109,9 +121,69 @@ pub struct DeletionLogEntry {
     /// mountpoint directory has no image by definition).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<PathBuf>,
-    /// The exact path that was unlinked.
+    /// The exact path that was unlinked; for `retire-workspace`, the checkout that retired.
     pub artifact: PathBuf,
     pub kind: DeletionKind,
+    /// The workspace's Git tips and what keeps each, for the lines that retire Git history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitTips>,
+}
+
+/// A retired repository's head and every tip it held, each with what keeps it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTips {
+    pub head: crate::api::dto::GitOid,
+    /// `HEAD` first, then every local branch in name order.
+    pub tips: Vec<KeptTip>,
+}
+
+/// One tip: `HEAD`, or a branch's short name.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptTip {
+    pub name: String,
+    pub tip: crate::api::dto::GitOid,
+    pub kept: KeptBy,
+}
+
+/// What keeps a tip once its workspace is gone.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "by", rename_all = "camelCase")]
+pub enum KeptBy {
+    /// `reference` in the repository at `repository` holds the tip itself: main's, or for a
+    /// purge the retained checkout the restore puts back, where the ref outlives the project.
+    Ref {
+        repository: PathBuf,
+        reference: String,
+    },
+    /// The removal gate proved `branch` (at `head`), or a ref `cowshed push` wrote, holds the
+    /// tip's changes (02_workspaces.md, `rm` step 1).
+    Target {
+        branch: String,
+        head: crate::api::dto::GitOid,
+    },
+}
+
+/// Best-effort append of a line carrying Git facts, under the same never-fail rule as
+/// [`log_deletion`].
+pub fn log_git_tips(
+    project_root: &Path,
+    op: DeletionOp,
+    workspace: &str,
+    artifact: &Path,
+    git: GitTips,
+) {
+    let entry = DeletionLogEntry {
+        at: rfc3339_utc(SystemTime::now()),
+        op,
+        workspace: workspace.to_owned(),
+        image: None,
+        artifact: artifact.to_path_buf(),
+        kind: DeletionKind::Other,
+        git: Some(git),
+    };
+    append_entry(project_root, &entry);
 }
 
 /// The controller's own record that it removed an image's CA companion.
@@ -156,6 +228,7 @@ pub fn log_deletion(
         image: image.map(Path::to_path_buf),
         artifact: artifact.to_path_buf(),
         kind,
+        git: None,
     };
     append_entry(project_root, &entry);
 }
@@ -417,6 +490,7 @@ mod tests {
             image: Some(image.clone()),
             artifact: companion.clone(),
             kind: DeletionKind::Companion,
+            git: None,
         };
         let newer = DeletionLogEntry {
             at: "2026-06-01T00:00:00Z".to_owned(),
@@ -425,6 +499,7 @@ mod tests {
             image: Some(image.clone()),
             artifact: companion.clone(),
             kind: DeletionKind::Companion,
+            git: None,
         };
         append_entry(&project, &older);
         append_entry(&project, &newer);

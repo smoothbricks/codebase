@@ -967,7 +967,11 @@ async fn rm_retires_a_pending_fork_after_its_source_is_removed() {
         .expect("stop the image-free removing runtime");
 }
 
-/// Losing a finished fork's source never authorizes losing its unlanded commits.
+/// Losing a finished fork's source never authorizes losing its unlanded commits, and abandoning
+/// them keeps them: `--abandon` writes the head into main's repository under
+/// `refs/cowshed/<ws>/abandoned/<head>/` before the image retires, and the deletion log names the
+/// head and that ref. A bundle whose refs are gone — what an earlier build left — gets them back
+/// from `gc --abandoned` before the sweep deletes it, journaled the same way.
 #[tokio::test]
 async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed() {
     let fixture = Fixture::new("rm-unlanded-fork");
@@ -1024,7 +1028,137 @@ async fn rm_keeps_a_finished_forks_unlanded_commits_after_its_source_is_removed(
                 .exists()
         );
     }
-    rm.shutdown().await.expect("stop the refusing runtime");
+
+    let abandoned = fixture
+        .call(
+            &rm,
+            "coordinator.destroy",
+            json!({
+                "repoId": fixture.repo, "workspace": "finished",
+                "options": RemoveOptions { abandon: true, ..RemoveOptions::default() },
+            }),
+        )
+        .await
+        .expect("--abandon retires the unlanded fork");
+    rm.shutdown().await.expect("stop the abandoning runtime");
+    let reference = format!("refs/cowshed/finished/abandoned/{original_head}/HEAD");
+    let kept_head = json!({ "name": "HEAD", "tip": original_head, "reference": reference });
+    assert!(
+        abandoned["abandoned"]["preserved"]
+            .as_array()
+            .is_some_and(|kept| kept.contains(&kept_head)),
+        "{abandoned}"
+    );
+    assert_eq!(
+        resolved(&fixture.checkout, &reference),
+        original_head,
+        "main's repository holds the abandoned commit"
+    );
+    let retired = deletion_log(&fixture, "retire-workspace", "finished");
+    assert_eq!(retired["git"]["head"], json!(original_head), "{retired}");
+    assert_kept_by_ref(&retired, &original_head, &fixture.checkout, &reference);
+
+    // An earlier build abandoned into the bundle alone: without the ref, the bundle in the trash
+    // is the only copy, and `gc --abandoned` keeps its tips before it deletes it.
+    git(&fixture.checkout, &["update-ref", "-d", &reference]);
+    let bundle = PathBuf::from(
+        abandoned["abandoned"]["bundle"]
+            .as_str()
+            .expect("bundle path"),
+    );
+    let gc = fixture.gc().await;
+    fixture
+        .call(
+            &gc,
+            "coordinator.gc",
+            json!({ "repoId": fixture.repo, "options": { "dryRun": false, "abandoned": true } }),
+        )
+        .await
+        .expect("gc --abandoned");
+    gc.shutdown().await.expect("stop gc");
+    assert!(!bundle.exists(), "the sweep deleted {}", bundle.display());
+    assert_eq!(
+        resolved(&fixture.checkout, &reference),
+        original_head,
+        "the sweep kept the bundle's tip in main's repository first"
+    );
+    let kept = deletion_log(&fixture, "keep-abandoned-tips", "finished");
+    assert_eq!(kept["artifact"], json!(bundle), "{kept}");
+    assert_eq!(kept["git"]["head"], json!(original_head), "{kept}");
+    assert_kept_by_ref(&kept, &original_head, &fixture.checkout, &reference);
+
+    // A purge retires main's image and every ref in it, so the restore first carries each
+    // refs/cowshed ref into the retained checkout it puts back: the abandoned commit outlives
+    // the project there.
+    let purge = fixture.gc().await;
+    fixture
+        .call(
+            &purge,
+            "coordinator.removeProject",
+            json!({ "repoId": fixture.repo, "options": { "force": false, "abandon": true } }),
+        )
+        .await
+        .expect("purge the project");
+    purge.shutdown().await.expect("stop the purging runtime");
+    assert_eq!(
+        resolved(&fixture.checkout, &reference),
+        original_head,
+        "the restored checkout keeps the abandoned commit"
+    );
+}
+
+/// `entry`'s Git tips name `HEAD` at `head`, kept by `reference` in the repository at
+/// `repository`.
+fn assert_kept_by_ref(entry: &Value, head: &str, repository: &Path, reference: &str) {
+    let tip = entry["git"]["tips"]
+        .as_array()
+        .and_then(|tips| tips.iter().find(|tip| tip["name"] == "HEAD"))
+        .unwrap_or_else(|| panic!("no HEAD tip: {entry}"));
+    assert_eq!(tip["tip"], json!(head), "{entry}");
+    assert_eq!(tip["kept"]["by"], json!("ref"), "{entry}");
+    assert_eq!(tip["kept"]["reference"], json!(reference), "{entry}");
+    let kept_in = PathBuf::from(tip["kept"]["repository"].as_str().expect("repository"));
+    assert_eq!(
+        kept_in.canonicalize().expect("kept repository"),
+        repository.canonicalize().expect("main checkout"),
+        "{entry}"
+    );
+}
+
+/// The newest `op` line of the project's deletion log for `workspace`.
+fn deletion_log(fixture: &Fixture, op: &str, workspace: &str) -> Value {
+    let log = fixture
+        .layout()
+        .project()
+        .project_root
+        .join("deletion-log.jsonl");
+    let text = fs::read_to_string(&log).expect("deletion log");
+    text.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|entry| entry["op"] == op && entry["workspace"] == workspace)
+        .unwrap_or_else(|| panic!("no {op} line for {workspace} in {}:\n{text}", log.display()))
+}
+
+/// The commit `revision` names in `directory`.
+fn resolved(directory: &Path, revision: &str) -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", revision])
+        .current_dir(directory)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output_locked()
+        .expect("git process");
+    assert!(
+        output.status.success(),
+        "git rev-parse {revision} in {}: {}",
+        directory.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("revision is UTF-8")
+        .trim()
+        .to_owned()
 }
 
 /// The kernel claim on a new workspace's port block lasts until its image publication is

@@ -969,6 +969,11 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
                 target_head: Some(GitOid::new("1".repeat(40)).unwrap()),
                 unlanded_commits: 3,
                 branches: Vec::new(),
+                preserved: vec![PreservedRef {
+                    name: "HEAD".into(),
+                    tip: GitOid::new("4".repeat(40)).unwrap(),
+                    reference: format!("refs/cowshed/raven/abandoned/{}/HEAD", "4".repeat(40)),
+                }],
                 bundle: PathBuf::from("/store/acme/widget/sessions/.trash/raven-tip.bundle"),
             }),
         })
@@ -978,6 +983,11 @@ fn all_lifecycle_options_use_camel_case_and_omit_only_optionals() {
             "targetBranch":"main",
             "targetHead":"1111111111111111111111111111111111111111",
             "unlandedCommits":3,
+            "preserved":[{
+                "name":"HEAD",
+                "tip":"4444444444444444444444444444444444444444",
+                "reference":"refs/cowshed/raven/abandoned/4444444444444444444444444444444444444444/HEAD"
+            }],
             "bundle":"/store/acme/widget/sessions/.trash/raven-tip.bundle"
         }})
     );

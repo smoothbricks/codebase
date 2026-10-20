@@ -308,6 +308,13 @@ ancestor) is written to `abandoned-main-<tip>.bundle` in a `cowshed/` directory 
 verified, and reported as abandoned work against the retained checkout's branch. `--abandon` on main without `--restore`
 is a usage error.
 
+Main's image is the repository that holds every `refs/cowshed/*` ref cowshed wrote: abandoned tips (`rm` step 1) and
+`push`ed branches. The restore retires that image, so before the swap it fetches each of those refs, unforced, into the
+retained checkout under the same name, reads each back, and refuses (naming the refs) when one is missing or holds
+another tip; a `push` staging ref is transient and stays. The retained checkout is the repository the user keeps, so the
+refs outlive the project there, and a later removal of that checkout is what would lose them; the restore says so on
+stderr.
+
 Unbinding is last. Removing main first records the checkout path in the project store (`checkout-root.json`), because
 main's images — the only other record naming it — are retired and then reclaimed. A restore interrupted after retiring
 main is finished by the same command from the checkout: the project root lookup matches that record when no main image
@@ -1181,7 +1188,18 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    identity. `--force` permits loss of dirty/in-progress state, not unlanded work. Explicit `--abandon` requires a
    verified recovery bundle, `sessions/.trash/<ws>-<head>.bundle`, holding HEAD and every branch that did not pass as
    refs, before retiring unlanded work. It is written beside that name and renamed into place once verified; a retried
-   removal that finds a bundle verifying for the same range keeps it instead of writing another.
+   removal that finds a bundle verifying for the same range keeps it instead of writing another. The verified bundle's
+   tips are then fetched into main's repository, unforced, as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and
+   `refs/cowshed/<ws>/abandoned/<head>/heads/<branch>`, each read back against the tip the bundle advertises, before
+   anything retires: the trash is emptied by `gc --abandoned`, main's repository is not, and keying the namespace by the
+   abandoned head means a later workspace reusing the name never overwrites what an earlier one left. A tip that cannot
+   be kept refuses the abandonment. The report names each kept ref (`AbandonedWork.preserved`).
+
+   Every retirement, abandoned or not, appends a `retire-workspace` line to the project's `deletion-log.jsonl`
+   (01_storage.md) once the image is renamed into trash: the head and every local branch tip read before the image went,
+   each with what keeps it — `{"by":"ref","repository":…,"reference":…}` for a tip the abandonment kept,
+   `{"by":"target",…}` naming the branch and head that held a tip the gate passed. A retirement whose tips could not be
+   read says so on stderr and logs no Git facts; it is never refused for that.
 
    The refusal reports whether the published branch already holds HEAD's commits; it never authorizes a removal. Only
    once the gate has refused HEAD does it measure HEAD, with the same landing module `ls` reads, against the primary
@@ -1255,10 +1273,11 @@ unpublished before retirement does not invalidate that recovery fact.
 `cowshed rm main --restore --purge [--force] [--abandon]` (`Coordinator::remove_project`) removes the whole project in
 one call: every session workspace, including clones a create never published, under the given `--force`/`--abandon`;
 then it waits for the background reclamation those removals started, so its collection plans against a settled store;
-collects; with `--abandon` deletes the abandon bundles in `sessions/.trash` (then the only copy of those commits); and
-restores main. Each step is idempotent, so a refusal leaves the rest to the same command. A collection that still finds
-the store changed under it (another process) is refused as retryable — `Conflict` with `Retry::GcPlanStale` — and the
-same command finishes the removal; callers never sleep and retry `gc` themselves.
+collects; with `--abandon` keeps every abandon bundle's tips in main's repository as `gc --abandoned` does
+(01_storage.md) and then deletes the bundles in `sessions/.trash`, refusing before one is deleted when any cannot be
+kept; and restores main. Each step is idempotent, so a refusal leaves the rest to the same command. A collection that
+still finds the store changed under it (another process) is refused as retryable — `Conflict` with `Retry::GcPlanStale`
+— and the same command finishes the removal; callers never sleep and retry `gc` themselves.
 
 ## `cowshed attach` / `cowshed detach`
 

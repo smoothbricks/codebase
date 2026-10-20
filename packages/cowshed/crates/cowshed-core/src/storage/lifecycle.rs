@@ -598,8 +598,8 @@ pub enum StorageGcReason {
     OrphanMountpoint,
     ExpiredCheckpoint,
     /// A `<ws>-<tip>.bundle` file in `sessions/.trash/`: the recovery bundle `rm --abandon`
-    /// verifies and writes there before retiring unlanded work. It is the only copy of the
-    /// commits main does not contain, so it becomes a candidate only under a sweep that
+    /// verifies and writes there before retiring unlanded work, whose tips main's repository also
+    /// keeps (02_workspaces.md, `rm` step 1). It becomes a candidate only under a sweep that
     /// explicitly authorizes reclaiming them (`StorageGcOptions::abandoned_bundles`) and is
     /// never reclaimed by a default one.
     AbandonedBundle,
@@ -613,7 +613,7 @@ pub enum StorageGcReason {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StorageGcOptions {
     /// Also reclaim the project trash's abandon bundles — the `sessions/.trash/<ws>-<tip>.bundle`
-    /// files that are the only copy of the commits their removal abandoned. Never a default.
+    /// recovery files of the commits their removal abandoned. Never a default.
     pub abandoned_bundles: bool,
 }
 

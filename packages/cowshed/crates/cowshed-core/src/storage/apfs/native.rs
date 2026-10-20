@@ -3052,10 +3052,10 @@ impl<R: CommandRunner> MacOsApfsExecutionHost<R> {
                 &[],
             )?);
         }
-        // The abandon bundles live in the same trash as the retired images but are not images,
-        // and each is the only copy of the commits its removal abandoned. They become
-        // candidates only for a sweep explicitly authorized for them: a plain `gc` leaves them
-        // for the operator to fetch or delete.
+        // The abandon bundles live in the same trash as the retired images but are not images:
+        // each is the recovery file of the commits its removal abandoned, whose tips the
+        // controller keeps in main before executing such a plan. They become candidates only for
+        // a sweep explicitly authorized for them: a plain `gc` leaves them for the operator.
         if options.abandoned_bundles {
             for bundle in abandon_bundles(&trash)? {
                 examined = examined

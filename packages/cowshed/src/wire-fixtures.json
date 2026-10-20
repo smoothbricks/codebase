@@ -2570,6 +2570,13 @@
       "abandoned": {
         "bundle": "/Users/fixture/Dev/.cowshed/abandoned/cs-seam.bundle",
         "head": "5555555555555555555555555555555555555555",
+        "preserved": [
+          {
+            "name": "HEAD",
+            "reference": "refs/cowshed/cs-seam/abandoned/5555555555555555555555555555555555555555/HEAD",
+            "tip": "5555555555555555555555555555555555555555"
+          }
+        ],
         "targetBranch": "main",
         "targetHead": "6666666666666666666666666666666666666666",
         "unlandedCommits": 4

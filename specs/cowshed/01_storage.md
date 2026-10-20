@@ -70,7 +70,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
     waivers.json                     # reasoned secret-scan waivers (02_workspaces.md)
     lifecycle-intents.json           # bounded persist-before-mutate create/fork/remove recovery journal, mode 0600
     lifecycle-intents.json.lock      # flock held for each read-modify-write of the journal
-    deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released (storage/deletion_log.rs)
+    deletion-log.jsonl               # one line per artifact the controller unlinked, one per build volume released, one per workspace retired and per abandon bundle kept, with Git tips (storage/deletion_log.rs)
     main.dmg                         # adopted main image (created here behind a PendingFence sidecar)
     main.dmg.grants.json             # controller-owned grants + detached metadata
     main.dmg.ca.key                  # main's workspace CA private key, 0600
@@ -253,7 +253,7 @@ burden with retention _conventions_, enforced by `cowshed gc`, never by a backgr
 | CI failure checkpoints                       | same checkpoint rule as above                                                         | labeled `ci-fail`, therefore explicitly pinned until unpinned; `10_ci.md`                  |
 | Idle workspaces                              | _flagged_ by `cowshed doctor` after 14 days no exec, **never auto-destroyed**         | landing/removal is always explicit                                                         |
 | Trash images (`sessions/.trash/…`)           | drained on next `gc`                                                                  | —                                                                                          |
-| Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; the only copy of the commits `rm --abandon` gave up       | explicit `cowshed gc --abandoned`                                                          |
+| Abandon bundles (`sessions/.trash/*.bundle`) | never reclaimed by default; their tips are also kept as refs in main's repository     | explicit `cowshed gc --abandoned`                                                          |
 
 - `cowshed gc` evaluates both checkpoint floors independently: it deletes only an unpinned checkpoint that is at least
   14 days old **and** is not among the newest five for that workspace. A user-supplied label creates an explicit pin;
@@ -280,8 +280,14 @@ burden with retention _conventions_, enforced by `cowshed gc`, never by a backgr
   are not bundle candidates. Plain `gc`, opportunistic collection, and `doctor --repair` never authorize their
   reclamation. Only explicit `--abandoned` (`GcOptions.abandoned: true`) adds the `abandonedBundle` category to the
   exact plan. `gc --dry-run --abandoned` lists those candidates and their allocated bytes without deleting them.
-  Reclamation is final: preserve the abandoned commits in another repository before requesting it. Keeping them is never
-  hiding them: a plain `gc` reports how many the trash keeps and their allocated bytes, `doctor` reports them as an
+  Reclamation never loses the commits: before executing the plan, every bundle candidate's tips are fetched into main's
+  repository under the namespace its removal used, `refs/cowshed/<ws>/abandoned/<head>/` (02_workspaces.md, `rm` step 1;
+  the file name `<ws>-<head>.bundle` names both), and journaled as a `keep-abandoned-tips` deletion-log line on the
+  bundle's path naming that repository and each ref; each kept tip is also said on stderr. A removal by this build
+  already kept them; a bundle an earlier build wrote gets them here. A purge keeps them the same way before its main
+  restore carries every `refs/cowshed/*` ref into the retained checkout (02_workspaces.md). A bundle whose name, tips or
+  fetch fail refuses the whole sweep as a conflict naming each, before anything is deleted. Keeping them is never hiding
+  them: a plain `gc` reports how many the trash keeps and their allocated bytes, `doctor` reports them as an
   `abandon-bundles` info finding, and `ls --all` names each project's after its table. Naming them authorizes nothing;
   the plain sweep's own plan still never holds one.
 - Explicit workspace retirement is the sole exception to live checkpoint retention: its exact trash metadata authorizes

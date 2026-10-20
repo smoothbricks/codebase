@@ -18,10 +18,10 @@ use cowshed_core::api::dto::{
     CheckpointResult, CommandArg, DefragmentResult, DoctorReport, ExecClass, ExecCommand,
     ExecRequest, ExecScope, Finding, FindingSeverity, ForkOptions, GcOptions, GcReport, GitOid,
     GrantDelta, GrantSet, JobId, JobInfo, JobJournalCursor, JobState, JobTail, JobTailBytes,
-    JobTailLimits, LandOptions, LandReport, MirrorInfo, PortBlock, PushOptions, PushReport,
-    RebaseOptions, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
-    ResizeResult, ResizeVolume, RunSandboxMode, StdinSource, StepReport, WorkspaceInfo,
-    WorkspaceState, WorkspaceTarget,
+    JobTailLimits, LandOptions, LandReport, MirrorInfo, PortBlock, PreservedRef, PushOptions,
+    PushReport, RebaseOptions, RemoveOptions, RemoveProjectOptions, RemoveProjectReport,
+    RemoveReport, ResizeResult, ResizeVolume, RunSandboxMode, StdinSource, StepReport,
+    WorkspaceInfo, WorkspaceState, WorkspaceTarget,
 };
 use cowshed_core::api::operations::{JobLogs, LogsRequest, Operation, OperationRequest};
 use cowshed_core::api::server::{ConnectionAuthority, RouterHandle, serve_controller_connection};
@@ -1058,6 +1058,14 @@ impl ProjectRuntimeHost for FakeHost {
                     target_head: Some(GitOid::new("1".repeat(40)).expect("fixed tip")),
                     unlanded_commits: 3,
                     branches: Vec::new(),
+                    preserved: vec![PreservedRef {
+                        name: "HEAD".to_owned(),
+                        tip: GitOid::new("4".repeat(40)).expect("fixed head"),
+                        reference: format!(
+                            "refs/cowshed/{workspace}/abandoned/{}/HEAD",
+                            "4".repeat(40)
+                        ),
+                    }],
                     bundle: self.descriptor.storage.store().join(format!(
                         "sessions/.trash/{workspace}-{}.bundle",
                         "4".repeat(40)

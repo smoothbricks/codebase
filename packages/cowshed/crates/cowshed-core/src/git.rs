@@ -11,7 +11,7 @@ use tokio::process::Command;
 
 #[cfg(any(target_os = "macos", test))]
 use crate::api::dto::Sha256Digest;
-use crate::api::dto::{GitOid, UnlandedChange, UnlandedPath};
+use crate::api::dto::{GitOid, PreservedRef, UnlandedChange, UnlandedPath};
 use crate::error::{CowshedError, Result};
 use cowshed_os::fork_lock::{Run as _, RunAsync as _, Spawn as _};
 use cowshed_os::timing::timed_async;
@@ -1480,6 +1480,111 @@ impl GitRepository {
                 "inspect the bundle and cowshed store, then retry removal",
             )),
         }
+    }
+
+    /// Keep every tip `bundle` advertises in this repository, under `namespace`: `HEAD` as
+    /// `<namespace>/HEAD` and `refs/heads/<branch>` as `<namespace>/heads/<branch>`, answering
+    /// each with the tip its ref holds.
+    ///
+    /// The fetch runs host-side like every bundle verb (04_sandbox.md): the bundle lives in the
+    /// controller's store, which no sandbox profile reads. Refspecs are not forced, so a ref that
+    /// already holds another tip refuses rather than being overwritten, and every ref is read back
+    /// and compared with the tip the bundle advertises: one that does not resolve to it has kept
+    /// nothing. A bundle advertising anything but `HEAD` and branches is refused, never partly
+    /// kept. Automatic maintenance stays off: this repository belongs to the user.
+    pub async fn preserve_bundle(
+        &self,
+        bundle: &Path,
+        namespace: &str,
+    ) -> Result<Vec<PreservedRef>> {
+        let listed = run_git_bundle_at(
+            &self.root,
+            None,
+            [
+                OsStr::new("bundle"),
+                OsStr::new("list-heads"),
+                bundle.as_os_str(),
+            ],
+        )
+        .await?;
+        if !listed.status.success() {
+            return Err(bundle_artifact_error(
+                "list the abandonment bundle's tips",
+                &listed,
+            ));
+        }
+        let mut kept = Vec::new();
+        for line in parse_lines(&listed.stdout, "abandonment bundle tip")? {
+            let unreadable = || {
+                CowshedError::integrity(
+                    format!(
+                        "abandonment bundle {} advertises `{line}`, which is neither HEAD nor a \
+                         branch",
+                        bundle.display()
+                    ),
+                    "inspect the bundle, then keep its tips by hand before deleting it",
+                )
+            };
+            let (tip, advertised) = line.split_once(' ').ok_or_else(unreadable)?;
+            let (name, reference) = match advertised.strip_prefix("refs/heads/") {
+                _ if advertised == "HEAD" => (String::from("HEAD"), format!("{namespace}/HEAD")),
+                Some(branch) => (branch.to_owned(), format!("{namespace}/heads/{branch}")),
+                None => return Err(unreadable()),
+            };
+            kept.push((
+                advertised.to_owned(),
+                PreservedRef {
+                    name,
+                    tip: parse_oid(tip.to_owned(), "abandonment bundle tip")?,
+                    reference,
+                },
+            ));
+        }
+        if kept.is_empty() {
+            return Err(CowshedError::integrity(
+                format!("abandonment bundle {} advertises no tip", bundle.display()),
+                "inspect the bundle; one with no tip holds nothing to keep",
+            ));
+        }
+        let mut fetch = vec![
+            OsString::from("fetch"),
+            OsString::from("--quiet"),
+            OsString::from("--no-tags"),
+            OsString::from("--no-write-fetch-head"),
+            OsString::from("--no-auto-maintenance"),
+            bundle.as_os_str().to_owned(),
+        ];
+        fetch.extend(kept.iter().map(|(advertised, preserved)| {
+            OsString::from(format!("{advertised}:{}", preserved.reference))
+        }));
+        let output = run_git_bundle_at(&self.root, None, fetch).await?;
+        if !output.status.success() {
+            return Err(bundle_artifact_error(
+                "keep the abandonment bundle's tips in main's repository",
+                &output,
+            ));
+        }
+        let mut preserved = Vec::with_capacity(kept.len());
+        for (_, kept) in kept {
+            let commit = format!("{}^{{commit}}", kept.reference);
+            let held = self
+                .read_one(
+                    ["rev-parse", "--verify", commit.as_str()],
+                    "read a kept tip",
+                )
+                .await?;
+            if held != kept.tip.as_str() {
+                return Err(CowshedError::integrity(
+                    format!(
+                        "{} holds {held}, not the abandoned {} tip {}",
+                        kept.reference, kept.name, kept.tip
+                    ),
+                    "inspect main's repository refs, then retry",
+                ));
+            }
+            preserved.push(kept);
+        }
+        Ok(preserved)
     }
 
     /// How many commits are reachable from any of `heads` and not from `target`.

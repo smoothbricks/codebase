@@ -1004,9 +1004,9 @@ pub enum GcReason {
     OrphanSessionImage,
     OrphanMountpoint,
     ExpiredCheckpoint,
-    /// The `<ws>-<tip>.bundle` recovery bundle `rm --abandon` keeps in `sessions/.trash/`: the
-    /// only copy of the commits that removal abandoned. A candidate only under a sweep that
-    /// explicitly authorizes it (`GcOptions.abandoned`).
+    /// The `<ws>-<tip>.bundle` recovery bundle `rm --abandon` keeps in `sessions/.trash/`, whose
+    /// tips main's repository keeps as refs before it is reclaimed. A candidate only under a sweep
+    /// that explicitly authorizes it (`GcOptions.abandoned`).
     AbandonedBundle,
     /// A build volume no checkout links (16_build_volumes.md, "Garbage collection").
     UnlinkedBuildVolume,
@@ -3149,8 +3149,8 @@ pub struct RemoveOptions {
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct GcOptions {
     pub dry_run: bool,
-    /// Also reclaim the project trash's abandon bundles — `sessions/.trash/<ws>-<tip>.bundle`,
-    /// the only copy of the commits `rm --abandon` gave up (02_workspaces.md). Never implied.
+    /// Also reclaim the project trash's abandon bundles — `sessions/.trash/<ws>-<tip>.bundle` —
+    /// once main's repository keeps each one's tips (01_storage.md). Never implied.
     pub abandoned: bool,
 }
 
@@ -3837,11 +3837,11 @@ pub struct CacheMiss {
     pub inputs_error: Option<String>,
 }
 
-/// The commits a `--abandon` removal destroyed, and where their bundle went.
+/// The commits a `--abandon` removal destroyed, and where they are kept.
 ///
 /// Every field is what a reader needs to *undo* the abandonment: the tip that is gone, the branch
-/// it never reached and where that branch stood, how much history went with it, and the bundle to
-/// fetch from.
+/// it never reached and where that branch stood, how much history went with it, the refs main's
+/// repository keeps it under, and the bundle to fetch from.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AbandonedWork {
@@ -3854,7 +3854,22 @@ pub struct AbandonedWork {
     /// The local branches besides `head` whose unheld commits went into the bundle as refs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<BranchLanding>,
+    /// `HEAD` and each of `branches`, as main's repository keeps them: under
+    /// `refs/cowshed/<ws>/abandoned/<head>/`, written before the image is retired. Empty for
+    /// main's own `--restore --abandon`, whose bundle the restored checkout keeps.
+    pub preserved: Vec<PreservedRef>,
     pub bundle: PathBuf,
+}
+
+/// One tip an abandonment kept in main's repository.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreservedRef {
+    /// `HEAD`, or the branch's short name.
+    pub name: String,
+    pub tip: GitOid,
+    /// The full ref name in main's repository that holds `tip`.
+    pub reference: String,
 }
 
 /// What `cowshed rm` destroyed beyond the workspace image itself.

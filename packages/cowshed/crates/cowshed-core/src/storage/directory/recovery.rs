@@ -1242,9 +1242,10 @@ impl DirectoryExecutionHost {
             )?);
         }
 
-        // The abandon bundles share the trash with retired payloads but are not payloads, and
-        // each is the only copy of the commits its removal abandoned. Only a sweep explicitly
-        // authorized for them names them; a plain `gc` leaves them to the operator.
+        // The abandon bundles share the trash with retired payloads but are not payloads: each is
+        // the recovery file of the commits its removal abandoned, whose tips the controller keeps
+        // in main before executing such a plan. Only a sweep explicitly authorized for them names
+        // them; a plain `gc` leaves them to the operator.
         if options.abandoned_bundles {
             for bundle in abandon_bundles(&sessions.join(TRASH_NAMESPACE))? {
                 checked_increment(&mut examined)?;

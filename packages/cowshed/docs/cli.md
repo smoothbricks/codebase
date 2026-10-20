@@ -644,8 +644,10 @@ rules, and not held by main's checkout with the same content at the same path: a
 every clone and is not the workspace's work.
 
 `--abandon` has no short spelling, and it is the only way to delete unlanded commits. Before deleting, it writes a Git
-bundle of `main..HEAD` beside the retired image in `sessions/.trash/<ws>-<tip>.bundle` and prints what it destroyed, so
-even a deliberate abandonment is recoverable:
+bundle of `main..HEAD` beside the retired image in `sessions/.trash/<ws>-<tip>.bundle`, keeps the bundle's tips in
+main's repository as `refs/cowshed/<ws>/abandoned/<head>/HEAD` and `…/heads/<branch>`, and prints what it destroyed and
+where it is kept, so even a deliberate abandonment is recoverable from main itself. The project's `deletion-log.jsonl`
+records every retirement's head and branch tips with the ref or target that keeps each:
 
 ```
 $ cowshed rm raven
@@ -655,14 +657,15 @@ next: land the workspace: cowshed land raven
 
 $ cowshed rm raven --abandon
 cowshed: abandoned 9 commits at 9b2e77d… that main (at 6f3a2c1…) did not contain
+cowshed: kept HEAD at 9b2e77d… in main as refs/cowshed/raven/abandoned/9b2e77d…/HEAD
 cowshed: bundled to /private/cowshed/store/acme/api/sessions/.trash/raven-9b2e77d….bundle
 next: cowshed gc   # free space from old checkpoints too
 ```
 
-Recover an abandoned bundle from main's repository, which holds its one prerequisite:
+Recover abandoned work from main's repository:
 
 ```sh
-git fetch <bundle> HEAD:refs/heads/recovered-raven
+git branch recovered-raven refs/cowshed/raven/abandoned/<head>/HEAD
 ```
 
 Bundle verification uses a temporary bare repository, and the bundle is staged beside its final name until it verifies.
@@ -670,7 +673,8 @@ Interrupting `rm --abandon` removes both before the command exits; a retry reval
 
 Bundles stay until `cowshed gc --abandoned`, but they are never out of sight: a plain `cowshed gc` says how many the
 trash keeps and their bytes, `cowshed doctor` reports them as an `abandon-bundles` finding, and `cowshed ls --all` names
-each project's after its table.
+each project's after its table. `gc --abandoned` keeps each bundle's tips in main the same way before deleting it —
+including a bundle an older cowshed left without refs — and refuses, deleting nothing, when one cannot be kept.
 
 `cowshed rm main --restore` is the reverse of `adopt`: it puts the pre-adoption checkout back and unbinds the project.
 Plain `cowshed rm main` throws the warm main image away instead, and needs `--force`.

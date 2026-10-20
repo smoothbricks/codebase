@@ -1749,6 +1749,14 @@ where
                         ))
                         .map_err(output_error)?;
                 }
+                for kept in &abandoned.preserved {
+                    output
+                        .guidance(&format!(
+                            "kept {} at {} in main as {}",
+                            kept.name, kept.tip, kept.reference
+                        ))
+                        .map_err(output_error)?;
+                }
                 output
                     .guidance(&format!("bundled to {}", abandoned.bundle.display()))
                     .map_err(output_error)?;
@@ -3387,7 +3395,7 @@ const fn gc_reason(reason: GcReason) -> &'static str {
         GcReason::OrphanMountpoint => "orphaned mountpoint",
         GcReason::ExpiredCheckpoint => "expired checkpoint",
         GcReason::AbandonedBundle => {
-            "abandon bundle, the only copy of commits main does not contain"
+            "abandon bundle of commits main does not contain; main keeps its tips as refs"
         }
         GcReason::UnlinkedBuildVolume => "build volume no checkout links",
         GcReason::SupersededSeed => "seed superseded by its target's latest, or its target retired",
@@ -3595,8 +3603,8 @@ async fn emit_project_listing<W: Write, E: Write>(
     emit_project_workspaces_table(output, &projects)
 }
 
-/// Name what each project's trash keeps of `rm --abandon`: the only copy of commits that removal
-/// gave up, in a dot-directory no listing shows and no plain gc deletes.
+/// Name what each project's trash keeps of `rm --abandon`: the recovery bundles of commits that
+/// removal gave up, in a dot-directory no listing shows and no plain gc deletes.
 fn emit_kept_abandon_bundles<W: Write, E: Write>(
     output: &mut Output<W, E>,
     kept: &[(RepoId, KeptAbandonBundles)],

@@ -238,7 +238,8 @@ pub trait ProjectRuntimeHost: Send + 'static {
     /// Wait for every image reclamation this host started in the background, so a collection
     /// that follows plans against a settled store instead of racing it.
     async fn settle_reclaims(&mut self) -> Result<()>;
-    /// Delete every `rm --abandon` bundle in the project's trash, answering the paths deleted.
+    /// Delete every `rm --abandon` bundle in the project's trash, answering the paths deleted,
+    /// once main's repository keeps every one's tips; none is deleted when any cannot be kept.
     async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>>;
     async fn grant(
         &mut self,
@@ -6258,7 +6259,8 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         .await
     }
 
-    /// Write and verify the commits that are about to lose their only workspace ref.
+    /// Write and verify the commits that are about to lose their only workspace ref, and keep
+    /// them in main's repository under [`abandoned_namespace`].
     ///
     /// The live main tip is both the report's baseline and a positive revision in the bundle.
     /// Carrying both histories makes the bundle self-contained even after main was rewritten, and
@@ -6352,14 +6354,274 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let unlanded_commits = git
             .bundle_commits(&bundle, target_head.as_ref().map(GitOid::as_str), &heads)
             .await?;
+        // The bundle lives in the store's trash, which `gc --abandoned` empties. Main's repository
+        // outlives every workspace and every sweep, so the verified bundle's tips go there too,
+        // before anything is retired: an abandonment that cannot keep them refuses.
+        let preserved = crate::git::GitRepository::from_root(
+            self.git.store_root(),
+            &self.main_containment()?.mount,
+        )
+        .preserve_bundle(
+            &bundle,
+            &abandoned_namespace(workspace.as_str(), &fence.head),
+        )
+        .await?;
         Ok(AbandonedWork {
             head: fence.head.clone(),
             target_branch: landed.branch,
             target_head,
             unlanded_commits,
             branches,
+            preserved,
             bundle,
         })
+    }
+
+    /// What retiring the repository at `mount` takes away: its head and every local branch, each
+    /// with what keeps it once the image is gone, for the deletion log (`retire-workspace`). A tip
+    /// an abandonment kept is held by its ref in main's repository — the ref of the same name, or
+    /// one holding the same tip (the checked-out branch is kept as `HEAD`); every other tip passed
+    /// the removal gate, so the containment branch holds its changes.
+    ///
+    /// Read before the image retires, because nothing can read it after. A failure is said and
+    /// costs the log its Git facts; it never fails a removal the gate already authorized.
+    async fn retired_tips(
+        &self,
+        workspace: &WorkspaceName,
+        mount: &Path,
+        head: &GitOid,
+        abandoned: Option<&AbandonedWork>,
+        containment: &NativeContainment,
+    ) -> std::result::Result<crate::storage::deletion_log::GitTips, String> {
+        use crate::storage::deletion_log::{GitTips, KeptBy, KeptTip};
+
+        let store_root = self.git.store_root();
+        let branches = crate::git::GitRepository::from_root(store_root, mount)
+            .ref_tips(&["refs/heads"])
+            .await
+            .map_err(|error| error.message)?;
+        let target_head = git_optional_ref_oid(
+            store_root,
+            &containment.mount,
+            &format!("refs/heads/{}", containment.branch),
+        )
+        .await
+        .map_err(|error| error.message)?;
+        let main = self
+            .main_containment()
+            .map_err(|error| error.message)?
+            .mount;
+        let preserved = abandoned.map_or(&[][..], |work| work.preserved.as_slice());
+        let kept = |name: &str, tip: &GitOid| -> std::result::Result<KeptBy, String> {
+            if let Some(kept) = preserved
+                .iter()
+                .find(|kept| kept.name == name)
+                .or_else(|| preserved.iter().find(|kept| kept.tip == *tip))
+            {
+                return Ok(KeptBy::Ref {
+                    repository: main.clone(),
+                    reference: kept.reference.clone(),
+                });
+            }
+            let head = target_head.clone().ok_or_else(|| {
+                format!(
+                    "{workspace}'s {name} passed the removal gate, yet {} has no {} branch",
+                    containment.mount.display(),
+                    containment.branch
+                )
+            })?;
+            Ok(KeptBy::Target {
+                branch: containment.branch.clone(),
+                head,
+            })
+        };
+        let mut tips = vec![KeptTip {
+            name: String::from("HEAD"),
+            tip: head.clone(),
+            kept: kept("HEAD", head)?,
+        }];
+        for (name, tip) in branches {
+            let name = String::from_utf8_lossy(name.strip_prefix(b"refs/heads/").unwrap_or(&name))
+                .into_owned();
+            let tip = GitOid::new(String::from_utf8_lossy(&tip).into_owned()).map_err(|error| {
+                format!("git listed a branch tip that is not an object id: {error}")
+            })?;
+            let kept = kept(&name, &tip)?;
+            tips.push(KeptTip { name, tip, kept });
+        }
+        Ok(GitTips {
+            head: head.clone(),
+            tips,
+        })
+    }
+
+    /// Write the `retire-workspace` line once the retirement committed, or say why it has no Git
+    /// facts to carry.
+    fn log_retired_tips(
+        &self,
+        workspace: &WorkspaceName,
+        mount: &Path,
+        tips: std::result::Result<crate::storage::deletion_log::GitTips, String>,
+    ) {
+        match tips {
+            Ok(tips) => crate::storage::deletion_log::log_git_tips(
+                &self.layout.project().project_root,
+                crate::storage::deletion_log::DeletionOp::RetireWorkspace,
+                workspace.as_str(),
+                mount,
+                tips,
+            ),
+            Err(reason) => eprintln!(
+                "cowshed: the deletion log records no Git tips for {workspace}'s retirement: \
+                 {reason}"
+            ),
+        }
+    }
+
+    /// Keep every tip of the abandon bundle at `bundle` in the repository at `repository`, under
+    /// the namespace its removal used (`<ws>-<head>.bundle` names both), before anything deletes
+    /// the bundle. Journaled against the bundle's path (`keep-abandoned-tips`) with the repository
+    /// named, and said on stderr: a ref nobody knows to look for is a ref nobody finds.
+    async fn keep_abandon_bundle(&self, repository: &Path, bundle: &Path) -> Result<()> {
+        use crate::storage::deletion_log::{GitTips, KeptBy, KeptTip};
+
+        let (workspace, head) = abandon_bundle_identity(bundle)?;
+        let preserved = crate::git::GitRepository::from_root(self.git.store_root(), repository)
+            .preserve_bundle(bundle, &abandoned_namespace(&workspace, &head))
+            .await?;
+        for kept in &preserved {
+            eprintln!(
+                "cowshed: kept {} at {} of {} in {} as {}",
+                kept.name,
+                kept.tip,
+                bundle.display(),
+                repository.display(),
+                kept.reference
+            );
+        }
+        crate::storage::deletion_log::log_git_tips(
+            &self.layout.project().project_root,
+            crate::storage::deletion_log::DeletionOp::KeepAbandonedTips,
+            &workspace,
+            bundle,
+            GitTips {
+                head,
+                tips: preserved
+                    .into_iter()
+                    .map(|kept| KeptTip {
+                        name: kept.name,
+                        tip: kept.tip,
+                        kept: KeptBy::Ref {
+                            repository: repository.to_path_buf(),
+                            reference: kept.reference,
+                        },
+                    })
+                    .collect(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Keep every abandon bundle in `bundles` in the repository at `repository`, or refuse naming
+    /// each one that could not be kept: a partial pass would read as complete, so nothing that
+    /// follows deletes a bundle unless all of them are kept.
+    async fn keep_abandon_bundles(&self, repository: &Path, bundles: &[PathBuf]) -> Result<()> {
+        let mut unkept = Vec::new();
+        for bundle in bundles {
+            if let Err(error) = self.keep_abandon_bundle(repository, bundle).await {
+                unkept.push(format!("{}: {}", bundle.display(), error.message));
+            }
+        }
+        if unkept.is_empty() {
+            return Ok(());
+        }
+        Err(CowshedError::conflict(
+            format!(
+                "no abandon bundle was deleted: {} could not keep the tips of {} of them: {}",
+                repository.display(),
+                unkept.len(),
+                unkept.join("; ")
+            ),
+            format!(
+                "fetch each named bundle into {} by hand, or move it out of sessions/.trash, \
+                 then retry",
+                repository.display()
+            ),
+        ))
+    }
+
+    /// Carry every `refs/cowshed/*` ref of main's repository — abandoned tips, `push`ed
+    /// branches — into the retained checkout at `retained` before a restore retires main's image.
+    /// That checkout is the repository the user keeps, so the refs outlive the project there, and
+    /// a later removal of that checkout is what would lose them; stderr says so. Refspecs are not
+    /// forced and every carried ref is read back: a retained ref holding another tip refuses the
+    /// restore rather than being overwritten. A `push` staging ref is transient and stays.
+    async fn carry_cowshed_refs(&self, main: &NativeWorkspace, retained: &Path) -> Result<()> {
+        use crate::storage::lifecycle::{MountIntent, MountState, Substrate};
+
+        if matches!(main.derived.mount_state, MountState::Detached) {
+            self.substrate
+                .ensure_mounted(&main.derived.workspace, MountIntent { browse: false })
+                .await
+                .map_err(native_storage_error)?;
+        }
+        let store_root = self.git.store_root();
+        let main_root = current_snapshot_mount(self, main)?;
+        let refs: Vec<(String, Vec<u8>)> =
+            crate::git::GitRepository::from_root(store_root, &main_root)
+                .ref_tips(&["refs/cowshed"])
+                .await?
+                .into_iter()
+                .map(|(name, tip)| (String::from_utf8_lossy(&name).into_owned(), tip))
+                .filter(|(name, _)| !name.split('/').nth(3).is_some_and(|part| part == "staging"))
+                .collect();
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let mut command = tokio::process::Command::from(crate::git::sandboxed_git_fetch_command(
+            store_root, retained, &main_root,
+        )?);
+        command
+            .args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"])
+            .arg(&main_root)
+            .args(refs.iter().map(|(name, _)| format!("{name}:{name}")));
+        let output = command.output_locked().await.map_err(|error| {
+            CowshedError::environment_missing(
+                error.to_string(),
+                "restore /usr/bin/git and sandbox-exec",
+            )
+        })?;
+        require_git_success("carry cowshed refs into the retained checkout", &output)?;
+        let carried = crate::git::GitRepository::from_root(store_root, retained)
+            .ref_tips(&["refs/cowshed"])
+            .await?;
+        let missing: Vec<&str> = refs
+            .iter()
+            .filter(|(name, tip)| carried.get(name.as_bytes()) != Some(tip))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            return Err(CowshedError::integrity(
+                format!(
+                    "{} does not hold {} of main's refs/cowshed refs after carrying them: {}",
+                    retained.display(),
+                    missing.len(),
+                    missing.join(", ")
+                ),
+                format!(
+                    "inspect refs/cowshed in {}, then retry the restore",
+                    retained.display()
+                ),
+            ));
+        }
+        eprintln!(
+            "cowshed: carried {} refs/cowshed ref{} from main into {}, which the restore keeps: \
+             they outlive the project there, and removing that checkout is what would lose them",
+            refs.len(),
+            if refs.len() == 1 { "" } else { "s" },
+            retained.display()
+        );
+        Ok(())
     }
 
     /// Remove `workspace`, gating a session's destruction on `containment` holding its commits:
@@ -6784,6 +7046,10 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
             self.mark_lifecycle_intent_mutating(&workspace).await?;
             if rollback_state != NativeAdoptRollbackState::Complete {
+                // The restore retires main's image, and with it every `refs/cowshed/*` ref cowshed
+                // wrote there: abandoned tips and `push`ed branches. The retained checkout is what
+                // the user keeps, so they go there first, or the restore refuses.
+                self.carry_cowshed_refs(&current, &pre_cowshed).await?;
                 self.substrate
                     .restore_adopted_checkout(&current.derived.workspace, &pre_cowshed)
                     .await
@@ -6857,7 +7123,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 ),
                 None => None,
             };
+            let mount = self.workspace_mount_path(&workspace)?;
+            let tips = self
+                .retired_tips(
+                    &workspace,
+                    &mount,
+                    &final_fence.head,
+                    abandoned.as_ref(),
+                    containment,
+                )
+                .await;
             self.finish_retirement(current, nx_check).await?;
+            self.log_retired_tips(&workspace, &mount, tips);
             Ok(RemoveReport { abandoned })
         }
         .await;
@@ -7044,6 +7321,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             unlanded_commits,
             // The restored checkout keeps main's other branches; only HEAD's range is abandoned.
             branches: Vec::new(),
+            // Main's repository is the one being restored: its bundle is what the restored
+            // checkout keeps, under its own Git directory.
+            preserved: Vec::new(),
             bundle: final_directory.join(name),
         })
     }
@@ -8424,7 +8704,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         // An unpublished clone never landed anywhere: main is what has to hold its work.
         let containment = self.main_containment()?;
         let result = async {
-            let (retired, abandoned) = substrate
+            let (retired, (abandoned, tips, mount)) = substrate
                 .execute_pending_clone_retirement(metadata, identity, |stage| {
                     let this = &mut *self;
                     let containment = &containment;
@@ -8476,13 +8756,23 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             ),
                             None => None,
                         };
+                        let tips = this
+                            .retired_tips(
+                                workspace,
+                                &stage.mount_point,
+                                &last.head,
+                                abandoned.as_ref(),
+                                containment,
+                            )
+                            .await;
                         this.unregister_workspace_in_main(workspace, git_worktree)
                             .await?;
-                        Ok::<_, CowshedError>(abandoned)
+                        Ok::<_, CowshedError>((abandoned, tips, stage.mount_point.clone()))
                     }
                 })
                 .await
                 .map_err(native_staged_error)?;
+            self.log_retired_tips(workspace, &mount, tips);
             self.commitments
                 .record(CommitmentDraft::WorkspaceRetired {
                     repo_id: self.descriptor.repo_id.clone(),
@@ -11810,6 +12100,19 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     .await?;
             }
         }
+        // An abandon bundle is deleted only once main's repository keeps every tip it advertises:
+        // `--abandoned` authorizes freeing the trash, not losing the commits. A removal by this
+        // build already kept them, so this writes the same refs again; a bundle an earlier build
+        // wrote gets them here. One that cannot be kept refuses the whole sweep, before anything
+        // is deleted, naming it.
+        let bundles: Vec<PathBuf> = plan
+            .candidates()
+            .iter()
+            .filter(|candidate| matches!(candidate.reason(), StorageGcReason::AbandonedBundle))
+            .map(|candidate| candidate.path().to_owned())
+            .collect();
+        self.keep_abandon_bundles(&self.main_containment()?.mount, &bundles)
+            .await?;
         let report = timed_async("gc", "substrate", self.substrate.execute_gc(plan))
             .await
             .map_err(native_storage_error)?;
@@ -11873,42 +12176,59 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         Ok(())
     }
 
+    /// The purge's last word on the trash: every bundle's tips go into main's repository first,
+    /// like `gc --abandoned`, so the main restore that follows carries them with every other
+    /// `refs/cowshed/*` ref into the retained checkout, where they outlive the project. Any bundle
+    /// that cannot be kept refuses the purge before one is deleted.
     async fn delete_abandon_bundles(&mut self) -> Result<Vec<PathBuf>> {
         let trash = self
             .layout
             .project()
             .sessions
             .join(crate::storage::recovery::TRASH_NAMESPACE);
+        let bundles =
+            crate::storage::lifecycle::dispatch_blocking(move || -> Result<Vec<PathBuf>> {
+                let unreadable = |error: std::io::Error| {
+                    CowshedError::environment_missing(
+                        format!(
+                            "cannot read the project's trash {}: {error}",
+                            trash.display()
+                        ),
+                        "check controller storage permissions and retry",
+                    )
+                };
+                let entries = match std::fs::read_dir(&trash) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(Vec::new());
+                    }
+                    Err(error) => return Err(unreadable(error)),
+                };
+                let mut bundles = Vec::new();
+                for entry in entries {
+                    let entry = entry.map_err(unreadable)?;
+                    let path = entry.path();
+                    if entry.file_type().map_err(unreadable)?.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|extension| extension == "bundle")
+                    {
+                        bundles.push(path);
+                    }
+                }
+                bundles.sort();
+                Ok(bundles)
+            })
+            .await
+            .map_err(|error| {
+                CowshedError::internal(format!("abandon bundle task failed: {error}"))
+            })??;
+        if bundles.is_empty() {
+            return Ok(bundles);
+        }
+        let main = self.main_containment()?.mount;
+        self.keep_abandon_bundles(&main, &bundles).await?;
         crate::storage::lifecycle::dispatch_blocking(move || -> Result<Vec<PathBuf>> {
-            let unreadable = |error: std::io::Error| {
-                CowshedError::environment_missing(
-                    format!(
-                        "cannot read the project's trash {}: {error}",
-                        trash.display()
-                    ),
-                    "check controller storage permissions and retry",
-                )
-            };
-            let entries = match std::fs::read_dir(&trash) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(Vec::new());
-                }
-                Err(error) => return Err(unreadable(error)),
-            };
-            let mut bundles = Vec::new();
-            for entry in entries {
-                let entry = entry.map_err(unreadable)?;
-                let path = entry.path();
-                if entry.file_type().map_err(unreadable)?.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|extension| extension == "bundle")
-                {
-                    bundles.push(path);
-                }
-            }
-            bundles.sort();
             for bundle in &bundles {
                 std::fs::remove_file(bundle).map_err(|error| {
                     CowshedError::environment_missing(
@@ -18616,6 +18936,39 @@ fn removal_dirty_refusal(workspace: &WorkspaceName) -> CowshedError {
         format!("workspace {workspace} has uncommitted Git work"),
         format!("commit the work and land it: cowshed land {workspace}"),
     )
+}
+
+/// Where main's repository keeps an abandoned workspace's tips: one namespace per abandoned head,
+/// so a later workspace reusing the name never overwrites what an earlier one left, and a
+/// retried abandonment writes the same refs again (02_workspaces.md, `rm` step 1).
+#[cfg(target_os = "macos")]
+fn abandoned_namespace(workspace: &str, head: &GitOid) -> String {
+    format!("refs/cowshed/{workspace}/abandoned/{head}")
+}
+
+/// The workspace and head an abandon bundle's file name records: `<ws>-<head>.bundle`.
+#[cfg(target_os = "macos")]
+fn abandon_bundle_identity(bundle: &Path) -> Result<(String, GitOid)> {
+    let unnamed = || {
+        CowshedError::integrity(
+            format!(
+                "{} is not named <workspace>-<head>.bundle, so nothing says whose tips it holds",
+                bundle.display()
+            ),
+            "fetch it into main's repository by hand, or move it out of sessions/.trash",
+        )
+    };
+    let stem = bundle
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".bundle"))
+        .ok_or_else(unnamed)?;
+    let (workspace, head) = stem.rsplit_once('-').ok_or_else(unnamed)?;
+    let head = GitOid::new(head.to_owned()).map_err(|_| unnamed())?;
+    if workspace.is_empty() {
+        return Err(unnamed());
+    }
+    Ok((workspace.to_owned(), head))
 }
 
 /// What the removal gate decided about a session's commits. The refusal is an outcome of the

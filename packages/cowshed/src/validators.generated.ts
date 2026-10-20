@@ -822,6 +822,12 @@ export const parsePortBlock = (json: string): Api.PortBlock => assertPortBlock(J
 export const assertPortBlockList = typia.createAssertEquals<readonly Api.PortBlock[]>();
 export const parsePortBlockList = (json: string): readonly Api.PortBlock[] => assertPortBlockList(JSON.parse(json));
 
+export const assertPreservedRef = typia.createAssertEquals<Api.PreservedRef>();
+export const parsePreservedRef = (json: string): Api.PreservedRef => assertPreservedRef(JSON.parse(json));
+export const assertPreservedRefList = typia.createAssertEquals<readonly Api.PreservedRef[]>();
+export const parsePreservedRefList = (json: string): readonly Api.PreservedRef[] =>
+  assertPreservedRefList(JSON.parse(json));
+
 export const assertPriorityFailure = typia.createAssertEquals<Api.PriorityFailure>();
 export const parsePriorityFailure = (json: string): Api.PriorityFailure => assertPriorityFailure(JSON.parse(json));
 export const assertPriorityFailureList = typia.createAssertEquals<readonly Api.PriorityFailure[]>();
