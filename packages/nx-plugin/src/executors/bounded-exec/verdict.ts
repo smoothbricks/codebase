@@ -8,10 +8,10 @@ import { join } from 'node:path';
  * - `bound`: the run hit a wall-clock bound and nothing else failed. Either the command
  *   outlived `timeoutMs` (`total`), or every failing test in the runner's report failed on
  *   its runner's per-test timeout (`test`). A loaded host produces exactly these.
- * - `wedged`: `idleTimeoutMs` fired: no test finished for that long. A machine that is only slow still finishes
- *   tests, so this is a hang, not a slow host, and the fix is the opposite one, so it is never a `bound`. It names
- *   the tests still running: those the runner said were running and never said finished, and those its report says
- *   it aborted when the bound stopped it.
+ * - `wedged`: `idleTimeoutMs` fired: no test finished for that long during a chargeable test interval. This proves
+ *   the suite's completion bound was exceeded, not that every process stopped: an expensive active fixture can
+ *   exceed it too. The verdict names tests reported running but never finished and tests the report says were
+ *   aborted; diagnostics distinguish a stalled wait from a progressing but oversized lifecycle.
  * - `no-space`: the run failed and its output said a write found no space (ENOSPC). Whatever its tests then reported,
  *   they failed on the disk, not on their own: the verdict names the line that said so and, when the task held one,
  *   its RAM temp volume as it stood when that line arrived.
@@ -274,6 +274,7 @@ const NEXTEST_REPORT_CONFIG_FILE = 'nextest-report.toml';
  */
 export const BUN_TEST = /(?<=^|[\s;&|()])((?:[^\s;&|()<>'"`\\=]*\/)?bun)\s+test(?=\s|$)/g;
 export const NEXTEST_RUN = /(?<=^|[\s;&|()-])nextest\s+run(?=\s|$)/g;
+export const GO_TEST = /(?<=^|[\s;&|()])go\s+test(?=\s|$)/;
 
 /**
  * `command` with its test runner asked to write a JUnit report into `directory`, the report

@@ -1328,13 +1328,22 @@ result line or dot. Output that finishes no test is not progress: nextest's `SLO
 period for a test still running, and a hung test's heartbeat both keep printing. A suite that keeps finishing tests
 therefore runs as long as it needs, however slow the host, and a test that never returns ends the run 180 s after the
 last test that finished. bun prints nothing per passing test when it believes an agent runs it, so the executor asks a
-lone `bun test` for `--dots`, one dot per finished test. A command that reports no tests makes progress only by exiting.
-nextest's slow-timeout and the serial groups' code-time classes only warn; no per-test bound kills a test or fails one
-that passed. Bun has a per-test deadline of its own, 5000 ms unless the command sets one, and it reads no bunfig for it,
-so every bun leg deletes it with `bun test --timeout=0` (`BUN_TEST_TIMEOUT_FLAG`; `0` means no deadline, measured on the
-pinned Bun 1.4.2). A test waits for the event it is waiting for, however long a loaded host makes the work take; one
-that never returns still ends the run through `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that
-report no tests; a target names at least one of the two.
+lone `bun test` for `--dots`, one dot per finished test. Without a recognised execution lifecycle, the clock starts at
+command spawn; a command that reports no tests makes progress only by exiting. nextest's slow-timeout and the serial
+groups' code-time classes only warn; no per-test bound kills a test or fails one that passed. Bun has a per-test
+deadline of its own, 5000 ms unless the command sets one, and it reads no bunfig for it, so every bun leg deletes it
+with `bun test --timeout=0` (`BUN_TEST_TIMEOUT_FLAG`; `0` means no deadline, measured on the pinned Bun 1.4.2). A test
+waits for the event it is waiting for, however long a loaded host makes the work take; one that never returns still ends
+the run through `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that report no tests; a target names
+at least one of the two.
+
+Direct `go test` invocations, including sequential `&&`, `||`, and `;` chains, are requested with `-json`. Go emits a
+package's `Action:start` only after its build dependencies settle; a package terminal (`pass`, `fail`, or `skip`) ends
+that execution interval. The unchanged idle bound runs while any package is executing, re-arms on test/package
+completion, and stops when none is executing. Initial linking and inter-package compilation therefore spend no test idle
+budget, while a stuck test or `TestMain` still expires after 180 s without a completion. `output`, `build-output`,
+pause/continue events, and arbitrary compiler activity are not progress. Mixed runner commands and unknown wrappers keep
+the existing spawn-based clock; Bun and Rust fixture compilation inside an active test gets no exemption.
 
 Process-group timeout fixtures retain cleanup authority only until the command leader exits and every descendant closes
 its inherited lifetime FIFO. EOF is the terminal ownership event; a later `afterEach` must not signal the retired PGID

@@ -1,5 +1,5 @@
 import { GATEWAY_SOCKET, holdLease, type UnleasedCause } from './gateway-lease.js';
-import { BUN_TEST, NEXTEST_RUN } from './verdict.js';
+import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
 
 /**
  * The client half of cowshed's host CPU budget (specs/cowshed/05_gateway.md, "Host CPU budget").
@@ -105,7 +105,7 @@ const WORKER_FLAGS: Readonly<Record<WorkerFlagKind, WorkerFlag>> = {
   },
   /** `go test -p`: packages built and tested at once, `GOMAXPROCS` by default, normally one per core. */
   'go-test': {
-    invocation: /(?<=^|[\s;&|()])go\s+test(?=\s|$)/,
+    invocation: GO_TEST,
     flag: new RegExp(String.raw`(?<![\w-])-p(?:=|\s+)${WORD}`, 'g'),
     sized: (count) => `-p=${count}`,
     ownDefault: (cores, env) => parseInheritedTokens(env.GOMAXPROCS) ?? cores,
@@ -236,7 +236,7 @@ function namedCounts(text: string, flag: RegExp): number[] {
  * Where `invocation` ends in `command`, and where its own arguments end: the next `;`, `&`, `|`, `(` or `)` outside
  * quotes and `$(…)`.
  */
-function invocationSpan(command: string, invocation: RegExp): { end: number; argsEnd: number } {
+export function invocationSpan(command: string, invocation: RegExp): { end: number; argsEnd: number } {
   const found = invocation.exec(command);
   const end = found === null ? command.length : found.index + found[0].length;
   let quote: string | null = null;
@@ -265,13 +265,19 @@ function invocationArgs(command: string, invocation: RegExp): string {
 }
 
 /**
- * `command` with every `flag` in `invocation`'s own arguments replaced by `sized`; when it names none, `sized` is
+ * `command` with every `flag` in `invocation`'s own arguments replaced by `value`; when it names none, `value` is
  * added right after the invocation if `add` says so.
  */
-function withSizedFlag(command: string, invocation: RegExp, flag: RegExp, sized: string, add: boolean): string {
+export function withInvocationFlag(
+  command: string,
+  invocation: RegExp,
+  flag: RegExp,
+  value: string,
+  add: boolean,
+): string {
   const { end, argsEnd } = invocationSpan(command, invocation);
   const args = command.slice(end, argsEnd);
-  const sizedArgs = args.search(flag) === -1 && add ? ` ${sized}${args}` : args.replace(flag, sized);
+  const sizedArgs = args.search(flag) === -1 && add ? ` ${value}${args}` : args.replace(flag, value);
   return `${command.slice(0, end)}${sizedArgs}${command.slice(argsEnd)}`;
 }
 
@@ -317,7 +323,7 @@ export function sizeRunner(
     case 'go-test': {
       const runner = WORKER_FLAGS[demand.kind];
       return {
-        command: withSizedFlag(command, runner.invocation, runner.flag, runner.sized(runnerCount), true),
+        command: withInvocationFlag(command, runner.invocation, runner.flag, runner.sized(runnerCount), true),
         env: { [CPU_TOKENS_ENV]: held },
       };
     }
@@ -326,9 +332,9 @@ export function sizeRunner(
       // `--jobs` is lowered only where it was set: cargo-mutants refuses it beside `--in-place`.
       const jobs = Math.min(demand.jobs, runnerCount);
       const share = String(Math.max(1, Math.floor(runnerCount / jobs)));
-      const tasks = withSizedFlag(command, CARGO_MUTANTS, JOBSERVER_TASKS, `--jobserver-tasks=${count}`, true);
+      const tasks = withInvocationFlag(command, CARGO_MUTANTS, JOBSERVER_TASKS, `--jobserver-tasks=${count}`, true);
       return {
-        command: withSizedFlag(tasks, CARGO_MUTANTS, MUTANTS_JOBS, `--jobs=${jobs}`, false),
+        command: withInvocationFlag(tasks, CARGO_MUTANTS, MUTANTS_JOBS, `--jobs=${jobs}`, false),
         env: {
           [CPU_TOKENS_ENV]: held,
           ...(demand.jobs > 1 ? { CARGO_MUTANTS_JOBS: String(jobs) } : {}),

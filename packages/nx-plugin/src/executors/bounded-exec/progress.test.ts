@@ -3,6 +3,69 @@ import { describe, expect, it } from 'bun:test';
 import { createRunProgress, withProgressReport } from './progress.js';
 
 describe('run progress', () => {
+  it('observes Go package execution and test completions, not build output or heartbeats', () => {
+    const progress = createRunProgress();
+    expect(
+      progress.scan('stdout', '{"Action":"build-output","ImportPath":"example/first","Output":"linking\\n"}\n'),
+    ).toBe(false);
+    expect(progress.inFlight()).toEqual([]);
+    expect(progress.scan('stdout', '{"Action":"start","Package":"example/first"}\n')).toBe(false);
+    expect(progress.inFlight()).toEqual(['example/first']);
+    expect(progress.scan('stdout', '{"Action":"run","Package":"example/first","Test":"TestReady"}\n')).toBe(false);
+    expect(progress.inFlight()).toEqual(['example/first TestReady']);
+    expect(progress.scan('stdout', '{"Action":"output","Package":"example/first","Output":"...\\n"}\n')).toBe(false);
+    expect(progress.scan('stdout', '{"Action":"pass","Package":"example/first","Test":"TestReady"}\n')).toBe(true);
+    expect(progress.scan('stdout', '{"Action":"pass","Package":"example/first"}\n')).toBe(true);
+    expect(progress.inFlight()).toEqual([]);
+    expect(
+      progress.scan('stdout', '{"Action":"build-output","ImportPath":"example/second","Output":"compiling\\n"}\n'),
+    ).toBe(false);
+    expect(progress.scan('stdout', '{"Action":"start","Package":"example/second"}\n')).toBe(false);
+    expect(progress.scan('stdout', '{"Action":"run","Package":"example/second","Test":"TestHang"}\n')).toBe(false);
+    expect(progress.inFlight()).toEqual(['example/second TestHang']);
+  });
+
+  it('counts only active Go package intervals, including startup and parallel packages', () => {
+    const progress = createRunProgress('go test ./...');
+    expect(progress.isTesting()).toBe(false);
+    progress.scan('stdout', '{"Action":"start","Package":"first"}\n{"Action":"start","Package":"second"}\n');
+    expect(progress.isTesting()).toBe(true);
+    expect(progress.inFlight()).toEqual(['first', 'second']);
+    progress.scan('stdout', '{"Action":"pass","Package":"first"}\n');
+    expect(progress.isTesting()).toBe(true);
+    expect(progress.inFlight()).toEqual(['second']);
+    progress.scan('stdout', '{"Action":"fail","Package":"second"}\n');
+    expect(progress.isTesting()).toBe(false);
+    expect(progress.inFlight()).toEqual([]);
+  });
+
+  it('buffers split Go events and does not mistake test output for lifecycle events', () => {
+    const progress = createRunProgress('go test ./...');
+    expect(progress.scan('stdout', '{"Action":"sta')).toBe(false);
+    expect(progress.isTesting()).toBe(false);
+    expect(progress.scan('stdout', 'rt","Package":"example"}\n')).toBe(false);
+    expect(progress.isTesting()).toBe(true);
+    expect(progress.scan('stdout', '{"Action":"run","Package":"example","Test":"TestHang"}\n')).toBe(false);
+    expect(progress.scan('stdout', '{"Action":"pause","Package":"example","Test":"TestHang"}\n')).toBe(false);
+    expect(progress.inFlight()).toEqual(['example TestHang']);
+    expect(progress.scan('stdout', '{"Action":"cont","Package":"example","Test":"TestHang"}\n')).toBe(false);
+    expect(progress.scan('stdout', '{"Action":"output","Package":"example","Output":"test fake ... ok\\n"}\n')).toBe(
+      false,
+    );
+    expect(progress.scan('stderr', '...\n')).toBe(false);
+    expect(progress.scan('stderr', '{invalid JSON}\n')).toBe(false);
+    expect(progress.scan('stdout', '{"Action":"skip","Package":"example","Test":"TestHang"}\n')).toBe(true);
+    expect(progress.inFlight()).toEqual(['example']);
+    expect(progress.scan('stdout', '{"Action":"pass","Package":"example"}\n')).toBe(true);
+    expect(progress.isTesting()).toBe(false);
+  });
+
+  it('keeps the existing watchdog for commands without a complete Go lifecycle contract', () => {
+    for (const command of ['bun test src', 'cargo nextest run', 'cargo test', 'go test ./... && bun test src']) {
+      expect(createRunProgress(command).isTesting()).toBe(true);
+    }
+  });
+
   it('counts a nextest status line with its run counter as a finished test, and a SLOW line as none', () => {
     const progress = createRunProgress();
     expect(progress.scan('stderr', '        SLOW [>  1.000s] (───) nt tests::hangs\n')).toBe(false);
@@ -60,6 +123,16 @@ describe('run progress', () => {
 });
 
 describe('progress report', () => {
+  it('asks Go for its package execution events without changing its test selection', () => {
+    expect(withProgressReport('go test -count=1 ./hts/... ./host/...')).toBe(
+      'go test -json -count=1 ./hts/... ./host/...',
+    );
+    expect(withProgressReport('go test -json -count=1 ./...')).toBe('go test -json -count=1 ./...');
+    expect(withProgressReport('go test -json=false ./first && go test -count=1 ./second')).toBe(
+      'go test -json ./first && go test -json -count=1 ./second',
+    );
+  });
+
   it('asks a lone bun test for dots, keeping the runtime the target named', () => {
     expect(withProgressReport('bun test --timeout=0 src')).toBe('bun test --dots --timeout=0 src');
     expect(withProgressReport('../x/.runtime/bun test a')).toBe('../x/.runtime/bun test --dots a');

@@ -474,7 +474,7 @@ export async function runBoundedExec(
   }
 
   // Progress is a finished test, not output: a runner's SLOW warnings and a hung test's heartbeat keep printing.
-  const progress = createRunProgress();
+  const progress = createRunProgress(command);
   // A write that found no space is said once, in the output, by whatever made it; the volume is read when it is said,
   // since the writer usually removes what it half-wrote before it exits and the volume no longer looks full by then.
   const noSpace = createNoSpaceWatch();
@@ -542,7 +542,7 @@ export async function runBoundedExec(
     idleTimer = setTimeout(() => expire({ kind: 'idle', limitMs, tests: progress.inFlight() }, queuedMs), leftMs);
   };
   const armIdleTimer = (): void => {
-    if (idleTimeoutMs === undefined || state.settled || state.expiry !== null) {
+    if (idleTimeoutMs === undefined || state.settled || state.expiry !== null || !progress.isTesting()) {
       return;
     }
     idleLeftMs = idleTimeoutMs;
@@ -577,6 +577,10 @@ export async function runBoundedExec(
       const waitedMs = Date.now() - queuedSinceMs;
       queuedMs += waitedMs;
       queuedSinceMs = null;
+      if (!progress.isTesting()) {
+        appendStderr(`bounded-exec: host CPU wait ended after ${waitedMs}ms; no test runner is active\n`);
+        return;
+      }
       appendStderr(
         `bounded-exec: idle clock restarted: no descendant's work is queued for host CPU tokens after ${waitedMs}ms; ${idleLeftMs}ms of idleTimeoutMs=${idleTimeoutMs} left\n`,
       );
@@ -587,16 +591,27 @@ export async function runBoundedExec(
   // Only the CHILD's own output is read for progress. The diagnostics below go
   // through appendStderr as well, and re-arming on those would let a teardown
   // message extend the very bound that just fired.
+  const scanProgress = (stream: 'stdout' | 'stderr', text: string): void => {
+    const wasTesting = progress.isTesting();
+    const finished = progress.scan(stream, text);
+    if (!progress.isTesting()) {
+      clearTimeout(idleTimer);
+      cancelCapture();
+      idleCapture = undefined;
+    } else if (finished || !wasTesting) {
+      armIdleTimer();
+    }
+  };
   child.stdout?.on('data', (chunk: Buffer | string) => {
     const text = chunk.toString();
-    if (progress.scan('stdout', text)) armIdleTimer();
+    scanProgress('stdout', text);
     const said = noSpace.scan('stdout', text);
     if (said !== null) state.noSpace = sight(said);
     appendStdout(text);
   });
   child.stderr?.on('data', (chunk: Buffer | string) => {
     const text = chunk.toString();
-    if (progress.scan('stderr', text)) armIdleTimer();
+    scanProgress('stderr', text);
     const said = noSpace.scan('stderr', text);
     if (said !== null) state.noSpace = sight(said);
     appendStderr(text);
