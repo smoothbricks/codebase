@@ -557,6 +557,7 @@ impl JobCpuAdmission for ScriptedCpu {
             let (withdraw, withdrawn) = tokio::sync::oneshot::channel();
             let (release, released) = tokio::sync::oneshot::channel();
             let queued = Signal(Some(withdraw));
+            let class = ask.class;
             requests
                 .send(CpuRequest {
                     ask,
@@ -567,11 +568,17 @@ impl JobCpuAdmission for ScriptedCpu {
                 .expect("the test reads its CPU requests");
             let tokens = answered.await.expect("the test answers each request")?;
             queued.disarm();
-            Ok(JobCpuGrant::new(
-                held(tokens),
-                PathBuf::from(TEST_POOL),
-                Box::new(Signal(Some(release))),
-            ))
+            let pool = PathBuf::from(TEST_POOL);
+            let holder = Box::new(Signal(Some(release)));
+            // A resident is granted its pool alone, whatever count the test answered.
+            Ok(match class {
+                ExecClass::Resident | ExecClass::InteractiveResident => {
+                    JobCpuGrant::resident(pool, holder)
+                }
+                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => {
+                    JobCpuGrant::new(held(tokens), pool, holder)
+                }
+            })
         })
     }
 
@@ -620,9 +627,12 @@ fn scripted_harness(label: &str) -> (Harness, mpsc::UnboundedReceiver<CpuRequest
     (h, asked, root)
 }
 
-/// A [`scripted_harness`] whose activation stakes the test answers by hand too.
+/// A [`scripted_harness`] whose activation stakes the test answers by hand too. `warm`: its
+/// spawns are a warm host's, whose command starts with a `Started` event the test sends;
+/// otherwise one-shot spawns, whose command has started when the spawn returns.
 fn staked_harness(
     label: &str,
+    warm: bool,
 ) -> (
     Harness,
     mpsc::UnboundedReceiver<CpuRequest>,
@@ -632,19 +642,18 @@ fn staked_harness(
     let root = workspace_root(label);
     let (requests, asked) = mpsc::unbounded_channel();
     let (stakes, staked) = mpsc::unbounded_channel();
-    let h = harness_with_config(
-        WorkspaceSupervisorConfig {
-            cpu: Arc::new(ScriptedCpu {
-                requests,
-                stakes: Some(stakes),
-            }),
-            ..config(&root)
-        },
-        1,
-        1024,
-        false,
-        false,
-    );
+    let config = WorkspaceSupervisorConfig {
+        cpu: Arc::new(ScriptedCpu {
+            requests,
+            stakes: Some(stakes),
+        }),
+        ..config(&root)
+    };
+    let h = if warm {
+        warm_harness(config)
+    } else {
+        harness_with_config(config, 1, 1024, false, false)
+    };
     (h, asked, staked, root)
 }
 
@@ -8220,13 +8229,18 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
         .expect("the concluded job returned its grant to the gateway");
 }
 
-/// A resident holds no token for its life, but its shell's activation is work: it first waits
-/// for one background token, asks for its zero-token pool only once that stake is held, holds the
-/// stake while its shell activates, and returns it when its command starts -- keeping its pool to
-/// the end (05_gateway.md "A resident holds no token").
-#[tokio::test]
-async fn a_resident_holds_one_token_until_its_command_starts_and_none_after() {
-    let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-start");
+/// A resident's admission up to its spawn: the stake asked before its pool, and the spawn under
+/// both. What reports the stake's return, what reports the pool's, and the spawn.
+async fn admit_resident(
+    h: &mut Harness,
+    asked: &mut mpsc::UnboundedReceiver<CpuRequest>,
+    staked: &mut mpsc::UnboundedReceiver<StakeRequest>,
+) -> (
+    JobId,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Receiver<()>,
+    Spawned,
+) {
     let job = h
         .handle
         .exec(
@@ -8240,43 +8254,56 @@ async fn a_resident_holds_one_token_until_its_command_starts_and_none_after() {
         )
         .await
         .expect("answered at admission");
-    let stake = staked
+    let StakeRequest {
+        command,
+        answer,
+        released: stake_released,
+    } = staked
         .recv()
         .await
         .expect("the resident asks its start stake");
-    assert!(!stake.command.is_empty(), "the stake names what activates");
+    assert!(!command.is_empty(), "the stake names what activates");
     assert!(
         asked.try_recv().is_err(),
         "no pool is asked before the stake is held"
     );
     assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Queued);
-    stake.answer.send(Ok(())).unwrap();
+    answer.send(Ok(())).unwrap();
     let pool = asked.recv().await.expect("then it asks its pool");
     assert_eq!(pool.ask.class, ExecClass::Resident);
     pool.answer.send(Ok(NonZeroUsize::MIN)).unwrap();
     let spawned = h.spawned.recv().await.unwrap();
+    (job, stake_released, pool.released, spawned)
+}
 
-    let mut stake_released = stake.released;
+/// A resident holds no token for its life, but its shell's activation is work: it first waits
+/// for one background token, asks for its zero-token pool only once that stake is held, holds the
+/// stake while a warm host's shell activates, and returns it when its command starts -- keeping its
+/// pool to the end (05_gateway.md "A resident's start holds one token").
+#[tokio::test]
+async fn a_resident_holds_one_token_until_its_warm_command_starts_and_none_after() {
+    let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-warm", true);
+    let (job, mut stake_released, mut pool_released, spawned) =
+        admit_resident(&mut h, &mut asked, &mut staked).await;
+    // The actor has handled the spawn's return once it answers this.
+    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Running);
     assert!(
         stake_released.try_recv().is_err(),
         "the stake is held while the shell activates, before the command starts"
     );
     let command = lone_group();
-    deliver(
-        &h.handle,
-        &spawned,
-        ProcessEvent::Started {
+    spawned
+        .events
+        .send(ProcessEvent::Started {
             job_id: job,
             process: owned(&command, Instant::now()),
             nice: 10,
-        },
-        0,
-    )
-    .await;
+        })
+        .await
+        .unwrap();
     stake_released
         .await
         .expect("the command started: the stake returned its token");
-    let mut pool_released = pool.released;
     assert!(
         pool_released.try_recv().is_err(),
         "the resident keeps its pool while it runs"
@@ -8290,11 +8317,76 @@ async fn a_resident_holds_one_token_until_its_command_starts_and_none_after() {
         .expect("the concluded resident returned its pool");
 }
 
+/// A one-shot spawn -- a direct `/bin/sh`, no warm host -- reports no `Started`: its command has
+/// started when the spawn returns its process. Its stake returns then, never held for the
+/// resident's life (measured 2026-10-20: a direct ticker resident held the stake, the one
+/// background token of a three-token ledger, and starved the land's check job behind it).
+#[tokio::test]
+async fn a_one_shot_resident_returns_its_stake_when_its_spawn_returns() {
+    let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-one-shot", false);
+    let (job, stake_released, mut pool_released, spawned) =
+        admit_resident(&mut h, &mut asked, &mut staked).await;
+    stake_released
+        .await
+        .expect("the one-shot command started with its spawn: the stake returned its token");
+    assert!(
+        pool_released.try_recv().is_err(),
+        "the resident keeps its pool while it runs"
+    );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+    pool_released
+        .await
+        .expect("the concluded resident returned its pool");
+}
+
+/// A resident whose spawn fails never starts a command: its stake returns with its grant when the
+/// failed job concludes, never held past it.
+#[tokio::test]
+async fn a_resident_whose_spawn_fails_returns_its_stake_with_its_grant() {
+    let root = workspace_root("cpu-resident-spawn-failed");
+    let (requests, mut asked) = mpsc::unbounded_channel();
+    let (stakes, mut staked) = mpsc::unbounded_channel();
+    let config = WorkspaceSupervisorConfig {
+        cpu: Arc::new(ScriptedCpu {
+            requests,
+            stakes: Some(stakes),
+        }),
+        ..config(&root)
+    };
+    let mut h = harness_with_config(config, 1, 1024, true, false);
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                class: ExecClass::Resident,
+                ..request(StdinSource::Empty)
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .expect("answered at admission");
+    let stake = staked.recv().await.expect("the start stake");
+    stake.answer.send(Ok(())).unwrap();
+    let pool = asked.recv().await.expect("the pool");
+    pool.answer.send(Ok(NonZeroUsize::MIN)).unwrap();
+    let ended = h.handle.wait(job).await.unwrap();
+    assert_eq!(ended.state, JobState::Failed);
+    stake
+        .released
+        .await
+        .expect("the failed spawn's job returned its stake");
+    pool.released.await.expect("and its pool");
+    assert!(h.spawned.try_recv().is_err(), "no command ran");
+}
+
 /// A resident whose start stake is refused fails before any command, as any refused admission:
 /// no pool is asked and nothing spawns.
 #[tokio::test]
 async fn a_resident_whose_start_stake_is_refused_fails_before_any_command() {
-    let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-refused");
+    let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-refused", false);
     let job = h
         .handle
         .exec(

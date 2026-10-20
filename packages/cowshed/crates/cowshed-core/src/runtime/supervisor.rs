@@ -5649,7 +5649,8 @@ impl SupervisorActor {
             clock_observation(job);
         }
         if let Some(owned) = process.process() {
-            // A one-shot command is the job's first process.
+            // A one-shot command is the job's first process: it has started.
+            command_started(job_id, job);
             own_process(job, owned.clone(), self.job_sampling.leaf_coverage);
             adopt_birth(job, self.group_ledger.is_some(), owned.birth.clone());
             self.arm_sample_clock();
@@ -6347,14 +6348,8 @@ impl SupervisorActor {
                 let ledger = self.group_ledger.is_some();
                 let coverage = self.job_sampling.leaf_coverage;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
-                    // A resident's shell has activated: its start stake returns its token.
-                    if let CpuStanding::Granted { grant } = &mut job.cpu
-                        && grant.started()
-                    {
-                        cowshed_os::timing::event("jobserver", || {
-                            format!("release activation job={}", job_id.get())
-                        });
-                    }
+                    // A warm host's command started: its shell has activated.
+                    command_started(job_id, job);
                     job.info.nice = Some(nice);
                     let birth = process.birth.clone();
                     own_process(job, process, coverage);
@@ -7346,6 +7341,20 @@ fn adopt_birth(job: &mut JobStateRecord, ledger: bool, birth: Birth) {
     }
     job.info.pid = Some(birth.pid());
     job.birth = Some(birth);
+}
+
+/// The job's command started, however its spawn reports it: a one-shot spawn's process at once, a
+/// warm host's with [`ProcessEvent::Started`] after its shell activated. A resident's start stake
+/// returns its token here, at the first of the two it sees (05_gateway.md "A resident's start
+/// holds one token").
+fn command_started(job_id: JobId, job: &mut JobStateRecord) {
+    if let CpuStanding::Granted { grant } = &mut job.cpu
+        && grant.started()
+    {
+        cowshed_os::timing::event("jobserver", || {
+            format!("release activation job={}", job_id.get())
+        });
+    }
 }
 
 /// The job's leader ended: its stdin closes for good and everything waiting on it is answered.
