@@ -369,6 +369,15 @@ impl JobCpuAdmission for ImmediateCpu {
             })
         })
     }
+
+    fn activation(
+        &self,
+        _checkout: PathBuf,
+        _command: String,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<super::job_cpu::ActivationStake>> + Send>>
+    {
+        Box::pin(async { Ok(super::job_cpu::ActivationStake::new(Box::new(()))) })
+    }
 }
 
 /// A named or anonymous session identity. Reopening a closed name gets a new identity.
@@ -2034,12 +2043,15 @@ pub struct SystemSpawnSink {
 }
 
 impl SystemSpawnSink {
+    /// A sink whose commands under a workspace `.envrc` run in warm hosts of `program`; a spare
+    /// host's activation asks `cpu` for its token.
     pub fn with_shell_host(
         program: super::shell_host::ShellHostProgram,
         config: super::shell_pool::ShellPoolConfig,
+        cpu: Arc<dyn JobCpuAdmission>,
     ) -> Self {
         Self {
-            shells: Some(super::shell_job::WorkspaceShells::new(program, config)),
+            shells: Some(super::shell_job::WorkspaceShells::new(program, config, cpu)),
         }
     }
 }
@@ -3365,7 +3377,11 @@ impl WorkspaceSupervisor {
             config.artifacts.clone(),
         )?;
         let spawner = match config.shell_host.clone() {
-            Some(program) => SystemSpawnSink::with_shell_host(program, config.shell_pool),
+            Some(program) => SystemSpawnSink::with_shell_host(
+                program,
+                config.shell_pool,
+                Arc::clone(&config.cpu),
+            ),
             None => SystemSpawnSink::default(),
         };
         Self::start_with_sinks(
@@ -4051,8 +4067,9 @@ enum CpuStanding {
     Queued(Box<PendingSpawn>),
     /// Cancelled while queued: it left the gateway's queue, and nothing ever spawned.
     Withdrawn,
-    /// The grant the command runs under, held until the job concludes, whatever ends it.
-    Granted { _grant: JobCpuGrant },
+    /// The grant the command runs under, held until the job concludes, whatever ends it; a
+    /// resident's start stake within it returns when its command starts.
+    Granted { grant: JobCpuGrant },
     /// Holding nothing: the request was refused, or the job concluded and returned its grant.
     Settled,
 }
@@ -5425,13 +5442,24 @@ impl SupervisorActor {
         }
         // Off the actor's path: the actor keeps serving every command while the gateway queues
         // the request. Dropping the request -- an abort, or this supervisor ending -- closes its
-        // connection, which leaves the queue.
+        // connection, which leaves the queue. A resident holds no token for its life, but its
+        // shell's activation is work: it first waits for one background token, which it holds
+        // until its command starts (05_gateway.md "A resident holds no token").
         let asking = {
+            let class = scheduling.class();
+            let checkout = self.workspace_root.clone();
+            let command = command_label(&info.command);
+            let start = match class {
+                ExecClass::Resident | ExecClass::InteractiveResident => {
+                    Some(self.cpu.activation(checkout.clone(), command.clone()))
+                }
+                ExecClass::Background | ExecClass::Interactive | ExecClass::Gate => None,
+            };
             let ask = self.cpu.admit(JobCpuAsk {
-                class: scheduling.class(),
+                class,
                 want: scheduling.want(),
-                checkout: self.workspace_root.clone(),
-                command: command_label(&info.command),
+                checkout,
+                command,
                 job: (
                     self.authority.repo_id.clone(),
                     self.authority.workspace_incarnation.clone(),
@@ -5439,7 +5467,16 @@ impl SupervisorActor {
                 ),
                 parent: cpu_parent,
             });
-            self.admissions.spawn(async move { (job_id, ask.await) })
+            self.admissions.spawn(async move {
+                let granted = match start {
+                    Some(start) => match start.await {
+                        Ok(stake) => ask.await.map(|grant| grant.holding_until_started(stake)),
+                        Err(error) => Err(error),
+                    },
+                    None => ask.await,
+                };
+                (job_id, granted)
+            })
         };
         let job = JobStateRecord {
             info,
@@ -5556,7 +5593,7 @@ impl SupervisorActor {
         };
         job.info.cpu_tokens = grant.tokens();
         job.info.state = JobState::Running;
-        job.cpu = CpuStanding::Granted { _grant: grant };
+        job.cpu = CpuStanding::Granted { grant };
         // Read before the job's first process is dispatched, so nothing it writes precedes its
         // baseline: a warm host may start the command before its start is reported here. Its
         // run counts from here too: the wait for the host is not the command's time.
@@ -6310,6 +6347,14 @@ impl SupervisorActor {
                 let ledger = self.group_ledger.is_some();
                 let coverage = self.job_sampling.leaf_coverage;
                 if let Some(job) = self.jobs.get_mut(&job_id) {
+                    // A resident's shell has activated: its start stake returns its token.
+                    if let CpuStanding::Granted { grant } = &mut job.cpu
+                        && grant.started()
+                    {
+                        cowshed_os::timing::event("jobserver", || {
+                            format!("release activation job={}", job_id.get())
+                        });
+                    }
                     job.info.nice = Some(nice);
                     let birth = process.birth.clone();
                     own_process(job, process, coverage);

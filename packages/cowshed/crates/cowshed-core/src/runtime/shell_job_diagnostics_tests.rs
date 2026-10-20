@@ -96,6 +96,7 @@ fn descriptor_exhaustion_reports_the_diagnostics_clone_failure() {
                 ),
                 environment: BTreeMap::new(),
                 envrc_directory: None,
+                cpu: Arc::new(crate::runtime::supervisor::ImmediateCpu),
             }),
             ShellPoolConfig {
                 prewarm: false,

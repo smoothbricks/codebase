@@ -26,7 +26,9 @@ use cowshed_core::api::{
 use cowshed_core::error::{ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
-use cowshed_core::runtime::job_cpu::{HeldTokens, JobCpuAdmission, JobCpuAsk, JobCpuGrant};
+use cowshed_core::runtime::job_cpu::{
+    ActivationStake, HeldTokens, JobCpuAdmission, JobCpuAsk, JobCpuGrant,
+};
 use cowshed_core::runtime::shell_host::ShellHostProgram;
 use cowshed_core::runtime::shell_pool::ShellPoolConfig;
 use cowshed_core::runtime::supervisor::{
@@ -61,10 +63,12 @@ const TEST_POOL: &str = "/nonexistent/cowshed-test-cpu-pool.sock";
 /// The gateway's CPU budget for these tests: each request is granted its whole want at once, and
 /// a resident is granted its pool alone, as the gateway answers one. A held grant's jobserver is
 /// `fifo`, a real one in the workspace's pool directory, which its exec host opens before every
-/// command (05_gateway.md "Cargo reads its holder's jobserver").
+/// command (05_gateway.md "Cargo reads its holder's jobserver"). Each activation stake is granted
+/// at once and recorded as one line of `stakes`, naming what activates.
 #[derive(Debug)]
 struct GrantingCpu {
     fifo: PathBuf,
+    stakes: PathBuf,
 }
 
 impl JobCpuAdmission for GrantingCpu {
@@ -84,6 +88,24 @@ impl JobCpuAdmission for GrantingCpu {
                     JobCpuGrant::new(held, pool, Box::new(()))
                 }
             })
+        })
+    }
+
+    fn activation(
+        &self,
+        _checkout: PathBuf,
+        command: String,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
+        let stakes = self.stakes.clone();
+        Box::pin(async move {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&stakes)
+                .expect("the stakes record");
+            writeln!(file, "{command}").expect("record the stake");
+            Ok(ActivationStake::new(Box::new(())))
         })
     }
 }
@@ -202,6 +224,13 @@ impl Workspace {
             .unwrap_or(0)
     }
 
+    /// The activation stakes this workspace's supervisors asked the budget for, in order.
+    fn stakes(&self) -> Vec<String> {
+        std::fs::read_to_string(self.sandbox.exec_temp_dir.join("stakes"))
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
     fn supervisor(&self, prewarm: bool) -> WorkspaceSupervisorHandle {
         self.supervisor_hosted_by(ShellHostProgram::dedicated(shell_host()), prewarm)
     }
@@ -233,6 +262,7 @@ impl Workspace {
             job_sampling: cowshed_core::runtime::supervisor::JobSamplingPolicy::default(),
             cpu: Arc::new(GrantingCpu {
                 fifo: self.jobserver(),
+                stakes: self.sandbox.exec_temp_dir.join("stakes"),
             }),
         };
         let artifacts = ArtifactStoreSink::open(
@@ -242,15 +272,17 @@ impl Workspace {
             config.artifacts.clone(),
         )
         .expect("artifact store");
+        let spawner = SystemSpawnSink::with_shell_host(
+            program,
+            ShellPoolConfig {
+                prewarm,
+                ..ShellPoolConfig::default()
+            },
+            Arc::clone(&config.cpu),
+        );
         WorkspaceSupervisor::start_with_sinks(
             config,
-            Box::new(SystemSpawnSink::with_shell_host(
-                program,
-                ShellPoolConfig {
-                    prewarm,
-                    ..ShellPoolConfig::default()
-                },
-            )),
+            Box::new(spawner),
             Box::new(artifacts),
             Box::new(DiscardedCommitments),
         )
@@ -820,6 +852,14 @@ async fn host_controller_a_concurrent_command_takes_the_prewarmed_spare() {
     assert!(
         spare_ready.is_ok(),
         "a spare is activated once a generation exists"
+    );
+    // The command's own activation ran under its job's grant; the spare's, for no job, held a
+    // stake of its own.
+    let stakes = workspace.stakes();
+    assert_eq!(stakes.len(), 1, "one stake, the spare's: {stakes:?}");
+    assert!(
+        stakes[0].starts_with("shell spare activation in "),
+        "{stakes:?}"
     );
     // One command holds the returned shell; the next takes the spare without activating.
     let holding = handle

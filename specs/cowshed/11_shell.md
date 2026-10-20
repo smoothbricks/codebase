@@ -133,7 +133,11 @@ no host activated under one grant revision serves another. Each pool keeps one a
 bounded cache (four hosts) of hosts that are executing or were just returned; a full cache evicts by SIEVE. A command
 takes the most recently returned idle host, else the spare — whose replacement starts activating in the background —
 else activates a host of its own. Commands never queue for a host. One actor owns each pool's state; nothing locks. A
-supervisor that lives only as long as a short-lived controller process keeps no spare, which would end unused with it.
+supervisor that lives only as long as a short-lived controller process keeps no spare, which would end unused with it. A
+spare's activation runs for no job, so no job's grant bounds it: it first asks one background token of the workspace's
+checkout with an activation stake (05_gateway.md, "A resident's start holds one token") and holds it until its
+activation ends, whatever ends it. A stake that is refused, or a gateway that cannot be reached, is a failed activation
+like any other: there is no spare, and the next command activates for itself.
 
 **Activation belongs to the job that waited on it.** A command that activates a host receives the activation's output on
 its own stdout and stderr, and until its command starts that host's process group is the job's: a kill reaches the

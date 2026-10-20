@@ -22,7 +22,9 @@ use cowshed_core::api::{JobLeafAttribution, ProcessCoverage, ProcessCoverageGap}
 use cowshed_core::error::{AdmissionField, AdmissionRefusal, CowshedError, ErrorCode, Result};
 use cowshed_core::metadata::{PortBlock, WorkspaceIncarnation, WorkspaceName};
 use cowshed_core::repository::{OwnedRepoIds, RepoId};
-use cowshed_core::runtime::job_cpu::{HeldTokens, JobCpuAdmission, JobCpuAsk, JobCpuGrant};
+use cowshed_core::runtime::job_cpu::{
+    ActivationStake, HeldTokens, JobCpuAdmission, JobCpuAsk, JobCpuGrant,
+};
 use cowshed_core::runtime::job_groups::Birth;
 use cowshed_core::runtime::supervisor_socket::AdmissionSource;
 use cowshed_core::sandbox::{SandboxConfig, SandboxGrants};
@@ -496,19 +498,37 @@ impl JobCpuAdmission for ImmediateCpu {
             })
         })
     }
+
+    fn activation(
+        &self,
+        _checkout: PathBuf,
+        _command: String,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
+        Box::pin(async { Ok(ActivationStake::new(Box::new(()))) })
+    }
 }
 
 /// A CPU budget a test answers by hand. Each request arrives as a [`CpuRequest`]; dropping a
 /// request before its answer (a job withdrawn while queued) and returning a grant are reported.
+/// Activation stakes arrive as [`StakeRequest`]s when the test reads them, else are granted at once.
 #[derive(Debug)]
 struct ScriptedCpu {
     requests: mpsc::UnboundedSender<CpuRequest>,
+    stakes: Option<mpsc::UnboundedSender<StakeRequest>>,
 }
 
 struct CpuRequest {
     ask: JobCpuAsk,
     answer: tokio::sync::oneshot::Sender<Result<NonZeroUsize>>,
     withdrawn: tokio::sync::oneshot::Receiver<()>,
+    released: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// One activation stake asked of a [`ScriptedCpu`]: what activates, the test's answer, and the
+/// stake's return to the budget.
+struct StakeRequest {
+    command: String,
+    answer: tokio::sync::oneshot::Sender<Result<()>>,
     released: tokio::sync::oneshot::Receiver<()>,
 }
 
@@ -554,6 +574,30 @@ impl JobCpuAdmission for ScriptedCpu {
             ))
         })
     }
+
+    fn activation(
+        &self,
+        _checkout: PathBuf,
+        command: String,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
+        let stakes = self.stakes.clone();
+        Box::pin(async move {
+            let Some(stakes) = stakes else {
+                return Ok(ActivationStake::new(Box::new(())));
+            };
+            let (answer, answered) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            stakes
+                .send(StakeRequest {
+                    command,
+                    answer,
+                    released,
+                })
+                .expect("the test reads its stake requests");
+            answered.await.expect("the test answers each stake")?;
+            Ok(ActivationStake::new(Box::new(Signal(Some(release)))))
+        })
+    }
 }
 
 /// A fake-spawner harness whose CPU requests the test answers by hand.
@@ -562,7 +606,10 @@ fn scripted_harness(label: &str) -> (Harness, mpsc::UnboundedReceiver<CpuRequest
     let (requests, asked) = mpsc::unbounded_channel();
     let h = harness_with_config(
         WorkspaceSupervisorConfig {
-            cpu: Arc::new(ScriptedCpu { requests }),
+            cpu: Arc::new(ScriptedCpu {
+                requests,
+                stakes: None,
+            }),
             ..config(&root)
         },
         1,
@@ -571,6 +618,34 @@ fn scripted_harness(label: &str) -> (Harness, mpsc::UnboundedReceiver<CpuRequest
         false,
     );
     (h, asked, root)
+}
+
+/// A [`scripted_harness`] whose activation stakes the test answers by hand too.
+fn staked_harness(
+    label: &str,
+) -> (
+    Harness,
+    mpsc::UnboundedReceiver<CpuRequest>,
+    mpsc::UnboundedReceiver<StakeRequest>,
+    TempRoot,
+) {
+    let root = workspace_root(label);
+    let (requests, asked) = mpsc::unbounded_channel();
+    let (stakes, staked) = mpsc::unbounded_channel();
+    let h = harness_with_config(
+        WorkspaceSupervisorConfig {
+            cpu: Arc::new(ScriptedCpu {
+                requests,
+                stakes: Some(stakes),
+            }),
+            ..config(&root)
+        },
+        1,
+        1024,
+        false,
+        false,
+    );
+    (h, asked, staked, root)
 }
 
 fn gate(request: ExecRequest) -> ExecRequest {
@@ -8143,6 +8218,114 @@ async fn a_job_spawns_under_its_actual_grant_and_returns_it_when_it_concludes() 
     released
         .await
         .expect("the concluded job returned its grant to the gateway");
+}
+
+/// A resident holds no token for its life, but its shell's activation is work: it first waits
+/// for one background token, asks for its zero-token pool only once that stake is held, holds the
+/// stake while its shell activates, and returns it when its command starts -- keeping its pool to
+/// the end (05_gateway.md "A resident holds no token").
+#[tokio::test]
+async fn a_resident_holds_one_token_until_its_command_starts_and_none_after() {
+    let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-start");
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                class: ExecClass::Resident,
+                ..request(StdinSource::Empty)
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .expect("answered at admission");
+    let stake = staked
+        .recv()
+        .await
+        .expect("the resident asks its start stake");
+    assert!(!stake.command.is_empty(), "the stake names what activates");
+    assert!(
+        asked.try_recv().is_err(),
+        "no pool is asked before the stake is held"
+    );
+    assert_eq!(h.handle.info(job).await.unwrap().state, JobState::Queued);
+    stake.answer.send(Ok(())).unwrap();
+    let pool = asked.recv().await.expect("then it asks its pool");
+    assert_eq!(pool.ask.class, ExecClass::Resident);
+    pool.answer.send(Ok(NonZeroUsize::MIN)).unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+
+    let mut stake_released = stake.released;
+    assert!(
+        stake_released.try_recv().is_err(),
+        "the stake is held while the shell activates, before the command starts"
+    );
+    let command = lone_group();
+    deliver(
+        &h.handle,
+        &spawned,
+        ProcessEvent::Started {
+            job_id: job,
+            process: owned(&command, Instant::now()),
+            nice: 10,
+        },
+        0,
+    )
+    .await;
+    stake_released
+        .await
+        .expect("the command started: the stake returned its token");
+    let mut pool_released = pool.released;
+    assert!(
+        pool_released.try_recv().is_err(),
+        "the resident keeps its pool while it runs"
+    );
+    end_group(&command);
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
+    reap(command);
+    pool_released
+        .await
+        .expect("the concluded resident returned its pool");
+}
+
+/// A resident whose start stake is refused fails before any command, as any refused admission:
+/// no pool is asked and nothing spawns.
+#[tokio::test]
+async fn a_resident_whose_start_stake_is_refused_fails_before_any_command() {
+    let (mut h, mut asked, mut staked, _root) = staked_harness("cpu-resident-refused");
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                class: ExecClass::Resident,
+                ..request(StdinSource::Empty)
+            },
+            AdmissionSource::Coordinator,
+        )
+        .await
+        .expect("answered at admission");
+    let stake = staked
+        .recv()
+        .await
+        .expect("the resident asks its start stake");
+    stake
+        .answer
+        .send(Err(CowshedError::conflict(
+            "the gateway is gone",
+            "start it",
+        )))
+        .unwrap();
+    let ended = h.handle.wait(job).await.unwrap();
+    assert_eq!(
+        (ended.state, ended.failure),
+        (JobState::Failed, Some(JobFailure::CpuAdmission))
+    );
+    assert!(asked.try_recv().is_err(), "no pool was asked");
+    assert!(h.spawned.try_recv().is_err(), "no command ran");
 }
 
 /// Cancelling a job still waiting for its grant withdraws its request from the gateway's queue:

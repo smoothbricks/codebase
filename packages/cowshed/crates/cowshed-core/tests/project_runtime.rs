@@ -2594,6 +2594,20 @@ impl cowshed_core::runtime::job_cpu::JobCpuAdmission for GrantingCpu {
             })
         })
     }
+
+    fn activation(
+        &self,
+        _checkout: PathBuf,
+        _command: String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<cowshed_core::runtime::job_cpu::ActivationStake>> + Send>,
+    > {
+        Box::pin(async {
+            Ok(cowshed_core::runtime::job_cpu::ActivationStake::new(
+                Box::new(()),
+            ))
+        })
+    }
 }
 
 struct AcceptedCommitments;

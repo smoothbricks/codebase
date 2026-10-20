@@ -72,7 +72,9 @@ pub struct JobserverRequest<'a> {
     command: &'a str,
     class: JobserverClass,
     pool: bool,
-    job: JobserverJob<'a>,
+    /// The job a pooled grant serves; an activation stake serves no job and has no pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job: Option<JobserverJob<'a>>,
     /// Only background jobs may borrow a requester's live pool. A gate always enters its
     /// repository's host queue; its constructor cannot attach a parent pool.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -94,7 +96,7 @@ impl<'a> JobserverRequest<'a> {
             command,
             class: JobserverClass::Background,
             pool: true,
-            job,
+            job: Some(job),
             parent_pool,
         }
     }
@@ -111,7 +113,23 @@ impl<'a> JobserverRequest<'a> {
             command,
             class: JobserverClass::Gate,
             pool: true,
-            job,
+            job: Some(job),
+            parent_pool: None,
+        }
+    }
+    /// One background token held while a shell activates, before a command exists to use it
+    /// (05_gateway.md "A resident holds no token"; 11_shell.md, spare): a resident's start, or a
+    /// shell pool's spare. It names no job and asks for no pool; the gateway answers `tokens: 1`
+    /// and a fifo nobody reads, and the token returns when the connection closes.
+    pub const fn activation(checkout: &'a str, command: &'a str) -> Self {
+        Self {
+            op: JOBSERVER_OP,
+            want: NonZeroUsize::MIN,
+            checkout,
+            command,
+            class: JobserverClass::Background,
+            pool: false,
+            job: None,
             parent_pool: None,
         }
     }

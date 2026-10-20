@@ -46,6 +46,15 @@ pub fn requester_cpu_pool() -> Option<String> {
 
 pub trait JobCpuAdmission: Send + Sync + fmt::Debug + 'static {
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>>;
+    /// One background token for a shell activation that has no command yet to use it -- a
+    /// resident's start, or a shell pool's spare (05_gateway.md "A resident holds no token";
+    /// 11_shell.md, spare) -- for `checkout`, `command` naming what activates. It waits as any
+    /// background ask does, and the token returns when the stake drops.
+    fn activation(
+        &self,
+        checkout: PathBuf,
+        command: String,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>>;
 }
 
 #[derive(Debug)]
@@ -79,6 +88,9 @@ pub struct HeldTokens {
 pub struct JobCpuGrant {
     held: Option<HeldTokens>,
     pool: PathBuf,
+    /// A resident's one background token while its shell activates, dropped at its command's
+    /// start ([`Self::started`]).
+    start: Option<ActivationStake>,
     _holder: Holder,
 }
 impl fmt::Debug for JobCpuGrant {
@@ -86,6 +98,7 @@ impl fmt::Debug for JobCpuGrant {
         out.debug_struct("JobCpuGrant")
             .field("held", &self.held)
             .field("pool", &self.pool)
+            .field("start", &self.start.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -97,6 +110,7 @@ impl JobCpuGrant {
         Self {
             held: Some(held),
             pool,
+            start: None,
             _holder: Holder::Injected { _owner: holder },
         }
     }
@@ -105,8 +119,19 @@ impl JobCpuGrant {
         Self {
             held: None,
             pool,
+            start: None,
             _holder: Holder::Injected { _owner: holder },
         }
+    }
+    /// This grant, holding `stake` until its command starts.
+    #[must_use]
+    pub fn holding_until_started(mut self, stake: ActivationStake) -> Self {
+        self.start = Some(stake);
+        self
+    }
+    /// The job's command started: a start stake returns its token. Whether one was held.
+    pub fn started(&mut self) -> bool {
+        self.start.take().is_some()
     }
     /// The tokens the job holds; `None` for a resident, which holds none.
     pub fn tokens(&self) -> Option<NonZeroUsize> {
@@ -118,6 +143,25 @@ impl JobCpuGrant {
     }
     pub fn pool(&self) -> &Path {
         &self.pool
+    }
+}
+
+/// One background token held while a shell activates ([`JobCpuAdmission::activation`]). The
+/// token returns to the host ledger when this drops.
+pub struct ActivationStake {
+    _holder: Holder,
+}
+impl fmt::Debug for ActivationStake {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_struct("ActivationStake").finish_non_exhaustive()
+    }
+}
+impl ActivationStake {
+    /// An injected stake: `holder` owns the allocation it stands for.
+    pub fn new(holder: Box<dyn Send + Sync>) -> Self {
+        Self {
+            _holder: Holder::Injected { _owner: holder },
+        }
     }
 }
 
@@ -160,31 +204,82 @@ fn refused(answer: JobserverAnswer) -> CowshedError {
     })
 }
 
+/// Connect to the gateway at `socket`, write `frame`, and read its `queued` then `granted`
+/// answers: the grant and the connection that holds it.
+async fn exchange(
+    socket: &Path,
+    frame: serde_json::Result<Vec<u8>>,
+) -> Result<(JobserverAnswer, Fenced<UnixStream>)> {
+    let mut connect = std::pin::pin!(UnixStream::connect(socket));
+    // Darwin creates a socket then sets CLOEXEC. Fence each poll, never an async wait,
+    // so no concurrently spawned child can keep this lease descriptor beyond exec.
+    let stream = std::future::poll_fn(|cx| {
+        cowshed_os::fork_lock::create(|| Ok(connect.as_mut().poll(cx)))
+            .expect("polling the connection runs an infallible closure")
+    })
+    .await
+    .map_err(|error| {
+        CowshedError::cpu_admission(CpuAdmissionRefusal::GatewayUnavailable {
+            socket: socket.to_path_buf(),
+            error: error.to_string(),
+        })
+    })?;
+    let mut connection = Fenced::new(stream);
+    let mut frame = frame.map_err(|error| {
+        CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+            detail: error.to_string(),
+        })
+    })?;
+    frame.push(b'\n');
+    connection.write_all(&frame).await.map_err(|error| {
+        CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+            detail: error.to_string(),
+        })
+    })?;
+    let mut reader = BufReader::new(connection);
+    let queued = tokio::time::timeout(ACK_BOUND, answer(&mut reader))
+        .await
+        .map_err(|_| {
+            CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+                detail: "the gateway did not acknowledge jobserver admission within 2000 ms"
+                    .to_owned(),
+            })
+        })??;
+    if !queued.ok {
+        return Err(refused(queued));
+    }
+    if queued.lease != Some(LeaseState::Queued) {
+        return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+            detail: "expected the jobserver queued acknowledgement".to_owned(),
+        }));
+    }
+    let granted = answer(&mut reader).await?;
+    if !granted.ok {
+        return Err(refused(granted));
+    }
+    if granted.lease != Some(LeaseState::Granted) {
+        return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+            detail: "expected a jobserver grant after queued".to_owned(),
+        }));
+    }
+    Ok((granted, reader.into_inner()))
+}
+
+/// `command` cut to the gateway's 512-byte bound at a character boundary.
+fn wire_command(command: &str) -> &str {
+    let mut end = command.len().min(512);
+    while !command.is_char_boundary(end) {
+        end -= 1;
+    }
+    &command[..end]
+}
+
 impl JobCpuAdmission for GatewayJobCpu {
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
         let socket = Arc::clone(&self.socket);
         Box::pin(async move {
-            let mut connect = std::pin::pin!(UnixStream::connect(socket.as_path()));
-            // Darwin creates a socket then sets CLOEXEC. Fence each poll, never an async wait,
-            // so no concurrently spawned child can keep this lease descriptor beyond exec.
-            let stream = std::future::poll_fn(|cx| {
-                cowshed_os::fork_lock::create(|| Ok(connect.as_mut().poll(cx)))
-                    .expect("polling the connection runs an infallible closure")
-            })
-            .await
-            .map_err(|error| {
-                CowshedError::cpu_admission(CpuAdmissionRefusal::GatewayUnavailable {
-                    socket: socket.as_ref().clone(),
-                    error: error.to_string(),
-                })
-            })?;
-            let mut connection = Fenced::new(stream);
             let checkout = ask.checkout.to_string_lossy();
-            let mut end = ask.command.len().min(512);
-            while !ask.command.is_char_boundary(end) {
-                end -= 1;
-            }
-            let command = &ask.command[..end];
+            let command = wire_command(&ask.command);
             let job = JobserverJob {
                 repo_id: ask.job.0.as_str(),
                 workspace_incarnation: ask.job.1.as_str(),
@@ -211,44 +306,7 @@ impl JobCpuAdmission for GatewayJobCpu {
                     serde_json::to_vec(&ResidentPoolRequest::new(&checkout, command, job))
                 }
             };
-            let mut frame = frame.map_err(|error| {
-                CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-                    detail: error.to_string(),
-                })
-            })?;
-            frame.push(b'\n');
-            connection.write_all(&frame).await.map_err(|error| {
-                CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-                    detail: error.to_string(),
-                })
-            })?;
-            let mut reader = BufReader::new(connection);
-            let queued = tokio::time::timeout(ACK_BOUND, answer(&mut reader))
-                .await
-                .map_err(|_| {
-                    CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-                        detail:
-                            "the gateway did not acknowledge jobserver admission within 2000 ms"
-                                .to_owned(),
-                    })
-                })??;
-            if !queued.ok {
-                return Err(refused(queued));
-            }
-            if queued.lease != Some(LeaseState::Queued) {
-                return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-                    detail: "expected the jobserver queued acknowledgement".to_owned(),
-                }));
-            }
-            let granted = answer(&mut reader).await?;
-            if !granted.ok {
-                return Err(refused(granted));
-            }
-            if granted.lease != Some(LeaseState::Granted) {
-                return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
-                    detail: "expected a jobserver grant after queued".to_owned(),
-                }));
-            }
+            let (granted, connection) = exchange(&socket, frame).await?;
             // A token-holding grant names its tokens, its fifo and its pool; a resident's names
             // only its pool, since it holds no token and its children ask the host through it.
             let (held, pool) = match (ask.class, granted.tokens, granted.cpu_pool, granted.fifo) {
@@ -292,7 +350,6 @@ impl JobCpuAdmission for GatewayJobCpu {
                             .to_owned(),
                 }));
             }
-            let connection = reader.into_inner();
             cowshed_os::timing::event("jobserver", || {
                 format!(
                     "grant class={:?} tokens={}/{} pool={} checkout={}",
@@ -306,6 +363,45 @@ impl JobCpuAdmission for GatewayJobCpu {
             Ok(JobCpuGrant {
                 held,
                 pool,
+                start: None,
+                _holder: Holder::Gateway {
+                    _connection: connection,
+                },
+            })
+        })
+    }
+
+    fn activation(
+        &self,
+        checkout: PathBuf,
+        command: String,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
+        let socket = Arc::clone(&self.socket);
+        Box::pin(async move {
+            let frame = serde_json::to_vec(&JobserverRequest::activation(
+                &checkout.to_string_lossy(),
+                wire_command(&command),
+            ));
+            let (granted, connection) = exchange(&socket, frame).await?;
+            // One token and the fifo that holds it, and no pool: nothing draws on a stake.
+            match (granted.tokens, granted.cpu_pool) {
+                (Some(tokens), None) if tokens == NonZeroUsize::MIN => {}
+                (tokens, pool) => {
+                    return Err(CowshedError::cpu_admission(CpuAdmissionRefusal::Protocol {
+                        detail: format!(
+                            "an activation stake is one token and no pool, not {tokens:?} \
+                             tokens and pool {pool:?}"
+                        ),
+                    }));
+                }
+            }
+            cowshed_os::timing::event("jobserver", || {
+                format!(
+                    "grant activation tokens=1/1 checkout={} command={command}",
+                    checkout.display()
+                )
+            });
+            Ok(ActivationStake {
                 _holder: Holder::Gateway {
                     _connection: connection,
                 },

@@ -1022,6 +1022,44 @@ async fn each_exec_class_takes_its_own_ledger_place_through_the_supervisors_admi
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A shell activation with no command yet to use a token -- a resident's start, a pool's spare --
+/// holds one through the supervisor's admission: a background token on the real ledger for its
+/// checkout, with no pool and no job, returned when the stake drops (05_gateway.md "A resident
+/// holds no token"; 11_shell.md, spare).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_activation_stake_holds_one_background_token_until_it_drops() {
+    use cowshed_core::runtime::job_cpu::{GatewayJobCpu, JobCpuAdmission as _};
+
+    let (gateway, root, socket) = gateway(4).await;
+    let admission = GatewayJobCpu::new(socket.clone());
+    let stake = admission
+        .activation(
+            PathBuf::from("/w/keeper"),
+            "shell spare activation in /w/keeper".to_owned(),
+        )
+        .await
+        .expect("the stake is granted");
+    let status = ledger(&socket).await;
+    assert_eq!(status.held, 1, "{status:?}");
+    assert_eq!(
+        status
+            .background
+            .iter()
+            .map(|stake| (stake.checkout.as_str(), stake.held))
+            .collect::<Vec<_>>(),
+        [("/w/keeper", 1)],
+        "the activation holds one background token of its checkout: {status:?}"
+    );
+    drop(stake);
+    // The ledger sends no change notification: read it until the return shows. A return that
+    // never comes is a hang, which the leg's no-progress backstop decides, never a count here.
+    while ledger(&socket).await.held != 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    gateway.drain().await.expect("drain");
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// Two checkouts of one repository cannot run gates together, even when the queued gate
 /// inherits the running gate's pool. A different repository still starts on the same host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

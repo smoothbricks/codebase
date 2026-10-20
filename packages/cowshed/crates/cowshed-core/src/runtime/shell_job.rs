@@ -25,6 +25,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, Interest};
 use tokio::sync::{mpsc, oneshot};
 
+use super::job_cpu::JobCpuAdmission;
 use super::job_groups::Birth;
 use super::shell_host::{
     BINDING_ARRAY, BINDING_SCALAR, FrameReader, FrameWriter, MAX_FRAME_BYTES, REPLY_ACTIVATED,
@@ -91,6 +92,8 @@ fn pool_key(
 pub(super) struct WorkspaceShells {
     program: ShellHostProgram,
     config: ShellPoolConfig,
+    /// The host CPU budget a spare's activation asks its token from: a spare runs for no job.
+    cpu: Arc<dyn JobCpuAdmission>,
     /// Keyed by (read-only, `.envrc` directory or none); a changed identity replaces the pool,
     /// whose idle hosts end with it and whose executing hosts are not returned.
     pools: BTreeMap<(bool, Option<PathBuf>), (Sha256Digest, ShellPool<HostActivator>)>,
@@ -123,10 +126,15 @@ pub(super) struct PooledSpawn<'a> {
 }
 
 impl WorkspaceShells {
-    pub(super) fn new(program: ShellHostProgram, config: ShellPoolConfig) -> Self {
+    pub(super) fn new(
+        program: ShellHostProgram,
+        config: ShellPoolConfig,
+        cpu: Arc<dyn JobCpuAdmission>,
+    ) -> Self {
         Self {
             program,
             config,
+            cpu,
             pools: BTreeMap::new(),
         }
     }
@@ -156,6 +164,7 @@ impl WorkspaceShells {
                         profile: spawn.profile.clone(),
                         environment: base,
                         envrc_directory: spawn.envrc_directory.clone(),
+                        cpu: Arc::clone(&self.cpu),
                     }),
                     self.config,
                 );
@@ -1120,6 +1129,8 @@ pub(super) struct HostActivator {
     /// `None` for a workspace with no shell configuration: its hosts hold the sandbox
     /// environment itself, which no workspace file can make stale.
     envrc_directory: Option<PathBuf>,
+    /// The host CPU budget a spare's activation holds one token of while it runs.
+    cpu: Arc<dyn JobCpuAdmission>,
 }
 
 impl HostActivator {
@@ -1350,22 +1361,37 @@ impl Activator for HostActivator {
     type Output = (OwnedFd, OwnedFd);
 
     /// A spare's activation output has no job to belong to and is discarded; its failure only
-    /// means no spare exists, and the next command activates for itself.
+    /// means no spare exists, and the next command activates for itself. It runs for no job, so
+    /// it holds one background token of its own while it activates (11_shell.md, spare): a
+    /// refused or unreachable budget is a failure like any other, and leaves no spare.
     async fn activate(
         &self,
         predicted: Vec<PathBuf>,
         output: Option<(OwnedFd, OwnedFd)>,
     ) -> Activation<ExecHost> {
-        let output = match output {
-            Some(output) => output,
-            None => match (null_device(), null_device()) {
-                (Ok(stdout), Ok(stderr)) => (stdout, stderr),
-                (Err(error), _) | (_, Err(error)) => {
-                    return Activation::Broken {
-                        error: pipe_error(error),
-                    };
+        let (output, _stake) = match output {
+            Some(output) => (output, None),
+            None => {
+                let stake = match self
+                    .cpu
+                    .activation(
+                        self.workspace_mount.clone(),
+                        format!("shell spare activation in {}", self.home().display()),
+                    )
+                    .await
+                {
+                    Ok(stake) => stake,
+                    Err(error) => return Activation::Broken { error },
+                };
+                match (null_device(), null_device()) {
+                    (Ok(stdout), Ok(stderr)) => ((stdout, stderr), Some(stake)),
+                    (Err(error), _) | (_, Err(error)) => {
+                        return Activation::Broken {
+                            error: pipe_error(error),
+                        };
+                    }
                 }
-            },
+            }
         };
         let mut host = match self.spawn_host().await {
             Ok(host) => host,

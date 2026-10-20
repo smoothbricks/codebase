@@ -960,6 +960,19 @@ core count.
   pool's life: the resident's exit closes it. A different token class would leave the resident in the ledger holding
   something; exempting it from the budget would leave the requests it runs unbudgeted; acquiring per request through a
   relay pool is the gate job's existing mechanism and budgets exactly the work.
+  - **A resident's start holds one token** (2026-10-20). A resident is idle between requests once it runs, but its start
+    is not: under a workspace `.envrc` its shell activates first, and a cold devenv evaluation is minutes of CPU
+    (measured 2026-10-20: a shed's Nx daemon keeper evaluated its shell for 197 s while holding nothing, beside other
+    work the budget had admitted, so the budget did not bound it). Before its `resident-pool` request, a resident's
+    supervisor therefore asks one background token for the resident's checkout with an activation stake,
+    `{"op":"jobserver","want":1,"checkout":"<workspace root>","command":"<command>","class":"background","pool":false}`,
+    which names no job and asks for no pool: it waits as any background request does, and the gateway answers
+    `tokens: 1` and a fifo nobody reads. The resident asks its pool only once the stake is held, holds the stake while
+    its shell activates, and closes it when its command starts (the job's `Started` event), so from then on it holds no
+    token, as above. A stake that is refused fails the job as a refused admission does; a job that ends before its
+    command starts returns the stake with its grant. The same stake bounds a shell pool's spare (11_shell.md, "One spare
+    and a SIEVE cache"). The ledger knows no partial return, so the stake is its own one-token grant rather than a count
+    the resident's pool would later give back.
   - **CPU pool retirement.** Pool retirement unlinks its endpoint before closing its listener. It drains the kernel
     accept queue, not merely the runtime's readiness cache, and answers queued and already accepted connections with
     `{"ok":false,"code":"pool-retired","error":"the CPU pool owner's lease ended"}` followed by EOF. A new connection
