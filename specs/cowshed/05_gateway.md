@@ -201,11 +201,15 @@ daemon's socket refusing the connection, failing the land. So every command a la
 and `land` — holds the install slot ("The install slot", below) shared from before it asks the daemon anything until it
 ends. An install takes the slot exclusive, so it waits for every land step in flight, and a land step that starts while
 an install holds the slot waits for that install and then reaches the gateway it installed, saying on stderr that it
-waits and for which file. Between two steps a land waits for an install; it is never cut off by one. The ledger is never
-this guard, however its entries are kept: between two of a land's commands no process of that land holds anything the
-gateway records, so an install that asks the ledger whether a land runs is answered "no" mid-land. Ordinary work does
-not hold the slot: a long-lived background exec would hold every install back. Status reads the slot without taking it,
-so land steps alone never read as a pending install.
+waits and for which file. Between two steps a land waits for an install; it is never cut off by one. So an install that
+restarted the gateway — `gateway start` and `setup`'s refresh alike — holds the slot until that gateway serves: its
+control socket answers from the installed bytes, its startup pass is over and it is not draining, the wait
+`gateway start` reports. Releasing the slot at the restart is not enough: measured 2026-10-20, `setup` restarted the
+gateway and released the slot at once, and the land step that had waited on it found the daemon's socket refusing the
+connection, failing a land whose gate had passed. The ledger is never this guard, however its entries are kept: between
+two of a land's commands no process of that land holds anything the gateway records, so an install that asks the ledger
+whether a land runs is answered "no" mid-land. Ordinary work does not hold the slot: a long-lived background exec would
+hold every install back. Status reads the slot without taking it, so land steps alone never read as a pending install.
 
 **Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
 the new build's and the one it replaced is removed. The replaced build stays one install longer: a workspace supervisor

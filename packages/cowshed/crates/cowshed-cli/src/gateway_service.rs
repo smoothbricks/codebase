@@ -610,7 +610,6 @@ where
             }),
         },
     );
-    let uid = effective_uid();
     let client = GatewayControlClient::new(paths.control_socket.clone()).map_err(control_error)?;
     // Activation restarts a gateway that runs; one that answers first sees its gates through.
     if client.status().await.is_ok() {
@@ -618,8 +617,43 @@ where
     }
     let written = executor.execute_install(&plan).map_err(launchd_error)?;
     install_and_activate_gateway(&mut executor, &home, &candidate, &spec, written)?;
-    let cli_sha256 = candidate.digest.to_string();
+    let reported = await_healthy(
+        output,
+        slot,
+        &client,
+        &paths.control_socket,
+        &candidate.digest.to_string(),
+        &mut executor,
+        spec.target(),
+    )
+    .await?;
+    Ok(CliGatewayStatus {
+        cpu_budget: Some(read_cpu_budget(&client).await),
+        ..reported
+    })
+}
 
+/// Wait until the gateway just activated serves: its control socket answers from the bytes
+/// `cli_sha256` names, its startup pass is over and it is not draining. The install holds
+/// `slot` throughout, so a land step that waited on the slot reaches a gateway that serves
+/// workspaces, never a socket nothing listens on yet (05_gateway.md "A land step holds the install
+/// slot"). launchd keeps the process it had when activation did not change the plist; that daemon
+/// is restarted once, after the gates in flight.
+async fn await_healthy<W, E, C>(
+    output: &mut Output<W, E>,
+    slot: &InstallSlot,
+    client: &GatewayControlClient,
+    control_socket: &Path,
+    cli_sha256: &str,
+    executor: &mut LaunchdExecutor<NativeFilesystem, C>,
+    target: &LaunchAgentTarget,
+) -> Result<CliGatewayStatus>
+where
+    W: Write + Send,
+    E: Write + Send,
+    C: LaunchctlCommand,
+{
+    let uid = effective_uid();
     let mut progress = StartProgress::new();
     let mut started = tokio::time::Instant::now();
     let mut restarted = false;
@@ -629,21 +663,16 @@ where
             Ok(status) => {
                 let reported = cli_status(
                     true,
-                    paths.control_socket.clone(),
+                    control_socket.to_path_buf(),
                     Some(&status),
-                    &cli_sha256,
+                    cli_sha256,
                 );
                 match (
                     &reported.drain_cause,
                     &reported.stale_daemon,
                     reported.healing,
                 ) {
-                    (None, None, None) => {
-                        return Ok(CliGatewayStatus {
-                            cpu_budget: Some(read_cpu_budget(&client).await),
-                            ..reported
-                        });
-                    }
+                    (None, None, None) => return Ok(reported),
                     // It answers, and tells how far its startup pass has got; nothing that
                     // needs a workspace is served until that pass is over.
                     (None, None, Some(heal)) => StartWait::Startup(heal),
@@ -651,15 +680,10 @@ where
                     // activation did not restart it onto the bytes just installed. Restart it
                     // once.
                     (None, Some(_), _) if !restarted => {
-                        wait_for_gates(slot, &client, &mut io::stderr()).await?;
+                        wait_for_gates(slot, client, &mut io::stderr()).await?;
                         // The start deadline is the daemon's to meet, not the gates'.
                         started = tokio::time::Instant::now();
-                        activate_launch_agent(
-                            &mut executor,
-                            uid,
-                            spec.target(),
-                            InstallOutcome::Changed,
-                        )?;
+                        activate_launch_agent(executor, uid, target, InstallOutcome::Changed)?;
                         restarted = true;
                         StartWait::ControlSocket
                     }
@@ -2375,8 +2399,9 @@ pub fn installed_binary_is_stale(
 ///
 /// The build has to be fit to supervise, and contain the installed one, *before* anything is
 /// copied, and a failed activation puts the old binary back: this is the function that,
-/// unguarded, replaced a host's supervised gateway with a debug build and then stranded it with
-/// no loaded agent. The caller holds the install slot: `slot` ([`take_install_slot`]).
+/// no loaded agent. The caller holds the install slot: `slot` ([`take_install_slot`]), and a
+/// refresh that restarted the gateway returns only once it serves ([`await_healthy`]), so the
+/// slot is released to a gateway a land step can reach.
 pub async fn refresh_gateway_binary(
     slot: &InstallSlot,
     home: &Path,
@@ -2399,7 +2424,7 @@ pub async fn refresh_gateway_binary(
         .filter(|_| daemon.is_some())
         .map(|client| (slot, client));
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
-    refresh_gateway_from(
+    let refresh = refresh_gateway_from(
         home,
         IncomingBuild {
             candidate: &candidate,
@@ -2411,7 +2436,25 @@ pub async fn refresh_gateway_binary(
         &mut executor,
         invoking_bun,
     )
-    .await
+    .await?;
+    if let Some(ServiceBinaryRefresh::Refreshed { .. }) = &refresh {
+        let socket = control_socket_path();
+        let client = GatewayControlClient::new(socket.clone()).map_err(control_error)?;
+        let target = LaunchAgentTarget::new(home, GATEWAY_LABEL).map_err(launchd_error)?;
+        // Setup reports the refresh itself; the wait says only what it is still waiting for.
+        let mut output = Output::new(io::sink(), io::stderr(), false);
+        await_healthy(
+            &mut output,
+            slot,
+            &client,
+            &socket,
+            &candidate.digest.to_string(),
+            &mut executor,
+            &target,
+        )
+        .await?;
+    }
+    Ok(refresh)
 }
 
 /// The build a refresh would install, with the judgements about installing it.
@@ -4526,6 +4569,85 @@ mod tests {
 
             daemon.gateway.drain().await.expect("drain the gateway");
             fs::remove_dir_all(&daemon.root).expect("cleanup");
+        }
+
+        /// The measured failure: `setup` restarted the gateway and released the install slot at
+        /// once, and a land step that had waited on the slot found the daemon's socket refusing
+        /// the connection, failing the land. An install now holds the slot until the gateway it
+        /// started serves: before its control socket answers, and through its startup pass.
+        #[tokio::test]
+        async fn an_install_holds_the_slot_until_the_gateway_it_started_serves() {
+            let support = PathBuf::from(format!("/tmp/csinstserve-{}", std::process::id()));
+            private_directory(&support);
+            let slot = InstallSlot::take(&support).await.expect("the slot");
+            let name = "csinstserve-gw";
+            let socket =
+                PathBuf::from(format!("/tmp/{name}-{}", std::process::id())).join("gateway.sock");
+            let client = GatewayControlClient::new(socket.clone()).expect("client");
+            let install = tokio::spawn({
+                let (socket, client) = (socket.clone(), client.clone());
+                async move {
+                    let mut executor = LaunchdExecutor::new(
+                        NativeFilesystem::new(),
+                        RecordingGatewayLaunchctl::default(),
+                    );
+                    let target =
+                        LaunchAgentTarget::new(Path::new("/tmp"), GATEWAY_LABEL).expect("target");
+                    let mut output = Output::new(Vec::new(), Vec::new(), false);
+                    let served = await_healthy(
+                        &mut output,
+                        &slot,
+                        &client,
+                        &socket,
+                        "aa",
+                        &mut executor,
+                        &target,
+                    )
+                    .await;
+                    drop(slot);
+                    served
+                }
+            });
+            let land = tokio::spawn({
+                let (support, client) = (support.clone(), client.clone());
+                async move {
+                    let _hold = crate::install_basis::LandHold::take(&support)
+                        .await
+                        .expect("the land step's hold");
+                    client.status().await
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!install.is_finished(), "no gateway answers yet");
+            assert!(!land.is_finished(), "the land step waits for the install");
+
+            let heal = Arc::new(StartupHealState::mounting(0));
+            let daemon = daemon(name, &[], Arc::clone(&heal)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !install.is_finished(),
+                "the gateway answers but still heals"
+            );
+            assert!(!land.is_finished(), "the land step still waits");
+
+            heal.restored();
+            let served = install
+                .await
+                .expect("the install task")
+                .expect("the gateway serves");
+            assert_eq!(served.healing, None);
+            let reached = land
+                .await
+                .expect("the land task")
+                .expect("the land step reaches the gateway");
+            assert_eq!(
+                reached.healing, None,
+                "the land step's first request finds the startup pass over"
+            );
+
+            daemon.gateway.drain().await.expect("drain the gateway");
+            fs::remove_dir_all(&daemon.root).expect("cleanup");
+            fs::remove_dir_all(&support).expect("cleanup");
         }
     }
 
