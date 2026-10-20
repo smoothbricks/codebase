@@ -77,12 +77,14 @@ case "$(uname -s)" in
   *) exit 0 ;;
 esac
 
+# The refusal uses shell builtins alone: without direnv nothing proves the
+# caller's PATH carries coreutils, and a Nix-built host's /usr/bin and /bin
+# hold none of them.
 if ! command -v direnv >/dev/null; then
-  cat >&2 <<'EOF'
-pre-push: direnv is not on PATH, so the Linux cross-compile check cannot run in
-this checkout's environment, and a check run in any other environment keys on
-values the land gate never used. Put direnv on PATH, then push again.
-EOF
+  printf '%s\n' \
+    'pre-push: direnv is not on PATH, so the Linux cross-compile check cannot run in' \
+    "this checkout's environment, and a check run in any other environment keys on" \
+    'values the land gate never used. Put direnv on PATH, then push again.' >&2
   exit 1
 fi
 

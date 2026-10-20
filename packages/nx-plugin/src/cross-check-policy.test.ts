@@ -260,8 +260,9 @@ describe('managed pre-push cross probe', () => {
           `[ "$1" = exec ] && [ "$2" = "$PWD" ] || { echo "direnv stub: unexpected $*" >&2; exit 64; }\nexport SDKROOT='${CHECKOUT_SDK}'\nshift 2\nexec "$@"`,
         );
       }
-      // Without direnv, PATH holds the stand-ins and the system directories alone, so no host direnv is found.
-      const path = direnv ? `${bin}:$PATH` : `${bin}:/usr/bin:/bin`;
+      // Without direnv, PATH holds the stand-ins alone: no host direnv is found, and no coreutils either, as on a
+      // Nix-built Linux host whose /usr/bin and /bin hold none. The refusal must still be said.
+      const path = direnv ? `${bin}:$PATH` : bin;
       await writeFile(join(root, 'repo', 'tooling', 'direnv', 'repo-path'), `#!/bin/sh\necho "${path}"\n`);
       await chmod(join(root, 'repo', 'tooling', 'direnv', 'repo-path'), 0o755);
       await writeFile(join(root, 'repo', 'tooling', 'direnv', 'ttsc-env.sh'), '');
