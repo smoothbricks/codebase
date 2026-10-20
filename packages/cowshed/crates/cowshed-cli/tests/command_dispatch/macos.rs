@@ -2562,6 +2562,110 @@ async fn directory_push_only_preserves_the_validated_head_without_landing_or_ret
         .expect("stop the real directory project");
 }
 
+/// A land fences the target's head under the caller's ref lock (02_workspaces.md "`cowshed
+/// land`" step 3). A writer holds the lock from before the land starts and moves main only once
+/// the land's check has run, so the land read main's old head before it: the land, waiting for
+/// the lock meanwhile, reads the new head once it holds it and refuses with the target moved
+/// rather than fast-forwarding. Rebased, the next land finds the lock free and lands, and the
+/// lock is free again once it returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_a_land_fences_the_target_head_under_the_caller_ref_lock_substrate_lifecycle() {
+    let mut fixture = Fixture::directory();
+    let mut service = serve_project(&mut fixture, &[]).await;
+    let main = fixture.checkout.clone();
+    let ref_lock = main.parent().expect("the fixture root").join("ref.lock");
+    let ref_lock_arg = ref_lock.to_str().expect("a UTF-8 fixture path").to_owned();
+    let open_lock = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&ref_lock)
+            .expect("open the ref lock")
+    };
+    let flock = |file: &fs::File, operation: libc::c_int| {
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: `file` owns the descriptor for the whole call.
+        unsafe { libc::flock(file.as_raw_fd(), operation) == 0 }
+    };
+    let topic = new_workspace(&mut service, "topic").await;
+    fs::write(topic.join("topic.txt"), b"topic\n").unwrap();
+    git(&topic, &["add", "topic.txt"]);
+    git(&topic, &["commit", "-q", "-m", "topic"]);
+    let main_head = git_stdout(&main, &["rev-parse", "HEAD"]);
+    let checked = topic.join(".git/ref-fence-checked");
+
+    let writer = open_lock();
+    assert!(
+        flock(&writer, libc::LOCK_EX),
+        "the writer took the ref lock"
+    );
+    let land = run(
+        &mut service,
+        [
+            "--json",
+            "land",
+            "topic",
+            "--ref-lock",
+            &ref_lock_arg,
+            "--expected-target-head",
+            &main_head,
+            "--check",
+            "/usr/bin/touch .git/ref-fence-checked",
+        ],
+    );
+    let doc_commit = async {
+        eventually(|| checked.exists()).await;
+        fs::write(main.join("doc.md"), b"doc\n").unwrap();
+        git(&main, &["add", "doc.md"]);
+        git(&main, &["commit", "-q", "-m", "doc"]);
+        drop(writer);
+    };
+    let ((result, _, stderr), ()) = tokio::join!(land, doc_commit);
+    let error = result.expect_err("a land whose target moved under the ref lock landed");
+    assert!(
+        matches!(
+            error.fence_source(),
+            Some(cowshed_core::error::FenceRefusal::TargetMoved { observed: Some(_) })
+        ),
+        "the land did not refuse with the target moved: {error:?}\n{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let doc_head = git_stdout(&main, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git_stdout(&main, &["rev-parse", "HEAD~1"]),
+        main_head,
+        "main holds the writer's commit and nothing the land delivered"
+    );
+    assert!(topic.exists(), "a refused land retired its workspace");
+
+    succeed(&mut service, ["rebase", "topic"]).await;
+    let rebased = git_stdout(&topic, &["rev-parse", "HEAD"]);
+    succeed(
+        &mut service,
+        [
+            "--json",
+            "land",
+            "topic",
+            "--ref-lock",
+            &ref_lock_arg,
+            "--expected-target-head",
+            &doc_head,
+        ],
+    )
+    .await;
+    assert_eq!(git_stdout(&main, &["rev-parse", "HEAD"]), rebased);
+    assert!(
+        flock(&open_lock(), libc::LOCK_EX | libc::LOCK_NB),
+        "a land kept the ref lock after it returned"
+    );
+    service
+        .shutdown()
+        .await
+        .expect("stop the real directory project");
+}
+
 async fn eventually(mut ready: impl FnMut() -> bool) {
     while !ready() {
         tokio::time::sleep(Duration::from_millis(100)).await;

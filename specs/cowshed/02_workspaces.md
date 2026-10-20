@@ -1071,6 +1071,21 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
    conflict rather than an unchecked land. The fetched branch lands in the workspace's own preservation namespace,
    `refs/cowshed/<ws>/heads/<branch>`, which retirement prunes.
 
+   **The repository lock is the target's ref lock, and it fences the head alone.** Writers that move the target branch
+   outside cowshed — an operator's Markdown commit straight into main, say — order themselves by a lock file of their
+   own, and the land joins them when its caller names that file with `--ref-lock <file>`: it takes the file's exclusive
+   `flock(2)`, the lock lockf(1) takes, re-reads the target head, revalidates the expected target head against it,
+   fetches and fast-forwards, and lets go. Nothing else runs under it: the check (step 2) and the Nx cache
+   initialization before it, and the build-volume adoption and retirement after it (steps 4 and 5), run unlocked, so a
+   writer queued on the lock waits for this fence, never for a land's minutes of other work. A land that finds the lock
+   held waits for it without bound — its holder is a writer of the same branch, which the land follows rather than
+   overtakes — and says on stderr every 10 s how long it has waited and which processes hold the file. Its `delivery`
+   span is the hold. Measured 2026-10-20 with the whole land under such a lock: an operator's land held its ref lock for
+   82 to 85 s per land, about 56 to 63 s of it build-volume adoption, and one land held it 45 minutes while its Nx cache
+   initialization waited, so every Markdown commit queued behind work the lock does not protect. Without `--ref-lock`,
+   git's own ref and index locks are the only fence against such writers, and the head is still re-read and revalidated
+   just before the fast-forward.
+
    **Land has no branch-name contract.** It fetches whatever branch the workspace has checked out — `cowshed/<ws>` is
    what `fork` creates, but an agent may have made `wt/<ws>` or anything else, and land neither assumes nor requires the
    minted name. Only the resolved head is load-bearing. A workspace with no checked-out branch is a conflict naming the

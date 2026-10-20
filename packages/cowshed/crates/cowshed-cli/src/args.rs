@@ -536,6 +536,7 @@ pub struct LandArgs {
     pub expected_workspace_incarnation: Option<OsString>,
     pub expected_source_head: Option<OsString>,
     pub expected_target_head: Option<OsString>,
+    pub ref_lock: Option<OsString>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -911,6 +912,7 @@ fn cli_command() -> ClapCommand {
             value("expected-workspace-incarnation"),
             value("expected-source-head"),
             value("expected-target-head"),
+            value("ref-lock"),
         ]))
         .subcommand(leaf("doctor").args([flag("repair"), flag("clear-attach-budget")]))
         .subcommand(
@@ -3197,6 +3199,10 @@ const LAND: CommandSpec = CommandSpec {
             spelling: "--expected-target-head <oid|missing>",
             meaning: "refuse unless the target branch is still this commit, or `missing` for one that must not exist yet",
         },
+        Opt {
+            spelling: "--ref-lock <file>",
+            meaning: "the lock file every other writer of the target branch holds while it moves it (lockf(1)); land holds it only from re-reading the target head through the fast-forward, and says who holds it while it waits",
+        },
     ],
 };
 
@@ -3216,6 +3222,7 @@ fn parse_land(matches: &ArgMatches) -> Result<Command, UsageError> {
         expected_workspace_incarnation: os(matches, "expected-workspace-incarnation"),
         expected_source_head: os(matches, "expected-source-head"),
         expected_target_head: os(matches, "expected-target-head"),
+        ref_lock: os(matches, "ref-lock"),
     }))
 }
 
@@ -4746,6 +4753,8 @@ mod tests {
             "1111111111111111111111111111111111111111",
             "--expected-target-head",
             "missing",
+            "--ref-lock",
+            "/tmp/ref.lock",
             "--json",
         ])
         .unwrap();
@@ -4759,6 +4768,7 @@ mod tests {
         );
         assert!(!args.retire);
         assert!(args.push_only);
+        assert_eq!(args.ref_lock, Some(OsString::from("/tmp/ref.lock")));
         assert!(cli.global.json);
 
         let Command::Remove(remove) = parse_args(["rm", "main", "--restore"]).unwrap().command

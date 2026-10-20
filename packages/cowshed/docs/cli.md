@@ -1152,7 +1152,7 @@ database another process holds carries nothing and names that process. The hash 
 that asks for one CPU token at background class; `--gate` asks at gate class instead, for a land's rebase, which its
 lander runs under the land lock: queued behind background work, it would hold up every land waiting for that lock.
 
-### `cowshed land <name> [--into <lane>] [--check <cmd>]`
+### `cowshed land <name> [--into <lane>] [--check <cmd>] [--ref-lock <file>]`
 
 The full close-out in one primitive: validate (`--check`) inside the sandbox, fast-forward the target's checkout to the
 workspace's branch, retire the workspace. The target is main, or with `--into <lane>` the lane base `<lane>`. A dirty
@@ -1168,6 +1168,13 @@ installs the exact head in `refs/cowshed/<name>/heads/<branch>`, without moving 
 recording a land outcome, collecting volumes or retiring the workspace, even when retirement is left at its default. Its
 text output is the preservation ref and source SHA; `--json` returns `kind: delivered` with the existing push-report
 fields. An ordinary land returns `kind: landed` with its target, build-volume and retirement report.
+
+`--ref-lock <file>` names the lock file every other writer of the target branch holds while it moves it, as an
+operator's Markdown commit into main holds it through lockf(1). Land takes the same exclusive lock only to re-read the
+target head, check it against `--expected-target-head`, fetch and fast-forward; the checks, Nx cache initialization,
+build-volume adoption and retirement run without it, so such a writer waits for that fence alone. A land that finds the
+lock held waits for it and says on stderr every 10 s how long and which processes hold the file. A target that moved
+while it waited is refused as moved (exit 4); the caller rebases and lands again.
 
 Post-land output restoration never reruns `--check` commands. Checks pass once in the landing workspace; only their
 attributed Nx task graphs may be hashed and restored from the adopted local cache. Missing or uncacheable results are

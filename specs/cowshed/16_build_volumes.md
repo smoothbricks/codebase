@@ -517,18 +517,19 @@ freeze, or `--ref` names a tree no volume was built at), the fork builds the dif
 ## Land: `cowshed land`
 
 Land's contract is 02_workspaces.md "`cowshed land`": it lands the head the caller validated into its target (main by
-default, an integration workspace with `--into <target>`), under the target's repository lock, and never rebases on its
-own. It builds nothing on the target: it adopts the workspace's build volume. Every step reads the same for main and for
-an integration workspace; "the target" is whichever one it is.
+default, an integration workspace with `--into <target>`), fencing the target's head under its repository lock, and
+never rebases on its own. It builds nothing on the target: it adopts the workspace's build volume. Every step reads the
+same for main and for an integration workspace; "the target" is whichever one it is.
 
 1. **Refuse a dirty tree**.
 2. **Validate in the workspace**: the caller's check (`--check`, for an Nx project `nx run-many -t lint test build` over
    what the workspace changed) runs in the sandbox against the workspace's own build volume. Only the delta builds.
-3. **Update the target** under its repository lock (02_workspaces.md "`cowshed land`" step 3). When the target's
-   checkout has the target branch checked out, the branch fast-forwards through that checkout and the land continues at
-   step 4. When nothing has the target branch checked out, the land compares-and-swaps the branch ref and **skips steps
-   4 to 7**: the target's checkout holds another branch, so its build volume and seed are not the landed branch's. The
-   target keeps its build volume and its seed; nothing is quiesced, carried, frozen or adopted.
+3. **Update the target** under its repository lock (02_workspaces.md "`cowshed land`" step 3), which the land holds for
+   this step alone: every step after it runs with the lock released. When the target's checkout has the target branch
+   checked out, the branch fast-forwards through that checkout and the land continues at step 4. When nothing has the
+   target branch checked out, the land compares-and-swaps the branch ref and **skips steps 4 to 7**: the target's
+   checkout holds another branch, so its build volume and seed are not the landed branch's. The target keeps its build
+   volume and its seed; nothing is quiesced, carried, frozen or adopted.
 4. **Quiesce the landing workspace.** The land holds the landing build volume (the shared `<id>.dmg.hold` a job holds,
    GC below) from before the workspace's jobs stop until its build-volume steps end (after step 7), so no collection in
    any process releases it while step 6 renames the target's link and records the target as its owner. Its supervisor
@@ -550,7 +551,8 @@ an integration workspace; "the target" is whichever one it is.
    locks and existing Cargo-profile guards through capture and publication. Other contributed paths remain exempt under
    the named-list rule (Owned index links). Mounted capture replaces the former detach-and-seal barrier; the
    new-host-profile gap remains as documented in Targets and seeds.
-5. **Close the target, carry, and freeze the seed.** Under the same lock (rule "The adoption needs the target's Nx
+5. **Close the target, carry, and freeze the seed.** Outside the repository lock, which fenced only the head: what keeps
+   these steps correct is the target's Nx open locks and image lock below (rule "The adoption needs the target's Nx
    database closed"):
    1. **stage the carry** (below) while the target still runs: copy into the landing volume the target's Nx cache
       entries it lacks, indexing none of them yet;
@@ -598,7 +600,7 @@ an integration workspace; "the target" is whichever one it is.
    A skip at 2 or 4 deletes what was staged, still freezes the seed (5.6), and skips the swap. A skipped capture at 5.6
    keeps the previous seed and still swaps.
 
-6. **Adopt the build volume.** Still under the lock:
+6. **Adopt the build volume.** Under the Nx open locks and the target's image lock:
    1. take, without waiting, stock Nx's open lock of each of the target's task databases (the database's path with the
       `lock` extension; every Nx process locks it exclusively before it opens the database and lets go once it has,
       pinned Nx 23.2.1 `native/db/mod.rs`). A lock some process holds means an Nx process is opening the database: skip,

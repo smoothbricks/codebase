@@ -991,6 +991,12 @@ export const assertRebaseRequestList = typia.createAssertEquals<readonly Api.Reb
 export const parseRebaseRequestList = (json: string): readonly Api.RebaseRequest[] =>
   assertRebaseRequestList(JSON.parse(json));
 
+export const assertRefLockPath = typia.createAssertEquals<Api.RefLockPath>();
+export const parseRefLockPath = (json: string): Api.RefLockPath => assertRefLockPath(JSON.parse(json));
+export const assertRefLockPathList = typia.createAssertEquals<readonly Api.RefLockPath[]>();
+export const parseRefLockPathList = (json: string): readonly Api.RefLockPath[] =>
+  assertRefLockPathList(JSON.parse(json));
+
 export const assertRekeyResult = typia.createAssertEquals<Api.RekeyResult>();
 export const parseRekeyResult = (json: string): Api.RekeyResult => assertRekeyResult(JSON.parse(json));
 export const assertRekeyResultList = typia.createAssertEquals<readonly Api.RekeyResult[]>();

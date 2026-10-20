@@ -1507,6 +1507,12 @@ export type LandOptions = {
   readonly expectedWorkspaceIncarnation?: WorkspaceIncarnation;
   readonly expectedSourceHead?: GitOid;
   readonly expectedTargetHead?: ExpectedRefHead;
+  /**
+   * The lock file the target's other branch writers hold; land holds it from re-reading the
+   * target head through the fast-forward, and for nothing else (02_workspaces.md
+   * "`cowshed land`" step 3).
+   */
+  readonly refLock?: RefLockPath;
 };
 
 /**
@@ -2086,6 +2092,14 @@ export type RebaseRequest = {
   readonly into?: WorkspaceTarget;
   readonly options: RebaseOptions;
 };
+
+/**
+ * The absolute host path of the lock file that orders every move of a land target's branch: the
+ * caller's, shared with the writers that move that branch outside cowshed (02_workspaces.md
+ * "`cowshed land`" step 3). Absolute, because the land opens it in its own process, whatever
+ * directory the caller named it from.
+ */
+export type RefLockPath = string;
 
 /**
  * The answer to `cowshed rekey <ws>`: the rotated workspace identity.

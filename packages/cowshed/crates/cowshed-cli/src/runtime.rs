@@ -21,8 +21,8 @@ use cowshed_core::api::{
     GcOptions, GcReason, GcReport, GitOid, GrantDelta, GrantSet, JobInfo, JobStream, LandOptions,
     LandReport, LandingCommits, MountResult, OutputPublication, ProjectGrantDelta, ProjectGrants,
     PublicationPolicy, PushOptions, PushReport, RebaseBuildVolume, RebaseOptions, RebaseReport,
-    RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport, ReseedResult,
-    ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus,
+    RefLockPath, RemoveOptions, RemoveProjectOptions, RemoveProjectReport, RemoveReport,
+    ReseedResult, ResizeResult, ResizeVolume, RevisionTarget, RunSandboxMode, SccacheStatus,
     StdinSource as CoreStdinSource, UtcTimestamp, WorkspaceInfo, WorkspaceLanding, WorkspacePath,
     WorkspaceState, validate_command_argv,
 };
@@ -1994,6 +1994,7 @@ where
                     .transpose()?,
                 expected_source_head: args.expected_source_head.map(os_git_oid).transpose()?,
                 expected_target_head: args.expected_target_head.map(os_expected_ref).transpose()?,
+                ref_lock: args.ref_lock.map(os_ref_lock).transpose()?,
             };
             let report = service
                 .land(&args.workspace, args.into.as_deref(), options)
@@ -2160,6 +2161,21 @@ fn os_git_oid(value: std::ffi::OsString) -> Result<GitOid> {
             "use a full lowercase 40- or 64-hex object id",
         )
     })
+}
+
+/// `--ref-lock`, resolved against this process's directory: the land opens it by that path.
+fn os_ref_lock(value: std::ffi::OsString) -> Result<RefLockPath> {
+    let path = std::path::absolute(&value).map_err(|error| {
+        usage(
+            format!(
+                "cannot resolve the ref lock {}: {error}",
+                std::path::Path::new(&value).display()
+            ),
+            "name the ref lock file by an absolute path",
+        )
+    })?;
+    RefLockPath::new(path)
+        .map_err(|error| usage(error.to_string(), "name the ref lock file by a UTF-8 path"))
 }
 
 fn os_incarnation(value: std::ffi::OsString) -> Result<WorkspaceIncarnation> {

@@ -84,6 +84,8 @@ pub enum DtoError {
     InvalidTimestamp(String),
     #[error("invalid workspace-relative path {0:?}")]
     InvalidWorkspacePath(PathBuf),
+    #[error("invalid ref lock path {0:?}: it must be an absolute UTF-8 path with no NUL")]
+    InvalidRefLockPath(PathBuf),
     #[error("invalid trace id {0:?}")]
     InvalidTraceId(String),
     #[error("invalid span id {0:?}")]
@@ -520,6 +522,58 @@ impl Serialize for WorkspacePath {
 }
 
 impl<'de> Deserialize<'de> for WorkspacePath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(PathBuf::from(String::deserialize(deserializer)?))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The absolute host path of the lock file that orders every move of a land target's branch: the
+/// caller's, shared with the writers that move that branch outside cowshed (02_workspaces.md
+/// "`cowshed land`" step 3). Absolute, because the land opens it in its own process, whatever
+/// directory the caller named it from.
+#[cfg_attr(any(), cowshed_api(accessor = "as-str", scalar = "string"))]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RefLockPath(PathBuf);
+
+impl RefLockPath {
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, DtoError> {
+        let path = path.into();
+        let valid = path
+            .to_str()
+            .is_some_and(|text| text.starts_with('/') && !text.contains('\0') && text != "/");
+        if valid {
+            Ok(Self(path))
+        } else {
+            Err(DtoError::InvalidRefLockPath(path))
+        }
+    }
+
+    /// The path's spelling as UTF-8 text, borrowed; `new` admits only UTF-8 paths.
+    pub fn as_str(&self) -> &str {
+        self.0
+            .to_str()
+            .expect("RefLockPath construction guarantees UTF-8")
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Serialize for RefLockPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RefLockPath {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -3132,6 +3186,11 @@ pub struct LandOptions {
     pub expected_source_head: Option<GitOid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_target_head: Option<ExpectedRefHead>,
+    /// The lock file the target's other branch writers hold; land holds it from re-reading the
+    /// target head through the fast-forward, and for nothing else (02_workspaces.md
+    /// "`cowshed land`" step 3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_lock: Option<RefLockPath>,
 }
 
 impl Default for LandOptions {
@@ -3144,6 +3203,7 @@ impl Default for LandOptions {
             expected_workspace_incarnation: None,
             expected_source_head: None,
             expected_target_head: None,
+            ref_lock: None,
         }
     }
 }

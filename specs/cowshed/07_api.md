@@ -500,6 +500,7 @@ pub struct LandOptions {
     pub expected_workspace_incarnation: Option<WorkspaceIncarnation>,
     pub expected_source_head: Option<GitOid>,
     pub expected_target_head: Option<ExpectedRefHead>,
+    pub ref_lock: Option<RefLockPath>,   // absolute; held only for the head fence and fast-forward (02, land step 3)
 }
 
 #[serde(tag = "kind", rename_all = "camelCase")]

@@ -26,6 +26,7 @@ pub mod process_stream;
 pub mod process_tree;
 pub mod process_usage;
 pub mod project;
+pub mod ref_lock;
 pub mod shell_host;
 mod shell_job;
 pub mod shell_pool;

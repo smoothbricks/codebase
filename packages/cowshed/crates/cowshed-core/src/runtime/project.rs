@@ -12438,9 +12438,27 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
             .await?;
             return Ok(LandReport::Delivered(delivered));
         }
-        timed_async(
-            "land",
-            "delivery",
+        // The ref fence (02_workspaces.md "`cowshed land`" step 3). The caller's ref lock, when it
+        // names one, is held from re-reading the target head through the fast-forward and for
+        // nothing else: the checks and Nx cache initialization before it and the adoption and
+        // retirement after it run outside, so a writer queued on the lock waits for this fence
+        // alone. The `delivery` span is the hold.
+        let ref_lock = match options.ref_lock.as_ref() {
+            Some(path) => Some(
+                timed_async(
+                    "land",
+                    "ref-lock-wait",
+                    super::ref_lock::RefLock::acquire(path),
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        timed_async("land", "delivery", async {
+            // Read again under the lock: the checks run for minutes, and the target can move
+            // meanwhile through a writer that holds this lock while it moves it.
+            let tip = git_optional_ref_oid(store_root, &into.root, &target_ref).await?;
+            require_target_head(options.expected_target_head.as_ref(), tip.as_ref())?;
             deliver_into(
                 &into.name,
                 &crate::git::GitRepository::from_root(store_root, &into.root),
@@ -12449,9 +12467,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                 &source_branch,
                 &source_head,
                 &target_branch,
-            ),
-        )
+            )
+            .await
+        })
         .await?;
+        drop(ref_lock);
         // The target has moved: a failed build-volume step reads as such, never as a refused land.
         let build_volume = timed_async(
             "land",
