@@ -365,6 +365,8 @@ impl GatewayPaths {
             git_helper_executable: Some(git_helper_executable),
             authorized_control_uid: uid,
             mirror_cache: MirrorCacheConfig::new(self.mirror_cache.clone()),
+            #[cfg(target_os = "macos")]
+            listener_handoff: Some(cowshed_gateway::handoff_path(&self.control_socket)),
             ..GatewayConfig::default()
         }
     }
@@ -615,6 +617,8 @@ where
     if client.status().await.is_ok() {
         wait_for_gates(slot, &client, &mut io::stderr()).await?;
     }
+    // Held until the restarted gateway serves: it took the listeners before it bound anything.
+    let _carrying = carry_listeners(&paths.control_socket, downgrade);
     let written = executor.execute_install(&plan).map_err(launchd_error)?;
     install_and_activate_gateway(&mut executor, &home, &candidate, &spec, written)?;
     let reported = await_healthy(
@@ -631,6 +635,37 @@ where
         cpu_budget: Some(read_cpu_budget(&client).await),
         ..reported
     })
+}
+
+/// The install's side of the listener handoff (05_gateway.md "An install never refuses a client
+/// connection"): serving it from before the restart until the restarted gateway serves carries
+/// every workspace listener across the restart. A downgrade carries none: an older gateway may
+/// not take them, and its own bind would then meet this install's copies. A handoff that cannot
+/// serve is said, and the restart refuses connections as it did before.
+#[cfg(target_os = "macos")]
+fn carry_listeners(
+    control_socket: &Path,
+    downgrade: Downgrade,
+) -> Option<cowshed_gateway::HandoffServer> {
+    if downgrade == Downgrade::Allow {
+        return None;
+    }
+    match cowshed_gateway::HandoffServer::start(&cowshed_gateway::handoff_path(control_socket)) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            eprintln!(
+                "cowshed: the workspace listeners are not carried across this restart, so their \
+                 clients are refused until the gateway serves again: {error}"
+            );
+            None
+        }
+    }
+}
+
+/// Linux binds no TCP workspace listener, so a restart has none to carry.
+#[cfg(not(target_os = "macos"))]
+const fn carry_listeners(_control_socket: &Path, _downgrade: Downgrade) -> Option<()> {
+    None
 }
 
 /// Wait until the gateway just activated serves: its control socket answers from the bytes
@@ -1171,6 +1206,15 @@ async fn run_daemon() -> Result<()> {
         heal_sccache_daemon().await;
         report_session_restore(&install_all_sessions(&inventory, &handle).await?);
         heal.restored();
+        // Every session that will be restored is: a carried listener none claimed would queue
+        // its clients for nobody.
+        match gateway.handle().release_unclaimed_listeners().await {
+            Ok(0) => {}
+            Ok(released) => eprintln!(
+                "cowshed: closed {released} carried workspace listener(s) no restored session claimed"
+            ),
+            Err(error) => eprintln!("cowshed: could not close the unclaimed carried listeners: {error}"),
+        }
         Ok::<(), CowshedError>(())
     }
     .await;
@@ -2424,6 +2468,8 @@ pub async fn refresh_gateway_binary(
         .filter(|_| daemon.is_some())
         .map(|client| (slot, client));
     let mut executor = LaunchdExecutor::new(NativeFilesystem::new(), NativeLaunchctlCommand);
+    // Held until the restarted gateway serves (`await_healthy` below).
+    let _carrying = carry_listeners(&control_socket_path(), downgrade);
     let refresh = refresh_gateway_from(
         home,
         IncomingBuild {

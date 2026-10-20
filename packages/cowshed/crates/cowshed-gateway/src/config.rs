@@ -273,6 +273,11 @@ pub struct GatewayConfig {
     pub startup: Option<Arc<dyn StartupProbe>>,
     /// Existing standalone accepted-artifact server, started lazily per Nx project.
     pub nx_cache: Option<crate::nx_cache::NxCacheServiceConfig>,
+    /// macOS: the socket an install serves while it restarts this gateway (`handoff_path`). The
+    /// gateway takes the workspace listeners held there before it binds any, and gives its own
+    /// there as its drain begins (05_gateway.md "An install never refuses a client connection").
+    /// Linux binds no TCP workspace listener, so it has none to carry and never reads this.
+    pub listener_handoff: Option<PathBuf>,
 }
 
 impl Default for GatewayConfig {
@@ -295,6 +300,7 @@ impl Default for GatewayConfig {
             executable_sha256: None,
             startup: None,
             nx_cache: None,
+            listener_handoff: None,
         }
     }
 }

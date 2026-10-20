@@ -149,6 +149,17 @@ impl GatewayHandle {
         receive.await.map_err(|_| GatewayError::Stopped)
     }
 
+    /// Close every listener an install carried across the restart that no restored session
+    /// claimed; how many. The daemon calls this once its startup pass has restored every session
+    /// (05_gateway.md "Startup contract" step 4): a connection queued on a listener nobody will
+    /// accept would wait forever, so it is reset instead, as it was when nothing was carried.
+    pub async fn release_unclaimed_listeners(&self) -> Result<usize, GatewayError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::ReleaseUnclaimedListeners { reply })
+            .await?;
+        receive.await.map_err(|_| GatewayError::Stopped)
+    }
+
     async fn send(&self, command: Command) -> Result<(), GatewayError> {
         self.commands
             .send(command)
@@ -287,6 +298,9 @@ impl Gateway {
         audit_tail: Option<AuditTailHandle>,
     ) -> Result<Self, GatewayError> {
         config.validate()?;
+        // Before anything binds: a session restored later claims its carried listener rather
+        // than racing the connections queued on it with a bind of its own.
+        let carried = take_carried_listeners(&config).await;
         let mirror_service =
             MirrorService::new(Cache::open(config.mirror_cache.cache_config()).await?);
         let (completions, completion_receiver) =
@@ -318,25 +332,28 @@ impl Gateway {
                 return Err(error.into());
             }
         };
-        let state = Actor::new(
-            config.clone(),
-            ActorChannels {
-                receiver,
-                commands: handle.commands.clone(),
-                completions,
-                completion_receiver,
-                cancellations,
-                cancellation_receiver,
-            },
-            credentials,
-            connector,
-            audit,
-            mirror_service,
-            BrokerHandles {
-                repo_mirror: repo_mirror.clone(),
-                sim_broker: sim_broker.clone(),
-            },
-        );
+        let state = Actor {
+            carried,
+            ..Actor::new(
+                config.clone(),
+                ActorChannels {
+                    receiver,
+                    commands: handle.commands.clone(),
+                    completions,
+                    completion_receiver,
+                    cancellations,
+                    cancellation_receiver,
+                },
+                credentials,
+                connector,
+                audit,
+                mirror_service,
+                BrokerHandles {
+                    repo_mirror: repo_mirror.clone(),
+                    sim_broker: sim_broker.clone(),
+                },
+            )
+        };
         let actor = tokio::spawn(state.run());
         let cpu_budget = crate::cpu_budget::CpuBudget::start(config.cpu_budget);
         let control = match &config.control_socket {
@@ -516,6 +533,9 @@ pub(crate) enum Command {
     },
     BeginDrain {
         reply: oneshot::Sender<()>,
+    },
+    ReleaseUnclaimedListeners {
+        reply: oneshot::Sender<usize>,
     },
     ForceStop,
 }
@@ -1025,6 +1045,10 @@ struct SessionState {
     connection_stop: watch::Sender<bool>,
     audit_stop: watch::Sender<bool>,
     listener_task: JoinHandle<()>,
+    /// A duplicate of a TCP session listener, which a draining gateway gives the install
+    /// restarting it ([`Actor::give_listeners`]). Closed with the listener, in [`Self::quiesce`]:
+    /// a copy that outlived it would keep the port listening for nobody, or refuse a rebind.
+    handoff: Option<Fenced<std::os::fd::OwnedFd>>,
 }
 
 impl SessionState {
@@ -1033,6 +1057,7 @@ impl SessionState {
         let _ = self.connection_stop.send(true);
         let _ = self.audit_stop.send(true);
         let _ = (&mut self.listener_task).await;
+        self.handoff = None;
         unlink_endpoint(&self.endpoint);
     }
 
@@ -1086,6 +1111,10 @@ struct Actor {
     draining: bool,
     drain_reply: Option<oneshot::Sender<()>>,
     audit_failure: Option<AuditError>,
+    /// The workspace listeners an install carried across the restart, by address, until a
+    /// restored session claims each ([`Actor::bind_endpoint`]). Fenced: a peer observes their
+    /// release, since the connections queued on one are reset when it closes.
+    carried: HashMap<std::net::SocketAddr, Fenced<TcpListener>>,
 }
 
 impl Actor {
@@ -1142,6 +1171,7 @@ impl Actor {
             draining: false,
             drain_reply: None,
             audit_failure: None,
+            carried: HashMap::new(),
         }
     }
 
@@ -1268,6 +1298,11 @@ impl Actor {
                         Command::Status { reply } => {
                             let _ = reply.send(self.status());
                         }
+                        Command::ReleaseUnclaimedListeners { reply } => {
+                            let released = self.carried.len();
+                            self.carried.clear();
+                            let _ = reply.send(released);
+                        }
                         Command::BeginDrain { reply } => {
                             self.begin_drain(reply).await;
                             if self.finish_drain().await? {
@@ -1330,11 +1365,11 @@ impl Actor {
             if let Some(current) = previous.as_mut() {
                 current.quiesce().await;
             }
-            match bind_endpoint(&session.endpoint) {
+            match self.bind_endpoint(&session.endpoint) {
                 Ok(listener) => listener,
                 Err(error) => {
                     if let Some(mut current) = previous.take() {
-                        let restored = bind_endpoint(&current.endpoint)?;
+                        let restored = self.bind_endpoint(&current.endpoint)?;
                         self.attach_listener(&workspace_id, &mut current, restored);
                         self.sessions.insert(workspace_id, current);
                     }
@@ -1342,7 +1377,7 @@ impl Actor {
                 }
             }
         } else {
-            match bind_endpoint(&session.endpoint) {
+            match self.bind_endpoint(&session.endpoint) {
                 Ok(listener) => listener,
                 Err(error) => {
                     if let Some(current) = previous.take() {
@@ -1383,7 +1418,7 @@ impl Actor {
         let (accept_stop, accept_rx) = watch::channel(false);
         let (connection_stop, connection_rx) = watch::channel(false);
         let (audit_stop, audit_rx) = watch::channel(false);
-        let listener_task = self.spawn_listener(
+        let (listener_task, handoff) = self.spawn_listener(
             workspace_id.clone(),
             listener,
             accept_rx,
@@ -1408,6 +1443,7 @@ impl Actor {
                 connection_stop,
                 audit_stop,
                 listener_task,
+                handoff,
             },
         );
         self.revisions.insert(workspace_id, revision);
@@ -1477,6 +1513,10 @@ impl Actor {
         self.drop_nx_backend(repo_id).await;
     }
 
+    /// Serve `listener` for `workspace_id`; the task, and for a TCP listener a duplicate a
+    /// draining gateway can give an install ([`SessionState::handoff`]). A duplicate the kernel
+    /// refuses (no descriptor left) leaves that one listener uncarried, and says so: across a
+    /// restart it is refused as before the handoff existed.
     fn spawn_listener(
         &self,
         workspace_id: String,
@@ -1484,7 +1524,23 @@ impl Actor {
         accept_rx: watch::Receiver<bool>,
         connection_rx: watch::Receiver<bool>,
         audit_rx: watch::Receiver<bool>,
-    ) -> JoinHandle<()> {
+    ) -> (JoinHandle<()>, Option<Fenced<std::os::fd::OwnedFd>>) {
+        let handoff = match &listener {
+            BoundListener::Tcp(tcp) => {
+                use std::os::fd::AsFd as _;
+                match tcp.as_fd().try_clone_to_owned() {
+                    Ok(copy) => Some(Fenced::new(copy)),
+                    Err(error) => {
+                        eprintln!(
+                            "cowshed: workspace {workspace_id}'s listener is not carried across a \
+                             gateway restart: duplicating it failed: {error}"
+                        );
+                        None
+                    }
+                }
+            }
+            BoundListener::Unix(_) => None,
+        };
         let context = proxy::AcceptContext {
             workspace_id,
             commands: self.commands.clone(),
@@ -1497,13 +1553,76 @@ impl Actor {
             repo_mirror: self.repo_mirror.clone(),
             sim_broker: self.sim_broker.clone(),
         };
-        tokio::spawn(proxy::accept_loop(
+        let task = tokio::spawn(proxy::accept_loop(
             listener,
             context,
             accept_rx,
             connection_rx,
             audit_rx,
-        ))
+        ));
+        (task, handoff)
+    }
+
+    /// A session's listener: the one an install carried across the restart for its address,
+    /// when there is one, so the connections queued on it meanwhile are served; else a fresh
+    /// bind (05_gateway.md "An install never refuses a client connection").
+    fn bind_endpoint(
+        &mut self,
+        endpoint: &WorkspaceEndpoint,
+    ) -> Result<BoundListener, GatewayError> {
+        if let WorkspaceEndpoint::Tcp { address, .. } = endpoint
+            && let Some(carried) = self.carried.remove(address)
+        {
+            return Ok(BoundListener::Tcp(carried));
+        }
+        bind_endpoint(endpoint)
+    }
+
+    /// As a drain begins, give the install restarting this gateway a duplicate of every TCP
+    /// workspace listener, while this gateway still holds them: from then on the install's
+    /// copies keep each port listening until the next gateway takes them. Nothing is given when
+    /// no install serves the handoff socket, and a failed give is said and changes nothing else:
+    /// the restart then refuses connections as it did before.
+    #[cfg(target_os = "macos")]
+    async fn give_listeners(&self) {
+        let Some(path) = self.config.listener_handoff.clone() else {
+            return;
+        };
+        let mut listeners = Vec::new();
+        for session in self.sessions.values() {
+            let (WorkspaceEndpoint::Tcp { address, .. }, Some(copy)) =
+                (&session.endpoint, &session.handoff)
+            else {
+                continue;
+            };
+            use std::os::fd::AsFd as _;
+            match copy.as_fd().try_clone_to_owned() {
+                Ok(copy) => listeners.push((*address, copy)),
+                Err(error) => eprintln!(
+                    "cowshed: the listener at {address} is not carried across this restart: {error}"
+                ),
+            }
+        }
+        let given = tokio::task::spawn_blocking(move || {
+            use std::os::fd::AsFd as _;
+            let borrowed: Vec<_> = listeners
+                .iter()
+                .map(|(address, copy)| (*address, copy.as_fd()))
+                .collect();
+            crate::listener_handoff::give(&path, &borrowed)
+        })
+        .await;
+        match given {
+            Ok(Ok(0)) => {}
+            Ok(Ok(given)) => eprintln!(
+                "cowshed: gave {given} workspace listener(s) to the install restarting this gateway"
+            ),
+            Ok(Err(error)) => eprintln!(
+                "cowshed: could not give the workspace listeners to the install restarting this \
+                 gateway; its clients are refused until the next gateway binds: {error}"
+            ),
+            Err(error) => eprintln!("cowshed: the listener handoff task failed: {error}"),
+        }
     }
 
     fn attach_listener(
@@ -1515,7 +1634,7 @@ impl Actor {
         let (accept_stop, accept_rx) = watch::channel(false);
         let (connection_stop, connection_rx) = watch::channel(false);
         let (audit_stop, audit_rx) = watch::channel(false);
-        let listener_task = self.spawn_listener(
+        let (listener_task, handoff) = self.spawn_listener(
             workspace_id.to_owned(),
             listener,
             accept_rx,
@@ -1526,6 +1645,7 @@ impl Actor {
         session.connection_stop = connection_stop;
         session.audit_stop = audit_stop;
         session.listener_task = listener_task;
+        session.handoff = handoff;
     }
 
     fn configure_nx_cache(&mut self, backend: NxCacheBackend) -> Result<(), GatewayError> {
@@ -2689,6 +2809,8 @@ impl Actor {
     }
 
     async fn begin_drain(&mut self, reply: oneshot::Sender<()>) {
+        #[cfg(target_os = "macos")]
+        self.give_listeners().await;
         self.draining = true;
         self.drain_reply = Some(reply);
         for session in self.sessions.values() {
@@ -2999,6 +3121,57 @@ fn audit_unavailable(status: StatusCode) -> AdmissionError {
         AuditStatus::Failed,
         None,
     )
+}
+
+/// The workspace listeners the install restarting this host's gateway carried across the
+/// restart, by address; empty when none was carried. A failed take is said and leaves every
+/// session binding fresh, as before the handoff existed: `take` returns only once the install
+/// has closed its copies, so no fresh bind meets them.
+async fn take_carried_listeners(
+    config: &GatewayConfig,
+) -> HashMap<std::net::SocketAddr, Fenced<TcpListener>> {
+    #[cfg(target_os = "macos")]
+    if let Some(path) = config.listener_handoff.clone() {
+        let taken = tokio::task::spawn_blocking(move || crate::listener_handoff::take(&path))
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|taken| taken);
+        let taken = match taken {
+            Ok(taken) => taken,
+            Err(error) => {
+                eprintln!(
+                    "cowshed: could not take the workspace listeners the install carried; every \
+                     session binds afresh: {error}"
+                );
+                return HashMap::new();
+            }
+        };
+        let mut carried = HashMap::new();
+        for (address, listener) in taken {
+            // Already close-on-exec: the handoff received it under the fork lock.
+            match listener
+                .set_nonblocking(true)
+                .and_then(|()| TcpListener::from_std(listener))
+            {
+                Ok(listener) => {
+                    carried.insert(address, Fenced::new(listener));
+                }
+                Err(error) => eprintln!(
+                    "cowshed: the carried listener at {address} is closed, and its session binds \
+                     afresh: {error}"
+                ),
+            }
+        }
+        if !carried.is_empty() {
+            eprintln!(
+                "cowshed: took {} workspace listener(s) the install carried across the restart",
+                carried.len()
+            );
+        }
+        return carried;
+    }
+    let _ = config;
+    HashMap::new()
 }
 
 fn bind_tcp(address: std::net::SocketAddr) -> std::io::Result<Fenced<TcpListener>> {

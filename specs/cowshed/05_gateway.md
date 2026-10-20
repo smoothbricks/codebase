@@ -211,6 +211,25 @@ two of a land's commands no process of that land holds anything the gateway reco
 whether a land runs is answered "no" mid-land. Ordinary work does not hold the slot: a long-lived background exec would
 hold every install back. Status reads the slot without taking it, so land steps alone never read as a pending install.
 
+**An install never refuses a client connection.** A restart closes every workspace listener until the next gateway's
+startup pass restores its session (5 s and more), and a stock client cannot wait for that: measured 2026-10-20, an
+install restarted the gateway under a shed's Nx build, and Nx read the refused cache connection
+(`Failed to send request …/nx/v1/cache/…`) as fatal and failed the build. No wait can prevent it. Nx sends a cache
+lookup holding no CPU token, so between two lookups no ledger, lease or slot shows that it runs, and waiting for all
+running work would hold installs back on any busy host. A typed "restarting" error is no answer either, since Nx reads
+only HTTP statuses. So the listening sockets outlive the restart. On macOS an install that restarts the gateway —
+`gateway start` and `setup`'s refresh alike, not a `--downgrade`, whose older gateway might not take them — serves
+`listener-handoff.sock` beside the control socket from before the restart until the restarted gateway serves. The old
+gateway, as its drain begins and while it still accepts, gives the install a duplicate of every TCP workspace listener
+(`SCM_RIGHTS`), and its drain then answers what it already accepted as before (the Nx route's 404/403). The install's
+copies keep each port listening, so the kernel queues a connection made while no gateway runs. The next gateway takes
+them before it binds anything ("Startup contract" step 2) and serves each on its restored session (step 4), queued
+connections included. Only this user's processes may give or take, and the store deny keeps every sandbox off the
+socket. Every failure is what a restart was without the handoff: no install serving the socket, an old gateway that
+predates the handoff, an install that dies (the kernel closes its copies), or a failed take, after which the install
+closes its copies before the new gateway binds. Linux binds no TCP workspace listener, so it carries none. A queued CPU
+request and an exec client of the replaced build are other clients a restart still cuts off.
+
 **Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
 the new build's and the one it replaced is removed. The replaced build stays one install longer: a workspace supervisor
 of that build, still draining its jobs (11_shell.md "Draining a supervisor of another build"), starts the shells those
@@ -1287,14 +1306,18 @@ mounts are restored. In order:
 
 1. Validate the host store — both dedicated volumes present, mounted, marked, and with canonical flags (01a_apfs.md). A
    store that fails validation stops here and reports; nothing below can be meaningful without it.
-2. Count the recorded projects and list the workspace supervisors still serving from before this daemon, then serve: the
-   control socket and the supervisor manager answer from the first moment. Status answers throughout, and so do the
-   audit, mirror, and simulator requests, none of which reads a workspace mount.
+2. Take the workspace listeners an install carried across the restart ("An install never refuses a client connection"),
+   before anything binds. Then count the recorded projects and list the workspace supervisors still serving from before
+   this daemon, then serve: the control socket and the supervisor manager answer from the first moment. Status answers
+   throughout, and so do the audit, mirror, and simulator requests, none of which reads a workspace mount.
 3. Eagerly heal every recorded project's mounts: every project's main attached and mounted at its checkout path first,
    then every other workspace under the mount root (02_workspaces.md). Each step is a lifecycle span of its own —
    `startup-heal discover`, `startup-heal open <repo>`, `startup-heal mount <repo>/<workspace>` — so a slow pass reads
    as the step that spent the time.
-4. Restore every attached workspace's session into the gateway from what step 3 mounted.
+4. Restore every attached workspace's session into the gateway from what step 3 mounted. A session whose endpoint an
+   install carried serves on that listener, connections queued on it included; any other binds its endpoint. Once every
+   session is restored, each carried listener no session claimed is closed, so its queued connections are reset rather
+   than left waiting for nobody.
 
 Positively authorized pending project retirements are excluded from the ordinary heal set. After the control socket and
 supervisor manager are serving, startup resumes those records through the same owned drain, unforced detach and

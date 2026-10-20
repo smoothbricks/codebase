@@ -14,6 +14,8 @@ mod cpu_budget;
 mod disk_lease;
 mod interfaces;
 mod jobserver;
+#[cfg(target_os = "macos")]
+mod listener_handoff;
 mod mirror;
 mod npm_index;
 mod nx_cache;
@@ -52,6 +54,8 @@ pub use interfaces::{
     CredentialRecord, GatewayIo, NegotiatedTransport, SystemConnector, UpstreamConnection,
     UpstreamConnector, UpstreamHealth, UpstreamPurpose,
 };
+#[cfg(target_os = "macos")]
+pub use listener_handoff::{HandoffServer, handoff_path};
 pub use mirror::{
     MirrorBody, MirrorCacheScope, MirrorCacheStatus, MirrorError, MirrorFetchRequest,
     MirrorOutcome, MirrorProtocolMetadata, MirrorRedirect, MirrorRequest, MirrorResourceKind,

@@ -3724,3 +3724,87 @@ async fn nx_cache_route_is_project_bound_readonly_except_qualified_hashes() {
         )
     );
 }
+
+/// 05_gateway.md "An install never refuses a client connection". Measured 2026-10-20: an install
+/// restarted the gateway under a shed's Nx build, and stock Nx read the refused cache connection
+/// as fatal. A cache request issued while no gateway runs at all is now queued on the listener the
+/// install carries, and the next gateway answers it once its session is restored: a miss, never a
+/// refusal. The same restart with no install carrying the listener refuses that request, so the
+/// handoff is what makes the difference.
+#[tokio::test]
+async fn a_request_during_a_gateway_restart_is_answered_never_refused() {
+    // `/tmp`, not TMPDIR: a Unix socket path has to fit in `sun_path`.
+    let handoff = std::path::PathBuf::from(format!("/tmp/cs-restart-{}.sock", std::process::id()));
+    let (config, _cache) = test_config();
+    let config = GatewayConfig {
+        listener_handoff: Some(handoff.clone()),
+        ..config
+    };
+    let start = |config: GatewayConfig| {
+        gateway(
+            config,
+            Arc::new(NoCredentials),
+            Arc::new(LocalConnector {
+                health: UpstreamHealth::Healthy,
+                observed: None,
+            }),
+            Arc::new(DiscardAudit),
+        )
+    };
+    let restarting = |endpoint| {
+        session(
+            "restarting",
+            "owner/nx-restart",
+            block_endpoint(endpoint),
+            61,
+            1,
+            WorkspacePolicy::default(),
+        )
+    };
+    let ask = |endpoint: SocketAddr, token: &str| {
+        let request = nx_request(endpoint, "GET", token, "42");
+        async move {
+            let mut stream = TcpStream::connect(endpoint).await?;
+            stream.write_all(request.as_bytes()).await?;
+            Ok::<_, io::Error>(stream)
+        }
+    };
+
+    let old = start(config.clone()).await;
+    let (session_one, token, _) = restarting(free_endpoint());
+    let endpoint = install_in_free_block(&old.handle(), session_one).await;
+    let mut before = ask(endpoint, &token).await.expect("the gateway serves");
+    assert!(
+        read_response_head(&mut before)
+            .await
+            .starts_with("HTTP/1.1 404"),
+        "no Nx backend is configured, so a lookup is a miss"
+    );
+
+    let install = cowshed_gateway::HandoffServer::start(&handoff).expect("the install's handoff");
+    old.drain().await.expect("the old gateway drains and exits");
+    // No gateway runs now: the restart's window.
+    let mut during = ask(endpoint, &token)
+        .await
+        .expect("the request is queued on the carried listener, not refused");
+    let new = start(config.clone()).await;
+    let (session_two, _, _) = restarting(endpoint);
+    new.handle()
+        .install(session_two)
+        .await
+        .expect("the session is restored on its carried listener");
+    assert!(
+        read_response_head(&mut during)
+            .await
+            .starts_with("HTTP/1.1 404"),
+        "the next gateway answers the request issued during the restart"
+    );
+    drop(install);
+
+    // The same restart with no install serving the handoff: the window refuses.
+    new.drain().await.expect("the new gateway drains");
+    let refused = ask(endpoint, &token)
+        .await
+        .expect_err("with nothing carried, a restart refuses the request");
+    assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+}
