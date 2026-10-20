@@ -1,12 +1,15 @@
 {
   "version": 1,
   "files": {
+    "src/executors/bounded-exec/go-progress-host.test.ts": 113358,
+    "src/executors/bounded-exec/runner-hook.test.ts": 91400,
     "src/ensure-built.test.ts": 74030,
     "src/nextest-partitions.test.ts": 65735,
     "src/nx-daemon-validity.test.ts": 61972,
     "src/cargo-resolve-cache.test.ts": 59317,
     "src/task-results.test.ts": 57421,
     "src/nx-daemon-ignore-files.test.ts": 50341,
+    "src/executors/bounded-exec/cargo-progress-host.test.ts": 38973,
     "src/cargo-closure-key.test.ts": 26380,
     "src/linked-snapshots.nx.test.ts": 25519,
     "src/testing.test.ts": 23681,
@@ -15,6 +18,7 @@
     "src/nx-use-local.test.ts": 19732,
     "src/owned-installation.test.ts": 15674,
     "src/cargo-source-hash.test.ts": 14605,
+    "src/executors/bounded-exec/runner-lifecycle.test.ts": 13182,
     "src/executors/bounded-exec/executor.test.ts": 12053,
     "src/index.test.ts": 10682,
     "src/executors/bounded-exec/ram-temp.test.ts": 9310,
