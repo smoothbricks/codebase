@@ -81,9 +81,7 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
         process.kill(-pid, 'SIGKILL');
       } catch (cause) {
         const code = cause instanceof Error && 'code' in cause ? cause.code : undefined;
-        // Darwin answers EPERM, not ESRCH, for a group whose only members are unreaped zombies (a killed
-        // descendant waiting for launchd to reap it): such a group has nothing left to kill.
-        if (code !== 'ESRCH' && !(code === 'EPERM' && onlyZombiesIn(pid))) {
+        if (code !== 'ESRCH') {
           throw new Error(`cleanup owned readiness process group pgid=${pid} failed`, { cause });
         }
       } finally {
@@ -574,6 +572,8 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     await termination.armed();
+    // This fixture has no descendants; runBoundedExec has observed its leader's exit.
+    termination.release();
     expect(result.success).toBe(false);
     expect(await readFile(handled, 'utf8'), `cooperative handler pid=${handlerPid} must handle SIGTERM`).toBe(
       `handled pid=${handlerPid}\n`,
@@ -736,7 +736,9 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     await termination.armed();
-    expect(await closed, `ready descendant pid=${descendantPid} must close its lifetime FIFO on exit`).toBe('');
+    const descendantOutput = await closed;
+    termination.release();
+    expect(descendantOutput, `ready descendant pid=${descendantPid} must close its lifetime FIFO on exit`).toBe('');
     expect(result.success).toBe(false);
   });
 
@@ -750,19 +752,20 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     const ready = join(workspace.root, 'straggler-ready.fifo');
     expect(spawnSync('mkfifo', [fifo, ready]).status).toBe(0);
     // The leader exits on SIGTERM. The subshell beside it ignores SIGTERM, a disposition its
-    // `tail` inherits, and announces itself only once it holds the FIFO: from then on the
-    // graceful signal cannot end it. A process forked while that signal goes out is the same
-    // case, without the trap.
+    // `tail` inherits, and announces itself only once that disposition is installed. Every
+    // script descendant inherits the lifetime FIFO, so EOF proves all of them ended, not
+    // just the ignoring child. A fork during signal delivery inherits that witness too.
     await workspace.write(
       'straggle.sh',
       [
-        '( trap "" TERM; exec 3>"$1"; echo ready; echo armed >"$2"; exec tail -f /dev/null ) | {',
+        'exec 3>"$1"',
+        '( trap "" TERM; echo ready; echo armed >"$2"; exec tail -f /dev/null ) | {',
         '  read -r line; echo "$line"; exec tail -f /dev/null',
         '}',
         '',
       ].join('\n'),
     );
-    // The straggler is the FIFO's only writer and never ends on its own, so the read ends only when it is killed.
+    // All script descendants own a writer; the read ends only when the last one exits.
     const straggler = readToEnd(fifo);
     const termination = armedKiller('TERM-ignoring FIFO straggler', async (pid) => {
       expect(await readToEnd(ready), `straggler readiness pgid=${pid} must follow trap and FIFO open`).toBe('armed\n');
@@ -777,10 +780,16 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     );
 
     await termination.armed();
+    const stragglerOutput = await straggler;
+    termination.release();
     expect(result.terminalOutput).toContain('ready');
-    expect(await straggler).toBe('');
+    expect(stragglerOutput).toBe('');
     expect(result.success).toBe(false);
     expect(result.terminalOutput).toContain('Force-killing what the timed-out command left in its process group');
+    expect(
+      [...ownedProcessGroups],
+      'leader exit and straggler FIFO EOF retire cleanup authority; afterEach must not signal their stale PGID',
+    ).toEqual([]);
   });
 
   it('runs the command with its RAM lease as TMPDIR, names held dead leases, and ends the lease after it exits', async () => {
@@ -1573,10 +1582,12 @@ function armedKiller(subject: string, ready: (pid: number) => Promise<void>) {
   const real = createProcessTreeKiller();
   const calls: NodeJS.Signals[] = [];
   let armed: Promise<void> | undefined;
+  let group: number | undefined;
   return {
     calls,
     killer: {
       async kill(pid: number, signal: NodeJS.Signals) {
+        group = pid;
         ownedProcessGroups.add(pid);
         armed ??= ready(pid);
         await armed;
@@ -1588,6 +1599,11 @@ function armedKiller(subject: string, ready: (pid: number) => Promise<void>) {
       expect(armed, `${subject}: readiness was never requested before timeout signal delivery`).toBeDefined();
       // The executor tolerates killer errors; re-await here so a failed readiness assertion cannot be swallowed.
       await armed;
+    },
+    /** Called only after leader exit and EOF from every descendant's inherited lifetime writer. */
+    release() {
+      if (group === undefined) throw new Error(`${subject}: no process group was armed`);
+      ownedProcessGroups.delete(group);
     },
   };
 }
@@ -1753,17 +1769,4 @@ function inheritedFrom(pool: CpuPool): InheritedCpuPool {
 /** The count a pool of `tokens` lends a run that wants `want`: min(want, tokens). */
 function lentCount(want: number, tokens: number): number {
   return Math.min(want, tokens);
-}
-
-/** Every process left in group `pgid` is a zombie: `ps` lists no member in any other state. */
-function onlyZombiesIn(pgid: number): boolean {
-  const listed = spawnSync('ps', ['-A', '-o', 'pgid=,stat='], { encoding: 'utf8' });
-  if (listed.status !== 0) {
-    return false;
-  }
-  return listed.stdout
-    .split('\n')
-    .map((line) => line.trim().split(/\s+/))
-    .filter(([group]) => Number(group) === pgid)
-    .every(([, state]) => state?.startsWith('Z') === true);
 }

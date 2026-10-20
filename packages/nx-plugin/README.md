@@ -1336,6 +1336,11 @@ pinned Bun 1.4.2). A test waits for the event it is waiting for, however long a 
 that never returns still ends the run through `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that
 report no tests; a target names at least one of the two.
 
+Process-group timeout fixtures retain cleanup authority only until the command leader exits and every descendant closes
+its inherited lifetime FIFO. EOF is the terminal ownership event; a later `afterEach` must not signal the retired PGID
+again. Darwin can answer `EPERM` for an unreaped zombie-only group, and an ambient `ps` scan is not an ownership proof.
+Failed fixtures retain their cleanup obligation rather than suppressing signal errors.
+
 A job waiting for a CPU token is queued, not idle. A descendant whose own work waits in the host's CPU queue (a test's
 scratch cowshed project, say) writes `{"op":"host-wait"}` on the `BOUNDED_EXEC_CPU_POOL` it inherited and holds the
 connection while the work waits; while any such wait is held, the idle clock is stopped and keeps the time it had left,
