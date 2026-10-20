@@ -2853,12 +2853,13 @@ const REMOVE: CommandSpec = CommandSpec {
         "Build volumes are collected before rm returns: a volume with no checkout link and no seed owner is detached and deleted unless a running job's hold or an unfinished create/fork in the lifecycle intent journal owns it. Release tries an unforced unmount with bounded grace, then forces it if needed, naming each initial holder's pid and command and whether the release needed force. Collection says why a volume is retained; an editor or indexer alone cannot strand an unlinked volume.",
         "Containment is content, not commit identity. A head main contains is landed outright; otherwise every file the workspace changed since its merge base with main must already carry that change in main, beside whatever main changed since. Work that reached main by squash-merge, cherry-pick, a history rewrite, or a pick whose conflict was resolved on the way in is therefore landed, so retiring it needs no flag — passing a commit-destroying flag to remove work main already has is exactly the habit this gate exists to prevent. The target tip is read live from main's own repository, never from the workspace's `main` remote, which is a clone-time snapshot; when it cannot be read the answer is `cannot determine`, which is refused exactly as unlanded work is.",
         "The two overrides authorize different losses and neither substitutes for the other, so a script carrying one has not acquired the other.",
+        "A process cowshed does not run that holds the workspace — a host shell's `direnv exec <ws> nx …`, a working directory in it, a file of it open — refuses the removal before anything stops, `--force` or not, named by pid, command and what it holds where. Cowshed stops none of them.",
         "The workspace is found in cwd's project or the one `--project` names. Run from outside any project, `rm <ws>` finds it the way `detach <ws>` does — in the store, by name — and refuses when more than one project holds that name; the gate is the same either way.",
     ],
     options: &[
         Opt {
             spelling: "--force",
-            meaning: "waive transient state only — a dirty tree, an in-progress merge, a busy mount. It does not waive the containment gate, and it does not preserve what it waives: an uncommitted tree is destroyed with no bundle and no record, so commit it or `cowshed checkpoint` first if it is the only copy",
+            meaning: "waive transient state only — a dirty tree, an in-progress merge, the workspace's own running jobs. It does not waive the containment gate or a process cowshed does not run holding the mount, and it does not preserve what it waives: an uncommitted tree is destroyed with no bundle and no record, so commit it or `cowshed checkpoint` first if it is the only copy",
         },
         Opt {
             spelling: "--restore",
@@ -3005,6 +3006,7 @@ const DETACH: CommandSpec = CommandSpec {
     summary: "detach session workspace(s)",
     about: &[
         "Unmounts session workspaces. `detach <ws>` names one, resolved from the store directly so it works from any directory; with no argument, the project from the cwd or `--project` scopes it; `--all` detaches every attached session store-wide. Mains are never detach targets.",
+        "Before anything stops, a process cowshed does not run that holds the workspace — a host shell's `direnv exec <ws> nx …`, a working directory in it, a file of it open — refuses the detach, named by pid, command and what it holds where. Cowshed stops none of them.",
     ],
     options: &[Opt {
         spelling: "--all",

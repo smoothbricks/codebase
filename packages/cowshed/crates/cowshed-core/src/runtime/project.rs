@@ -6051,6 +6051,18 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         NativeRemovalGitFence,
         super::supervisor_socket::BoundSocket,
     )> {
+        let mount = self.workspace_mount_path(workspace)?;
+        let mounted = |current: &NativeWorkspace| {
+            matches!(
+                current.derived.mount_state,
+                crate::storage::lifecycle::MountState::Mounted { .. }
+            )
+        };
+        if mounted(&self.current(workspace).await?) {
+            let supervisor = self.serving_supervisor(workspace).await?;
+            self.require_mount_unheld(workspace, &mount, supervisor)
+                .await?;
+        }
         let stopped = self
             .stop_supervisor_with_mode(
                 workspace,
@@ -6065,6 +6077,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         require_lost_groups_released(workspace, &stopped, "remove").await?;
         let current = self.current(workspace).await?;
         Self::require_exact_incarnation(&current, &initial.incarnation)?;
+        if mounted(&current) {
+            self.require_mount_unheld(workspace, &mount, None).await?;
+        }
         let fence = self.removal_git_fence(&current).await?;
         if fence.head != initial.head {
             return Err(match purpose {
@@ -8572,6 +8587,73 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             .await
     }
 
+    /// The pid serving `workspace`'s supervisor: this process when it serves it, else whoever
+    /// answers the socket's hello. A supervisor of another cowshed build names none to this one;
+    /// its jobs are still in its ledger ([`super::mount_activity::Accounted`]).
+    async fn serving_supervisor(&self, workspace: &WorkspaceName) -> Result<Option<i32>> {
+        let pid = if self.served.contains_key(workspace) {
+            Some(std::process::id())
+        } else {
+            let socket = super::supervisor_socket::socket_path(
+                self.descriptor.storage.store(),
+                &self.descriptor.repo_id,
+                workspace,
+            );
+            match super::supervisor_socket::hello_if_present(&socket).await {
+                Ok(hello) => hello.map(|hello| hello.pid),
+                Err(error) if error.code == ErrorCode::Conflict => None,
+                Err(error) => return Err(error),
+            }
+        };
+        pid.map(i32::try_from)
+            .transpose()
+            .map_err(|_| CowshedError::internal("a supervisor pid overflows pid_t"))
+    }
+
+    /// What holds `workspace`'s mount at `mount` beyond the processes cowshed runs on it, with
+    /// `supervisor`'s process tree exempt ([`super::mount_activity`]).
+    async fn mount_held(
+        &self,
+        workspace: &WorkspaceName,
+        mount: &Path,
+        supervisor: Option<i32>,
+    ) -> Result<Option<super::mount_activity::MountHeld>> {
+        let ledger = self.job_group_ledger(workspace);
+        let census = mount.to_owned();
+        crate::storage::lifecycle::dispatch_blocking(move || {
+            super::mount_activity::unaccounted(
+                &census,
+                &super::mount_activity::Accounted {
+                    supervisor,
+                    ledger: &ledger,
+                },
+            )
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("mount census task failed: {error}")))?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("cannot list what holds {}: {error}", mount.display()),
+                "cowshed doctor --json",
+            )
+        })
+    }
+
+    /// Refuse while a process cowshed does not run holds `workspace`'s mount at `mount`. A verb
+    /// asks before the supervisor stops, with the serving supervisor exempt, so the census never
+    /// ends the Nx daemon a host shell's run is using; a retirement asks again once it stopped.
+    async fn require_mount_unheld(
+        &self,
+        workspace: &WorkspaceName,
+        mount: &Path,
+        supervisor: Option<i32>,
+    ) -> Result<()> {
+        match self.mount_held(workspace, mount, supervisor).await? {
+            Some(held) => Err(held.refusal(workspace)),
+            None => Ok(()),
+        }
+    }
+
     /// One request, so the supervisor retires whatever becomes of this process: a quiesce and
     /// a retire sent apart left it refusing work for good when the caller went away between them
     /// (11_shell.md "Supervisor").
@@ -8709,6 +8791,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     }
                     let since = *idle_since.get_or_insert(now);
                     if now.duration_since(since) >= SUPERVISOR_IDLE {
+                        // A host shell's run on the mount runs no job here, yet the workspace
+                        // is in use: the supervisor stays while such a process holds it.
+                        let mount = self.workspace_mount_path(&name)?;
+                        let supervisor = self.serving_supervisor(&name).await?;
+                        if let Some(held) = self.mount_held(&name, &mount, supervisor).await? {
+                            eprintln!("cowshed: workspace {name}'s supervisor stays: {held}");
+                            idle_since = Some(now);
+                            continue;
+                        }
                         // One request: a command admitted since the last look finishes before
                         // the supervisor retires.
                         break actor.retire_after_jobs(NxDaemonRetirement::Recorded).await;
@@ -8920,6 +9011,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                             containment,
                         )
                         .await?;
+                        let supervisor = this.serving_supervisor(workspace).await?;
+                        this.require_mount_unheld(workspace, &stage.mount_point, supervisor)
+                            .await?;
                         let _stopped = this
                             .stop_supervisor_with_mode(
                                 workspace,
@@ -11820,6 +11914,14 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         self.validate_binding().await?;
         let current = self.current(&workspace).await?;
         let mount = self.workspace_mount_path(&workspace)?;
+        if matches!(
+            current.derived.mount_state,
+            crate::storage::lifecycle::MountState::Mounted { .. }
+        ) {
+            let supervisor = self.serving_supervisor(&workspace).await?;
+            self.require_mount_unheld(&workspace, &mount, supervisor)
+                .await?;
+        }
         let _stopped = self.stop_supervisor(&workspace).await?;
         if matches!(
             current.derived.mount_state,
@@ -19197,46 +19299,37 @@ impl<H: RuntimeStorageHost> super::supervisor::VolumeLabeller for ApfsLabeller<H
     }
 }
 
-/// The kernel refused to unmount `workspace` at `mount` because something holds it: name every
-/// holder, pid and argv, so the next move is stopping them rather than repairing storage that is
-/// not broken.
+/// The kernel refused to unmount `workspace` at `mount` because something holds it. Name every
+/// holder with what it holds, so the next move is stopping them rather than repairing storage
+/// that is not broken: first the tree census, then the volume census, which also walks mapped
+/// files. With neither naming a process, say so, and name what is mounted inside the volume:
+/// what still holds it then is another user's process or the kernel, which this user cannot see.
 #[cfg(target_os = "macos")]
 fn detach_refused(
     workspace: &WorkspaceName,
     mount: &Path,
     error: &crate::storage::apfs::ApfsStorageError,
 ) -> CowshedError {
-    match crate::build_volume::nx::volume_holders(mount) {
-        Ok(holders) if !holders.is_empty() => {
-            let named = holders
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; ");
-            let pids = holders
-                .iter()
-                .map(|holder| holder.pid.to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-            CowshedError::conflict(
-                format!(
-                    "{workspace} is in use at {}, held by: {named}",
-                    mount.display()
-                ),
-                format!(
-                    "stop pid {pids} (or move their working directories off the workspace), \
-                     then `cowshed detach {workspace}`"
-                ),
-            )
-        }
-        Ok(_) => CowshedError::conflict(
+    let held = |named: Vec<String>, pids: Vec<i32>| {
+        let pids = pids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        CowshedError::conflict(
             format!(
-                "{workspace} was busy at {} ({error}), and nothing holds it now",
-                mount.display()
+                "{workspace} is in use at {}, held by: {}",
+                mount.display(),
+                named.join("; ")
             ),
-            format!("cowshed detach {workspace}"),
-        ),
-        Err(query) => CowshedError::conflict(
+            format!(
+                "stop pid {pids} (or move their working directories off the workspace), \
+                 then `cowshed detach {workspace}`"
+            ),
+        )
+    };
+    let unlisted = |query: std::io::Error| {
+        CowshedError::conflict(
             format!(
                 "{workspace} is in use at {} ({error}); its holders could not be listed: {query}",
                 mount.display()
@@ -19245,7 +19338,63 @@ fn detach_refused(
                 "`lsof +f -- {}` names them; stop them, then `cowshed detach {workspace}`",
                 mount.display()
             ),
+        )
+    };
+    match crate::build_volume::nx::tree_holds(mount) {
+        Ok(holds) if !holds.is_empty() => held(
+            holds.iter().map(ToString::to_string).collect(),
+            holds.iter().map(|held| held.holder.pid).collect(),
         ),
+        Ok(_) => match crate::build_volume::nx::volume_holders(mount) {
+            Ok(holders) if !holders.is_empty() => held(
+                holders
+                    .iter()
+                    .map(|holder| format!("{holder}, a mapped file or other vnode on the volume"))
+                    .collect(),
+                holders.iter().map(|holder| holder.pid).collect(),
+            ),
+            Ok(_) => {
+                let inside = match cowshed_apfs::mounts::kernel_mounts() {
+                    Ok(mounts) => {
+                        let nested = mounts
+                            .iter()
+                            .filter(|nested| {
+                                nested.mount_point != mount && nested.mount_point.starts_with(mount)
+                            })
+                            .map(|nested| {
+                                format!(
+                                    "{} at {}",
+                                    nested.source_device,
+                                    nested.mount_point.display()
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        if nested.is_empty() {
+                            "nothing is mounted inside it, so what holds it is another user's \
+                             process (Spotlight's mds runs as root) or the kernel itself"
+                                .to_owned()
+                        } else {
+                            format!("mounted inside it: {}", nested.join("; "))
+                        }
+                    }
+                    Err(query) => format!("what is mounted inside it could not be listed: {query}"),
+                };
+                CowshedError::conflict(
+                    format!(
+                        "{workspace} is busy at {} ({error}), yet no process of this user holds \
+                         it: {inside}",
+                        mount.display()
+                    ),
+                    format!(
+                        "`sudo lsof +f -- {}` names another user's holders; once they are gone, \
+                         `cowshed detach {workspace}`",
+                        mount.display()
+                    ),
+                )
+            }
+            Err(query) => unlisted(query),
+        },
+        Err(query) => unlisted(query),
     }
 }
 

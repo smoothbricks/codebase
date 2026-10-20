@@ -1224,7 +1224,9 @@ clone of a snapshot of the lane base on ZFS as it is a clone of its image on APF
    job to complete. Teardown precedes image retirement — live children would otherwise hold the mount busy and keep
    enforcing stale launch-time authority after the grants disappear. The checkout's Nx daemon outlives its supervisor
    (it detaches from the job that started it) and its cwd is the checkout, so it is stopped as `detach` stops it
-   (06_cli.md); anything else still holding the volume is left to step 5's grace and force, never a refusal.
+   (06_cli.md). A process cowshed does not run that holds the mount refuses the removal before the supervisor stops,
+   `--force` or not, and again once it has stopped ("Holders cowshed does not run", below); step 5's grace and force
+   cover only a holder that appears after that second look.
 3. Remove the host-side state this workspace put in main's repository, before the image goes anywhere: its reverse
    remote if one was registered, and its worktree registration if it is a git-worktree workspace (remove, then prune).
    This is the one piece of teardown that lives where the user can see it — a remote or a registration naming a trashed
@@ -1293,6 +1295,38 @@ Linux connector, unlinks the Linux per-incarnation socket, then frees the attach
 persist. `attach` mounts at the canonical path with canonical flags and, on Linux, creates the per-workspace
 socket/netns and starts exactly one connector before admitting execs. Personal macOS workspaces are typically attached
 at login by a launchd agent; Linux uses its platform service/controller lifecycle.
+
+### Holders cowshed does not run
+
+A workspace is in use while a process cowshed does not run holds its mount: the process's working directory, root
+directory or executable is under the mount, or it has a file there open. Event-only opens hold nothing (FSEvents,
+Spotlight, cowshed's own shell watches). A host shell's `direnv exec <ws> nx …` is such a process. It runs with no
+supervisor and no job, so the supervisor's view alone calls the workspace idle. On 2026-10-21 a census of idle sheds
+that went by supervisors alone missed at least nine running Nx runs; adding the working-directory and open-file checks
+found them.
+
+Cowshed runs three kinds of process on a workspace, and only these are exempt: the supervisor's process tree, the job
+groups its ledger records (11_shell.md), and the Nx daemon the checkout's own record names, with its plugin workers. The
+census (`runtime::mount_activity`) takes one pass over the process table (`build_volume::nx::tree_holds`). For each
+process it checks the working and root directory, then the executable, then each vnode descriptor, and keeps the first
+hold it finds. For each holder it then walks up the parents and reads the ledger once. It reads kernel process state and
+stats nothing on the mount but its root. A holder whose parent the kernel will not describe to this user is not shown to
+be cowshed's, so it stays a holder.
+
+`detach`, `rm`, the retirement a `land` ends with (which is `rm`'s), `mv`, gc's retirement of an abandoned unpublished
+clone, and a supervisor's idle retirement all consult it. Each asks before the supervisor stops, with the serving
+supervisor exempt. Stopping the supervisor first would end the keeper's Nx daemon that a host run may be using, so the
+census itself would disrupt what it measures. A retirement asks again once the supervisor has stopped, before the image
+is retired. A held mount refuses with `conflict`, naming each holder's pid, command, and what it holds where
+(`pid 4242 (nx run-many -t test), working directory /…/raven/packages`). It names ten holders and counts the rest.
+Nothing is stopped, and no flag overrides the refusal (11_shell.md, "Teardown ordering"). A supervisor whose idle bound
+expires while such a process holds the mount keeps serving, says so on stderr, and looks again after another bound. gc's
+build-volume collection is a separate gate with its own grace (16_build_volumes.md) and does not consult it.
+
+When a detach's unmount is still refused by the kernel, the refusal names what holds the volume: first the tree census,
+then the volume census, which also walks mapped files. When neither names a process of this user, the refusal says so
+and names any file system mounted inside the volume. With none, the holder is another user's process (Spotlight's `mds`
+runs as root) or the kernel, and `sudo lsof +f -- <mount>` is the next look.
 
 ## Workspace environment: `.cowshed/env`, optionally sourced by direnv
 

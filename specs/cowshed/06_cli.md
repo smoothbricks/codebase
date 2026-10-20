@@ -570,11 +570,13 @@ session resolved from the store readdir (`<owner>/<repo>/sessions/<ws>.image` pl
 or git discovery; `--project` still selects the project; `--all` every attached session store-wide. Mains are never
 detach targets. A bare `detach` with neither a name nor `--all` is usage.
 
-Detach stops the workspace's supervisor, then stops the Nx daemon the checkout's own `.nx/workspace-data` record names,
-as a land's quiesce does (`nx daemon --stop`'s `SIGTERM`): the daemon's cwd is the checkout, whichever shell started it,
-and Nx starts a fresh one on the next run. A volume the kernel still refuses to unmount is a `conflict` naming every
-holder, pid and argv (an open file, a working directory or an executable on the volume), with stopping them as the next
-move. It is not a storage failure.
+Before anything stops, detach refuses while a process cowshed does not run holds the mount, naming each holder's pid,
+command and what it holds where (02_workspaces.md, "Holders cowshed does not run"). Then it stops the workspace's
+supervisor, then stops the Nx daemon the checkout's own `.nx/workspace-data` record names, as a land's quiesce does
+(`nx daemon --stop`'s `SIGTERM`): the daemon's cwd is the checkout, whichever shell started it, and Nx starts a fresh
+one on the next run. A volume the kernel still refuses to unmount is a `conflict` naming every holder, pid and argv (an
+open file, a working directory or an executable on the volume), with stopping them as the next move. It is not a storage
+failure. When no process of this user holds it, the refusal says so and names what is mounted inside it.
 
 ### Resident workspaces
 

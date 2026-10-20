@@ -1201,6 +1201,123 @@ async fn directory_rm_stops_the_checkouts_nx_daemon_before_removal() {
     fixture.stop_gateway().await;
 }
 
+/// Processes a host shell started, which cowshed does not run: each `sleep` is backgrounded by an
+/// `sh` that exits at once, so launchd adopts it rather than this test process (which serves
+/// the fixture's supervisors). Killed when dropped.
+struct HostProcesses(Vec<i32>);
+
+impl HostProcesses {
+    /// A `sleep` working in `cwd`, with `open` open as descriptor 3 when given.
+    fn start(&mut self, cwd: &Path, open: Option<&Path>) -> i32 {
+        let script = match open {
+            Some(_) => "exec 3<\"$1\"; /bin/sleep 600 </dev/null >/dev/null 2>&1 & echo $!",
+            None => "/bin/sleep 600 </dev/null >/dev/null 2>&1 & echo $!",
+        };
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script).arg("sh");
+        if let Some(file) = open {
+            command.arg(file);
+        }
+        let output = command
+            .current_dir(cwd)
+            .output()
+            .expect("start a host process");
+        assert!(output.status.success(), "{output:?}");
+        let pid = String::from_utf8(output.stdout)
+            .expect("a pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        self.0.push(pid);
+        pid
+    }
+}
+
+impl Drop for HostProcesses {
+    fn drop(&mut self) {
+        for pid in self.0.drain(..) {
+            // SAFETY: kill takes plain integers; a pid that already exited answers ESRCH.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// A host shell's `direnv exec <ws> nx …` runs on the mount with no supervisor and no job: a
+/// process working in the workspace and one with a file of it open, both started outside
+/// cowshed. `detach`, `rm` and `rm --force` refuse before anything stops, naming each with what
+/// it holds and where, and offer no override. Once they are gone the workspace detaches.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_detach_and_rm_refuse_a_host_process_holding_the_mount() {
+    let mut fixture = Fixture::directory();
+    let mut service = fixture.open().await;
+    adopt(&fixture, &mut service).await;
+    fixture.start_gateway().await;
+    service
+        .reconcile_gateway()
+        .await
+        .expect("serve the project");
+    let topic = new_workspace(&mut service, "held-topic")
+        .await
+        .canonicalize()
+        .expect("the mount resolves");
+    let head = topic.join(".git/HEAD");
+    let mut host = HostProcesses(Vec::new());
+    let working = host.start(&topic, None);
+    let reading = host.start(&std::env::temp_dir(), Some(&head));
+    let evidence = [
+        (working, format!("working directory {}", topic.display())),
+        (reading, format!("open file {}", head.display())),
+    ];
+    for args in [
+        &["detach", "held-topic"][..],
+        &["rm", "held-topic"],
+        &["rm", "--force", "held-topic"],
+    ] {
+        let (refused, _, stderr) = run(&mut service, args.iter().copied()).await;
+        let refusal = refused.expect_err(&format!(
+            "{args:?} beneath a host process; {}",
+            String::from_utf8_lossy(&stderr)
+        ));
+        assert_eq!(refusal.code, ErrorCode::Conflict, "{args:?}: {refusal}");
+        for (pid, holds) in &evidence {
+            assert!(
+                refusal.message.contains(&format!("pid {pid} ("))
+                    && refusal.message.contains(holds),
+                "{args:?} does not name pid {pid} with {holds:?}: {}",
+                refusal.message
+            );
+        }
+        assert!(
+            !refusal.hint.contains("--force"),
+            "no override: {}",
+            refusal.hint
+        );
+        assert!(head.is_file(), "{args:?} left the workspace mounted");
+    }
+    drop(host);
+    let (detached, _, stderr) = run(&mut service, ["detach", "held-topic"]).await;
+    let mut detached = detached.map(|_| ());
+    for _ in 0..100 {
+        if detached.is_ok() {
+            break;
+        }
+        // SIGKILL is asynchronous: the killed processes leave the process table shortly.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        detached = run(&mut service, ["detach", "held-topic"])
+            .await
+            .0
+            .map(|_| ());
+    }
+    detached.unwrap_or_else(|error| {
+        panic!(
+            "detach once nothing holds it: {error}; {}",
+            String::from_utf8_lossy(&stderr)
+        )
+    });
+    service.shutdown().await.expect("stop the runtime");
+    fixture.stop_gateway().await;
+}
+
 /// The checkout's ordinary Bun-installed patched Nx and its actual Node runtime.
 fn repository_nx() -> (PathBuf, PathBuf) {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR")

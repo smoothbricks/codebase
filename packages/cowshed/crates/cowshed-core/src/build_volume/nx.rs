@@ -39,6 +39,71 @@ impl std::fmt::Display for Holders<'_> {
     }
 }
 
+/// What a process holds inside a tree: the first hold the census found, cheapest first. A
+/// process can hold a tree several ways at once; one is proof enough that it holds it, and
+/// naming one keeps the census to one look per process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Hold {
+    /// Its working directory is in the tree.
+    WorkingDirectory(PathBuf),
+    /// Its root directory (`chroot`) is in the tree.
+    RootDirectory(PathBuf),
+    /// It runs an executable from the tree.
+    Executable(PathBuf),
+    /// It has a file of the tree open. Event-only opens (`O_EVTONLY`) hold nothing.
+    OpenFile(PathBuf),
+    /// It maps a file of the tree (procfs `maps`; Darwin's census reads no mappings).
+    MappedFile(PathBuf),
+}
+
+impl Hold {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::WorkingDirectory(path)
+            | Self::RootDirectory(path)
+            | Self::Executable(path)
+            | Self::OpenFile(path)
+            | Self::MappedFile(path) => path,
+        }
+    }
+}
+
+impl std::fmt::Display for Hold {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorkingDirectory(path) => {
+                write!(formatter, "working directory {}", path.display())
+            }
+            Self::RootDirectory(path) => write!(formatter, "root directory {}", path.display()),
+            Self::Executable(path) => write!(formatter, "executable {}", path.display()),
+            Self::OpenFile(path) => write!(formatter, "open file {}", path.display()),
+            Self::MappedFile(path) => write!(formatter, "mapped file {}", path.display()),
+        }
+    }
+}
+
+/// A process holding a tree, with the hold that shows it: `pid <n> (<argv>), <hold>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeHold {
+    pub holder: Holder,
+    pub hold: Hold,
+}
+
+impl std::fmt::Display for TreeHold {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}, {}", self.holder, self.hold)
+    }
+}
+
+/// Every process holding anything inside the directory tree at `root` ([`tree_holds`]),
+/// without what it holds.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn tree_holders(root: &Path) -> io::Result<Vec<Holder>> {
+    Ok(tree_holds(root)?
+        .into_iter()
+        .map(|held| held.holder)
+        .collect())
+}
 /// Every Nx task database in the volume rooted at `volume`: each `*.db` file directly in a
 /// `workspace-data` directory the volume holds.
 pub fn task_databases(volume: &Path, state: &BuildVolumeState) -> io::Result<Vec<PathBuf>> {
@@ -305,7 +370,7 @@ fn task_databases_in(data: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// The pid of the daemon `workspace-data`'s record names, when that daemon is live, from the one
 /// read of the record that verified it: its process runs and its socket accepts a connection.
-fn live_daemon(data: &Path) -> Option<i32> {
+pub(crate) fn live_daemon(data: &Path) -> Option<i32> {
     crate::runtime::nx_daemon::live_pid(&data.join(DAEMON_DIRECTORY).join(DAEMON_RECORD))
 }
 
@@ -453,13 +518,16 @@ pub fn holders(path: &Path) -> io::Result<Vec<Holder>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    procfs_holders(|process| {
-        fs::read_dir(process.join("fd")).is_ok_and(|descriptors| {
-            descriptors
-                .flatten()
-                .any(|descriptor| fs::read_link(descriptor.path()).is_ok_and(|link| link == file))
-        })
-    })
+    let open = procfs_census(|process| {
+        fs::read_dir(process.join("fd"))
+            .is_ok_and(|descriptors| {
+                descriptors.flatten().any(|descriptor| {
+                    fs::read_link(descriptor.path()).is_ok_and(|link| link == file)
+                })
+            })
+            .then_some(())
+    })?;
+    Ok(open.into_iter().map(|(holder, ())| holder).collect())
 }
 
 /// [`holders`] of each of `files`, in order.
@@ -474,54 +542,56 @@ fn descriptor_holders(files: &[PathBuf]) -> io::Result<Vec<Vec<Holder>>> {
 /// listing, shows none.
 #[cfg(target_os = "linux")]
 pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
-    holders_under(mount)
+    tree_holders(mount)
 }
 
-/// Every process holding anything inside the directory tree at `root` -- an open file, a mapped
-/// file, its working directory, its root, its executable -- whether or not `root` is a volume's
-/// mount point. A plain checkout's holders, which `volume_holders` cannot name without naming its
-/// whole volume. From procfs, so a process of another user, or one that exited since the listing,
-/// shows none. A missing `root` has none.
+/// Every process holding anything inside the directory tree at `root` -- its working directory,
+/// its root, its executable, an open file, a mapped file, checked in that order -- whether or not
+/// `root` is a volume's mount point, each with the first hold found. A plain checkout's holders,
+/// which `volume_holders` cannot name without naming its whole volume. From procfs, so a process
+/// of another user, or one that exited since the listing, shows none. `root` is canonicalized
+/// first, so a symlinked path names the tree its target does; a missing `root` has none.
 #[cfg(target_os = "linux")]
-pub fn tree_holders(root: &Path) -> io::Result<Vec<Holder>> {
-    holders_under(root)
-}
-
-/// The procfs census behind `volume_holders` and `tree_holders`: a process holds `root`'s tree
-/// when a link or mapping names a path at or under it. `root` is canonicalized first, so a
-/// symlinked path names the tree its target does.
-#[cfg(target_os = "linux")]
-fn holders_under(root: &Path) -> io::Result<Vec<Holder>> {
+pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
     let root = match fs::canonicalize(root) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let under_root = |link: PathBuf| link.starts_with(&root);
-    procfs_holders(|process| {
-        ["cwd", "root", "exe"]
-            .iter()
-            .any(|name| fs::read_link(process.join(name)).is_ok_and(under_root))
-            || fs::read_dir(process.join("fd")).is_ok_and(|descriptors| {
-                descriptors
+    let under = |link: PathBuf| link.starts_with(&root).then_some(link);
+    let holds = procfs_census(|process| {
+        let link = |name: &str| fs::read_link(process.join(name)).ok().and_then(&under);
+        link("cwd")
+            .map(Hold::WorkingDirectory)
+            .or_else(|| link("root").map(Hold::RootDirectory))
+            .or_else(|| link("exe").map(Hold::Executable))
+            .or_else(|| {
+                fs::read_dir(process.join("fd"))
+                    .ok()?
                     .flatten()
-                    .any(|descriptor| fs::read_link(descriptor.path()).is_ok_and(under_root))
+                    .find_map(|descriptor| fs::read_link(descriptor.path()).ok().and_then(&under))
+                    .map(Hold::OpenFile)
             })
             // A mapping's path is its line's last field and the line's first `/`: the
             // address range, permissions, offset, device and inode before it hold none.
-            || fs::read_to_string(process.join("maps")).is_ok_and(|maps| {
-                maps.lines().any(|mapping| {
-                    mapping
-                        .find('/')
-                        .is_some_and(|start| Path::new(&mapping[start..]).starts_with(&root))
-                })
+            .or_else(|| {
+                fs::read_to_string(process.join("maps"))
+                    .ok()?
+                    .lines()
+                    .find_map(|mapping| under(PathBuf::from(&mapping[mapping.find('/')?..])))
+                    .map(Hold::MappedFile)
             })
-    })
+    })?;
+    Ok(holds
+        .into_iter()
+        .map(|(holder, hold)| TreeHold { holder, hold })
+        .collect())
 }
 
-/// Every process under `/proc` that `held` answers yes for, given its `/proc/<pid>` directory.
+/// Every process under `/proc` that `held` names something for, given its `/proc/<pid>`
+/// directory, with what it named.
 #[cfg(target_os = "linux")]
-fn procfs_holders(held: impl Fn(&Path) -> bool) -> io::Result<Vec<Holder>> {
+fn procfs_census<T>(held: impl Fn(&Path) -> Option<T>) -> io::Result<Vec<(Holder, T)>> {
     let mut holders = Vec::new();
     for process in fs::read_dir("/proc")? {
         let process = process?;
@@ -532,11 +602,14 @@ fn procfs_holders(held: impl Fn(&Path) -> bool) -> io::Result<Vec<Holder>> {
         else {
             continue;
         };
-        if held(&process.path()) {
-            holders.push(Holder {
-                pid,
-                command: command_line(pid),
-            });
+        if let Some(hold) = held(&process.path()) {
+            holders.push((
+                Holder {
+                    pid,
+                    command: command_line(pid),
+                },
+                hold,
+            ));
         }
     }
     Ok(holders)
@@ -631,43 +704,56 @@ pub fn volume_holders(mount: &Path) -> io::Result<Vec<Holder>> {
     )
 }
 
-/// Every process holding anything inside the directory tree at `root` -- an open file, its
-/// working directory or root directory, its executable -- whether or not `root` is a volume's
-/// mount point. A plain checkout's holders, which `volume_holders` cannot name without naming its
-/// whole volume. A process the kernel withholds from this user, or that exited since the listing,
-/// shows none. A missing `root` has none.
+/// Every process holding anything inside the directory tree at `root` -- its working directory
+/// or root directory, its executable, an open file -- whether or not `root` is a volume's mount
+/// point, each with the first hold found ([`hold_in_tree`]). A plain checkout's holders, which
+/// `volume_holders` cannot name without naming its whole volume. A process the kernel withholds
+/// from this user, or that exited since the listing, shows none. A missing `root` has none.
 #[cfg(target_os = "macos")]
-pub fn tree_holders(root: &Path) -> io::Result<Vec<Holder>> {
+pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
     let root = match fs::canonicalize(root) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    let mut holders = Vec::new();
+    let mut holds = Vec::new();
     for pid in all_pids()? {
-        if holds_tree(pid, &root)? {
-            holders.push(Holder {
-                pid,
-                command: command_line(pid),
+        if let Some(hold) = hold_in_tree(pid, &root)? {
+            holds.push(TreeHold {
+                holder: Holder {
+                    pid,
+                    command: command_line(pid),
+                },
+                hold,
             });
         }
     }
-    Ok(holders)
+    Ok(holds)
 }
 
-/// Whether `pid` holds anything inside `root`. Cheapest first: the directories cost one call, the
-/// executable one more, and the descriptors a listing plus one call per vnode.
+/// What `pid` holds inside `root`, if anything. Cheapest first: the directories cost one call,
+/// the executable one more, and the descriptors a listing plus one call per vnode.
 #[cfg(target_os = "macos")]
-fn holds_tree(pid: libc::pid_t, root: &Path) -> io::Result<bool> {
-    Ok(directories(pid)?.iter().any(|path| path.starts_with(root))
-        || executable(pid).is_some_and(|path| path.starts_with(root))
-        || open_vnodes(pid)?.iter().any(|path| path.starts_with(root)))
+fn hold_in_tree(pid: libc::pid_t, root: &Path) -> io::Result<Option<Hold>> {
+    if let Some(hold) = directories(pid)?
+        .into_iter()
+        .find(|hold| hold.path().starts_with(root))
+    {
+        return Ok(Some(hold));
+    }
+    if let Some(executable) = executable(pid).filter(|path| path.starts_with(root)) {
+        return Ok(Some(Hold::Executable(executable)));
+    }
+    Ok(open_vnodes(pid)?
+        .into_iter()
+        .find(|path| path.starts_with(root))
+        .map(Hold::OpenFile))
 }
 
 /// `pid`'s working directory and root directory (`PROC_PIDVNODEPATHINFO`). A process the kernel
 /// withholds from this user, or that exited, names none.
 #[cfg(target_os = "macos")]
-fn directories(pid: libc::pid_t) -> io::Result<Vec<PathBuf>> {
+fn directories(pid: libc::pid_t) -> io::Result<Vec<Hold>> {
     let size = c_size::<libc::proc_vnodepathinfo>()?;
     // SAFETY: `proc_vnodepathinfo` is plain C data (integers and byte arrays), for which all
     // zeros is a valid value; it is read only when the kernel fills all of it, as checked below.
@@ -686,8 +772,8 @@ fn directories(pid: libc::pid_t) -> io::Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     Ok([
-        c_path(info.pvi_cdir.vip_path.as_flattened()),
-        c_path(info.pvi_rdir.vip_path.as_flattened()),
+        c_path(info.pvi_cdir.vip_path.as_flattened()).map(Hold::WorkingDirectory),
+        c_path(info.pvi_rdir.vip_path.as_flattened()).map(Hold::RootDirectory),
     ]
     .into_iter()
     .flatten()

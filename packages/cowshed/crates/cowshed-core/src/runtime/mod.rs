@@ -15,6 +15,8 @@ mod job_resources;
 pub mod job_span_facts;
 pub mod job_spans;
 pub mod job_unattributed;
+#[cfg(target_os = "macos")]
+pub(crate) mod mount_activity;
 pub(crate) mod nx_daemon;
 #[cfg(target_os = "macos")]
 pub mod process_events;
