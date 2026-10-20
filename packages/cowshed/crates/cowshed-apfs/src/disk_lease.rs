@@ -337,26 +337,11 @@ fn connect(socket: &Path, deadline: Option<CommandDeadline>) -> io::Result<UnixS
             let remaining = deadline
                 .remaining()
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::ETIMEDOUT))?;
-            let millis = remaining
-                .as_millis()
-                .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
-            let timeout = i32::try_from(millis).unwrap_or(i32::MAX);
-            let mut pending = libc::pollfd {
-                fd: stream.as_raw_fd(),
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            // SAFETY: pending is one initialized pollfd, live and exclusively borrowed here.
-            let ready = unsafe { libc::poll(std::ptr::from_mut(&mut pending), 1, timeout) };
-            if ready == -1 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue; // Recompute the original remaining budget, never restart it.
-                }
-                return Err(error);
-            }
-            if ready == 0 {
-                continue; // A capped poll interval is not a fresh connection or deadline.
+            match poll_ready(&stream, libc::POLLOUT, remaining) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
             }
             if let Some(error) = stream.take_error()? {
                 return Err(error);
@@ -370,6 +355,28 @@ fn connect(socket: &Path, deadline: Option<CommandDeadline>) -> io::Result<UnixS
     }
     stream.set_nonblocking(false)?;
     Ok(stream)
+}
+
+/// Wait for readiness without changing socket options: Darwin refuses `setsockopt` after
+/// peer shutdown even while a complete answer remains readable. The caller owns the deadline
+/// and recomputes it after a capped poll interval or signal; this wait never restarts it.
+fn poll_ready(stream: &UnixStream, events: libc::c_short, within: Duration) -> io::Result<bool> {
+    let millis = within
+        .as_millis()
+        .saturating_add(u128::from(within.subsec_nanos() % 1_000_000 != 0));
+    let timeout = i32::try_from(millis).unwrap_or(i32::MAX);
+    let mut pending = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    // SAFETY: pending is one initialized pollfd, live and exclusively borrowed here.
+    let ready = unsafe { libc::poll(std::ptr::from_mut(&mut pending), 1, timeout) };
+    if ready == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ready != 0)
+    }
 }
 
 /// A held lease: the open connection to the gateway. Dropping it releases the lease.
@@ -727,6 +734,7 @@ fn read_answer(
     deadline: Option<CommandDeadline>,
 ) -> io::Result<DiskLeaseAnswer> {
     let step = CommandDeadline::new(within);
+    answers.get_ref().set_nonblocking(true)?;
     let mut line = Vec::new();
     loop {
         let remaining = step
@@ -741,8 +749,26 @@ fn read_answer(
                     "the disk-lease answer deadline expired",
                 )
             })?;
-        answers.get_ref().set_read_timeout(Some(remaining))?;
-        let available = answers.fill_buf()?;
+        if answers.buffer().is_empty() {
+            match poll_ready(answers.get_ref(), libc::POLLIN, remaining) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let available = match answers.fill_buf() {
+            Ok(available) => available,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if available.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1090,6 +1116,23 @@ mod tests {
 
     /// What a lease-scheduling gateway from before `share` answers a request that names it.
     const UNKNOWN_SHARE: &[u8] = b"{\"ok\":false,\"code\":\"invalid-request\",\"error\":\"gateway control encoding failed: gateway control request contains an unknown field\"}\n";
+
+    #[test]
+    fn a_closed_peer_leaves_its_complete_refusal_readable() {
+        let (client, mut server) = UnixStream::pair().expect("owned socket pair");
+        server.write_all(UNKNOWN_SHARE).expect("write the refusal");
+        drop(server);
+        // The real gateway closes after a refusal; order that close before the read instead
+        // of relying on the scheduler to win the race in alone-to-shared admission.
+        let answer = read_answer(&mut BufReader::new(client), PEER_ENDS, None)
+            .expect("peer close does not discard its complete buffered refusal");
+        assert!(
+            matches!(expect(answer, LeaseState::Queued),
+                Err(Unleased::Refused { code, error })
+                    if code == "invalid-request" && error.ends_with(UNKNOWN_FIELD)),
+            "the refusal remains a protocol answer, not a transport error"
+        );
+    }
 
     #[test]
     fn a_gateway_that_refuses_the_share_field_predates_alone_leases_only_when_asked_alone() {

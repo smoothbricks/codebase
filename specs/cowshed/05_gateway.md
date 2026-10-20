@@ -624,12 +624,15 @@ so attaches stall beside mount churn and stay fast once the two are kept apart. 
   authority to retry. Descriptor creation and close-on-exec/nonblocking flag installation alone run under the fork lock,
   never connect or poll. Every failed connection closes its owned descriptor; no connector thread remains alive. Each
   queued acknowledgement, grant and after-half-close wait is clipped to its remaining budget, including old-gateway and
-  alone-to-shared retries. The runner checks remaining time before spawn and inside its existing pre-exec closure, after
-  any fork-lock wait: exhausted admission never executes the native tool. A failed pre-exec fork stub is reaped by the
-  spawn operation; it performs no disk-tool effect. An overrun signals the owned process group and waits to reap the
-  child, retaining its actual exit or signal status. A kill failure retains the kill error, exact child pid and a
-  nonblocking observation of exited, still running or reap failure; it neither waits without bound nor joins live output
-  pipes. A reap failure is distinct and never claims the child was reaped. A protected disk-image command
+  alone-to-shared retries. Answer reads wait on descriptor readability under those original deadlines and drain bytes
+  already received, including a complete refusal followed by peer close. Closing after writing a refusal is valid: the
+  client does not require the peer to remain connected while it consumes the answer, nor set receive-timeout socket
+  options after the peer can close. The runner checks remaining time before spawn and inside its existing pre-exec
+  closure, after any fork-lock wait: exhausted admission never executes the native tool. A failed pre-exec fork stub is
+  reaped by the spawn operation; it performs no disk-tool effect. An overrun signals the owned process group and waits
+  to reap the child, retaining its actual exit or signal status. A kill failure retains the kill error, exact child pid
+  and a nonblocking observation of exited, still running or reap failure; it neither waits without bound nor joins live
+  output pipes. A reap failure is distinct and never claims the child was reaped. A protected disk-image command
   (`diskutil image …`, `diskutil eject`, every `hdiutil` verb) instead warns at the caller's configured cadence and is
   never killed, because interruption can leak its device until reboot (01a_apfs.md, "How the APFS host degrades" §2).
   Its detached session, file-backed output and caller-bounded stop-wait policy are unchanged.
