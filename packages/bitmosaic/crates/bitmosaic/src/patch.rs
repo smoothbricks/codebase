@@ -1115,10 +1115,23 @@ fn merge_interval_events<W: Witness>(
             left = bounds(i).0;
         }
     }
+
+    // The sweep already proves one maximal interval. Its bounds and count
+    // are the Stride payload; singleton Array priority remains unchanged.
+    let direct_stride = len > 1 && scratch.runs.len() == 1;
+    #[cfg(feature = "bench-internals")]
+    let direct_stride =
+        direct_stride && (len as usize > ARRAY_MAX || crate::patch_sequence::interval_enabled());
     let fresh = if len == 0 {
         None
     } else if dense {
         Some(finish(scratch, len))
+    } else if direct_stride {
+        let arm = Arm::Stride {
+            first: scratch.runs[0].start,
+            stride: 1,
+        };
+        Some(emit_arm(scratch, arm, len))
     } else if len as usize <= ARRAY_MAX {
         scratch.members.clear();
         for run in &scratch.runs {
@@ -1126,20 +1139,13 @@ fn merge_interval_events<W: Witness>(
         }
         Some(finish_members(scratch, len))
     } else {
-        let arm = if scratch.runs.len() == 1 {
-            Arm::Stride {
-                first: scratch.runs[0].start,
-                stride: 1,
-            }
-        } else {
-            crate::choose_candidates(
-                len as usize,
-                Some((crate::WORDS_HEAP_BYTES, Arm::Words)),
-                None,
-                None,
-                scratch.runs.len(),
-            )
-        };
+        let arm = crate::choose_candidates(
+            len as usize,
+            Some((crate::WORDS_HEAP_BYTES, Arm::Words)),
+            None,
+            None,
+            scratch.runs.len(),
+        );
         Some(emit_arm(scratch, arm, len))
     };
     (added, removed, fresh)

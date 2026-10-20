@@ -40,11 +40,11 @@ fn reserved_scratch(image_bytes: usize, touched_chunks: usize) -> PatchScratch {
 
 #[test]
 fn compact_sequence_patches_preserve_bytes_counts_and_witnesses() {
-    for jitter in [false, true] {
+    for (spacing, jitter) in [(1u32, false), (8, false), (8, true)] {
         for n in [2u32, 16, 32, 128, 512, 1024, 4094, 4095, 4096, 4097] {
             for base in [0u32, 0xffff_0000] {
                 let members: Vec<_> = (0..n)
-                    .map(|i| base + 8 * i + if jitter { i % 3 } else { 0 })
+                    .map(|i| base + spacing * i + if jitter { i % 3 } else { 0 })
                     .collect();
                 let middle = members[n as usize / 2];
                 let batches = [
@@ -53,6 +53,14 @@ fn compact_sequence_patches_preserve_bytes_counts_and_witnesses() {
                     (vec![], members.clone()),
                     (vec![], vec![middle + 1]),
                     (vec![base + 65535], vec![members[0]]),
+                    (
+                        vec![members[0], members[n as usize - 1] + 1],
+                        vec![members[0]],
+                    ),
+                    (vec![], vec![members[0]]),
+                    (vec![], vec![members[n as usize - 1]]),
+                    (vec![], members[1..].to_vec()),
+                    (vec![members[n as usize - 1] + 1], vec![]),
                 ];
                 let image = Bitmosaic::from_sorted(members.iter().copied()).to_forest_bytes();
                 let mut scratch = reserved_scratch(32 * 1024, 1);
@@ -71,7 +79,10 @@ fn compact_sequence_patches_preserve_bytes_counts_and_witnesses() {
                     let mut previous = None;
                     for dense in [true, false] {
                         #[cfg(feature = "bench-internals")]
-                        bitmosaic::patch_sequence::force_dense(dense);
+                        {
+                            bitmosaic::patch_sequence::force_dense(dense);
+                            bitmosaic::patch_sequence::force_interval_expansion(dense);
+                        }
                         #[cfg(not(feature = "bench-internals"))]
                         if dense {
                             continue;

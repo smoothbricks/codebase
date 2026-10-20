@@ -1,4 +1,4 @@
-//! Same-binary sparse patch control: former dense staging versus compact merge.
+//! Same-binary patch controls: dense staging and interval expansion versus direct extraction.
 //! Run with `cargo run -p bitmosaic --profile bench --features bench-internals
 //! --example patch_sequence`. Restore and fixture construction are not timed.
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -45,9 +45,30 @@ fn main() {
     ALLOCATION.with(|count| count.set((0, 0)));
     drop(black_box(vec![0u8; 97]));
     assert!(ALLOCATION.with(|count| count.get().0) > 0);
-    for family in ["stride", "cone", "array"] {
-        for n in [2u32, 16, 32, 128, 512, 1024, 4094, 4095] {
-            if (family == "cone" && !(32..=1024).contains(&n)) || (family == "array" && n == 2) {
+
+    let selected = std::env::args().nth(1);
+
+    for family in [
+        "stride",
+        "cone",
+        "array",
+        "interval",
+        "interval-grow",
+        "interval-shrink",
+    ] {
+        let interval = family.starts_with("interval");
+        if selected
+            .as_deref()
+            .is_some_and(|name| !family.starts_with(name))
+        {
+            continue;
+        }
+
+        for n in [1u32, 2, 16, 32, 128, 512, 1024, 4094, 4095, 4096, 4097] {
+            if (family == "cone" && !(32..=1024).contains(&n))
+                || (family == "array" && n <= 2)
+                || (!interval && (n == 1 || n > 4095))
+            {
                 continue;
             }
             let members: Vec<_> = if family == "array" {
@@ -62,24 +83,45 @@ fn main() {
                 values.into_iter().collect()
             } else {
                 (0..n)
-                    .map(|i| 16 + i * 8 + if family == "cone" { i % 3 } else { 0 })
+                    .map(|i| {
+                        16 + i * if interval { 1 } else { 8 }
+                            + if family == "cone" { i % 3 } else { 0 }
+                    })
                     .collect()
             };
             let owned = Bitmosaic::from_sorted(members.iter().copied());
             let image = owned.to_forest_bytes();
-            let adds = [members[0], members[n as usize / 2] + 1];
-            let removes = [members[n as usize / 2]];
+
+            let (adds, removes) = if interval {
+                ([members[0], members[n as usize - 1] + 1], [members[0]])
+            } else {
+                (
+                    [members[0], members[n as usize / 2] + 1],
+                    [members[n as usize / 2]],
+                )
+            };
+
+            let adds = if family == "interval-shrink" {
+                &adds[..1]
+            } else {
+                &adds[..]
+            };
+            let removes = if family == "interval-grow" {
+                &[][..]
+            } else {
+                &removes[..]
+            };
             let mut expected: BTreeSet<_> = members.iter().copied().collect();
             let added = adds
                 .iter()
                 .filter(|value| !expected.contains(value))
                 .count() as u32;
-            expected.extend(adds);
+            expected.extend(adds.iter().copied());
             let removed = removes
                 .iter()
                 .filter(|value| expected.contains(value))
                 .count() as u32;
-            for value in removes {
+            for &value in removes {
                 expected.remove(&value);
             }
             let expected: Vec<_> = expected.into_iter().collect();
@@ -89,8 +131,9 @@ fn main() {
             scratch.try_reserve_for(slot.len(), 1).expect("reserve");
             for dense in [true, false] {
                 patch_sequence::force_dense(dense);
+                patch_sequence::force_interval_expansion(dense);
                 slot[..image.len()].copy_from_slice(&image);
-                let report = patch(&mut slot, &adds, &removes, &mut scratch).expect("patch");
+                let report = patch(&mut slot, adds, removes, &mut scratch).expect("patch");
                 assert_eq!(&slot[..report.serialized_len], canonical);
                 assert_eq!(
                     (report.added, report.removed, report.len),
@@ -110,6 +153,7 @@ fn main() {
             for rep in 0..17 {
                 for lane in if rep % 2 == 0 { [0, 1] } else { [1, 0] } {
                     patch_sequence::force_dense(lane == 0);
+                    patch_sequence::force_interval_expansion(lane == 0);
                     let mut elapsed = 0u128;
                     ALLOCATION.with(|count| count.set((0, 0)));
                     for _ in 0..ITERS {
@@ -118,8 +162,8 @@ fn main() {
                         black_box(
                             patch(
                                 black_box(&mut slot),
-                                black_box(&adds),
-                                black_box(&removes),
+                                black_box(adds),
+                                black_box(removes),
                                 black_box(&mut scratch),
                             )
                             .expect("patch"),
@@ -135,7 +179,10 @@ fn main() {
                 sample.sort_by(f64::total_cmp);
             }
             println!(
-                "family={family} members={n} adds=2 removes=1 image_bytes={} dense_ns={:.1} compact_ns={:.1} speedup={:.3} dense_range={:.1}..{:.1} compact_range={:.1}..{:.1} warm_allocations={allocations:?}",
+                "family={family} members={n} result_members={} adds={} removes={} image_bytes={} control_ns={:.1} compact_ns={:.1} speedup={:.3} control_range={:.1}..{:.1} compact_range={:.1}..{:.1} warm_allocations={allocations:?}",
+                expected.len(),
+                adds.len(),
+                removes.len(),
                 image.len(),
                 samples[0][8],
                 samples[1][8],
@@ -148,4 +195,5 @@ fn main() {
         }
     }
     patch_sequence::force_dense(false);
+    patch_sequence::force_interval_expansion(false);
 }

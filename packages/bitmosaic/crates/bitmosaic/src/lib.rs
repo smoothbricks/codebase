@@ -43,10 +43,21 @@ pub mod patch_sequence {
 
     static DENSE: AtomicBool = AtomicBool::new(false);
 
+    static EXPAND_INTERVAL: AtomicBool = AtomicBool::new(false);
+
     /// Force the former Cone/Stride dense staging path. Process-global;
     /// measurement harnesses must not change it during a patch.
     pub fn force_dense(force: bool) {
         DENSE.store(force, Ordering::Relaxed);
+    }
+
+    /// Force the former interval-to-members finalization in the patch planner.
+    pub fn force_interval_expansion(force: bool) {
+        EXPAND_INTERVAL.store(force, Ordering::Relaxed);
+    }
+
+    pub(crate) fn interval_enabled() -> bool {
+        !EXPAND_INTERVAL.load(Ordering::Relaxed)
     }
 
     /// Whether compact sequences may bypass the dense staging plane.
