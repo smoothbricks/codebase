@@ -50,11 +50,13 @@ async function fixtureWorkspace(workspace: string): Promise<void> {
 }
 
 /**
- * Run `nx show projects`, require it to list the fixture's one project, and return everything it printed. The list is
- * stdout's last line: a note Nx prints about its daemon goes to stdout before it.
+ * Run `nx show projects --json`, require it to list the fixture's one project, and return everything it printed. The
+ * format is asked for, never inferred: unasked, Nx prints JSON only when it detects an AI agent in the environment
+ * (`show/command-object.js`, `isAiAgent`) and a plain name per line otherwise. The list is stdout's last line: a note
+ * Nx prints about its daemon goes to stdout before it.
  */
 function showProjects(workspace: string, env: Record<string, string>): string {
-  const ran = spawnSync('bun', [nxEntry, 'show', 'projects'], { cwd: workspace, env, encoding: 'utf8' });
+  const ran = spawnSync('bun', [nxEntry, 'show', 'projects', '--json'], { cwd: workspace, env, encoding: 'utf8' });
   const output = `${ran.stdout}${ran.stderr}`;
   expect(ran.status, output).toBe(0);
   expect(JSON.parse(ran.stdout.trimEnd().split('\n').at(-1) ?? ''), output).toEqual(['p']);
