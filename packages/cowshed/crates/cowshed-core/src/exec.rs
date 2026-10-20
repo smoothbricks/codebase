@@ -104,13 +104,15 @@ pub fn plan_exec(
     let profile =
         seatbelt_profile(sandbox, SandboxProfileRole::ExecutedChild).map_err(map_sandbox_error)?;
     let profile =
-        ProfileLaunch::write(sandbox, &profile).map_err(|source| ExecError::WrapperFailure {
-            stage: WrapperStage::ValidateProfile,
-            message: format!(
-                "cannot write the sandbox profile into {}: {source}",
-                sandbox.profile_directory().display()
-            ),
-            source: Some(source),
+        ProfileLaunch::write(&sandbox.profile_directory(), &profile).map_err(|source| {
+            ExecError::WrapperFailure {
+                stage: WrapperStage::ValidateProfile,
+                message: format!(
+                    "cannot write the sandbox profile into {}: {source}",
+                    sandbox.profile_directory().display()
+                ),
+                source: Some(source),
+            }
         })?;
     plan_exec_under(request, sandbox, &profile)
 }
@@ -1158,8 +1160,12 @@ mod tests {
         )
         .unwrap();
         let planned_profile = std::fs::read_to_string(&plan.args[1]).unwrap();
-        let child = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
-        let supervisor = seatbelt_profile(&sandbox, SandboxProfileRole::TrustedSupervisor).unwrap();
+        let child = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
+        let supervisor = seatbelt_profile(&sandbox, SandboxProfileRole::TrustedSupervisor)
+            .unwrap()
+            .into_text();
 
         assert_eq!(planned_profile, child);
         assert_ne!(planned_profile, supervisor);

@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use crate::api::dto::Sha256Digest;
-use crate::sandbox::{BUILD_VOLUME_PARAM, SandboxConfig};
+use crate::sandbox::{BUILD_VOLUME_PARAM, SeatbeltProfile};
 
 /// Where the profile files of `store_root`'s launches live: beside its supervisors' sockets in
 /// its `run` directory.
@@ -171,18 +171,13 @@ pub struct ProfileLaunch {
 }
 
 impl ProfileLaunch {
-    /// A launch of `profile`, rendered from `sandbox`: its file made sure of in `sandbox`'s
-    /// profile directory now, bound to `sandbox`'s build volume.
-    pub fn write(sandbox: &SandboxConfig, profile: &str) -> io::Result<Self> {
-        Ok(Self::bound(
-            ProfileFile::write(&sandbox.profile_directory(), profile)?,
-            sandbox.build_volume_mount.clone(),
-        ))
-    }
-
-    /// `file`, bound to `build_volume`, the build volume of the sandbox it was rendered from.
-    pub fn bound(file: ProfileFile, build_volume: Option<PathBuf>) -> Self {
-        Self { file, build_volume }
+    /// A launch of `profile`: its file made sure of in `directory` now, bound to the build
+    /// volume its text names.
+    pub fn write(directory: &Path, profile: &SeatbeltProfile) -> io::Result<Self> {
+        Ok(Self {
+            file: ProfileFile::write(directory, profile.text())?,
+            build_volume: profile.build_volume().map(Path::to_path_buf),
+        })
     }
 
     pub fn file(&self) -> &ProfileFile {

@@ -54,7 +54,9 @@ fn sandbox(workspace: &Path, temp: &Path) -> SandboxConfig {
 }
 
 fn job(config: &SandboxConfig, script: &str) -> std::process::Output {
-    let profile = seatbelt_profile(config, SandboxProfileRole::ExecutedChild).expect("profile");
+    let profile = seatbelt_profile(config, SandboxProfileRole::ExecutedChild)
+        .expect("profile")
+        .into_text();
     Command::new("/usr/bin/sandbox-exec")
         .args(["-p", &profile, "--", "/bin/sh", "-c", script])
         .current_dir(&config.workspace_mount)

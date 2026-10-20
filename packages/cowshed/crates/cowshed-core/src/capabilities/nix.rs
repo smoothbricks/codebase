@@ -418,7 +418,9 @@ mod tests {
             crate::sandbox::SandboxProfileRole::TrustedSupervisor,
             crate::sandbox::SandboxProfileRole::ExecutedChild,
         ] {
-            let profile = crate::sandbox::seatbelt_profile(&config, role).unwrap();
+            let profile = crate::sandbox::seatbelt_profile(&config, role)
+                .unwrap()
+                .into_text();
             for root in ["/etc/nix", "/private/etc/nix"] {
                 let rule = format!("(allow file-read* (subpath \"{root}\"))");
                 assert!(profile.contains(&rule), "{role:?} lacks {rule}");
@@ -461,7 +463,8 @@ mod tests {
             &config,
             crate::sandbox::SandboxProfileRole::ExecutedChild,
         )
-        .unwrap();
+        .unwrap()
+        .into_text();
         let run = |script: &str, path: &Path| {
             std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile, "--", "/bin/sh", "-c", script, "sh"])

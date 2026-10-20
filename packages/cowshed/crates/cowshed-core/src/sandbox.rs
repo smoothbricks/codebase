@@ -681,6 +681,47 @@ fn validated_sandbox_paths(
     })
 }
 
+/// A rendered profile and the build volume its rules name as [`BUILD_VOLUME_PARAM`].
+///
+/// The text names the build volume only as `(param "BUILD_VOLUME")`, so a pivot binds a new
+/// path to the same text (04_sandbox.md, "Exec pipeline" step 4). An unbound `param` evaluates
+/// to `#f`, and `sandbox-exec` refuses the whole profile ("invalid data type of path filter;
+/// expected pattern, got boolean", exit 65). The binding therefore travels with the text it
+/// completes: [`crate::exec::ProfileLaunch::write`] takes both from this one value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeatbeltProfile {
+    text: String,
+    build_volume: Option<PathBuf>,
+}
+
+impl SeatbeltProfile {
+    /// A profile whose text names no parameter: a test's hand-written host profile.
+    #[cfg(test)]
+    pub(crate) fn unparameterized(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            build_volume: None,
+        }
+    }
+
+    /// The SBPL program. Launched alone (`sandbox-exec -p`), a profile with a build volume
+    /// is refused; launch it through [`crate::exec::ProfileLaunch`].
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The text alone, its binding dropped: a profile with a build volume launches only through
+    /// [`crate::exec::ProfileLaunch`].
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// The path a launch binds to [`BUILD_VOLUME_PARAM`]; `Some` exactly when the text names it.
+    pub fn build_volume(&self) -> Option<&Path> {
+        self.build_volume.as_deref()
+    }
+}
+
 /// Generate a complete, deterministic SBPL profile for one authority tier.
 ///
 /// Paths must already be canonical controller data. Child argv, environment,
@@ -689,7 +730,7 @@ fn validated_sandbox_paths(
 pub fn seatbelt_profile(
     config: &SandboxConfig,
     role: SandboxProfileRole,
-) -> Result<String, SandboxError> {
+) -> Result<SeatbeltProfile, SandboxError> {
     let ValidatedSandboxPaths {
         hard_denies,
         read_grants,
@@ -1209,7 +1250,10 @@ pub fn seatbelt_profile(
             push_exact_and_subpath_rule(&mut profile, "deny file-write*", &tool_root)?;
         }
     }
-    Ok(profile)
+    Ok(SeatbeltProfile {
+        text: profile,
+        build_volume: config.build_volume_mount.clone(),
+    })
 }
 
 /// The current block, then every retained one.
@@ -1585,10 +1629,10 @@ mod tests {
             .push(PathBuf::from("target/blocked"));
         // A launch as every launcher makes one: the profile's kept file, bound to the volume.
         let launch = |sandbox: &SandboxConfig| {
-            let text = seatbelt_profile(sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+            let profile = seatbelt_profile(sandbox, SandboxProfileRole::ExecutedChild).unwrap();
             (
-                text.clone(),
-                crate::exec::ProfileLaunch::write(sandbox, &text).unwrap(),
+                profile.text().to_owned(),
+                crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile).unwrap(),
             )
         };
         let (old_text, old) = launch(&sandbox);
@@ -1676,6 +1720,46 @@ mod tests {
         );
     }
 
+    /// A profile names its build volume only as `(param "BUILD_VOLUME")`. Unbound, that is
+    /// `#f`, and `sandbox-exec` refuses the profile with exit 65 ("invalid data type of path
+    /// filter; expected pattern, got boolean"): a launch of the bare text, with no `-D`, broke
+    /// `host_controller_build_state_answers_with_only_the_installed_executable_grant`. The
+    /// rendered value names the binding exactly when its text needs one, and its launch passes it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_rendered_profile_carries_the_build_volume_its_text_names_and_launches_with_it() {
+        let mut sandbox = config(RunSandboxMode::ReadWrite);
+        let unbound = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        assert_eq!(unbound.build_volume(), None);
+        assert!(
+            !unbound.text().contains("(param "),
+            "no volume, no parameter"
+        );
+
+        let volume = sandbox
+            .mount_root
+            .join(".build/acme/widget/0123456789abcdef0123456789abcdef");
+        sandbox.build_volume_mount = Some(volume.clone());
+        let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        assert!(profile.text().contains(&format!(
+            "(literal (param \"{BUILD_VOLUME_PARAM}\")) (subpath (param \"{BUILD_VOLUME_PARAM}\"))"
+        )));
+        assert_eq!(profile.build_volume(), Some(volume.as_path()));
+        let launch =
+            crate::exec::ProfileLaunch::write(&sandbox.profile_directory(), &profile).unwrap();
+        let ran = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(launch.args())
+            .arg("/usr/bin/true")
+            .output_locked()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "{}: {}",
+            ran.status,
+            String::from_utf8_lossy(&ran.stderr)
+        );
+    }
+
     /// A profile past the 128 KiB a command argument may hold -- many read grants make one --
     /// launches with no argument over that bound, from its file, and `sandbox-exec -f` enforces
     /// it: a granted tree reads and stays unwritable, and the workspace writes. Passed as
@@ -1713,7 +1797,9 @@ mod tests {
         }
         let readable = sandbox.grants.read[count - 1].join("file");
         fs::write(&readable, b"granted\n").unwrap();
-        let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         assert!(
             profile.len() > MAX_COMMAND_ARG_BYTES,
             "the fixture needs a profile past one argument's bound, not {} bytes",
@@ -1778,7 +1864,9 @@ mod tests {
             .contribution
             .daemon_isolation
             .directories = vec![shared_daemon_runtime_link(&sandbox).join("nx")];
-        let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&sandbox, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         let touch = |path: &Path| {
             std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile, "--", "/usr/bin/touch"])
@@ -1905,7 +1993,9 @@ mod tests {
         custom.mount_root = PathBuf::from("/Users/tester/Dev/.cowshed-mounts");
         custom.workspace_mount =
             PathBuf::from("/Users/tester/Dev/.cowshed-mounts/acme/widget/raven");
-        let profile = seatbelt_profile(&custom, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&custom, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
 
         let root_deny = profile
             .find("(deny file-read* file-write* (subpath \"/Users/tester/Dev/.cowshed-mounts\"))")
@@ -1964,7 +2054,9 @@ mod tests {
             &[],
         );
         config.grants.read = vec![PathBuf::from("/Users/tester/Dev/sibling")];
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         let broad = profile
             .find("(allow file-read-data (subpath \"/\"))")
             .unwrap();
@@ -2001,7 +2093,9 @@ mod tests {
             );
         }
         // Controller-only Git discovery never had the broad read, so it needs no HOME deny.
-        let discovery = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery).unwrap();
+        let discovery = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery)
+            .unwrap()
+            .into_text();
         assert!(!discovery.contains("(allow file-read-data (subpath \"/\"))"));
     }
 
@@ -2105,7 +2199,9 @@ mod tests {
 
         let raven = build(&mount_root.join("acme/widget/raven"));
         assert!(raven.additional_denies.contains(&main.to_path_buf()));
-        let profile = seatbelt_profile(&raven, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&raven, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         let deny = profile.find(main_deny).expect("main denied like a sibling");
         let own = profile
             .find("(allow file-read* (subpath \"/Users/tester/.cowshed/mnt/acme/widget/raven\"))")
@@ -2124,7 +2220,9 @@ mod tests {
 
         let itself = build(main);
         assert!(!itself.additional_denies.contains(&main.to_path_buf()));
-        let profile = seatbelt_profile(&itself, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&itself, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         assert!(!profile.contains(main_deny));
         assert!(profile.contains("(allow file-read* (subpath \"/Users/tester/Dev/widget\"))"));
     }
@@ -2138,7 +2236,9 @@ mod tests {
         let mut config = config(RunSandboxMode::ReadWrite);
         config.grants.deny = vec![PathBuf::from(".runtime/secrets")];
         config.grants.deny_write = vec![PathBuf::from(".git/hooks")];
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         let target = format!("{mount}/.runtime/secrets");
         let deny = profile
             .find(&format!(
@@ -2234,7 +2334,9 @@ mod tests {
                 target: PathBuf::from("/Users/tester/Dev/elsewhere"),
             },
         ];
-        let profile = seatbelt_profile(&custom, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&custom, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
 
         let root_deny = profile
             .find("(deny file-read* file-write* (subpath \"/Users/tester/Dev/.cowshed\"))")
@@ -2292,8 +2394,12 @@ mod tests {
         for size in [16, crate::metadata::NEW_PORT_BLOCK_SIZE] {
             let mut config = config(RunSandboxMode::ReadWrite);
             config.port_block = PortBlock::new(40_960, size).unwrap();
-            let first = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
-            let second = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+            let first = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+                .unwrap()
+                .into_text();
+            let second = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+                .unwrap()
+                .into_text();
             assert_eq!(first, second);
             assert_eq!(
                 first
@@ -2323,7 +2429,9 @@ mod tests {
             PortBlock::new(40_960, 64).unwrap(),
             PortBlock::new(41_024, 16).unwrap(),
         ];
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         let admitted: Vec<u16> = profile
             .lines()
             .filter_map(|line| {
@@ -2366,7 +2474,9 @@ mod tests {
         let main_mount = PathBuf::from("/Users/tester/.cowshed/mnt/acme/widget/main");
         linked.additional_denies = vec![main_mount.clone()];
         linked.git_worktree_repository = Some(main_mount.join(".git"));
-        let profile = seatbelt_profile(&linked, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&linked, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
 
         let carve_back = profile
             .find("(allow file-read* file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/main/.git\") (subpath \"/Users/tester/.cowshed/mnt/acme/widget/main/.git\"))")
@@ -2390,7 +2500,8 @@ mod tests {
             &config(RunSandboxMode::ReadWrite),
             SandboxProfileRole::ExecutedChild,
         )
-        .unwrap();
+        .unwrap()
+        .into_text();
         assert!(!standalone.contains("/Users/tester/.cowshed/mnt/acme/widget/main/.git"));
     }
 
@@ -2402,7 +2513,9 @@ mod tests {
         let mut with_socket = config(RunSandboxMode::ReadWrite);
         let socket = PathBuf::from("/private/cowshed/store/daemon.sock");
         with_socket.allowed_unix_sockets.push(socket.clone());
-        let profile = seatbelt_profile(&with_socket, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&with_socket, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         assert!(profile.contains(
             "(allow network-outbound (remote unix-socket (path-literal \"/private/cowshed/store/daemon.sock\")))"
         ));
@@ -2445,7 +2558,8 @@ mod tests {
             &config(RunSandboxMode::ReadWrite),
             SandboxProfileRole::ExecutedChild,
         )
-        .unwrap();
+        .unwrap()
+        .into_text();
         let allows: Vec<&str> = profile
             .lines()
             .filter(|line| line.starts_with("(allow"))
@@ -2484,7 +2598,9 @@ mod tests {
             ],
             &["/Users/tester/.cargo/registry"],
         );
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         assert!(profile.contains(
             "(allow file-read* file-write* (subpath \"/Users/tester/.cargo/registry\"))"
         ));
@@ -2624,7 +2740,9 @@ mod tests {
     #[test]
     fn shared_cache_ancestors_resolve_without_reading_their_home() {
         let config = with_contribution(Vec::new(), &["/Users/tester/.cargo/git"]);
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         let deny = profile
             .find("(deny file-read* (subpath \"/Users/tester\"))")
             .expect("HOME read deny");
@@ -2648,12 +2766,14 @@ mod tests {
             &config(RunSandboxMode::ReadWrite),
             SandboxProfileRole::ExecutedChild,
         )
-        .unwrap();
+        .unwrap()
+        .into_text();
         let read_only = seatbelt_profile(
             &config(RunSandboxMode::ReadOnly),
             SandboxProfileRole::ExecutedChild,
         )
-        .unwrap();
+        .unwrap()
+        .into_text();
         let workspace_write = "(allow file-write* (subpath \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount\"))";
         assert!(read_write.contains(workspace_write));
         assert!(!read_only.contains(workspace_write));
@@ -2666,7 +2786,8 @@ mod tests {
             &config(RunSandboxMode::ReadWrite),
             SandboxProfileRole::ExecutedChild,
         )
-        .unwrap();
+        .unwrap()
+        .into_text();
         assert!(profile.contains(
             "(allow file-read* (literal \"/Applications\") (subpath \"/Applications\"))"
         ));
@@ -2694,7 +2815,7 @@ mod tests {
                 SandboxProfileRole::ExecutedChild,
                 SandboxProfileRole::GitDiscovery,
             ] {
-                let profile = seatbelt_profile(&config(mode), role).unwrap();
+                let profile = seatbelt_profile(&config(mode), role).unwrap().into_text();
                 for operation in ["file-read*", "file-read-data"] {
                     assert!(profile.contains(&format!(
                         "(allow {operation} (literal \"/nix/store\") (subpath \"/nix/store\"))"
@@ -2724,7 +2845,8 @@ mod tests {
             &config(RunSandboxMode::ReadWrite),
             SandboxProfileRole::ExecutedChild,
         )
-        .unwrap();
+        .unwrap()
+        .into_text();
         let grant = profile.find("/opt/shared").unwrap();
         let carve_back = profile.rfind("allow file-write*").unwrap();
         let secret = profile.rfind("/Users/tester/.ssh").unwrap();
@@ -2885,8 +3007,12 @@ mod tests {
     #[test]
     fn executed_child_is_a_terminal_narrowing_of_the_supervisor() {
         let config = config(RunSandboxMode::ReadOnly);
-        let supervisor = seatbelt_profile(&config, SandboxProfileRole::TrustedSupervisor).unwrap();
-        let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let supervisor = seatbelt_profile(&config, SandboxProfileRole::TrustedSupervisor)
+            .unwrap()
+            .into_text();
+        let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         let protected_allow = "(allow file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
         let ancestor_deny = "(deny file-write-create file-write-unlink (literal \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed\"))";
         let protected_deny = "(deny file-write* (literal \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed/job\") (subpath \"/Users/tester/.cowshed/mnt/acme/widget/workspaces/raven/mount/.cowshed/job\"))";
@@ -2926,7 +3052,9 @@ mod tests {
         ));
 
         config.grants.write.pop();
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         assert!(profile.lines().any(|line| line == "(deny file-link)"));
     }
 
@@ -2986,7 +3114,9 @@ mod tests {
     #[test]
     fn git_only_profile_executes_only_git() {
         let config = config(RunSandboxMode::ReadWrite);
-        let profile = seatbelt_profile(&config, SandboxProfileRole::GitDiscoveryGitOnly).unwrap();
+        let profile = seatbelt_profile(&config, SandboxProfileRole::GitDiscoveryGitOnly)
+            .unwrap()
+            .into_text();
         assert!(!profile.contains("(allow process-exec process-fork)"));
         assert!(profile.contains("(allow process-fork)"));
         let execs = profile
@@ -2999,7 +3129,9 @@ mod tests {
                 || line.ends_with("/usr/libexec/git-core\"))")),
             "{execs:?}"
         );
-        let broad = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery).unwrap();
+        let broad = seatbelt_profile(&config, SandboxProfileRole::GitDiscovery)
+            .unwrap()
+            .into_text();
         assert!(broad.contains("(allow process-exec process-fork)"));
     }
 
@@ -3016,7 +3148,7 @@ mod tests {
             #[cfg(target_os = "macos")]
             SandboxProfileRole::GitDiscoveryGitOnly,
         ] {
-            let profile = seatbelt_profile(&config, role).unwrap();
+            let profile = seatbelt_profile(&config, role).unwrap().into_text();
             for rule in [
                 "(allow file-read* (literal \"/dev/random\"))",
                 "(allow file-read* (literal \"/dev/urandom\"))",
@@ -3034,7 +3166,9 @@ mod tests {
         let socket = PathBuf::from("/private/var/run/daemon-socket/socket");
         let mut config = config(RunSandboxMode::ReadWrite);
         config.allowed_unix_sockets = vec![socket.clone()];
-        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let profile = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         assert!(profile.contains(
             "(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/daemon-socket/socket\")))"
         ));
@@ -3095,7 +3229,7 @@ mod tests {
             SandboxProfileRole::ExecutedChild,
             SandboxProfileRole::GitDiscovery,
         ] {
-            let profile = seatbelt_profile(&config, role).unwrap();
+            let profile = seatbelt_profile(&config, role).unwrap().into_text();
             let identity = std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", &profile, "--", "/usr/bin/id", "-un"])
                 .output_locked()
@@ -3177,7 +3311,7 @@ mod tests {
             SandboxProfileRole::ExecutedChild,
             SandboxProfileRole::GitDiscovery,
         ] {
-            let profile = seatbelt_profile(&config, role).unwrap();
+            let profile = seatbelt_profile(&config, role).unwrap().into_text();
             let seeded = run(
                 &profile,
                 &[&python, "-c", "import os; print(len(os.urandom(8)))"],
@@ -3233,8 +3367,12 @@ mod tests {
         let git_alias = config.workspace_mount.join("git-config-alias");
         std::os::unix::fs::symlink(&git_config, &git_alias).unwrap();
 
-        let supervisor = seatbelt_profile(&config, SandboxProfileRole::TrustedSupervisor).unwrap();
-        let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let supervisor = seatbelt_profile(&config, SandboxProfileRole::TrustedSupervisor)
+            .unwrap()
+            .into_text();
+        let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
         let canonical_stream = protected.join("out");
         let child_stream = protected.join("child");
         let workspace_file = config.workspace_mount.join("ordinary");
@@ -3320,7 +3458,9 @@ mod tests {
         for directory in [&config.home, &config.workspace_mount, &config.exec_temp_dir] {
             fs::create_dir_all(directory).unwrap();
         }
-        let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild).unwrap();
+        let child = seatbelt_profile(&config, SandboxProfileRole::ExecutedChild)
+            .unwrap()
+            .into_text();
 
         // `Stdio::null()` opens the device write-only for stdout, as a shell's `>/dev/null`
         // does; BSD stat with no operand fstats its stdin, here that same descriptor.

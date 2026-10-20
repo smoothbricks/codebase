@@ -7,6 +7,7 @@ use std::process::{Command, Output};
 
 use cowshed_core::build_volume::{BUILD_LINK, BuildVolumeState};
 use cowshed_core::capabilities::BuildStatePath;
+use cowshed_core::exec::{ProfileLaunch, SANDBOX_EXEC};
 use cowshed_core::git::git_command_at;
 use cowshed_core::host_dirs::support_directory;
 use cowshed_core::metadata::PortBlock;
@@ -28,13 +29,14 @@ impl Drop for Scratch {
     }
 }
 
+/// Launch `argv` as every launcher does (04_sandbox.md, "Exec pipeline" step 4): the profile
+/// from its file in the fixture's own store, its build volume bound with `-D`. The text names
+/// the volume only as a parameter; launched bare (`-p`), sandbox-exec refuses it, exit 65.
 fn job(config: &SandboxConfig, tools: &Path, argv: &[&str]) -> Output {
-    Command::new("/usr/bin/sandbox-exec")
-        .args([
-            "-p",
-            &seatbelt_profile(config, SandboxProfileRole::ExecutedChild).unwrap(),
-            "--",
-        ])
+    let profile = seatbelt_profile(config, SandboxProfileRole::ExecutedChild).unwrap();
+    let launch = ProfileLaunch::write(&config.profile_directory(), &profile).unwrap();
+    Command::new(SANDBOX_EXEC)
+        .args(launch.args())
         .args(argv)
         .current_dir(&config.workspace_mount)
         .env_clear()

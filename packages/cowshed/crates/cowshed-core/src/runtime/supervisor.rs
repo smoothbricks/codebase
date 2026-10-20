@@ -36,14 +36,14 @@ use crate::api::resources::{
 use crate::error::PriorityFailure;
 use crate::error::{AdmissionField, AdmissionRefusal, CowshedError, Result, StdinRefusal};
 use crate::exec::{
-    ExecError, ProfileFile, ProfileLaunch, SandboxExecRequest, SpawnPlan, classify_spawn_error,
-    plan_exec_under, prepare_child_descriptors,
+    ExecError, ProfileLaunch, SandboxExecRequest, SpawnPlan, classify_spawn_error, plan_exec_under,
+    prepare_child_descriptors,
 };
 use crate::metadata::{WorkspaceIncarnation, WorkspaceName, WorkspaceRole};
 use crate::repository::{OwnedRepoIds, RepoId};
 use crate::sandbox::{
-    SandboxConfig, SandboxProfileRole, sandbox_runtime_dir, sandbox_runtime_link, seatbelt_profile,
-    shared_daemon_runtime_dir, shared_daemon_runtime_link,
+    SandboxConfig, SandboxProfileRole, SeatbeltProfile, sandbox_runtime_dir, sandbox_runtime_link,
+    seatbelt_profile, shared_daemon_runtime_dir, shared_daemon_runtime_link,
 };
 use crate::storage::apfs::Labelled;
 use crate::storage::audit::AuditSinkError;
@@ -454,22 +454,20 @@ struct RenderedPolicy {
     read_only_child: ChildProfile,
 }
 
-/// An executed-child profile, rendered, the store directory its file lives in, and the build
-/// volume its launches bind. The text depends only on the workspace's authority, so renders
+/// An executed-child profile, rendered with the build volume its launches bind, and the store
+/// directory its file lives in. The text depends only on the workspace's authority, so renders
 /// before and after a build-volume pivot share one file and differ only in the binding.
 #[derive(Clone, Debug)]
 pub struct ChildProfile {
-    text: String,
+    profile: SeatbeltProfile,
     directory: PathBuf,
-    build_volume: Option<PathBuf>,
 }
 
 impl ChildProfile {
-    fn new(text: String, sandbox: &SandboxConfig) -> Self {
+    fn new(profile: SeatbeltProfile, sandbox: &SandboxConfig) -> Self {
         Self {
-            text,
+            profile,
             directory: sandbox.profile_directory(),
-            build_volume: sandbox.build_volume_mount.clone(),
         }
     }
 
@@ -477,21 +475,20 @@ impl ChildProfile {
     #[cfg(test)]
     pub(super) fn unbound(text: &str, directory: &Path) -> Self {
         Self {
-            text: text.to_owned(),
+            profile: SeatbeltProfile::unparameterized(text),
             directory: directory.to_owned(),
-            build_volume: None,
         }
     }
 
     /// The rendered profile.
     pub fn text(&self) -> &str {
-        &self.text
+        self.profile.text()
     }
 
     /// How a launch is told this profile: its file, made sure of now (written when `cowshed gc`
-    /// removed it or no launch wrote it yet, its mtime bumped otherwise), and its binding.
+    /// removed it or no launch wrote it yet, its mtime bumped otherwise), and its build volume.
     pub fn launch(&self) -> Result<ProfileLaunch> {
-        let file = ProfileFile::write(&self.directory, &self.text).map_err(|error| {
+        ProfileLaunch::write(&self.directory, &self.profile).map_err(|error| {
             CowshedError::environment_missing(
                 format!(
                     "cannot write the sandbox profile into {}: {error}",
@@ -499,8 +496,7 @@ impl ChildProfile {
                 ),
                 "check the store's run directory exists and is yours",
             )
-        })?;
-        Ok(ProfileLaunch::bound(file, self.build_volume.clone()))
+        })
     }
 }
 

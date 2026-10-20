@@ -3897,15 +3897,16 @@ fn sandboxed_git_command_with_paths(
             "repair the workspace Git path",
         )
     })?;
-    let profile = crate::exec::ProfileLaunch::write(&config, &profile).map_err(|error| {
-        CowshedError::environment_missing(
-            format!(
-                "cannot write controller git's sandbox profile into {}: {error}",
-                config.profile_directory().display()
-            ),
-            "run `cowshed setup` so the store's run directory exists and is yours",
-        )
-    })?;
+    let profile = crate::exec::ProfileLaunch::write(&config.profile_directory(), &profile)
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "cannot write controller git's sandbox profile into {}: {error}",
+                    config.profile_directory().display()
+                ),
+                "run `cowshed setup` so the store's run directory exists and is yours",
+            )
+        })?;
     let build = || -> Result<std::process::Command> {
         let git = git_command_at(&canonical);
         let mut command = std::process::Command::new(crate::exec::SANDBOX_EXEC);
