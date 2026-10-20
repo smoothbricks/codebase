@@ -1597,13 +1597,13 @@ mod tests {
             "the refusal leaves the supervisor and its jobs running"
         );
 
-        let started = std::time::Instant::now();
+        // A ceiling no run reaches: past a ceiling the wait refuses, so an `Ok` is the exit event.
         let waited = tokio::spawn({
             let socket = socket.clone();
             async move {
                 supervisor_socket::await_other_build_retired(
                     &socket,
-                    std::time::Instant::now() + Duration::from_secs(60),
+                    std::time::Instant::now() + Duration::from_secs(24 * 60 * 60),
                 )
                 .await
             }
@@ -1617,11 +1617,7 @@ mod tests {
         waited
             .await
             .expect("the wait")
-            .expect("the step goes on once the supervisor has exited");
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "the exit event ends the wait, not its ceiling"
-        );
+            .expect("the supervisor's exit ends the wait, not its ceiling");
         std::fs::remove_dir_all(store).expect("cleanup");
     }
 }
