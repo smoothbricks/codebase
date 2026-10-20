@@ -183,59 +183,73 @@ mod tests {
         format!("{open} ours\n{ours}{middle} base\n{base}{separator}\n{theirs}{close} theirs\n")
     }
 
-    /// The pick a lander resolved: the target edited the line beside the workspace's, so git
-    /// conflicts on the region, and the target's version still holds the workspace's line.
-    #[test]
-    fn a_resolved_region_holding_the_workspace_line_beside_the_target_edit_is_held() {
-        let merged = format!("{}c\n", block("a main\nb shed\n", "a\nb\n", "a\nb shed\n"));
-        assert_eq!(
-            judge(merged.as_bytes(), b"a main\nb shed\nc\n"),
-            Verdict::Held
-        );
-    }
+    /// One conflicted region and the lines git printed around it, judged against the target's
+    /// version: `(why, before, [ours, base, theirs], after, target, verdict)`.
+    type RegionCase = (
+        &'static str,
+        &'static str,
+        [&'static str; 3],
+        &'static str,
+        &'static str,
+        Verdict,
+    );
 
-    /// Both sides inserted at one place, and the target kept the workspace's lines among its own.
     #[test]
-    fn insertions_the_target_interleaved_with_its_own_are_held() {
-        let merged = format!(
-            "a\n{}d\n",
-            block(
-                "\"foo\": 1,\n\"baz\": 3,\n\"bar\": 2\n",
-                "\"foo\": 1\n",
-                "\"foo\": 1,\n\"bar\": 2\n"
-            )
-        );
-        assert_eq!(
-            judge(
-                merged.as_bytes(),
-                b"a\n\"foo\": 1,\n\"baz\": 3,\n\"bar\": 2\nd\n"
+    fn a_conflicted_region_is_held_only_when_the_target_carries_the_workspace_hunks_in_place() {
+        let cases: [RegionCase; 5] = [
+            (
+                "the pick a lander resolved: the target edited the line beside the workspace's",
+                "",
+                ["a main\nb shed\n", "a\nb\n", "a\nb shed\n"],
+                "c\n",
+                "a main\nb shed\nc\n",
+                Verdict::Held,
             ),
-            Verdict::Held
-        );
-    }
-
-    /// The target changed the line the workspace changed, to something else.
-    #[test]
-    fn a_line_both_sides_rewrote_differently_is_a_conflict() {
-        let merged = block("b main\n", "b\n", "b shed\n");
-        assert_eq!(judge(merged.as_bytes(), b"b main\n"), Verdict::Conflict);
-    }
-
-    /// The workspace replaced a line the target kept: its deletion is not in the target.
-    #[test]
-    fn a_replaced_line_the_target_kept_is_a_conflict() {
-        let merged = block("a main\nb\nb shed\n", "a\nb\n", "a\nb shed\n");
-        assert_eq!(
-            judge(merged.as_bytes(), b"a main\nb\nb shed\n"),
-            Verdict::Conflict
-        );
-    }
-
-    /// The workspace's line exists in the target, but only outside the place it was written.
-    #[test]
-    fn a_line_found_only_outside_its_place_is_a_conflict() {
-        let merged = format!("x\n{}", block("a main\n", "a\n", "a\nx\n"));
-        assert_eq!(judge(merged.as_bytes(), b"x\na main\n"), Verdict::Conflict);
+            (
+                "both inserted at one place and the target kept the workspace's lines among its own",
+                "a\n",
+                [
+                    "\"foo\": 1,\n\"baz\": 3,\n\"bar\": 2\n",
+                    "\"foo\": 1\n",
+                    "\"foo\": 1,\n\"bar\": 2\n",
+                ],
+                "d\n",
+                "a\n\"foo\": 1,\n\"baz\": 3,\n\"bar\": 2\nd\n",
+                Verdict::Held,
+            ),
+            (
+                "the target rewrote the workspace's line to something else",
+                "",
+                ["b main\n", "b\n", "b shed\n"],
+                "",
+                "b main\n",
+                Verdict::Conflict,
+            ),
+            (
+                "the workspace replaced a line the target kept: its deletion is not in the target",
+                "",
+                ["a main\nb\nb shed\n", "a\nb\n", "a\nb shed\n"],
+                "",
+                "a main\nb\nb shed\n",
+                Verdict::Conflict,
+            ),
+            (
+                "the workspace's line is in the target only outside the place it was written",
+                "x\n",
+                ["a main\n", "a\n", "a\nx\n"],
+                "",
+                "x\na main\n",
+                Verdict::Conflict,
+            ),
+        ];
+        for (why, before, [ours, base, theirs], after, target, verdict) in cases {
+            let merged = format!("{before}{}{after}", block(ours, base, theirs));
+            assert_eq!(
+                judge(merged.as_bytes(), target.as_bytes()),
+                verdict,
+                "{why}"
+            );
+        }
     }
 
     #[test]
