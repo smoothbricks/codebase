@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { realpath } from 'node:fs/promises';
 import { cpus } from 'node:os';
 import { posix } from 'node:path';
-import { cargoClosureInputs } from '../src/cargo-closure-input.js';
 import { expandedFilesets, filesetSource } from '../src/__tests__/cargo-closure-filesets.js';
+import { cargoClosureInputs } from '../src/cargo-closure-input.js';
 
 // Run from the workspace root: taskpolicy -b bun packages/nx-plugin/benchmarks/cargo-closure-input.bench.ts
 // One caller, warmed resolution/source-scan data; the real async closure entry still performs its realpath.
