@@ -88,12 +88,18 @@ paths; `--ref <rev>` implies clean. Ignored dependencies and build state stay wa
 6. Lane work: fork units from the lane base (`cowshed fork <lane> <unit>`), then `rebase --into <lane>` /
    `land --into <lane>`; the lane base itself lands to main as an ordinary workspace.
 
-## Host route vs sandbox route
+## Enter a shed through `cowshed exec`
 
-- `cowshed exec` is the sandboxed route (argv only, cwd = shed root, child's exit passes through).
-- Heavy host tooling often belongs on the host route: `cd "$(cowshed path <ws>)" && direnv exec . nx run …`. In
-  particular `taskpolicy -b` inside `cowshed exec` fails with EPERM — run it outside:
-  `cd "$(cowshed path <ws>)" && taskpolicy -b direnv exec . nx run …`.
+- Shed work runs through `cowshed exec <ws> -- <argv…>`: argv only, cwd = shed root, the child's exit passes through.
+  Its default class is `background` (`--class background`): it holds a host CPU token and runs at nice +10, the effect
+  `taskpolicy -b` was used for. `taskpolicy -b` itself fails with EPERM inside the sandbox; do not reach for it.
+- Never `direnv exec` a shed from the host (`cd "$(cowshed path <ws>)" && direnv exec . …`). devenv evaluates a shell
+  per path, `TMPDIR` and runtime directory (specs/cowshed/03_caches.md "Sandboxed shells evaluate devenv in place"), so
+  a host entry is a second cold evaluation of the same shed beside the sandbox's own (measured 2026-10-20: 197 s on top
+  of the shed's, concurrently), and the Nx it runs starts its daemon outside the sandbox.
+- The one thing this changes for you: the command runs with the shed's authority, not yours. A path outside the shed
+  (another checkout, `~`) needs `cowshed grant <ws> --read|--write <path>` first, and a host-boundary operation (a land
+  gate, an APFS image test) goes through the repository's land path, not `cowshed exec`.
 - macOS loopback inside exec: only the shed's own port block (`$COWSHED_PORT_BASE`, 64 ports) is connectable; 127.0.0.1
   outside it is EPERM. Bind services at `$COWSHED_PORT_BASE + 1…`, and `grant --ports <N>` before starting them. Linux
   sheds get private loopback with all ports.
