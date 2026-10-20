@@ -267,6 +267,7 @@ fn locked_recovery_settles_only_its_own_workspace_and_never_reads_a_broken_neigh
     let fixture = Fixture::new("scoped-recovery");
     let config = fixture.config();
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
     let host = native_host(&fixture, RecordingRunner::default());
 
     let kite = WorkspaceName::session("kite").expect("session");
@@ -293,15 +294,17 @@ fn locked_recovery_settles_only_its_own_workspace_and_never_reads_a_broken_neigh
         .checkpoints
         .join("broken")
         .join(format!("pre-restore-{SIBLING}.dmg"));
-    let foreign = StorageLayout::new(
+    let foreign_layout = StorageLayout::new(
         &fixture.root,
         &RepoId::parse("other/thing").expect("foreign repo"),
     )
-    .expect("foreign layout")
-    .main_image()
-    .expect("foreign main")
-    .image()
-    .to_owned();
+    .expect("foreign layout");
+    adopt_owner(&foreign_layout);
+    let foreign = foreign_layout
+        .main_image()
+        .expect("foreign main")
+        .image()
+        .to_owned();
     let poisoned = [
         sidecar_path(&broken_canonical),
         sidecar_path(&staged),

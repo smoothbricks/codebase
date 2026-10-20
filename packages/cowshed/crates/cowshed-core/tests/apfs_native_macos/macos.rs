@@ -745,6 +745,14 @@ fn repo() -> RepoId {
     RepoId::parse("acme/widget").expect("repo")
 }
 
+/// Mark `layout`'s owner as adoption's provisioning does, so the store-wide recovery pass reads
+/// its project: it reads only marked owners (01_storage.md, "Directory layout").
+fn adopt_owner(layout: &StorageLayout) {
+    let owner = layout.project().project_root.parent().expect("owner");
+    std::fs::create_dir_all(owner).expect("owner directory");
+    cowshed_core::storage::bootstrap::write_owner_marker(owner).expect("owner marker");
+}
+
 fn execute_gc<R>(
     host: &MacOsApfsExecutionHost<R>,
     config: &ApfsSubstrateConfig,
@@ -4268,6 +4276,7 @@ fn interrupted_restore_image_publication(
 fn recovery_quarantines_a_canonical_image_missing_its_ca_companion() {
     let missing = Fixture::new("recovery-missing-ca");
     let missing_layout = StorageLayout::new(&missing.root, &repo()).expect("layout");
+    adopt_owner(&missing_layout);
     let missing_canonical = missing_layout.main_image().expect("canonical");
     create_image(missing_canonical.image());
     std::fs::remove_file(ca_key_path(missing_canonical.image())).expect("remove CA key");
@@ -4320,6 +4329,7 @@ fn recovery_quarantines_a_canonical_image_missing_its_ca_companion() {
 fn an_imageless_sibling_publication_is_reconciled_instead_of_failing_every_other_workspace() {
     let fixture = Fixture::new("orphan-publication-sibling");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
 
     let live = WorkspaceName::new("session-live").expect("live session");
     let live_canonical = layout.session_image(&live).expect("live canonical");
@@ -4462,6 +4472,7 @@ fn a_keyless_staged_session_image_is_left_to_gc_instead_of_failing_every_verb() 
 fn an_imageless_publication_with_a_restore_in_flight_keeps_its_evidence_and_still_refuses() {
     let fixture = Fixture::new("orphan-publication-restore-in-flight");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
     let canonical = layout.main_image().expect("canonical");
     let undo = layout
         .project()
@@ -5649,6 +5660,7 @@ fn retired_workspace_restart_ignores_multiple_retained_restore_generations() {
 fn restore_recovery_rejects_fact_without_canonical_image() {
     let fixture = Fixture::new("restore-fact-without-canonical");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
     let canonical = layout.main_image().expect("canonical");
     let destination =
         WorkspaceIncarnation::new("00000000000000000000000000000002").expect("destination");
@@ -6265,12 +6277,9 @@ fn lock_and_command_targets_reject_intermediate_symlink_ancestors_without_effect
 /// `PendingFence` sidecar recording revision 1, and the user's checkout still the original tree.
 fn pending_adopt_fixture(fixture: &Fixture) -> (PathBuf, DetachedWorkspaceMetadata) {
     let config = fixture.config();
-    let canonical = StorageLayout::new(&fixture.root, &repo())
-        .expect("layout")
-        .main_image()
-        .expect("canonical")
-        .image()
-        .to_owned();
+    let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
+    let canonical = layout.main_image().expect("canonical").image().to_owned();
     create_image(&canonical);
     std::fs::write(&canonical, b"partially copied main").expect("pending payload");
     let mut pending = metadata();
@@ -6836,6 +6845,7 @@ impl CommandRunner for ImmutableDuringResize {
 fn quarantine_keyless_canonical_sidecar_leaves_image_and_spares_healthy_sibling() {
     let fixture = Fixture::new("quarantine-keyless-canonical");
     let layout = StorageLayout::new(&fixture.root, &repo()).expect("layout");
+    adopt_owner(&layout);
 
     let live = WorkspaceName::new("session-live").expect("live session");
     let live_canonical = layout.session_image(&live).expect("live canonical");
