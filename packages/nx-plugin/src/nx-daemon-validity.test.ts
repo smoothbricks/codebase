@@ -698,6 +698,57 @@ it('does not serve a request sent on a connection opened before a lockfile chang
   );
 });
 
+it('stops a kept daemon on a lockfile change instead of spawning a successor its keeper does not own', async () => {
+  await withNxFixture(
+    'nx-daemon-validity-kept-',
+    async ({ socketDirectory, workspace }) => {
+      await fixtureWorkspace(workspace);
+      const lock = join(workspace, 'yarn.lock');
+      await writeFile(lock, 'lock one\n');
+      const env = fixtureNxEnv(workspace, socketDirectory);
+      // As cowshed's keeper job starts it: the daemon's own entry in the foreground, kept.
+      const kept = spawn('node', [daemonStart, '--kept'], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let log = '';
+      kept.stdout.setEncoding('utf8').on('data', (text: string) => {
+        log += text;
+      });
+      kept.stderr.setEncoding('utf8').on('data', (text: string) => {
+        log += text;
+      });
+      const exited = Promise.withResolvers<number | null>();
+      kept.once('exit', (code) => exited.resolve(code));
+      try {
+        const record = await watchUntil(
+          dirname(recordPath(workspace)),
+          'the kept daemon to write its record',
+          async () => {
+            const current = await daemonRecord(workspace);
+            return current !== null && current.processId === kept.pid ? current : null;
+          },
+          async () => {},
+        );
+        const daemon = await readyDaemon(workspace, record);
+        await writeFile(lock, 'lock two\n');
+        assertNotServed(
+          await requestOnce(daemon.record.socketPath, ping(workspace), 'a PING sent after the lockfile changed'),
+          'a PING sent to the kept daemon after the lockfile changed',
+        );
+        await guardEvent(exited.promise, 'the kept daemon to exit after the lockfile changed', () => log);
+        // The decision is in the daemon's own log, written before it exits: it stopped, and started nothing.
+        expect(log, 'the kept daemon did not say it left its successor to its keeper').toContain(
+          'Stopping: the process that started this daemon (--kept) starts its successor',
+        );
+        expect(log, 'the kept daemon spawned a successor of its own').not.toContain('Restarting daemon');
+        expect(log, 'the kept daemon spawned a successor of its own').not.toContain('Started new daemon process');
+      } finally {
+        if (kept.exitCode === null && kept.signalCode === null && kept.pid !== undefined) terminate(kept.pid);
+        await exited.promise;
+      }
+    },
+    FIXTURE_WORKSPACE,
+  );
+});
+
 it('stops a daemon at the next request after an ignored lockfile changes, then its successor within its safety poll with no request', async () => {
   await withNxFixture(
     'nx-daemon-validity-ignored-',

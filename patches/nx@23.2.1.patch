@@ -694,10 +694,10 @@ index 0000000000000000000000000000000000000000..28f263f82b7b698ec1bf88943924696b
 +export declare function stopDaemonIfWorkspaceGone(): boolean;
 diff --git a/dist/src/daemon/server/restart-checks.js b/dist/src/daemon/server/restart-checks.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..5f7aa0aa874dfe389388169c8acb0c0ab45f5180
+index 0000000000000000000000000000000000000000..6bd6df6e26cdbc306b33c01b363dc4b3d4475ada
 --- /dev/null
 +++ b/dist/src/daemon/server/restart-checks.js
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,306 @@
 +"use strict";
 +Object.defineProperty(exports, "__esModule", { value: true });
 +exports.relativeServerProcess = exports.DAEMON_VALIDITY_SAFETY_INTERVAL_MS = void 0;
@@ -721,6 +721,12 @@ index 0000000000000000000000000000000000000000..5f7aa0aa874dfe389388169c8acb0c0a
 +// Adapted from nrwl/nx#37113. Kept apart from server.js: importing it starts a server.
 +let daemon;
 +let terminating = false;
++// The process that starts a daemon owns its restart. A supervisor that keeps
++// this daemon (cowshed's keeper job) starts it as `start.js --kept` and starts
++// its successor itself; a successor spawned here would run outside that job,
++// where its owner cannot prove it. argv, read once at boot, is the launcher's
++// own word: no client's environment, which this daemon adopts, can change it.
++const keptByLauncher = process.argv.slice(2).includes('--kept');
 +function registerDaemonForRestartChecks(server, sockets, socketPath) {
 +    daemon = { server, sockets, socketPath };
 +    terminating = false;
@@ -986,10 +992,15 @@ index 0000000000000000000000000000000000000000..5f7aa0aa874dfe389388169c8acb0c0a
 +}
 +function restartDaemon(reason) {
 +    if (!daemon || terminating) return;
++    logger_1.serverLogger.log(`[Server] Daemon outdated: ${reason}`);
++    if (keptByLauncher) {
++        logger_1.serverLogger.log('[Server] Stopping: the process that started this daemon (--kept) starts its successor');
++        stopDaemon(reason);
++        return;
++    }
 +    // Do not spawn multiple replacements or answer queued requests while the
 +    // asynchronous restart releases ownership and starts the successor.
 +    terminating = true;
-+    logger_1.serverLogger.log(`[Server] Daemon outdated: ${reason}`);
 +    logger_1.serverLogger.log('[Server] Restarting daemon...');
 +    (0, shutdown_utils_1.handleServerProcessTerminationWithRestart)({ server: daemon.server, reason, sockets: daemon.sockets });
 +}

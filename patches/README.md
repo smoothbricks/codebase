@@ -242,6 +242,12 @@ the full census, which finds a file added beside them. Only changed bytes restar
 so a rebuild that rewrites identical files, or a link moved to a copy with the same bytes, keeps it. A package inside
 the workspace changes only with its lockfile and is not watched this way.
 
+Each restart (`LOCK_FILES_CHANGED`, `LINKED_PLUGIN_CHANGED`) belongs to the process that started the daemon. A daemon
+started as `start.js --kept`, cowshed's keeper job (`specs/cowshed/04_sandbox.md`), stops instead of spawning its own
+successor, and the keeper's next probe starts one inside its job; Nx clients waiting on it reconnect within their 60 s
+poll and resend. Read once at boot from argv, which no client's environment can rewrite. Any other daemon restarts
+itself as before.
+
 The existing ignore-file content snapshot, watch-before-scan ordering, exclusive daemon claim and five-minute inactivity
 policy remain unchanged. This follows `specs/cowshed/04_sandbox.md`'s fixture ownership and one-state-per- checkout
 contract and `packages/nx-plugin/README.md`'s runtime-state exclusions and daemon policy. `nx-daemon-validity.test.ts`

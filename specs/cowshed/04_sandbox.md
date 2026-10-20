@@ -915,17 +915,23 @@ A workspace's daemon executes the project-graph plugins of the workspace's check
 only inside the sandbox, and Nx 23.2.1 has no setting that makes a client connect to a live daemon without ever starting
 one. A workspace's supervisor therefore keeps that daemon alive itself. At start, and every 5 s while it admits jobs, it
 probes the record: present, its process alive, its socket accepting. When the probe fails it runs
-`node <project>/node_modules/nx/dist/src/daemon/server/start.js` as one read-write resident maintenance job, at most one
-at a time: the daemon answers clients that hold their own CPU tokens and is idle between them, so it holds none
+`node <project>/node_modules/nx/dist/src/daemon/server/start.js --kept` as one read-write resident maintenance job, at
+most one at a time: the daemon answers clients that hold their own CPU tokens and is idle between them, so it holds none
 (05_gateway.md, "A resident holds no token") and keeping it costs the shed none of its share of the host. The foreground
 process stays owned by that job's real birth and group and keeps its shared build-volume hold for its lifetime
-(16_build_volumes.md, "The Nx daemon stays on"). A failed start is reported on the supervisor's stderr; the next probe
-tries again. A host client finds the daemon through the shared record and connects to it instead of starting one outside
-the sandbox. Main's supervisor keeps no daemon: main is the operator's checkout, and its daemon is the host's. A fork
-deletes the record from the build volume; a land deletes the landing workspace's and gives the adopted volume the
-target's record of a live unsandboxed daemon in its place (16_build_volumes.md). A repository shell that exports either
-directory unconditionally replaces the checkout's, like any export, and splits the state again; a repository shell that
-sets them keeps a value already present (`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
+(16_build_volumes.md, "The Nx daemon stays on"). The process that starts a daemon owns its restart. A daemon the keeper
+started stops, rather than restarts, when its installation changes (a root lockfile or a linked plugin, the patched Nx's
+validity checks); the keeper starts its successor. `--kept` is how the keeper says so: a successor the old daemon
+spawned itself would run outside the job, and a land skips adopting a volume whose daemon its ledger cannot prove
+(16_build_volumes.md, Land step 4), discarding the gate's whole cache for an ordinary plugin rebuild. A daemon a client
+started outside a keeper, such as main's host daemon, keeps restarting itself, since no keeper would. A failed start is
+reported on the supervisor's stderr; the next probe tries again. A host client finds the daemon through the shared
+record and connects to it instead of starting one outside the sandbox. Main's supervisor keeps no daemon: main is the
+operator's checkout, and its daemon is the host's. A fork deletes the record from the build volume; a land deletes the
+landing workspace's and gives the adopted volume the target's record of a live unsandboxed daemon in its place
+(16_build_volumes.md). A repository shell that exports either directory unconditionally replaces the checkout's, like
+any export, and splits the state again; a repository shell that sets them keeps a value already present
+(`${NX_CACHE_DIRECTORY:-.nx/cache}`) or leaves them unset.
 
 A kept daemon costs its host a resident Node process, about six plugin workers and a file watcher that recomputes the
 project graph on every change in the tree, per shed. Stock Nx stops a daemon after three hours without a request or a

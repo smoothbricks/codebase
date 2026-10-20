@@ -6529,13 +6529,15 @@ fn nx_project(name: &str) -> (WorkspaceSupervisorConfig, TempRoot) {
     (supervisor_config, root)
 }
 
-/// The argv that starts the daemon of the Nx project at `project`: the project's own `nx`.
+/// The argv that starts the daemon of the Nx project at `project`: the project's own `nx`, kept, so the daemon
+/// leaves its restart to the keeper.
 fn nx_daemon_start(project: &Path) -> Vec<OsString> {
     vec![
         OsString::from("node"),
         project
             .join("node_modules/nx/dist/src/daemon/server/start.js")
             .into_os_string(),
+        OsString::from("--kept"),
     ]
 }
 

@@ -349,6 +349,10 @@ pub(crate) fn start_request(workspace_root: &Path, project_root: &Path) -> Resul
         command: ExecCommand::Argv(vec![
             CommandArg::from("node"),
             CommandArg::new(project_root.join("node_modules/nx/dist/src/daemon/server/start.js")),
+            // The keeper owns this daemon's restart: the patched daemon stops, rather than spawning a successor
+            // outside this job, when its installation changes, and the next probe starts the owned one
+            // (04_sandbox.md, "The process that starts a daemon owns its restart").
+            CommandArg::from("--kept"),
         ]),
         cwd,
         mode: RunSandboxMode::ReadWrite,
@@ -1481,6 +1485,7 @@ mod lifecycle_authority_tests {
             .args(["-p", SELF_ONLY])
             .arg(node)
             .arg(nx.join("dist/src/daemon/server/start.js"))
+            .arg("--kept")
             .clear_nx_environment()
             .envs(nx_environment(root))
             .current_dir(root)
