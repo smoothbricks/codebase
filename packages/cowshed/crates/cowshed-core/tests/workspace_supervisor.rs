@@ -7872,6 +7872,8 @@ async fn host_controller_a_real_exec_seals_one_job_span_through_the_production_s
 
 /// Real background jobs under seatbelt, with the production artifact, commitment and span
 /// writers. CPU admission is immediate so scheduler queueing is not mistaken for setup cost.
+/// Tool counts describe the initial capability ceiling, not the live bootstrap links: per-cwd
+/// detection replaces those contributions. The fsio probe independently varies actual link count.
 /// Run explicitly on the host with COWSHED_TIMING=1 and --test-threads=1; never part of a gate.
 #[cfg(target_os = "macos")]
 #[tokio::test]
@@ -7978,7 +7980,7 @@ async fn per_job_fixed_cost_measurement() {
         samples.sort_by(f64::total_cmp);
         let mean = samples.iter().sum::<f64>() / samples.len() as f64;
         println!(
-            "fixed-cost tools={count} jobs={} mean_ms={:.3} median_ms={:.3} seconds_per_1000={:.3}",
+            "fixed-cost initial_tools={count} jobs={} mean_ms={:.3} median_ms={:.3} seconds_per_1000={:.3}",
             samples.len(),
             mean * 1e3,
             samples[samples.len() / 2] * 1e3,
