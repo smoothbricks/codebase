@@ -1363,13 +1363,31 @@ waits for the event it is waiting for, however long a loaded host makes the work
 the run through `idleTimeoutMs`. `timeoutMs`, an absolute ceiling, is for commands that report no tests; a target names
 at least one of the two.
 
-Direct `go test` invocations, including sequential `&&`, `||`, and `;` chains, are requested with `-json`. Go emits a
-package's `Action:start` only after its build dependencies settle; a package terminal (`pass`, `fail`, or `skip`) ends
-that execution interval. The unchanged idle bound runs while any package is executing, re-arms on test/package
-completion, and stops when none is executing. Initial linking and inter-package compilation therefore spend no test idle
-budget, while a stuck test or `TestMain` still expires after 180 s without a completion. `output`, `build-output`,
-pause/continue events, and arbitrary compiler activity are not progress. Mixed runner commands and unknown wrappers keep
-the existing spawn-based clock; Bun and Rust fixture compilation inside an active test gets no exemption.
+On POSIX hosts, direct Go and Cargo test commands (including chains joined by `&&`, `||`, or `;`) share one private
+runner lifecycle: `build`, `active`, and `terminal`. A per-command Node supervisor reports phases over an acknowledged
+descriptor that its actual tool child and nested fixtures do not inherit. Shell/supervisor startup is bounded; the tool
+starts only after its build phase is accepted, and native lifecycle-bearing stdout is forwarded only after its phase
+owns the clock. A malformed or prematurely closed lifecycle channel fails the run rather than silently disabling the
+watchdog.
+
+| Runner                                                          | Authoritative end of build                                                 | End of active execution                                                                                                                |
+| --------------------------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Go (`go test -json`)                                            | Native package `Action:start`, after that package's build dependencies     | Native package `pass`, `fail`, or `skip`; the clock runs while any package executes                                                    |
+| Cargo (`cargo test --message-format=json-render-diagnostics`)   | Native `build-finished`, after `compile_tests` and before `run_unit_tests` | The owned Cargo child's close **and drained output**, never a libtest summary; custom harnesses, doctests, and teardown remain bounded |
+| Bun                                                             | No separate authoritative build event; active from command spawn           | Command exit                                                                                                                           |
+| Unknown shell wrappers, mixed unsupported commands, and nextest | No inferred build exemption; active from command spawn                     | Command exit                                                                                                                           |
+
+The unchanged 180 s interval re-arms on finished tests/packages. Initial Go linking, inter-package Go compilation, and
+initial or inter-command Cargo compilation spend no test idle budget. **Compiler-process activity is deliberately not a
+signal:** Go linking and Rust compilation before execution are build work; Bun's cold-compiler fixture (and a Rust test
+compiling a fixture) is active-test work and must still expire. Build output and heartbeats never reset the bound. Cargo
+uses its native build declaration without replacing configured target runners; a nested `test result` or
+`build-finished` line cannot retire the owned process or exempt its teardown. Absolute `timeoutMs`, when supplied, is
+unchanged.
+
+Separately building test binaries and then executing them under the unchanged bound is a **workaround** for callers
+without a native lifecycle hook, not evidence that their combined cold-build command is safe. Direct Go/Cargo commands
+use the lifecycle channel instead; unknown wrappers retain conservative spawn accounting.
 
 Process-group timeout fixtures retain cleanup authority only until the command leader exits and every descendant closes
 its inherited lifetime FIFO. EOF is the terminal ownership event; a later `afterEach` must not signal the retired PGID
@@ -1596,10 +1614,10 @@ task id and the hash it ran at:
   `type="test abort"`, `process aborted with signal 15 (SIGTERM)` (SIGKILL once the force-kill follows); they are the
   bound's casualties and do not make the run `failed`. A test that dies of any other signal, or that is aborted with no
   bound to explain it, does.
-- `wedged`: `idleTimeoutMs` fired: no test finished for that long. A host that is only slow still finishes tests, so
-  this is a hang, never load. Its `tests` name the tests still running: those the runner said were running (nextest's
-  `SLOW`, libtest's `has been running for over`) and never said finished, and those the JUnit report says it aborted
-  when the bound stopped it.
+- `wedged`: `idleTimeoutMs` fired: no test finished during that much active test time. This proves the completion
+  interval was exceeded, not that every process stopped: an oversized fixture can exceed it too. Its `tests` name those
+  the runner reported running (nextest's `SLOW`, libtest's `has been running for over`) and never finished, and those
+  the JUnit report says it aborted when the bound stopped it.
 - `no-space`: the command failed after its output said a write found no space (`ENOSPC` or `No space left on device`).
   Its tests failed on the disk, not on their own, whatever bound or hang followed: it records that line and, when the
   task held a RAM lease, the lease, the volume and its free bytes when the line arrived. A passing run that printed such

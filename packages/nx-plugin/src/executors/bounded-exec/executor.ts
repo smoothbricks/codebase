@@ -2,6 +2,8 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
 import { availableParallelism, userInfo } from 'node:os';
 import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { createInterface } from 'node:readline';
+import { Duplex } from 'node:stream';
 import { workspaceDataDirectoryForWorkspace } from 'nx/src/utils/cache-directory.js';
 
 import {
@@ -25,6 +27,7 @@ import type { HangDiagnostics } from './hang-diagnostics.js';
 import { captureHangDiagnostics, HANG_CAPTURE_MS } from './hang-diagnostics.js';
 import { createNoSpaceWatch } from './no-space.js';
 import { createRunProgress, withProgressReport } from './progress.js';
+import { createRunnerLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
 import {
   COWSHED_EXECUTABLE_ENV,
   createHostCommands,
@@ -458,13 +461,18 @@ export async function runBoundedExec(
     ...sized.env,
     ...(pool?.environment ?? {}),
   };
+  const hooked = process.platform === 'win32' ? null : withRunnerLifecycle(command);
+  const lifecycle = hooked === null ? null : createRunnerLifecycle(hooked.runners);
+  let lifecycleFailure: string | null = null;
+  const isTesting = (): boolean => lifecycleFailure !== null || (lifecycle?.isTesting() ?? true);
   const startedAt = Date.now();
   let child: ChildProcess;
   try {
-    child = spawn(command, [], {
+    child = spawn(hooked?.command ?? command, [], {
       cwd,
       env: mergeEnv(lease, env),
       shell: true,
+      stdio: hooked === null ? 'pipe' : ['pipe', 'pipe', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
       windowsHide: true,
     });
@@ -542,7 +550,7 @@ export async function runBoundedExec(
     idleTimer = setTimeout(() => expire({ kind: 'idle', limitMs, tests: progress.inFlight() }, queuedMs), leftMs);
   };
   const armIdleTimer = (): void => {
-    if (idleTimeoutMs === undefined || state.settled || state.expiry !== null || !progress.isTesting()) {
+    if (idleTimeoutMs === undefined || state.settled || state.expiry !== null || !isTesting()) {
       return;
     }
     idleLeftMs = idleTimeoutMs;
@@ -577,7 +585,7 @@ export async function runBoundedExec(
       const waitedMs = Date.now() - queuedSinceMs;
       queuedMs += waitedMs;
       queuedSinceMs = null;
-      if (!progress.isTesting()) {
+      if (!isTesting()) {
         appendStderr(`bounded-exec: host CPU wait ended after ${waitedMs}ms; no test runner is active\n`);
         return;
       }
@@ -591,10 +599,8 @@ export async function runBoundedExec(
   // Only the CHILD's own output is read for progress. The diagnostics below go
   // through appendStderr as well, and re-arming on those would let a teardown
   // message extend the very bound that just fired.
-  const scanProgress = (stream: 'stdout' | 'stderr', text: string): void => {
-    const wasTesting = progress.isTesting();
-    const finished = progress.scan(stream, text);
-    if (!progress.isTesting()) {
+  const updateIdle = (finished: boolean, wasTesting: boolean): void => {
+    if (!isTesting()) {
       clearTimeout(idleTimer);
       cancelCapture();
       idleCapture = undefined;
@@ -602,6 +608,34 @@ export async function runBoundedExec(
       armIdleTimer();
     }
   };
+  const scanProgress = (stream: 'stdout' | 'stderr', text: string): void => {
+    updateIdle(progress.scan(stream, text), isTesting());
+  };
+  if (lifecycle !== null) {
+    const channel = child.stdio[3];
+    if (!(channel instanceof Duplex)) throw new Error('runner lifecycle requires a duplex child descriptor');
+    const failLifecycle = (detail: string, wasTesting = isTesting()): void => {
+      if (lifecycleFailure !== null || state.expiry !== null) return;
+      lifecycleFailure = detail;
+      appendStderr(`bounded-exec: runner lifecycle failed: ${detail}\n`);
+      updateIdle(false, wasTesting);
+    };
+    createInterface({ input: channel }).on('line', (line) => {
+      const wasTesting = isTesting();
+      const event = lifecycle.accept(line);
+      if (event === null) {
+        failLifecycle(lifecycle.error() ?? 'invalid lifecycle event', wasTesting);
+        return;
+      }
+      updateIdle(false, wasTesting);
+      // Tool startup and native lifecycle-bearing stdout wait for their phase acknowledgement.
+      channel.write(`${JSON.stringify(event)}\n`);
+    });
+    channel.on('error', (error) => failLifecycle(error.message));
+    channel.on('end', () => {
+      if (!lifecycle.finished()) failLifecycle('supervisor channel ended without an owned terminal event');
+    });
+  }
   child.stdout?.on('data', (chunk: Buffer | string) => {
     const text = chunk.toString();
     scanProgress('stdout', text);
@@ -661,7 +695,7 @@ export async function runBoundedExec(
       state.settled = true;
       resolve({ code: 1, signal: null });
     });
-    child.once('exit', (code, signal) => {
+    child.once(hooked === null ? 'exit' : 'close', (code: number | null, signal: NodeJS.Signals | null) => {
       state.settled = true;
       resolve({ code, signal });
     });
@@ -806,9 +840,9 @@ export async function runBoundedExec(
   }
   await releaseLease();
 
-  // A run whose sub-pool did not close cleanly fails even when the command exited 0, and whatever bound also fired:
-  // its verdict is an ordinary failure, never a bound.
-  const operationalFailure = state.poolCloseError !== null;
+  // Broken resource ownership or a lost native lifecycle fails even if a shell branch later exited 0:
+  // its verdict is an ordinary operational failure, never a successful or silently unbounded run.
+  const operationalFailure = state.poolCloseError !== null || lifecycleFailure !== null;
   await recordRun(code, state.expiry, Date.now() - startedAt, operationalFailure, seen);
 
   return {

@@ -23,15 +23,13 @@ import { BUN_TEST, GO_TEST, NEXTEST_RUN } from './verdict.js';
  *   `fail`, or `skip` ends that execution interval. Test terminals re-arm the bound, but `output` and
  *   `build-output` never do. Initial and inter-package builds are outside an active test interval.
  *
- * A command without a recognised execution lifecycle remains bounded from spawn.
+ * Execution phases are owned by the private supervisor channel in runner-lifecycle.ts, never these text reports.
  */
 export interface RunProgress {
   /** One chunk of one of the command's output streams; true when it reports a finished test or Go package. */
   scan(stream: OutputStream, chunk: string): boolean;
   /** The tests the runner reported running and has not reported finished, in the order it first named them. */
   inFlight(): string[];
-  /** Whether test idle time is currently chargeable; unknown runner lifecycles stay chargeable. */
-  isTesting(): boolean;
 }
 
 export type OutputStream = 'stdout' | 'stderr';
@@ -68,7 +66,7 @@ function goTestEvent(text: string): GoTestEvent | null {
   }
 }
 
-/** Defer only a direct Go command/chain; an unknown shell wrapper or another runner keeps its existing bound. */
+/** A direct Go chain reports tests only through JSON; other commands may also carry text runner reports. */
 function onlyGoTests(command: string): boolean {
   let rest = command.trim();
   while (rest.search(GO_TEST) === 0) {
@@ -170,7 +168,6 @@ export function createRunProgress(command = ''): RunProgress {
         tests.size === 0 ? [name] : [...tests].map((test) => `${name} ${test}`),
       ),
     ],
-    isTesting: () => !goLifecycle || packages.size > 0,
   };
 }
 

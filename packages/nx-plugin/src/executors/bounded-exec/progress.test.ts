@@ -25,26 +25,20 @@ describe('run progress', () => {
     expect(progress.inFlight()).toEqual(['example/second TestHang']);
   });
 
-  it('counts only active Go package intervals, including startup and parallel packages', () => {
+  it('tracks Go package startup and parallel packages until their terminal reports', () => {
     const progress = createRunProgress('go test ./...');
-    expect(progress.isTesting()).toBe(false);
     progress.scan('stdout', '{"Action":"start","Package":"first"}\n{"Action":"start","Package":"second"}\n');
-    expect(progress.isTesting()).toBe(true);
     expect(progress.inFlight()).toEqual(['first', 'second']);
     progress.scan('stdout', '{"Action":"pass","Package":"first"}\n');
-    expect(progress.isTesting()).toBe(true);
     expect(progress.inFlight()).toEqual(['second']);
     progress.scan('stdout', '{"Action":"fail","Package":"second"}\n');
-    expect(progress.isTesting()).toBe(false);
     expect(progress.inFlight()).toEqual([]);
   });
 
   it('buffers split Go events and does not mistake test output for lifecycle events', () => {
     const progress = createRunProgress('go test ./...');
     expect(progress.scan('stdout', '{"Action":"sta')).toBe(false);
-    expect(progress.isTesting()).toBe(false);
     expect(progress.scan('stdout', 'rt","Package":"example"}\n')).toBe(false);
-    expect(progress.isTesting()).toBe(true);
     expect(progress.scan('stdout', '{"Action":"run","Package":"example","Test":"TestHang"}\n')).toBe(false);
     expect(progress.scan('stdout', '{"Action":"pause","Package":"example","Test":"TestHang"}\n')).toBe(false);
     expect(progress.inFlight()).toEqual(['example TestHang']);
@@ -57,13 +51,6 @@ describe('run progress', () => {
     expect(progress.scan('stdout', '{"Action":"skip","Package":"example","Test":"TestHang"}\n')).toBe(true);
     expect(progress.inFlight()).toEqual(['example']);
     expect(progress.scan('stdout', '{"Action":"pass","Package":"example"}\n')).toBe(true);
-    expect(progress.isTesting()).toBe(false);
-  });
-
-  it('keeps the existing watchdog for commands without a complete Go lifecycle contract', () => {
-    for (const command of ['bun test src', 'cargo nextest run', 'cargo test', 'go test ./... && bun test src']) {
-      expect(createRunProgress(command).isTesting()).toBe(true);
-    }
   });
 
   it('counts a nextest status line with its run counter as a finished test, and a SLOW line as none', () => {
