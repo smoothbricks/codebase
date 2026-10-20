@@ -38,7 +38,6 @@ use cowshed_os::fsio::AnchoredDirectory;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::super::bootstrap::is_reserved_store_namespace;
 use super::super::deletion_log::{self, DeletionKind, DeletionOp};
 use super::super::lifecycle::{
     CheckpointFact, DefragmentOutcome, DerivedWorkspace, KernelMountFact, LifecycleFact,
@@ -509,6 +508,7 @@ pub(in crate::storage) fn gc_candidate_failure_is_fatal(error: &ApfsStorageError
         | ApfsStorageError::InsufficientSpace { .. }
         | ApfsStorageError::InvalidPlan(_)
         | ApfsStorageError::Layout(_)
+        | ApfsStorageError::OwnerScan(_)
         | ApfsStorageError::MarkerMismatch(_)
         | ApfsStorageError::MissingCaCompanion { .. }
         | ApfsStorageError::PendingPublication(_)
@@ -909,20 +909,12 @@ fn staged_stem_workspace(stem: &str) -> Option<WorkspaceName> {
     WorkspaceIncarnation::new(incarnation).ok()?;
     WorkspaceName::new(workspace).ok()
 }
-fn is_project_owner_directory(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| !is_reserved_store_namespace(name))
-}
-
+/// The project directories of every owner cowshed marked (`bootstrap::project_owner_directories`).
 pub(in crate::storage) fn collect_project_directories(
     store_root: &Path,
 ) -> Result<Vec<PathBuf>, ApfsStorageError> {
     let mut projects = Vec::new();
-    for owner in directory_children(store_root)? {
-        if !is_project_owner_directory(&owner) {
-            continue;
-        }
+    for owner in crate::storage::bootstrap::project_owner_directories(store_root)? {
         projects.extend(directory_children(&owner)?);
     }
     Ok(projects)
@@ -7812,7 +7804,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn project_recovery_ignores_unreadable_apfs_metadata_directories() {
+    fn project_recovery_reads_marked_owners_only() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
@@ -7821,8 +7813,17 @@ mod tests {
         ));
         let system_metadata = root.join(".Trashes");
         let project = root.join("acme").join("widget");
+        // Shaped like an owner, with a project binding even, but nothing marked it one.
+        let foreign = root.join("telemetry-archive").join("widget");
         std::fs::create_dir_all(&system_metadata).expect("APFS metadata fixture");
         std::fs::create_dir_all(&project).expect("project fixture");
+        std::fs::create_dir_all(&foreign).expect("foreign fixture");
+        std::fs::write(
+            foreign.join(crate::repository::REPOSITORY_BINDING_FILE),
+            b"{}",
+        )
+        .expect("foreign binding");
+        crate::storage::bootstrap::write_owner_marker(&root.join("acme")).expect("mark acme");
         std::fs::set_permissions(&system_metadata, std::fs::Permissions::from_mode(0o000))
             .expect("make APFS metadata unreadable");
 

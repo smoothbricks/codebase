@@ -2998,7 +2998,7 @@ fn remove_unbound_project_state(paths: &crate::repository::ProjectPaths) -> Resu
     }
     remove_directory_if_empty(&paths.project_root)?;
     if let Some(owner) = paths.project_root.parent() {
-        remove_directory_if_empty(owner)?;
+        remove_store_owner_if_projectless(owner)?;
     }
     for tree in [paths.mount_root.as_path(), build.mounts()] {
         remove_empty_mount_tree(tree)?;
@@ -3044,6 +3044,19 @@ fn remove_directory_if_empty(directory: &Path) -> Result<()> {
             "check controller storage permissions and retry",
         )),
     }
+}
+
+/// An unbound project's store owner goes with its last project, marker and all.
+fn remove_store_owner_if_projectless(owner: &Path) -> Result<()> {
+    crate::storage::bootstrap::remove_owner_if_projectless(owner).map_err(|error| {
+        CowshedError::environment_missing(
+            format!(
+                "cannot remove unbound project owner {}: {error}",
+                owner.display()
+            ),
+            "check controller storage permissions and retry",
+        )
+    })
 }
 
 /// An unbound project's mount tree holds only the mountpoints of retired workspaces and
@@ -7173,7 +7186,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             remove_unbound_file(&paths.checkout_root)?;
             remove_directory_if_empty(&paths.project_root)?;
             match paths.project_root.parent() {
-                Some(owner) => remove_directory_if_empty(owner),
+                Some(owner) => remove_store_owner_if_projectless(owner),
                 None => Ok(()),
             }
         })
@@ -20674,7 +20687,8 @@ mod workspace_origin_tests {
             .expect("origin");
         let repo_id = RepoId::parse("acme/widget").expect("repo");
         let layout = crate::storage::StorageLayout::new(&store, &repo_id).expect("layout");
-        std::fs::create_dir_all(&layout.project().project_root).expect("project store");
+        std::fs::create_dir_all(&store).expect("store");
+        layout.provision_project().expect("project store");
         let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
             repo_id: repo_id.clone(),
             remote_name: Some("origin".to_owned()),
@@ -20724,7 +20738,8 @@ mod workspace_origin_tests {
         let layout =
             crate::storage::StorageLayout::with_mount_root(&store, temp.join("mnt"), &repo_id)
                 .expect("layout");
-        std::fs::create_dir_all(&layout.project().project_root).expect("project store");
+        std::fs::create_dir_all(&store).expect("store");
+        layout.provision_project().expect("project store");
         let binding = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
             repo_id: repo_id.clone(),
             remote_name: Some("origin".to_owned()),
@@ -21050,7 +21065,8 @@ mod binding_heal_persistence_tests {
             std::env::temp_dir().join(format!("cowshed-heal-{}-{nonce}", std::process::id()));
         let repo_id = RepoId::parse("acme/widget").expect("repo");
         let layout = crate::storage::StorageLayout::new(&store, &repo_id).expect("layout");
-        std::fs::create_dir_all(&layout.project().project_root).expect("project store");
+        std::fs::create_dir_all(&store).expect("store");
+        layout.provision_project().expect("project store");
         let recorded = RepositoryBinding::new(vec![crate::repository::BoundIdentity {
             repo_id: repo_id.clone(),
             remote_name: Some("origin".to_owned()),
@@ -21715,7 +21731,7 @@ mod port_reservation_tests {
         std::fs::create_dir_all(roots.store()).expect("store");
         let repo = RepoId::parse("acme/widget").expect("repo");
         let layout = StorageLayout::new(roots.store(), &repo).expect("layout");
-        std::fs::create_dir_all(&layout.project().project_root).expect("project");
+        layout.provision_project().expect("project");
         let binding = RepositoryBinding::new(vec![BoundIdentity {
             repo_id: repo,
             remote_name: None,
@@ -22524,6 +22540,10 @@ mod terminal_project_cleanup_tests {
         let paths = ProjectPaths::with_mount_root(root.join("store"), root.join("mnt"), &repo)
             .expect("project paths");
         std::fs::create_dir_all(&paths.project_root).expect("project root");
+        crate::storage::bootstrap::write_owner_marker(
+            paths.project_root.parent().expect("owner directory"),
+        )
+        .expect("mark the owner");
         std::fs::create_dir_all(paths.mount_root.join(".staging/main-orphan")).expect("staging");
         std::fs::create_dir_all(paths.mount_root.join("raven")).expect("retired mountpoint");
         for file in [

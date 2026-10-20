@@ -89,6 +89,13 @@ place, and the only volume it ever deletes is a retired caches volume, under `--
 healthy host it changes nothing and says so. Every storage error in the CLI points here — a host with no volumes has no
 checkout to adopt.
 
+Once the store is mounted, setup brings its layout current before anything else reads it. Only a directory that holds
+`.cowshed-owner` is a project owner to every command, so a directory dropped into the store root costs nothing. A store
+from before those markers (its volume marker at layout version 1) is refused by every command that enumerates projects,
+naming the store and `cowshed setup`. Setup marks each store-root directory that holds a `<repo>/repository.json`, never
+one that does not, says which it marked, and then records layout version 2 (specs/cowshed/01_storage.md, "Directory
+layout").
+
 Once storage repair succeeds, setup installs the build it runs from as the host's cowshed — the gateway daemon's binary
 and the `cowshed` you type, as one artifact. The build is copied to a content-addressed file,
 `~/Library/Application Support/dev.cowshed/bin/cowshed-<sha256>`; the stable name `cowshed` beside it becomes a link to

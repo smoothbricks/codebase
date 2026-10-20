@@ -168,8 +168,11 @@ fn published_directory(
     );
     let repo = RepoId::parse("fixture/directory").unwrap();
     let workspace = WorkspaceName::session(name).unwrap();
-    let image = layout(&config, &repo)
-        .unwrap()
+    let storage = layout(&config, &repo).unwrap();
+    // Adoption's own provisioning, which marks the owner store recovery reads.
+    fs::create_dir_all(&config.store_root).unwrap();
+    storage.provision_project().unwrap();
+    let image = storage
         .session_image(&workspace)
         .unwrap()
         .image()

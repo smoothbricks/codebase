@@ -3188,7 +3188,9 @@ fn detach_store_storage_error(error: impl std::fmt::Display) -> CowshedError {
 /// Resolve a session workspace's owning checkout from the store readdir.
 ///
 /// Identity is the image sidecar's `infoSnapshot.projectRoot` (the same project root the
-/// in-image marker records). Remotes and cwd git discovery are not consulted.
+/// in-image marker records). Remotes and cwd git discovery are not consulted. Owners are the
+/// store's marked owners, the one enumeration every store walker uses; a reserved name is
+/// never read as a repository.
 pub(crate) fn resolve_session_project_root(
     store: &Path,
     workspace: &str,
@@ -3201,36 +3203,27 @@ pub(crate) fn resolve_session_project_root(
         )
     })?;
     let mut found: Vec<(RepoId, PathBuf)> = Vec::new();
-    let owners = fs::read_dir(store).map_err(|error| {
-        CowshedError::environment_missing(
-            format!("could not read cowshed store {}: {error}", store.display()),
-            "cowshed setup",
-        )
-    })?;
+    let owners = cowshed_core::storage::bootstrap::project_owner_directories(store)
+        .map_err(|error| CowshedError::environment_missing(error.to_string(), "cowshed setup"))?;
     for owner in owners {
-        let owner = owner.map_err(|error| {
+        let repos = fs::read_dir(&owner).map_err(|error| {
             CowshedError::environment_missing(
-                format!("could not read cowshed store {}: {error}", store.display()),
-                "cowshed setup",
-            )
-        })?;
-        if !dirent_is_plain_dir(&owner) {
-            continue;
-        }
-        let repos = fs::read_dir(owner.path()).map_err(|error| {
-            CowshedError::environment_missing(
-                format!("could not read {}: {error}", owner.path().display()),
+                format!("could not read {}: {error}", owner.display()),
                 "cowshed setup",
             )
         })?;
         for repo in repos {
             let repo = repo.map_err(|error| {
                 CowshedError::environment_missing(
-                    format!("could not read {}: {error}", owner.path().display()),
+                    format!("could not read {}: {error}", owner.display()),
                     "cowshed setup",
                 )
             })?;
-            if !dirent_is_plain_dir(&repo) {
+            let reserved = repo
+                .file_name()
+                .to_str()
+                .is_none_or(cowshed_core::storage::bootstrap::is_reserved_store_namespace);
+            if reserved || !dirent_is_plain_dir(&repo) {
                 continue;
             }
             let sessions = repo.path().join("sessions");
@@ -7188,6 +7181,7 @@ mod tests {
     ) {
         let sessions = store.join(owner).join(repo).join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
+        cowshed_core::storage::bootstrap::write_owner_marker(&store.join(owner)).unwrap();
         let image = sessions.join(format!("{workspace}.dmg"));
         std::fs::write(&image, b"image").unwrap();
         let mut sidecar = serde_json::json!({

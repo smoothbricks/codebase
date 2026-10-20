@@ -781,6 +781,8 @@ pub enum ApfsStorageError {
     Apfs(#[from] ApfsError),
     #[error("storage layout failed: {0}")]
     Layout(#[from] StorageLayoutError),
+    #[error(transparent)]
+    OwnerScan(#[from] super::bootstrap::OwnerScanError),
     #[error("{operation} {path} failed: {source}")]
     Io {
         operation: &'static str,

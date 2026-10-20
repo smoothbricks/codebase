@@ -44,7 +44,7 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
 
 ```
 /private/cowshed/store/                          # ← the cowshed.store volume, fstab-pinned here (01a_apfs.md, "Dedicated store volume")
-  .cowshed-volume.json               # volume marker: its ABSENCE means "not mounted" (01a_apfs.md, mount ordering)
+  .cowshed-volume.json               # volume marker: its ABSENCE means "not mounted" (01a_apfs.md, mount ordering); a store's is at layout version 2
   host.json                          # host configuration: credential routes; mount root is derived, never stored
   .staging/                          # port-block reservations held while a workspace's grants are minted
   .blank/                            # APFS blank templates (01a_apfs.md, "Images")
@@ -60,6 +60,8 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
   .retired-projects/                  # preserved, detached evidence; never discovered as live projects
     <operation-id>/                  # the complete former project store tree, renamed without copying or deleting
     <operation-id>.json              # completed retirement receipt
+  <owner>/                           # a project owner, and the only store-root entry discovery reads
+    .cowshed-owner                   # empty: makes this directory an owner (written when its first project is provisioned)
   <owner>/<repo>/                    # primary repo_id, encoded one component at a time
     repository.json                  # chosen remote binding, alternate identities, and primary designation
     checkout-root.json               # where the checkout was when main was last removed (written then, read to reopen)
@@ -104,6 +106,19 @@ The store root owns the logical namespaces below. This tree shows the macOS/APFS
   (rebuildable caches are not beneath this tree: each tool keeps its own in the host HOME; see 03_caches.md)
   (workspaces mount under one fixed per-user root; macOS path and provisioning: 01a_apfs.md, "Stable workspace mount root")
 ```
+
+**Owners are marked, never inferred.** Every walker of the store root reads only the directories that hold
+`.cowshed-owner` and are not reserved names (dotted names and the controller's own namespaces above): one `lstat` passes
+over anything else, however much it holds. Nothing is ever read as a repository under a reserved name. A project's
+provisioning writes its owner's marker. A store whose volume marker is at layout version 1 predates the markers: every
+enumeration of it refuses, naming the store and `cowshed setup`, and setup migrates it. Setup alone walks the store root
+by what it finds: it marks each directory that holds a `<repo>/repository.json`, and only those, then records layout
+version 2 in the store's volume marker, last and atomically, so a migration cut short is redone by the next setup.
+Measured 2026-10-20, before the markers: six telemetry archives moved into the store root, one holding 3,070,019 files,
+made every command that discovers projects probe each entry of each for a volume marker and a binding.
+`cowshed path main` sat in that probe for more than 18 minutes, and in the same window a land's Nx cache initialization
+took 2685 s. With the archives renamed under a dotted name, `cowshed path main` took 0.19 s and the same initialization
+0.3 s.
 
 Workspace mountpoints live under a fixed **mount root**, laid out `<mount-root>/<owner>/<repo>/<workspace>`. On macOS
 the canonical root is `/private/var/folders/cowshed/<uid>/mnt`, derived from the invoking numeric UID; Linux uses

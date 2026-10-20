@@ -63,6 +63,8 @@ struct FakeHost {
     /// nix, a flake, or launchd.
     sccache_install: SccacheInstall,
     build_state: Vec<ProjectBuildState>,
+    /// The owners the store layout migration marked, so its sentence is provable without a store.
+    owners: Vec<PathBuf>,
     /// What steps 1–3 of the caches retirement did, so the rows and the exit are provable
     /// without moving anything out of a real home.
     retirement: Option<RetirementReport>,
@@ -148,6 +150,7 @@ impl Default for FakeHost {
                 ),
             },
             build_state: Vec::new(),
+            owners: Vec::new(),
             retirement: None,
             caches_volume: None,
         }
@@ -211,6 +214,11 @@ impl HostSetup for FakeHost {
 
     async fn install_cli(&mut self) -> Result<Option<CliInstall>> {
         Ok(self.cli.clone())
+    }
+
+    async fn mark_project_owners(&mut self) -> Result<Vec<PathBuf>> {
+        self.events.push(String::from("mark-project-owners"));
+        Ok(self.owners.clone())
     }
 
     async fn build_state_projects(&mut self) -> Result<Vec<AdoptedProject>> {
@@ -734,6 +742,7 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
             "retire-caches-volume",
             "plan",
             "execute",
+            "mark-project-owners",
             "unmounted-mains",
             "git-identity",
             "configure-sccache-client",
@@ -742,6 +751,46 @@ async fn a_healthy_host_is_told_it_is_already_set_up() {
             "retire-caches-volume",
             "census"
         ]
+    );
+}
+
+/// A store from before owner markers is migrated as soon as its volumes are up, before any step
+/// that enumerates projects, and the owners it marked are named.
+#[tokio::test]
+async fn setup_marks_the_store_owners_before_anything_enumerates_projects() {
+    let mut host = FakeHost {
+        owners: vec![
+            PathBuf::from("/private/cowshed/store/acme"),
+            PathBuf::from("/private/cowshed/store/widgets"),
+        ],
+        ..FakeHost::default()
+    };
+
+    let streams = run(&mut host, REPAIR, false, false).await;
+
+    assert_eq!(streams.exit, 0);
+    assert!(
+        streams.stderr.contains(
+            "cowshed: marked 2 project owner(s) so store discovery reads them: \
+             /private/cowshed/store/acme, /private/cowshed/store/widgets\n"
+        ),
+        "{}",
+        streams.stderr
+    );
+    let marked = host
+        .events
+        .iter()
+        .position(|event| event == "mark-project-owners")
+        .expect("the migration ran");
+    let executed = host.events.iter().position(|event| event == "execute");
+    let enumerated = host
+        .events
+        .iter()
+        .position(|event| event == "unmounted-mains");
+    assert!(
+        executed < Some(marked) && Some(marked) < enumerated,
+        "{:?}",
+        host.events
     );
 }
 
@@ -1188,6 +1237,7 @@ async fn an_escalating_run_announces_the_prompt_before_executing() {
             "retire-caches-volume",
             "plan",
             "execute",
+            "mark-project-owners",
             "unmounted-mains",
             "git-identity",
             "configure-sccache-client",
@@ -2224,6 +2274,7 @@ async fn mount_service_install_is_disclosed_before_authorization() {
             "retire-caches-volume",
             "plan",
             "execute",
+            "mark-project-owners",
             "unmounted-mains",
             "git-identity",
             "configure-sccache-client",

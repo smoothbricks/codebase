@@ -82,6 +82,8 @@ impl Fixture {
             GitOid::new(git_text(&checkout, &["rev-parse", "HEAD^{tree}"])).expect("tree oid");
         let project = scratch.join("store").join("acme").join("widget");
         fs::create_dir_all(&project).expect("create project directory");
+        crate::storage::bootstrap::write_owner_marker(project.parent().expect("owner"))
+            .expect("mark the owner");
         let staging = project.join(STAGING_NAMESPACE);
         Self {
             _scratch: scratch,

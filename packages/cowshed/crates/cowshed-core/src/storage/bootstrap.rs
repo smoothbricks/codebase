@@ -73,6 +73,228 @@ pub const RETIREMENTS_NAMESPACE: &str = ".retirements";
 /// re-discovered or healed, and nothing in cowshed reclaims it.
 pub const RETIRED_PROJECTS_NAMESPACE: &str = ".retired-projects";
 
+/// What makes a store-root directory a project owner: an empty regular file of this name in it,
+/// written when cowshed provisions the owner's first project (01_storage.md "Directory layout").
+/// An owner is a fact recorded where it lives, never an inference from what a directory holds: a
+/// directory someone drops in the store root costs one `lstat` to pass over, whatever it holds.
+/// Dotted, so no walker takes it for a repository.
+pub const OWNER_MARKER_FILE: &str = ".cowshed-owner";
+
+/// The store layout whose owners carry [`OWNER_MARKER_FILE`]. A store volume's marker at an
+/// older version predates owner markers: `cowshed setup` marks its owners and then records this
+/// version ([`mark_project_owners`]); nothing else enumerates such a store.
+const STORE_LAYOUT_VERSION: u32 = 2;
+
+/// The marker version a volume of `role` is written at and read as current.
+const fn marker_version(role: VolumeRole) -> u32 {
+    match role {
+        VolumeRole::Store => STORE_LAYOUT_VERSION,
+        VolumeRole::Caches | VolumeRole::Projects => MARKER_VERSION,
+    }
+}
+
+/// Why the project owners of a store cannot be enumerated.
+#[derive(Debug, Error)]
+pub enum OwnerScanError {
+    #[error(
+        "cowshed store {store} is at layout version {found}, whose project owners carry no {OWNER_MARKER_FILE} marker: run `cowshed setup` to mark them"
+    )]
+    Unmigrated { store: PathBuf, found: u32 },
+    #[error("cannot read the volume marker of cowshed store {store}: {message}")]
+    Marker { store: PathBuf, message: String },
+    #[error("cannot {operation} {path}: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+/// Is `owner`, the store-root entry named `name`, a project owner? Only a directory cowshed
+/// marked is one; a reserved name never is.
+pub fn is_project_owner(owner: &Path, name: &str) -> bool {
+    !is_reserved_store_namespace(name)
+        && std::fs::symlink_metadata(owner.join(OWNER_MARKER_FILE))
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+/// The project owners of the store at `store_root`, in name order: the one enumeration every
+/// walker of the store root uses. A store whose volume marker predates owner markers is refused,
+/// naming the command that migrates it; a store root with no volume marker (a directory store)
+/// has no older layout to migrate.
+pub fn project_owner_directories(store_root: &Path) -> Result<Vec<PathBuf>, OwnerScanError> {
+    require_store_layout(store_root)?;
+    let entries = std::fs::read_dir(store_root).map_err(|source| OwnerScanError::Io {
+        operation: "enumerate the owners of",
+        path: store_root.to_owned(),
+        source,
+    })?;
+    let mut owners = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| OwnerScanError::Io {
+            operation: "enumerate the owners of",
+            path: store_root.to_owned(),
+            source,
+        })?;
+        let path = entry.path();
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| is_project_owner(&path, name))
+        {
+            owners.push(path);
+        }
+    }
+    owners.sort();
+    Ok(owners)
+}
+
+fn require_store_layout(store_root: &Path) -> Result<(), OwnerScanError> {
+    let path = store_root.join(VOLUME_MARKER_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(OwnerScanError::Io {
+                operation: "read",
+                path,
+                source,
+            });
+        }
+    };
+    let marker = VolumeMarker::from_json(&bytes).map_err(|error| OwnerScanError::Marker {
+        store: store_root.to_owned(),
+        message: error.to_string(),
+    })?;
+    if marker.is_current() {
+        Ok(())
+    } else {
+        Err(OwnerScanError::Unmigrated {
+            store: store_root.to_owned(),
+            found: marker.version,
+        })
+    }
+}
+
+/// Write [`OWNER_MARKER_FILE`] in `owner`; an existing one is kept.
+pub fn write_owner_marker(owner: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(owner.join(OWNER_MARKER_FILE))
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Remove the owner directory `owner` once it holds no project: nothing but its
+/// [`OWNER_MARKER_FILE`]. An owner that still holds anything else is kept as it is. A project
+/// provisioned under it between the look and the removal keeps its owner: the directory is then
+/// not empty, and the marker is written back.
+pub fn remove_owner_if_projectless(owner: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(owner) {
+        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if entries
+        .iter()
+        .any(|entry| entry.file_name() != std::ffi::OsStr::new(OWNER_MARKER_FILE))
+    {
+        return Ok(());
+    }
+    match std::fs::remove_file(owner.join(OWNER_MARKER_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match std::fs::remove_dir(owner) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            write_owner_marker(owner)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The store layout migration `cowshed setup` runs, and the one path allowed to walk the store
+/// root by what it finds: mark every store-root directory that holds a `<repo>/repository.json`
+/// as a project owner, then record [`STORE_LAYOUT_VERSION`] in the store's volume marker. A
+/// directory holding no project binding is never marked. Answers the owners it marked. A store
+/// already at the current layout is left as it is.
+pub fn mark_project_owners(store_root: &Path) -> Result<Vec<PathBuf>, OwnerScanError> {
+    let marker_path = store_root.join(VOLUME_MARKER_FILE);
+    let bytes = std::fs::read(&marker_path).map_err(|source| OwnerScanError::Io {
+        operation: "read",
+        path: marker_path.clone(),
+        source,
+    })?;
+    let marker = VolumeMarker::from_json(&bytes).map_err(|error| OwnerScanError::Marker {
+        store: store_root.to_owned(),
+        message: error.to_string(),
+    })?;
+    if marker.is_current() {
+        return Ok(Vec::new());
+    }
+    let io = |operation, path: &Path| {
+        let path = path.to_owned();
+        move |source| OwnerScanError::Io {
+            operation,
+            path,
+            source,
+        }
+    };
+    let mut marked = Vec::new();
+    for entry in std::fs::read_dir(store_root).map_err(io("enumerate", store_root))? {
+        let entry = entry.map_err(io("enumerate", store_root))?;
+        let owner = entry.path();
+        let is_candidate = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| !is_reserved_store_namespace(name))
+            && entry.file_type().map_err(io("inspect", &owner))?.is_dir();
+        if !is_candidate {
+            continue;
+        }
+        for child in std::fs::read_dir(&owner).map_err(io("enumerate", &owner))? {
+            let child = child.map_err(io("enumerate", &owner))?;
+            if !child
+                .file_type()
+                .map_err(io("inspect", &child.path()))?
+                .is_dir()
+            {
+                continue;
+            }
+            let binding = child
+                .path()
+                .join(crate::repository::REPOSITORY_BINDING_FILE);
+            if std::fs::symlink_metadata(&binding).is_ok_and(|metadata| metadata.is_file()) {
+                write_owner_marker(&owner).map_err(io("mark", &owner))?;
+                marked.push(owner);
+                break;
+            }
+        }
+    }
+    marked.sort();
+    let current = VolumeMarker::new(VolumeRole::Store, marker.substrate);
+    let json = current.to_json().map_err(|error| OwnerScanError::Marker {
+        store: store_root.to_owned(),
+        message: error.to_string(),
+    })?;
+    // Recorded last, and atomically: a migration cut short leaves the old version, and the next
+    // `cowshed setup` marks again, keeping every marker already written.
+    let staged = store_root.join(format!("{VOLUME_MARKER_FILE}.migrating"));
+    std::fs::write(&staged, json).map_err(io("write", &staged))?;
+    std::fs::rename(&staged, &marker_path).map_err(io("record the layout in", &marker_path))?;
+    Ok(marked)
+}
+
 pub(crate) use cowshed_apfs::device::DISKUTIL;
 const ZFS: &str = "/usr/sbin/zfs";
 const MARKER_VERSION: u32 = 1;
@@ -681,10 +903,16 @@ pub struct VolumeMarker {
 impl VolumeMarker {
     pub fn new(role: VolumeRole, substrate: SubstrateKind) -> Self {
         Self {
-            version: MARKER_VERSION,
+            version: marker_version(role),
             role,
             substrate,
         }
+    }
+
+    /// Is this marker at its role's current version? A store marker at an older one is a store
+    /// `cowshed setup` has yet to migrate ([`mark_project_owners`]).
+    pub fn is_current(&self) -> bool {
+        self.version == marker_version(self.role)
     }
 
     pub fn role(&self) -> VolumeRole {
@@ -701,9 +929,11 @@ impl VolumeMarker {
         Ok(bytes)
     }
 
+    /// Reads a marker at any version its role has had: setup reads an older store marker to
+    /// migrate it, and everything that enumerates the store refuses one ([`OwnerScanError`]).
     pub fn from_json(bytes: &[u8]) -> Result<Self, MarkerError> {
         let marker: Self = serde_json::from_slice(bytes).map_err(MarkerError::Decode)?;
-        if marker.version != MARKER_VERSION {
+        if !(MARKER_VERSION..=marker_version(marker.role)).contains(&marker.version) {
             return Err(MarkerError::UnsupportedVersion(marker.version));
         }
         Ok(marker)
@@ -1550,7 +1780,7 @@ fn zfs_marker(dataset: &str, role: VolumeRole) -> HostOperation {
         ZFS,
         [
             "set".to_owned(),
-            format!("org.cowshed:version={MARKER_VERSION}"),
+            format!("org.cowshed:version={}", marker_version(role)),
             format!("org.cowshed:role={role}"),
             dataset.to_owned(),
         ],
@@ -2019,6 +2249,8 @@ pub enum BootstrapExecutionError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::{
         RETIRED_PROJECTS_NAMESPACE, RETIREMENTS_NAMESPACE, VOLUME_MARKER_FILE,
         is_reserved_store_namespace,
@@ -2074,5 +2306,110 @@ mod tests {
                 String::from_utf8_lossy(rejected)
             );
         }
+    }
+
+    fn store_marker(root: &Path, version: u32) {
+        std::fs::write(
+            root.join(super::VOLUME_MARKER_FILE),
+            format!(r#"{{"version":{version},"role":"store","substrate":"apfs"}}"#),
+        )
+        .expect("store marker");
+    }
+
+    /// A store-root directory shaped like an owner, with a `<repo>/repository.json` even, is
+    /// passed over unless cowshed marked it; a marked reserved name is still never an owner.
+    #[test]
+    fn only_marked_owners_are_enumerated() {
+        use super::{OWNER_MARKER_FILE, project_owner_directories, write_owner_marker};
+        let root = crate::temp_root::TempRoot::new("owner-scan");
+        store_marker(&root, 2);
+        for repo in ["acme/widget", "archive/widget", "telemetry/widget"] {
+            let project = root.join(repo);
+            std::fs::create_dir_all(&project).expect("project fixture");
+            std::fs::write(
+                project.join(crate::repository::REPOSITORY_BINDING_FILE),
+                b"{}",
+            )
+            .expect("binding fixture");
+        }
+        write_owner_marker(&root.join("acme")).expect("mark acme");
+        write_owner_marker(&root.join("acme")).expect("marking again keeps the marker");
+        std::fs::write(root.join("telemetry").join(OWNER_MARKER_FILE), b"").expect("marker");
+        assert_eq!(
+            project_owner_directories(&root).expect("owner scan"),
+            vec![root.join("acme")]
+        );
+    }
+
+    /// A store whose volume marker predates owner markers is refused by every enumeration, naming
+    /// the store and the command that migrates it.
+    #[test]
+    fn an_unmigrated_store_refuses_enumeration_naming_the_store_and_setup() {
+        use super::{OwnerScanError, project_owner_directories};
+        let root = crate::temp_root::TempRoot::new("owner-scan-v1");
+        store_marker(&root, 1);
+        let error = project_owner_directories(&root).expect_err("a v1 store was enumerated");
+        assert!(
+            matches!(&error, OwnerScanError::Unmigrated { store, found: 1 } if store == &*root),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&root.display().to_string()) && message.contains("`cowshed setup`"),
+            "{message}"
+        );
+    }
+
+    /// The migration marks exactly the directories that hold a project binding, records the
+    /// current layout last, and finds nothing to do once the store is current.
+    #[test]
+    fn setup_marks_owners_with_a_project_binding_and_records_the_layout() {
+        use super::{
+            OWNER_MARKER_FILE, VolumeMarker, mark_project_owners, project_owner_directories,
+        };
+        let root = crate::temp_root::TempRoot::new("owner-migration");
+        store_marker(&root, 1);
+        let bound = root.join("acme/widget");
+        std::fs::create_dir_all(&bound).expect("project fixture");
+        std::fs::write(
+            bound.join(crate::repository::REPOSITORY_BINDING_FILE),
+            b"{}",
+        )
+        .expect("binding fixture");
+        std::fs::create_dir_all(root.join("acme/half-adopted")).expect("unbound sibling");
+        // A directory dropped in the store root: files, and a directory with no binding.
+        let foreign = root.join("telemetry-archive-2026-10-19");
+        std::fs::create_dir_all(foreign.join("2026-10-19")).expect("foreign fixture");
+        std::fs::write(foreign.join("process-1.arrow"), b"").expect("foreign file");
+        std::fs::create_dir_all(root.join("run/widget")).expect("reserved fixture");
+        std::fs::write(
+            root.join("run/widget")
+                .join(crate::repository::REPOSITORY_BINDING_FILE),
+            b"{}",
+        )
+        .expect("reserved binding");
+
+        assert_eq!(
+            mark_project_owners(&root).expect("migration"),
+            vec![root.join("acme")]
+        );
+        assert!(
+            !foreign.join(OWNER_MARKER_FILE).exists(),
+            "a guess was marked"
+        );
+        assert!(!root.join("run").join(OWNER_MARKER_FILE).exists());
+        let marker = VolumeMarker::from_json(
+            &std::fs::read(root.join(super::VOLUME_MARKER_FILE)).expect("store marker"),
+        )
+        .expect("current marker");
+        assert!(marker.is_current(), "{marker:?}");
+        assert_eq!(
+            project_owner_directories(&root).expect("owner scan"),
+            vec![root.join("acme")]
+        );
+        assert_eq!(
+            mark_project_owners(&root).expect("second migration"),
+            Vec::<PathBuf>::new()
+        );
     }
 }

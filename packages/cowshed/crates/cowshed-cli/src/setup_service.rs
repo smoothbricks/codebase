@@ -291,6 +291,11 @@ pub trait HostSetup: Send {
     /// home in the host HOME, stopping the gateway and the sccache daemon around the moves they
     /// own. `None` on a host that has no caches volume. Needs no authorization.
     async fn retire_caches_volume(&mut self) -> Result<Option<RetirementReport>>;
+    /// Migrate the store to the layout whose project owners carry a marker
+    /// (`bootstrap::mark_project_owners`): the owners it marked, none once the store is current.
+    /// Runs right after the volumes are up and before anything enumerates the store, since every
+    /// enumeration refuses a store that predates the markers.
+    async fn mark_project_owners(&mut self) -> Result<Vec<PathBuf>>;
     /// Enumerate adopted mains before announcing any rebuild-only migration.
     async fn build_state_projects(&mut self) -> Result<Vec<AdoptedProject>>;
     /// Refresh one adopted main through the same runtime path jobs use.
@@ -484,6 +489,22 @@ impl HostSetup for NativeHostSetup {
             });
         }
         Ok(GitIdentity::Checked(observed))
+    }
+
+    async fn mark_project_owners(&mut self) -> Result<Vec<PathBuf>> {
+        let storage = validate_existing_host_storage(&self.home).await?;
+        let store = storage.store().to_owned();
+        tokio::task::spawn_blocking(move || {
+            cowshed_core::storage::bootstrap::mark_project_owners(&store)
+        })
+        .await
+        .map_err(|error| CowshedError::internal(format!("owner marking task failed: {error}")))?
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!("could not migrate the store to marked project owners: {error}"),
+                "fix the named path, then cowshed setup",
+            )
+        })
     }
 
     async fn build_state_projects(&mut self) -> Result<Vec<AdoptedProject>> {
@@ -825,6 +846,26 @@ where
     // the caller: the per-action rows say what happened, and the taxonomy says it did not work.
     // Exiting 0 here would tell every script the host was set up.
     let failure = report.failure().cloned();
+    // The store layout migration comes first among the post-volume steps: every one after it
+    // enumerates the store's projects, and that enumeration refuses a store whose owners predate
+    // their markers. A run that stopped partway has no store to migrate.
+    let marked = match &failure {
+        Some(_) => Vec::new(),
+        None => setup.mark_project_owners().await?,
+    };
+    if !marked.is_empty() {
+        output
+            .guidance(&format!(
+                "marked {} project owner(s) so store discovery reads them: {}",
+                marked.len(),
+                marked
+                    .iter()
+                    .map(|owner| owner.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .map_err(output_error)?;
+    }
     // Observed only on a run that finished. A run that stopped partway has its own headline and its
     // own remedy, and a main-mount observation on top of a failed store mount would aim the reader
     // at the wrong problem.

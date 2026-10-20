@@ -219,6 +219,8 @@ pub enum GatewayInventoryError {
     #[error("adopted project {0} records no main workspace to mount")]
     MissingMainWorkspace(RepoId),
     #[error(transparent)]
+    OwnerScan(#[from] crate::storage::bootstrap::OwnerScanError),
+    #[error(transparent)]
     Apfs(#[from] ApfsStorageError),
     #[error(transparent)]
     Derivation(#[from] DerivationError),
@@ -2075,29 +2077,17 @@ impl NativeGatewayInventory {
     }
 }
 
-/// Is this store entry something other than a project namespace?
-///
-/// Three kinds of neighbour share the store root with `<owner>/<repo>` projects and none of them is
-/// one: the bootstrap volumes, which carry a `.cowshed-volume.json` role marker and are their own
-/// namespace; macOS's per-volume system directories (`.fseventsd`, `.Spotlight-V100`, `.Trashes`),
-/// which are root-owned and unreadable to us; and cowshed's own reserved namespaces. The volume
-/// marker is the structural test and is checked first, because it identifies a volume root by what
-/// it *is* rather than by what it is called — a name list cannot keep up with a mountpoint the user
-/// relocates, and being wrong here costs the whole inventory.
-fn is_not_a_project_namespace(path: &Path, name: &str) -> bool {
-    crate::storage::bootstrap::is_reserved_store_namespace(name)
-        || fs::symlink_metadata(path.join(crate::storage::bootstrap::VOLUME_MARKER_FILE)).is_ok()
-}
-
 /// Enumerate the projects in the store, skipping everything that is not one.
 ///
-/// Discovery is per-entry isolated for the same reason healing is (see `heal`): the store root
-/// is a mount point with neighbours cowshed does not own and cannot read, and an entry that cannot
-/// be inspected is evidence that it is not a project — not grounds to fail the pass. Raising here
-/// took down the entire gateway inventory over one root-owned system directory, which left launchd
-/// showing a running process while status and doctor reported nothing started and eager heal never
-/// ran. A candidate that cannot be read is skipped; a candidate that reads as a real but broken
-/// project still raises, because that is cowshed's own state and hiding it would hide corruption.
+/// Only the owners cowshed marked are read (`bootstrap::project_owner_directories`): whatever
+/// else sits in the store root — a volume, a macOS system directory, a directory someone put
+/// there for safe-keeping — costs one `lstat` and is never listed. Measured 2026-10-20: six
+/// telemetry archives moved into the store root, one holding 3,070,019 files, made every command
+/// that discovers projects probe each of them for a volume marker and a binding; `cowshed path
+/// main` waited more than 18 minutes, and with them moved under a dotted name it answered in 0.19 s.
+/// Within an owner, discovery is per-entry isolated for the same reason healing is (see `heal`):
+/// a candidate that cannot be read is skipped; a candidate that reads as a real but broken project
+/// still raises, because that is cowshed's own state and hiding it would hide corruption.
 pub(crate) fn discover_repositories(
     store_root: &Path,
 ) -> Result<Vec<RepoId>, GatewayInventoryError> {
@@ -2118,14 +2108,7 @@ pub(crate) fn discover_owned_identities(
     ensure_directory(store_root, "opening validated store root")?;
     let mut current: BTreeSet<RepoId> = BTreeSet::new();
     let mut owned = Vec::new();
-    for owner in read_directory(store_root, "enumerating store owners")? {
-        let Some(owner_name) = owner.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if is_not_a_project_namespace(&owner, owner_name) || !is_directory(&owner).unwrap_or(false)
-        {
-            continue;
-        }
+    for owner in crate::storage::bootstrap::project_owner_directories(store_root)? {
         let Ok(projects) = read_directory(&owner, "enumerating owner repositories") else {
             continue;
         };
@@ -2133,7 +2116,7 @@ pub(crate) fn discover_owned_identities(
             let Some(project_name) = project.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if is_not_a_project_namespace(&project, project_name)
+            if crate::storage::bootstrap::is_reserved_store_namespace(project_name)
                 || !is_directory(&project).unwrap_or(false)
             {
                 continue;
@@ -2868,11 +2851,10 @@ mod tests {
         }
 
         fn bind(&self, repo: &RepoId) {
-            let paths = StorageLayout::new(self.storage.store(), repo)
-                .expect("project paths")
-                .project()
-                .clone();
-            fs::create_dir_all(&paths.project_root).expect("project root");
+            let layout = StorageLayout::new(self.storage.store(), repo).expect("project paths");
+            // Adoption's own provisioning, which marks the owner discovery reads.
+            layout.provision_project().expect("project root");
+            let paths = layout.project().clone();
             let binding = RepositoryBinding::new(vec![BoundIdentity {
                 repo_id: repo.clone(),
                 remote_name: None,
@@ -3009,10 +2991,9 @@ mod tests {
         let caches_system = caches.join(".fseventsd");
         fs::create_dir_all(&caches_system).expect("caches system directory");
 
-        // A volume root whose name is not on any reserved list — a relocated mount is identified by
-        // its marker, never by what it happens to be called.
-        // Its child carries a binding, so without the marker skip it would be discovered as the
-        // bogus repository `scratch-volume/anything`.
+        // A volume root whose name is not on any reserved list. Its child carries a binding, but
+        // nothing marked the volume a project owner, so it is never read as the bogus repository
+        // `scratch-volume/anything`.
         let relocated = store.join("scratch-volume");
         fs::create_dir_all(relocated.join("anything")).expect("relocated volume");
         fs::write(relocated.join("anything/repository.json"), b"{}").expect("decoy binding");

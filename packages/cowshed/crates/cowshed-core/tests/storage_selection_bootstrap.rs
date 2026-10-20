@@ -729,7 +729,7 @@ fn zfs_plan_has_exact_fixed_sibling_hierarchy_and_store_first_order() {
         [
             "/usr/sbin/zfs create -o mountpoint=none tank/cowshed",
             "/usr/sbin/zfs create -o mountpoint=/private/cowshed/store tank/cowshed/store",
-            "/usr/sbin/zfs set org.cowshed:version=1 org.cowshed:role=store tank/cowshed/store",
+            "/usr/sbin/zfs set org.cowshed:version=2 org.cowshed:role=store tank/cowshed/store",
             "/usr/sbin/zfs create -o mountpoint=none tank/cowshed/projects",
             "/usr/sbin/zfs set org.cowshed:version=1 org.cowshed:role=projects tank/cowshed/projects",
         ]
@@ -950,7 +950,7 @@ fn unmounted_existing_storage_requires_a_current_exact_marker() {
     for invalid in [
         ExistingMarkerEvidence::Missing,
         ExistingMarkerEvidence::Invalid,
-        ExistingMarkerEvidence::UnsupportedVersion(2),
+        ExistingMarkerEvidence::UnsupportedVersion(3),
         ExistingMarkerEvidence::Valid(VolumeMarker::new(VolumeRole::Caches, SubstrateKind::Apfs)),
     ] {
         assert!(matches!(
@@ -976,7 +976,7 @@ fn unmounted_existing_storage_requires_a_current_exact_marker() {
     for invalid in [
         ExistingMarkerEvidence::Missing,
         ExistingMarkerEvidence::Invalid,
-        ExistingMarkerEvidence::UnsupportedVersion(2),
+        ExistingMarkerEvidence::UnsupportedVersion(3),
         ExistingMarkerEvidence::Valid(VolumeMarker::new(VolumeRole::Caches, SubstrateKind::Zfs)),
     ] {
         assert!(matches!(
@@ -1188,10 +1188,10 @@ fn marker_round_trip_and_missing_or_wrong_markers_refuse_access() {
         require_mounted_marker(Some(&bytes), VolumeRole::Caches, SubstrateKind::Apfs),
         Err(MountGuardError::WrongMarker { .. })
     ));
-    let future = br#"{"version":2,"role":"store","substrate":"apfs"}"#;
+    let future = br#"{"version":3,"role":"store","substrate":"apfs"}"#;
     assert!(matches!(
         VolumeMarker::from_json(future),
-        Err(MarkerError::UnsupportedVersion(2))
+        Err(MarkerError::UnsupportedVersion(3))
     ));
 }
 
@@ -1499,7 +1499,7 @@ async fn post_mount_marker_mismatch_refuses_without_relabeling_existing_storage(
             SubstrateKind::Apfs
         };
         let future = format!(
-            r#"{{"version":2,"role":"store","substrate":"{}"}}"#,
+            r#"{{"version":3,"role":"store","substrate":"{}"}}"#,
             if zfs { "zfs" } else { "apfs" }
         )
         .into_bytes();
@@ -1578,7 +1578,7 @@ async fn every_host_effect_crosses_the_injected_blocking_lane() {
 
 #[tokio::test]
 async fn marker_version_and_masking_refuse_before_any_mutation() {
-    let unsupported = br#"{"version":2,"role":"store","substrate":"apfs"}"#;
+    let unsupported = br#"{"version":3,"role":"store","substrate":"apfs"}"#;
     for state in [
         MountpointState::Mounted { marker: None },
         MountpointState::Mounted {

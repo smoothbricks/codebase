@@ -494,11 +494,10 @@ mod tests {
 
     fn bind_repository(store: &Path, repo_id: &str) -> PathBuf {
         let repo_id = RepoId::parse(repo_id).expect("repository identity");
-        let paths = crate::storage::StorageLayout::new(store, &repo_id)
-            .expect("project paths")
-            .project()
-            .clone();
-        fs::create_dir_all(&paths.project_root).expect("project root");
+        let layout = crate::storage::StorageLayout::new(store, &repo_id).expect("project paths");
+        fs::create_dir_all(store).expect("store root");
+        layout.provision_project().expect("project root");
+        let paths = layout.project().clone();
         let binding =
             crate::repository::RepositoryBinding::new(vec![crate::repository::BoundIdentity {
                 repo_id,

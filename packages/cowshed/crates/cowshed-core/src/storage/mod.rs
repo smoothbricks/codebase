@@ -176,15 +176,28 @@ impl StorageLayout {
     pub fn project(&self) -> &ProjectPaths {
         &self.project
     }
-    /// Establishes the per-project storage boundary before any project-local metadata is written.
+    /// Establishes the per-project storage boundary before any project-local metadata is written,
+    /// and marks the owner directory as one (`bootstrap::OWNER_MARKER_FILE`), so store discovery
+    /// reads it.
     ///
     /// Path derivation remains side-effect free; only the macOS adopt path calls this in production.
     /// Test builds retain the platform-neutral filesystem boundary checks on every host.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn provision_project(&self) -> Result<(), StorageLayoutError> {
         verify_no_symlinks(&self.project.store_root, &self.project.project_root)?;
-        fs::create_dir_all(&self.project.project_root).map_err(|source| StorageLayoutError::Io {
-            path: self.project.project_root.clone(),
+        fs::create_dir_all(&self.project.project_root).map_err(|source| {
+            StorageLayoutError::Io {
+                path: self.project.project_root.clone(),
+                source,
+            }
+        })?;
+        let owner = self
+            .project
+            .project_root
+            .parent()
+            .expect("a project root is <store>/<owner>/<repo>");
+        bootstrap::write_owner_marker(owner).map_err(|source| StorageLayoutError::Io {
+            path: owner.join(bootstrap::OWNER_MARKER_FILE),
             source,
         })
     }
