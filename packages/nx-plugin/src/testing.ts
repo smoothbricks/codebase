@@ -168,7 +168,7 @@ export async function pidsWorkingIn(root: string): Promise<number[]> {
       for (const pid of (await readdir('/proc')).filter((name) => /^\d+$/.test(name))) {
         const cwd = await readlink(`/proc/${pid}/cwd`).catch((error: unknown) => {
           // Another user's process, or one that exited since the listing.
-          if (errorCode(error) === 'EACCES' || errorCode(error) === 'ENOENT') {
+          if (errorCode(error) === 'EACCES' || errorCode(error) === 'ENOENT' || errorCode(error) === 'ESRCH') {
             return null;
           }
           throw error;
