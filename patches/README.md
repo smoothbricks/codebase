@@ -283,6 +283,31 @@ direnv exec <shed> nx run nx-plugin:test-shard1 \
 Drop these hunks only when the installed upstream version has the event-driven checks, retaining behavioral and idle CPU
 evidence. This is a carry of the existing upstream PR, not a new upstream issue.
 
+## A job's client never starts a daemon
+
+A stock client that finds no live daemon starts one, detached into a session of its own (`setsid`), and the record
+shares it with every client of the checkout. Cowshed ends a job's whole process tree when the job ends, so a daemon one
+job's client started would end with that job while another job's `nx run` still used it. Cowshed therefore gives every
+job `NX_DAEMON_START=never` (`specs/cowshed/04_sandbox.md`). Under it, `enabled()` uses the daemon only while the
+process its record names runs. Otherwise the command runs without one, as `NX_DAEMON=false` would. The daemon can stop
+after the client chose it; its successor belongs to its starter (cowshed's keeper). In that case the client turns the
+daemon off for its own process alone (`disableDaemonForThisProcess`, never the `disabled` marker that only `nx reset`
+clears), and throws an error tagged `daemonStartForbidden` that names the variable. The project-graph builder then notes
+it and continues without the daemon; any other request in flight fails with that error. The client never calls
+`startInBackground`. Without the variable nothing changes.
+
+`nx-daemon-start-never.test.ts` runs the installed Nx against a fixture with `NX_DAEMON=true`:
+
+- with no daemon, the command succeeds and leaves no record;
+- the same client without the variable starts one (the control);
+- a running daemon is used, and the record still names it;
+- a killed daemon's stale record starts nothing;
+- a record naming a live process that serves no socket: the command notes the variable and continues without a daemon,
+  the record is untouched, and no `disabled` marker is written.
+
+Drop the hunk only when cowshed no longer ends a job's tree around a shared daemon, or upstream Nx has an equivalent
+setting; retain the regression.
+
 ## Canonical daemon workspace roots
 
 The daemon and plugin-worker message guard compares canonical path strings. A redundant trailing separator does not make

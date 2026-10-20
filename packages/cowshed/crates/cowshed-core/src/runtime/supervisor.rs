@@ -2153,8 +2153,9 @@ impl SpawnSink for SystemSpawnSink {
 /// The host-boundary command of a trusted coordinator's gate: its argv exec'd directly in the
 /// workspace, outside every sandbox profile and without shell activation, so the gate keeps the
 /// host authority real APFS images need. Its environment is exactly the caller's (credential
-/// names already withheld), with the CPU grant's pool and count laid over it. Admission refused
-/// a host-gate script, which needs the sandboxed exec host's interpreter.
+/// names already withheld), with the CPU grant's pool and count laid over it and
+/// `NX_DAEMON_START=never` last, so no job's Nx client starts a daemon (04_sandbox.md). Admission
+/// refused a host-gate script, which needs the sandboxed exec host's interpreter.
 fn host_gate_command(request: &ProcessSpawnRequest, cwd: &Path) -> Result<tokio::process::Command> {
     let SpawnCommand::Argv(argv) = &request.command else {
         return Err(CowshedError::internal(format!(
@@ -2176,6 +2177,7 @@ fn host_gate_command(request: &ProcessSpawnRequest, cwd: &Path) -> Result<tokio:
         .current_dir(cwd)
         .envs(caller_environment(&request.env))
         .envs(request.cpu.environment(&request.env))
+        .env("NX_DAEMON_START", "never")
         .env("PWD", cwd);
     Ok(command)
 }
@@ -8558,6 +8560,12 @@ mod workspace_toolchain_tests {
             state(read_only, "NX_DAEMON"),
             Some(crate::capabilities::EnvAction::Unset)
         );
+        for mode in [read_write, read_only] {
+            assert_eq!(
+                state(mode, "NX_DAEMON_START"),
+                Some(crate::capabilities::EnvAction::Own("never".into()))
+            );
+        }
     }
 
     /// The real host-side environment builder creates its own global short runtime alias. The
@@ -9286,6 +9294,44 @@ mod sandbox_environment_tests {
             WorkspaceToken::parse(non_canonical).is_err(),
             "a 43-character alphabet-valid string that is not 32 encoded bytes must be refused"
         );
+    }
+
+    /// A host gate runs at the host boundary, outside every sandbox profile, so its command's
+    /// environment is the only guard against an Nx daemon there. Whatever a caller names, the
+    /// command is given `never`: a daemon the client started would be shared through the
+    /// rendezvous record and end with the job (04_sandbox.md).
+    #[test]
+    fn a_host_gate_command_is_given_nx_daemon_start_never_whatever_the_caller_names() {
+        let root = scratch("host-gate-environment");
+        let mount = root.join("workspace");
+        std::fs::create_dir_all(&mount).expect("workspace");
+        let config = WorkspaceSupervisorConfig::default();
+        let sandbox = SandboxConfig {
+            workspace_mount: mount.clone(),
+            ..config.sandbox
+        };
+        let request = ProcessSpawnRequest {
+            authority: config.authority,
+            job_id: JobId::new(1).expect("static job id"),
+            command: SpawnCommand::Argv(vec![OsString::from("true")]),
+            cwd: mount.clone(),
+            env: BTreeMap::from([("NX_DAEMON_START".to_owned(), "always".to_owned())]),
+            policy: SandboxPolicy::render(sandbox).expect("render"),
+            mode: crate::api::dto::RunSandboxMode::ReadWrite,
+            scope: ExecScope::HostGate,
+            cpu: CpuPlacement {
+                held: None,
+                pool: PathBuf::from("/pool/p.sock"),
+                nice: 0,
+            },
+        };
+        let command = host_gate_command(&request, &mount).expect("host gate command");
+        let environment: BTreeMap<&OsStr, Option<&OsStr>> = command.as_std().get_envs().collect();
+        assert_eq!(
+            environment.get(OsStr::new("NX_DAEMON_START")),
+            Some(&Some(OsStr::new("never")))
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }
 

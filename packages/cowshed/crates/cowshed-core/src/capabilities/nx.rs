@@ -83,6 +83,9 @@ fn contribute(context: &DetectionContext<'_>) -> Result<CapabilityContribution> 
             ("NX_DAEMON", EnvAction::Unset),
             ("NX_PROJECT_GRAPH_CACHE_DIRECTORY", EnvAction::Unset),
             ("NX_USE_LOCAL", EnvAction::Own(OsString::from("true"))),
+            // A job's Nx client never starts a daemon: a daemon it started would be shared
+            // through the rendezvous record and end with the job (04_sandbox.md).
+            ("NX_DAEMON_START", EnvAction::Own(OsString::from("never"))),
         ]
         .into(),
         build_state: ["cache", "workspace-data"]
@@ -201,6 +204,7 @@ mod tests {
                 env: BTreeMap::from([
                     ("NX_CACHE_DIRECTORY", own(state.join("cache"))),
                     ("NX_DAEMON", EnvAction::Unset),
+                    ("NX_DAEMON_START", EnvAction::Own(OsString::from("never"))),
                     ("NX_PROJECT_GRAPH_CACHE_DIRECTORY", EnvAction::Unset),
                     ("NX_USE_LOCAL", EnvAction::Own(OsString::from("true"))),
                     (

@@ -343,7 +343,7 @@ index 9bd7b61bf9ad94c72a198dfe6f15fbcb68dfaac3..c552b4b252c2d0496312ddb6ff481699
      flushSyncGeneratorChangesToDisk(generators: string[]): Promise<FlushSyncGeneratorChangesResult>;
      getRegisteredSyncGenerators(): Promise<{
 diff --git a/dist/src/daemon/client/client.js b/dist/src/daemon/client/client.js
-index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..31fcb14fbf3811f0e1c545791026e5a6a3133399 100644
+index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..a1aeb1ac56800af773219df4f55ee95e324f1a26 100644
 --- a/dist/src/daemon/client/client.js
 +++ b/dist/src/daemon/client/client.js
 @@ -40,7 +40,6 @@ const nx_console_1 = require("../message-types/nx-console");
@@ -354,7 +354,23 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..31fcb14fbf3811f0e1c545791026e5a6
  const update_workspace_context_1 = require("../message-types/update-workspace-context");
  const tmp_dir_1 = require("../tmp-dir");
  const sandbox_socket_hint_1 = require("../sandbox-socket-hint");
-@@ -668,27 +667,6 @@ class DaemonClient {
+@@ -135,6 +134,15 @@ class DaemonClient {
+                 });
+                 this._enabled = false;
+             }
++            else if (process.env.NX_DAEMON_START === 'never' && !recordedDaemonRuns()) {
++                // A client that may never start a daemon (every cowshed job's) and
++                // finds none running computes this command in its own process. A
++                // daemon it started would serve every client of the checkout through
++                // the shared record while belonging to this client's job, and end
++                // with it.
++                logger_1.clientLogger.log(`[Client] NX_DAEMON_START=never and the recorded daemon is not running: running without the daemon`);
++                this._enabled = false;
++            }
+             else {
+                 this._enabled = true;
+             }
+@@ -668,27 +676,6 @@ class DaemonClient {
          };
          return this.sendToDaemonViaQueue(message);
      }
@@ -382,7 +398,33 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..31fcb14fbf3811f0e1c545791026e5a6
      getSyncGeneratorChanges(generators) {
          const message = {
              type: get_sync_generator_changes_1.GET_SYNC_GENERATOR_CHANGES,
-@@ -831,13 +809,24 @@ class DaemonClient {
+@@ -813,8 +800,23 @@ class DaemonClient {
+                 }
+             }
+             if (!probe.available) {
+-                // Carried as a value so no other caller's probe can substitute for it.
+-                daemonPid = await this.startInBackground(probe.refusal);
++                if (process.env.NX_DAEMON_START === 'never') {
++                    // The daemon enabled() found running has stopped since. Its
++                    // successor is its starter's (cowshed's keeper) to start, never
++                    // this client's. The stop belongs to that owner, not to the
++                    // workspace, so the daemon is off for this process alone: no
++                    // marker that an ordinary terminal would inherit.
++                    const reason = 'The Nx daemon this client was using stopped, and NX_DAEMON_START=never: this client never starts a daemon.';
++                    (0, tmp_dir_1.disableDaemonForThisProcess)(reason);
++                    this._daemonStatus = DaemonStatus.DISCONNECTED;
++                    const error = new Error(reason);
++                    error.daemonStartForbidden = true;
++                    throw error;
++                }
++                else {
++                    // Carried as a value so no other caller's probe can substitute for it.
++                    daemonPid = await this.startInBackground(probe.refusal);
++                }
+             }
+             this.setUpConnection();
+             this._daemonStatus = DaemonStatus.CONNECTED;
+@@ -831,13 +833,24 @@ class DaemonClient {
          }
      }
      async sendToDaemonViaQueue(messageToDaemon, parser) {
@@ -414,7 +456,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..31fcb14fbf3811f0e1c545791026e5a6
      }
      setUpConnection() {
          const socketPath = this.getSocketPath();
-@@ -846,7 +835,13 @@ class DaemonClient {
+@@ -846,7 +859,13 @@ class DaemonClient {
          // sendMessageToDaemon method uses a keep-alive setTimeout to
          // explicitly hold the event loop open while awaiting a response.
          socket.unref();
@@ -429,7 +471,7 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..31fcb14fbf3811f0e1c545791026e5a6
              // it's ok for the daemon to terminate if the client doesn't wait on
              // any messages from the daemon
              if (this.queue.isEmpty()) {
-@@ -1132,8 +1127,11 @@ class DaemonClient {
+@@ -1132,8 +1151,11 @@ class DaemonClient {
           */
          const { available, refusal: polled } = await this.waitForServerToBeAvailable({ ignoreVersionMismatch: true });
          if (available) {
@@ -443,6 +485,33 @@ index cebfd6d1f8ddb2c5b93dcb847904aa9ab0553de6..31fcb14fbf3811f0e1c545791026e5a6
          }
          else {
              // A permission refusal from either source wins, then the poll's errno,
+@@ -1200,6 +1222,26 @@ function isDocker() {
+ function nxJsonIsNotPresent() {
+     return !(0, nx_json_1.hasNxJson)(workspace_root_1.workspaceRoot);
+ }
++/**
++ * Whether the process the daemon record names still runs. Read only under
++ * NX_DAEMON_START=never, before any request, to choose between that daemon and
++ * none: a record whose daemon has gone is a reason to run without one, never to
++ * start one.
++ */
++function recordedDaemonRuns() {
++    const pid = (0, cache_1.getDaemonProcessIdSync)();
++    if (!Number.isInteger(pid) || pid < 1) {
++        return false;
++    }
++    try {
++        process.kill(pid, 0);
++        return true;
++    }
++    catch (err) {
++        // EPERM: a process this one may not signal holds the pid, so it runs.
++        return err.code === 'EPERM';
++    }
++}
+ /**
+  * The operating system refused the connection. Most often the socket belongs to
+  * another user, which is the guarantee the owner-only socket directory buys —
 diff --git a/dist/src/daemon/message-types/daemon-message.d.ts b/dist/src/daemon/message-types/daemon-message.d.ts
 index 9dd6123ad6d9adb20a07f7db56fc476be78cbcca..0b1ee217729d63a29806cf6c38d0fc5d4a2161a5 100644
 --- a/dist/src/daemon/message-types/daemon-message.d.ts
@@ -2121,7 +2190,7 @@ index 3659fdd1955d56e60cc0158d19ac55d59916d78e..92e6700adfc52a380b3e9e37b655fbc9
      /**
       * Returns the current session count for a phase. Useful for testing.
 diff --git a/dist/src/project-graph/project-graph.js b/dist/src/project-graph/project-graph.js
-index a23de7d0f27d7bc222ee09f4904f5d236510d01d..247ed0fe9f7a1a1a3d8d91d0d772763e9068b1be 100644
+index a23de7d0f27d7bc222ee09f4904f5d236510d01d..0d8514be79f2ed03c7cc2410ea0d91f7c885d634 100644
 --- a/dist/src/project-graph/project-graph.js
 +++ b/dist/src/project-graph/project-graph.js
 @@ -149,14 +149,7 @@ function handleProjectGraphError(opts, e) {
@@ -2140,6 +2209,21 @@ index a23de7d0f27d7bc222ee09f4904f5d236510d01d..247ed0fe9f7a1a1a3d8d91d0d772763e
          }
          else if (typeof e.message === 'string') {
              const lines = e.message.split('\n');
+@@ -356,6 +349,14 @@ async function createProjectGraphAndSourceMapsAsync(opts = {
+                 (0, tmp_dir_1.markDaemonAsDisabled)(e.message);
+                 return buildProjectGraphAndSourceMapsWithoutDaemon();
+             }
++            if (e.daemonStartForbidden) {
++                // The daemon stopped under a client that may not start one
++                // (NX_DAEMON_START=never). The client already turned the daemon off
++                // for this process alone; the command continues without it.
++                output_1.output.note({ title: `${e.message} Continuing without the daemon.` });
++                client_1.daemonClient.reset();
++                return buildProjectGraphAndSourceMapsWithoutDaemon();
++            }
+             if (e.daemonPermissionError) {
+                 // Deliberately not disabled: unlike the inotify limit above, a socket
+                 // owned by someone else stops being there when it is removed or the
 diff --git a/dist/src/tasks-runner/cache.d.ts b/dist/src/tasks-runner/cache.d.ts
 index 34aa44f81f1df63c5d33e58d8b55d15fcf1d7619..edf41406f465726828fa447bd10d71a49a2ede8a 100644
 --- a/dist/src/tasks-runner/cache.d.ts

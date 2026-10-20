@@ -869,9 +869,14 @@ unlinking only its verified alias and removing its root.
 
 A sandboxed Nx keeps Nx's own daemon default: a caller's `NX_DAEMON` never reaches the child, so Nx decides from
 `nx.json` and its own CI and container checks, as it does in a host shell. A client connects only to the socket named by
-`d/server-process.json` in Nx's workspace-data directory, never to one derived from the socket directory, and a client
-that cannot reach that socket starts a daemon of its own, which overwrites the record and so retires the daemon it
-replaced (pinned Nx 23.2.1, `daemon/client/client.js` and `daemon/server/server.js`).
+`d/server-process.json` in Nx's workspace-data directory, never to one derived from the socket directory. A client in a
+job never starts a daemon: every job, sandboxed or host gate, gets `NX_DAEMON_START=never`, and a caller's value never
+passes. Under it the patched Nx client uses the daemon the record names while that process runs, otherwise runs the
+command without one, and waits for a successor, never starting one, when its daemon stops under it. A daemon a job
+started would belong to that job's process tree and end with the job, while clients of other jobs still used it through
+the shared record. A host shell's client, which has no such variable, that cannot reach the socket starts a daemon of
+its own, which overwrites the record and so retires the daemon it replaced (pinned Nx 23.2.1, `daemon/client/client.js`
+and `daemon/server/server.js`).
 
 One Nx state per checkout. Every job of an Nx project (`nx.json`, 15_capabilities.md), read-write or read-only, gets
 `NX_WORKSPACE_DATA_DIRECTORY` and `NX_CACHE_DIRECTORY` naming the checkout's own `<project>/.nx/workspace-data` and
@@ -907,14 +912,15 @@ the workspace's own short link, creating it when no job has yet. Any other path 
 path is too long for Nx's plugin-worker sockets, and Nx refuses a symlinked leaf. The daemon adopts each connecting
 client's environment, so its plugin workers bind under the client's `NX_SOCKET_DIR`. And the profile admits Unix sockets
 by literal path, so a sandboxed daemon's worker that reaches the leaf through any other link is refused (`EPERM`) and
-its plugin fails to load. Main's sandboxed jobs therefore connect to main's host daemon instead of starting their own
-and overwriting its record, and a host client in a workspace uses the workspace's sandboxed daemon without breaking its
-plugin workers.
+its plugin fails to load. Main's jobs therefore connect to main's host daemon while it runs and otherwise run without
+one, never starting their own or overwriting its record, and a host client in a workspace uses the workspace's sandboxed
+daemon without breaking its plugin workers.
 
 A workspace's daemon executes the project-graph plugins of the workspace's checkout, which is unsigned code that runs
-only inside the sandbox, and Nx 23.2.1 has no setting that makes a client connect to a live daemon without ever starting
-one. A workspace's supervisor therefore keeps that daemon alive itself. At start, and every 5 s while it admits jobs, it
-probes the record: present, its process alive, its socket accepting. When the probe fails it runs
+only inside the sandbox, and stock Nx 23.2.1 has no setting that makes a client connect to a live daemon without ever
+starting one; the patched Nx's `NX_DAEMON_START=never` is that setting, and every job runs under it. A workspace's
+supervisor therefore keeps that daemon alive itself. At start, and every 5 s while it admits jobs, it probes the record:
+present, its process alive, its socket accepting. When the probe fails it runs
 `node <project>/node_modules/nx/dist/src/daemon/server/start.js --kept` as one read-write resident maintenance job, at
 most one at a time: the daemon answers clients that hold their own CPU tokens and is idle between them, so it holds none
 (05_gateway.md, "A resident holds no token") and keeping it costs the shed none of its share of the host. The foreground
@@ -962,8 +968,8 @@ workers go with it), says so on its stderr, and starts none until the shed is in
 database held, or a daemon someone else started, which the keeper then stops after five more minutes of disuse. A
 supervisor retires only once its keeper holds no daemon (11_shell.md), so no daemon outlives the supervisor that watched
 it. The price is one Nx's own idle stop has: the first host client after a shed went idle finds no daemon and starts one
-of its own, outside the sandbox, until the keeper stops that one too. A daemon is stopped, never disabled: the next Nx
-command starts one (16_build_volumes.md, "The Nx daemon stays on").
+of its own, outside the sandbox, until the keeper stops that one too. A daemon is stopped, never disabled: the next host
+Nx command, or the keeper once a job is admitted, starts one (16_build_volumes.md, "The Nx daemon stays on").
 
 An open request connection, registered watcher or graph listener retains the daemon even when silent; closing the last
 request connection resets the full idle interval. The non-default, uncached target

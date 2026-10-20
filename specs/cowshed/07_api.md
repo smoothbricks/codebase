@@ -1858,9 +1858,10 @@ spawn. No class has an admission deadline (05_gateway.md, "No admission deadline
 `ExecScope` is Workspace (default) or HostGate. HostGate requires Gate, argv, read-write mode and no session; it runs
 one host one-shot without ExecutedChild or shell activation, never a new wrapper. No worker gains host authority. The
 operator gate command explicitly selects its checkout environment. The host child starts from an empty environment and
-gets the ordinary request environment under the existing reserved/credential rules, its live grant's pool/count and PWD,
-not the supervisor's environment or authority. CLI HostGate preserves custom operator/project names; ordinary worker
-activation and overlays remain unchanged.
+gets the ordinary request environment under the existing reserved/credential rules, its live grant's pool/count, PWD and
+`NX_DAEMON_START=never` (no job's Nx client starts a daemon, 04_sandbox.md), not the supervisor's environment or
+authority. CLI HostGate preserves custom operator/project names; ordinary worker activation and overlays remain
+unchanged.
 
 The public environment-name policy is **record-only**, for **all scopes**: `JobAdmission.env` stores only
 `PATH HOME USER LOGNAME SHELL TMPDIR LANG TERM TZ CARGO_HOME RUSTUP_HOME RUSTUP_TOOLCHAIN BUN_INSTALL DEVELOPER_DIR` and
