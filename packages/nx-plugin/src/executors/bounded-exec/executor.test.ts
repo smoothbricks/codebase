@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, jest } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { access, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { onProgressClock } from '../../__tests__/progress-clock.js';
@@ -330,54 +330,101 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
 
   it('discards the previous snapshot when a test finishes and captures the next idle interval', async () => {
     const workspace = await createWorkspace();
-    // Only observed child output advances the fake clock, never elapsed host time.
+    const socketRoot = await ownedSocketDirectory('snapshot-progress-', 'control.sock');
+    workspaces.push(socketRoot);
+    const endpoint = join(socketRoot, 'control.sock');
+    const connected = Promise.withResolvers<Socket>();
+    const publicationHeld = Promise.withResolvers<void>();
+    const sockets = new Set<Socket>();
+    const server = createServer((socket) => {
+      sockets.add(socket);
+      socket.once('close', () => sockets.delete(socket));
+      connected.resolve(socket);
+    });
     await workspace.write(
       'snapshot-progress.js',
       [
-        "const { existsSync } = require('node:fs');",
-        'let progressed = false;',
-        'setInterval(() => {',
-        "  if (!progressed && existsSync('progress')) {",
-        "    console.log('        PASS [   0.010s] (1/1) fake tests::progress');",
-        '    progressed = true;',
-        '  }',
-        "  console.log('snapshot-clock');",
-        '}, 20);',
+        "const { connect } = require('node:net');",
+        "const { createInterface } = require('node:readline');",
+        `const socket = connect(${JSON.stringify(endpoint)}, () => console.log('snapshot-clock\\nsnapshot-stage:initial'));`,
+        "socket.on('error', error => { throw error; });",
+        "createInterface({ input: socket }).on('line', command => {",
+        "  if (command === 'hold') console.log('snapshot-clock\\nsnapshot-stage:held');",
+        "  else if (command === 'progress') console.log('        PASS [   0.010s] (1/1) fake tests::progress\\nsnapshot-clock\\nsnapshot-stage:progress');",
+        "  else if (command === 'expire') console.log('snapshot-clock\\nsnapshot-stage:captured');",
+        "  else throw new Error('unexpected snapshot command: ' + command);",
+        '});',
         '',
       ].join('\n'),
     );
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(endpoint, resolve);
+    });
     const signals: Array<AbortSignal | undefined> = [];
-    const { result } = await onProgressClock(
-      (chunk) => chunk.includes('snapshot-clock\n'),
-      5_000,
-      () =>
-        runBoundedExec(
-          { command: 'node snapshot-progress.js', idleTimeoutMs: 10_000, killAfterMs: 0 },
-          workspace.context,
-          createProcessTreeKiller(),
-          null,
-          null,
-          null,
-          async (request) => {
-            signals.push(request.signal);
-            const ordinal = signals.length;
-            if (ordinal === 1) await workspace.write('progress', 'go');
-            const capturedAtMs = Date.now();
-            return {
-              startedAtMs: capturedAtMs,
-              capturedAtMs,
-              offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
-              outcome: 'holders',
-              text: `capture-interval-${ordinal}\n`,
-            };
-          },
-        ),
-    );
-    expect(result.success).toBe(false);
-    expect(signals).toHaveLength(2);
-    expect(signals.every((signal) => signal?.aborted)).toBe(true);
-    expect(result.terminalOutput).not.toContain('capture-interval-1');
-    expect(result.terminalOutput).toContain('capture-interval-2');
+    let partial = '';
+    try {
+      const { result, movedMs } = await onProgressClock(
+        (chunk) => {
+          const lines = (partial + chunk).split('\n');
+          partial = lines.pop() ?? '';
+          let move = false;
+          for (const line of lines) {
+            if (line === 'snapshot-stage:held') publicationHeld.resolve();
+            if (
+              line === 'snapshot-stage:initial' ||
+              line === 'snapshot-stage:progress' ||
+              line === 'snapshot-stage:captured'
+            )
+              move = true;
+          }
+          return move;
+        },
+        5_000,
+        () =>
+          runBoundedExec(
+            { command: 'node snapshot-progress.js', idleTimeoutMs: 10_000, killAfterMs: 0 },
+            workspace.context,
+            createProcessTreeKiller(),
+            null,
+            null,
+            null,
+            async (request) => {
+              signals.push(request.signal);
+              const ordinal = signals.length;
+              const socket = await connected.promise;
+              if (ordinal === 1) {
+                // Deliberately deliver another heartbeat while publication is held. It cannot
+                // spend the next interval: only the observed PASS releases that clock step.
+                socket.write('hold\n');
+                await publicationHeld.promise;
+                socket.write('progress\n');
+              } else {
+                socket.write('expire\n');
+              }
+              const capturedAtMs = Date.now();
+              return {
+                startedAtMs: capturedAtMs,
+                capturedAtMs,
+                offsetFromExpiryMs: request.expiresAtMs - capturedAtMs,
+                outcome: 'holders',
+                text: `capture-interval-${ordinal}\n`,
+              };
+            },
+          ),
+      );
+      expect(result.success).toBe(false);
+      expect(signals).toHaveLength(2);
+      expect(signals.every((signal) => signal?.aborted)).toBe(true);
+      expect(result.terminalOutput).not.toContain('capture-interval-1');
+      expect(result.terminalOutput).toContain('capture-interval-2');
+      expect(result.terminalOutput).toContain('snapshot-stage:held');
+      expect(movedMs).toBe(15_000);
+    } finally {
+      publicationHeld.resolve();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
   });
 
   it('kills a command whose only output is a heartbeat', async () => {

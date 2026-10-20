@@ -1405,6 +1405,10 @@ The final-five-second pre-signal snapshot attributes the runner's process tree a
 incomplete/raced results and no delay to termination. Its timing, visibility and evidence contract is defined in
 `specs/cowshed/08_testing.md`, "Integration tests (real substrate)".
 
+The snapshot-reset regression orders capture, test completion, and expiry through IPC, not heartbeat cadence. It
+deliberately holds the first capture's progress publication while another heartbeat arrives; only the observed PASS
+advances the next capture interval. Its 10 s virtual idle bound remains unchanged.
+
 On a macOS host, every `bounded-exec` task runs with its own `TMPDIR` lease: a directory on one RAM-backed APFS volume
 per user, so test temp files never reach the SSD. The volume is created lazily by the first task that needs it and
 detached when the last live lease ends, since its pages return only on detach. It is a legacy DiskImages RAM disk, so it
