@@ -2281,6 +2281,70 @@ mod tests {
         assert_eq!(close(&stock.checkout, &state).unwrap(), Ok(()));
     }
 
+    /// The rebase-carry probe runs as a job, so under `NX_DAEMON_START=never`. It stops the
+    /// checkout's running daemon, whose file map trails the rebase, and computes the graph in its
+    /// own process: it starts no daemon and never asks for one. Asking for the stopped one is what
+    /// failed a consumer's carry, through a plugin whose Nx was another checkout's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_task_hash_probe_computes_its_graph_without_a_daemon_under_the_job_rule() {
+        use std::io::Write as _;
+
+        let root =
+            crate::scratch_directory::ScratchRoot::new("nx-task-hashes").expect("scratch root");
+        let stock = StockNx::new(&root);
+        fs::create_dir_all(stock.checkout.join("p")).unwrap();
+        fs::write(
+            stock.checkout.join("p/project.json"),
+            r#"{"name":"p","targets":{"build":{"executor":"nx:noop","cache":true}}}"#,
+        )
+        .unwrap();
+        stock.daemon("--start");
+        let daemon = crate::runtime::nx_daemon::live_pid(&stock.record()).expect("a live daemon");
+
+        let mut command = std::process::Command::new("node");
+        command
+            .arg("-")
+            .arg(&stock.checkout)
+            .current_dir(&stock.checkout);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("NX_") || key == "CI" {
+                command.env_remove(key);
+            }
+        }
+        let mut probe = command
+            .env("NX_DAEMON_START", "never")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()
+            .expect("node runs");
+        probe
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&task_hashes_script())
+            .unwrap();
+        let output = probe.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "the probe failed: {stderr}");
+        assert!(
+            !stderr.contains("NX_DAEMON_START=never"),
+            "the probe asked for a daemon it may not start: {stderr}"
+        );
+        let selection = task_selection(&output.stdout).expect("a selection");
+        assert!(!selection.hashes.is_empty(), "p:build is hashed up front");
+        assert!(
+            !cowshed_os::process::running(daemon).unwrap(),
+            "the stale daemon was stopped"
+        );
+        assert_eq!(
+            crate::runtime::nx_daemon::live_pid(&stock.record()),
+            None,
+            "the probe started no daemon"
+        );
+    }
+
     /// A test that fails while its stock Nx daemon runs leaves no daemon behind. The daemon
     /// detaches from the `nx daemon --start` that started it, so nothing but the fixture's own
     /// teardown ever ends it: a failed assertion between `--start` and [`close`] left it running

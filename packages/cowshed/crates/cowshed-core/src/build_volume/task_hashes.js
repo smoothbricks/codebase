@@ -43,10 +43,17 @@ async function main() {
   }
   // A running daemon's file map trails what the rebase just wrote until its watcher catches up,
   // and a graph from it would hash yesterday's files. It is stopped, as `nx daemon --stop` stops
-  // it; the graph below then comes from a daemon started on the files as they are now.
+  // it, and the graph below is computed in this process, on the files as they are now: this probe
+  // is a job, and a job's Nx starts no daemon (NX_DAEMON_START=never, 04_sandbox.md). NX_DAEMON
+  // rather than this client alone, because every Nx loaded in this process reads it: a plugin
+  // linked from another checkout requires that checkout's Nx, whose own daemon client would
+  // otherwise go on asking for the daemon just stopped, and the plugin fails ("this client never
+  // starts a daemon").
   if (daemonClient.enabled()) {
     await daemonClient.stop();
   }
+  process.env.NX_DAEMON = 'false';
+  daemonClient.reset();
   const projectGraph = await createProjectGraphAsync({ exitOnError: false, resetDaemonClient: false });
   const projects = Object.values(projectGraph.nodes);
   const targets = [...new Set(projects.flatMap((project) => Object.keys(project.data.targets ?? {})))].sort();
