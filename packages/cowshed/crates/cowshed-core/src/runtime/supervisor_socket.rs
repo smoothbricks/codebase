@@ -26,8 +26,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::process_stream::JobProcessStream;
 use super::supervisor::{
-    CheckpointBarrier, Command, LogChunk, NxDaemonRetirement, SessionSnapshot, SessionToken,
-    WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
+    CheckpointBarrier, Command, LogChunk, NxDaemonRetirement, RetireWhen, SessionSnapshot,
+    SessionToken, WorkspaceAuthoritySnapshot, WorkspaceSupervisorHandle,
 };
 use crate::api::dto::{
     AdmissionKey, CommandArg, ExecClass, ExecCommand, ExecRequest, ExecScope, JobId,
@@ -356,12 +356,9 @@ enum Call {
         checkpoint_id: String,
     },
     #[serde(rename_all = "camelCase")]
-    Quiesce {
-        fail_if_busy: bool,
-    },
-    #[serde(rename_all = "camelCase")]
     Retire {
         nx_daemon: NxDaemonRetirement,
+        when: RetireWhen,
     },
     /// Name the build volume a land or refork moved the checkout's link onto.
     #[serde(rename_all = "camelCase")]
@@ -1618,16 +1615,12 @@ async fn answer(
                 Bytes::new(),
             )
         }
-        Call::Quiesce { fail_if_busy } => {
-            if fail_if_busy {
-                supervisor.quiesce_if_idle().await?;
-            } else {
-                supervisor.quiesce().await?;
+        Call::Retire { nx_daemon, when } => {
+            match when {
+                RetireWhen::Now => supervisor.retire(nx_daemon).await?,
+                RetireWhen::AfterJobs => supervisor.retire_after_jobs(nx_daemon).await?,
+                RetireWhen::IfIdle => supervisor.retire_if_idle(nx_daemon).await?,
             }
-            (unit()?, Bytes::new())
-        }
-        Call::Retire { nx_daemon } => {
-            supervisor.retire(nx_daemon).await?;
             (unit()?, Bytes::new())
         }
         Call::NameBuildVolume { build_volume } => {
@@ -2408,28 +2401,29 @@ async fn forward(path: Arc<PathBuf>, command: Command) {
             });
             let _ = reply.send(result);
         }
-        Command::Quiesce {
+        // Only the supervisor's own process may close its admission without retiring it
+        // (`WorkspaceSupervisorHandle::quiesce`): a remote caller that went away afterwards would
+        // leave it refusing work for good.
+        Command::Quiesce { reply, .. } => {
+            let _ = reply.send(Err(CowshedError::internal(
+                "a remote supervisor handle cannot quiesce without retiring; ask retire_after_jobs",
+            )));
+        }
+        Command::Retire {
             authority,
-            fail_if_busy,
+            nx_daemon,
+            when,
             reply,
         } => {
             let _ = reply.send(
                 call(
                     path,
                     &authority,
-                    Call::Quiesce { fail_if_busy },
+                    Call::Retire { nx_daemon, when },
                     Bytes::new(),
                 )
                 .await,
             );
-        }
-        Command::Retire {
-            authority,
-            nx_daemon,
-            reply,
-        } => {
-            let _ =
-                reply.send(call(path, &authority, Call::Retire { nx_daemon }, Bytes::new()).await);
         }
         Command::NameBuildVolume {
             authority,

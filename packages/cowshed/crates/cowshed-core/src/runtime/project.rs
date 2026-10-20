@@ -48,7 +48,7 @@ use crate::repository::{RepoId, RepositoryBinding};
 use crate::runtime::job_progress::JobProgressStream;
 use crate::runtime::process_stream::JobProcessStream;
 #[cfg(target_os = "macos")]
-use crate::runtime::supervisor::NxDaemonRetirement;
+use crate::runtime::supervisor::{NxDaemonRetirement, RetireWhen};
 use crate::runtime::supervisor_socket::AdmissionSource;
 #[cfg(target_os = "macos")]
 use cowshed_os::fork_lock::RunAsync as _;
@@ -2379,6 +2379,18 @@ const LOST_JOB_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// holds no Nx daemon) before it retires; the next command starts another. A draining supervisor
 /// whose ended jobs nobody reads gives up on them after as long with no client call.
 pub(crate) const SUPERVISOR_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// A port-block change asked of a workspace that runs jobs: its supervisor is left serving them.
+#[cfg(target_os = "macos")]
+fn port_change_while_busy(error: CowshedError) -> CowshedError {
+    match error.code {
+        ErrorCode::Conflict => CowshedError::conflict(
+            "workspace port capacity cannot change while jobs are active",
+            "request port capacity before starting the workload",
+        ),
+        _ => error,
+    }
+}
 
 /// What the supervisor process's serving loop woke for.
 #[cfg(target_os = "macos")]
@@ -4820,7 +4832,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             }
         }
         let stopped = self
-            .stop_supervisor_with_mode(workspace, true, NxDaemonRetirement::ControllerOwned)
+            .stop_supervisor_with_mode(
+                workspace,
+                RetireWhen::Now,
+                NxDaemonRetirement::ControllerOwned,
+            )
             .await?;
         require_lost_groups_released(workspace, &stopped, "quiesce").await?;
         for (root, plan) in daemons {
@@ -6036,7 +6052,15 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         super::supervisor_socket::BoundSocket,
     )> {
         let stopped = self
-            .stop_supervisor_with_mode(workspace, force, nx_check.supervisor_retirement())
+            .stop_supervisor_with_mode(
+                workspace,
+                if force {
+                    RetireWhen::Now
+                } else {
+                    RetireWhen::AfterJobs
+                },
+                nx_check.supervisor_retirement(),
+            )
             .await?;
         require_lost_groups_released(workspace, &stopped, "remove").await?;
         let current = self.current(workspace).await?;
@@ -7952,11 +7976,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             current.derived.mount_state,
             crate::storage::lifecycle::MountState::Mounted { .. }
         ) {
-            self.ensure_supervisor(workspace)
-                .await?
-                .quiesce_if_idle()
-                .await?;
-            Some(self.stop_supervisor(workspace).await?)
+            Some(
+                self.stop_supervisor_if_idle(workspace)
+                    .await
+                    .map_err(port_change_while_busy)?,
+            )
         } else {
             None
         };
@@ -8165,8 +8189,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             // Only a supervisor this process serves is retired here; another process's is its
             // own to retire, and the hello below says whose it is.
             if self.served.contains_key(name) {
-                old.quiesce().await?;
-                old.retire(NxDaemonRetirement::Recorded).await?;
+                old.retire_after_jobs(NxDaemonRetirement::Recorded).await?;
                 self.forget_served(name).await?;
             }
             self.sessions.retain(|(workspace, _), _| workspace != name);
@@ -8533,27 +8556,39 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         &mut self,
         name: &WorkspaceName,
     ) -> Result<super::supervisor_socket::BoundSocket> {
-        self.stop_supervisor_with_mode(name, false, NxDaemonRetirement::Recorded)
+        self.stop_supervisor_with_mode(name, RetireWhen::AfterJobs, NxDaemonRetirement::Recorded)
             .await
     }
 
+    /// [`Self::stop_supervisor`] only when the workspace runs no job: a `Conflict`, leaving the
+    /// supervisor serving, while one runs.
+    async fn stop_supervisor_if_idle(
+        &mut self,
+        name: &WorkspaceName,
+    ) -> Result<super::supervisor_socket::BoundSocket> {
+        self.stop_supervisor_with_mode(name, RetireWhen::IfIdle, NxDaemonRetirement::Recorded)
+            .await
+    }
+
+    /// One request, so the supervisor retires whatever becomes of this process: a quiesce and
+    /// a retire sent apart left it refusing work for good when the caller went away between them
+    /// (11_shell.md "Supervisor").
     async fn stop_supervisor_handle(
         handle: &super::supervisor::WorkspaceSupervisorHandle,
-        terminate_jobs: bool,
+        when: RetireWhen,
         nx_daemon: NxDaemonRetirement,
     ) -> Result<()> {
-        if terminate_jobs {
-            handle.retire(nx_daemon).await
-        } else {
-            handle.quiesce().await?;
-            handle.retire(nx_daemon).await
+        match when {
+            RetireWhen::Now => handle.retire(nx_daemon).await,
+            RetireWhen::AfterJobs => handle.retire_after_jobs(nx_daemon).await,
+            RetireWhen::IfIdle => handle.retire_if_idle(nx_daemon).await,
         }
     }
 
     async fn stop_supervisor_with_mode(
         &mut self,
         name: &WorkspaceName,
-        terminate_jobs: bool,
+        when: RetireWhen,
         nx_daemon: NxDaemonRetirement,
     ) -> Result<super::supervisor_socket::BoundSocket> {
         let socket = super::supervisor_socket::socket_path(
@@ -8590,7 +8625,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
             },
         };
         if let Some(handle) = handle {
-            Self::stop_supervisor_handle(&handle, terminate_jobs, nx_daemon).await?;
+            Self::stop_supervisor_handle(&handle, when, nx_daemon).await?;
         }
         self.forget_served(name).await?;
         self.sessions.retain(|(workspace, _), _| workspace != name);
@@ -8672,10 +8707,9 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     }
                     let since = *idle_since.get_or_insert(now);
                     if now.duration_since(since) >= SUPERVISOR_IDLE {
-                        // Quiesce first: a command admitted since the last look finishes
-                        // before the supervisor retires.
-                        actor.quiesce().await?;
-                        break actor.retire(NxDaemonRetirement::Recorded).await;
+                        // One request: a command admitted since the last look finishes before
+                        // the supervisor retires.
+                        break actor.retire_after_jobs(NxDaemonRetirement::Recorded).await;
                     }
                 }
             }
@@ -8887,7 +8921,11 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                         let _stopped = this
                             .stop_supervisor_with_mode(
                                 workspace,
-                                options.force,
+                                if options.force {
+                                    RetireWhen::Now
+                                } else {
+                                    RetireWhen::AfterJobs
+                                },
                                 NxDaemonRetirement::Recorded,
                             )
                             .await?;
@@ -11046,7 +11084,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
                     ));
                 }
                 let stopped = self
-                    .stop_supervisor_with_mode(&source, false, NxDaemonRetirement::Recorded)
+                    .stop_supervisor_with_mode(
+                        &source,
+                        RetireWhen::AfterJobs,
+                        NxDaemonRetirement::Recorded,
+                    )
                     .await?;
                 require_lost_groups_released(&source, &stopped, "rename").await?;
                 let source_incarnation = self.clone_source_incarnation(&current).await?;
@@ -12465,11 +12507,11 @@ impl<H: RuntimeStorageHost> ProjectRuntimeHost for StorageProjectRuntimeHost<H> 
         // Port authority changes require an idle workspace. The actor rejects a busy
         // request atomically, without queuing it or stopping any existing workload.
         let port_lease = if growth_size.is_some() {
-            self.ensure_supervisor(&workspace)
-                .await?
-                .quiesce_if_idle()
-                .await?;
-            Some(self.stop_supervisor(&workspace).await?)
+            Some(
+                self.stop_supervisor_if_idle(&workspace)
+                    .await
+                    .map_err(port_change_while_busy)?,
+            )
         } else {
             None
         };
@@ -16273,7 +16315,7 @@ mod removal_supervisor_tests {
             Duration::from_secs(10),
             NativeProjectRuntimeHost::stop_supervisor_handle(
                 &supervisor,
-                true,
+                crate::runtime::supervisor::RetireWhen::Now,
                 NxDaemonRetirement::Recorded,
             ),
         )

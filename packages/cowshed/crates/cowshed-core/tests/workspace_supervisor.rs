@@ -2791,7 +2791,7 @@ async fn quiesce_rejects_admission_and_waits_for_existing_terminal_commitment() 
 }
 
 #[tokio::test]
-async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
+async fn retire_if_idle_refuses_busy_without_closing_admission_or_waiting() {
     let (mut h, _root) = harness(2, 1024, false, false);
     let first = h
         .handle
@@ -2804,7 +2804,11 @@ async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
         .await
         .unwrap();
     let first_spawned = h.spawned.recv().await.unwrap();
-    let refused = h.handle.quiesce_if_idle().await.unwrap_err();
+    let refused = h
+        .handle
+        .retire_if_idle(NxDaemonRetirement::Recorded)
+        .await
+        .unwrap_err();
     assert_eq!(refused.code, ErrorCode::Conflict);
     let second = h
         .handle
@@ -2821,7 +2825,10 @@ async fn idle_quiesce_refuses_busy_without_closing_admission_or_waiting() {
     complete(&second_spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(first).await.unwrap();
     h.handle.wait(second).await.unwrap();
-    h.handle.quiesce_if_idle().await.unwrap();
+    h.handle
+        .retire_if_idle(NxDaemonRetirement::Recorded)
+        .await
+        .unwrap();
     assert_eq!(
         h.handle
             .exec(
@@ -5038,6 +5045,75 @@ async fn a_drained_supervisor_serves_a_job_s_end_to_a_client_that_comes_back_for
         .unwrap();
 }
 
+/// Measured 2026-10-21: a supervisor whose 17 jobs had all ended refused every exec as
+/// "quiescing or retired" for hours. A caller in another process had quiesced it and gone before
+/// it asked the retirement, which was a second request; nothing returns a supervisor to running,
+/// and its idle retirement never fired, since the Nx keeper probes only while it runs. A caller
+/// in another process now asks one request, retire after the jobs: if it goes away while it
+/// waits, the supervisor still retires once the jobs end, and the next command starts another.
+/// No remote request closes admission without retiring.
+#[tokio::test]
+async fn a_caller_that_goes_away_while_waiting_never_leaves_the_supervisor_refusing_work() {
+    use cowshed_core::runtime::supervisor_socket;
+    let (mut h, _root) = harness(1, 1024, false, false);
+    let path = PathBuf::from("/tmp").join(format!(
+        "cowshed-sock-{}/s",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
+    let listener = supervisor_socket::bind(&path).await.unwrap();
+    let server = tokio::spawn(supervisor_socket::serve(
+        listener,
+        h.handle.clone(),
+        None,
+        None,
+    ));
+    let remote = supervisor_socket::connect(path.clone(), authority());
+    let job = remote
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = h.spawned.recv().await.unwrap();
+
+    assert!(
+        remote.quiesce().await.is_err(),
+        "a remote caller cannot close admission without retiring"
+    );
+    let stopping = tokio::spawn({
+        let remote = remote.clone();
+        async move { remote.retire_after_jobs(NxDaemonRetirement::Recorded).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        remote
+            .exec(
+                None,
+                None,
+                request(StdinSource::Empty),
+                AdmissionSource::Worker,
+            )
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict,
+        "admission is closed while the retirement waits"
+    );
+    // The caller goes away mid-wait: a detach killed by its caller's timeout.
+    stopping.abort();
+    assert!(stopping.await.unwrap_err().is_cancelled());
+
+    let _ = job;
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    server
+        .await
+        .expect("the supervisor retires once its job ends, its caller gone")
+        .unwrap();
+}
+
 #[tokio::test]
 async fn a_controller_reads_a_served_supervisor_s_commitments_by_cursor_until_it_acknowledges() {
     use cowshed_core::runtime::commitment_feed::{CommitmentFeed, FeedingSink};
@@ -6791,7 +6867,8 @@ async fn a_foreground_nx_keeper_does_not_count_as_user_work_and_quiescence_drain
         "empty stdin closes before lifecycle signalling"
     );
     let handle = h.handle.clone();
-    let quiesce = tokio::spawn(async move { handle.quiesce_if_idle().await });
+    let quiesce =
+        tokio::spawn(async move { handle.retire_if_idle(NxDaemonRetirement::Recorded).await });
     assert_eq!(
         h.process.recv().await.unwrap(),
         ProcessObservation::Signal(keeper.request.job_id, ProcessSignal::Term)

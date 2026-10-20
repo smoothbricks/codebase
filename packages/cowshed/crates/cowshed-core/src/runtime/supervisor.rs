@@ -3256,20 +3256,14 @@ impl WorkspaceSupervisorHandle {
         .await
     }
 
+    /// Close admission and wait for the running jobs to end, retiring nothing. Only a caller
+    /// in the supervisor's own process may leave it there, since it retires the supervisor
+    /// itself afterwards; a remote handle refuses it. A caller in another process asks
+    /// [`Self::retire_after_jobs`], so its going away can never leave the supervisor refusing
+    /// work while it serves.
     pub async fn quiesce(&self) -> Result<()> {
         self.call(|reply| Command::Quiesce {
             authority: self.authority.clone(),
-            fail_if_busy: false,
-            reply,
-        })
-        .await
-    }
-
-    /// Close admission atomically only when no job is active; never wait for a workload.
-    pub async fn quiesce_if_idle(&self) -> Result<()> {
-        self.call(|reply| Command::Quiesce {
-            authority: self.authority.clone(),
-            fail_if_busy: true,
             reply,
         })
         .await
@@ -3299,10 +3293,28 @@ impl WorkspaceSupervisorHandle {
         self.call(|reply| Command::NxDaemonKeeper { reply }).await
     }
 
+    /// Retire now: every running job is stopped (TERM, grace, KILL).
     pub async fn retire(&self, nx_daemon: NxDaemonRetirement) -> Result<()> {
+        self.retire_when(nx_daemon, RetireWhen::Now).await
+    }
+
+    /// Admit nothing more and retire once the running jobs have ended, as one request: the
+    /// supervisor retires whether or not its caller is still there to see it.
+    pub async fn retire_after_jobs(&self, nx_daemon: NxDaemonRetirement) -> Result<()> {
+        self.retire_when(nx_daemon, RetireWhen::AfterJobs).await
+    }
+
+    /// Retire now if no job runs (the Nx keeper's start excepted); refused as a `Conflict`,
+    /// changing nothing, while one does.
+    pub async fn retire_if_idle(&self, nx_daemon: NxDaemonRetirement) -> Result<()> {
+        self.retire_when(nx_daemon, RetireWhen::IfIdle).await
+    }
+
+    async fn retire_when(&self, nx_daemon: NxDaemonRetirement, when: RetireWhen) -> Result<()> {
         self.call(|reply| Command::Retire {
             authority: self.authority.clone(),
             nx_daemon,
+            when,
             reply,
         })
         .await
@@ -3437,6 +3449,7 @@ impl WorkspaceSupervisor {
             named_sessions: BTreeMap::new(),
             quiesce_waiters: Vec::new(),
             retire_waiters: Vec::new(),
+            retire_after_jobs: Vec::new(),
             nx_keeper_waiters: Vec::new(),
             command_lane_closed: false,
             nx_daemon,
@@ -3585,12 +3598,12 @@ pub(super) enum Command {
     },
     Quiesce {
         authority: WorkspaceAuthoritySnapshot,
-        fail_if_busy: bool,
         reply: oneshot::Sender<Result<()>>,
     },
     Retire {
         authority: WorkspaceAuthoritySnapshot,
         nx_daemon: NxDaemonRetirement,
+        when: RetireWhen,
         reply: oneshot::Sender<Result<()>>,
     },
     NameBuildVolume {
@@ -3619,6 +3632,20 @@ enum ActorLifecycle {
     Quiescing,
     Retiring,
     Retired,
+}
+
+/// When a retirement takes effect (11_shell.md "Supervisor"). Admission closes only on the way to
+/// retirement: a supervisor that refuses work is one that retires, whoever asked and whether or
+/// not they are still there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RetireWhen {
+    /// Now: every running job is stopped.
+    Now,
+    /// Once the running jobs have ended; nothing more is admitted meanwhile.
+    AfterJobs,
+    /// Now if no job runs; a `Conflict`, changing nothing, while one does.
+    IfIdle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4219,6 +4246,9 @@ struct SupervisorActor {
     named_sessions: BTreeMap<String, u64>,
     quiesce_waiters: Vec<oneshot::Sender<Result<()>>>,
     retire_waiters: Vec<oneshot::Sender<Result<()>>>,
+    /// Retirements asked to wait for the running jobs ([`RetireWhen::AfterJobs`]): taken up
+    /// once no job runs, whatever became of their callers.
+    retire_after_jobs: Vec<(NxDaemonRetirement, oneshot::Sender<Result<()>>)>,
     /// Callers of [`WorkspaceSupervisorHandle::nx_daemon_keeper`], answered after the next
     /// probe, or with `None` once no keeper is left.
     nx_keeper_waiters: Vec<oneshot::Sender<Result<Option<super::NxKeeperState>>>>,
@@ -4337,6 +4367,13 @@ impl SupervisorActor {
                 }
             }
             self.finish_ready_jobs().await;
+            // A retirement that waited for the jobs takes effect once none runs, in this loop:
+            // nothing outside the actor has to come back for it.
+            if !self.retire_after_jobs.is_empty() && !self.has_running_jobs() {
+                for (nx_daemon, reply) in std::mem::take(&mut self.retire_after_jobs) {
+                    self.retire_now(nx_daemon, reply);
+                }
+            }
             if self.lifecycle == ActorLifecycle::Retiring && !self.has_running_jobs() {
                 self.release_kept_nx_daemon().await;
             }
@@ -4660,27 +4697,13 @@ impl SupervisorActor {
                 let result = self.checkpoint(&authority, checkpoint_id).await;
                 let _ = reply.send(result);
             }
-            Command::Quiesce {
-                authority,
-                fail_if_busy,
-                reply,
-            } => {
+            Command::Quiesce { authority, reply } => {
                 if let Err(error) = self.validate_authority(&authority) {
                     let _ = reply.send(Err(error));
                 } else if self.lifecycle == ActorLifecycle::Retired {
                     let _ = reply.send(Ok(()));
-                } else if fail_if_busy && self.has_user_jobs() {
-                    let _ = reply.send(Err(CowshedError::conflict(
-                        "workspace port capacity cannot change while jobs are active",
-                        "request port capacity before starting the workload",
-                    )));
                 } else {
-                    if self.lifecycle == ActorLifecycle::Running {
-                        self.lifecycle = ActorLifecycle::Quiescing;
-                    }
-                    if let Some(id) = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting) {
-                        let _ = self.begin_kill(id, KillReason::Retire);
-                    }
+                    self.close_admission();
                     self.quiesce_waiters.push(reply);
                 }
             }
@@ -4713,6 +4736,7 @@ impl SupervisorActor {
             Command::Retire {
                 authority,
                 nx_daemon,
+                when,
                 reply,
             } => {
                 if let Err(error) = self.validate_authority(&authority) {
@@ -4720,22 +4744,19 @@ impl SupervisorActor {
                 } else if self.lifecycle == ActorLifecycle::Retired {
                     let _ = reply.send(Ok(()));
                 } else {
-                    self.lifecycle = ActorLifecycle::Retiring;
-                    if nx_daemon == NxDaemonRetirement::ControllerOwned {
-                        // Land already captured the only processes its controller may signal.
-                        // Relinquish record cleanup, not any admitted job's retirement.
-                        self.nx_daemon.take();
-                    }
-                    self.retire_waiters.push(reply);
-                    // The keeper is the foreground daemon itself, so it stops and concludes
-                    // through the same lifecycle as every other admitted job.
-                    let running = self
-                        .jobs
-                        .iter()
-                        .filter_map(|(id, job)| (!job.terminal()).then_some(*id))
-                        .collect::<Vec<_>>();
-                    for job_id in running {
-                        let _ = self.begin_kill(job_id, KillReason::Retire);
+                    match when {
+                        RetireWhen::Now => self.retire_now(nx_daemon, reply),
+                        RetireWhen::IfIdle if self.has_user_jobs() => {
+                            let _ = reply.send(Err(CowshedError::conflict(
+                                "the workspace runs jobs, so its supervisor was not retired",
+                                "let its jobs finish, then retry",
+                            )));
+                        }
+                        RetireWhen::IfIdle => self.retire_now(nx_daemon, reply),
+                        RetireWhen::AfterJobs => {
+                            self.close_admission();
+                            self.retire_after_jobs.push((nx_daemon, reply));
+                        }
                     }
                 }
             }
@@ -6757,6 +6778,39 @@ impl SupervisorActor {
         job.stderr = VecDeque::new();
         if job.birth.is_some() {
             self.record_groups();
+        }
+    }
+
+    /// Admit nothing more: running jobs run on, and the keeper's daemon start is stopped, since
+    /// the keeper probes only while the supervisor runs. Only the way to a retirement passes
+    /// here; nothing returns a supervisor to `Running`.
+    fn close_admission(&mut self) {
+        if self.lifecycle == ActorLifecycle::Running {
+            self.lifecycle = ActorLifecycle::Quiescing;
+        }
+        if let Some(id) = self.nx_daemon.as_ref().and_then(|keeper| keeper.starting) {
+            let _ = self.begin_kill(id, KillReason::Retire);
+        }
+    }
+
+    /// Retire now: every running job is stopped, and `reply` is answered once none runs.
+    fn retire_now(&mut self, nx_daemon: NxDaemonRetirement, reply: oneshot::Sender<Result<()>>) {
+        self.lifecycle = ActorLifecycle::Retiring;
+        if nx_daemon == NxDaemonRetirement::ControllerOwned {
+            // Land already captured the only processes its controller may signal.
+            // Relinquish record cleanup, not any admitted job's retirement.
+            self.nx_daemon.take();
+        }
+        self.retire_waiters.push(reply);
+        // The keeper is the foreground daemon itself, so it stops and concludes through the
+        // same lifecycle as every other admitted job.
+        let running = self
+            .jobs
+            .iter()
+            .filter_map(|(id, job)| (!job.terminal()).then_some(*id))
+            .collect::<Vec<_>>();
+        for job_id in running {
+            let _ = self.begin_kill(job_id, KillReason::Retire);
         }
     }
 

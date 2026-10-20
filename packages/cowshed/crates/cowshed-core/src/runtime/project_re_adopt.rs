@@ -62,18 +62,16 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
         let supervisor = if replaced.legacy {
             None
         } else {
-            self.ensure_supervisor(&main)
-                .await?
-                .quiesce_if_idle()
-                .await
-                .map_err(|error| match error.code {
-                    ErrorCode::Conflict => CowshedError::conflict(
-                        "main cannot be re-adopted while it runs jobs",
-                        "let main's jobs finish, then retry",
-                    ),
-                    _ => error,
-                })?;
-            let lease = self.stop_supervisor(&main).await?;
+            let lease =
+                self.stop_supervisor_if_idle(&main)
+                    .await
+                    .map_err(|error| match error.code {
+                        ErrorCode::Conflict => CowshedError::conflict(
+                            "main cannot be re-adopted while it runs jobs",
+                            "let main's jobs finish, then retry",
+                        ),
+                        _ => error,
+                    })?;
             if let Err(busy) =
                 check_checkout_nx(&main, &checkout, CheckoutNxCheck::CloseRecorded).await?
             {

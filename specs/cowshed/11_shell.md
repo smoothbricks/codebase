@@ -211,6 +211,17 @@ into `OsString` for `plan_exec`; no `String`, lossy rendering, or alternate supe
   process serves, stops and waits for all of the supervisor's jobs, including the foreground keeper maintenance job,
   through the ordinary job lifecycle (16_build_volumes.md, "The Nx daemon stays on"). No daemon or plugin worker
   outlives the supervisor or the runtime.
+- Admission closes only on the way to retirement, and nothing reopens it: a supervisor that refuses work is one that
+  retires, whoever asked and whether or not they are still there. So a caller in another process asks one request,
+  `retire`, saying when — now (running jobs stopped), after the running jobs end, or only if no job runs (a `Conflict`,
+  changing nothing, while one does) — and the supervisor carries it out on its own. Closing admission without retiring
+  (quiesce) is for the supervisor's own process alone, which retires it afterwards itself; the wire has no such request.
+  Measured 2026-10-21: a supervisor whose 17 jobs had all ended refused every exec as "quiescing or retired" for hours.
+  A caller had quiesced it and then failed to send the retire that was a second request; `attach` changed nothing, and
+  its idle retirement never fired either, because the Nx keeper probes only while the supervisor runs, so "idle", which
+  waits for the keeper to settle, never became true. Every caller in another process that stops a supervisor goes
+  through this one request: `detach`, `rm`, `grant` growing the port block, `doctor --repair` moving a colliding port
+  block, and re-adopting main.
 
 ## Protocol
 
@@ -303,10 +314,10 @@ kills it under the authority it serves then, and says so on its stderr.
   into it, and acknowledges them. The supervisor keeps up to 65,536 unacknowledged commitments and then drops the
   oldest, which the next read reports.
 - **calls** — `openSession`, `sessionSnapshot`, `closeSession`, `exec`, `stdinWrite`, `stdinClose`, `streamChunk`,
-  `streamEnd`, `info`, `sealed`, `jobByKey`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `quiesce`, `retire`: one
-  per supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it exactly
-  as it fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under
-  the wrong profile. A first `exec` allocates its numeric `jobId` before process creation; a keyed repeat answers the
+  `streamEnd`, `info`, `sealed`, `jobByKey`, `list`, `kill`, `wait`, `logRead`, `checkpoint`, `retire`: one per
+  supervisor operation, each naming the authority the caller holds. The supervisor fences every call by it exactly as it
+  fences an in-process one, so a caller holding a stale incarnation or grant revision is refused, not served under the
+  wrong profile. A first `exec` allocates its numeric `jobId` before process creation; a keyed repeat answers the
   durable existing id and spawns nothing. A spawn failure is therefore a terminal job, not a response with no identity.
   `jobByKey` reads the exact incarnation's admission records after a lost reply or supervisor restart; only proven
   absence in that current authority returns `None` (wire `null`). Missing workspace/job, stale authority, transport,
