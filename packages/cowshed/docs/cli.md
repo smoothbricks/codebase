@@ -1683,14 +1683,17 @@ most severe finding (3/4/5). Stdout is `healthy` or `unhealthy`. Stderr is first
 then every finding, then the distinct `next:` commands those findings carry — findings first, hints after, never
 interleaved.
 
-Each probe is a `cowshed: doctor <probe> start` line and a `done elapsed=<duration> status=ok|err` line, and a probe
-that waits for another party — launchd, securityd, the gateway or sccache server at its socket, the commitment publisher
-— names it before it asks:
+Each probe prints `cowshed: doctor <probe> start` before it asks anything and, once it has taken 2 s,
+`done elapsed=<duration> status=ok|err`; the per-workspace checks end in one
+`cowshed: doctor workspace-checks done … workspaces=<n> slowest=<workspace> <d>` line. A probe that waits for another
+party — launchd, securityd, the gateway or sccache server at its socket, the commitment publisher — names it before it
+asks:
 `cowshed: doctor gateway-status waits-on=launchd (dev.cowshed.gateway), then the gateway daemon at /private/cowshed/store/gateway.sock`.
 The project's checks run inside the `doctor project` step, per workspace as `doctor <workspace>/<check>`. A doctor that
-seems stuck is in the probe of its last `start` without a `done`, waiting on the `waits-on=` party it named. Doctor adds
-no timeout: an absent or refusing party is a finding, one that never answers stays named on stderr, and no probe reports
-an answer it did not get.
+seems stuck is in the probe it last started, waiting on the `waits-on=` party it named. An absent or refusing party is a
+finding; a gateway or sccache server that took doctor's request and gives no answer in 60 s is `gateway-unanswered` or
+`sccache-unanswered`. The bound is a minute, not seconds, because a saturated gateway answers late; its hint is
+`cowshed gateway status` before any restart. No probe reports an answer it did not get.
 
 Store-wide listing and diagnosis continue past an unreadable project's records: listing warns with the project name, and
 doctor records a finding for it while checking other projects.

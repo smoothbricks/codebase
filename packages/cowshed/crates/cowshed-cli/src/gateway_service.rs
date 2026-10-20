@@ -35,6 +35,7 @@ use cowshed_gateway::{
     StartupProbe, SupervisorRecovery, WorkspaceSession,
 };
 use sha2::{Digest as _, Sha256};
+use std::convert::Infallible;
 use std::fs;
 use std::io::{self, Read as _, Write};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1045,6 +1046,59 @@ pub(crate) async fn start_after_host_move(slot: &InstallSlot, downgrade: Downgra
 }
 
 pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
+    let Ok(status) = observe_service(|client| async move {
+        Ok::<_, Infallible>(match client.status().await {
+            Ok(status) => Some((status, read_cpu_budget(&client).await)),
+            Err(_) => None,
+        })
+    })
+    .await?;
+    Ok(status)
+}
+
+/// A daemon that took a request over its socket and gave no answer within its asker's bound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Unanswered {
+    /// Who took the request: `the gateway daemon`, `the sccache server`.
+    pub(crate) peer: &'static str,
+    pub(crate) socket: PathBuf,
+    pub(crate) within: Duration,
+}
+
+/// [`service_status`] for `doctor`, from a gateway that must answer within `within` of taking
+/// each request (specs/cowshed/06_cli.md, "doctor"): one that stays silent is [`Unanswered`].
+pub(crate) async fn service_status_within(
+    within: Duration,
+) -> Result<std::result::Result<CliGatewayStatus, Unanswered>> {
+    let socket = control_socket_path();
+    observe_service(|client| async move {
+        match client.status_within(within).await {
+            Ok(status) => {
+                let cpu_budget = match client.cpu_budget_within(within).await {
+                    Ok(ledger) => GatewayCpuBudget::Ledger(ledger),
+                    Err(error) => GatewayCpuBudget::Unanswered(error.to_string()),
+                };
+                Ok(Some((status, cpu_budget)))
+            }
+            Err(ControlError::Unanswered { within }) => Err(Unanswered {
+                peer: "the gateway daemon",
+                socket,
+                within,
+            }),
+            Err(_) => Ok(None),
+        }
+    })
+    .await
+}
+
+/// The gateway's status as launchd and the daemon report it, `ask` putting the questions to a
+/// loaded daemon; what `ask` cannot answer for is its own error.
+async fn observe_service<E, Asked>(
+    ask: impl FnOnce(GatewayControlClient) -> Asked,
+) -> Result<std::result::Result<CliGatewayStatus, E>>
+where
+    Asked: Future<Output = std::result::Result<Option<(DaemonStatus, GatewayCpuBudget)>, E>>,
+{
     let home = canonical_home()?;
     let socket = control_socket_path();
     let executable =
@@ -1063,20 +1117,20 @@ pub(crate) async fn service_status() -> Result<CliGatewayStatus> {
     );
     let answered = if installed {
         let client = GatewayControlClient::new(socket.clone()).map_err(control_error)?;
-        match client.status().await {
-            Ok(status) => Some((status, read_cpu_budget(&client).await)),
-            Err(_) => None,
+        match ask(client).await {
+            Ok(answered) => answered,
+            Err(unanswered) => return Ok(Err(unanswered)),
         }
     } else {
         None
     };
     let (status, cpu_budget) = answered.unzip();
     let cli_sha256 = executable_digest(&running_executable()?)?;
-    Ok(CliGatewayStatus {
+    Ok(Ok(CliGatewayStatus {
         cpu_budget,
         pending_install,
         ..cli_status(installed, socket, status.as_ref(), cli_sha256.as_str())
-    })
+    }))
 }
 
 /// The host CPU ledger of a daemon that answered `status`, or why it did not answer

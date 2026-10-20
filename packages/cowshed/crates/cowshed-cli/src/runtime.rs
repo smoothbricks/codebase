@@ -4718,7 +4718,7 @@ fn retired_layout_finding(record: RetiredLayoutRecord) -> Finding {
 }
 
 fn retired_mount_layout_findings(store_root: &Path) -> Vec<Finding> {
-    match cowshed_os::timing::timed("doctor", format_args!("retired-mount-layout"), || {
+    match cowshed_core::doctor::probe_sync(format_args!("retired-mount-layout"), || {
         retired_layout_paths(store_root)
     }) {
         Ok(records) => records.into_iter().map(retired_layout_finding).collect(),
@@ -4948,13 +4948,11 @@ fn departed_volume_references_finding(
 }
 
 async fn diagnose_host() -> Result<Vec<Finding>> {
-    use cowshed_os::timing::{attribute, timed, timed_async, timed_value};
+    use cowshed_core::doctor::{probe, probe_sync, probe_value, waits_on};
     let home = gateway_service::canonical_home()?;
-    let plan = timed_async("doctor", "host-storage", async {
-        attribute(
-            "doctor",
+    let plan = probe("host-storage", async {
+        waits_on(
             format_args!("host-storage"),
-            "waits-on",
             "securityd (security find-generic-password, System.keychain) and launchd (system/dev.cowshed.storage)",
         );
         plan_host_setup(&home, CachesVolume::Keep).await
@@ -4970,24 +4968,27 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
             path: None,
         }],
     };
-    findings
-        .extend(timed_value("doctor", "caches-volume", async { caches_volume_finding() }).await);
-    let gateway = timed_async("doctor", "gateway-status", async {
-        attribute(
-            "doctor",
+    findings.extend(probe_value("caches-volume", async { caches_volume_finding() }).await);
+    let gateway = probe("gateway-status", async {
+        waits_on(
             format_args!("gateway-status"),
-            "waits-on",
             format_args!(
                 "launchd ({}), then the gateway daemon at {}",
                 crate::launchd::GATEWAY_LABEL,
                 cowshed_gateway_types::control_socket_path().display()
             ),
         );
-        gateway_service::service_status().await
+        gateway_service::service_status_within(DOCTOR_PEER_ANSWER).await
     })
     .await;
     match gateway {
-        Ok(status) => findings.extend(gateway_findings(&status)),
+        Ok(Ok(status)) => findings.extend(gateway_findings(&status)),
+        Ok(Err(unanswered)) => findings.push(unanswered_finding(
+            "gateway-unanswered",
+            FindingSeverity::Error,
+            &unanswered,
+            GATEWAY_UNANSWERED_HINT,
+        )),
         Err(error) => findings.push(Finding {
             code: "gateway-status".into(),
             severity: FindingSeverity::Error,
@@ -4996,19 +4997,16 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
             path: None,
         }),
     }
-    findings.extend(vnode_table_finding(timed(
-        "doctor",
+    findings.extend(vnode_table_finding(probe_sync(
         format_args!("vnode-table"),
         cowshed_core::vnodes::VnodeTable::read,
     )));
-    findings.extend(orphaned_disk_image_helpers_finding(timed(
-        "doctor",
+    findings.extend(orphaned_disk_image_helpers_finding(probe_sync(
         format_args!("disk-image-helpers"),
         cowshed_apfs::disk_image_helpers::OrphanedHelpers::read,
     )));
     // One snapshot answers both findings: departed volumes need no census of their own.
-    let budget = timed(
-        "doctor",
+    let budget = probe_sync(
         format_args!("attach-budget"),
         cowshed_apfs::attach_budget::observe,
     );
@@ -5018,22 +5016,30 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
         .and_then(|budget| departed_volume_references_finding(&budget.reading));
     findings.extend(disk_image_attach_budget_finding(budget));
     findings.extend(departed);
-    let sccache = timed_async("doctor", "sccache-status", async {
-        attribute(
-            "doctor",
+    let sccache = probe("sccache-status", async {
+        waits_on(
             format_args!("sccache-status"),
-            "waits-on",
             format_args!(
                 "launchd ({}), then the sccache server at {}",
                 crate::launchd::SCCACHE_LABEL,
                 cowshed_core::capabilities::sccache::server_socket().display()
             ),
         );
-        crate::capabilities::sccache::service::service_status().await
+        crate::capabilities::sccache::service::service_status_within(DOCTOR_PEER_ANSWER).await
     })
     .await;
     match sccache {
-        Ok(status) => findings.push(sccache_finding(&status)),
+        Ok((status, unanswered)) => {
+            findings.push(sccache_finding(&status));
+            findings.extend(unanswered.map(|unanswered| {
+                unanswered_finding(
+                    "sccache-unanswered",
+                    FindingSeverity::Warning,
+                    &unanswered,
+                    "cowshed sccache stop && cowshed sccache start",
+                )
+            }));
+        }
         Err(error) => findings.push(Finding {
             code: "sccache-status".into(),
             severity: FindingSeverity::Warning,
@@ -5045,7 +5051,7 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     // Whether the agent still has a program to run, which the status above cannot answer: a loaded
     // agent whose store path was collected looks identical to a healthy one until launchd next
     // tries to exec it, which may be a reboot away.
-    let pinning = timed("doctor", format_args!("sccache-agent"), || {
+    let pinning = probe_sync(format_args!("sccache-agent"), || {
         crate::capabilities::sccache::service::control_target(&home).map(|target| {
             crate::capabilities::sccache::nix::pinning_findings(&home, target.plist_path())
         })
@@ -5062,7 +5068,7 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
     }
     // Inventory validates the existing store itself. A pending host setup action is a finding,
     // not permission to hide project state. One registry traversal supplies every view below.
-    match timed_async("doctor", "inventory", doctor_projects()).await {
+    match probe("inventory", doctor_projects()).await {
         Ok((projects, mains, checkoutless, unreadable)) => {
             let roots = CanonicalRoots::global();
             let store = roots.store();
@@ -5105,6 +5111,39 @@ async fn diagnose_host() -> Result<Vec<Finding>> {
         }),
     }
     Ok(findings)
+}
+
+/// How long doctor waits for a daemon that took its request — the gateway, the sccache server —
+/// to answer before it reports that daemon as unanswered (specs/cowshed/06_cli.md, "doctor").
+/// Long rather than absent: a socket that takes a request and answers late may be a live,
+/// saturated gateway (05_gateway.md), and on a loaded host the gateway answered status in 4.6 to
+/// 4.9 s; a minute is over ten times that, and still inside the 180 s a caller once gave a silent
+/// doctor before killing it.
+const DOCTOR_PEER_ANSWER: Duration = Duration::from_secs(60);
+
+/// What to do about a gateway that took doctor's request and did not answer: it may be saturated
+/// and answer later, so look before restarting it, which would cut off every gate it serves.
+const GATEWAY_UNANSWERED_HINT: &str = "cowshed gateway status shows whether it answers late; if it never answers: cowshed gateway stop && cowshed gateway start";
+
+/// A daemon that took doctor's request and gave no answer within [`DOCTOR_PEER_ANSWER`].
+fn unanswered_finding(
+    code: &'static str,
+    severity: FindingSeverity,
+    unanswered: &gateway_service::Unanswered,
+    hint: &str,
+) -> Finding {
+    Finding {
+        code: code.into(),
+        severity,
+        message: format!(
+            "{} accepted doctor's request at {} and gave no answer in {:?}",
+            unanswered.peer,
+            unanswered.socket.display(),
+            unanswered.within
+        ),
+        hint: hint.into(),
+        path: Some(unanswered.socket.clone()),
+    }
 }
 
 fn doctor_report(findings: Vec<Finding>) -> DoctorReport {
@@ -5205,12 +5244,12 @@ where
     W: Write + Send,
     E: Write + Send,
 {
-    use cowshed_os::timing::{timed, timed_async};
+    use cowshed_core::doctor::{probe, probe_sync};
     let repair = matches!(&cli.command, Command::Doctor(args) if args.repair);
-    let project_root = timed_async("doctor", "project-root", resolve_project_root(&cli)).await;
+    let project_root = probe("project-root", resolve_project_root(&cli)).await;
     let mut findings = diagnose_host().await?;
     if repair && let Ok(root) = project_root.as_ref() {
-        match timed_async("doctor", "artifact-repair", repair_project_artifacts(root)).await {
+        match probe("artifact-repair", repair_project_artifacts(root)).await {
             Ok(repaired) => findings.extend(repaired),
             Err(error) => findings.push(Finding {
                 code: "artifact-repair".into(),
@@ -5226,21 +5265,13 @@ where
     match project_root {
         Ok(root) => {
             let scope = runtime_recovery_scope(&cli.command)?;
-            match timed_async(
-                "doctor",
-                "project-open",
-                ActorBridge::open_existing(&root, scope),
-            )
-            .await
-            {
+            match probe("project-open", ActorBridge::open_existing(&root, scope)).await {
                 Ok(mut bridge) => {
-                    let identity = timed("doctor", format_args!("git-identity"), || {
+                    let identity = probe_sync(format_args!("git-identity"), || {
                         git_identity_findings(&bridge)
                     });
-                    let project = timed_async("doctor", "project", bridge.doctor()).await;
-                    let teardown = timed_async("doctor", "project-shutdown", bridge.shutdown())
-                        .await
-                        .err();
+                    let project = probe("project", bridge.doctor()).await;
+                    let teardown = probe("project-shutdown", bridge.shutdown()).await.err();
                     match identity {
                         Ok(identity) => findings.extend(identity),
                         Err(error) => findings.push(Finding {
@@ -7408,6 +7439,28 @@ mod tests {
             finding.path.as_deref(),
             Some(record.metadata_path.as_path())
         );
+        assert!(!doctor_report(vec![finding]).healthy);
+    }
+
+    #[test]
+    fn a_gateway_that_accepted_and_never_answered_is_an_unhealthy_finding() {
+        let unanswered = gateway_service::Unanswered {
+            peer: "the gateway daemon",
+            socket: PathBuf::from("/private/cowshed/store/gateway.sock"),
+            within: DOCTOR_PEER_ANSWER,
+        };
+        let finding = unanswered_finding(
+            "gateway-unanswered",
+            FindingSeverity::Error,
+            &unanswered,
+            GATEWAY_UNANSWERED_HINT,
+        );
+        assert_eq!(finding.code, "gateway-unanswered");
+        assert_eq!(
+            finding.message,
+            "the gateway daemon accepted doctor's request at /private/cowshed/store/gateway.sock and gave no answer in 60s"
+        );
+        assert!(finding.hint.contains("cowshed gateway status"));
         assert!(!doctor_report(vec![finding]).healthy);
     }
 

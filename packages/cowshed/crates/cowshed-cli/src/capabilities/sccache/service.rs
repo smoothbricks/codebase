@@ -10,6 +10,7 @@
 
 use super::nix;
 use crate::args::SccacheCommand;
+use crate::gateway_service::Unanswered;
 use crate::gateway_service::{
     activate_launch_agent, canonical_home, effective_uid, inspect_install_state, launchd_error,
     output_error, remove_launch_agent,
@@ -359,6 +360,62 @@ pub(crate) fn remove_stale_socket(socket: &Path) -> Result<()> {
 }
 
 pub(crate) async fn service_status() -> Result<SccacheStatus> {
+    let (home, socket, installed, running) = observe_agent().await?;
+    let stats = if running {
+        read_stats(&home, &socket).await
+    } else {
+        None
+    };
+    Ok(SccacheStatus {
+        installed,
+        running,
+        stats,
+        socket,
+    })
+}
+
+async fn read_stats(home: &Path, socket: &Path) -> Option<SccacheStats> {
+    parse_stats(stats_command(home, socket)?.output_locked().await.ok()?)
+}
+
+/// [`service_status`] for `doctor`, from a server that must answer its statistics within
+/// `within` (specs/cowshed/06_cli.md, "doctor"): one that took the connection and stays silent
+/// is [`Unanswered`], beside a status that reports no statistics.
+pub(crate) async fn service_status_within(
+    within: Duration,
+) -> Result<(SccacheStatus, Option<Unanswered>)> {
+    let (home, socket, installed, running) = observe_agent().await?;
+    let (stats, unanswered) = match stats_command(&home, &socket).filter(|_| running) {
+        None => (None, None),
+        Some(mut command) => {
+            command.kill_on_drop(true);
+            match tokio::time::timeout(within, command.output_locked()).await {
+                Ok(output) => (output.ok().and_then(parse_stats), None),
+                Err(_) => (
+                    None,
+                    Some(Unanswered {
+                        peer: "the sccache server",
+                        socket: socket.clone(),
+                        within,
+                    }),
+                ),
+            }
+        }
+    };
+    Ok((
+        SccacheStatus {
+            installed,
+            running,
+            stats,
+            socket,
+        },
+        unanswered,
+    ))
+}
+
+/// The agent's home and socket, whether launchd has it loaded, and whether its socket takes a
+/// connection.
+async fn observe_agent() -> Result<(PathBuf, PathBuf, bool, bool)> {
     let home = canonical_home()?;
     let socket = server_socket();
     let target = control_target(&home)?;
@@ -374,31 +431,21 @@ pub(crate) async fn service_status() -> Result<SccacheStatus> {
         LaunchdServiceStatus::NotLoaded { .. } => false,
     };
     let running = socket_answers(&socket).await;
-    let stats = if running {
-        read_stats(&home, &socket).await
-    } else {
-        None
-    };
-    Ok(SccacheStatus {
-        installed,
-        running,
-        stats,
-        socket,
-    })
+    Ok((home, socket, installed, running))
 }
 
-/// The daemon's own `--show-stats`, as the only authority on what it is doing.
-///
-/// Reported per language, because the operational question a slot host asks is never "how many
-/// hits" but "are the *Rust* units hitting" — cross-workspace C/C++ reuse works without slots and
-/// would otherwise mask a Rust hit rate of zero. `base_directories` rides along for the same
-/// reason: it is the only way to see whether the server actually took `SCCACHE_BASEDIRS`.
-///
-/// A stats read that fails is absence, not an error: the verb's job is to report health, and a
-/// daemon that answers its socket but not a stats request is still installed and running. The
-/// client binary is resolved the same way the install resolves it, so `doctor` reports stats under
-/// launchd — where there is no `PATH` — instead of reporting a running daemon with no statistics.
-async fn read_stats(home: &Path, socket: &Path) -> Option<SccacheStats> {
+/// The installed client's `--show-stats` against the server at `socket`, or `None` when no
+/// client is installed.
+fn stats_command(home: &Path, socket: &Path) -> Option<tokio::process::Command> {
+    let mut command = tokio::process::Command::new(installed_program(home).ok()?.program());
+    command
+        .args(["--show-stats", "--stats-format", "json"])
+        .env("SCCACHE_SERVER_UDS", socket);
+    Some(command)
+}
+
+/// The statistics a successful `--show-stats` printed.
+fn parse_stats(output: std::process::Output) -> Option<SccacheStats> {
     #[derive(serde::Deserialize)]
     struct Counted {
         counts: std::collections::BTreeMap<String, u64>,
@@ -418,12 +465,6 @@ async fn read_stats(home: &Path, socket: &Path) -> Option<SccacheStats> {
         stats: Counters,
     }
 
-    let output = tokio::process::Command::new(installed_program(home).ok()?.program())
-        .args(["--show-stats", "--stats-format", "json"])
-        .env("SCCACHE_SERVER_UDS", socket)
-        .output_locked()
-        .await
-        .ok()?;
     if !output.status.success() {
         return None;
     }

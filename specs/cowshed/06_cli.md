@@ -64,21 +64,31 @@ Two verbs own the host story, both runnable from any directory:
   reports the `caches-volume` warning, whose hint is `cowshed setup --retire-caches-volume` once only the volume's
   marker remains and `cowshed setup, then cowshed setup --retire-caches-volume` before that.
 
-  Doctor says where it is as it goes, on stderr, in the lifecycle-span form every slow verb uses
-  (`cowshed: <scope> <step> start`, then `done elapsed=<duration> status=ok|err`): every probe is a `doctor <probe>`
-  step, and a probe that waits for another party's answer names that party, before it asks, on the line after its
-  `start`: `cowshed: doctor <probe> waits-on=<party>` (launchd, securityd, the gateway or the sccache server at its
-  socket, the commitment publisher). The host probes are `host-storage`, `caches-volume`, `gateway-status`,
+  Doctor says where it is as it goes, on stderr, in the lifecycle-span form every slow verb uses: every probe is a
+  `doctor <probe>` step whose `cowshed: doctor <probe> start` line always prints, before the probe asks anything, and
+  whose `done elapsed=<duration> status=ok|err` line prints only once the probe took 2 s (`SLOW_PROBE`). On a loaded
+  host every ordinary probe answered in under a second while the ones a slow doctor's time went to — the gateway's
+  answer, the store's metadata walk, main's abandoned refs — took 2 s and more, so below that a `done` line would only
+  say, hundreds of times per project, that a probe was fast. A probe that waits for another party names it on the line
+  after its `start`: `cowshed: doctor <probe> waits-on=<party>` (launchd, securityd, the gateway or the sccache server
+  at its socket, the commitment publisher). The host probes are `host-storage`, `caches-volume`, `gateway-status`,
   `vnode-table`, `disk-image-helpers`, `attach-budget`, `sccache-status`, `sccache-agent`, `inventory` and
   `retired-mount-layout`; the project's are `project-root`, `artifact-repair` (`--repair` only), `project-open`,
   `git-identity`, `project` and `project-shutdown`, and `project` runs one step per project check, per workspace as
-  `<workspace>/<check>` (`main/marker`). A doctor that does not finish therefore names, in its last `start` without a
-  `done`, the probe it waits in, and in that probe's `waits-on=` whose answer is missing. `status=err` means the probe's
-  own query failed; the failure is also its finding. Doctor sets no deadline of its own: a party that is absent or
-  refuses is a typed finding (`gateway-down`, `gateway-status`, `sccache-status`, `project-checks-skipped`, …), and one
-  that accepted and never answers stays named on stderr rather than cut off by a timer that would report a guess; no
-  probe reports an answer it did not get. A caller that asked for its steps (07_api.md) hears the same steps; `--json`
-  changes stdout only.
+  `<workspace>/<check>` (`main/marker`), ending in one summary line,
+  `cowshed: doctor workspace-checks done elapsed=<d> workspaces=<n> slowest=<workspace> <d>`. A doctor that does not
+  finish therefore names, in its last `start` line, the probe it waits in, and in that probe's `waits-on=` whose answer
+  is missing. `status=err` means the probe's own query failed; the failure is also its finding. A party that is absent
+  or refuses is a typed finding (`gateway-down`, `gateway-status`, `sccache-status`, `project-checks-skipped`, …). A
+  daemon that took doctor's request and stays silent — the gateway's `status` and `cpu-budget`, the sccache server's
+  statistics — is given 60 s (`DOCTOR_PEER_ANSWER`) and then reported as `gateway-unanswered` (error) or
+  `sccache-unanswered` (warning): `<peer> accepted doctor's request at <socket> and gave no answer in 60s`. The bound is
+  long rather than absent because a socket that takes a request and answers late may be a live, saturated gateway
+  (05_gateway.md, "Host CPU budget": only `ENOENT` proves the gateway absent); that gateway answered `status` in 4.6–4.9
+  s on a loaded host, a minute is over ten times that, and it is still well inside the 180 s a caller once gave a silent
+  doctor before killing it. The `gateway-unanswered` hint looks before it restarts, since a restart cuts off every gate
+  the gateway serves. No probe reports an answer it did not get. A caller that asked for its steps (07_api.md) hears
+  every step start and end, however short; `--json` changes stdout only.
 
 - **`setup`** is idempotent host repair: provision absent volumes, repair detached or mis-mounted ones,
   FileVault-encrypt unencrypted ones in place and store passphrases in System.keychain, validate markers precisely, pin

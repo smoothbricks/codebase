@@ -5,6 +5,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -93,6 +94,17 @@ impl GatewayControlClient {
             .ok_or(ControlError::InvalidResponse)
     }
 
+    /// [`Self::status`] from a daemon that must answer within `within` of taking the request: one
+    /// that took it and stays silent is [`ControlError::Unanswered`], not a wait without end
+    /// (specs/cowshed/06_cli.md, "doctor").
+    pub async fn status_within(&self, within: Duration) -> Result<DaemonStatus, ControlError> {
+        let response: ControlResponse = self
+            .exchange_within(&ControlRequest::Status, Some(within))
+            .await?;
+        check_response(&response)?;
+        response.status.ok_or(ControlError::InvalidResponse)
+    }
+
     /// Observe one installed workspace revision without requesting the host session census.
     pub async fn session_current(
         &self,
@@ -130,6 +142,18 @@ impl GatewayControlClient {
         .await?
         .nx_cache_cleared
         .ok_or(ControlError::InvalidResponse)
+    }
+
+    /// [`Self::cpu_budget`] answered within `within`, as [`Self::status_within`].
+    pub async fn cpu_budget_within(
+        &self,
+        within: Duration,
+    ) -> Result<CpuBudgetStatus, ControlError> {
+        let response: ControlResponse = self
+            .exchange_within(&ControlRequest::CpuBudget, Some(within))
+            .await?;
+        check_response(&response)?;
+        response.cpu_budget.ok_or(ControlError::InvalidResponse)
     }
 
     /// The gate jobs a gateway restart now would cut off (05_gateway.md, "An install waits for
@@ -317,11 +341,26 @@ impl GatewayControlClient {
         &self,
         request: &ControlRequest,
     ) -> Result<T, ControlError> {
+        self.exchange_within(request, None).await
+    }
+
+    /// [`Self::exchange`], whose answer must arrive within `within` of the request being sent,
+    /// when a bound is given.
+    async fn exchange_within<T: serde::de::DeserializeOwned>(
+        &self,
+        request: &ControlRequest,
+        within: Option<Duration>,
+    ) -> Result<T, ControlError> {
         let (mut stream, encoded) = self.connect_and_encode(request).await?;
         stream.write_all(&encoded).await?;
         stream.shutdown().await?;
         let mut reader = BufReader::new(stream);
-        read_answer_line(&mut reader).await
+        match within {
+            None => read_answer_line(&mut reader).await,
+            Some(within) => tokio::time::timeout(within, read_answer_line(&mut reader))
+                .await
+                .map_err(|_| ControlError::Unanswered { within })?,
+        }
     }
 
     async fn connect_and_encode(
@@ -2410,6 +2449,8 @@ pub enum ControlError {
     },
     #[error("gateway control I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("the gateway took the request and gave no answer within {within:?}")]
+    Unanswered { within: Duration },
 }
 
 #[cfg(test)]
@@ -2617,6 +2658,37 @@ mod tests {
         );
         answering.await.expect("the answers");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A daemon that takes the request and never answers is refused once the asker's bound
+    /// elapses, naming the bound; that elapsing is this scenario's event.
+    #[tokio::test]
+    async fn a_daemon_that_takes_status_and_stays_silent_is_unanswered_within_the_bound() {
+        let id = Uuid::new_v4().simple().to_string();
+        let root = test_fixture_dir::secure_fixture_dir(&format!("csilent-{}", &id[..8]));
+        let socket = root.path().join("gateway.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let (taken, answered) = tokio::sync::oneshot::channel();
+        let silent = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request = read_request_line(&mut stream).await.expect("one request");
+            assert!(matches!(
+                parse_control_request(&request),
+                Ok(Incoming::Request(ControlRequest::Status))
+            ));
+            // Hold the connection open, unanswered, until the client has given up on it.
+            answered.await.expect("the client's verdict");
+            drop(stream);
+        });
+        let within = Duration::from_millis(50);
+        let client = GatewayControlClient::new(socket).expect("client");
+        let refused = client.status_within(within).await;
+        taken.send(()).expect("release the silent daemon");
+        assert!(
+            matches!(refused, Err(ControlError::Unanswered { within: bound }) if bound == within),
+            "{refused:?}"
+        );
+        silent.await.expect("silent daemon");
     }
 
     #[tokio::test]

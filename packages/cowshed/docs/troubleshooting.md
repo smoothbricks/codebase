@@ -422,10 +422,13 @@ step, so the slow step is named on stderr. On a large repository two steps carry
 - **`fork links`**, the walk over the whole tree for symlinks that point outside it; its cost scales with the entries
   visited.
 
-`cowshed doctor` prints a `cowshed: doctor <probe>` span for every probe, each project check per workspace as
-`doctor <workspace>/<check>`, and a probe that waits for another party says so before it asks with
-`cowshed: doctor <probe> waits-on=<party>`. A doctor that does not finish is in the probe of its last `start` without a
-`done`, waiting for the party that line names; the elapsed times of the others say where a slow doctor's minute went.
+`cowshed doctor` prints `cowshed: doctor <probe> start` for every probe, each project check per workspace as
+`doctor <workspace>/<check>`, and a `done elapsed=…` line for each probe that took 2 s or more, then one
+`doctor workspace-checks done` summary naming the slowest workspace. A probe that waits for another party says so before
+it asks with `cowshed: doctor <probe> waits-on=<party>`. A doctor that does not finish is in the probe it last started,
+waiting for the party that line names; the `done` lines say where a slow doctor's minute went. A gateway or sccache
+server that accepts doctor's request and stays silent for a minute is reported as `gateway-unanswered` or
+`sccache-unanswered` instead of holding doctor.
 
 ## A disk child `did not finish within 120s`
 

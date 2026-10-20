@@ -21,7 +21,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -131,18 +131,7 @@ pub fn timed<T, E: fmt::Display>(
     step: fmt::Arguments<'_>,
     work: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    eprintln!("cowshed: {scope} {step} start");
-    let started = Instant::now();
-    let result = match OpenStep::start(scope, || step.to_string()) {
-        Some(open) => {
-            let result = STEPS.sync_scope(open.inside(), work);
-            open.end(&result);
-            result
-        }
-        None => work(),
-    };
-    done(format_args!("{scope} {step}"), started, result.is_ok());
-    result
+    timed_over(scope, step, Duration::ZERO, work)
 }
 
 /// Run one asynchronous step inside a span labelled `<scope> <step>`, reported to the call's
@@ -153,6 +142,60 @@ pub fn timed<T, E: fmt::Display>(
 pub async fn timed_async<T, E: fmt::Display>(
     scope: &'static str,
     step: impl Into<Cow<'static, str>>,
+    work: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    timed_async_over(scope, step, Duration::ZERO, work).await
+}
+
+/// [`timed_async_over`] for a step that answers a value rather than a result, so it ends
+/// `status=ok`: a doctor probe, which reports a failure of what it asked as a finding, not as
+/// its own.
+pub async fn timed_value_over<T>(
+    scope: &'static str,
+    step: impl Into<Cow<'static, str>>,
+    slow: Duration,
+    work: impl Future<Output = T>,
+) -> T {
+    let Ok(value) =
+        timed_async_over(scope, step, slow, async { Ok::<_, Infallible>(work.await) }).await;
+    value
+}
+
+/// [`timed`] whose `done` line prints only when the step took at least `slow`. Its `start` line
+/// always prints, so a step that never ends is still the `start` with no `done`; a verb that
+/// runs hundreds of steps, such as `doctor`, says how long only of the ones the time went to.
+/// A caller that asked for its steps hears every step end either way.
+pub fn timed_over<T, E: fmt::Display>(
+    scope: &'static str,
+    step: fmt::Arguments<'_>,
+    slow: Duration,
+    work: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    eprintln!("cowshed: {scope} {step} start");
+    let started = Instant::now();
+    let result = match OpenStep::start(scope, || step.to_string()) {
+        Some(open) => {
+            let result = STEPS.sync_scope(open.inside(), work);
+            open.end(&result);
+            result
+        }
+        None => work(),
+    };
+    done(
+        format_args!("{scope} {step}"),
+        started,
+        slow,
+        result.is_ok(),
+    );
+    result
+}
+
+/// [`timed_async`] whose `done` line prints only when the step took at least `slow`, as
+/// [`timed_over`].
+pub async fn timed_async_over<T, E: fmt::Display>(
+    scope: &'static str,
+    step: impl Into<Cow<'static, str>>,
+    slow: Duration,
     work: impl Future<Output = Result<T, E>>,
 ) -> Result<T, E> {
     let step = step.into();
@@ -166,28 +209,24 @@ pub async fn timed_async<T, E: fmt::Display>(
         }
         None => work.await,
     };
-    done(format_args!("{scope} {step}"), started, result.is_ok());
+    done(
+        format_args!("{scope} {step}"),
+        started,
+        slow,
+        result.is_ok(),
+    );
     result
 }
 
-/// [`timed_async`] for a step that answers a value rather than a result, so it always ends
-/// `status=ok`: a doctor probe, which reports a failure of what it asked as a finding, not as
-/// its own.
-pub async fn timed_value<T>(
-    scope: &'static str,
-    step: impl Into<Cow<'static, str>>,
-    work: impl Future<Output = T>,
-) -> T {
-    let Ok(value) = timed_async(scope, step, async { Ok::<_, Infallible>(work.await) }).await;
-    value
-}
-
-fn done(label: fmt::Arguments<'_>, started: Instant, ok: bool) {
-    eprintln!(
-        "cowshed: {label} done elapsed={:?} status={}",
-        started.elapsed(),
-        if ok { "ok" } else { "err" }
-    );
+/// The step's `done` line, when it took at least `slow`.
+fn done(label: fmt::Arguments<'_>, started: Instant, slow: Duration, ok: bool) {
+    let elapsed = started.elapsed();
+    if elapsed >= slow {
+        eprintln!(
+            "cowshed: {label} done elapsed={elapsed:?} status={}",
+            if ok { "ok" } else { "err" }
+        );
+    }
 }
 
 /// Attach one fact to a lifecycle step: printed unconditionally as
@@ -355,13 +394,14 @@ mod tests {
         );
     }
 
-    /// A step that answers a value is reported like any other, and ends without an error.
+    /// A step that answers a value is reported like any other, and ends without an error; a
+    /// step under its `done` threshold still ends for a caller that asked for its steps.
     #[tokio::test]
     async fn a_value_step_is_reported_and_ends_without_an_error() {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let value = reporting(
             StepSink::new(sender),
-            timed_value("doctor", "probe", async { 7 }),
+            timed_value_over("doctor", "probe", Duration::MAX, async { 7 }),
         )
         .await;
 
