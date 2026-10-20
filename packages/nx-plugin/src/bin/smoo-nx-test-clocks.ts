@@ -3,8 +3,8 @@ import { findClockOracles, formatClockOracle, TEST_CLOCK_ORACLE } from '../test-
 import { diffScope, upstreamBase } from '../test-walk-policy.js';
 
 // TEST-CLOCK-ORACLE over the current directory's repository, judged on the cases changed since the upstream merge base
-// (`upstreamBase`, the base `smoo-nx-test-walks --base` prints for the lint target's runtime input). Every finding
-// prints `error[…]` and exits 1. Exit 2 when git cannot answer.
+// (`upstreamBase`, resolved as a run precondition before Nx hashes anything). Every finding prints `error[…]` and
+// exits 1. Exit 2 when git cannot answer.
 if (process.argv.length > 2) {
   process.stderr.write('usage: smoo-nx-test-clocks\n');
   process.exit(2);

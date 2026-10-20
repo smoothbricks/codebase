@@ -82,6 +82,7 @@ import {
 import { runtimeInput, shellWord } from './runtime-input.js';
 import { isNonSourceDirectory } from './source-directories.js';
 import { postTasksExecution as postTaskResults, preTasksExecution as preTaskResults } from './task-results.js';
+import { assertUpstreamBasePrecondition } from './test-walk-policy.js';
 import { SHARD_TIMINGS_EXECUTOR, SHARD_TIMINGS_TARGET, timingsShardedSuite } from './test-timings.js';
 import {
   isBuildOutputTargetName,
@@ -1076,6 +1077,9 @@ function isBuildOutputPackageJson(packageJsonPath: string): boolean {
  * (`run-cpu-pool.ts`), and closes it when the run ends.
  */
 export const preTasksExecution: PreTasksExecution<ProducerReceiptsOptions> = async (options, context) => {
+  // Before any task is hashed: a workspace that declares the test-walk check
+  // must be able to name its upstream base, or the run fails with that reason.
+  assertUpstreamBasePrecondition(context.workspaceRoot);
   preTaskResults(options, context);
   await preProducerReceipts(options, context);
   await serveRunCpuPool(context);

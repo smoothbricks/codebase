@@ -707,6 +707,25 @@ export function upstreamBase(root: string): GitAnswer<string> {
 }
 
 /**
+ * The upstream base as a run precondition, checked before Nx hashes anything:
+ * only a workspace whose own root package.json declares the test-walk check
+ * (this repository) is gated, and a missing main ref fails the run with the
+ * check's own reason instead of an error smuggled through a runtime input's
+ * byte channel. Workspaces that never declare the check are untouched.
+ */
+export function assertUpstreamBasePrecondition(workspaceRoot: string): void {
+  let rootPackage: string;
+  try {
+    rootPackage = readFileSync(join(workspaceRoot, 'package.json'), 'utf8');
+  } catch {
+    return;
+  }
+  if (!rootPackage.includes('smoo-nx-test-walks')) return;
+  const base = upstreamBase(workspaceRoot);
+  if (!base.ok) throw new Error(`${TEST_ONE_WALK.id} cannot find the upstream base: ${base.reason}`);
+}
+
+/**
  * The files changed since `base`, tracked or untracked, and the new-side line ranges of each change; an untracked
  * file is changed throughout.
  */

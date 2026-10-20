@@ -9,12 +9,13 @@ import {
 } from '../test-walk-policy.js';
 
 // TEST-ONE-WALK over the current directory's repository, judged on the cases changed since the upstream merge base
-// (`upstreamBase`). `--base` prints only that base, for an Nx runtime input: the verdict depends on it and no file
-// hash names it. Refusing kinds print `error[…]` and exit 1; advisory kinds print `warning[…]` for the writer and
-// reviewer and leave the exit at 0. Exit 2 when git cannot answer.
+// (`upstreamBase`). The base is repository state, not task data: the plugin resolves it as a run precondition
+// before Nx hashes anything (assertUpstreamBasePrecondition), so it is never carried by a runtime input.
+// Refusing kinds print `error[…]` and exit 1; advisory kinds print `warning[…]` for the writer and reviewer and
+// leave the exit at 0. Exit 2 when git cannot answer.
 const args = process.argv.slice(2);
-if (args.length > 1 || (args.length === 1 && args[0] !== '--base')) {
-  process.stderr.write('usage: smoo-nx-test-walks [--base]\n');
+if (args.length > 0) {
+  process.stderr.write('usage: smoo-nx-test-walks\n');
   process.exit(2);
 }
 const root = process.cwd();
@@ -22,10 +23,6 @@ const base = upstreamBase(root);
 if (!base.ok) {
   process.stderr.write(`${TEST_ONE_WALK.id} cannot find the upstream base: ${base.reason}\n`);
   process.exit(2);
-}
-if (args[0] === '--base') {
-  process.stdout.write(`${base.value}\n`);
-  process.exit(0);
 }
 const scope = diffScope(root, base.value);
 if (!scope.ok) {

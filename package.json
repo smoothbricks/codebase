@@ -125,10 +125,7 @@
           "{workspaceRoot}/packages/nx-plugin/src/test-clock-policy.ts",
           "{workspaceRoot}/packages/nx-plugin/src/bounded-test-policy.ts",
           "{workspaceRoot}/packages/nx-plugin/src/bin/smoo-nx-test-clocks.ts",
-          "{workspaceRoot}/packages/validation/src/bun/preload.ts",
-          {
-            "runtime": "sh node_modules/@smoothbricks/nx-plugin/runtime-input.sh bun packages/nx-plugin/src/bin/smoo-nx-test-walks.ts --base"
-          }
+          "{workspaceRoot}/packages/validation/src/bun/preload.ts"
         ],
         "options": {
           "commands": [

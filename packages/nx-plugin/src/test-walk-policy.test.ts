@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  assertUpstreamBasePrecondition,
   diffScope,
   findDuplicateScenarios,
   formatDuplicateScenario,
@@ -577,6 +578,39 @@ describe('test-walk-policy', () => {
       expect(upstreamBase(root)).toEqual({ ok: true, value: base });
       process.env.NX_BASE = 'no-such-commit';
       expect(upstreamBase(root)).toEqual({ ok: false, reason: 'NX_BASE=no-such-commit names no commit' });
+    } finally {
+      if (inheritedBase === undefined) delete process.env.NX_BASE;
+      else process.env.NX_BASE = inheritedBase;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('gates only a workspace that declares the check, and names a missing main ref as its own reason', () => {
+    const root = mkdtempSync(join(tmpdir(), 'test-walk-precondition-'));
+    const git = (...args: string[]): string =>
+      execFileSync('git', args, {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+      });
+    const inheritedBase = process.env.NX_BASE;
+    delete process.env.NX_BASE;
+    try {
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'elsewhere' }));
+      expect(() => assertUpstreamBasePrecondition(root)).not.toThrow();
+      writeFileSync(
+        join(root, 'package.json'),
+        JSON.stringify({
+          name: 'codebase',
+          nx: { targets: { lint: { options: { commands: ['bun smoo-nx-test-walks.ts'] } } } },
+        }),
+      );
+      git('init', '--quiet', '-b', 'topic');
+      git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'add', '.');
+      git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'base');
+      expect(() => assertUpstreamBasePrecondition(root)).toThrow('no main ref in this shed');
+      git('branch', 'main');
+      expect(() => assertUpstreamBasePrecondition(root)).not.toThrow();
     } finally {
       if (inheritedBase === undefined) delete process.env.NX_BASE;
       else process.env.NX_BASE = inheritedBase;
