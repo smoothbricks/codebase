@@ -824,6 +824,31 @@ hook all select this one managed file.
 The generated pre-commit hook runs the same formatter path from the repository root with `tooling`, `node_modules/.bin`,
 and the [devenv] profile on `PATH`.
 
+Before anything rewrites the index, the hook guards cowshed's main checkout. A commit there moves main's ref, which only
+a holder of the repository's ref lock may move: the lock a land holds for its fast-forward and the doc lane holds for
+its commit. The checkout's role comes from cowshed's in-image marker, `.cowshed/workspace.json` (`"role": "main"`,
+cowshed `01_storage.md`); a shed (`"role": "workspace"`), a plain clone and a CI runner have no main role and commit as
+before. In main, the hook requires the lock holder's marker:
+
+```bash
+SMOO_REF_LOCK_HOLDER=<pid>:<absolute path of the ref lock file>
+```
+
+`<pid>` is the process that has the lock file open while the commit runs. For `lockf(1)` that is the `lockf` process,
+not its command: `lockf` keeps the file open and closes it in the child it runs. Name it with the `$$` of the shell that
+`exec`s `lockf` (`exec lockf -k "$lock" env SMOO_REF_LOCK_HOLDER="$$:$lock" git commit …`), or with `$PPID` in the
+lock-held pass when `lockf` is that pass's parent (a `direnv exec` between them `exec`s and keeps the parent). Export it
+after any environment scrub, since a scrub such as `env -i` drops it. The lock holder sets it, and every commit, merge
+conclusion or rebase step the holder runs inherits it.
+
+The hook trusts no part of the marker: it proves that `<pid>` is its own ancestor, from one read of the process table,
+and that `<pid>` has `<lock file>` open (`/proc/<pid>/fd` on Linux, `lsof -a -p` elsewhere). An unset, malformed, stale
+(holder not an ancestor) or hand-set (ancestor that never opened the lock) marker refuses the commit with exit 1, before
+formatting, and names the retry: commit through the repository's doc lane,
+`~/Dev/.land-lock.sh <repo> git [-C <main>] commit -m '…' -- <paths>`, and report that lane's failure rather than
+committing in main by hand. A fast-forward, a merge without a conflict and a rebase run no pre-commit hook, so a land's
+fast-forward moves main without a marker. `git commit --no-verify` skips the guard with every other hook.
+
 After formatting, the hook runs `smoo monorepo validate --fail-fast --only-if-new-workspace-package`. This keeps normal
 commits fast while still catching incomplete package setup and conditional managed-file drift when a new workspace
 package manifest is staged.
