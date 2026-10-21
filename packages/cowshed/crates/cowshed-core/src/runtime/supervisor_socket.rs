@@ -927,38 +927,179 @@ pub async fn serve(
                     }
                 }
                 Ok(Retirement::Draining) => {
+                    let report = DrainReport::beside(&socket_path);
                     // Under the authority it holds now, which an advance may have moved.
-                    let Ok(authority) = supervisor.current_authority().await else {
-                        return;
+                    let current = match supervisor.current_authority().await {
+                        Ok(authority) => supervisor.with_authority(authority),
+                        Err(error) => return report.stuck("read its authority", &error),
                     };
-                    let current = supervisor.with_authority(authority);
-                    let Ok(jobs) = current.list().await else {
-                        return;
+                    let jobs = match current.list().await {
+                        Ok(jobs) => jobs,
+                        Err(error) => return report.stuck("list its jobs", &error),
                     };
-                    // A second `drain` finds the first one's reckoning under way.
-                    let running = jobs
+                    let running: Vec<JobId> = jobs
                         .iter()
                         .filter(|job| !job.state.is_terminal())
-                        .map(|job| job.job_id);
-                    if !owed.begin(running) {
+                        .map(|job| job.job_id)
+                        .collect();
+                    // A second `drain` finds the first one's reckoning under way.
+                    if !owed.begin(running.iter().copied()) {
                         return;
                     }
-                    if current.quiesce().await.is_err() {
-                        return;
+                    report.publish(DrainWait::Jobs { running });
+                    if let Err(error) = current.quiesce().await {
+                        return report.stuck("wait for its running jobs", &error);
                     }
+                    report.publish(DrainWait::Reads {
+                        unread: owed.unread(),
+                    });
                     let settled = owed.settle(super::project::SUPERVISOR_IDLE).await;
                     cowshed_os::eprintln!(
                         "cowshed: workspace supervisor {} of build {} retires after draining; {settled}",
                         socket_path.display(),
                         BuildId::current().map_or("(unnamed)", BuildId::as_str),
                     );
-                    if current.retire(NxDaemonRetirement::Recorded).await.is_ok() {
-                        retired.notify_one();
+                    match current.retire(NxDaemonRetirement::Recorded).await {
+                        Ok(()) => {
+                            report.withdraw();
+                            retired.notify_one();
+                        }
+                        Err(error) => report.stuck("retire", &error),
                     }
                 }
                 Ok(Retirement::Serving) | Err(_) => {}
             }
         });
+    }
+}
+
+/// What a draining supervisor waits for, published beside its socket (`<socket>.drain`) so that
+/// a command of another build it refuses can say why it still serves (11_shell.md "Draining a
+/// supervisor of another build"). Read across builds: a reader decodes what it knows, and says
+/// so when it cannot.
+struct DrainReport {
+    path: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DrainReportWire {
+    /// The supervisor that wrote it: a report whose pid is not the one serving the socket is a
+    /// killed supervisor's, and says nothing.
+    pid: u32,
+    waits: DrainWait,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "for", rename_all = "camelCase")]
+enum DrainWait {
+    /// The jobs that ran when it was asked to drain, to end.
+    Jobs { running: Vec<JobId> },
+    /// A client to read these jobs' ends, or [`super::project::SUPERVISOR_IDLE`] with no client
+    /// call at all.
+    Reads { unread: Vec<JobId> },
+    /// A step of its retirement failed: it serves on until it is killed.
+    Stuck { step: String, error: String },
+}
+
+impl DrainWait {
+    fn describe(&self) -> String {
+        let jobs = |ids: &[JobId]| {
+            ids.iter()
+                .map(|job| job.get().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match self {
+            Self::Jobs { running } => {
+                format!("it drains: it waits for jobs {} to end", jobs(running))
+            }
+            Self::Reads { unread } if unread.is_empty() => "it drains and is retiring".to_owned(),
+            Self::Reads { unread } => format!(
+                "it drains: its jobs ended, and it waits for a client to read the ends of jobs {}, \
+                 or {} minutes with no client call",
+                jobs(unread),
+                super::project::SUPERVISOR_IDLE.as_secs() / 60
+            ),
+            Self::Stuck { step, error } => format!(
+                "its retirement failed to {step} ({error}), so it serves until it is killed"
+            ),
+        }
+    }
+}
+
+impl DrainReport {
+    fn beside(socket: &Path) -> Self {
+        Self {
+            path: socket.with_extension("drain"),
+        }
+    }
+
+    fn publish(&self, waits: DrainWait) {
+        let wire = DrainReportWire {
+            pid: std::process::id(),
+            waits,
+        };
+        let published = serde_json::to_vec(&wire)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                crate::metadata::write_atomic_bytes(&self.path, &bytes)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = published {
+            cowshed_os::eprintln!(
+                "cowshed: a draining supervisor cannot publish what it waits for at {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+
+    /// Say on stderr and in the report that retirement stopped at `step`.
+    fn stuck(&self, step: &str, error: &CowshedError) {
+        cowshed_os::eprintln!(
+            "cowshed: a draining supervisor ({}) failed to {step}: {error}; it serves until it is \
+             killed",
+            self.path.display()
+        );
+        self.publish(DrainWait::Stuck {
+            step: step.to_owned(),
+            error: error.to_string(),
+        });
+    }
+
+    fn withdraw(&self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => cowshed_os::eprintln!(
+                "cowshed: a retired supervisor left its drain report {}: {error}",
+                self.path.display()
+            ),
+        }
+    }
+
+    /// What the supervisor `pid` serving `socket` reported it waits for: `None` when it published
+    /// nothing, or the report is another (killed) process's.
+    fn read(socket: &Path, pid: u64) -> Option<String> {
+        let path = socket.with_extension("drain");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                return Some(format!(
+                    "its drain report {} is unreadable: {error}",
+                    path.display()
+                ));
+            }
+        };
+        match serde_json::from_slice::<DrainReportWire>(&bytes) {
+            Ok(wire) if u64::from(wire.pid) == pid => Some(wire.waits.describe()),
+            Ok(_) => None,
+            Err(error) => Some(format!(
+                "its drain report {} does not decode: {error}",
+                path.display()
+            )),
+        }
     }
 }
 
@@ -1045,6 +1186,16 @@ impl DrainReads {
         }
         *owed = Some(running.map(|job| (job, Owed::default())).collect());
         true
+    }
+
+    /// The owed jobs whose ends no client has read yet.
+    fn unread(&self) -> Vec<JobId> {
+        self.owed()
+            .iter()
+            .flatten()
+            .filter(|(_, owed)| !owed.read())
+            .map(|(job, _)| *job)
+            .collect()
     }
 
     /// Record what a served call told its client about `job`, while draining.
@@ -1760,7 +1911,10 @@ fn decode_hello(path: &Path, value: serde_json::Value) -> Result<Hello> {
         let pid = value.get("pid").and_then(serde_json::Value::as_u64);
         let (serving, hint) = match pid {
             Some(pid) => (
-                format!(" (pid {pid})"),
+                match DrainReport::read(path, pid) {
+                    Some(waits) => format!(" (pid {pid}; {waits})"),
+                    None => format!(" (pid {pid})"),
+                },
                 format!(
                     "it admits nothing more and retires once its running jobs end, and a land step \
                      waits for that; to end its jobs now, `kill {pid}`: they end when it exits, \
@@ -3122,5 +3276,73 @@ mod drain_read_tests {
             settled.to_string(),
             "read by a client: []; unread after 30 minutes with no client call: [7]"
         );
+    }
+
+    /// A draining supervisor's report says what it waits for at each step, read back by the
+    /// pid serving the socket. A report another pid wrote is a killed supervisor's and says
+    /// nothing, and one that does not decode says so rather than vanishing.
+    #[test]
+    fn a_drain_report_names_what_the_supervisor_serving_the_socket_waits_for() {
+        let root = std::env::temp_dir().join(format!(
+            "cowshed-drain-report-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let socket = root.join("0123.sock");
+        let report = DrainReport::beside(&socket);
+        let ours = u64::from(std::process::id());
+        assert_eq!(DrainReport::read(&socket, ours), None, "nothing published");
+
+        report.publish(DrainWait::Jobs {
+            running: vec![job(12), job(13)],
+        });
+        assert_eq!(
+            DrainReport::read(&socket, ours).as_deref(),
+            Some("it drains: it waits for jobs 12, 13 to end")
+        );
+        assert_eq!(
+            DrainReport::read(&socket, ours + 1),
+            None,
+            "another process's report"
+        );
+
+        let owed = DrainReads::default();
+        owed.begin([job(7024), job(7025)].into_iter());
+        owed.record(job(7025), |owed| owed.end = true);
+        report.publish(DrainWait::Reads {
+            unread: owed.unread(),
+        });
+        assert_eq!(
+            DrainReport::read(&socket, ours).as_deref(),
+            Some(
+                "it drains: its jobs ended, and it waits for a client to read the ends of jobs \
+                 7024, or 30 minutes with no client call"
+            )
+        );
+
+        report.stuck(
+            "retire",
+            &CowshedError::internal("the Nx daemon record is unwritable"),
+        );
+        let stuck = DrainReport::read(&socket, ours).unwrap();
+        assert!(
+            stuck.starts_with("its retirement failed to retire (")
+                && stuck.ends_with("so it serves until it is killed"),
+            "{stuck}"
+        );
+
+        report.withdraw();
+        assert_eq!(
+            DrainReport::read(&socket, ours),
+            None,
+            "withdrawn on retirement"
+        );
+        std::fs::write(socket.with_extension("drain"), b"{\"pid\":").unwrap();
+        assert!(
+            DrainReport::read(&socket, ours).is_some_and(|said| said.contains("does not decode")),
+            "a torn report says so"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
