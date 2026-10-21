@@ -24,6 +24,11 @@
       "implementation": "./dist/executors/shard-timings/executor.js",
       "schema": "./src/executors/shard-timings/schema.json",
       "description": "Fail when a timings-sharded bun test suite runs a file its --timings manifest does not name"
+    },
+    "all-verdicts": {
+      "implementation": "./dist/executors/all-verdicts/executor.js",
+      "schema": "./src/executors/all-verdicts/schema.json",
+      "description": "Run every command at once to its own verdict and report each one a signal ended or that never ran as UNJUDGED"
     }
   }
 }

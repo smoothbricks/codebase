@@ -54,6 +54,15 @@ JavaScript/TypeScript sources or changing the declared test program updates lint
 `@smoothbricks/nx-plugin/eslint-file-set` owns its type and generated validator; an inspector can resolve each file's
 actual ESLint parser program instead of guessing from the project or target name.
 
+The `lint` target runs its commands with this plugin's `all-verdicts` executor, not Nx's `run-commands`, which in
+parallel terminates the other commands once one fails and serially never starts the ones after a failure: one tool's
+errors would hide another's until a later run. `all-verdicts` starts every command at once, and none ends another. Each
+command's output prints as one block when it closes, then every command's verdict: `PASS`, `FAIL (exit n)`, or
+`UNJUDGED` with its cause when a signal ended it, it never started, or the run itself was signalled. A signal to the run
+ends each command's process group, and the run then ends by the same signal. The target passes only when every command
+passed; an empty command list is refused, since it could never fail. The options keep `commands` and `cwd`, so each
+tool's command, the inputs that key it and `metadata.eslintFileSet` are what they were.
+
 Lint inputs include dependency production inputs because type-aware ESLint reads dependencies' declarations. This uses
 `^production` unless the workspace opts into the versionless production input described below. Keep
 `targetDefaults.lint` limited to shared cache policy or additive inputs such as `["...", "^production"]`. Smoo's

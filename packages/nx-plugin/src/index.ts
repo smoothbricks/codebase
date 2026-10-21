@@ -66,6 +66,7 @@ import {
   runsFrozenCargo,
 } from './cross-check-policy.js';
 import type { EslintFileSet } from './eslint-file-set.js';
+import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
 import { closeRunCpuPool, serveRunCpuPool } from './executors/bounded-exec/run-cpu-pool.js';
 import { hashVersionlessCrateManifests } from './manifest-hash.js';
 import {
@@ -1939,9 +1940,11 @@ async function createProjectTargets(
     inputs: lintProgramInputs,
     eslintFileSet,
   } = projectLintCommands(projectRoot, workspaceRoot, eslintSources);
+  // Every lint tool reaches its own verdict in one run: run-commands would end the
+  // other tools once one fails, and their findings would surface a run later.
   if (validationTargets.length > 0 || lintCommands.length > 0) {
     targets.lint = {
-      executor: lintCommands.length > 0 ? 'nx:run-commands' : 'nx:noop',
+      executor: lintCommands.length > 0 ? ALL_VERDICTS_EXECUTOR : 'nx:noop',
       ...(eslintFileSet === null ? {} : { metadata: { eslintFileSet } }),
       cache: true,
       dependsOn: validationTargets,

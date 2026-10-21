@@ -24,6 +24,7 @@ import { BOUNDED_TEST_IDLE_TIMEOUT_MS, BOUNDED_TEST_KILL_AFTER_MS } from './boun
 import { CARGO_CLOSURE_INPUT } from './cargo-closure-input.js';
 import { exceptionalTestFilter, packageNameFromCargoTestTarget } from './cargo-workspace.js';
 import { CARGO_CROSS_LINT_COMMAND, CARGO_CROSS_LINT_TARGET, CARGO_LINT_CLIPPY_COMMAND } from './cross-check-policy.js';
+import { ALL_VERDICTS_EXECUTOR } from './executors/all-verdicts/schema.js';
 import { cargoCommandNpmPackages, createNodesV2, createNodesV2ForPlatform } from './index.js';
 import { NEXTEST_EXTRACTION_DIRECTORY } from './nextest-extraction.js';
 import { applyWorkspaceConfig, RELEASE_CONFIGURATION } from './workspace-config-policy.js';
@@ -188,9 +189,9 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
           'patches/nx.patch',
         ]);
         const before = context.hashFilesMatchingGlob(positive, negative);
-        await workspace.write('patches/README.md', name + ' docs\n');
-        await workspace.write('patches/compiler/notes.md', name + ' nested docs\n');
-        await workspace.write('packages/unrelated/source.ts', 'export const value = ' + name.length + ';\n');
+        await workspace.write('patches/README.md', `${name} docs\n`);
+        await workspace.write('patches/compiler/notes.md', `${name} nested docs\n`);
+        await workspace.write('packages/unrelated/source.ts', `export const value = ${name.length};\n`);
         context.incrementalUpdate(
           ['patches/README.md', 'patches/compiler/notes.md', 'packages/unrelated/source.ts'],
           [],
@@ -198,7 +199,7 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
         expect(context.hashFilesMatchingGlob(positive, negative)).toBe(before);
         let previous = before;
         for (const file of ['patches/nx.patch', 'patches/compiler/PIN', 'patches/compiler/VERSION']) {
-          await workspace.write(file, name + ' changed ' + file + '\n');
+          await workspace.write(file, `${name} changed ${file}\n`);
           context.incrementalUpdate([file], []);
           const changed = context.hashFilesMatchingGlob(positive, negative);
           expect(changed).not.toBe(previous);
@@ -1053,13 +1054,14 @@ describe('@smoothbricks/nx-plugin inferred targets', () => {
       const biome = `biome check --files-ignore-unknown=true '${root}'`;
       const rust = await inferProjectTargets(workspace, `${root}/package.json`);
       const rustLint = resolveLint(rust);
-      expect(rustLint.executor).toBe('nx:run-commands');
+      expect(rustLint.executor).toBe(ALL_VERDICTS_EXECUTOR);
       expect(rustLint.dependsOn).toEqual(['cargo-lint']);
       expect(rustLint.options?.commands).toEqual([biome]);
 
       // A JavaScript source joins ESLint's file list the moment it appears, with no tsconfig to announce it.
       await workspace.write(`${root}/src/check.js`, 'debugger;\n');
       const withJavaScript = resolveLint(await inferProjectTargets(workspace, `${root}/package.json`));
+      expect(withJavaScript.executor).toBe(ALL_VERDICTS_EXECUTOR);
       expect(withJavaScript.dependsOn).toEqual(['cargo-lint']);
       expect(withJavaScript.options?.commands).toEqual([biome, `eslint '${root}/src/check.js'`]);
 

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/schema",
+  "version": 2,
+  "title": "All Verdicts Executor",
+  "description": "Run every command at once to its own verdict: none ends another, and each command a signal ended or that never ran is reported UNJUDGED by name.",
+  "type": "object",
+  "cli": "nx",
+  "required": ["commands", "cwd"],
+  "properties": {
+    "commands": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "Shell commands, all started at once. An empty list is refused: it could never fail."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Where every command runs, relative to the workspace root."
+    }
+  },
+  "additionalProperties": false
+}
