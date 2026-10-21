@@ -710,8 +710,8 @@ const fn carry_listeners(_control_socket: &Path, _downgrade: Downgrade) -> Optio
 /// Wait until the gateway just activated serves: its control socket answers from the bytes
 /// `cli_sha256` names, its startup pass is over and it is not draining. The install holds
 /// `slot` throughout, so a land step that waited on the slot reaches a gateway that serves
-/// workspaces, never a socket nothing listens on yet (05_gateway.md "A land step holds the install
-/// slot"). launchd keeps the process it had when activation did not change the plist; that daemon
+/// workspaces, never a socket nothing listens on yet (05_gateway.md "A land step waits for an
+/// install in progress"). launchd keeps the process it had when activation did not change the plist; that daemon
 /// is restarted once, after the gates in flight.
 async fn await_healthy<W, E, C>(
     output: &mut Output<W, E>,
@@ -4781,9 +4781,9 @@ mod tests {
             let land = tokio::spawn({
                 let (support, client) = (support.clone(), client.clone());
                 async move {
-                    let _hold = crate::install_basis::LandHold::take(&support)
+                    crate::install_basis::wait_for_install(&support)
                         .await
-                        .expect("the land step's hold");
+                        .expect("the land step's wait");
                     client.status().await
                 }
             });

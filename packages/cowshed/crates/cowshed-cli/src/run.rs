@@ -224,22 +224,20 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
             setup_service::dispatch_native(setup_args, parsed.global.json, &mut output).await;
         return Ok(finish(outcome, &mut output, json));
     }
-    // A land step holds the install slot shared until it ends, so no install restarts the gateway
-    // under it, and one that holds the slot now is waited for (`install_basis::LandHold`). Taken
-    // before the build check, so the step judges the daemon the install it waited for left.
-    let _land_hold = if is_land_step(&parsed.command) {
-        let held = async {
+    // A land step that starts while an install holds the slot waits for that install, and then
+    // holds nothing (`install_basis::wait_for_install`): no install ever waits on a land step.
+    // Waited for before the build check, so the step judges the daemon the install left.
+    if is_land_step(&parsed.command) {
+        let waited = async {
             let home = cowshed_core::gateway_sessions::canonical_home()?;
-            install_basis::LandHold::take(&cowshed_core::host_dirs::support_directory(&home)).await
+            install_basis::wait_for_install(&cowshed_core::host_dirs::support_directory(&home))
+                .await
         }
         .await;
-        match held {
-            Ok(hold) => Some(hold),
-            Err(error) => return Ok(finish(Err(error), &mut output, json)),
+        if let Err(error) = waited {
+            return Ok(finish(Err(error), &mut output, json));
         }
-    } else {
-        None
-    };
+    }
     // The daemon refuses another build's cowshed at the first supervisor a verb asks for, which
     // is after the verb's first step. Ask it now, before anything is changed.
     if let Err(error) = runtime::require_daemon_of_this_build(&parsed.command).await {
@@ -382,9 +380,9 @@ fn runtime_dispatch(command: &args::Command) -> RuntimeDispatch {
     }
 }
 
-/// The commands a land runs, each of which an install must neither cut off nor start under:
-/// its gates (`exec --class gate`), its rebase and its land. Ordinary work is not one: a
-/// long-lived background exec must not hold every install back.
+/// The commands a land runs, each of which waits for an install in progress before it starts:
+/// its gates (`exec --class gate`), its rebase and its land. Ordinary work does not wait: it
+/// reaches the daemon as any command does.
 fn is_land_step(command: &args::Command) -> bool {
     match command {
         args::Command::Exec(exec) => exec.class == cowshed_core::api::dto::ExecClass::Gate,
@@ -450,7 +448,7 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
-    fn a_lands_gates_rebase_and_land_hold_the_install_slot_and_ordinary_work_does_not() {
+    fn a_lands_gates_rebase_and_land_wait_for_an_install_and_ordinary_work_does_not() {
         let step = |argv: &[&str]| {
             is_land_step(
                 &args::parse_args(argv.iter().map(OsString::from))

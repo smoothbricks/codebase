@@ -194,22 +194,26 @@ is left. A gateway that does not answer `cpu-budget` is not waited on, and the i
 nothing (no daemon answers, or the refresh finds the agent current) does not wait. The restart and its refusals
 themselves are unchanged.
 
-**A land step holds the install slot.** The ledger shows a land only while one of its gates runs, and a land is several
-cowshed commands with none running between them: measured 2026-10-20, an install found the ledger empty as a land's
-first gate ended and restarted the gateway as its host gate started, and that gate's `cowshed exec` failed with the
-daemon's socket refusing the connection, failing the land. So every command a land runs — `exec --class gate`, `rebase`
-and `land` — holds the install slot ("The install slot", below) shared from before it asks the daemon anything until it
-ends. An install takes the slot exclusive, so it waits for every land step in flight, and a land step that starts while
-an install holds the slot waits for that install and then reaches the gateway it installed, saying on stderr that it
-waits and for which file. Between two steps a land waits for an install; it is never cut off by one. So an install that
-restarted the gateway — `gateway start` and `setup`'s refresh alike — holds the slot until that gateway serves: its
-control socket answers from the installed bytes, its startup pass is over and it is not draining, the wait
-`gateway start` reports. Releasing the slot at the restart is not enough: measured 2026-10-20, `setup` restarted the
-gateway and released the slot at once, and the land step that had waited on it found the daemon's socket refusing the
-connection, failing a land whose gate had passed. The ledger is never this guard, however its entries are kept: between
-two of a land's commands no process of that land holds anything the gateway records, so an install that asks the ledger
-whether a land runs is answered "no" mid-land. Ordinary work does not hold the slot: a long-lived background exec would
-hold every install back. Status reads the slot without taking it, so land steps alone never read as a pending install.
+**A land step waits for an install in progress.** The ledger shows a land only while one of its gates runs, and a land
+is several cowshed commands with none running between them: measured 2026-10-20, an install found the ledger empty as a
+land's first gate ended and restarted the gateway as its host gate started, and that gate's `cowshed exec` failed with
+the daemon's socket refusing the connection, failing the land. So every command a land runs — `exec --class gate`,
+`rebase` and `land` — before it asks the daemon anything, waits for an install that holds the slot ("The install slot",
+below), saying on stderr that it waits and for which file, and then holds nothing. A daemon connection refused later in
+the step, while an install holds the slot, is that install restarting the daemon — a positive signal — so it waits for
+the install and connects once more to the daemon the install started; a refusal with no install holding the slot is
+returned as it is. An install that restarted the gateway — `gateway start` and `setup`'s refresh alike — holds the slot
+until that gateway serves: its control socket answers from the installed bytes, its startup pass is over and it is not
+draining, the wait `gateway start` reports. Releasing the slot at the restart is not enough: measured 2026-10-20,
+`setup` restarted the gateway and released the slot at once, and the land step that had waited on it found the daemon's
+socket refusing the connection, failing a land whose gate had passed. A land step never holds the slot for its run: it
+did once, and an install then waited on every land step in flight, between its gates as well as during them. An install
+still waits for a gate that holds or wants tokens ("An install waits for the gates in flight"), because a gate's CPU
+pool is gateway state a restart ends and is never carried across one; measured 2026-10-21, that wait is what held an
+install behind a gate of 2 h 26 min until the gate was killed. A job in flight lives in its workspace supervisor, which
+a gateway restart leaves running; what a restart breaks is a new connection to the daemon, and that is what waits. The
+ledger is never the guard against a restart between two of a land's commands: no process of that land holds anything the
+gateway records there. Status reads the slot without taking it.
 
 **An install never refuses a client connection.** A restart closes every workspace listener until the next gateway's
 startup pass restores its session (5 s and more), and a stock client cannot wait for that: measured 2026-10-20, an
@@ -227,9 +231,11 @@ them before it binds anything ("Startup contract" step 2) and serves each on its
 connections included. Only this user's processes may give or take, and the store deny keeps every sandbox off the
 socket. Every failure is what a restart was without the handoff: no install serving the socket, an old gateway that
 predates the handoff, an install that dies (the kernel closes its copies), or a failed take, after which the install
-closes its copies before the new gateway binds. Linux binds no TCP workspace listener, so it carries none. An exec
-client of the replaced build reads its job's end from its own drained supervisor (11_shell.md "Draining a supervisor of
-another build"); a queued CPU request is a client a restart still cuts off.
+closes its copies before the new gateway binds. A gateway that drains with workspace listeners and finds no install
+serving the handoff — `gateway stop`, then a fresh start — says on stderr how many it did not carry and why, so the
+refused connections that follow read as designed, not as a failed handoff. Linux binds no TCP workspace listener, so it
+carries none. An exec client of the replaced build reads its job's end from its own drained supervisor (11_shell.md
+"Draining a supervisor of another build"); a queued CPU request is a client a restart still cuts off.
 
 **Pruning.** After an install succeeds (for the gateway, after its activation), every stored copy and build record but
 the new build's and the one it replaced is removed. The replaced build stays one install longer: a workspace supervisor

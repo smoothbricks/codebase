@@ -1622,6 +1622,7 @@ impl Actor {
         let Some(path) = self.config.listener_handoff.clone() else {
             return;
         };
+        let path_for_message = path.clone();
         let mut listeners = Vec::new();
         for session in self.sessions.values() {
             let (WorkspaceEndpoint::Tcp { address, .. }, Some(copy)) =
@@ -1637,6 +1638,7 @@ impl Actor {
                 ),
             }
         }
+        let carried = listeners.len();
         let given = tokio::task::spawn_blocking(move || {
             use std::os::fd::AsFd as _;
             let borrowed: Vec<_> = listeners
@@ -1647,7 +1649,16 @@ impl Actor {
         })
         .await;
         match given {
-            Ok(Ok(0)) => {}
+            Ok(Ok(0)) if carried == 0 => {}
+            // A stop, or a start onto a gateway nothing replaces: no install served the handoff,
+            // so the workspace listeners close with this gateway, as designed. Said, so the
+            // refused connections that follow read as that, not as a failed handoff.
+            Ok(Ok(0)) => eprintln!(
+                "cowshed: {carried} workspace listener(s) not carried across this restart: no \
+                 install was serving the handoff socket {}; their clients are refused until the \
+                 next gateway binds",
+                path_for_message.display()
+            ),
             Ok(Ok(given)) => eprintln!(
                 "cowshed: gave {given} workspace listener(s) to the install restarting this gateway"
             ),

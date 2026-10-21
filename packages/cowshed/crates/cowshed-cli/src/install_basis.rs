@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 /// The install slot's lock file, beside `bin` in `dev.cowshed`. Never removed: uninstall removes
 /// what the slot holds, not the line to fill it.
-pub const INSTALL_LOCK_NAME: &str = "install.lock";
+pub use cowshed_core::host_dirs::INSTALL_LOCK_NAME;
 
 /// What the slot's holder records while it waits for gates before restarting the gateway, beside
 /// the lock: a [`PendingInstall`]. Only the holder writes or removes it, and a holder removes one
@@ -170,50 +170,24 @@ impl InstallSlot {
     }
 }
 
-/// A land step's hold on the install slot: a shared `flock(2)` on [`INSTALL_LOCK_NAME`] for as
-/// long as the step runs (05_gateway.md, "An install waits for the gates in flight"). An install
-/// takes the slot exclusive, so it cannot start its restart while any land step holds the slot,
-/// and a land step that starts while an install holds it waits for that install to finish and
-/// then reaches the new gateway. A land is several cowshed commands with no gate job between
-/// them, and a restart in such a gap refused the next one: measured 2026-10-20, an install
-/// restarted the gateway as a land's host gate started, and the land failed with the daemon's
-/// socket refusing the connection.
-#[derive(Debug)]
-pub struct LandHold {
-    _lock: File,
-}
-
-impl LandHold {
-    /// Hold the slot shared, waiting for any install that holds it, and saying so first.
-    pub async fn take(support_directory: &Path) -> Result<Self> {
-        let path = support_directory.join(INSTALL_LOCK_NAME);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .map_err(|error| slot_error(&path, "open", &error))?;
-        match flock(&lock, libc::LOCK_SH | libc::LOCK_NB) {
-            Ok(()) => return Ok(Self { _lock: lock }),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(slot_error(&path, "lock", &error)),
-        }
-        eprintln!(
-            "cowshed: an install holds {}; this land step waits for it to finish",
-            path.display()
-        );
-        let waited = path.clone();
-        let lock = tokio::task::spawn_blocking(move || flock(&lock, libc::LOCK_SH).map(|()| lock))
-            .await
-            .map_err(|error| {
-                CowshedError::internal(format!("waiting for {} failed: {error}", waited.display()))
-            })?
-            .map_err(|error| slot_error(&path, "lock", &error))?;
-        Ok(Self { _lock: lock })
-    }
+/// A land step's wait for the install in progress, if one is (05_gateway.md, "A land step waits
+/// for an install in progress"): an install takes the slot exclusive until the gateway it
+/// restarted serves, so a step that starts meanwhile waits for it and then reaches the new
+/// gateway, saying so on stderr. The wait holds nothing afterwards, so an install never waits on
+/// a land step: holding the slot for the whole step made every install wait on the longest gate
+/// (measured 2026-10-21, when two gates were killed to let an install run). A daemon connection
+/// refused later in the step, mid-restart, waits for that install too
+/// (`supervisor_manager::connect_across_install`).
+pub async fn wait_for_install(support_directory: &Path) -> Result<()> {
+    let support = support_directory.to_path_buf();
+    let path = support_directory.join(INSTALL_LOCK_NAME);
+    tokio::task::spawn_blocking(move || cowshed_core::host_dirs::wait_for_running_install(&support))
+        .await
+        .map_err(|error| {
+            CowshedError::internal(format!("waiting for {} failed: {error}", path.display()))
+        })?
+        .map(|_| ())
+        .map_err(|error| slot_error(&path, "lock", &error))
 }
 
 fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
@@ -641,51 +615,30 @@ pub(crate) mod tests {
             .expect("the second installer takes the slot once the first lets go");
     }
 
-    /// An install cannot take the slot while a land step holds it, two land steps hold it
-    /// together, and a land step that arrives while an install holds the slot waits for that
-    /// install to finish. Status, which reads the slot without taking it, sees no install while
-    /// only land steps hold it.
+    /// A land step never holds the slot: an install takes it while land steps run, and a land
+    /// step that arrives while an install holds it waits for that install, then holds nothing.
     #[tokio::test]
-    async fn an_install_and_a_land_step_never_overlap() {
-        let main = Main::new("land-hold");
-        let first = LandHold::take(&main.root).await.expect("a land step");
-        let second = LandHold::take(&main.root)
+    async fn an_install_never_waits_on_a_land_step_and_a_land_step_waits_on_an_install() {
+        let main = Main::new("land-wait");
+        wait_for_install(&main.root)
             .await
-            .expect("land steps share the slot");
-        assert_eq!(InstallSlot::observe(&main.root).expect("observe"), None);
-        let probe = File::open(main.root.join(INSTALL_LOCK_NAME)).expect("lock file");
-        let install = tokio::spawn({
-            let root = main.root.clone();
-            async move { InstallSlot::take(&root).await }
-        });
-        drop(first);
-        assert_eq!(
-            flock(&probe, libc::LOCK_EX | libc::LOCK_NB)
-                .expect_err("one land step still holds the slot")
-                .kind(),
-            io::ErrorKind::WouldBlock,
-            "an install could take the slot while a land step held it"
-        );
-        drop(second);
-        let slot = install
+            .expect("no install runs, so the step goes on at once");
+        let slot = InstallSlot::take(&main.root)
             .await
-            .expect("installer")
-            .expect("the install takes the slot once the land steps end");
+            .expect("an install takes the slot although a land step ran");
         let step = tokio::spawn({
             let root = main.root.clone();
-            async move { LandHold::take(&root).await }
+            async move { wait_for_install(&root).await }
         });
-        assert_eq!(
-            flock(&probe, libc::LOCK_SH | libc::LOCK_NB)
-                .expect_err("the install holds the slot")
-                .kind(),
-            io::ErrorKind::WouldBlock,
-            "a land step could start while an install held the slot"
-        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!step.is_finished(), "the land step waits for the install");
         drop(slot);
         step.await
             .expect("land step")
             .expect("the land step goes on once the install ends");
+        let probe = File::open(main.root.join(INSTALL_LOCK_NAME)).expect("lock file");
+        flock(&probe, libc::LOCK_EX | libc::LOCK_NB)
+            .expect("the land step holds nothing once it goes on: the next install takes the slot");
     }
 
     /// A holder that died while it waited for gates leaves its record and frees the slot: status

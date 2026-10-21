@@ -978,6 +978,30 @@ fn same_build(request: &serde_json::Value) -> Result<()> {
     }))
 }
 
+/// Connect to the daemon socket at `path`. A refused connection while an install holds the slot
+/// in `support` is that install restarting the daemon: a positive signal, so the connection waits
+/// for the install and is made once more against the daemon it installed. Any other refusal is
+/// returned as it is (05_gateway.md, "A land step waits for an install in progress"). Measured
+/// 2026-10-20: a land step's connection made mid-restart was refused and failed the land.
+pub(crate) async fn connect_across_install(path: &Path, support: &Path) -> io::Result<UnixStream> {
+    let refused = match UnixStream::connect(path).await {
+        Ok(stream) => return Ok(stream),
+        Err(error) => error,
+    };
+    let support = support.to_path_buf();
+    let waited =
+        tokio::task::spawn_blocking(move || crate::host_dirs::wait_for_running_install(&support))
+            .await
+            .map_err(io::Error::other)?;
+    match waited {
+        Ok(true) => UnixStream::connect(path).await,
+        Ok(false) => Err(refused),
+        Err(error) => Err(io::Error::other(format!(
+            "{refused}; and the install slot could not be read: {error}"
+        ))),
+    }
+}
+
 /// Ask the host's manager for the supervisor serving `authority`'s workspace.
 pub async fn ensure(
     store_root: &Path,
@@ -985,15 +1009,18 @@ pub async fn ensure(
     authority: &WorkspaceAuthoritySnapshot,
 ) -> Result<Ensured> {
     let path = manager_socket_path(store_root);
-    let mut stream = UnixStream::connect(&path).await.map_err(|error| {
-        CowshedError::environment_missing(
-            format!(
-                "the cowshed daemon, which runs workspace supervisors, is not reachable at {}: {error}",
-                path.display()
-            ),
-            "cowshed gateway start",
-        )
-    })?;
+    let support = crate::host_dirs::support_directory(&crate::gateway_sessions::canonical_home()?);
+    let mut stream = connect_across_install(&path, &support)
+        .await
+        .map_err(|error| {
+            CowshedError::environment_missing(
+                format!(
+                    "the cowshed daemon, which runs workspace supervisors, is not reachable at {}: {error}",
+                    path.display()
+                ),
+                "cowshed gateway start",
+            )
+        })?;
     write_json(
         &mut stream,
         &ManagerRequest::Ensure {
@@ -1621,5 +1648,51 @@ mod tests {
             .expect("the wait")
             .expect("the supervisor's exit ends the wait, not its ceiling");
         std::fs::remove_dir_all(store).expect("cleanup");
+    }
+
+    /// A daemon socket that refuses while an install holds the slot is waited out and connected
+    /// to once the install has its daemon serving; one that refuses with no install running is
+    /// refused at once, waiting for nothing.
+    #[tokio::test]
+    async fn a_refused_daemon_connection_waits_for_a_running_install_only() {
+        use std::os::fd::AsRawFd as _;
+        let root = PathBuf::from("/tmp").join(format!(
+            "cowshed-across-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let socket = root.join("manager.sock");
+        let support = root.join("support");
+        std::fs::create_dir(&support).expect("support");
+
+        let refused = connect_across_install(&socket, &support)
+            .await
+            .expect_err("nothing serves and no install runs");
+        assert_eq!(refused.kind(), io::ErrorKind::NotFound, "{refused}");
+
+        let install = std::fs::File::create(support.join(crate::host_dirs::INSTALL_LOCK_NAME))
+            .expect("the install's lock");
+        // SAFETY: a live descriptor.
+        assert_eq!(
+            unsafe { libc::flock(install.as_raw_fd(), libc::LOCK_EX) },
+            0
+        );
+        let connecting = tokio::spawn({
+            let (socket, support) = (socket.clone(), support.clone());
+            async move { connect_across_install(&socket, &support).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !connecting.is_finished(),
+            "the refusal waits for the install"
+        );
+        // The install's daemon serves, and only then does the install let the slot go.
+        let _daemon = tokio::net::UnixListener::bind(&socket).expect("the new daemon");
+        drop(install);
+        connecting
+            .await
+            .expect("the connecting task")
+            .expect("reaches the daemon the install started");
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }
