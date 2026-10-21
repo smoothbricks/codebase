@@ -723,6 +723,9 @@ mod parity_tests {
             | Command::Sccache(_)
             // A host disk-tool facade for scripts; the addon's callers run cowshed's own verbs.
             | Command::DiskCommand(_)
+            // A host-only land queue over repository files; the addon has no endpoint for it, and
+            // scripts run cowshed's own verb.
+            | Command::LandTurn(_)
             | Command::Skill(_)
             | Command::Setup(_)
             | Command::Mount(_)
@@ -801,6 +804,7 @@ mod parity_tests {
         (&["identity", "add", "forge"], None),
         (&["sccache", "status"], None),
         (&["disk-command", "hdiutil", "--", "info"], None),
+        (&["land-turn", "parity", "--", "true"], None),
         (&["skill", "install"], None),
         (&["mount", "main", "--repo-id", "acme/widget"], None),
         (&["forget", "acme/widget", "--abandon"], None),

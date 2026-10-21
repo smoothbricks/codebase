@@ -281,6 +281,8 @@ fn gateway_status_json_uses_the_frozen_success_envelope_only() {
             stale_daemon: None,
             cpu_budget: None,
             pending_install: None,
+            land_turns: Vec::new(),
+            land_turns_error: None,
         },
     )
     .expect("status emits");
@@ -332,6 +334,8 @@ fn gateway_status_names_launchd_socket_and_both_versions() {
                 stale_daemon: None,
                 cpu_budget: None,
                 pending_install: None,
+                land_turns: Vec::new(),
+                land_turns_error: None,
             },
         )
         .expect("status emits");
@@ -368,6 +372,8 @@ fn answering_status(cpu_budget: GatewayCpuBudget) -> CliGatewayStatus {
         stale_daemon: None,
         cpu_budget: Some(cpu_budget),
         pending_install: None,
+        land_turns: Vec::new(),
+        land_turns_error: None,
     }
 }
 

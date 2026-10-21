@@ -40,6 +40,7 @@ pub fn collect_api(project: &Path) -> Result<ir::Api, String> {
         "metadata.rs",
         "repository.rs",
         "project_policy.rs",
+        "land_turn.rs",
         "build_volume/mod.rs",
         "runtime/supervisor_socket.rs",
     ] {

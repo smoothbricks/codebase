@@ -246,6 +246,7 @@ fn needs_daemon_of_this_build(command: &Command) -> bool {
         | Command::Setup(_)
         | Command::Gateway(_)
         | Command::DiskCommand(_)
+        | Command::LandTurn(_)
         | Command::Controller
         | Command::Credential(_)
         | Command::Identity(_)
@@ -310,6 +311,7 @@ fn runtime_open_mode(command: &Command) -> RuntimeOpenMode {
         | Command::Setup(_)
         | Command::Gateway(_)
         | Command::DiskCommand(_)
+        | Command::LandTurn(_)
         | Command::Controller
         | Command::Credential(_)
         | Command::Identity(_)
@@ -415,6 +417,7 @@ fn runtime_recovery_scope(command: &Command) -> Result<RecoveryScope> {
         | Command::Setup(_)
         | Command::Gateway(_)
         | Command::DiskCommand(_)
+        | Command::LandTurn(_)
         | Command::Controller
         | Command::Sccache(_)
         | Command::Skill(_)
@@ -2117,6 +2120,9 @@ where
         )),
         Command::DiskCommand(_) => Err(CowshedError::internal(
             "disk-command names no project and is dispatched before the runtime bridge",
+        )),
+        Command::LandTurn(_) => Err(CowshedError::internal(
+            "land-turn names no project and is dispatched before the runtime bridge",
         )),
         Command::Controller => Err(CowshedError::internal(
             "the controller verb serves its own connection and is dispatched before the runtime bridge",
@@ -7058,6 +7064,8 @@ mod tests {
             }),
             cpu_budget: None,
             pending_install: None,
+            land_turns: Vec::new(),
+            land_turns_error: None,
         };
 
         let findings = gateway_findings(&status);
@@ -7087,6 +7095,8 @@ mod tests {
             stale_daemon: None,
             cpu_budget: None,
             pending_install: None,
+            land_turns: Vec::new(),
+            land_turns_error: None,
         });
         let draining = findings
             .iter()
@@ -7111,6 +7121,8 @@ mod tests {
             stale_daemon: None,
             cpu_budget: None,
             pending_install: None,
+            land_turns: Vec::new(),
+            land_turns_error: None,
         });
         assert_eq!(gateway[0].code, "gateway-down");
         assert_eq!(gateway[0].severity, FindingSeverity::Error);

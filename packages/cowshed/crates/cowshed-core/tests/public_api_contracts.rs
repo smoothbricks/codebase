@@ -1262,6 +1262,8 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
         stale_daemon: None,
         cpu_budget: None,
         pending_install: None,
+        land_turns: Vec::new(),
+        land_turns_error: None,
     };
     assert_eq!(
         serde_json::to_value(&status).unwrap(),
@@ -1314,6 +1316,8 @@ fn reports_gateway_and_audit_shapes_are_frozen() {
                 }],
             },
         )),
+        land_turns: Vec::new(),
+        land_turns_error: None,
         ..status.clone()
     };
     assert_eq!(

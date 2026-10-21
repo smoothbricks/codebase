@@ -1060,6 +1060,16 @@ export type GatewayStatus = {
    * the gateway (05_gateway.md "The install slot"). Absent while no install holds the slot.
    */
   readonly pendingInstall?: PendingInstall;
+  /**
+   * The land queues with live tickets, one per repository, each first ticket holding its turn.
+   * Read without taking a turn; empty when no land is queued or the queues could not be read.
+   */
+  readonly landTurns?: ReadonlyArray<LandTurnQueue>;
+  /**
+   * Why `land_turns` could not be read, when reading it failed; the rest of the status is still
+   * served.
+   */
+  readonly landTurnsError?: string;
 };
 
 export type GcCandidate = {
@@ -1671,6 +1681,15 @@ export type LandSeed =
   | ({ readonly kind: 'sealBusy' } & {
       readonly reason: string;
     });
+
+/**
+ * One repository's land queue as `gateway status` observes it: its live tickets in turn order,
+ * the first of which holds the turn.
+ */
+export type LandTurnQueue = {
+  readonly repo: string;
+  readonly tickets: ReadonlyArray<Ticket>;
+};
 
 export type LandedReport = {
   readonly landedHead: GitOid;
@@ -2797,6 +2816,32 @@ export type TerminalCommitment = {
   readonly stderrSha256: Sha256Digest;
   readonly batchSha256: Sha256Digest;
   readonly outputLimit?: OutputLimitInfo;
+};
+
+/**
+ * One land's place in its repository's queue, as its ticket file records it.
+ */
+export type Ticket = {
+  /**
+   * The order the land asked in: lower holds the turn first.
+   */
+  readonly number: number & tags.Type<'uint64'>;
+  /**
+   * The process that waits for or holds the turn.
+   */
+  readonly pid: number & tags.Type<'uint32'>;
+  /**
+   * The workspace the land lands.
+   */
+  readonly workspace: string;
+  /**
+   * When the land asked, in milliseconds since the Unix epoch.
+   */
+  readonly askedUnixMs: number & tags.Type<'uint64'>;
+  /**
+   * The command the turn runs.
+   */
+  readonly command: string;
 };
 
 export type TraceContext = {

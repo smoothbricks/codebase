@@ -762,6 +762,12 @@ export const parseLandSeed = (json: string): Api.LandSeed => assertLandSeed(JSON
 export const assertLandSeedList = typia.createAssertEquals<readonly Api.LandSeed[]>();
 export const parseLandSeedList = (json: string): readonly Api.LandSeed[] => assertLandSeedList(JSON.parse(json));
 
+export const assertLandTurnQueue = typia.createAssertEquals<Api.LandTurnQueue>();
+export const parseLandTurnQueue = (json: string): Api.LandTurnQueue => assertLandTurnQueue(JSON.parse(json));
+export const assertLandTurnQueueList = typia.createAssertEquals<readonly Api.LandTurnQueue[]>();
+export const parseLandTurnQueueList = (json: string): readonly Api.LandTurnQueue[] =>
+  assertLandTurnQueueList(JSON.parse(json));
+
 export const assertLandedReport = typia.createAssertEquals<Api.LandedReport>();
 export const parseLandedReport = (json: string): Api.LandedReport => assertLandedReport(JSON.parse(json));
 export const assertLandedReportList = typia.createAssertEquals<readonly Api.LandedReport[]>();
@@ -1426,6 +1432,11 @@ export const parseTerminalCommitment = (json: string): Api.TerminalCommitment =>
 export const assertTerminalCommitmentList = typia.createAssertEquals<readonly Api.TerminalCommitment[]>();
 export const parseTerminalCommitmentList = (json: string): readonly Api.TerminalCommitment[] =>
   assertTerminalCommitmentList(JSON.parse(json));
+
+export const assertTicket = typia.createAssertEquals<Api.Ticket>();
+export const parseTicket = (json: string): Api.Ticket => assertTicket(JSON.parse(json));
+export const assertTicketList = typia.createAssertEquals<readonly Api.Ticket[]>();
+export const parseTicketList = (json: string): readonly Api.Ticket[] => assertTicketList(JSON.parse(json));
 
 export const assertTraceContext = typia.createAssertEquals<Api.TraceContext>();
 export const parseTraceContext = (json: string): Api.TraceContext => assertTraceContext(JSON.parse(json));

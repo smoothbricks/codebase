@@ -283,6 +283,30 @@ wait ends; an installer removes a record a dead holder left when it takes the sl
 is the holder's. Status reports `pendingInstall: { waitingFor: [{ job, checkout }] }` (empty while the holder waits for
 no gate), absent while the slot is free; `gateway start`'s own report, which holds the slot, carries none.
 
+**Land turns.** A repository lands one land at a time, in the order the lands asked (tg#7385 keeps the per-repository
+serialization; FIFO, no priority). A bare `flock(2)` on one lock file serialized lands but never ordered them: the
+kernel wakes every waiter when the holder releases and the first to retry wins, so a land asking at the moment of a
+release barges ahead of one that has waited for minutes. Measured 2026-10-21: a 72-commit train queued behind one land,
+and when it released, a land that had asked after the train took the turn and held it for 36 minutes; the train's only
+output meanwhile was watchdog `QUEUED` records. So `cowshed land-turn <repo> --workspace <ws> -- <cmd…>` waits for the
+repository's turn, runs the command holding it, and exits with the command's status (128 plus the signal for a signalled
+one; SIGINT, SIGTERM and SIGHUP are passed on to the command, and the turn is held until the command really ends). Each
+land takes a numbered ticket in `dev.cowshed/land-turn/<repo>/`: a file locked exclusively by the waiting process for as
+long as it waits or holds, so the kernel drops it with that process however it ends. Numbers are given under the
+directory's `.seq` lock, each above every ticket present, and a ticket is locked under a temporary name before it is
+renamed into place, so no reader ever sees an unlocked live ticket. A ticket whose lock is free is dead and is removed
+by whoever finds it. The lowest live ticket holds the turn; each other land waits on the lock of the live ticket just
+ahead of its own and, when that ends, looks again, so a killed holder or a killed waiter blocks nobody and only the next
+in line is woken. A waiting land says on stderr how many lands are ahead and who holds the turn — its workspace, pid and
+when it asked — when it starts waiting, whenever the land ahead changes, and every 90 s between (the land watchdog's
+cadence), and how long it waited once the turn is its own. `--outside-lock <file>` names the lock file lands took before
+every caller asked for turns: the head takes it too, exclusively and keeping the file, so it excludes a land started
+that way, and says so while it waits for one. A land's turn covers rebase, gate, fast-forward and adoption; the push to
+a remote runs after the turn ends, since a remote is never needed to land (tg#6988). `cowshed gateway status` lists each
+repository's live tickets, the holder first, as
+`landTurns: [{ repo, tickets: [{ number, pid, workspace, askedUnixMs, command }] }]`, read without taking a turn, the
+way it reads the install slot.
+
 **Build records and the basis.** A release build records the commit `HEAD` names and that commit's committer time
 (`build.rs`: `COWSHED_BUILD_COMMIT`, `COWSHED_BUILD_COMMIT_TIME`); the time is read from that one commit, so a shallow
 clone records it too. Its Git HEAD/reflog watch paths are emitted relative to the build-script manifest directory, so a
@@ -903,14 +927,14 @@ core count.
   alone grants the class (class-not-permitted for a worker). The job's own grant is the one token its orchestrator uses;
   its pool relays every task's ask, from the host or from inside the sandbox, as a gate-class request for the
   workspace's checkout, ranked by the job's own admission. A land therefore takes returned tokens at every task, in the
-  order its tasks ask, and is never frozen at the width of its first grant. The per-repository land lock protects the
-  landing turn; the gateway independently enforces one token-holding gate job per repository. Lands of two repositories
-  are served oldest gate job first: the younger land's orchestrator starts on its floor token, the older land's tasks
-  take every returned token they want, the younger land's tasks take what the older one does not ask for, and the
-  younger takes the older one's place when it completes. Neither is preempted: a running task of either keeps its grant.
-  The jobs the land's own cowshed steps start are gate-class work too, since the land waits on each of them: the rebase
-  carry's task-hash computation, which the lander asks for with `cowshed rebase --gate`, `cowshed land`'s Nx cache
-  initialization (16_build_volumes.md, "Carry" and "Rebase carry"), and each `cowshed land --check` command
+  order its tasks ask, and is never frozen at the width of its first grant. The repository's land turn ("Land turns")
+  protects the landing turn; the gateway independently enforces one token-holding gate job per repository. Lands of two
+  repositories are served oldest gate job first: the younger land's orchestrator starts on its floor token, the older
+  land's tasks take every returned token they want, the younger land's tasks take what the older one does not ask for,
+  and the younger takes the older one's place when it completes. Neither is preempted: a running task of either keeps
+  its grant. The jobs the land's own cowshed steps start are gate-class work too, since the land waits on each of them:
+  the rebase carry's task-hash computation, which the lander asks for with `cowshed rebase --gate`, `cowshed land`'s Nx
+  cache initialization (16_build_volumes.md, "Carry" and "Rebase carry"), and each `cowshed land --check` command
   (02_workspaces.md, "`cowshed land`" step 2). Measured 2026-10-19 with the first two at background class: a land's
   task-hash job waited 21 s in the background queue with no other gate running, and in one repository the same
   computation took 48 s on one land and 297 s on the next, while that repository's whole land queue waited behind it.
@@ -926,7 +950,7 @@ core count.
   process that asked for it, so when that process is gone the job stops and its tokens return. A gate job's verdict
   moves main only through the `cowshed land` its lander runs next. A gate whose lander is gone — killed, or stopped
   under the one-lander rule — authorizes nothing, yet it keeps its admission, so it stays the oldest gate job and takes
-  every returned token ahead of the land that holds a land lock. Measured 2026-10-18: a land of another repository
+  every returned token ahead of the land that holds the land turn. Measured 2026-10-18: a land of another repository
   stopped while gating left `nx run-many --parallel=18` running at gate class with no lander and that repository's land
   lock free; it headed `gateQueue` and held 13 of 18 tokens against the locked smoothbricks land. The same holds for
   background work. Measured 2026-10-19: an agent's tool timeout killed three `cowshed exec` clients, and their sandboxed

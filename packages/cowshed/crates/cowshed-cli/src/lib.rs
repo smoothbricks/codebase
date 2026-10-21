@@ -10,6 +10,7 @@ pub mod gateway_service;
 pub mod help;
 pub mod identity_service;
 pub mod install_basis;
+pub mod land_turn;
 pub mod launchd;
 pub mod mount_main;
 pub mod output;

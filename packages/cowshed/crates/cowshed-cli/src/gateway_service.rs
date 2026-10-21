@@ -1,6 +1,7 @@
 use crate::args::GatewayCommand;
 use crate::build_record::{BuildRecord, unproven_refusal, unrecorded_refusal};
 use crate::install_basis::{self, InstallSlot};
+use crate::land_turn::local_clock;
 use crate::launchd::{
     BunDirectory, CARGO_LINK_NAME, COWSHED_BINARY_NAME, DevenvProfile, ExecutableDigest,
     ExecutableInstallState, ExistingPlist, GATEWAY_LABEL, HostStableExecutable, InstallOutcome,
@@ -15,9 +16,11 @@ use crate::path_entry::PathEntryOutcome;
 use async_trait::async_trait;
 use cowshed_core::api::Coordinator;
 use cowshed_core::api::{
-    EmptyResult, GateJobRef, GatewayCpuBudget, GatewayStatus as CliGatewayStatus, PendingInstall,
-    StaleDaemonBinary,
+    EmptyResult, GateJobRef, GatewayCpuBudget, GatewayStatus as CliGatewayStatus, LandTurnQueue,
+    PendingInstall, StaleDaemonBinary,
 };
+use cowshed_core::host_dirs::support_directory;
+use cowshed_core::land_turn as turns;
 use cowshed_core::metadata::{NEW_PORT_BLOCK_SIZE, PortBlock};
 use cowshed_core::project_retirement::ProjectRetirementReport;
 use cowshed_core::repository::RepoId;
@@ -1136,12 +1139,30 @@ where
         None
     };
     let (status, cpu_budget) = answered.unzip();
+    let (land_turns, land_turns_error) = observe_land_turns(&home);
     let cli_sha256 = executable_digest(&running_executable()?)?;
     Ok(Ok(CliGatewayStatus {
         cpu_budget,
         pending_install,
+        land_turns,
+        land_turns_error,
         ..cli_status(installed, socket, status.as_ref(), cli_sha256.as_str())
     }))
+}
+
+/// The land queues on this host, read without taking a turn. A queue that cannot be read is the
+/// status's error string, not a failed status: the rest of the status still answers.
+fn observe_land_turns(home: &Path) -> (Vec<LandTurnQueue>, Option<String>) {
+    match turns::observe_all(&turns::land_turn_root(&support_directory(home))) {
+        Ok(queues) => (
+            queues
+                .into_iter()
+                .map(|(repo, tickets)| LandTurnQueue { repo, tickets })
+                .collect(),
+            None,
+        ),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    }
 }
 
 /// The host CPU ledger of a daemon that answered `status`, or why it did not answer
@@ -1583,6 +1604,9 @@ fn cli_status(
         cpu_budget: None,
         // The slot is observed beside the daemon, not asked of it.
         pending_install: None,
+        // The land queues are read beside the daemon, not asked of it.
+        land_turns: Vec::new(),
+        land_turns_error: None,
     }
 }
 
@@ -1664,6 +1688,16 @@ pub fn emit_gateway_status<W: Write, E: Write>(
             .guidance(&pending_install_line(pending))
             .map_err(output_error)?;
     }
+    for queue in &status.land_turns {
+        output
+            .guidance(&land_turn_line(queue))
+            .map_err(output_error)?;
+    }
+    if let Some(error) = &status.land_turns_error {
+        output
+            .guidance(&format!("gateway land turns unavailable: {error}"))
+            .map_err(output_error)?;
+    }
     for line in status.cpu_budget.iter().flat_map(cpu_budget_lines) {
         output.guidance(&line).map_err(output_error)?;
     }
@@ -1683,6 +1717,29 @@ fn pending_install_line(pending: &PendingInstall) -> String {
             gate_jobs_named(gates)
         ),
     }
+}
+
+/// One repository's land queue in the operator's words: the ticket holding its turn, then the
+/// tickets waiting behind it, oldest first.
+fn land_turn_line(queue: &LandTurnQueue) -> String {
+    let Some((holder, waiting)) = queue.tickets.split_first() else {
+        return format!("land turn {}: no live ticket", queue.repo);
+    };
+    let holds = format!(
+        "{} holds it (pid {}, asked {})",
+        holder.workspace,
+        holder.pid,
+        local_clock(holder.asked_unix_ms)
+    );
+    if waiting.is_empty() {
+        return format!("land turn {}: {holds}", queue.repo);
+    }
+    let behind = waiting
+        .iter()
+        .map(|ticket| format!("{} (pid {})", ticket.workspace, ticket.pid))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("land turn {}: {holds}; waiting: {behind}", queue.repo)
 }
 
 /// The host CPU ledger in the operator's words (05_gateway.md "Host CPU budget"), in the order the

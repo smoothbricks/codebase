@@ -40,11 +40,40 @@ impl Ending {
 
 /// Who answers the process's termination signals while a project or host command runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InterruptPolicy {
+pub(crate) enum InterruptPolicy {
     /// An in-process host owns its signals; cowshed installs no handler it could never remove.
     LeaveToHost,
     /// The `cowshed` process itself: an interrupt ends the command and the jobs it started.
     EndJobs,
+}
+
+/// The clause a signal's warning ends with when cowshed cannot watch for it, for a command whose
+/// jobs the signal ends.
+const JOBS_FATE: &str = "will leave the jobs this command started running";
+/// The same clause for a command a signal is forwarded to. Cowshed is the process that holds the
+/// turn, so when it cannot watch for the signal the signal ends cowshed and the turn with it.
+const FORWARDED_FATE: &str =
+    "will end cowshed and give up the land turn while its command may keep running";
+
+impl InterruptPolicy {
+    /// The signal watch this policy calls for, for a command whose jobs a signal ends. The caller
+    /// arms it where the command's own signal handling begins.
+    pub(crate) fn arm(self) -> Interrupts {
+        self.arm_with(JOBS_FATE)
+    }
+
+    /// The signal watch this policy calls for, for a command a signal is forwarded to: it keeps
+    /// running and holds its turn until it ends.
+    pub(crate) fn arm_forwarding(self) -> Interrupts {
+        self.arm_with(FORWARDED_FATE)
+    }
+
+    fn arm_with(self, fate: &'static str) -> Interrupts {
+        match self {
+            Self::LeaveToHost => Interrupts::none(),
+            Self::EndJobs => Interrupts::install(fate),
+        }
+    }
 }
 
 /// Run one CLI invocation inside a host process. `arguments` excludes argv[0].
@@ -154,6 +183,11 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     if let args::Command::DiskCommand(disk) = &parsed.command {
         return Ok(crate::disk_command::dispatch(disk, &mut output).await);
     }
+    // A land turn queues behind the repository's other lands and may wait a long time, so like
+    // disk-command it is answered before anything asks the daemon.
+    if let args::Command::LandTurn(land) = &parsed.command {
+        return Ok(crate::land_turn::dispatch(land, &mut output, interrupts).await);
+    }
     if let args::Command::Skill(skill_args) = &parsed.command {
         let outcome = skill::dispatch(skill_args, &parsed.global, &mut output);
         return Ok(finish(outcome, &mut output, json));
@@ -246,10 +280,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
     // Project and host commands run the controller in this process, and its workspace supervisors
     // run jobs as children in their own process groups, out of reach of the terminal's signals.
     // The long-running services above own their signals, so only this section is interruptible.
-    let mut interrupts = match interrupts {
-        InterruptPolicy::LeaveToHost => Interrupts::none(),
-        InterruptPolicy::EndJobs => Interrupts::install(),
-    };
+    let mut interrupts = interrupts.arm();
     let outcome = {
         let command = async {
             match runtime_dispatch(&parsed.command) {
@@ -272,7 +303,7 @@ async fn run_command(parsed: args::Cli, interrupts: InterruptPolicy) -> Result<i
 ///
 /// A signal the process inherited as ignored stays ignored: `nohup`, or a background job of a
 /// non-interactive shell, asked for exactly that, and its jobs are meant to outlive the caller.
-struct Interrupts {
+pub(crate) struct Interrupts {
     interrupt: Option<Signal>,
     hangup: Option<Signal>,
     terminate: Option<Signal>,
@@ -287,16 +318,16 @@ impl Interrupts {
         }
     }
 
-    fn install() -> Self {
+    fn install(fate: &'static str) -> Self {
         Self {
-            interrupt: watch(SignalKind::interrupt(), libc::SIGINT, "SIGINT"),
-            hangup: watch(SignalKind::hangup(), libc::SIGHUP, "SIGHUP"),
-            terminate: watch(SignalKind::terminate(), libc::SIGTERM, "SIGTERM"),
+            interrupt: watch(SignalKind::interrupt(), libc::SIGINT, "SIGINT", fate),
+            hangup: watch(SignalKind::hangup(), libc::SIGHUP, "SIGHUP", fate),
+            terminate: watch(SignalKind::terminate(), libc::SIGTERM, "SIGTERM", fate),
         }
     }
 
     /// The number of the first watched signal to arrive; never resolves when none is watched.
-    async fn received(&mut self) -> i32 {
+    pub(crate) async fn received(&mut self) -> i32 {
         tokio::select! {
             () = arrival(&mut self.interrupt) => libc::SIGINT,
             () = arrival(&mut self.hangup) => libc::SIGHUP,
@@ -306,27 +337,21 @@ impl Interrupts {
 }
 
 /// Watches `kind` unless the process inherited it as ignored. A disposition that cannot be read
-/// or a handler that cannot be installed is said out loud, and that signal keeps its inherited
-/// action.
-fn watch(kind: SignalKind, number: libc::c_int, name: &str) -> Option<Signal> {
+/// or a handler that cannot be installed is said out loud, with `fate` telling what the signal
+/// then does to the command, and that signal keeps its inherited action.
+fn watch(kind: SignalKind, number: libc::c_int, name: &str, fate: &str) -> Option<Signal> {
     match inherited_as_ignored(number) {
         Ok(true) => return None,
         Ok(false) => {}
         Err(error) => {
-            eprintln!(
-                "cowshed: cannot read the {name} disposition ({error}); a {name} will leave the \
-                 jobs this command started running"
-            );
+            eprintln!("cowshed: cannot read the {name} disposition ({error}); a {name} {fate}");
             return None;
         }
     }
     match signal(kind) {
         Ok(watched) => Some(watched),
         Err(error) => {
-            eprintln!(
-                "cowshed: cannot watch for {name} ({error}); a {name} will leave the jobs this \
-                 command started running"
-            );
+            eprintln!("cowshed: cannot watch for {name} ({error}); a {name} {fate}");
             None
         }
     }
@@ -513,7 +538,7 @@ mod tests {
         let hangup = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
         assert_ne!(hangup, libc::SIG_ERR, "set SIGHUP ignored");
 
-        let interrupts = Interrupts::install();
+        let interrupts = Interrupts::install(JOBS_FATE);
         let hangup_still_ignored = inherited_as_ignored(libc::SIGHUP);
         // SAFETY: restores the disposition this test found, a value `signal` itself returned.
         let restored = unsafe { libc::signal(libc::SIGHUP, hangup) };

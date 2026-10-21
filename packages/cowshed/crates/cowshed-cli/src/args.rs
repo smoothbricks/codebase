@@ -47,6 +47,7 @@ pub static COMMANDS: &[&CommandSpec] = &[
     &LAND,
     &DOCTOR,
     &DISK_COMMAND,
+    &LAND_TURN,
     &GATEWAY,
     &CONTROLLER,
     &CREDENTIAL,
@@ -106,6 +107,9 @@ pub enum Command {
     /// One `diskutil` or `hdiutil` invocation through cowshed's disk runner, for a caller that is
     /// not cowshed: no project, no daemon, the tool's own bytes and exit status.
     DiskCommand(DiskCommandArgs),
+    /// `land-turn <repo> -- <cmd...>`: one command run as its repository's land turn, in the order
+    /// the lands asked, for a caller that is not cowshed: no project, no daemon, no runtime.
+    LandTurn(LandTurnArgs),
     Gateway(GatewayCommand),
     /// One coordinator controller connection, served on standard input for an embedding process.
     Controller,
@@ -163,6 +167,7 @@ impl Command {
             | Self::Setup(_)
             | Self::Gateway(_)
             | Self::DiskCommand(_)
+            | Self::LandTurn(_)
             | Self::Sccache(_)
             | Self::Skill(_)
             | Self::Version
@@ -177,6 +182,16 @@ pub struct DiskCommandArgs {
     pub tool: DiskTool,
     pub deadline: std::time::Duration,
     pub args: Vec<OsString>,
+}
+
+/// `land-turn <repo> [--workspace <ws>] [--outside-lock <path>] -- <cmd...>`: the repository whose
+/// land queue the command joins, the workspace the land is for, and the command run under its turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LandTurnArgs {
+    pub repo: String,
+    pub workspace: String,
+    pub outside_lock: Option<PathBuf>,
+    pub argv: Vec<OsString>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -950,6 +965,19 @@ fn cli_command() -> ClapCommand {
                 ),
         )
         .subcommand(
+            leaf("land-turn")
+                .arg(positional("repo", 0..=1))
+                .arg(value("workspace"))
+                .arg(value("outside-lock"))
+                .arg(
+                    Arg::new("argv")
+                        .value_parser(value_parser!(OsString))
+                        .num_args(0..)
+                        .last(true)
+                        .allow_hyphen_values(true),
+                ),
+        )
+        .subcommand(
             leaf("gateway")
                 .subcommand_required(true)
                 .subcommand(leaf("start"))
@@ -1097,6 +1125,7 @@ fn cli_from_matches(matches: ArgMatches) -> Result<Cli, UsageError> {
         "land" => parse_land(leaf)?,
         "doctor" => parse_doctor(leaf)?,
         "disk-command" => parse_disk_command(leaf, &global)?,
+        "land-turn" => parse_land_turn(leaf, &global)?,
         "controller" => Command::Controller,
         "gateway" => parse_gateway(leaf, &global)?,
         "credential" => parse_credential(leaf)?,
@@ -1185,6 +1214,9 @@ fn translate_clap(error: clap::Error, args: &[OsString]) -> UsageError {
                         "disk-command requires `--` before the tool's arguments",
                         spec,
                     )
+                }
+                Some(spec) if spec.name == "land-turn" && !token.starts_with('-') => {
+                    UsageError::new("land-turn requires `--` before the command", spec)
                 }
                 Some(spec) if token.starts_with('-') => unknown_flag(&token, spec),
                 Some(spec) => UsageError::new(
@@ -1495,6 +1527,101 @@ fn parse_disk_command(matches: &ArgMatches, global: &GlobalOptions) -> Result<Co
         deadline,
         args,
     }))
+}
+
+const LAND_TURN: CommandSpec = CommandSpec {
+    name: "land-turn",
+    missing: "land-turn requires a repository name before `--`",
+    args: "<repo>",
+    trailing: "-- <cmd...>",
+    summary: "run a command as a land turn",
+    about: &[
+        "Takes this repository's land turn and runs `<cmd...>` under it. The command is argv, never a shell string, and it inherits cowshed's standard streams and environment. Turns are granted first come, first served per repository: a land that asks while another holds the turn waits behind it and says on stderr who holds it, how many are ahead, and when the holder asked. The report repeats every 90 s, the land watchdog's cadence, and `taken after N s` says how long the wait was.",
+        "The turn is released only after the command ends, so an interrupted land still waits for the command's real end. SIGINT, SIGHUP and SIGTERM that cowshed receives are forwarded to the command; a signal that arrives while the turn is still queued ends cowshed and gives up its place. The command's exit status is cowshed's, and a signal ends it with 128 + the signal.",
+        "It needs no project and asks no daemon: a land script calls it from any directory. `--json` is refused, since its output is the command's own bytes and cowshed's stderr lines.",
+    ],
+    options: &[
+        Opt {
+            spelling: "--workspace <ws>",
+            meaning: "the workspace this land is for, shown to the lands queued behind it; defaults to `-`",
+        },
+        Opt {
+            spelling: "--outside-lock <path>",
+            meaning: "the lock file that lands which do not ask for turns hold; once the turn reaches the head of the queue it waits for that lock, then holds it exclusively until the command ends",
+        },
+    ],
+};
+
+fn parse_land_turn(matches: &ArgMatches, global: &GlobalOptions) -> Result<Command, UsageError> {
+    const USAGE: &CommandSpec = &LAND_TURN;
+    reject_project(
+        global,
+        USAGE,
+        "--project is not valid for land-turn: it names no project",
+    )?;
+    if global.json {
+        return Err(UsageError::new(
+            "land-turn writes no JSON envelope: its output is the command's own bytes and cowshed's stderr lines; drop --json",
+            USAGE,
+        ));
+    }
+    let repo = os(matches, "repo").ok_or_else(|| UsageError::new(USAGE.missing, USAGE))?;
+    let repo = repo
+        .to_str()
+        .filter(|name| valid_repo_name(name))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            UsageError::new(
+                format!(
+                    "land-turn names a repository as 1 to 64 of A-Z a-z 0-9 . _ -, not starting with `.`; got `{}`",
+                    repo.to_string_lossy()
+                ),
+                USAGE,
+            )
+        })?;
+    let workspace = match os(matches, "workspace") {
+        None => "-".to_owned(),
+        Some(value) => value
+            .into_string()
+            .ok()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                UsageError::new(
+                    "--workspace must be a non-empty UTF-8 workspace name",
+                    USAGE,
+                )
+            })?,
+    };
+    let argv: Vec<OsString> = matches
+        .get_many::<OsString>("argv")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    if argv.is_empty() {
+        return Err(UsageError::new(
+            if matches.contains_id("argv") {
+                "land-turn requires a command after `--`"
+            } else {
+                "land-turn requires `--` before the command"
+            },
+            USAGE,
+        ));
+    }
+    Ok(Command::LandTurn(LandTurnArgs {
+        repo,
+        workspace,
+        outside_lock: os(matches, "outside-lock").map(PathBuf::from),
+        argv,
+    }))
+}
+
+/// A land queue is keyed by one directory name: 1 to 64 of `[A-Za-z0-9._-]`, not starting with a
+/// dot, so a name can never reach the queue's parent or a hidden file.
+fn valid_repo_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 const CONTROLLER: CommandSpec = CommandSpec {
@@ -5299,6 +5426,7 @@ mod tests {
             (&["controller"], Required),
             (&["sccache", "status"], NotUsed),
             (&["skill", "install"], NotUsed),
+            (&["land-turn", "repo", "--", "true"], NotUsed),
             (&["help"], NotUsed),
         ];
 
