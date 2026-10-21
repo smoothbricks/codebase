@@ -517,15 +517,12 @@ export type CowshedError = {
    * where that input stands. Absent from the wire otherwise, like `fence`.
    */
   readonly stdin?: StdinRefusal;
-  /**
-   * Present only on an explicit removal refused after every gate that guards work passed,
-   * naming why. Absent from the wire otherwise, like `fence`.
-   */
-  readonly removal?: RemovalRefusal;
 } & {
   readonly cpuAdmission?: CpuAdmissionRefusal;
 } & {
   readonly priority?: PriorityFailure;
+} & {
+  readonly removal?: RemovalRefusal;
 };
 
 /**

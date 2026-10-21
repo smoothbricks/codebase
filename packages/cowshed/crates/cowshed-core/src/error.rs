@@ -114,18 +114,11 @@ pub struct CowshedError {
         deserialize_with = "known_to_this_build"
     )]
     stdin: Option<Box<StdinRefusal>>,
-    /// Present only on an explicit removal refused after every gate that guards work passed,
-    /// naming why. Absent from the wire otherwise, like `fence`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "known_to_this_build"
-    )]
-    removal: Option<Box<RemovalRefusal>>,
 
-    /// One cold execution refusal, never two pointer slots in every Result.
+    /// One cold refusal of the causes that never occur together (CPU admission, priority, an
+    /// explicit removal's reason): one pointer slot in every Result, never one per cause.
     #[serde(flatten, default, deserialize_with = "known_to_this_build")]
-    execution: Option<Box<ExecutionRefusal>>,
+    cold: Option<Box<ColdRefusal>>,
     /// Boxed like `otherBuild` and `fence`: the structured CAS refusal is rare, and every
     /// `Result` in cowshed carries this type.
     #[serde(skip)]
@@ -135,13 +128,18 @@ pub struct CowshedError {
 /// Canonical wire fields remain flat; only the private storage groups these exclusive causes.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
-enum ExecutionRefusal {
+enum ColdRefusal {
     Admission {
         #[serde(rename = "cpuAdmission")]
         cpu_admission: CpuAdmissionRefusal,
     },
     Priority {
         priority: PriorityFailure,
+    },
+    /// Present only on an explicit removal refused after every gate that guards work passed,
+    /// naming why.
+    Removal {
+        removal: RemovalRefusal,
     },
 }
 
@@ -480,7 +478,7 @@ impl CowshedError {
             ),
         };
         Self {
-            execution: Some(Box::new(ExecutionRefusal::Admission {
+            cold: Some(Box::new(ColdRefusal::Admission {
                 cpu_admission: refusal,
             })),
             ..error
@@ -496,21 +494,21 @@ impl CowshedError {
             "interactive runs at the supervisor's own nice and every other class only lower (05_gateway.md \"Bands\"); never request an elevated priority",
         );
         Self {
-            execution: Some(Box::new(ExecutionRefusal::Priority { priority: failure })),
+            cold: Some(Box::new(ColdRefusal::Priority { priority: failure })),
             ..error
         }
     }
 
     pub fn cpu_admission_source(&self) -> Option<&CpuAdmissionRefusal> {
-        match self.execution.as_deref() {
-            Some(ExecutionRefusal::Admission { cpu_admission }) => Some(cpu_admission),
-            Some(ExecutionRefusal::Priority { .. }) | None => None,
+        match self.cold.as_deref() {
+            Some(ColdRefusal::Admission { cpu_admission }) => Some(cpu_admission),
+            Some(ColdRefusal::Priority { .. } | ColdRefusal::Removal { .. }) | None => None,
         }
     }
     pub fn priority_source(&self) -> Option<&PriorityFailure> {
-        match self.execution.as_deref() {
-            Some(ExecutionRefusal::Priority { priority }) => Some(priority),
-            Some(ExecutionRefusal::Admission { .. }) | None => None,
+        match self.cold.as_deref() {
+            Some(ColdRefusal::Priority { priority }) => Some(priority),
+            Some(ColdRefusal::Admission { .. } | ColdRefusal::Removal { .. }) | None => None,
         }
     }
 
@@ -526,8 +524,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
-            removal: None,
-            execution: None,
+            cold: None,
             lifecycle_conflict: None,
         }
     }
@@ -557,8 +554,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
-            removal: None,
-            execution: None,
+            cold: None,
             lifecycle_conflict: Some(Box::new(conflict)),
         }
     }
@@ -585,8 +581,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
-            removal: None,
-            execution: None,
+            cold: None,
             lifecycle_conflict: None,
         }
     }
@@ -615,8 +610,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
-            removal: None,
-            execution: None,
+            cold: None,
             lifecycle_conflict: None,
         }
     }
@@ -640,8 +634,7 @@ impl CowshedError {
             retry: None,
             admission: None,
             stdin: None,
-            removal: None,
-            execution: None,
+            cold: None,
             lifecycle_conflict: None,
         }
     }
@@ -749,7 +742,7 @@ impl CowshedError {
         hint: impl Into<String>,
     ) -> Self {
         Self {
-            removal: Some(Box::new(refusal)),
+            cold: Some(Box::new(ColdRefusal::Removal { removal: refusal })),
             ..Self::conflict(message, hint)
         }
     }
@@ -901,7 +894,10 @@ impl CowshedError {
     /// Why an explicit removal refused a workspace its work gates let go, when this is that
     /// refusal.
     pub fn removal_source(&self) -> Option<&RemovalRefusal> {
-        self.removal.as_deref()
+        match self.cold.as_deref() {
+            Some(ColdRefusal::Removal { removal }) => Some(removal),
+            Some(ColdRefusal::Admission { .. } | ColdRefusal::Priority { .. }) | None => None,
+        }
     }
 
     pub const fn exit_code(&self) -> u8 {
