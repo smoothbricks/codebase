@@ -833,6 +833,14 @@ impl JobCgroup {
     /// Kill the complete membership atomically with respect to forks and migrations. A process
     /// in a different session or a descendant cgroup is still a member. This is not an exit proof.
     pub fn kill(&self) -> Result<()> {
+        self.issue_kill()?
+    }
+
+    /// [`Self::kill`] with its refusal kept apart from what failed beside it: `Err` when
+    /// cgroup.kill was not written, so nothing is known to have ended; `Ok(Err(_))` when the kill
+    /// was issued, or membership was already empty, but a membership snapshot or population read
+    /// failed around it.
+    fn issue_kill(&self) -> Result<Result<()>> {
         let members = self.members();
         let mut signalled = self
             .signalled
@@ -855,7 +863,7 @@ impl JobCgroup {
         let populated = self.populated();
         if matches!(populated, Ok(false)) {
             // Empty membership cannot fork: do not issue a kill that would need a receipt.
-            return recording.map(|_| ());
+            return Ok(recording.map(|_| ()));
         }
         // Diagnostic snapshot failures do not revoke the controller's authority to end the
         // complete membership. Report them after attempting the atomic kernel operation.
@@ -867,14 +875,18 @@ impl JobCgroup {
         // cgroup.kill exposes no killed-member list. A fork can occur after even a nonempty
         // snapshot, so every atomic kill of populated membership marks the rows non-exhaustive.
         signalled.metadata_gap = true;
-        for pid in recording? {
+        let recording = match recording {
+            Ok(recording) => recording,
+            Err(error) => return Ok(Err(error)),
+        };
+        for pid in recording {
             signalled
                 .pinned
                 .get_mut(&pid)
                 .expect("the pinned member remains held")
                 .signal = Some(libc::SIGKILL);
         }
-        populated.map(|_| ())
+        Ok(populated.map(|_| ()))
     }
 
     /// Ask every currently live member to end, addressing each through a pidfd. KILL later
@@ -1012,9 +1024,11 @@ impl JobCgroup {
         Ok(())
     }
 
-    /// End every member and retain the cgroup until the kernel reports that every one exited.
+    /// End every member and retain the cgroup until the kernel reports that every one exited. A
+    /// refused cgroup.kill write ended nothing, so it is answered at once: joining would wait on
+    /// members still running, and the caller keeps its claim for an explicit retry.
     pub fn kill_and_wait(&self) -> Result<()> {
-        let killed = self.kill();
+        let killed = self.issue_kill()?;
         let waited = self.wait_empty();
         match (killed, waited) {
             (Ok(()), Ok(())) => Ok(()),
