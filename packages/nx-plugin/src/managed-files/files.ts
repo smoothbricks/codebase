@@ -123,6 +123,16 @@ const managedFiles: ManagedFileDescriptor[] = [
   },
   {
     kind: 'raw',
+    source: 'tooling/direnv/cargo-fetch-bound.ts',
+    target: 'tooling/direnv/cargo-fetch-bound.ts',
+  },
+  {
+    kind: 'raw',
+    source: 'tooling/direnv/cargo-fetch-run.ts',
+    target: 'tooling/direnv/cargo-fetch-run.ts',
+  },
+  {
+    kind: 'raw',
     source: 'tooling/direnv/developer-links.ts',
     target: 'tooling/direnv/developer-links.ts',
   },

@@ -542,6 +542,10 @@ nothing when nothing changed:
   flake input: the live import makes generated pins part of devenv's evaluation dependencies as well as direnv's
   watches. Ordinary activation then selects changed pins while an unchanged shell stays cached; no forced refresh or
   second version witness is needed.
+- `smoo:cargo-fetch` bounds each `cargo fetch --locked`, which holds Cargo's package-cache lock while it runs and so
+  stops every cargo that shares `CARGO_HOME` while it stalls: the fetch runs in a process group of its own under a 300 s
+  deadline that kills the group, and git's low-speed limits end a stalled HTTP(S) transfer after about a minute. A fetch
+  that is killed fails the task like any failed fetch (the Nx plugin README, "Cargo closure input", has the mechanism).
 - Shell secrets resolve only for an entry that installs; see below.
 - `tooling/direnv/ttsc-env.sh`, sourced by shell entry and by the git hooks, names the checkout's own native compiler in
   `TTSC_TSGO_BINARY`, caches ttsc in the checkout's `.cache/ttsc` and its Go build cache in `.cache/ttsc/go-build`.

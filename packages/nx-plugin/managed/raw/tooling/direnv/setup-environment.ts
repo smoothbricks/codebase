@@ -26,6 +26,8 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { getSystemErrorName, parseArgs } from 'node:util';
 import { $ } from 'bun';
+import { boundedFetchEnv, CARGO_FETCH_DEADLINE_ENV, describeDeadline, fetchDeadline } from './cargo-fetch-bound.ts';
+import { type BoundedOutcome, runBounded } from './cargo-fetch-run.ts';
 import {
   applyDeclaredLinks,
   hasStaleDeveloperLinks,
@@ -60,6 +62,21 @@ class CapturedCommandError extends Error {
     public readonly stderr: Uint8Array,
   ) {
     super(`${command} failed with exit code ${exitCode}`);
+  }
+}
+
+/**
+ * A setup command that outlived its deadline and was killed with everything it started. It has no exit code: `message`
+ * says what it held while it ran, and what it printed until the kill is kept for the replay.
+ */
+class CommandDeadlineError extends Error {
+  constructor(
+    public readonly command: string,
+    message: string,
+    public readonly stdout: Uint8Array,
+    public readonly stderr: Uint8Array,
+  ) {
+    super(message);
   }
 }
 
@@ -201,10 +218,12 @@ const POST_COMMIT_BLOCK = [
 // environment uv builds does not name this checkout's profile as its home.
 // `--cargo` runs the Cargo fetches instead of the installs: they are devenv's
 // smoo:cargo-fetch task, whose `status` is `--cargo --check` (exit 0 when
-// CARGO_HOME already holds every workspace's locked packages). Their stamps
-// (cargoFetcher) live in smoo's user cache and count only while CARGO_HOME
-// names the directory they were fetched into, which no checkout-relative
-// change detection can see.
+// CARGO_HOME already holds every workspace's locked packages). Each fetch runs
+// under a deadline, and under git's low-speed limits: while it runs it holds
+// Cargo's package-cache lock, so one that stalls stops every cargo that shares
+// CARGO_HOME (cargo-fetch-bound.ts). Their stamps (cargoFetcher) live in smoo's
+// user cache and count only while CARGO_HOME names the directory they were
+// fetched into, which no checkout-relative change detection can see.
 // `--links` repairs stale install links (including external Nx aliases and
 // store links whose install-cache entry is gone), then
 // points the packages `smoo.developerLinks` declares at their local checkouts.
@@ -1528,6 +1547,13 @@ function uvInstaller(inputs: readonly string[], options: { locked: boolean }): I
  * this checkout sharing that CARGO_HOME enters fetched. `--locked` makes a
  * stale Cargo.lock fail here, in Cargo's words, rather than fetch a graph the
  * lockfile does not name.
+ *
+ * The fetch holds Cargo's package-cache lock while it runs, so a fetch that
+ * stalls would stop every cargo that shares CARGO_HOME. It is bounded
+ * (cargo-fetch-bound.ts): it runs in a process group of its own under a
+ * deadline that kills the group, with git's low-speed limits for the git
+ * transfers Cargo starts. A fetch that is killed records no stamp, like one
+ * that failed.
  */
 function cargoFetcher(workspace: string): Installer {
   const manifest = path.posix.join(workspace, 'Cargo.toml');
@@ -1551,10 +1577,17 @@ function cargoFetcher(workspace: string): Installer {
   return {
     isCurrent: () => readInstallStamp(stampPath)?.inputs === fetched(),
     install: async ({ quiet }) => {
-      await runSetupCommand(
+      const deadline = fetchDeadline(process.env[CARGO_FETCH_DEADLINE_ENV]);
+      if (deadline.kind === 'refused') throw new Error(deadline.message);
+      await runBoundedSetupCommand(
         `cargo fetch --locked --manifest-path ${manifest}`,
-        $`cargo fetch --locked --manifest-path ${manifest}`,
-        { quiet },
+        ['cargo', 'fetch', '--locked', '--manifest-path', manifest],
+        {
+          quiet,
+          deadlineMs: deadline.ms,
+          env: boundedFetchEnv(process.env),
+          lockPath: path.join(cargoHome, '.package-cache'),
+        },
       );
       // After the fetch, not before: the fetch may be what created CARGO_HOME.
       writeInstallStamp(stampPath, { inputs: fetched() });
@@ -1972,6 +2005,39 @@ async function runSetupCommand(
 }
 
 /**
+ * `runSetupCommand` for a command that must not outlive `deadlineMs`: it runs in a process group of its own, which is
+ * killed with everything in it when the deadline passes (cargo-fetch-run.ts). `lockPath` is the lock the command holds
+ * while it runs, which the failure of one that was killed names.
+ */
+async function runBoundedSetupCommand(
+  command: string,
+  argv: readonly string[],
+  options: { quiet: boolean; deadlineMs: number; env: Readonly<Record<string, string>>; lockPath: string },
+): Promise<CapturedOutput> {
+  let outcome: BoundedOutcome;
+  try {
+    outcome = await runBounded({
+      argv,
+      cwd: projectRoot,
+      env: options.env,
+      deadlineMs: options.deadlineMs,
+      echo: !options.quiet,
+    });
+  } catch (cause) {
+    throw new Error(`${command} could not run: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+  }
+  if (outcome.kind === 'expired') {
+    const { deadlineMs, lockPath } = options;
+    const message = describeDeadline({ command, deadlineMs, elapsedMs: Math.round(outcome.elapsedMs), lockPath });
+    throw new CommandDeadlineError(command, message, outcome.stdout, outcome.stderr);
+  }
+  if (outcome.exitCode !== 0) {
+    throw new CapturedCommandError(command, outcome.exitCode, outcome.stdout, outcome.stderr);
+  }
+  return outcome;
+}
+
+/**
  * One value the repository's own config holds. `replaces` is a pattern over the
  * key's existing values: the values it matches are this one's to replace, and
  * every other value of the key stays. Without it the value replaces them all.
@@ -2136,6 +2202,9 @@ function describeFailure(level: 'ERROR' | 'WARNING', error: unknown): void {
   if (error instanceof CapturedCommandError) {
     console.error(`--- ${level}: setup-environment.ts failed while running: ${error.command}`);
     console.error(`exit code: ${error.exitCode}`);
+  } else if (error instanceof CommandDeadlineError) {
+    console.error(`--- ${level}: setup-environment.ts failed while running: ${error.command}`);
+    console.error(error.message);
   } else {
     console.error(`--- ${level}: setup-environment.ts failed: ${error}`);
   }
@@ -2144,7 +2213,7 @@ function describeFailure(level: 'ERROR' | 'WARNING', error: unknown): void {
 }
 
 function replayCapturedOutput(error: unknown): void {
-  if (!(error instanceof CapturedCommandError)) {
+  if (!(error instanceof CapturedCommandError || error instanceof CommandDeadlineError)) {
     return;
   }
   // The install ran with every resolved secret in its environment, so its

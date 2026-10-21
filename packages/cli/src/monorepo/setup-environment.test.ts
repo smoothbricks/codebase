@@ -1,5 +1,6 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: Shell fixture scripts are literal shell text. */
 import { describe, expect, it } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   lstatSync,
@@ -10,10 +11,14 @@ import {
   symlinkSync,
   watch,
 } from 'node:fs';
-import { chmod, copyFile, cp, mkdir, mkdtemp, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, cp, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
+import {
+  GIT_HTTP_LOW_SPEED_LIMIT,
+  GIT_HTTP_LOW_SPEED_TIME_S,
+} from '../../../nx-plugin/managed/raw/tooling/direnv/cargo-fetch-bound.ts';
 import { keepDeveloperLinks } from './developer-links.js';
 import { DECLARED_LINKS_POSTINSTALL } from './package-policy.js';
 
@@ -38,6 +43,16 @@ const MANAGED = resolve(
   'raw',
 );
 
+/** What shell entry loads from `tooling/direnv`: the script and the modules it imports. */
+const MANAGED_SCRIPTS = [
+  'setup-environment.ts',
+  'cargo-fetch-bound.ts',
+  'cargo-fetch-run.ts',
+  'developer-links.ts',
+  'linked-snapshots.ts',
+  'secret-references.ts',
+] as const;
+
 interface ShellEntry {
   readonly exitCode: number;
   readonly stderr: string;
@@ -55,6 +70,10 @@ type EntryOptions = {
   readonly ciSecrets?: Readonly<Record<string, string>>;
   /** devenv's smoo:cargo-fetch task: `--cargo`, and its `status`, `--cargo --check`. */
   readonly cargo?: boolean;
+  /** The fetch's deadline, SMOO_CARGO_FETCH_DEADLINE_MS: a step is given a shorter one than its default, never a longer. */
+  readonly deadlineMs?: number;
+  /** Variables the entry's environment holds besides the fixture's own: what the step must override or pass on. */
+  readonly env?: Readonly<Record<string, string>>;
   /** devenv's smoo:developer-links task: `--links`, and its `status`, `--links --check`. */
   readonly links?: boolean;
   readonly check?: boolean;
@@ -91,10 +110,14 @@ interface Repository {
   readonly uvRuns: () => string[][];
   /** The argument vectors the recording `cargo` received, one per run. */
   readonly cargoRuns: () => string[][];
+  /** The git low-speed limits the recording `cargo` saw, as `limit time` per run, `unset` for one it did not see. */
+  readonly cargoLowSpeed: () => string[][];
   /** The CARGO_HOME every shell entry of this repository runs with. */
   readonly cargoHome: string;
   /** The XDG_CACHE_HOME every shell entry of this repository runs with: private, so a stamp has one place to be. */
   readonly xdgCache: string;
+  /** The fixture's ledgers: what the recording `uv`, `cargo` and `git` write, and the pipes of a `cargo` that stalls. */
+  readonly ledgers: string;
   /**
    * Each `git config` invocation that writes, as a `begin <pid>` and an `end <pid>` line
    * around the write, in the order they happened across every shell entry.
@@ -135,7 +158,7 @@ async function withManagedRepository(
     await mkdir(join(root, 'tooling', 'git-hooks'), { recursive: true });
     await mkdir(ledgers);
     await mkdir(bin);
-    for (const name of ['setup-environment.ts', 'developer-links.ts', 'linked-snapshots.ts', 'secret-references.ts']) {
+    for (const name of MANAGED_SCRIPTS) {
       await copyFile(join(MANAGED, 'tooling', 'direnv', name), join(root, 'tooling', 'direnv', name));
     }
     await copyFile(join(MANAGED, 'envrc'), join(root, '.envrc'));
@@ -210,19 +233,29 @@ async function withManagedRepository(
       ].join('\n'),
     );
     await chmod(join(bin, 'uv'), 0o755);
-    // cargo reduced to what setup-environment.ts can observe: it records its argv and,
-    // while the checkout holds `cargo-fails`, refuses the way a fetch without a registry does.
-    // A fetch that succeeds leaves what Cargo itself writes in its home — the package-cache
-    // lock and the registry — and nothing else, creating the home if it was not there.
+    // cargo reduced to what setup-environment.ts can observe: it records its argv and the git low-speed limits it was
+    // given and, while the checkout holds `cargo-fails`, refuses the way a fetch without a registry does, and while it
+    // holds `cargo-stalls`, never answers, as a fetch whose git child stalls on an established connection does. A fetch
+    // that succeeds leaves what Cargo itself writes in its home — the package-cache lock and the registry — and
+    // nothing else, creating the home if it was not there.
     await writeFile(
       join(bin, 'cargo'),
       [
         '#!/usr/bin/env bash',
         'set -e',
         `printf '%s\\n' "$*" >> ${JSON.stringify(join(ledgers, 'cargo'))}`,
+        `printf '%s %s\\n' "\${GIT_HTTP_LOW_SPEED_LIMIT-unset}" "\${GIT_HTTP_LOW_SPEED_TIME-unset}" >> ${JSON.stringify(join(ledgers, 'cargo-env'))}`,
         'if [ -f cargo-fails ]; then',
         "  echo 'error: failed to download from `https://index.crates.io/config.json`' >&2",
         '  exit 101',
+        'fi',
+        'if [ -f cargo-stalls ]; then',
+        // Every process of this tree holds the write end of the lifetime pipe, so its end of file is the death of
+        // the last one, and `up` is said once the tree stands. A case that reads neither finds two plain files.
+        `  exec 3>${JSON.stringify(join(ledgers, 'stall-lifetime'))}`,
+        '  tail -f /dev/null &',
+        `  echo up > ${JSON.stringify(join(ledgers, 'stall-up'))}`,
+        '  wait',
         'fi',
         'home="${CARGO_HOME:-$HOME/.cargo}"',
         'mkdir -p "$home/registry/cache"',
@@ -282,8 +315,10 @@ function repository(root: string, ledgers: string, bin: string): Repository {
     count: (name) => lines(name).length,
     uvRuns: () => lines('uv').map((line) => line.split(' ')),
     cargoRuns: () => lines('cargo').map((line) => line.split(' ')),
+    cargoLowSpeed: () => lines('cargo-env').map((line) => line.split(' ')),
     cargoHome: join(dirname(bin), 'cargo-home'),
     xdgCache: join(dirname(bin), 'xdg-cache'),
+    ledgers,
     gitConfigWrites: () => lines('git-config-writes'),
   };
 }
@@ -329,6 +364,7 @@ function startShell(root: string, state: string, bin: string, options: EntryOpti
     ],
     cwd: root,
     env: {
+      ...options.env,
       PATH: `${bin}:${process.env.PATH ?? ''}`,
       TMPDIR: dirname(bin),
       ...(options.home === undefined
@@ -341,6 +377,7 @@ function startShell(root: string, state: string, bin: string, options: EntryOpti
       DEVENV_ROOT: join(root, 'tooling', 'direnv'),
       DEVENV_STATE: state,
       ...(options.uvProjectEnvironment === undefined ? {} : { UV_PROJECT_ENVIRONMENT: options.uvProjectEnvironment }),
+      ...(options.deadlineMs === undefined ? {} : { SMOO_CARGO_FETCH_DEADLINE_MS: String(options.deadlineMs) }),
       ...(options.ciSecrets === undefined ? {} : { GITHUB_ACTIONS: 'true', ...options.ciSecrets }),
     },
     stdout: 'pipe',
@@ -2649,6 +2686,82 @@ describe('what shell entry fetches for a Cargo workspace', () => {
       },
     );
   });
+
+  // A fetch whose git child stalls holds Cargo's package-cache lock until something ends it, so the step bounds it. The
+  // bound is the case's subject: the fixture's cargo never answers, so only the deadline ends it. The step must have run
+  // that one fetch and stopped at its failure, say which fetch it ended, past which deadline and holding which lock,
+  // and record nothing. A bound that starts at spawn races the child's first instruction, so the deadline is a margin
+  // beyond the fixture's start, not a tight value. That everything the fetch started dies with it is proved against a
+  // real process tree, with the clock held by hand, in cargo-fetch-run.test.ts.
+  const STALL_DEADLINE_MS = 2_000;
+  for (const [mode, entry, exitCode] of [
+    ['local', CARGO, 0],
+    ['CI', { cargo: true, ciSecrets: { SMOO_NPM_TOKEN: 'registry-value', SMOO_TOKEN: 'shell-value' } }, 1],
+  ] as const) {
+    it(`ends a fetch that outlives its deadline and stamps nothing, in a ${mode} entry`, async () => {
+      await withManagedRepository(
+        { workspaces: ['packages/*'], files: { ...CARGO_PROJECT, 'cargo-stalls': '' } },
+        async ({ cargoHome, xdgCache, enterShell: enter, cargoRuns }) => {
+          const entered = await enter({ ...entry, deadlineMs: STALL_DEADLINE_MS });
+          expect(entered.exitCode).toBe(exitCode);
+          // One fetch ran, and the step stopped at its failure: the second workspace was never fetched.
+          expect(cargoRuns()).toEqual([fetch('Cargo.toml')]);
+          for (const fact of [
+            'cargo fetch --locked --manifest-path Cargo.toml',
+            `past its ${STALL_DEADLINE_MS} ms deadline`,
+            join(cargoHome, '.package-cache'),
+          ]) {
+            expect(entered.stderr).toContain(fact);
+          }
+          expect(existsSync(join(xdgCache, 'smoo'))).toBe(false);
+        },
+      );
+    });
+  }
+
+  // Cargo runs `git fetch` for git dependencies, and git reads its low-speed limit from these variables ahead of its
+  // configuration: the fetch gets the step's limits whatever the entry carried, which is what ends a stalled transfer.
+  // The recording cargo shows what reached it.
+  it("gives each fetch the step's git low-speed limits, over any the entry carried", async () => {
+    const limits = [String(GIT_HTTP_LOW_SPEED_LIMIT), String(GIT_HTTP_LOW_SPEED_TIME_S)];
+    await withManagedRepository(
+      { workspaces: ['packages/*'], files: CARGO_PROJECT },
+      async ({ root, enterShell: enter, cargoLowSpeed }) => {
+        expect(await enter(CARGO)).toEqual(HEALTHY);
+        expect(cargoLowSpeed()).toEqual([limits, limits]);
+
+        // The lockfile changed, so the root workspace fetches again, from an entry that carries other limits.
+        await edit(join(root, 'Cargo.lock'), 'version = 4\n\n[[package]]\nname = "arrow-ipc"\n');
+        const carried = { GIT_HTTP_LOW_SPEED_LIMIT: '1000000', GIT_HTTP_LOW_SPEED_TIME: '1' };
+        expect(await enter({ ...CARGO, env: carried })).toEqual(HEALTHY);
+        expect(cargoLowSpeed()).toEqual([limits, limits, limits]);
+      },
+    );
+  });
+
+  // The fetch leads a process group of its own, so the signal that ends the step no longer reaches it the way a
+  // terminal's does: the step ends it, and what it started, as it ends.
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    it(`takes the fetch and what the fetch started along when ${signal} ends the step`, async () => {
+      await withManagedRepository(
+        { files: { ...CARGO_PROJECT, 'cargo-stalls': '' } },
+        async ({ ledgers, startShell }) => {
+          const lifetime = join(ledgers, 'stall-lifetime');
+          const up = join(ledgers, 'stall-up');
+          execFileSync('mkfifo', [lifetime, up]);
+          // Each end of a pipe opens only once the other does: read both before the fixture's cargo writes.
+          const gone = readFile(lifetime, 'utf8');
+          const said = readFile(up, 'utf8');
+          const entry = startShell(CARGO);
+          expect(await said).toBe('up\n');
+          entry.kill(signal);
+          await entry.exited;
+          expect(entry.signalCode).toBe(signal);
+          expect(await gone).toBe('');
+        },
+      );
+    });
+  }
 });
 
 describe('the workspace git config', () => {

@@ -507,6 +507,22 @@ deleted and recreated `CARGO_HOME`, or another one, fetches again, while a copie
 not. A failed fetch writes no stamp. In CI (`devenv tasks run`) a failed fetch fails; locally the task prints Cargo's
 cause, the shell loads, and the next entry retries, while graph inference keeps refusing with that same cause.
 
+The fetch is bounded, because it holds Cargo's global package-cache lock (`$CARGO_HOME/.package-cache`) while it runs
+and every other cargo that shares the `CARGO_HOME` waits behind it. Each `cargo fetch --locked` runs in a process group
+of its own under a 300 s deadline (`CARGO_FETCH_DEADLINE_MS` in `tooling/direnv/cargo-fetch-bound.ts`, the bound the
+project graph puts on each of its own Cargo children). At the deadline the whole group is killed and the task fails,
+naming the command and the lock it held and printing Cargo's output up to the kill; `SMOO_CARGO_FETCH_DEADLINE_MS` gives
+a shorter deadline in whole milliseconds and never a longer one. A signal that ends the step (SIGINT, SIGTERM, SIGHUP)
+or the step's exit ends the group with it, since the group no longer shares the terminal's signals.
+
+The step also gives the fetch `GIT_HTTP_LOW_SPEED_LIMIT=1` and `GIT_HTTP_LOW_SPEED_TIME=60`, over any value the shell
+already holds. Git has no low-speed limit unless one is set, and Cargo runs the `git` executable for git dependencies
+unless `net.git-fetch-with-cli = false` (its default detects `git`), so a `git fetch` over HTTP(S) whose connection
+stalls fails 60 to 67 s after its last byte instead of holding the lock until the deadline. The limit reaches only those
+transfers: a git dependency over ssh or the git protocol, and Cargo's own git library
+(`net.git-fetch-with-cli = false`), are bounded by the deadline alone. Cargo's registry downloads carry limits of their
+own (`http.timeout`, `http.low-speed-limit`).
+
 In-workspace members follow Nx's file semantics, which differ from the command's own walk in two places: a symlinked
 directory inside a package is not followed, and manifests and Cargo configuration above the Nx root (a
 `~/.cargo/config.toml` above a checkout in the home directory) are machine-local and not hashed, as for every other

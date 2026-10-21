@@ -633,7 +633,14 @@ describe('snapshot declarations', () => {
       '-qm',
       'advance',
     );
-    for (const file of ['setup-environment.ts', 'developer-links.ts', 'linked-snapshots.ts', 'secret-references.ts']) {
+    for (const file of [
+      'setup-environment.ts',
+      'cargo-fetch-bound.ts',
+      'cargo-fetch-run.ts',
+      'developer-links.ts',
+      'linked-snapshots.ts',
+      'secret-references.ts',
+    ]) {
       write(
         join(checkout.consumer, 'tooling/direnv', file),
         readFileSync(join(managedAssetsRoot, 'raw/tooling/direnv', file), 'utf8'),

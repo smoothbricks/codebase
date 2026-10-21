@@ -473,6 +473,13 @@ in {
   # and no checkout path can name, so it is gated by `status` (exit 0 when
   # CARGO_HOME holds them) rather than execIfModified.
   #
+  # Each fetch is bounded (tooling/direnv/cargo-fetch-bound.ts): cargo holds its
+  # global package-cache lock while it runs, so a fetch that stalls stops every
+  # cargo that shares CARGO_HOME. It runs in a process group of its own under a
+  # deadline that kills the group, and git, which has no low-speed limit of its
+  # own, drops a transfer that has all but stopped. A fetch that ends either
+  # way fails the task and records nothing.
+  #
   # smoo:developer-links points the packages the root package.json's
   # `smoo.developerLinks` declares at their local checkouts, after an install
   # and in every tree that installed them (tooling/direnv/developer-links.ts).
