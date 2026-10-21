@@ -530,6 +530,15 @@ serialized with, and queued ahead of, the lands of its repository (measured 2026
 behind host unit work admitted as gates), or left cowshed for an unbudgeted host shell. Nothing about the host boundary
 requires the gate class.
 
+The CLI is that coordinator route (07_api.md, "CLI and API exec parity"): every exec it admits travels as
+`coordinator.exec`, whatever its class, so who asks decides the route and the class asked for never does. What keeps a
+workspace's own process from asking is that it cannot reach that authority. On macOS a job may run the installed CLI,
+but its sandbox denies cowshed's store, which holds every project's records, the daemon's socket and every workspace
+supervisor's socket, and it admits no controller socket. So the CLI fails at its first write into the store, as
+sandbox-denied (exit 6) naming the path, before any route is asked. On Linux there is no sandbox yet (04_sandbox.md,
+"Linux enforcement"): a workspace command already runs with the invoking user's full authority, store included, so the
+host scope gives it nothing it lacks, and this boundary arrives with the Linux sandbox.
+
 `--register` (on `cowshed fork`) additionally adds a `cowshed/<ws>` remote in the **main** workspace pointing at the new
 workspace's canonical mount, so a human in main can fetch and review the workspace's branch in place. Off by default
 because it is host-side state that accumulates; `cowshed rm` and `cowshed land` drop it at retirement (02).
