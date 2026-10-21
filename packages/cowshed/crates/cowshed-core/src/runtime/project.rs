@@ -2821,9 +2821,8 @@ fn plan_terminal_storage_tree(path: &Path, plan: &mut Vec<TerminalEntry>) -> Res
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
-                // A land lease describes its last holder (a killed one cannot clear it); that
-                // description is no state, so the lease is a lock whatever its length.
-                name.ends_with(super::land_lease::LAND_LEASE_SUFFIX)
+                // A lifecycle lease is a lock whatever record it holds (`lease_holder::is_lease`).
+                crate::lease_holder::is_lease(name)
                     || (metadata.len() == 0
                         && (name.ends_with(".lock")
                             || name.ends_with(crate::build_volume::HOLD_SUFFIX)))
@@ -24139,6 +24138,57 @@ mod terminal_project_cleanup_tests {
         }
     }
 
+    /// A lifecycle lease's record is no retained state: the purge passes over an intent lease
+    /// recorded by a holder that still has it, one whose recorded holder ended without clearing it,
+    /// a released (emptied) one, and a land lease with a record, and removes each as a lock.
+    #[test]
+    fn a_recorded_or_released_lifecycle_lease_never_refuses_the_purge() {
+        let (root, paths) = project("recorded-lease");
+        std::fs::create_dir_all(&paths.sessions).expect("sessions");
+        let main = crate::metadata::WorkspaceName::main();
+        let held = crate::storage::recovery::IntentLease::try_claim(&paths.sessions, &main)
+            .expect("claim")
+            .expect("the lease is free");
+        let raven = crate::metadata::WorkspaceName::new("raven").expect("name");
+        drop(
+            crate::storage::recovery::IntentLease::try_claim(&paths.sessions, &raven)
+                .expect("claim")
+                .expect("the lease is free"),
+        );
+        let stale = paths.sessions.join(format!(
+            "wren{}",
+            crate::storage::recovery::INTENT_LEASE_SUFFIX
+        ));
+        std::fs::write(
+            &stale,
+            serde_json::to_vec(&crate::lease_holder::Process::this().expect("this process"))
+                .expect("record"),
+        )
+        .expect("stale record");
+        drop(
+            crate::runtime::land_lease::take(
+                &paths.sessions,
+                "lark",
+                crate::runtime::land_lease::Holding::Land,
+            )
+            .expect("land lease"),
+        );
+        let main_lease = paths.sessions.join(format!(
+            "main{}",
+            crate::storage::recovery::INTENT_LEASE_SUFFIX
+        ));
+        assert!(
+            !std::fs::read(&main_lease).expect("read").is_empty(),
+            "the held lease records its holder"
+        );
+        require_terminal_storage(&paths.project_root)
+            .expect("a recorded lease is a lock, not a retained artifact");
+        clean_terminal_project_storage(&paths.project_root, &paths.repository_binding)
+            .expect("the purge removes every lease as a lock");
+        assert!(!stale.exists() && !main_lease.exists());
+        drop(held);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
     #[test]
     fn mains_own_checkpoints_and_temp_dir_do_not_refuse_its_restore() {
         let (root, paths) = project("main-checkpoint");

@@ -135,7 +135,15 @@ fn directories(directory: &Path) -> Vec<PathBuf> {
     )
 }
 
-/// The intent and land lease files in a project's `sessions` directory.
+/// Whether `name` is a cowshed lifecycle lease file: a workspace's intent lease or its land lease.
+/// A lease is a lock whatever its length: the record it holds describes its holder, or a holder
+/// that ended without unwinding, and is no state of its own.
+pub fn is_lease(name: &str) -> bool {
+    name.ends_with(crate::storage::recovery::INTENT_LEASE_SUFFIX)
+        || name.ends_with(crate::runtime::land_lease::LAND_LEASE_SUFFIX)
+}
+
+/// The intent and land lease files in a project's `sessions` directory ([`is_lease`]).
 #[cfg(target_os = "macos")]
 fn leases(sessions: &Path) -> Vec<PathBuf> {
     fs::read_dir(sessions).map_or_else(
@@ -147,10 +155,7 @@ fn leases(sessions: &Path) -> Vec<PathBuf> {
                 .filter(|path| {
                     path.file_name()
                         .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            name.ends_with(crate::storage::recovery::INTENT_LEASE_SUFFIX)
-                                || name.ends_with(crate::runtime::land_lease::LAND_LEASE_SUFFIX)
-                        })
+                        .is_some_and(is_lease)
                 })
                 .collect()
         },
