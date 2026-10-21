@@ -4166,6 +4166,121 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
 
+    /// The defect a review found: a bootout that went overdue after `launchctl bootout` exited
+    /// non-zero was read as an ordinary failure, and the restore then kickstarted a job launchd
+    /// still tore down (launchctl 37). Whatever the bootout answered, an overdue bootout is
+    /// overdue: the error says so, carries a refused bootout's answer as context, and the
+    /// restore puts the previous build back and leaves the agent alone — no kickstart and no
+    /// bootstrap. launchd here holds the job throughout and reports an exit timeout of 0 s, so
+    /// the bootout is overdue after the 1 s unload grace.
+    #[test]
+    fn an_overdue_bootout_is_never_kickstarted_whatever_launchctl_bootout_answered() {
+        struct TearingDown {
+            bootout: crate::launchd::CommandStatus,
+            argv: Vec<String>,
+        }
+        impl LaunchctlCommand for TearingDown {
+            fn run(
+                &mut self,
+                _: &Path,
+                arguments: &[std::ffi::OsString],
+            ) -> io::Result<crate::launchd::LaunchctlOutput> {
+                let verb = arguments[0].to_string_lossy().into_owned();
+                let (status, stdout) = match verb.as_str() {
+                    "print" => (
+                        crate::launchd::CommandStatus::Success,
+                        b"gui/501/dev.cowshed.gateway = {\n\tstate = not running\n\texit timeout = 0\n}\n"
+                            .to_vec(),
+                    ),
+                    "bootout" => (self.bootout, Vec::new()),
+                    _ => (crate::launchd::CommandStatus::Success, Vec::new()),
+                };
+                self.argv.push(verb);
+                Ok(crate::launchd::LaunchctlOutput {
+                    status,
+                    stdout,
+                    stderr: b"Boot-out failed: 5: Input/output error".to_vec(),
+                })
+            }
+        }
+        for (case, bootout) in [
+            ("refused", crate::launchd::CommandStatus::ExitCode(5)),
+            ("accepted", crate::launchd::CommandStatus::Success),
+        ] {
+            let (home, executable, spec) = host_with_agent(&format!("overdue-{case}"));
+            let first = build(&home, "first", b"the supervised release build", Some(100));
+            let second = build(&home, "second", b"a build launchd never ran", Some(200));
+            install_host_stable_executable(&mut LaunchdExecutor::native(), &home, &first.source)
+                .unwrap();
+            let mut executor = LaunchdExecutor::new(
+                NativeFilesystem::new(),
+                TearingDown {
+                    bootout,
+                    argv: Vec::new(),
+                },
+            );
+            let error = install_and_activate_gateway(
+                &mut executor,
+                &home,
+                &second,
+                spec.target(),
+                InstallOutcome::Changed,
+            )
+            .expect_err("the bootout went overdue");
+            assert_eq!(error.code, ErrorCode::EnvironmentMissing, "{case}");
+            assert!(
+                error.message.contains("did not finish booting out")
+                    && error
+                        .message
+                        .contains("its process exited and launchd still holds the job"),
+                "{case}: {}",
+                error.message
+            );
+            assert_eq!(
+                error.message.contains("the bootout itself answered"),
+                case == "refused",
+                "{case}: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains("this host is as it was found")
+                    && error.message.contains("is not loaded again"),
+                "{case}: {}",
+                error.message
+            );
+            assert!(
+                error.hint.contains("launchctl bootstrap gui/"),
+                "{case}: {}",
+                error.hint
+            );
+            let (_, command) = executor.into_parts();
+            assert!(
+                command
+                    .argv
+                    .iter()
+                    .all(|verb| verb == "print" || verb == "bootout"),
+                "{case}: nothing but print and one bootout: {:?}",
+                command.argv
+            );
+            assert_eq!(
+                command
+                    .argv
+                    .iter()
+                    .filter(|verb| *verb == "bootout")
+                    .count(),
+                1,
+                "{case}: {:?}",
+                command.argv
+            );
+            assert_eq!(
+                fs::read_link(executable.path()).unwrap(),
+                executable.stored_link(&first.digest),
+                "{case}: the stable name runs the build it ran"
+            );
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
     /// A build whose package has no Nx cache server dependency cannot be installed: the refresh
     /// names the missing companion and stops before any launchctl call or change to the stable name.
     #[tokio::test]

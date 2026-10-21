@@ -1703,6 +1703,29 @@ mod tests {
         GroupLeader::observe(pid).expect("observe a live test group leader")
     }
 
+    /// A watch taken on a running process by pid reports it running, then its exit once it is
+    /// killed; a pid no process holds any more (reaped) is no watch at all.
+    #[test]
+    fn an_exit_watch_by_pid_sees_the_exit_and_none_for_a_reaped_pid() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("600")
+            .stdin(Stdio::null())
+            .spawn_locked()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let watch = super::ExitWatch::of(pid)
+            .expect("watch")
+            .expect("a running child is watched");
+        assert!(!watch.within(Duration::from_millis(50)).expect("poll"));
+        child.kill().expect("kill");
+        watch.wait().expect("the exit is reported");
+        child.wait().expect("reap");
+        assert!(
+            super::ExitWatch::of(pid).expect("watch").is_none(),
+            "a reaped pid names no process"
+        );
+    }
+
     /// A job-shaped process tree: a group leader with a child, both sleeping.
     fn job_group() -> std::process::Child {
         Command::new("/bin/sh")

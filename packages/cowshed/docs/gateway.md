@@ -130,13 +130,14 @@ because a workspace supervisor of that build still draining its jobs may start s
 removed once the new build's agent is active. If activation fails, the stable name is pointed back at the previous copy
 and the agent is loaded again: bootstrapped from its plist when launchd no longer holds it (a `kickstart` answers such
 an agent "Could not find service"), kickstarted when it does, and left alone, with the bootstrap to run once it has
-gone, while launchd still tears it down. An install that would restart a running gateway refuses (exit 4), changing
-nothing, while a land holds its repository's turn or a gate job holds or wants CPU tokens, and names them; it never
-waits. A release build records its commit beside its copy (`cowshed-<sha256>.build`), and `start` and `setup` take the
-install slot (`dev.cowshed/install.lock`), one install at a time, and refuse to replace the installed cowshed with a
-build that does not contain it — one whose commit is not on an adopted `main`, or that lacks an installed commit by both
-ancestry and patch identity — naming the binary, both builds and each commit it lacks; `cowshed setup --downgrade`
-installs it anyway. The full rules are in the spec, `specs/cowshed/05_gateway.md` "The installed cowshed".
+gone, while launchd still tears it down. An install that would restart a running gateway refuses (exit 4) to install or
+restart anything while a land holds its repository's turn or a gate job holds or wants CPU tokens, and names them; it
+never waits. A refused `setup` keeps the storage repair it ran first. A release build records its commit beside its copy
+(`cowshed-<sha256>.build`), and `start` and `setup` take the install slot (`dev.cowshed/install.lock`), one install at a
+time, and refuse to replace the installed cowshed with a build that does not contain it — one whose commit is not on an
+adopted `main`, or that lacks an installed commit by both ancestry and patch identity — naming the binary, both builds
+and each commit it lacks; `cowshed setup --downgrade` installs it anyway. The full rules are in the spec,
+`specs/cowshed/05_gateway.md` "The installed cowshed".
 
 `start` atomically installs `~/Library/LaunchAgents/dev.cowshed.gateway.plist` at mode 0600, with the stable name
 followed by the fixed `gateway run` argv. The agent has `RunAtLoad`, `KeepAlive` and `ExitTimeOut` 30 s; early startup
