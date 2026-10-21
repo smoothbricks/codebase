@@ -20515,15 +20515,17 @@ async fn seed_tree_findings(
             path: Some(checkout.to_owned()),
         });
     }
-    if age.unlanded() {
+    if let Some(placed) = age.moved_from() {
         findings.push(Finding {
             code: "target-moved-outside-land".into(),
             severity: FindingSeverity::Warning,
             message: format!(
                 "{workspace}'s HEAD tree {tree} matches neither its live build tree {} nor seed \
-                 tree {}; no cowshed build-volume adoption records this tree",
+                 tree {}, and its checkout moved from {}, where cowshed placed its build volume; \
+                 no cowshed build-volume adoption records this tree",
                 recorded(age.tree.as_ref()),
                 recorded(age.seed.as_ref().and_then(|seed| seed.tree.as_ref())),
+                placed,
             ),
             hint: "a cowshed land may have skipped its capture and adoption, or plain Git moved \
                    the branch; the next fork tries a matching seed"
@@ -21922,7 +21924,7 @@ mod workspace_origin_tests {
 
     #[tokio::test]
     async fn doctor_names_seed_tree_drift_and_keeps_a_nearer_landed_seed() {
-        use super::super::build_volumes::{Frozen, Nearness, SeedAge};
+        use super::super::build_volumes::{Frozen, Nearness, Placed, SeedAge};
         use crate::build_volume::BuildVolumeId;
         let store = crate::temp_root::FixtureStore::new();
         let store_root = store.shared();
@@ -21973,6 +21975,7 @@ mod workspace_origin_tests {
             live: BuildVolumeId::mint(),
             tree: Some(previous.clone()),
             nearness: Nearness::Paths(1),
+            placed: Placed::Elsewhere(previous.clone()),
             written: frozen + std::time::Duration::from_secs(1),
             seed: Some(Frozen {
                 id: BuildVolumeId::mint(),

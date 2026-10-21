@@ -136,6 +136,12 @@ pub struct BuildVolumeRecord {
     pub role: BuildVolumeRole,
     /// RFC 3339 UTC.
     pub created_at: String,
+    /// The tree the linking checkout had checked out when cowshed placed this volume there: a
+    /// fork's tree at its fork, the landed tree at an adoption. `tree` says what was built into
+    /// the volume; this says where it was put. `None` on a record that predates it, or for a
+    /// placement at no tree cowshed knows (16_build_volumes.md, "Which volume a seed holds").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_out: Option<GitOid>,
 }
 
 impl BuildVolumeRecord {
@@ -145,6 +151,7 @@ impl BuildVolumeRecord {
             tree,
             role,
             created_at: crate::storage::deletion_log::rfc3339_utc(std::time::SystemTime::now()),
+            checked_out: None,
         }
     }
 

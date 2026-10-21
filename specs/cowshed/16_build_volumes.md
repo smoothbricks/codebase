@@ -384,20 +384,24 @@ invocation before it creates or writes a profile and held for the build, is requ
 in `agent-todo/cowshed-small-spec-gaps.md`; no protection for that case is claimed by the current capture contract.
 
 **Which volume a seed holds.** Every build volume's sidecar records the tree it was built at (01_storage.md "Layout"): a
-seed the tree it was frozen at, a land's adopted volume the landed tree, a fork's live volume its seed's. A fork names
-the tree it checks out: the target's `HEAD^{tree}`, or under `fork --ref <rev>` the tree of `<rev>`'s commit. A volume's
-**nearness** to that tree is _equal_; else the number of paths `git diff-tree -r` reports between the two trees in the
-target's repository; else _unknown_ (no recorded tree, or one the repository cannot compare, said on stderr), farther
-than any count. Fork step 2 decides, under the target's image lock:
+seed the tree it was frozen at, a land's adopted volume the landed tree, a fork's live volume its seed's. A linked
+volume's sidecar also records `checkedOut`, the tree its checkout had when cowshed placed the volume there: the fork's
+tree at a fork, the landed tree at an adoption. `tree` says what was built into the volume; `checkedOut` says where it
+was put. A record without `checkedOut` (one that predates it, or a placement at no tree cowshed knows) never reads as
+moved. A fork names the tree it checks out: the target's `HEAD^{tree}`, or under `fork --ref <rev>` the tree of
+`<rev>`'s commit. A volume's **nearness** to that tree is _equal_; else the number of paths `git diff-tree -r` reports
+between the two trees in the target's repository; else _unknown_ (no recorded tree, or one the repository cannot
+compare, said on stderr), farther than any count. Fork step 2 decides, under the target's image lock:
 
-1. **An external land.** When neither the seed nor the target's live volume is equal and the fork's tree is the target's
-   `HEAD^{tree}`, the target's branch moved past every volume cowshed knows, and a live workspace whose `HEAD^{tree}` is
-   that tree ran its gates there. The seed becomes a capture of that workspace's build volume, recorded at the tree.
-   Candidates are tried warmest first (latest written). Each one's image lock is taken without waiting (a held one is a
-   skip naming it: its own fork or land is running), its `HEAD^{tree}` is read again under that lock, and a candidate
-   whose tree moved is refused: a seed is never recorded at a tree its volume was not built at. It is then captured
-   under the same writer exclusion as every seed, above, with its own Nx daemon stopped as at a land. When no candidate
-   is captured, each skip is said on stderr and the decision falls to the reseed.
+1. **An external land.** When neither the seed nor the target's live volume is equal, the fork's tree is the target's
+   `HEAD^{tree}`, and that tree differs from the live volume's `checkedOut`, the target's branch moved past every volume
+   cowshed knows, and a live workspace whose `HEAD^{tree}` is that tree ran its gates there. The seed becomes a capture
+   of that workspace's build volume, recorded at the tree. Candidates are tried warmest first (latest written). Each
+   one's image lock is taken without waiting (a held one is a skip naming it: its own fork or land is running), its
+   `HEAD^{tree}` is read again under that lock, and a candidate whose tree moved is refused: a seed is never recorded at
+   a tree its volume was not built at. It is then captured under the same writer exclusion as every seed, above, with
+   its own Nx daemon stopped as at a land. When no candidate is captured, each skip is said on stderr and the decision
+   falls to the reseed.
 2. **A reseed** refreezes the seed from the target's live volume when the live volume is nearer the fork's tree, or as
    near and written after the seed (behind, above). A seed nearer than the live volume is kept however much later the
    live volume was written, and the live volume is not sealed at all: a landed seed beats a live volume built at an
@@ -405,6 +409,13 @@ than any count. Fork step 2 decides, under the target's image lock:
    Both at the same tree: the target ran tasks on the adopted volume after its land.
 
 A skip names each holder and leaves the seed as it was: the fork is colder, never wrong, and the next fork tries again.
+
+A fork of a workspace whose checkout has not moved since cowshed placed its volume is therefore no external land, even
+when its live volume records an older seed tree (forked while its target's seed was behind) and another workspace has
+its tree checked out: the reseed takes the workspace's own live volume, and the fork inherits what it built.
+**Limitation:** forking a working shed is cold. A workspace that commits and builds its own work moves its checkout from
+`checkedOut`, so step 1 treats its new tree as an external land, and its own volume is not a candidate. This is a known
+gap, not closed here.
 
 A foreground keeper is an admitted holder. While it holds the source volume, fork takes this busy-skip cold-seed path;
 it does not stop the keeper, bypass its hold, or wait synchronously for its release. The warm path becomes reachable

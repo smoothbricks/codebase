@@ -229,6 +229,28 @@ pub(crate) enum Nearness {
     Unknown,
 }
 
+/// Where cowshed placed a target's live volume, against the tree a fork checks out: the tree the
+/// target's checkout had when cowshed linked the volume (its record's `checkedOut`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Placed {
+    /// At the fork's tree: the target's branch has not moved since.
+    Here,
+    /// At this other tree: the target's checkout moved since cowshed placed the volume.
+    Elsewhere(GitOid),
+    /// The record predates `checkedOut`, or the volume was placed at no tree cowshed knows.
+    Unrecorded,
+}
+
+impl Placed {
+    fn of(checked_out: Option<&GitOid>, tree: &GitOid) -> Self {
+        match checked_out {
+            Some(placed) if placed == tree => Self::Here,
+            Some(placed) => Self::Elsewhere(placed.clone()),
+            None => Self::Unrecorded,
+        }
+    }
+}
+
 /// A target's latest seed: the tree it was frozen at, how near that is to the fork's tree, and
 /// the instant of the last write it holds.
 #[derive(Clone, Debug)]
@@ -248,6 +270,7 @@ pub(crate) struct SeedAge {
     /// The tree the live volume's record names: the one a reseed records.
     pub tree: Option<GitOid>,
     pub nearness: Nearness,
+    pub placed: Placed,
     /// When the live volume's image was last written, after its volume was flushed.
     pub written: SystemTime,
     /// `None` for a target that has no seed.
@@ -264,14 +287,21 @@ impl SeedAge {
         })
     }
 
-    /// Whether neither volume was built at the fork's tree: when that tree is the target's
-    /// `HEAD^{tree}`, the target's branch moved without a `cowshed land`.
-    pub fn unlanded(&self) -> bool {
-        self.nearness != Nearness::Equal
-            && self
+    /// The tree cowshed placed the live volume at, when the target's branch moved past every
+    /// volume cowshed knows without a `cowshed land` (16_build_volumes.md, "Which volume a seed
+    /// holds", step 1): its checkout moved away from that tree, and neither volume was built at
+    /// the fork's tree. A record that cannot say where its volume was placed is never read as
+    /// moved: the fork is colder, never seeded from another workspace's volume.
+    pub fn moved_from(&self) -> Option<&GitOid> {
+        let Placed::Elsewhere(placed) = &self.placed else {
+            return None;
+        };
+        let built_here = self.nearness == Nearness::Equal
+            || self
                 .seed
                 .as_ref()
-                .is_none_or(|seed| seed.nearness != Nearness::Equal)
+                .is_some_and(|seed| seed.nearness == Nearness::Equal);
+        (!built_here).then_some(placed)
     }
 
     /// How long before the live volume's last write the seed was frozen: `None` when the seed
@@ -916,6 +946,8 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
         destination: WorkspaceName,
         aim: Aim,
     ) -> Result<Option<PreparedFork>> {
+        // Where the new workspace's live volume is placed: the tree its checkout starts at.
+        let placed = aim.tree.clone();
         let refreshed = self
             .refresh_seed(source.clone(), source_checkout, aim)
             .await?;
@@ -929,12 +961,15 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 .fork_build_volume(
                     layout,
                     &seed,
-                    &BuildVolumeRecord::new(
-                        record.tree.clone(),
-                        BuildVolumeRole::Linked {
-                            checkout: destination,
-                        },
-                    ),
+                    &BuildVolumeRecord {
+                        checked_out: Some(placed),
+                        ..BuildVolumeRecord::new(
+                            record.tree.clone(),
+                            BuildVolumeRole::Linked {
+                                checkout: destination,
+                            },
+                        )
+                    },
                 )
                 .map_err(storage)?;
             Ok(Some(PreparedFork {
@@ -1266,7 +1301,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
                 });
             };
             let mut passed = Vec::new();
-            if age.unlanded()
+            if age.moved_from().is_some()
                 && let Some(landed) =
                     seed_from_landed(&*this.host, &this.layout, &target, &aim, &mut passed)?
             {
@@ -1444,6 +1479,7 @@ impl<H: RuntimeStorageHost> BuildVolumes<H> {
             layout.write_record(
                 &quiet.id,
                 &BuildVolumeRecord {
+                    checked_out: Some(tree.clone()),
                     tree: Some(tree),
                     role: BuildVolumeRole::Linked {
                         checkout: target.clone(),
@@ -2454,6 +2490,7 @@ fn seed_age(
     Ok(Some(SeedAge {
         live,
         nearness: nearness(checkout, record.tree.as_ref(), tree),
+        placed: Placed::of(record.checked_out.as_ref(), tree),
         tree: record.tree,
         written,
         seed,
@@ -3176,6 +3213,7 @@ mod tests {
             live: BuildVolumeId::mint(),
             tree: None,
             nearness: live.0,
+            placed: Placed::Elsewhere(GitOid::new("e".repeat(40)).unwrap()),
             written: live.1,
             seed: seed.map(|(nearness, written)| Frozen {
                 id: BuildVolumeId::mint(),
@@ -3221,7 +3259,10 @@ mod tests {
             Some((Nearness::Equal, frozen)),
         );
         assert!(!landed.reseeds());
-        assert!(!landed.unlanded(), "the seed was built at the fork's tree");
+        assert!(
+            landed.moved_from().is_none(),
+            "the seed was built at the fork's tree"
+        );
         let nearer = age(
             (Nearness::Paths(2), later),
             Some((Nearness::Paths(9), frozen)),
@@ -3240,16 +3281,44 @@ mod tests {
             adopted.reseeds(),
             "an older live volume at the fork's own tree"
         );
-        assert!(!adopted.unlanded());
+        assert!(adopted.moved_from().is_none());
         let moved = age(
             (Nearness::Paths(1), later),
             Some((Nearness::Paths(1), frozen)),
         );
         assert!(
-            moved.unlanded(),
+            moved.moved_from().is_some(),
             "neither volume was built at the fork's tree"
         );
-        assert!(age((Nearness::Unknown, frozen), None).unlanded());
+        assert!(
+            age((Nearness::Unknown, frozen), None)
+                .moved_from()
+                .is_some()
+        );
+        // A checkout still at the tree cowshed placed its volume at did not move, and a record
+        // that cannot say where it was placed is never read as moved.
+        let unmoved = SeedAge {
+            placed: Placed::Here,
+            ..age(
+                (Nearness::Paths(1), later),
+                Some((Nearness::Paths(1), frozen)),
+            )
+        };
+        assert!(
+            unmoved.moved_from().is_none(),
+            "the target's branch has not moved"
+        );
+        let unrecorded = SeedAge {
+            placed: Placed::Unrecorded,
+            ..age(
+                (Nearness::Paths(1), later),
+                Some((Nearness::Paths(1), frozen)),
+            )
+        };
+        assert!(
+            unrecorded.moved_from().is_none(),
+            "a record that predates checkedOut"
+        );
     }
 
     /// A git repository at `path` whose commit holds `files`, by its `HEAD^{tree}`.
@@ -5610,6 +5679,7 @@ fn main() {
                 live,
                 tree: Some(tree.clone()),
                 nearness: Nearness::Unknown,
+                placed: Placed::Unrecorded,
                 written: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
                 seed: Some(Frozen {
                     id: previous.clone(),
@@ -5639,8 +5709,8 @@ fn main() {
     /// Fork `destination` from `main`'s seed refreshed for `aim`, as `fork` does, and read the
     /// marker output in the fork's live volume, if any.
     #[cfg(target_os = "macos")]
-    async fn fork_marker(
-        scratch: &Scratch,
+    async fn fork_marker<H: RuntimeStorageHost>(
+        scratch: &Scratch<H>,
         main: &Owner,
         main_checkout: &Path,
         destination: &str,
@@ -5671,6 +5741,117 @@ fn main() {
         fs::read_to_string(scratch.layout.mount(&forked).join("marker")).ok()
     }
 
+    /// A fork of a workspace that has not moved since cowshed placed its build volume carries
+    /// that volume (16_build_volumes.md, "Which volume a seed holds"). `topic` was forked from
+    /// main while main's seed was behind main's tree, so neither `topic`'s live volume nor its
+    /// seed was built at the tree it has checked out, and main has that tree checked out too.
+    /// Nothing moved `topic`'s branch, so that is no external land: the fork of `topic`
+    /// reseeds from `topic`'s own volume and inherits what `topic` built, never main's volume.
+    #[cfg(target_os = "macos")]
+    async fn a_fork_of_an_unmoved_workspace_carries_its_build_volume<H: RuntimeStorageHost>(
+        scratch: Scratch<H>,
+    ) {
+        use cowshed_os::fork_lock::Run as _;
+        let main = owner("main", '0');
+        let (main_checkout, main_live, main_mount) = scratch.linked_checkout("main", 1);
+        let behind = commit(&main_checkout, &[("lib.rs", "1")]);
+        scratch
+            .layout
+            .write_record(
+                &main_live,
+                &BuildVolumeRecord::new(Some(behind.clone()), linked("main")),
+            )
+            .unwrap();
+        scratch
+            .host
+            .clone_build_volume(
+                &scratch.layout,
+                &main_live,
+                &BuildVolumeId::mint(),
+                &BuildVolumeRecord::new(
+                    Some(behind),
+                    BuildVolumeRole::Seed {
+                        target: main.name.clone(),
+                        incarnation: main.incarnation.clone(),
+                    },
+                ),
+            )
+            .expect("seed main");
+        fs::write(main_mount.join("marker"), "main").unwrap();
+        // Main moves on and its seed stays behind, as when a land's seal was skipped.
+        let tree = commit(&main_checkout, &[("lib.rs", "2")]);
+
+        // `topic` is forked from main at main's tree.
+        let topic = owner("topic", '1');
+        let topic_checkout = scratch.root.path().join("topic");
+        let cloned = crate::git::git_command_at(scratch.root.path())
+            .args(["clone", "--quiet"])
+            .arg(&main_checkout)
+            .arg(&topic_checkout)
+            .output_locked()
+            .unwrap();
+        assert!(cloned.status.success(), "{cloned:?}");
+        fs::create_dir_all(topic_checkout.join(".cowshed")).unwrap();
+        let prepared = scratch
+            .volumes
+            .prepare_fork(
+                main.clone(),
+                main_checkout.clone(),
+                topic.name.clone(),
+                Aim {
+                    tree: tree.clone(),
+                    landed: Vec::new(),
+                },
+            )
+            .await
+            .expect("prepare topic's fork from main");
+        let topic_live = scratch
+            .volumes
+            .finish_fork(prepared, topic.clone(), topic_checkout.clone())
+            .await
+            .expect("fork topic from main")
+            .expect("main has a seed");
+        // What topic builds at its tree, which nothing in main built.
+        fs::write(scratch.layout.mount(&topic_live).join("marker"), "topic").unwrap();
+
+        let copy = fork_marker(
+            &scratch,
+            &topic,
+            &topic_checkout,
+            "copy",
+            Aim {
+                tree,
+                landed: vec![Peer {
+                    name: main.name.clone(),
+                    checkout: main_checkout,
+                    lock: scratch.image_lock(&main.name),
+                }],
+            },
+        )
+        .await;
+        assert_eq!(
+            copy.as_deref(),
+            Some("topic"),
+            "a fork of an unmoved workspace inherits that workspace's build volume"
+        );
+        scratch.release_all();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn directory_a_fork_of_an_unmoved_workspace_carries_its_build_volume() {
+        a_fork_of_an_unmoved_workspace_carries_its_build_volume(Scratch::directory(
+            "build-unmoved-fork",
+        ))
+        .await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn real_apfs_a_fork_of_an_unmoved_workspace_carries_its_build_volume() {
+        a_fork_of_an_unmoved_workspace_carries_its_build_volume(Scratch::new("build-unmoved-fork"))
+            .await;
+    }
     /// An external land (16_build_volumes.md, "Which volume a seed holds"): main's branch moves
     /// by plain git to the tree `lander` has checked out, and `lander`'s build volume holds a
     /// marker output nothing in main built. A fork of main at that tree inherits the marker
@@ -5688,7 +5869,11 @@ fn main() {
             .layout
             .write_record(
                 &main_live,
-                &BuildVolumeRecord::new(Some(before.clone()), linked("main")),
+                // Placed at `before`, as a land's adoption places it.
+                &BuildVolumeRecord {
+                    checked_out: Some(before.clone()),
+                    ..BuildVolumeRecord::new(Some(before.clone()), linked("main"))
+                },
             )
             .unwrap();
         scratch
@@ -6076,6 +6261,7 @@ fn main() {
                 live,
                 tree: None,
                 nearness: Nearness::Unknown,
+                placed: Placed::Unrecorded,
                 written: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
                 seed: Some(Frozen {
                     id: previous.clone(),
@@ -6147,6 +6333,7 @@ fn main() {
                 live: live.clone(),
                 tree: None,
                 nearness: Nearness::Unknown,
+                placed: Placed::Unrecorded,
                 written: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
                 seed: Some(Frozen {
                     id: previous.clone(),
