@@ -876,13 +876,14 @@ async fn host_controller_killing_a_job_ends_its_whole_group_and_keeps_the_warm_s
     );
 }
 
-/// A warm command whose leader exits while a descendant holds the job's output open is still the
-/// job's: the job runs on, a kill reaches the descendant through the group the host still holds,
-/// and the job ends Killed with the leader's own exit. The warm shell serves the next command
-/// once the host released the command.
+/// A warm command whose leader exits while a descendant holds the job's output open does not
+/// outlive its job (11_shell.md, "Process identity and signal ownership"): leader exit begins
+/// `draining`, retirement ends the descendant through the group the host still holds, and the job
+/// ends with the leader's own exit and a receipt naming the descendant. The warm shell serves the
+/// next command once the host released the command.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
-async fn host_controller_a_kill_reaches_the_descendants_of_an_exited_leader() {
+async fn host_controller_an_exited_leaders_descendants_are_retired_before_the_job_ends() {
     let workspace = Workspace::new("shell-pool-exited-leader", 41_344);
     workspace.envrc("");
     let handle = workspace.supervisor(false);
@@ -910,25 +911,24 @@ async fn host_controller_a_kill_reaches_the_descendants_of_an_exited_leader() {
     .await
     .expect("the job records its descendant");
     let descendant: i32 = recorded.trim().parse().expect("pid");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        handle.info(job).await.expect("job status").state,
-        JobState::Running,
-        "the descendant holds the job's output open"
-    );
-    handle.kill(job).await.expect("kill");
-    let info = tokio::time::timeout(Duration::from_secs(10), handle.wait(job))
+    let info = tokio::time::timeout(Duration::from_secs(30), handle.wait(job))
         .await
-        .expect("the killed job ends")
-        .expect("killed job");
+        .expect("the drained job ends")
+        .expect("drained job");
     assert_eq!(
-        (info.state, info.exit),
-        (JobState::Killed, Some(ExitStatus::Exited { code: 3 }))
+        (info.state, info.exit.as_ref()),
+        (JobState::Exited, Some(&ExitStatus::Exited { code: 3 }))
+    );
+    assert!(
+        info.outlived
+            .iter()
+            .any(|row| i32::try_from(row.pid).ok() == Some(descendant)),
+        "the receipt names the descendant retirement ended: {info:?}"
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !process_alive(descendant),
-        "the kill reached the exited leader's descendant"
+        "retirement reached the exited leader's descendant"
     );
     assert_eq!(run(&handle, sh("printf again")).await.ok().stdout, "again");
     assert_eq!(workspace.activations(), 1, "the warm shell was kept");
