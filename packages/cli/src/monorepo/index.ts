@@ -185,7 +185,7 @@ export async function checkPolicyFailures(root: string, projectTargets: ProjectT
     validateNoStaleTestOutput(root) +
     validateWorkspaceDependencies(root, { resolvedTargetsByProject: resolvedTargetsByProject(projectTargets) }) +
     validateDevenvModuleImport(root) +
-    validateDevenvReleaseLock(root) +
+    (await validateDevenvReleaseLock(root)) +
     validateCargoCachePolicy(root) +
     validateCargoToolchainInputs(root, projectTargets) +
     validateSccachePatches(root)

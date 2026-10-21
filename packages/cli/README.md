@@ -970,14 +970,18 @@ derivation and output still exist on an eval-cache hit, re-evaluating when garba
 The bootstrap script is intentionally small. It only handles work required before `smoo` can run in GitHub Actions:
 
 - Install `devenv`, held to `devenv.lock`'s rev on an ephemeral runner. `check` requires that rev to be a devenv release
-  whose build the binary cache keeps: the lock's `devenv` node must record `latest` or a tag from `v2.0.4` on, and no
-  `rev` beside it. `devenv.yaml` declares that as `inputs.devenv.url: github:cachix/devenv/v2.3.1?dir=src/modules` (a
-  `git+https` URL names the tag `ref=refs/tags/v2.3.1`). devenv.cachix.org has pinned the `aarch64-darwin`,
-  `aarch64-linux` and `x86_64-linux` builds of every release from `v2.0.4` on for good, and the `x86_64-darwin` builds
-  up to `v2.1.2`: from `v2.2` on devenv builds nothing for `x86_64-darwin`, so an Intel macOS runner cannot install
-  those releases at all. Some older tags, such as `v2.0.3`, have no pin, and their builds are already gone. An
-  undeclared input locks devenv's main instead, and the cache drops such a build after about six weeks, after which
-  every cold runner compiles devenv from source.
+  whose build the binary cache keeps: the lock's `devenv` node must name its remote (a `github` input's owner and repo,
+  or a `git` input's url) and a commit that one of that remote's tags from `v2.0.4` on names. `check` asks the remote
+  with `git ls-remote --tags` on every run and keeps no copy of its tags, so a remote it cannot list, offline included,
+  fails the check rather than passes it. How `devenv.yaml` declared the input does not matter to the check, but
+  declaring it at a tag, `inputs.devenv.url: github:cachix/devenv/v2.3.1?dir=src/modules` (a `git+https` URL names the
+  tag `ref=refs/tags/v2.3.1`), or at `latest` keeps every re-lock on a release. devenv.cachix.org has pinned the
+  `aarch64-darwin`, `aarch64-linux` and `x86_64-linux` builds of every release from `v2.0.4` on for good, and the
+  `x86_64-darwin` builds up to `v2.1.2`: from `v2.2` on devenv builds nothing for `x86_64-darwin`, so an Intel macOS
+  runner cannot install those releases at all. Some older tags, such as `v2.0.3`, have no pin, and their builds are
+  already gone. The cache drops the build of any commit no tag names after about six weeks, an ancestor of a release
+  included, and an undeclared input locks devenv's main as it was that minute; once that build is gone, every cold
+  runner compiles devenv from source.
 - Build the devenv shell and add repo-local tooling to `GITHUB_PATH`.
 
 ### Deploy configuration (`package.json` → `smoo.github`)

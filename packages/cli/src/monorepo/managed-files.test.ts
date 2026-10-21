@@ -1,12 +1,14 @@
 /* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub Actions expressions are asserted literally. */
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import { chmod, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { managedNxPatch } from '@smoothbricks/nx-plugin/managed-files/files';
 import { renderPublishWorkflowYaml } from '@smoothbricks/nx-plugin/managed-files/publish-workflow';
 import { LINUX_PLATFORM_TARGET_GLOBS, PLATFORM_TARGET_GLOBS } from '@smoothbricks/nx-plugin/workspace-config-policy';
 import typia from 'typia';
+import { mergeEnv } from '../lib/run.js';
 import { type NxProjects, targetNamesFromProjects } from '../nx/index.js';
 import {
   anyProjectHasTagForTest,
@@ -115,14 +117,64 @@ describe('managed devenv module import', () => {
 });
 
 describe('managed devenv release lock', () => {
-  // The devenv node as `devenv update` writes it: `original` is what devenv.yaml declared.
-  const lockWithDevenv = (rev: string, original: Record<string, string>): string =>
+  const gitEnv = mergeEnv(undefined, ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR']);
+  const git = (cwd: string, ...args: string[]): string => {
+    const identity = ['-c', 'user.name=smoo', '-c', 'user.email=smoo@example.invalid'];
+    const unsigned = ['-c', 'commit.gpgSign=false', '-c', 'tag.gpgSign=false'];
+    const result = Bun.spawnSync(['git', ...identity, ...unsigned, ...args], { cwd, env: gitEnv });
+    if (result.exitCode !== 0) {
+      throw new Error(`git ${args.join(' ')} failed: ${result.stderr.toString()}`);
+    }
+    return result.stdout.toString().trim();
+  };
+
+  interface DevenvRemote {
+    readonly root: string;
+    readonly url: string;
+    readonly v203: string;
+    readonly v204: string;
+    readonly between: string;
+    readonly v210: string;
+    readonly head: string;
+  }
+
+  /**
+   * A stand-in for cachix/devenv's repository: v2.0.3, older than every release whose builds stay cached; v2.0.4,
+   * annotated, so ls-remote lists its commit only as refs/tags/v2.0.4^{}; an untagged commit after it; v2.10, which
+   * only a numeric comparison puts after v2.0.4; and an untagged head.
+   */
+  const withDevenvRemote = async (run: (remote: DevenvRemote) => Promise<void>): Promise<void> => {
+    const root = await mkdtemp(join(tmpdir(), 'smoo-devenv-remote-'));
+    try {
+      const repo = join(root, 'devenv');
+      await mkdir(repo);
+      git(repo, 'init', '--quiet');
+      const commit = (message: string): string => {
+        git(repo, 'commit', '--quiet', '--allow-empty', '-m', message);
+        return git(repo, 'rev-parse', 'HEAD');
+      };
+      const v203 = commit('2.0.3');
+      git(repo, 'tag', 'v2.0.3');
+      const v204 = commit('2.0.4');
+      git(repo, 'tag', '--annotate', 'v2.0.4', '-m', 'v2.0.4');
+      const between = commit('between releases');
+      const v210 = commit('2.10');
+      git(repo, 'tag', 'v2.10');
+      const head = commit('main');
+      await run({ root, url: pathToFileURL(repo).href, v203, v204, between, v210, head });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  };
+
+  // The devenv node as `devenv update` writes it. `original` is what devenv.yaml declared; the check reads `locked`.
+  const lockWithDevenv = (locked: Record<string, string>): string =>
     `${JSON.stringify(
       {
         nodes: {
           devenv: {
-            locked: { dir: 'src/modules', owner: 'cachix', repo: 'devenv', rev, type: 'github' },
-            original: { dir: 'src/modules', owner: 'cachix', repo: 'devenv', type: 'github', ...original },
+            locked: { dir: 'src/modules', ...locked },
+            original: { dir: 'src/modules', owner: 'cachix', repo: 'devenv', type: 'github' },
           },
           root: { inputs: { devenv: 'devenv' } },
         },
@@ -133,75 +185,98 @@ describe('managed devenv release lock', () => {
       2,
     )}\n`;
 
-  const checkLock = async (lock: string | null): Promise<number> => {
+  /** The check's failure count, and everything it printed to say why. */
+  const checkLock = async (lock: string | null): Promise<{ failures: number; reason: string }> => {
     const root = await mkdtemp(join(tmpdir(), 'smoo-devenv-release-'));
+    const errors = spyOn(console, 'error').mockImplementation(() => {});
     try {
       if (lock !== null) {
         await mkdir(join(root, 'tooling/direnv'), { recursive: true });
         await writeFile(join(root, 'tooling/direnv/devenv.lock'), lock);
       }
-      return validateDevenvReleaseLock(root);
+      const failures = await validateDevenvReleaseLock(root);
+      return { failures, reason: errors.mock.calls.map((call) => String(call[0])).join('\n') };
     } finally {
+      errors.mockRestore();
       await rm(root, { recursive: true, force: true });
     }
   };
 
-  it('accepts a devenv input locked at latest or at a release from v2.0.4 on', async () => {
-    // github:cachix/devenv/v2.3.1?dir=src/modules and .../latest?dir=src/modules, as devenv 2.3.1 locks them.
-    expect(await checkLock(lockWithDevenv('2418e1b43797c44de5166176622c8d8fa0149871', { ref: 'v2.3.1' }))).toBe(0);
-    expect(await checkLock(lockWithDevenv('b904dcb51fe48c30db250038241507f60752f222', { ref: 'latest' }))).toBe(0);
-    // The oldest release whose builds are pinned, and a two-part tag after it.
-    expect(await checkLock(lockWithDevenv('fa25529c64880987081d5d9523fb6c4db244cb79', { ref: 'v2.0.4' }))).toBe(0);
-    expect(await checkLock(lockWithDevenv('2cf62a010000b70f15c78a72761fad7c9e6fb47a', { ref: 'v2.1' }))).toBe(0);
+  it('accepts a commit that a release tag from v2.0.4 on names, whatever devenv.yaml declared', async () => {
+    await withDevenvRemote(async ({ url, v204, v210 }) => {
+      // An annotated tag, matched through the commit it peels to.
+      expect(await checkLock(lockWithDevenv({ type: 'git', url, rev: v204 }))).toEqual({ failures: 0, reason: '' });
+      // As text, v2.10 would sort before v2.0.4.
+      expect(await checkLock(lockWithDevenv({ type: 'git', url, rev: v210 }))).toEqual({ failures: 0, reason: '' });
+    });
   });
 
-  it('accepts a release declared as a git+https URL, which names the tag as refs/tags/<tag>', async () => {
-    // git+https://github.com/cachix/devenv?ref=refs/tags/v2.3.1&dir=src/modules, as devenv 2.3.1 locks it.
-    const original = {
-      dir: 'src/modules',
-      ref: 'refs/tags/v2.3.1',
-      type: 'git',
-      url: 'https://github.com/cachix/devenv',
-    };
-    const locked = { ...original, rev: '2418e1b43797c44de5166176622c8d8fa0149871' };
-    const nodes = { devenv: { locked, original }, root: { inputs: { devenv: 'devenv' } } };
-    expect(await checkLock(JSON.stringify({ nodes, root: 'root', version: 7 }))).toBe(0);
+  it('asks the remote of a github input at https://github.com/<owner>/<repo>', async () => {
+    await withDevenvRemote(async ({ url, v204 }) => {
+      // git's own URL rewriting sends the derived GitHub URL to the stand-in, so no test reaches the network.
+      const rewrite: Record<string, string> = {
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: `url.${url}.insteadOf`,
+        GIT_CONFIG_VALUE_0: 'https://github.com/cachix/devenv',
+      };
+      const saved = Object.fromEntries(Object.keys(rewrite).map((key) => [key, process.env[key]]));
+      Object.assign(process.env, rewrite);
+      try {
+        const locked = { owner: 'cachix', repo: 'devenv', rev: v204, type: 'github' };
+        expect(await checkLock(lockWithDevenv(locked))).toEqual({ failures: 0, reason: '' });
+      } finally {
+        for (const [key, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    });
   });
 
-  it('refuses a release older than v2.0.4, because some of those builds are already gone', async () => {
-    // v2.0.3 and v2.0 have no pin, and v2.0.3's build is no longer served.
-    expect(await checkLock(lockWithDevenv('9e5c17caf0ead1bb29d430d4c0a26a77bc5d374b', { ref: 'v2.0.3' }))).toBe(1);
-    expect(await checkLock(lockWithDevenv('fc38277c6a89226d1bafe2963e844485a4a01726', { ref: 'v2.0' }))).toBe(1);
-    const git = { ref: 'refs/tags/v2.0.3' };
-    expect(await checkLock(lockWithDevenv('9e5c17caf0ead1bb29d430d4c0a26a77bc5d374b', git))).toBe(1);
+  it('refuses a commit no release tag from v2.0.4 on names, even an ancestor of one, and says why', async () => {
+    await withDevenvRemote(async ({ url, v203, between, head }) => {
+      // `between` is part of v2.10's history, which is not enough: the cache keeps the tag's build, not its history's.
+      for (const rev of [between, head, 'f'.repeat(40)]) {
+        const { failures, reason } = await checkLock(lockWithDevenv({ type: 'git', url, rev }));
+        expect(failures).toBe(1);
+        expect(reason).toContain(`locks devenv at ${rev} from ${url}, which no release tag names,`);
+        expect(reason).toContain('every cold runner compiles devenv from source');
+      }
+      const old = await checkLock(lockWithDevenv({ type: 'git', url, rev: v203 }));
+      expect(old.failures).toBe(1);
+      expect(old.reason).toContain('which only v2.0.3 names, not a release from v2.0.4 on');
+    });
   });
 
-  it('compares release numbers part by part as numbers, not as text', async () => {
-    // Tags that do not exist yet; the check does not read the rev of a release. As text, v10.0 and v2.0.10 would
-    // sort before v2.0.4.
-    const rev = 'b904dcb51fe48c30db250038241507f60752f222';
-    expect(await checkLock(lockWithDevenv(rev, { ref: 'v2.10' }))).toBe(0);
-    expect(await checkLock(lockWithDevenv(rev, { ref: 'v2.0.10' }))).toBe(0);
-    expect(await checkLock(lockWithDevenv(rev, { ref: 'v10.0' }))).toBe(0);
-    expect(await checkLock(lockWithDevenv(rev, { ref: 'v2' }))).toBe(1);
+  it('refuses a lock that names no remote or no commit', async () => {
+    const rev = 'f'.repeat(40);
+    const cases = [
+      [{ path: '/nix/store/devenv', rev, type: 'path' }, 'with no remote (a path input, which names no git remote)'],
+      [{ repo: 'devenv', rev, type: 'github' }, 'with no remote (a github input without an owner and a repo)'],
+      [{ rev, type: 'git' }, 'with no remote (a git input without a url)'],
+      [{ rev: 'main', type: 'git', url: 'https://github.com/cachix/devenv' }, 'with no commit hash'],
+      [{ type: 'git', url: 'https://github.com/cachix/devenv' }, 'with no commit hash'],
+    ] as const;
+    for (const [locked, why] of cases) {
+      const { failures, reason } = await checkLock(lockWithDevenv(locked));
+      expect(failures).toBe(1);
+      expect(reason).toContain(`tooling/direnv/devenv.lock locks devenv ${why}`);
+    }
   });
 
-  it('refuses a devenv input that follows main, a branch, or a commit, even one declared beside a tag', async () => {
-    // Undeclared, the input locks devenv's main as it was that minute, and `original` carries no ref.
-    expect(await checkLock(lockWithDevenv('190959a9a4bb52d4802f076a90c3c4e3aa2e6fa2', {}))).toBe(1);
-    expect(await checkLock(lockWithDevenv('190959a9a4bb52d4802f076a90c3c4e3aa2e6fa2', { ref: 'main' }))).toBe(1);
-    // A commit may happen to be a release, but nothing offline can tell.
-    const rev = '2418e1b43797c44de5166176622c8d8fa0149871';
-    expect(await checkLock(lockWithDevenv(rev, { rev }))).toBe(1);
-    // A git+https URL takes a rev beside the tag (`?ref=refs/tags/v2.3.1&rev=190959a…`), and Nix locks that rev.
-    const besideTag = { ref: 'refs/tags/v2.3.1', rev: '190959a9a4bb52d4802f076a90c3c4e3aa2e6fa2' };
-    expect(await checkLock(lockWithDevenv(besideTag.rev, besideTag))).toBe(1);
+  it('refuses, rather than passes, when it cannot list the tags of the remote', async () => {
+    await withDevenvRemote(async ({ root, v204 }) => {
+      const url = pathToFileURL(join(root, 'unreachable')).href;
+      const { failures, reason } = await checkLock(lockWithDevenv({ type: 'git', url, rev: v204 }));
+      expect(failures).toBe(1);
+      expect(reason).toContain(`cannot list the release tags of ${url}`);
+    });
   });
 
   it('has nothing to check without a lock or a devenv node, and reports a lock it cannot read', async () => {
-    expect(await checkLock(null)).toBe(0);
-    expect(await checkLock('{"nodes":{"root":{"inputs":{}}},"root":"root","version":7}\n')).toBe(0);
-    expect(await checkLock('{"nodes":')).toBe(1);
+    expect((await checkLock(null)).failures).toBe(0);
+    expect((await checkLock('{"nodes":{"root":{"inputs":{}}},"root":"root","version":7}\n')).failures).toBe(0);
+    expect((await checkLock('{"nodes":')).failures).toBe(1);
   });
 });
 

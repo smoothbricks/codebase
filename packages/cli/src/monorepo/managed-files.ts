@@ -5,6 +5,7 @@ import { generateManagedFiles, generateManagedFilesForContext } from '@smoothbri
 import type { FileResult } from '@smoothbricks/nx-plugin/managed-files/tree';
 import { FsTree } from 'nx/src/generators/tree.js';
 import typia from 'typia';
+import { runResult } from '../lib/run.js';
 import { loadNxProjects } from '../nx/index.js';
 import { finishManagedFiles } from './managed-fs.js';
 
@@ -82,17 +83,33 @@ export function validateDevenvModuleImport(root: string): number {
 
 /** The only part of devenv.lock this check reads: the node install-devenv installs the CLI from. */
 interface DevenvLock {
-  nodes: { devenv?: { locked?: { rev?: string }; original?: { ref?: string; rev?: string } } };
+  nodes: { devenv?: { locked?: LockedDevenvInput } };
+}
+
+/**
+ * The input as Nix locked it: a `github` input names its remote by owner and repo (and a host for GitHub Enterprise),
+ * a `git` input by url. `rev` is the commit install-devenv installs.
+ */
+interface LockedDevenvInput {
+  type?: string;
+  owner?: string;
+  repo?: string;
+  host?: string;
+  url?: string;
+  rev?: string;
 }
 
 /** devenv.lock is repo-owned text, so it is validated rather than cast. */
 const parseDevenvLock = typia.json.createIsParse<DevenvLock>();
 
+/** A full commit hash: the only `rev` that may reach git's argv. */
+const COMMIT_HASH = /^[0-9a-f]{40}$/;
+
 /**
- * What a devenv input declared at `latest` or a `v*` tag leaves in the lock's
- * `original.ref`. A `git+https` URL can name a tag only as `refs/tags/<tag>`.
+ * A release tag in `git ls-remote` output. An annotated tag's own line names the tag object; the commit it tags is on
+ * the `^{}` line after it.
  */
-const DEVENV_RELEASE_REF = /^(?:refs\/tags\/)?(?:latest|v(\d+(?:\.\d+)*))$/;
+const DEVENV_RELEASE_TAG = /^refs\/tags\/(v(\d+(?:\.\d+)*))(?:\^\{\})?$/;
 
 /**
  * devenv.cachix.org has pinned the aarch64-darwin, aarch64-linux and
@@ -102,30 +119,83 @@ const DEVENV_RELEASE_REF = /^(?:refs\/tags\/)?(?:latest|v(\d+(?:\.\d+)*))$/;
  * builds are gone.
  */
 const OLDEST_PINNED_DEVENV_RELEASE = '2.0.4';
+const OLDEST_PINNED_DEVENV_TAG = `v${OLDEST_PINNED_DEVENV_RELEASE}`;
 
-/** Whether a lock's `original.ref` names `latest`, which is always the newest release, or a pinned release. */
-function isPinnedDevenvRelease(ref: string): boolean {
-  const release = DEVENV_RELEASE_REF.exec(ref);
-  if (release === null) {
-    return false;
+type DevenvRemote = { kind: 'remote'; url: string } | { kind: 'none'; reason: string };
+
+/** The remote whose tags say whether the locked commit is a release. */
+function devenvRemote(locked: LockedDevenvInput | undefined): DevenvRemote {
+  if (locked?.type === undefined) {
+    return { kind: 'none', reason: 'no locked input' };
   }
-  const version = release[1];
-  // Numeric collation orders dotted versions: 2.0 < 2.0.4 < 2.1 < 2.10.
-  return version === undefined || version.localeCompare(OLDEST_PINNED_DEVENV_RELEASE, 'en', { numeric: true }) >= 0;
+  switch (locked.type) {
+    case 'github':
+      return locked.owner === undefined || locked.repo === undefined
+        ? { kind: 'none', reason: 'a github input without an owner and a repo' }
+        : { kind: 'remote', url: `https://${locked.host ?? 'github.com'}/${locked.owner}/${locked.repo}` };
+    case 'git':
+      return locked.url === undefined
+        ? { kind: 'none', reason: 'a git input without a url' }
+        : { kind: 'remote', url: locked.url };
+    default:
+      return { kind: 'none', reason: `a ${locked.type} input, which names no git remote` };
+  }
 }
+
+/** A release tag the remote lists at the locked commit, with its version for the comparison. */
+interface ReleaseTag {
+  tag: string;
+  version: string;
+}
+
+type ReleaseTags = { kind: 'listed'; tags: ReleaseTag[] } | { kind: 'unreadable'; detail: string };
+
+/** The release tags `url` has at `rev`, as the remote lists them now. */
+async function releaseTagsAt(root: string, url: string, rev: string): Promise<ReleaseTags> {
+  // No terminal prompt: a remote that wants credentials fails here instead of waiting on a hook's stdin.
+  const listed = await runResult('git', ['ls-remote', '--tags', '--', url, 'refs/tags/v*'], root, {
+    GIT_TERMINAL_PROMPT: '0',
+  });
+  if (listed.exitCode !== 0) {
+    return { kind: 'unreadable', detail: listed.stderr.trim() || `git ls-remote exited ${listed.exitCode}` };
+  }
+  const tags: ReleaseTag[] = [];
+  for (const line of listed.stdout.split('\n')) {
+    const [hash, ref] = line.split('\t');
+    const release = ref === undefined ? null : DEVENV_RELEASE_TAG.exec(ref);
+    if (hash === rev && release?.[1] !== undefined && release[2] !== undefined) {
+      tags.push({ tag: release[1], version: release[2] });
+    }
+  }
+  return { kind: 'listed', tags };
+}
+
+const DEVENV_LOCK_PATH = 'tooling/direnv/devenv.lock';
+
+const RELOCK_DEVENV_AT_A_RELEASE =
+  '  Declare the input at a release in tooling/direnv/devenv.yaml:\n' +
+  '    inputs:\n' +
+  '      devenv:\n' +
+  '        url: github:cachix/devenv/latest?dir=src/modules   # or a tag, such as v2.3.1\n' +
+  '  and re-lock that input alone: run `devenv update devenv` in tooling/direnv.';
 
 /**
  * Report, never rewrite: re-locking is `devenv update`'s job. On a hosted
  * runner install-devenv installs the CLI at the commit this node locks.
  * devenv.cachix.org keeps the aarch64-darwin, aarch64-linux and x86_64-linux
- * builds of every release from v2.0.4 on for good, but drops a build of
- * devenv's main after about six weeks, and from then on every cold runner
- * compiles devenv from source. An input nobody declared locks main as it was
- * that minute. The check reads the tag offline: asking the cache would pass on
+ * builds of every release tag from v2.0.4 on for good, and only those: it
+ * drops the build of any other commit after about six weeks, an ancestor of a
+ * release included, and from then on every cold runner compiles devenv from
+ * source. So the lock passes when it names a remote and a commit that one of
+ * that remote's release tags from v2.0.4 on names, however devenv.yaml
+ * declared the input. The tags are asked of the remote with `git ls-remote` on
+ * every run, and nothing is kept: a remote that cannot be listed, offline
+ * included, fails the check rather than passes it. A pushed tag is permanent,
+ * which is why asking the remote holds where asking the cache would pass on
  * the day of the re-lock and fail six weeks later.
  */
-export function validateDevenvReleaseLock(root: string): number {
-  const target = join(root, 'tooling/direnv/devenv.lock');
+export async function validateDevenvReleaseLock(root: string): Promise<number> {
+  const target = join(root, DEVENV_LOCK_PATH);
   if (!existsSync(target)) {
     return 0;
   }
@@ -136,33 +206,52 @@ export function validateDevenvReleaseLock(root: string): number {
     lock = null;
   }
   if (lock === null) {
-    console.error('tooling/direnv/devenv.lock is not a devenv lock: it must be JSON with a nodes object');
+    console.error(`${DEVENV_LOCK_PATH} is not a devenv lock: it must be JSON with a nodes object`);
     return 1;
   }
   const node = lock.nodes.devenv;
-  const ref = node?.original?.ref;
-  // A rev declared beside the tag (a git+https URL takes both) is what Nix locks, whichever commit it names.
-  const revBesideRef = ref !== undefined && node?.original?.rev !== undefined;
-  if (node === undefined || (ref !== undefined && !revBesideRef && isPinnedDevenvRelease(ref))) {
+  if (node === undefined) {
     return 0;
   }
-  const commit = node.locked?.rev?.slice(0, 7) ?? 'an unknown commit';
-  let lockedAt = ref === undefined ? commit : `${ref} (${commit})`;
-  if (revBesideRef) {
-    lockedAt = `${commit} (a rev declared beside ${ref})`;
+  const remote = devenvRemote(node.locked);
+  const rev = node.locked?.rev;
+  if (remote.kind === 'none' || rev === undefined || !COMMIT_HASH.test(rev)) {
+    const missing =
+      remote.kind === 'none' ? `no remote (${remote.reason})` : `no commit hash (rev: ${rev ?? 'absent'})`;
+    console.error(
+      `${DEVENV_LOCK_PATH} locks devenv with ${missing}, so nothing can tell whether it is a release.\n` +
+        RELOCK_DEVENV_AT_A_RELEASE,
+    );
+    return 1;
   }
-  const oldest = `v${OLDEST_PINNED_DEVENV_RELEASE}`;
+  const listed = await releaseTagsAt(root, remote.url, rev);
+  if (listed.kind === 'unreadable') {
+    console.error(
+      `${DEVENV_LOCK_PATH} locks devenv at ${rev}, and the check cannot list the release tags of ${remote.url} to tell whether a release names it:\n` +
+        `  ${listed.detail}\n` +
+        '  The check asks the remote on every run and keeps no copy of its tags, so it fails rather than passes\n' +
+        '  offline. Run it again with the remote reachable.',
+    );
+    return 1;
+  }
+  // Numeric collation orders dotted versions: 2.0 < 2.0.4 < 2.1 < 2.10.
+  if (
+    listed.tags.some(({ version }) => version.localeCompare(OLDEST_PINNED_DEVENV_RELEASE, 'en', { numeric: true }) >= 0)
+  ) {
+    return 0;
+  }
+  const named =
+    listed.tags.length === 0
+      ? 'which no release tag names'
+      : `which only ${listed.tags.map(({ tag }) => tag).join(' and ')} name${listed.tags.length === 1 ? 's' : ''}`;
   console.error(
-    `tooling/direnv/devenv.lock locks devenv at ${lockedAt}, not at latest or a release from ${oldest} on.\n` +
+    `${DEVENV_LOCK_PATH} locks devenv at ${rev} from ${remote.url}, ${named}, not a release from ${OLDEST_PINNED_DEVENV_TAG} on.\n` +
       '  On a GitHub-hosted runner install-devenv installs the devenv CLI at that commit. devenv.cachix.org keeps\n' +
-      `  the aarch64-darwin, aarch64-linux and x86_64-linux builds of every release from ${oldest} on for good.\n` +
-      "  Some older tags, such as v2.0.3, have no pin and their builds are gone, and a build of devenv's main is\n" +
-      '  dropped after about six weeks. Once the build is gone, every cold runner compiles devenv from source.\n' +
-      '  Declare the input at a release in tooling/direnv/devenv.yaml:\n' +
-      '    inputs:\n' +
-      '      devenv:\n' +
-      '        url: github:cachix/devenv/latest?dir=src/modules   # or a tag, such as v2.3.1\n' +
-      '  and re-lock that input alone: run `devenv update devenv` in tooling/direnv.',
+      `  the aarch64-darwin, aarch64-linux and x86_64-linux builds of every release tag from ${OLDEST_PINNED_DEVENV_TAG} on\n` +
+      '  for good, and only those. Some older tags, such as v2.0.3, have no pin and their builds are gone, and the\n' +
+      '  cache drops the build of any other commit, an ancestor of a release included, after about six weeks. Once\n' +
+      '  the build is gone, every cold runner compiles devenv from source.\n' +
+      RELOCK_DEVENV_AT_A_RELEASE,
   );
   return 1;
 }

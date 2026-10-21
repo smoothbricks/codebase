@@ -136,8 +136,8 @@ const packs: MonorepoPack[] = [
   },
   {
     name: 'devenv',
-    validatePreBuild(ctx) {
-      return validateDevenvModuleImport(ctx.root) + validateDevenvReleaseLock(ctx.root);
+    async validatePreBuild(ctx) {
+      return validateDevenvModuleImport(ctx.root) + (await validateDevenvReleaseLock(ctx.root));
     },
   },
   {

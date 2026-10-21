@@ -227,8 +227,8 @@ describe('monorepo validation pack phases', () => {
     try {
       await mkdir(join(root, 'tooling/direnv'), { recursive: true });
       await writeFile(join(root, 'tooling/direnv/devenv.nix'), '{...}: { imports = [./devenv.smoo.nix]; }\n');
-      // devenv's main as an undeclared input locks it: no ref in `original`.
-      const devenv = { dir: 'src/modules', owner: 'cachix', repo: 'devenv', type: 'github' };
+      // A lock with no remote to ask for release tags: refused before any network.
+      const devenv = { path: '/nix/store/devenv', type: 'path' };
       await writeFile(
         join(root, 'tooling/direnv/devenv.lock'),
         JSON.stringify({
