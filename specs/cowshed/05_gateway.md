@@ -200,14 +200,16 @@ changed plist, a daemon running other bytes) and `gateway stop` wait until the o
 `NOTE_EXIT`, watched from before the bootout signals it, which it posts once the process has released every descriptor,
 its listeners included — and launchd no longer holds the job. launchd SIGKILLs a process its bootout's SIGTERM has not
 ended at the agent's exit timeout, so that is the only bound: the exit timeout of the definition launchd loaded, read
-from `launchctl print`, plus 1 s its unload may trail its kill by. Past it the bootout is overdue, an
-`environment-missing` error naming what is left — the pid that has not exited, or the job launchd still holds — with the
-bootstrap that loads the agent once that has gone. The gateway plist states `ExitTimeOut` 30 s (`GATEWAY_EXIT_TIMEOUT`),
-and the daemon's drain force-stops what it accepted after 20 s (`GATEWAY_DRAIN_WITHIN`), so the drain, its force stop
-and the audit flush finish before launchd's kill. Measured 2026-10-22: launchd's default exit timeout is 5 s; the plist
-stated none, so a bootout SIGKILLed a draining gateway 5.03 s after its SIGTERM, while the install's own wait, a fixed 5
-s, gave up 0.03 s earlier and reported the bootout stuck; its restore then kickstarted the job still in teardown
-(launchctl 37), and launchd dropped it a moment later, leaving the host with no gateway.
+from `launchctl print`, plus 1 s its unload may trail its kill by. Past it the bootout is overdue, whatever
+`launchctl bootout` itself answered (it can exit non-zero while launchd tears the job down; its answer is kept as
+context): an `environment-missing` error naming what is left — the pid that has not exited, or the job launchd still
+holds — with the bootstrap that loads the agent once that has gone, and a restore never kickstarts it. The gateway plist
+states `ExitTimeOut` 30 s (`GATEWAY_EXIT_TIMEOUT`), and the daemon's drain force-stops what it accepted after 20 s
+(`GATEWAY_DRAIN_WITHIN`), so the drain, its force stop and the audit flush finish before launchd's kill. Measured
+2026-10-22: launchd's default exit timeout is 5 s; the plist stated none, so a bootout SIGKILLed a draining gateway 5.03
+s after its SIGTERM, while the install's own wait, a fixed 5 s, gave up 0.03 s earlier and reported the bootout stuck;
+its restore then kickstarted the job still in teardown (launchctl 37), and launchd dropped it a moment later, leaving
+the host with no gateway.
 
 **An install refuses while a land or a gate runs.** Activating the agent restarts a gateway that runs, and so does the
 host move inside `setup`; a restart closes every lease connection ("Crash safety by connection"), a land's gate-job pool
@@ -219,16 +221,18 @@ waits for an install in progress"). So an install — holding the slot, after it
 anything that would restart a gateway that answers `status` — refuses with `Conflict`, naming each blocker, while a land
 holds its repository's turn (the first live ticket under `dev.cowshed/land-turn/<repo>/`, "Land turns": its workspace,
 ticket and pid) or that gateway's `cpu-budget` ledger shows gate-class work holding or wanting tokens (`gateJobs` and
-`gateQueue`, each entry's `checkout` and `job`: `gate job <n> at <checkout>`). It never waits for them, and the refusal
-leaves the host as it was; the hint is to rerun once they have ended, and `cowshed gateway status` lists both. A land
-queued behind the turn's holder runs nothing yet and is not a blocker: its first command waits for the slot. Land turns
-that cannot be read refuse too, naming the directory: not knowing whether a land runs is no permission. The install
-reads only those two ledger fields: the gateway it is about to replace is of another build, and a field one build has
-and the other lacks must not turn the check into a restart that cuts a gate off. A gateway that does not answer
-`cpu-budget` names no gate job, and the install says so. An install that restarts nothing (no daemon answers, or the
-refresh finds the agent current) checks nothing. This replaces a wait with no deadline for the gates in flight: measured
-2026-10-21, it held an install behind a gate of 2 h 26 min until the gate was killed, and operators took to granting
-installs a window by hand.
+`gateQueue`, each entry's `checkout` and `job`: `gate job <n> at <checkout>`). It never waits for them. The refused
+install copies, moves and restarts nothing, so the installed cowshed and the running gateway stay as they were;
+`setup`'s storage repair, which runs before its install (setup_service order: volumes, owner markers, mains, git
+identity, sccache client, then the service refresh), stays done. The hint is to rerun once they have ended, and
+`cowshed gateway status` lists both. A land queued behind the turn's holder runs nothing yet and is not a blocker: its
+first command waits for the slot. Land turns that cannot be read refuse too, naming the directory: not knowing whether a
+land runs is no permission. The install reads only those two ledger fields: the gateway it is about to replace is of
+another build, and a field one build has and the other lacks must not turn the check into a restart that cuts a gate
+off. A gateway that does not answer `cpu-budget` names no gate job, and the install says so. An install that restarts
+nothing (no daemon answers, or the refresh finds the agent current) checks nothing. This replaces a wait with no
+deadline for the gates in flight: measured 2026-10-21, it held an install behind a gate of 2 h 26 min until the gate was
+killed, and operators took to granting installs a window by hand.
 
 **A land step waits for an install in progress.** The ledger shows a land only while one of its gates runs, and a land
 is several cowshed commands with none running between them: measured 2026-10-20, an install found the ledger empty as a

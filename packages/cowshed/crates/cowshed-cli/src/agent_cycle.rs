@@ -226,8 +226,8 @@ pub fn refusal(busy: &[Busy]) -> Option<CowshedError> {
     }
     Some(CowshedError::conflict(
         format!(
-            "this install would restart the gateway under work it cuts off, so it changed \
-             nothing: {}",
+            "this install would restart the gateway under work it cuts off, so it installed and \
+             restarted nothing: {}",
             busy.iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()

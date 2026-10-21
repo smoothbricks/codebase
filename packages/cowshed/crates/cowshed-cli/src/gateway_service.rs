@@ -520,6 +520,10 @@ enum ActivationError {
         label: String,
         remains: Remains,
         exit_timeout: Duration,
+        /// What `launchctl bootout` itself answered, when it answered a failure: context only.
+        /// launchctl can exit non-zero while launchd tears the job down, so a failed bootout is
+        /// no proof the job is untouched, and never licenses a kickstart of it.
+        refused: Option<String>,
         /// How the agent is loaded again once launchd has let go of it.
         bootstrap: String,
     },
@@ -535,13 +539,17 @@ impl ActivationError {
                 label,
                 remains,
                 exit_timeout,
+                refused,
                 bootstrap,
             } => CowshedError::environment_missing(
                 format!(
                     "launchd did not finish booting out {label} within its {}s exit timeout and \
-                     the {}s its unload may trail it by: {remains}",
+                     the {}s its unload may trail it by: {remains}{}",
                     exit_timeout.as_secs(),
-                    agent_cycle::UNLOAD_GRACE.as_secs()
+                    agent_cycle::UNLOAD_GRACE.as_secs(),
+                    refused
+                        .map(|refused| format!(" (the bootout itself answered: {refused})"))
+                        .unwrap_or_default()
                 ),
                 format!("once that has gone, {bootstrap}"),
             ),
@@ -619,7 +627,8 @@ where
         Reload::Blocked(remains) => {
             Err(ActivationError::Failed(CowshedError::environment_missing(
                 format!(
-                    "{} is not loaded again: launchd still tears it down, and {remains}",
+                    "{} is not loaded again: launchd still holds it after its bootout went \
+                     overdue, and {remains}",
                     target.label()
                 ),
                 format!(
@@ -700,15 +709,15 @@ where
         match agent_cycle::bootout_progress(agent, running, job_loaded, started.elapsed()) {
             Bootout::Done => return Ok(()),
             Bootout::Overdue(remains) => {
-                // A bootout launchctl itself refused is the honest explanation of what is left.
-                return Err(match booted_out {
-                    Err(error) => ActivationError::Failed(launchd_error(error)),
-                    Ok(_) => ActivationError::BootoutOverdue {
-                        label: target.label().to_owned(),
-                        remains,
-                        exit_timeout: agent.exit_timeout,
-                        bootstrap: crate::launchd::bootstrap_hint(uid, target),
-                    },
+                // Overdue whatever launchctl answered: it can exit non-zero while launchd tears
+                // the job down, and a restore that read that as "untouched" would kickstart a job
+                // in teardown (launchctl 37). Its answer is kept as context.
+                return Err(ActivationError::BootoutOverdue {
+                    label: target.label().to_owned(),
+                    remains,
+                    exit_timeout: agent.exit_timeout,
+                    refused: booted_out.err().map(|error| launchd_error(error).message),
+                    bootstrap: crate::launchd::bootstrap_hint(uid, target),
                 });
             }
             Bootout::Waiting if running.is_none() => std::thread::sleep(BOOTOUT_POLL_INTERVAL),
@@ -1346,7 +1355,9 @@ async fn read_cpu_budget(client: &GatewayControlClient) -> GatewayCpuBudget {
 /// Refuse an install about to restart the running gateway while a land holds its repository's
 /// turn or a gate job holds or wants CPU tokens (05_gateway.md "An install refuses while a land
 /// or a gate runs"); the decision is [`agent_cycle::restart_blockers`]. It never waits for them,
-/// and it runs before the install changes anything, so a refusal leaves the host as it was.
+/// and it runs before the install copies, moves or restarts anything, so a refused install
+/// leaves the installed cowshed and the running gateway as they were. `setup`'s storage repair,
+/// which runs before its install, is not undone.
 ///
 /// A restart closes every lease connection, and a gate's pool goes with it ("cpu-tokens parent
 /// pool refused: the gateway closed the lease connection" killed a land mid-gate); between a
@@ -1366,8 +1377,8 @@ async fn refuse_restart_while_busy(
     let lands = turns::observe_all(&root, u64::MAX).map_err(|error| {
         CowshedError::environment_missing(
             format!(
-                "this install cannot tell whether a land runs, so it changed nothing: the land \
-                 turns in {} cannot be read: {error}",
+                "this install cannot tell whether a land runs, so it installed and restarted \
+                 nothing: the land turns in {} cannot be read: {error}",
                 root.display()
             ),
             format!("make {} readable, then rerun", root.display()),
@@ -2940,7 +2951,8 @@ async fn refresh_gateway_from<C: LaunchctlCommand>(
         }
     }
     let restarts = binary_is_stale || daemon_is_stale || !plan.is_noop();
-    // Before anything is installed: a refusal leaves the host as it was.
+    // Before anything is installed: a refusal leaves the installed cowshed and the gateway as
+    // they were.
     if restarts && let Some((slot, client)) = gates {
         refuse_restart_while_busy(slot, home, client, &mut io::stderr()).await?;
     }
