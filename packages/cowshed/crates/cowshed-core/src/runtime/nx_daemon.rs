@@ -527,8 +527,9 @@ pub(crate) struct NxDaemonKeeper {
     probes: Interval,
     /// The foreground daemon job admitted last, retained until a probe sees its terminal result.
     pub(super) starting: Option<JobId>,
-    /// The last probe that found the shed in use, or a daemon newly up.
-    last_use: Instant,
+    /// The last probe that found the shed in use, or a daemon newly up; `None` until one does.
+    /// The supervisor's own start is no use, so a supervisor nothing uses starts no daemon.
+    last_use: Option<Instant>,
     /// Whether the previous probe found the daemon live, to tell a daemon coming up from one
     /// that has been up.
     daemon_was_live: bool,
@@ -563,8 +564,10 @@ pub(crate) enum Verdict {
 
 impl NxDaemonKeeper {
     /// The keeper of a supervisor of a workspace in `role`: a shed's, never main's. Its first
-    /// probe is due at once, so a shed's daemon is ensured as its supervisor starts, and that
-    /// start counts as use.
+    /// probe is due at once, but the supervisor's start is no use: a daemon is started only once
+    /// the ledger holds a job or a session, and one found live gets its interval. A supervisor
+    /// started for anything else (a failed `rm` restoring the workspace, an ensure that runs
+    /// nothing) would otherwise launch a daemon whose start processes then hold the mount.
     pub(crate) fn for_role(role: WorkspaceRole) -> Option<Self> {
         match role {
             WorkspaceRole::Main => None,
@@ -575,7 +578,7 @@ impl NxDaemonKeeper {
                 Some(Self {
                     probes,
                     starting: None,
-                    last_use: Instant::now(),
+                    last_use: None,
                     daemon_was_live: false,
                     kept_by: None,
                     settled: false,
@@ -758,7 +761,7 @@ impl NxDaemonKeeper {
         // A daemon that has just come up was asked for by someone: it gets a whole interval,
         // however idle the shed looks.
         if working.is_some() || (live && !self.daemon_was_live) {
-            self.last_use = now;
+            self.last_use = Some(now);
         }
         let kept_by = working.filter(|_| live);
         if let Some(using) = kept_by
@@ -772,7 +775,10 @@ impl NxDaemonKeeper {
         }
         self.kept_by = kept_by;
         self.daemon_was_live = live;
-        if now.duration_since(self.last_use) < IDLE {
+        if self
+            .last_use
+            .is_some_and(|used| now.duration_since(used) < IDLE)
+        {
             self.settled = false;
             return Verdict::Keep;
         }
@@ -1054,22 +1060,17 @@ mod tests {
         keeper.judge(Path::new(NO_PROJECT), working, daemon).await
     }
 
-    /// A shed keeps a daemon for [`IDLE`] from its last use and no longer: its supervisor's start
-    /// is a use, a job or session is one at every probe, and a probe that finds the shed in use
-    /// after it was released asks for a daemon again.
+    /// A shed keeps a daemon for [`IDLE`] from its last use and no longer. Its supervisor's start
+    /// is no use: a keeper nothing has used wants no daemon at its first probe. A job or session
+    /// is use at every probe, and a probe that finds the shed in use after it was released asks
+    /// for a daemon again.
     #[tokio::test(start_paused = true)]
     async fn a_keeper_releases_the_daemon_of_a_shed_unused_for_the_idle_interval() {
         let mut keeper = keeper();
-        tokio::time::advance(IDLE - Duration::from_secs(1)).await;
         assert_eq!(
             judge(&mut keeper, false, Probe::Unrecorded).await,
-            Verdict::Keep
-        );
-        assert!(!keeper.settled, "a daemon is still wanted");
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(
-            judge(&mut keeper, false, Probe::Unrecorded).await,
-            Verdict::Release
+            Verdict::Release,
+            "a supervisor that just started, with nothing in its ledger, wants no daemon"
         );
         assert!(keeper.settled, "nothing is left to keep or to stop");
 

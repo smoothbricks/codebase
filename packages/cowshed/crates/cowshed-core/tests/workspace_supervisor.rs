@@ -6903,7 +6903,7 @@ const NX_PROBES: Duration = Duration::from_secs(60);
 
 /// A shed's code is unsigned and Nx's daemon runs it, so the daemon a host client connects to is
 /// one the shed's supervisor keeps alive inside the sandbox: a read-write resident job of the
-/// project's own `nx`, started with the supervisor, never a second while one runs, and again
+/// project's own `nx`, started once the shed is in use, never a second while one runs, and again
 /// once the daemon it started is gone. A resident holds no CPU token, so keeping the daemon
 /// leaves the shed's share of the host whole (05_gateway.md "A resident holds no token").
 #[tokio::test(start_paused = true)]
@@ -6911,6 +6911,7 @@ async fn a_shed_keeps_its_nx_daemon_inside_the_sandbox() {
     let (supervisor_config, _root) = nx_project("raven");
     let project = supervisor_config.workspace_root.clone();
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let _in_use = open_named(&h.handle, "build").await;
 
     let first = h.spawned.recv().await.unwrap();
     let SpawnCommand::Argv(argv) = &first.request.command else {
@@ -7427,16 +7428,48 @@ async fn nx_retirement_policy_preserves_foreign_nominees_but_retires_owned_jobs_
     }
 }
 
-/// A shed with a live daemon its start job left, and the harness over it.
+/// A shed with a live daemon its start job left, and the harness over it. A named session puts
+/// the shed in use for the start and is closed once the daemon is up, so the shed is unused from
+/// then on.
 async fn shed_with_live_nx_daemon(name: &str) -> (Harness, LiveDaemon, PathBuf, TempRoot) {
     let (supervisor_config, root) = nx_project(name);
     let project = supervisor_config.workspace_root.clone();
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let in_use = open_named(&h.handle, "build").await;
     let start = h.spawned.recv().await.unwrap();
     let daemon = LiveDaemon::start(&project);
     complete(&start, b"", b"", ExitStatus::Exited { code: 0 }).await;
     h.handle.wait(start.request.job_id).await.unwrap();
+    h.handle.close_session(in_use).await.unwrap();
     (h, daemon, project, root)
+}
+
+/// A supervisor's own start is no use (04_sandbox.md, the kept daemon): one that runs no job and
+/// holds no session starts no daemon, so a supervisor started for anything else, such as a failed
+/// `rm` restoring its workspace, launches nothing on the mount. The first session is use, and the
+/// daemon follows at the next probe.
+#[tokio::test(start_paused = true)]
+async fn a_shed_supervisor_nothing_uses_starts_no_nx_daemon() {
+    let (supervisor_config, _root) = nx_project("finch");
+    let project = supervisor_config.workspace_root.clone();
+    let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    assert!(
+        tokio::time::timeout(NX_PROBES, h.spawned.recv())
+            .await
+            .is_err(),
+        "a supervisor nothing uses started a job"
+    );
+    let _in_use = open_named(&h.handle, "build").await;
+    let start = tokio::time::timeout(NX_PROBES, h.spawned.recv())
+        .await
+        .expect("a shed in use wants its daemon")
+        .unwrap();
+    let SpawnCommand::Argv(argv) = &start.request.command else {
+        panic!("the daemon start is an argv");
+    };
+    assert_eq!(argv, &nx_daemon_start(&project));
+    complete(&start, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(start.request.job_id).await.unwrap();
 }
 
 /// A daemon costs its host a Node process, its plugin workers and a file watcher that recomputes
@@ -7655,6 +7688,7 @@ async fn nx_daemon_restart_follows_a_build_volume_swap_without_an_exec() {
     supervisor_config.sandbox.build_volume_mount = Some(before.clone());
     supervisor_config.build_volume_layout = Some(layout.clone());
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let _in_use = open_named(&h.handle, "build").await;
 
     let first = h.spawned.recv().await.unwrap();
     let SpawnCommand::Argv(first_argv) = &first.request.command else {
@@ -7735,6 +7769,10 @@ async fn a_shed_with_no_node_refuses_its_nx_daemon_with_its_enoent_named_until_o
     let node = fixture_node(&project);
     std::fs::remove_file(&node).unwrap();
     let mut h = harness_with_config(supervisor_config, 1, 1024, false, false);
+    let _in_use = open_named(&h.handle, "build").await;
+    // The probe that found the supervisor unused at its start wanted no daemon; the next one,
+    // finding the session, wants one and refuses its start.
+    tokio::time::sleep(Duration::from_secs(10)).await;
     let refused = |keeper: Option<cowshed_core::runtime::NxKeeperState>| {
         let keeper = keeper.expect("a shed keeps a daemon");
         assert_eq!(keeper.starting, None);
