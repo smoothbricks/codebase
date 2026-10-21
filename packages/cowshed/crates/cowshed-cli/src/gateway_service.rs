@@ -1406,10 +1406,11 @@ async fn refuse_restart_while_busy(
 const BUILD_VOLUME_TRASH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Empty every project's build-volume trash now and then every [`BUILD_VOLUME_TRASH_INTERVAL`]
-/// for as long as the daemon runs, on a thread of its own at background disk priority
-/// (16_build_volumes.md, "Garbage collection"): a release only renames an image into the trash,
-/// and this is what deletes it. With no daemon running, the next daemon start empties it, and
-/// so does `cowshed gc`.
+/// for as long as the daemon runs, on a thread of its own (16_build_volumes.md, "Garbage
+/// collection"): a release only renames an image into the trash, and this is what frees it, in
+/// bounded steps at normal disk priority, so no free stalls the store's container and an
+/// interrupted one resumes from the image's length. With no daemon running, the next daemon
+/// start empties it, and so does `cowshed gc`.
 fn empty_build_volume_trash_from_now_on(store: PathBuf) {
     let started = std::thread::Builder::new()
         .name("build-volume-trash".to_owned())
@@ -1430,7 +1431,19 @@ fn empty_build_volume_trash_from_now_on(store: PathBuf) {
     }
 }
 
+/// Queue this daemon's stderr lines for a writer thread of their own (13_telemetry.md, "The one
+/// text-file survivor"), or say why they stay in place.
+pub(crate) fn detach_stderr(daemon: &str) {
+    if let Err(error) = cowshed_os::stderr::detach() {
+        cowshed_os::eprintln!(
+            "cowshed: the {daemon}'s stderr is written in place, so a stalled log stalls the {daemon}: {error}"
+        );
+    }
+}
+
 async fn run_daemon() -> Result<()> {
+    // This thread runs the whole runtime: a log write the container stalls must not stall it.
+    detach_stderr("gateway");
     let home = canonical_home()?;
     let storage = validate_existing_host_storage(&home).await?;
     let paths = GatewayPaths::from_storage(&storage);

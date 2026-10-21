@@ -20,6 +20,8 @@ pub const VERB: &str = "__workspace-supervisor";
 /// manager that started this process, which answers the command that asked for the workspace
 /// with it.
 pub async fn run(arguments: &[OsString]) -> i32 {
+    // This thread runs the whole runtime: a log write the container stalls must not stall it.
+    crate::gateway_service::detach_stderr("workspace supervisor");
     let report = StartReport::inherited();
     match serve(arguments).await {
         Ok(()) => 0,

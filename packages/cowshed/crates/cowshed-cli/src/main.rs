@@ -31,6 +31,7 @@ fn main() {
         .is_some_and(|verb| verb == cowshed_cli::workspace_supervisor::VERB)
     {
         let code = runtime.block_on(cowshed_cli::workspace_supervisor::run(&arguments[1..]));
+        cowshed_os::stderr::flush();
         std::process::exit(code);
     }
     let ending = runtime.block_on(run_interruptible(arguments));
@@ -40,8 +41,11 @@ fn main() {
         // process is gone nothing could observe or cancel them. A finished command skips this on
         // purpose, so the jobs it backgrounded keep running after it exits.
         runtime.shutdown_timeout(INTERRUPTED_SHUTDOWN_GRACE);
+        cowshed_os::stderr::flush();
         die_by(signal);
     }
+    // A daemon's stderr lines still queued are written before it goes.
+    cowshed_os::stderr::flush();
     std::process::exit(ending.exit_code());
 }
 

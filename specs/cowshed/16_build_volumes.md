@@ -913,10 +913,24 @@ again at any level above it.
   2026-10-21, a land's slowest step was deleting its own workspace's image, one `unlink` for minutes with 84,594
   metadata reads under it, inside the land and against every other reader of the store volume. So nothing that waits for
   a release deletes an image. The daemon empties every project's trash at its start and then every minute, one image at
-  a time at background disk priority (`IOPOL_THROTTLE`), so a released image waits at most a minute plus the deletions
-  queued before it; with no daemon running the next daemon start empties it, and `cowshed gc` empties its project's
-  trash before it answers. Only `<id>.dmg` files are deleted there; anything else is named and left. The canonical image
-  is gone once the rename returns, so a hold taken after it finds none, as before.
+  a time, so a released image waits at most a minute plus the deletions queued before it; with no daemon running the
+  next daemon start empties it, and `cowshed gc` empties its project's trash before it answers. Only `<id>.dmg` files
+  are deleted there; anything else is named and left. The canonical image is gone once the rename returns, so a hold
+  taken after it finds none, as before.
+- Emptying the trash never frees an image in one go. One `unlink` of a written image is one free of its whole extent
+  tree, and every writer of the store's APFS container waits behind it: measured 2026-10-22, the installed daemon's
+  trash thread sat in one `unlink` of a 300 GiB image (its first 100,000 runs held 778 MiB, a median run of 4 KiB) while
+  its main thread waited on a write to its own log and every `cowshed fork` and `ls` on the host hung. So a release cuts
+  the image from its end with `ftruncate(2)`, at most 1,024 physical runs (`F_LOG2PHYS_EXT`) per cut, and unlinks it
+  once it is empty. The 1,024 is measured: over a 131,072-extent clone on the store's container a cut of 1,024 extents
+  took 0.1 s to 0.3 s at the median, and from there a cut's length grows with its extents; the table is `STEP_EXTENTS`
+  in `storage/apfs/release.rs`. The image's length is the release's journal: a cut ends on a run boundary, so an
+  interrupted release leaves a shorter image that the next pass walks and finishes, and nothing else records progress. A
+  release holds the image's `flock` for its whole run, and an image another process is releasing is left to it. It runs
+  at normal disk priority: a thread throttled to background priority (`IOPOL_THROTTLE`) holds the container's work while
+  its own metadata reads wait, so measured the same day it freed the same clone in 53 s instead of 7.6 s and the writers
+  beside it waited 10.6 ms at the median instead of 0.2 ms; the installed daemon's throttled `unlink` made 1,213
+  throttled 4 KiB metadata reads at a 20 ms median in 21 s.
 - Every release that deletes an image, a seed's or another volume's, whatever asked for it (collection, a land's release
   of the target's previous volume or superseded seed, a reseed, a fork that never staged), appends one line for the
   image to the project's `deletion-log.jsonl` (01_storage.md): op `release-build-volume`, kind `build-seed` when its

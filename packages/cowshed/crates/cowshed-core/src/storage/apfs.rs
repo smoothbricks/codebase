@@ -1,6 +1,7 @@
 pub mod extents;
 pub mod native;
 pub mod rekey;
+pub mod release;
 
 use std::io;
 use std::path::{Path, PathBuf};

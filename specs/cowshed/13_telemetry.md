@@ -457,7 +457,15 @@ Cowshed uses Arrow IPC for both, but placement and authority differ:
   write it at once, so each cowshed process writes each line in one `write(2)` (`cowshed_os::eprintln!`; clippy refuses
   `std::eprintln!`/`eprint!` in the cowshed crates). `std` writes a line one formatted piece at a time, and pieces of
   concurrent processes splice: measured 2026-10-21, an install's `supervisor-recovery drain` spans and its supervisors'
-  "retires after draining" lines interleaved mid-word, so no line said which supervisor waited on what.
+  "retires after draining" lines interleaved mid-word, so no line said which supervisor waited on what. A daemon (the
+  gateway, each workspace supervisor) never writes it from the thread that serves: that thread runs the daemon's whole
+  runtime, and the file shares the store's APFS container, so one write the container stalls stops every request.
+  Measured 2026-10-22, the installed gateway's main thread waited in `write(2)` on this file in all 728 samples while
+  the build-volume trash freed an image, and every `cowshed fork` and `ls` on the host hung. So a daemon queues each
+  whole line for one writer thread of its own (`cowshed_os::stderr::detach`), up to 4,096 lines. A line that finds the
+  queue full is dropped and counted, never waited for, and the writer's next write first says
+  `cowshed: <n> stderr line(s) dropped: the log took no writes while the queue was full`. The process waits for the
+  queue before it exits.
 
 `StreamInfo` is the shared content descriptor:
 

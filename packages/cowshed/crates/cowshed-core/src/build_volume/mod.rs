@@ -1033,15 +1033,27 @@ impl ReleaseClaim {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EmptiedTrash {
     pub images: usize,
-    /// The bytes those images held on disk, read before each was deleted.
+    /// The bytes those images held on disk, read when each release opened it.
     pub bytes: u64,
 }
 
-/// Delete every image in the build-volume trash at `trash` (`<project>/build/.trash`), one at
-/// a time, at background disk priority on the calling thread, so the extent walk each deletion
-/// costs yields to every other reader on the volume. A trash that does not exist is empty.
-/// Only image files of the trash's own naming are deleted; anything else there is left and said.
+/// Release every image in the build-volume trash at `trash` (`<project>/build/.trash`), one at
+/// a time on the calling thread, each in bounded steps at normal disk priority
+/// ([`crate::storage::apfs::release`]): no step frees more than
+/// [`STEP_EXTENTS`](crate::storage::apfs::release::STEP_EXTENTS) extents, so no deletion is one
+/// free of a whole extent tree that every other writer of the store's container waits behind. An
+/// image another process is releasing is left to it, and an image a crash left half-released is
+/// finished from its length. A trash that does not exist is empty. Only image files of the
+/// trash's own naming are released; anything else there is left and said.
+///
+/// Normal priority, not background (`IOPOL_THROTTLE`): measured 2026-10-22, a throttled thread
+/// freeing a 131,072-extent clone took 53 s against 7.6 s unthrottled, and the writers beside it
+/// waited 10.6 ms at the median instead of 0.2 ms; the installed gateway's throttled unlink did
+/// 1,213 throttled 4 KiB metadata reads at a 20 ms median in 21 s. A throttled free holds the
+/// container's work while its own reads wait, so it slows every writer instead of yielding.
 pub fn empty_trash(trash: &Path) -> io::Result<EmptiedTrash> {
+    use crate::storage::apfs::release::{Released, STEP_EXTENTS, release_file};
+
     let entries = match fs::read_dir(trash) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1049,7 +1061,6 @@ pub fn empty_trash(trash: &Path) -> io::Result<EmptiedTrash> {
         }
         Err(error) => return Err(error),
     };
-    let _background = BackgroundDiskPriority::set();
     let mut emptied = EmptiedTrash::default();
     for entry in entries {
         let entry = entry?;
@@ -1060,7 +1071,11 @@ pub fn empty_trash(trash: &Path) -> io::Result<EmptiedTrash> {
             .and_then(|name| name.strip_suffix(&format!(".{IMAGE_EXTENSION}")))
             .and_then(BuildVolumeId::parse)
             .is_some();
-        let metadata = entry.metadata()?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         if !image || !metadata.is_file() {
             cowshed_os::eprintln!(
                 "cowshed: {} is not a trashed build-volume image; it is left",
@@ -1068,17 +1083,16 @@ pub fn empty_trash(trash: &Path) -> io::Result<EmptiedTrash> {
             );
             continue;
         }
-        let bytes = {
-            use std::os::unix::fs::MetadataExt as _;
-            metadata.blocks() * 512
-        };
-        match fs::remove_file(&path) {
-            Ok(()) => {
+        match release_file(&path, STEP_EXTENTS)? {
+            Released::Freed { bytes, .. } => {
                 emptied.images += 1;
                 emptied.bytes += bytes;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Released::Absent => {}
+            Released::Busy => cowshed_os::eprintln!(
+                "cowshed: trashed build-volume image {} is being released by another process; it is left to that release",
+                path.display()
+            ),
         }
     }
     Ok(emptied)
@@ -1119,60 +1133,6 @@ pub fn empty_store_trash(store: &Path) -> EmptiedTrash {
         }
     }
     emptied
-}
-
-/// This thread's disk I/O at background priority (`IOPOL_THROTTLE`) until dropped. Elsewhere
-/// than macOS the scheduler has no such policy, and this changes nothing.
-struct BackgroundDiskPriority {
-    #[cfg(target_os = "macos")]
-    previous: libc::c_int,
-}
-
-#[cfg(target_os = "macos")]
-mod iopolicy {
-    // <sys/resource.h>: not in the `libc` crate.
-    pub const IOPOL_TYPE_DISK: libc::c_int = 0;
-    pub const IOPOL_SCOPE_THREAD: libc::c_int = 1;
-    pub const IOPOL_THROTTLE: libc::c_int = 3;
-    unsafe extern "C" {
-        pub fn getiopolicy_np(iotype: libc::c_int, scope: libc::c_int) -> libc::c_int;
-        pub fn setiopolicy_np(
-            iotype: libc::c_int,
-            scope: libc::c_int,
-            policy: libc::c_int,
-        ) -> libc::c_int;
-    }
-}
-
-impl BackgroundDiskPriority {
-    fn set() -> Self {
-        #[cfg(target_os = "macos")]
-        {
-            use iopolicy::*;
-            // SAFETY: both calls take plain integers and change only this thread's policy.
-            let previous = unsafe { getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD) };
-            if unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE) } != 0 {
-                cowshed_os::eprintln!(
-                    "cowshed: build-volume trash is emptied at normal disk priority: {}",
-                    io::Error::last_os_error()
-                );
-            }
-            Self { previous }
-        }
-        #[cfg(not(target_os = "macos"))]
-        Self {}
-    }
-}
-
-impl Drop for BackgroundDiskPriority {
-    fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
-        if self.previous >= 0 {
-            use iopolicy::*;
-            // SAFETY: as in `set`.
-            unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, self.previous) };
-        }
-    }
 }
 
 /// Open (creating) `path`, the lock file every hold and release claim of one volume shares,

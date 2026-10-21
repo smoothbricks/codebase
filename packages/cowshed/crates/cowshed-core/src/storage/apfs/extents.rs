@@ -33,19 +33,8 @@ pub fn count_extents(path: &Path) -> Result<ExtentCount, ApfsStorageError> {
         .map_err(|error| io_error("inspect image to count extents", path, error))?
         .len();
     let mut extents = 0_u64;
-    let mut offset = 0;
-    while let Some((start, end)) = next_data_region(&file, offset, length)
-        .map_err(|error| io_error("find image data to count extents", path, error))?
-    {
-        let mut position = start;
-        while position < end {
-            position += physical_run(&file, position, end - position)
-                .map_err(|error| io_error("map image extents", path, error))?
-                .bytes;
-            extents += 1;
-        }
-        offset = end;
-    }
+    for_each_run(&file, length, |_| extents += 1)
+        .map_err(|error| io_error("map image extents", path, error))?;
     Ok(ExtentCount::new(extents))
 }
 
@@ -278,7 +267,6 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ApfsStor
 }
 
 /// The next `[start, end)` run of data at or after `offset`, or `None` when only a hole remains.
-#[cfg(target_os = "macos")]
 fn next_data_region(file: &File, offset: u64, length: u64) -> io::Result<Option<(u64, u64)>> {
     use std::os::fd::AsRawFd;
 
@@ -304,6 +292,32 @@ fn next_data_region(file: &File, offset: u64, length: u64) -> io::Result<Option<
     };
     let end = seek(start, libc::SEEK_HOLE)?.unwrap_or(length);
     Ok(Some((start, end.min(length))))
+}
+
+/// Call `run` with the start of every physically contiguous run of the file's data, ascending,
+/// skipping holes: one `F_LOG2PHYS_EXT` query per run. Elsewhere than macOS nothing maps a file
+/// to the device and no RAW image lives there, so each data region counts as one run.
+pub(super) fn for_each_run(file: &File, length: u64, mut run: impl FnMut(u64)) -> io::Result<()> {
+    let mut offset = 0;
+    while let Some((start, end)) = next_data_region(file, offset, length)? {
+        let mut position = start;
+        while position < end {
+            run(position);
+            position += run_bytes(file, position, end - position)?;
+        }
+        offset = end;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_bytes(file: &File, offset: u64, length: u64) -> io::Result<u64> {
+    physical_run(file, offset, length).map(|run| run.bytes)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_bytes(_: &File, _: u64, length: u64) -> io::Result<u64> {
+    Ok(length)
 }
 
 /// One physically contiguous run of a file: where it starts on the device and how many bytes long.
@@ -397,14 +411,6 @@ fn available_bytes(directory: &Path) -> Result<u64, ApfsStorageError> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn next_data_region(_: &File, _: u64, _: u64) -> io::Result<Option<(u64, u64)>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "image extents are read with macOS F_LOG2PHYS_EXT",
-    ))
-}
-
-#[cfg(not(target_os = "macos"))]
 fn physical_run(_: &File, _: u64, _: u64) -> io::Result<PhysicalRun> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -441,7 +447,7 @@ fn available_bytes(directory: &Path) -> Result<u64, ApfsStorageError> {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
+pub(super) mod tests {
     use std::fs::{self, File, OpenOptions, Permissions};
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -454,7 +460,7 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
     const PAGE: u64 = 16 * 1024;
 
-    struct Scratch(PathBuf);
+    pub(in crate::storage::apfs) struct Scratch(pub(in crate::storage::apfs) PathBuf);
 
     impl Drop for Scratch {
         fn drop(&mut self) {
@@ -462,7 +468,7 @@ mod tests {
         }
     }
 
-    fn scratch(test: &str) -> Scratch {
+    pub(in crate::storage::apfs) fn scratch(test: &str) -> Scratch {
         let root =
             std::env::temp_dir().join(format!("cowshed-extents-{test}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -491,7 +497,9 @@ mod tests {
 
     /// Two data regions around a hole and a trailing hole — the shape of a sparse disk image —
     /// with every other page of the data rewritten while a clone shares it.
-    fn fragmented_sparse_file(root: &Path) -> (PathBuf, Vec<(u64, u64)>) {
+    pub(in crate::storage::apfs) fn fragmented_sparse_file(
+        root: &Path,
+    ) -> (PathBuf, Vec<(u64, u64)>) {
         let path = root.join("image.dmg");
         let file = OpenOptions::new()
             .create_new(true)

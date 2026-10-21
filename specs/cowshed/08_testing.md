@@ -344,6 +344,11 @@ Invariants the table-driven unit cases only sample. Each is a pure function over
   enumeration never returns one — the "derived state" promise holds under partial writes.
 - **Idempotent recovery/gc**: replaying a crash-recovery or `gc` pass over any generated interrupted-state fixture
   converges to the same result as running it once (crash points from the adopt/new/rm recovery tables, 02).
+- **Bounded image release** (16_build_volumes.md, "Garbage collection"): over generated run layouts and step bounds,
+  every cut shortens the file and frees at most one step of runs, the cuts end at zero and free every run exactly once
+  in as few cuts as the bound allows, and a release resumed after any cut plans exactly the cuts left. Its real boundary
+  is a fragmented file on the host's filesystem, cut a few steps, abandoned, and finished by a second release that
+  counts only what was left.
 - **Stateless restore recovery boundaries**: interrupt after undo-sidecar publication, each image/CA-key swap and
   rename, each canonical/undo parent fsync, pending metadata rename/fsync, staged-metadata removal, and final parent
   fsync. Restart twice from every fixture. Recovery must derive rollback/forward state only from APFS image, detached
