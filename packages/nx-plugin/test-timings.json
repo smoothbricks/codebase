@@ -73,6 +73,7 @@
     "src/managed-files/setup-devenv-free-disk.test.ts": 91,
     "src/test-timings.test.ts": 89,
     "src/release-config-policy.test.ts": 79,
+    "src/executors/bounded-exec/runtime-pin.test.ts": 74,
     "src/workspace-config-policy.test.ts": 59,
     "src/producer-receipts.test.ts": 53,
     "src/nx-task-graph-cycles.test.ts": 49,

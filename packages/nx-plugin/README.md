@@ -1435,6 +1435,22 @@ The snapshot-reset regression orders capture, test completion, and expiry throug
 deliberately holds the first capture's progress publication while another heartbeat arrives; only the observed PASS
 advances the next capture interval. Its 10 s virtual idle bound remains unchanged.
 
+A leg that runs `bun` runs the Bun its workspace declares. Before it asks for a RAM lease or CPU tokens, the executor
+reads `packageManager` in the workspace root's `package.json` and, when that names `bun@<version>`, finds the first
+`bun` on the PATH the command runs with (the target's `env.PATH`, else the executor's own) and asks it `--version`, in
+the command's own environment, which is what a wrapper that routes `bun` reads. A command with no `bun` word in it
+(`bun test`, `cd x && bun run y`, `sh -c 'bun test'`), a workspace that declares no Bun and a PATH that holds none are
+not checked: the first runs none, the second declares none and the third leaves the shell to say so. A path-qualified
+`../runtime/bun test` names its binary itself, so PATH decides nothing for it. When the printed version is not the
+declared one the run is refused with a `failed` verdict, like every refusal before its command starts, and stderr names
+both versions, the binary and the setting each came from: `packageManager "bun@1.4.3"` in the manifest against
+`PATH from the target's env`, whose first `bun` prints 1.4.2. A `packageManager` that names `bun` and no exact version,
+or a `bun` that gives no answer to `--version` within 120 s, is refused the same way: a guard that skipped what it
+cannot read would be silent exactly where the declaration or the binary is wrong. The refusal replaces a failure far
+from its cause. A Bun other than the declared one passes startup, and on Bun 1.4.2 `console.log` drops what a full pipe
+refuses, so a child's JSON document reaches the parent that reads it cut mid-string while the child exits 0: the leg
+fails three layers from the cause as `JSON Parse error: Unterminated string`. The check is not made on Windows.
+
 On a macOS host, every `bounded-exec` task runs with its own `TMPDIR` lease: a directory on one RAM-backed APFS volume
 per user, so test temp files never reach the SSD. The volume is created lazily by the first task that needs it and
 detached when the last live lease ends, since its pages return only on detach. It is a legacy DiskImages RAM disk, so it

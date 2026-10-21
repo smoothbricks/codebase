@@ -42,6 +42,7 @@ import {
   ramTempPaths,
 } from './ram-temp.js';
 import { createRunnerLifecycle, withRunnerLifecycle } from './runner-lifecycle.js';
+import { checkRuntimePin, describeRuntimePinRefusal } from './runtime-pin.js';
 import type { BoundedExecOptions } from './schema.js';
 import {
   type BoundedExecRecord,
@@ -323,6 +324,24 @@ export async function runBoundedExec(
     outputChunks.push(text);
     process.stderr.write(text);
   };
+
+  // A leg that runs bun runs the Bun its workspace declares, or it does not run. This comes before the RAM lease and the
+  // CPU tokens: a refusal that waited in the CPU queue first would say nothing for minutes.
+  const runtime = await checkRuntimePin({
+    root: context.root,
+    command: requested,
+    env: { ...withoutPoolEnv(process.env), ...options.env },
+    cwd,
+    pathSource: options.env?.PATH === undefined ? 'the inherited environment' : "the target's env",
+  });
+  if (runtime !== null) {
+    appendStderr(describeRuntimePinRefusal(runtime, context.record?.task.id));
+    if (context.record !== undefined) {
+      const { task, directory: recordDirectory } = context.record;
+      await writeRecord(recordDirectory, { task: task.id, hash: task.hash, verdict: judgeOperationalFailure(1, null) });
+    }
+    return { success: false, terminalOutput: outputChunks.join('') };
+  }
 
   let lease: RamTempLease | null = null;
   if (tempVolume !== null) {

@@ -4,6 +4,7 @@ import { access, mkdir, mkdtemp, open, readFile, rm, writeFile } from 'node:fs/p
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { FAKE_BUN_INVOKED, FAKE_BUN_RAN, fakeBun } from '../../__tests__/fake-bun.js';
 import {
   closeServer,
   fakeClock,
@@ -1527,6 +1528,124 @@ describe('@smoothbricks/nx-plugin:bounded-exec', () => {
     } finally {
       await new Promise<void>((resolve) => refusing.close(() => resolve()));
     }
+  });
+
+  describe('a leg that runs bun', () => {
+    const declaresBun = JSON.stringify({ name: 'workspace', packageManager: 'bun@1.4.3' });
+    const systemPath = ':/usr/bin:/bin';
+
+    it('is refused before it asks for RAM or CPU when its first bun is another version, and records why', async () => {
+      const workspace = await createWorkspace();
+      await workspace.write('package.json', declaresBun);
+      const bun = await fakeBun(join(workspace.root, 'bin'), '1.4.2');
+      const volume = scriptedVolume({
+        ok: true,
+        value: { kind: 'leased', lease: leaseAt(join(workspace.root, 'lease')), held: [], reaped: [] },
+      });
+      const asked: number[] = [];
+      const budget: CpuBudget = {
+        async take(want) {
+          asked.push(want);
+          return heldGrant(1, []);
+        },
+      };
+      const record = { task: { id: 'compiler:test-3', hash: 'h' }, directory: join(workspace.root, 'record') };
+
+      const result = await runBoundedExec(
+        {
+          command: 'bun run.js',
+          env: { PATH: join(workspace.root, 'bin') + systemPath },
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        },
+        { ...workspace.context, record },
+        createProcessTreeKiller(),
+        volume,
+        budget,
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.terminalOutput).toContain('compiler:test-3: refusing to run the command');
+      expect(result.terminalOutput).toContain('declares Bun 1.4.3');
+      expect(result.terminalOutput).toContain('is Bun 1.4.2');
+      expect(result.terminalOutput).toContain(bun);
+      expect(result.terminalOutput).toContain("PATH from the target's env");
+      // Nothing was asked of the host: no RAM lease, no CPU tokens, and the command never ran.
+      expect(volume.order).toEqual([]);
+      expect(asked).toEqual([]);
+      expect(await exists(join(workspace.root, 'bin', FAKE_BUN_RAN))).toBe(false);
+      expect(await readRecord(record.directory)).toEqual({
+        task: record.task.id,
+        hash: 'h',
+        verdict: { outcome: 'failed', exitCode: 1, tests: [] },
+      });
+    });
+
+    it('runs on the declared version', async () => {
+      const workspace = await createWorkspace();
+      await workspace.write('package.json', declaresBun);
+      await fakeBun(join(workspace.root, 'bin'), '1.4.3');
+
+      const result = await runBoundedExec(
+        {
+          command: 'bun run.js',
+          env: { PATH: join(workspace.root, 'bin') + systemPath },
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        null,
+      );
+
+      expect(result.success).toBe(true);
+      expect(await exists(join(workspace.root, 'bin', FAKE_BUN_RAN))).toBe(true);
+    });
+
+    it('is not asked about a command that runs no bun, whatever bun is on PATH', async () => {
+      const workspace = await createWorkspace();
+      await workspace.write('package.json', declaresBun);
+      await fakeBun(join(workspace.root, 'bin'), '1.4.2');
+
+      const result = await runBoundedExec(
+        {
+          command: 'touch ran.marker',
+          env: { PATH: join(workspace.root, 'bin') + systemPath },
+          timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS,
+        },
+        workspace.context,
+        createProcessTreeKiller(),
+        null,
+        null,
+      );
+
+      expect(result.success).toBe(true);
+      expect(await exists(join(workspace.root, 'ran.marker'))).toBe(true);
+      expect(await exists(join(workspace.root, 'bin', FAKE_BUN_INVOKED))).toBe(false);
+    });
+
+    it('names the inherited environment when the target sets no PATH of its own', async () => {
+      const workspace = await createWorkspace();
+      await workspace.write('package.json', declaresBun);
+      await fakeBun(join(workspace.root, 'bin'), '1.4.2');
+      const inherited = process.env.PATH;
+      process.env.PATH = join(workspace.root, 'bin') + systemPath;
+
+      try {
+        const result = await runBoundedExec(
+          { command: 'bun run.js', timeoutMs: BOUNDED_TEST_IDLE_TIMEOUT_MS },
+          workspace.context,
+          createProcessTreeKiller(),
+          null,
+          null,
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.terminalOutput).toContain('PATH from the inherited environment');
+      } finally {
+        if (inherited === undefined) delete process.env.PATH;
+        else process.env.PATH = inherited;
+      }
+    });
   });
 
   it('asks the gateway once more across an install that restarts it, and runs on the grant it takes', async () => {
