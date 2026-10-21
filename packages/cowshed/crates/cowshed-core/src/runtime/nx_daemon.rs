@@ -86,13 +86,6 @@ pub(crate) const STOP_ATTEMPTS: u32 = 3;
 /// whose agent has finished costs its host five minutes of a daemon, not the rest of the day.
 pub(crate) const IDLE: Duration = Duration::from_secs(5 * 60);
 
-/// How often a probe of an otherwise idle shed also looks for a client at work: one open-file
-/// query over every process of the host, which took 0.34 to 0.73 s (median 0.46 s) over 669
-/// processes at load 90, against the file read and one connect of a probe. A run holds a task
-/// database for as long as its tasks run, far longer than this, so a look finds it; and the
-/// stop itself looks once more.
-pub(crate) const CLIENT_LOOK_INTERVAL: Duration = Duration::from_secs(30);
-
 /// The daemon of an Nx project, as its rendezvous record and the world agree on it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Probe {
@@ -539,8 +532,8 @@ pub(crate) struct NxDaemonKeeper {
     /// Whether the previous probe found the daemon live, to tell a daemon coming up from one
     /// that has been up.
     daemon_was_live: bool,
-    /// When a probe last looked for a client at work ([`CLIENT_LOOK_INTERVAL`]).
-    last_look: Option<Instant>,
+    /// What in the ledger kept the live daemon at the last probe, said each time it changes.
+    kept_by: Option<Use>,
     /// Whether the last probe found the shed unused for [`IDLE`] and no daemon live: nothing is
     /// left for the supervisor to wait for.
     pub(super) settled: bool,
@@ -584,7 +577,7 @@ impl NxDaemonKeeper {
                     starting: None,
                     last_use: Instant::now(),
                     daemon_was_live: false,
-                    last_look: None,
+                    kept_by: None,
                     settled: false,
                     failed_starts: 0,
                     starting_served: false,
@@ -745,37 +738,39 @@ impl NxDaemonKeeper {
     }
 
     /// Judge one probe of the Nx project at `project_root`, whose daemon the probe found
-    /// `daemon`, `working` being whether the supervisor runs a job or holds a session. Stops the
-    /// daemon when the shed has gone unused for [`IDLE`].
+    /// `daemon`, `working` being what the supervisor's ledger holds that uses the shed: a job it
+    /// runs or a named session it holds. Stops the daemon once the ledger has held neither for
+    /// [`IDLE`].
     ///
-    /// Use is `working`, or a process other than the daemon holding a task database open.
-    /// Nx's graph and hash passes open none, so a client between its tasks, or one that only asks
-    /// the daemon for the graph, shows no use of its own: [`IDLE`] outlasts both. The look at the
-    /// databases is made at most every [`CLIENT_LOOK_INTERVAL`], and only for a shed with a live
-    /// daemon and no job.
+    /// The ledger is the only source of use. Work that runs as no job of the supervisor's is not
+    /// asked about, so no probe reads the process table or waits on another process's kernel
+    /// state: a probe runs inside the supervisor's actor, and a call that blocks there stops every
+    /// hello and exec the supervisor answers. A kept daemon is said on stderr with the job or
+    /// session that keeps it, each time that changes.
     pub(crate) async fn judge(
         &mut self,
         project_root: &Path,
-        working: bool,
+        working: Option<Use>,
         daemon: Probe,
     ) -> Verdict {
         let live = daemon == Probe::Live;
         let now = Instant::now();
-        let look = live
-            && !working
-            && self
-                .last_look
-                .is_none_or(|looked| now.duration_since(looked) >= CLIENT_LOOK_INTERVAL);
-        let in_use = working
-            || (look && {
-                self.last_look = Some(now);
-                clients_at_work(project_root).await
-            });
         // A daemon that has just come up was asked for by someone: it gets a whole interval,
         // however idle the shed looks.
-        if in_use || (live && !self.daemon_was_live) {
+        if working.is_some() || (live && !self.daemon_was_live) {
             self.last_use = now;
         }
+        let kept_by = working.filter(|_| live);
+        if let Some(using) = kept_by
+            .as_ref()
+            .filter(|using| self.kept_by.as_ref() != Some(using))
+        {
+            eprintln!(
+                "cowshed: keeps the Nx daemon of {}: {using}",
+                project_root.display()
+            );
+        }
+        self.kept_by = kept_by;
         self.daemon_was_live = live;
         if now.duration_since(self.last_use) < IDLE {
             self.settled = false;
@@ -791,24 +786,13 @@ impl NxDaemonKeeper {
             return Verdict::Release;
         }
         let why = format!(
-            "the shed ran nothing and held no Nx database for {}s",
+            "its supervisor ran no job and held no named session for {}s",
             IDLE.as_secs()
         );
-        match stop(project_root, &why).await {
-            Stop::Stopped => Verdict::Release,
-            Stop::InUse(why) => {
-                eprintln!(
-                    "cowshed: kept the Nx daemon of {}: {why}",
-                    project_root.display()
-                );
-                self.last_use = Instant::now();
-                Verdict::Keep
-            }
-            Stop::Failed(why) => {
-                self.stop_failed(project_root, &why);
-                Verdict::Release
-            }
+        if let Err(why) = stop(project_root, &why).await {
+            self.stop_failed(project_root, &why);
         }
+        Verdict::Release
     }
 
     /// Whether a probe may try to stop the idle shed's live daemon: not once [`STOP_ATTEMPTS`]
@@ -840,118 +824,54 @@ impl NxDaemonKeeper {
     }
 }
 
-/// Whether a process other than the daemon holds one of the Nx project's task databases open
-/// ([`crate::build_volume::nx::in_use`]). A look that fails proves the shed idle no more than a
-/// holder does, so it counts as use, and is said.
-async fn clients_at_work(project_root: &Path) -> bool {
-    let data = nx::workspace_data(project_root);
-    match tokio::task::spawn_blocking(move || crate::build_volume::nx::in_use(&data)).await {
-        Ok(Ok(held)) => held.is_some(),
-        Ok(Err(error)) => {
-            eprintln!(
-                "cowshed: cannot tell whether a client of the Nx daemon of {} is at work, so the \
-                 shed counts as in use: {error}",
-                project_root.display()
-            );
-            true
-        }
-        Err(error) => {
-            eprintln!(
-                "cowshed: the look at the clients of the Nx daemon of {} failed, so the shed \
-                 counts as in use: {error}",
-                project_root.display()
-            );
-            true
-        }
-    }
+/// What in the supervisor's ledger uses the shed ([`NxDaemonKeeper::judge`]): a job it runs, or
+/// a named session it holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Use {
+    Job(JobId),
+    Session(String),
 }
 
-/// How stopping the daemon of an idle shed ended.
-enum Stop {
-    /// The daemon exited, or was already gone.
-    Stopped,
-    /// Something still uses the daemon, said as `why`: a process other than the daemon holds a
-    /// task database open, or one the supervisor does not run holds the checkout. Nothing was
-    /// stopped.
-    InUse(String),
-    Failed(String),
-}
-
-/// Stop the daemon of the Nx project at `project_root` as `nx daemon --stop` does, unless a
-/// process the supervisor does not run holds the checkout ([`host_holders`]) or a process other
-/// than the daemon holds a task database open
-/// ([`crate::build_volume::nx::close_workspace_data`]), and say on the supervisor's stderr that
-/// it stopped and `why`.
-async fn stop(project_root: &Path, why: &str) -> Stop {
-    #[cfg(target_os = "macos")]
-    if let Some(held) = host_holders(project_root).await {
-        return Stop::InUse(held);
-    }
-    let pid = live_pid(&nx::daemon_record(project_root));
-    let data = nx::workspace_data(project_root);
-    let closed =
-        tokio::task::spawn_blocking(move || crate::build_volume::nx::close_workspace_data(&data))
-            .await;
-    match closed {
-        Ok(Ok(Ok(()))) => {
-            if let Some(pid) = pid {
-                eprintln!(
-                    "cowshed: stopped the Nx daemon (pid {pid}) of {}: {why}",
-                    project_root.display(),
-                );
+impl std::fmt::Display for Use {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Job(job) => write!(formatter, "its supervisor runs job {}", job.get()),
+            Self::Session(name) => {
+                write!(formatter, "its supervisor holds the named session {name}")
             }
-            Stop::Stopped
         }
-        Ok(Ok(Err(busy @ crate::build_volume::nx::Busy::Held { .. }))) => Stop::InUse(format!(
-            "a host client holds one of its task databases open: {busy}"
-        )),
-        Ok(Ok(Err(busy))) => Stop::Failed(busy.to_string()),
-        Ok(Err(error)) => Stop::Failed(error.to_string()),
-        Err(error) => Stop::Failed(format!("the stop did not finish: {error}")),
     }
 }
 
-/// What holds the Nx project's checkout at `project_root` beyond what this supervisor runs: the
-/// mount census every detach and retirement asks ([`super::mount_activity`]), with this process's
-/// tree and the recorded daemon exempt. A host shell's run between its tasks holds no task
-/// database, yet the daemon is what it talks to. A census that fails proves the checkout idle no
-/// more than a holder does, so it counts as a hold, and says why.
-#[cfg(target_os = "macos")]
-async fn host_holders(project_root: &Path) -> Option<String> {
-    let root = project_root.to_owned();
-    let census = tokio::task::spawn_blocking(move || {
-        super::mount_activity::unaccounted(
-            &root,
-            &super::mount_activity::Accounted {
-                supervisor: i32::try_from(std::process::id()).ok(),
-                ledger: None,
-            },
-        )
-    })
-    .await;
-    match census {
-        Ok(Ok(held)) => held.map(|held| held.to_string()),
-        Ok(Err(error)) => Some(format!("what holds its checkout cannot be listed: {error}")),
-        Err(error) => Some(format!(
-            "the look at what holds its checkout failed: {error}"
-        )),
+/// Stop the daemon of the Nx project at `project_root` as `nx daemon --stop` does
+/// ([`crate::build_volume::nx::stop_recorded_daemon`]), and say on the supervisor's stderr that
+/// it stopped and `why`. Nothing else is asked: the ledger has already said the shed is unused.
+async fn stop(project_root: &Path, why: &str) -> std::result::Result<(), String> {
+    let data = nx::workspace_data(project_root);
+    let stopped =
+        tokio::task::spawn_blocking(move || crate::build_volume::nx::stop_recorded_daemon(&data))
+            .await
+            .map_err(|error| format!("the stop did not finish: {error}"))?
+            .map_err(|error| error.to_string())?
+            .map_err(|busy| busy.to_string())?;
+    if let Some(pid) = stopped {
+        eprintln!(
+            "cowshed: stopped the Nx daemon (pid {pid}) of {}: {why}",
+            project_root.display(),
+        );
     }
+    Ok(())
 }
 
 /// End the daemon a retiring supervisor's keeper kept for the Nx project at `project_root`, so
-/// none outlives the supervisor that watched it (04_sandbox.md). Its jobs have ended by now; a
-/// host client still holding a task database keeps the daemon, and that is said.
+/// none outlives the supervisor that watched it (04_sandbox.md). Its jobs have ended by now, so
+/// its ledger holds nothing that uses the daemon.
 pub(crate) async fn release(project_root: &Path) {
-    match stop(project_root, "its supervisor retired").await {
-        Stop::Stopped => {}
-        Stop::InUse(why) => eprintln!(
-            "cowshed: the Nx daemon of {} outlives its retired supervisor: {why}",
-            project_root.display()
-        ),
-        Stop::Failed(why) => eprintln!(
+    if let Err(why) = stop(project_root, "its supervisor retired").await {
+        eprintln!(
             "cowshed: the Nx daemon of {} did not stop as its supervisor retired: {why}",
             project_root.display()
-        ),
+        );
     }
 }
 
@@ -1129,6 +1049,7 @@ mod tests {
     }
 
     async fn judge(keeper: &mut NxDaemonKeeper, working: bool, daemon: Probe) -> Verdict {
+        let working = working.then(|| Use::Job(JobId::new(1).expect("a job id")));
         keeper.judge(Path::new(NO_PROJECT), working, daemon).await
     }
 
@@ -1198,23 +1119,32 @@ mod tests {
         assert!(keeper.settled, "the next probe finds it gone");
     }
 
-    /// A host shell's run between its tasks holds no task database, so the idle look cannot see
-    /// it, yet the daemon is what it talks to. A process the supervisor does not run, working in
-    /// the checkout, keeps the daemon past the idle interval; once it is gone the unused daemon is
-    /// stopped.
+    /// The supervisor's ledger is the keeper's only source of use (04_sandbox.md, "The Nx daemon
+    /// stays on"). A host run the ledger does not hold -- its working directory in the checkout and
+    /// one of the checkout's task databases open -- is no use: the unused daemon is released an
+    /// interval after the shed was last used, as it is with nothing running at all. The probes of
+    /// that whole interval, one every [`PROBE_INTERVAL`], begin no process-table walk; a one-shot
+    /// census, the guard of a destructive operation, still finds the host run.
     #[cfg(target_os = "macos")]
     #[tokio::test(start_paused = true)]
-    async fn an_idle_looking_shed_with_a_host_run_in_it_keeps_its_daemon() {
+    async fn a_process_the_ledger_does_not_hold_keeps_no_daemon() {
         let root = std::env::temp_dir().join(format!(
             "cowshed-keeper-host-run-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::create_dir_all(&root).expect("scratch");
+        let data = nx::workspace_data(&root);
+        std::fs::create_dir_all(&data).expect("scratch");
+        let database = data.join("task-v3.db");
+        std::fs::write(&database, b"").expect("database");
         // Backgrounded by an `sh` that exits at once, so launchd adopts it rather than this test
-        // process, as it adopts a host shell's run.
+        // process, as it adopts a host shell's run; it holds the database open on descriptor 3.
         let mut shell = std::process::Command::new("/bin/sh");
         shell
-            .args(["-c", "/bin/sleep 600 </dev/null >/dev/null 2>&1 & echo $!"])
+            .arg("-c")
+            .arg(format!(
+                "/bin/sleep 600 3<'{}' </dev/null >/dev/null 2>&1 & echo $!",
+                database.display()
+            ))
             .current_dir(&root)
             .stdout(std::process::Stdio::piped());
         let started = cowshed_os::fork_lock::Spawn::spawn_locked(&mut shell)
@@ -1226,24 +1156,69 @@ mod tests {
             .trim()
             .parse()
             .expect("a pid");
+        let walks = crate::build_volume::nx::process_table_walks();
         let mut keeper = keeper();
-        assert_eq!(keeper.judge(&root, false, Probe::Live).await, Verdict::Keep);
-        tokio::time::advance(IDLE * 2).await;
-        let kept = keeper.judge(&root, false, Probe::Live).await;
+        let mut verdicts = Vec::new();
+        let mut waited = Duration::ZERO;
+        while waited <= IDLE {
+            verdicts.push(keeper.judge(&root, None, Probe::Live).await);
+            tokio::time::advance(PROBE_INTERVAL).await;
+            waited += PROBE_INTERVAL;
+        }
+        let walked = crate::build_volume::nx::process_table_walks() - walks;
+        let census = crate::build_volume::nx::tree_holders(&root);
+        let censused = crate::build_volume::nx::process_table_walks() - walks - walked;
         // SAFETY: kill takes plain integers and touches no memory of ours.
         unsafe { libc::kill(run, libc::SIGKILL) };
-        // SAFETY: the null signal only asks whether the pid is still held.
-        while unsafe { libc::kill(run, 0) } == 0 {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(kept, Verdict::Keep, "a host run in the checkout is use");
-        tokio::time::advance(IDLE).await;
-        assert_eq!(
-            keeper.judge(&root, false, Probe::Live).await,
-            Verdict::Release,
-            "once the run is gone the unused daemon is stopped"
-        );
         std::fs::remove_dir_all(&root).expect("remove scratch");
+        let (idle, young) = verdicts.split_last().expect("probes");
+        assert!(
+            young.iter().all(|verdict| *verdict == Verdict::Keep),
+            "a daemon is kept for the whole interval: {verdicts:?}"
+        );
+        assert_eq!(
+            *idle,
+            Verdict::Release,
+            "a host run the ledger does not hold is no use"
+        );
+        assert_eq!(
+            walked,
+            0,
+            "{} probes began {walked} process-table walks",
+            verdicts.len()
+        );
+        assert!(censused > 0, "a one-shot census walks the process table");
+        assert!(
+            census
+                .expect("the one-shot census")
+                .iter()
+                .any(|holder| holder.pid == run),
+            "a one-shot census still finds the host run"
+        );
+    }
+
+    /// A kept daemon names what in the ledger keeps it, a job or a named session, for as long as
+    /// it lasts; once the ledger holds neither, nothing keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_daemon_names_what_in_the_ledger_keeps_it() {
+        let mut keeper = keeper();
+        let root = Path::new(NO_PROJECT);
+        let job = Use::Job(JobId::new(7).expect("a job id"));
+        assert_eq!(
+            keeper.judge(root, Some(job.clone()), Probe::Live).await,
+            Verdict::Keep
+        );
+        assert_eq!(keeper.kept_by, Some(job));
+        tokio::time::advance(IDLE * 2).await;
+        let session = Use::Session("build".to_owned());
+        assert_eq!(
+            keeper.judge(root, Some(session.clone()), Probe::Live).await,
+            Verdict::Keep,
+            "a job or session is use however long it lasts"
+        );
+        assert_eq!(keeper.kept_by, Some(session));
+        assert_eq!(keeper.judge(root, None, Probe::Live).await, Verdict::Keep);
+        assert_eq!(keeper.kept_by, None);
     }
 
     /// A scratch tree with two PATH directories, `a` and `b`, and the PATH that lists them.

@@ -216,24 +216,37 @@ pub fn close_workspace_data(data: &Path) -> io::Result<Result<(), Busy>> {
         return Ok(Err(busy));
     }
     if let Some(pid) = daemon
-        && !stop_daemon(pid)?
+        && let Err(busy) = stop_live_daemon(pid)?
     {
-        return Ok(Err(Busy::DaemonStayed {
-            daemon: Holder {
-                pid,
-                command: command_line(pid),
-            },
-        }));
+        return Ok(Err(busy));
     }
     Ok(first_held(&databases, None)?.map_or(Ok(()), Err))
 }
 
-/// Whether a process other than the live daemon of the `workspace-data` directory `data` holds
-/// one of its task databases open, as [`close_workspace_data`] first asks: an Nx client at work,
-/// which a host shell is as much as a job. Nothing is stopped. Nx's graph and hash passes open
-/// no database, so this is the signal of a run's tasks, not of every client.
-pub fn in_use(data: &Path) -> io::Result<Option<Busy>> {
-    first_held(&task_databases_in(data)?, live_daemon(data))
+/// Stop the live daemon the `workspace-data` directory `data` records, as stock `nx daemon
+/// --stop` does, and wait for its exit; `None` when none is live. It asks nothing of any other
+/// process, so it reads no process table: an idle shed's keeper stops its daemon this way once
+/// the supervisor's ledger has held no job and no session for the idle interval (04_sandbox.md,
+/// "The Nx daemon stays on").
+pub fn stop_recorded_daemon(data: &Path) -> io::Result<Result<Option<i32>, Busy>> {
+    let Some(pid) = live_daemon(data) else {
+        return Ok(Ok(None));
+    };
+    Ok(stop_live_daemon(pid)?.map(|()| Some(pid)))
+}
+
+/// `SIGTERM` the live daemon `pid` and wait for its exit ([`stop_daemon`]); one that outlives
+/// its grace is [`Busy::DaemonStayed`].
+fn stop_live_daemon(pid: i32) -> io::Result<Result<(), Busy>> {
+    if stop_daemon(pid)? {
+        return Ok(Ok(()));
+    }
+    Ok(Err(Busy::DaemonStayed {
+        daemon: Holder {
+            pid,
+            command: command_line(pid),
+        },
+    }))
 }
 
 /// The first of `databases` that a process other than `daemon` holds open, with its holders:
@@ -536,10 +549,26 @@ pub fn tree_holds(root: &Path) -> io::Result<Vec<TreeHold>> {
         .collect())
 }
 
+/// Process-table walks this process has begun: every listing of all pids a holder census starts
+/// from (`all_pids`, `proc_listpidspath`, a `/proc` read). Never on an interval and never in a
+/// supervisor's actor (02_workspaces.md, "Holders cowshed does not run"), which tests read
+/// through [`process_table_walks`].
+static PROCESS_TABLE_WALKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many process-table walks this process has begun ([`PROCESS_TABLE_WALKS`]).
+pub fn process_table_walks() -> u64 {
+    PROCESS_TABLE_WALKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn walk_begins() {
+    PROCESS_TABLE_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Every process under `/proc` that `held` names something for, given its `/proc/<pid>`
 /// directory, with what it named.
 #[cfg(target_os = "linux")]
 fn procfs_census<T>(held: impl Fn(&Path) -> Option<T>) -> io::Result<Vec<(Holder, T)>> {
+    walk_begins();
     let mut holders = Vec::new();
     for process in fs::read_dir("/proc")? {
         let process = process?;
@@ -890,6 +919,7 @@ const O_EVTONLY: u32 = 0x0000_8000;
 /// except pid 0. The listing grows until it fits, as `listpidspath`'s does.
 #[cfg(target_os = "macos")]
 fn all_pids() -> io::Result<Vec<libc::pid_t>> {
+    walk_begins();
     let mut capacity = 256usize;
     loop {
         let mut pids: Vec<libc::pid_t> = vec![0; capacity];
@@ -946,6 +976,7 @@ fn executable(pid: libc::pid_t) -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn listpidspath(path: &Path, pathflags: u32) -> io::Result<Vec<Holder>> {
+    walk_begins();
     use std::os::unix::ffi::OsStrExt;
     const PROC_ALL_PIDS: u32 = 1;
     unsafe extern "C" {

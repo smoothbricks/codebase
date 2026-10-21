@@ -5828,11 +5828,18 @@ impl SupervisorActor {
         }
         // The keeper's foreground job is maintenance, not use by the developer. It still belongs
         // to the ordinary job ledger and every lifecycle drain waits for its real conclusion.
-        let working = !self.named_sessions.is_empty()
-            || self
-                .jobs
-                .iter()
-                .any(|(id, job)| Some(*id) != keeper.starting && !job.terminal());
+        let working = self
+            .jobs
+            .iter()
+            .find(|(id, job)| Some(**id) != keeper.starting && !job.terminal())
+            .map(|(id, _)| super::nx_daemon::Use::Job(*id))
+            .or_else(|| {
+                self.named_sessions
+                    .keys()
+                    .next()
+                    .cloned()
+                    .map(super::nx_daemon::Use::Session)
+            });
         if keeper.judge(&project_root, working, daemon).await == Verdict::Release {
             return;
         }

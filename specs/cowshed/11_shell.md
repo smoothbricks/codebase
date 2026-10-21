@@ -782,9 +782,8 @@ admitted but never sealed. Two things put that right:
 — including one that names no build at all — to drain: it admits nothing more, lets its running jobs finish, and
 retires, and the next command for its workspace gets a supervisor of the new build. `drain` is the one request whose
 shape never changes across builds, so any later daemon can retire any earlier supervisor. A supervisor of the daemon's
-own build keeps serving across a daemon restart and retires on its own when idle, unless a process it does not run holds
-the mount (02_workspaces.md, "Holders cowshed does not run"): then it keeps serving and looks again after another idle
-bound.
+own build keeps serving across a daemon restart and retires on its own once its ledger has held nothing for its idle
+bound; it reads no process table to decide (02_workspaces.md, "Holders cowshed does not run").
 
 A draining supervisor serves the ends of the jobs it ran before it retires. Their clients are of its own build, and the
 workspace's next supervisor is of another, whose protocol they cannot speak: measured 2026-10-20, an exec client of the

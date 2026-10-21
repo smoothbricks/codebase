@@ -198,8 +198,9 @@ deleting it. A background delete that finds another delete of the checkout runni
 and then takes whatever is still pending, so what its own refresh moved aside never waits for a later one. A process
 that ends first, a crash included, leaves the rest pending. Every later refresh of the checkout resumes the delete, and
 `cowshed gc` finishes it, naming each directory it deletes. A discovery job that has not answered within 10 seconds says
-on stderr every 10 seconds what it is waiting on: the processes holding the host Cargo home's package-cache locks, or
-none, in which case it is the shell's activation or Cargo itself.
+on stderr every 10 seconds what it is waiting on: the processes that held the host Cargo home's package-cache locks at
+its first report, looked up once for the whole wait, or none, in which case it is the shell's activation or Cargo
+itself.
 
 Cargo discovery runs at most four queries concurrently within one activation of each selected workspace shell. Answers
 and failures retain manifest order; a failed manifest does not hide independent workspaces. The existing tracked-input

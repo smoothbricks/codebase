@@ -8684,7 +8684,7 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                 &census,
                 &super::mount_activity::Accounted {
                     supervisor,
-                    ledger: Some(&ledger),
+                    ledger: &ledger,
                 },
             )
         })
@@ -8850,15 +8850,6 @@ impl<H: RuntimeStorageHost> StorageProjectRuntimeHost<H> {
                     }
                     let since = *idle_since.get_or_insert(now);
                     if now.duration_since(since) >= SUPERVISOR_IDLE {
-                        // A host shell's run on the mount runs no job here, yet the workspace
-                        // is in use: the supervisor stays while such a process holds it.
-                        let mount = self.workspace_mount_path(&name)?;
-                        let supervisor = self.serving_supervisor(&name).await?;
-                        if let Some(held) = self.mount_held(&name, &mount, supervisor).await? {
-                            eprintln!("cowshed: workspace {name}'s supervisor stays: {held}");
-                            idle_since = Some(now);
-                            continue;
-                        }
                         // One request: a command admitted since the last look finishes before
                         // the supervisor retires.
                         break actor.retire_after_jobs(NxDaemonRetirement::Recorded).await;

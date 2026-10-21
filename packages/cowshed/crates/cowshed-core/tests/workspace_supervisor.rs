@@ -6897,9 +6897,6 @@ async fn a_foreground_nx_keeper_does_not_count_as_user_work_and_quiescence_drain
 /// How long a shed must go unused before its keeper stops the daemon it keeps.
 const NX_IDLE: Duration = Duration::from_secs(5 * 60);
 
-/// How often a shed's keeper looks for a client at work.
-const NX_LOOK: Duration = Duration::from_secs(30);
-
 /// The daemon a start job leaves, as Nx leaves one: a running process its record names, whose
 /// socket accepts. The process stands in for the daemon and is `sleep`, which a `SIGTERM` ends.
 /// The socket is served, as Nx's daemon serves its own: a listener nobody accepts from refuses
@@ -7330,34 +7327,68 @@ async fn a_shed_keeps_its_nx_daemon_while_a_job_runs() {
     assert!(!daemon.running(), "the daemon stops once the shed is idle");
 }
 
-/// A host shell's Nx run is no job of the supervisor's, but it holds a task database open while
-/// its tasks run, so a shed whose gate runs from a host shell is not idle: the keeper's looks
-/// find the client and restart the idle interval, so the daemon outlives the interval that began
-/// when it came up.
-///
-/// The client lets go before the keeper first tries to stop the daemon, an interval after it came
-/// up. That attempt looks for holders itself and refuses to stop a daemon whose database is held,
-/// so a client still holding then would keep the daemon whether or not the periodic looks counted
-/// it: only a client that is gone by then tells the two apart.
+/// The supervisor's ledger alone says whether a shed is in use (04_sandbox.md, "The Nx daemon
+/// stays on"). A host client holding a task database open is no job of the shed's, so the daemon
+/// stops an interval after it came up all the same. Throughout, no probe begins a process-table
+/// walk, so nothing a probe does can wait on another process's kernel state, and the supervisor
+/// answers at once, before and after. A one-shot census, the guard of a destructive operation,
+/// still walks the table and finds the client.
+#[cfg(target_os = "macos")]
 #[tokio::test(start_paused = true)]
-async fn a_shed_keeps_its_nx_daemon_while_a_client_holds_a_task_database() {
-    let (_h, mut daemon, project, _root) = shed_with_live_nx_daemon("pika").await;
-
+async fn a_shed_s_ledger_alone_says_it_is_in_use_and_its_supervisor_answers_throughout() {
+    let (mut h, mut daemon, project, _root) = shed_with_live_nx_daemon("pika").await;
     let database = project.join(".nx/workspace-data/task-v3.db");
     std::fs::write(&database, b"").unwrap();
     let client = std::fs::File::open(&database).unwrap();
-    // Held for most of the interval the daemon came up with, and let go before it is over.
-    tokio::time::sleep(NX_IDLE - NX_LOOK).await;
+    let walks = cowshed_core::build_volume::nx::process_table_walks();
+
+    tokio::time::sleep(NX_IDLE - Duration::from_secs(30)).await;
+    let asked = Instant::now();
+    h.handle.current_authority().await.unwrap();
+    let answered = asked.elapsed();
+    assert!(daemon.running(), "a daemon is kept for the whole interval");
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let walked = cowshed_core::build_volume::nx::process_table_walks() - walks;
+    assert!(
+        !daemon.running(),
+        "a client the ledger does not hold keeps no daemon"
+    );
+    assert_eq!(
+        walked, 0,
+        "the supervisor began {walked} process-table walks over the interval"
+    );
+    let holders = cowshed_core::build_volume::nx::holders(&database).unwrap();
+    assert!(
+        cowshed_core::build_volume::nx::process_table_walks() - walks > 0,
+        "a one-shot census walks the process table"
+    );
+    let own = i32::try_from(std::process::id()).unwrap();
+    assert!(
+        holders.iter().any(|holder| holder.pid == own),
+        "a one-shot census still finds the client: {holders:?}"
+    );
     drop(client);
 
-    // The daemon was first found live at the keeper's first probe. Unless something restarts its
-    // interval it is stopped one interval later, at about 305 s, when the client is long gone. A
-    // keeper that counts the client stops it one interval after the last look that found the
-    // client, up to a look interval before the client let go: at about 545 s.
-    tokio::time::sleep(NX_LOOK * 5).await;
-    assert!(daemon.running(), "the interval starts when the client ends");
-    tokio::time::sleep(NX_LOOK * 6).await;
-    assert!(!daemon.running(), "the daemon stops once the shed is idle");
+    let asked = Instant::now();
+    let job = h
+        .handle
+        .exec(
+            None,
+            None,
+            request(StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let admitted = asked.elapsed();
+    let ran = h.spawned.recv().await.unwrap();
+    assert_eq!(ran.request.job_id, job);
+    assert!(
+        answered < Duration::from_secs(1) && admitted < Duration::from_secs(1),
+        "the supervisor answered in {answered:?} and admitted in {admitted:?}"
+    );
+    complete(&ran, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    h.handle.wait(job).await.unwrap();
 }
 
 /// A supervisor whose keeper still holds a daemon is not idle, however little else it holds, so

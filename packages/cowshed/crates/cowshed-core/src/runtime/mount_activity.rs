@@ -28,8 +28,8 @@ pub(crate) struct Accounted<'a> {
     /// The process serving the workspace's supervisor, when one is known to serve.
     pub supervisor: Option<i32>,
     /// The job-group ledger beside the workspace's supervisor socket: a job that left the
-    /// supervisor's tree. Absent for the supervisor's own keeper, which has no socket path.
-    pub ledger: Option<&'a Path>,
+    /// supervisor's tree.
+    pub ledger: &'a Path,
 }
 
 /// A workspace mount that processes cowshed does not account for hold, each named with what it
@@ -97,9 +97,7 @@ pub(crate) fn unaccounted(
         if descends_from(held.holder.pid, &roots) {
             continue;
         }
-        if let Some(ledger) = accounted.ledger
-            && job_groups::owned_process(ledger, held.holder.pid)?.is_some()
-        {
+        if job_groups::owned_process(accounted.ledger, held.holder.pid)?.is_some() {
             continue;
         }
         holders.push(held);
@@ -189,7 +187,7 @@ mod tests {
         let ledger = beside.join("supervisor.groups");
         let accounted = Accounted {
             supervisor: None,
-            ledger: Some(&ledger),
+            ledger: &ledger,
         };
         let mut working = holder(&packages, None);
         let mut reading = holder(&beside, Some(&lock));
@@ -248,7 +246,7 @@ mod tests {
             &mount,
             &Accounted {
                 supervisor: None,
-                ledger: Some(&ledger),
+                ledger: &ledger,
             },
             &[pid],
         );
@@ -256,7 +254,7 @@ mod tests {
             &mount,
             &Accounted {
                 supervisor: Some(i32::try_from(std::process::id()).unwrap()),
-                ledger: Some(&ledger),
+                ledger: &ledger,
             },
         )
         .unwrap();

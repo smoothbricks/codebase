@@ -253,6 +253,9 @@ impl CargoRunner for JobCargo<'_> {
             let output = self.runtime.block_on(async {
                 tokio::pin!(job);
                 let started = std::time::Instant::now();
+                // Who holds Cargo's locks is looked up once, at the first report, and named in
+                // every later one: the wait never walks the process table again.
+                let mut held: Option<String> = None;
                 let mut report = tokio::time::interval_at(
                     tokio::time::Instant::now() + WAIT_REPORT,
                     WAIT_REPORT,
@@ -263,12 +266,12 @@ impl CargoRunner for JobCargo<'_> {
                         _ = report.tick() => eprintln!(
                             "cowshed: build-state discovery has waited {}s on `cargo {}` in {} \
                              ({} manifests, run as a job after the workspace shell's \
-                             activation); {}",
+                             activation); {} (holders as of the first report)",
                             started.elapsed().as_secs(),
                             args.first().copied().unwrap_or_default(),
                             directory.display(),
                             batch.len(),
-                            cargo_lock_holders(&self.sandbox.home),
+                            held.get_or_insert_with(|| cargo_lock_holders(&self.sandbox.home)),
                         ),
                     }
                 }

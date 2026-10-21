@@ -1087,12 +1087,12 @@ ordinary remedy `git rebase --onto <new-main> e9e596563`; it never replays that 
    initialization before it, and the build-volume adoption and retirement after it (steps 4 and 5), run unlocked, so a
    writer queued on the lock waits for this fence, never for a land's minutes of other work. A land that finds the lock
    held waits for it without bound — its holder is a writer of the same branch, which the land follows rather than
-   overtakes — and says on stderr every 10 s how long it has waited and which processes hold the file. Its `delivery`
-   span is the hold. Measured 2026-10-20 with the whole land under such a lock: an operator's land held its ref lock for
-   82 to 85 s per land, about 56 to 63 s of it build-volume adoption, and one land held it 45 minutes while its Nx cache
-   initialization waited, so every Markdown commit queued behind work the lock does not protect. Without `--ref-lock`,
-   git's own ref and index locks are the only fence against such writers, and the head is still re-read and revalidated
-   just before the fast-forward.
+   overtakes — and says on stderr every 10 s how long it has waited and which processes held the file when the wait
+   began: one look at the holders per wait, never one per report. Its `delivery` span is the hold. Measured 2026-10-20
+   with the whole land under such a lock: an operator's land held its ref lock for 82 to 85 s per land, about 56 to 63 s
+   of it build-volume adoption, and one land held it 45 minutes while its Nx cache initialization waited, so every
+   Markdown commit queued behind work the lock does not protect. Without `--ref-lock`, git's own ref and index locks are
+   the only fence against such writers, and the head is still re-read and revalidated just before the fast-forward.
 
    **Land has no branch-name contract.** It fetches whatever branch the workspace has checked out — `cowshed/<ws>` is
    what `fork` creates, but an agent may have made `wt/<ws>` or anything else, and land neither assumes nor requires the
@@ -1326,7 +1326,8 @@ directory or executable is under the mount, or it has a file there open. Event-o
 Spotlight, cowshed's own shell watches). A host shell's `direnv exec <ws> nx …` is such a process. It runs with no
 supervisor and no job, so the supervisor's view alone calls the workspace idle. On 2026-10-21 a census of idle sheds
 that went by supervisors alone missed at least nine running Nx runs; adding the working-directory and open-file checks
-found them.
+found them. Such work belongs in `cowshed exec`, whose jobs the supervisor's ledger records; the census is no way of
+keeping it alive.
 
 Cowshed runs three kinds of process on a workspace, and only these are exempt: the supervisor's process tree, the job
 groups its ledger records (11_shell.md), and the Nx daemon the checkout's own record names, with its plugin workers. The
@@ -1336,17 +1337,18 @@ hold it finds. For each holder it then walks up the parents and reads the ledger
 stats nothing on the mount but its root. A holder whose parent the kernel will not describe to this user is not shown to
 be cowshed's, so it stays a holder.
 
-`detach`, `rm`, the retirement a `land` ends with (which is `rm`'s), `mv`, gc's retirement of an abandoned unpublished
-clone, a supervisor's idle retirement, and the Nx keeper's daemon stop (04_sandbox.md) all consult it. Each asks before
-the supervisor stops, with the serving supervisor exempt. Stopping the supervisor first would end the keeper's Nx daemon
+A holder check belongs in front of a destructive operation and nowhere else: once per operation, in that operation's own
+context, never on an interval and never inside a supervisor's actor. `detach`, `rm`, the retirement a `land` ends with
+(which is `rm`'s), `mv` and gc's retirement of an abandoned unpublished clone consult this census. Each asks before the
+supervisor stops, with the serving supervisor exempt. Stopping the supervisor first would end the keeper's Nx daemon
 that a host run may be using, so the census itself would disrupt what it measures. A retirement asks again once the
 supervisor has stopped, before the image is retired. A held mount refuses with `conflict`, naming each holder's pid,
 command, and what it holds where (`pid 4242 (nx run-many -t test), working directory /…/raven/packages`). It names ten
 holders and counts the rest. Nothing is stopped, and no flag overrides the refusal (11_shell.md, "Teardown ordering"). A
-supervisor whose idle bound expires while such a process holds the mount keeps serving, says so on stderr, and looks
-again after another bound. A keeper about to stop an idle shed's daemon keeps it instead, saying what holds the
-checkout. gc's build-volume collection is a separate gate with its own grace (16_build_volumes.md) and does not consult
-it.
+supervisor's idle retirement and the Nx keeper's daemon stop (04_sandbox.md) run on timers and consult the supervisor's
+ledger alone: a supervisor retires once its ledger has held nothing for its idle bound, whatever else is on the mount,
+since retiring it unmounts nothing. gc's build-volume collection is a separate gate with its own grace
+(16_build_volumes.md) and does not consult it.
 
 When a detach's unmount is still refused by the kernel, the refusal names what holds the volume: first the tree census,
 then the volume census, which also walks mapped files. When neither names a process of this user, the refusal says so

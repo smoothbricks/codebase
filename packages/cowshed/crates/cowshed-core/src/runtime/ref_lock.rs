@@ -25,8 +25,9 @@ pub struct RefLock {
 impl RefLock {
     /// Take the ref lock at `path`, creating its file if no writer has yet. An uncontended lock is
     /// taken at once; a held one is waited for on a helper thread, and the wait says every
-    /// [`WAIT_REPORT`] who holds the file. Nothing bounds the wait: the holder is a writer moving
-    /// the same branch, which a land must follow, not overtake.
+    /// [`WAIT_REPORT`] how long it has waited and who held the file when it began: one look at
+    /// the holders for the whole wait, never one per report. Nothing bounds the wait: the holder
+    /// is a writer moving the same branch, which a land must follow, not overtake.
     pub async fn acquire(path: &RefLockPath) -> Result<Self> {
         let file = open(path.as_path()).map_err(|error| failure(path, "open", &error))?;
         match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
@@ -45,6 +46,7 @@ impl RefLock {
             .map_err(|error| failure(path, "start the waiter for", &error))?;
         tokio::pin!(waiter);
         let started = Instant::now();
+        let held = holder_text(path.as_path());
         let mut report = tokio::time::interval_at(tokio::time::Instant::now(), WAIT_REPORT);
         loop {
             tokio::select! {
@@ -58,10 +60,9 @@ impl RefLock {
                     return Ok(Self { _file: file });
                 }
                 _ = report.tick() => eprintln!(
-                    "cowshed: land has waited {}s for the ref lock {}: {}",
+                    "cowshed: land has waited {}s for the ref lock {}: {held} when the wait began",
                     started.elapsed().as_secs(),
                     path.as_str(),
-                    holder_text(path.as_path()),
                 ),
             }
         }
