@@ -42,7 +42,8 @@ when it cannot collect the host at all.
 **Inherited shells.** Every activation whose inputs stayed put while it ran (below) leaves its export in
 `.cowshed/shell-host/activation.json`, written by the supervisor, so the APFS clone carries it to every workspace forked
 from this one, and a fork of a fork carries it again. A host that starts with no live generation adopts that export
-instead of evaluating when three checks pass, and evaluates otherwise:
+instead of evaluating when four checks pass, and evaluates otherwise (the checkout the record was written in needs only
+the first two: nothing moves):
 
 - **The inputs are the same bytes.** The record keeps the activation's watch list, each input relative to the checkout
   root, and its key: SHA-256 over every input, ordered by relative path, as (path, whether it exists, its bytes). The
@@ -60,15 +61,20 @@ instead of evaluating when three checks pass, and evaluates otherwise:
   `-Wl,-rpath,/x/repo/lib`, never `/x/repo-worktrees` or `/w/x/repo`); devenv's `DEVENV_RUNTIME`, a hash of the dotfile
   path, is recomputed as devenv computes it. The check after the move is stricter than the move: a value in which an
   origin place still ends a component anywhere, or that holds a number inside the origin's port block, refuses adoption,
-  since a false refusal costs one evaluation and a false pass would hand the clone the origin's tree. A value derived
-  from a hash of the root or from a fact cowshed does not publish is invisible to that check. The two-root equivalence
-  fixture (08_testing.md) proves the mechanism for cowshed's own fixture shell, and that monorepo's export was measured
-  against a fresh evaluation of a fork (of its 71 variables, 51 equal as recorded, 16 equal after the move,
-  `DEVENV_RUNTIME` recomputed, `DIRENV_WATCHES` rebuilt, `COWSHED_RUNTIME_LINK` read from the tail, and
-  `DEVENV_TASK_FILE` dropped); no gate runs a repository's own shell at two roots, so a repository edit that adds such a
-  value (an `.envrc` exporting a hash of `$PWD`, say) is adopted with the origin's value. That is a known limitation of
-  adoption as built, stated here so no reader takes an adopted shell for proof against it; closing it means scoping
-  adoption to a producer a two-root gate has measured, not a runtime check.
+  since a false refusal costs one evaluation and a false pass would hand the clone the origin's tree.
+- **The producer is certified.** No check of the values can see one derived from a hash of the checkout path (an
+  `.envrc` exporting a hash of `$PWD`) or from a fact cowshed does not publish, so a record moves only once its input
+  generation's producer has been measured at two roots. A clone whose inherited record is uncertified evaluates, as
+  every clone used to; when its own export, for the same input bytes over an equivalent baseline, equals the moved one
+  variable for variable (withheld names by name), the supervisor writes its record with the proof — the two roots — and
+  gives the origin's record the same proof if that record is still the one the clone read (compared by its bytes'
+  SHA-256). Clones of either then adopt. Any disagreement leaves both uncertified, names the variable on the
+  supervisor's stderr, and every later clone of that generation evaluates; a hash of `$PWD` therefore never reaches a
+  clone. The cost is one evaluation per input generation, by its first clone. The two-root fixture (08_testing.md) runs
+  this end to end, the `$PWD` hash included, and a devenv monorepo's export was measured against a fresh evaluation of a
+  fork (of its 71 variables, 51 equal as recorded, 16 equal after the move, `DEVENV_RUNTIME` recomputed,
+  `DIRENV_WATCHES` rebuilt, `COWSHED_RUNTIME_LINK` read from the tail, and `DEVENV_TASK_FILE` dropped), the comparison a
+  certification makes.
 
 The record never carries direnv's own `DIRENV_WATCHES` and `DIRENV_DIFF` (the host rebuilds both for its checkout),
 `DEVENV_TASK_FILE` (the parent's task file runs scripts built with the parent's root; tasks and processes are not tools)

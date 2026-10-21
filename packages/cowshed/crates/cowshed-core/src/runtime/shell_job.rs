@@ -1313,17 +1313,22 @@ impl HostActivator {
             shell_inherit::verify(&Placement::of(&mount, &baseline), &baseline)
         })
         .await;
-        let miss = match verified {
+        // An uncertified record of another checkout is kept: this evaluation is the second root
+        // its producer needs, and agreeing with it certifies the records ([`Self::record`]).
+        let (miss, inherited) = match verified {
             Ok(Ok(verified)) => match self
                 .adopt_host(host, envrc_directory, &verified, &stderr)
                 .await
             {
                 Ok(Ok(())) => return HostActivation::Ready(Ok(verified.into_evidence())),
-                Ok(Err(refused)) => refused,
+                Ok(Err(refused)) => (refused, None),
                 Err(error) => return HostActivation::Broken(error),
             },
-            Ok(Err(miss)) => miss.to_string(),
-            Err(error) => format!("the inheritance check failed: {error}"),
+            Ok(Err(miss)) => {
+                let reason = miss.to_string();
+                (reason, miss.into_uncertified())
+            }
+            Err(error) => (format!("the inheritance check failed: {error}"), None),
         };
         report_on(
             &stderr,
@@ -1445,17 +1450,30 @@ impl HostActivator {
                     && evidence.stable()
                     && let Some(contents) = &evidence.contents
                 {
-                    self.record(evidence.entries.clone(), contents.clone(), export)
-                        .await;
+                    self.record(
+                        evidence.entries.clone(),
+                        contents.clone(),
+                        export,
+                        inherited,
+                    )
+                    .await;
                 }
                 HostActivation::Ready(evidence)
             }
         }
     }
 
-    /// Leave a stable evaluation's export in this checkout's host directory. A record that
-    /// cannot be written only means a clone evaluates for itself; the reason is reported.
-    async fn record(&self, entries: Vec<WatchEntry>, contents: Contents, export: Vec<u8>) {
+    /// Leave a stable evaluation's export in this checkout's host directory, certifying the
+    /// uncertified record this checkout inherited when its export agrees with it after the move.
+    /// A record that cannot be written only means a clone evaluates for itself; that, and a
+    /// producer that disagrees, is reported.
+    async fn record(
+        &self,
+        entries: Vec<WatchEntry>,
+        contents: Contents,
+        export: Vec<u8>,
+        inherited: Option<shell_inherit::Uncertified>,
+    ) {
         let mount = self.workspace_mount.clone();
         let baseline = self.environment.clone();
         let written = tokio::task::spawn_blocking(move || {
@@ -1469,18 +1487,35 @@ impl HostActivator {
                 &entries,
                 &contents,
                 &export,
+                inherited.as_ref(),
             )
             .map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| error.to_string())
         .and_then(|written| written);
-        if let Err(reason) = written {
-            eprintln!(
+        match written {
+            Ok(shell_inherit::Certification::NotAttempted) => {}
+            Ok(shell_inherit::Certification::Certified { origin }) => eprintln!(
+                "cowshed: the workspace shell of {} certified its origin's export at a second root{}",
+                self.workspace_mount.display(),
+                if origin {
+                    "; clones of either adopt it"
+                } else {
+                    "; the origin's record had changed, so only clones of this one adopt it"
+                }
+            ),
+            Ok(shell_inherit::Certification::Differs { name }) => eprintln!(
+                "cowshed: the workspace shell of {} exports {name} differently from its origin's \
+                 after the move (a value derived from the checkout path, not a path in it); its \
+                 producer is not certified and clones evaluate their own",
+                self.workspace_mount.display()
+            ),
+            Err(reason) => eprintln!(
                 "cowshed: the workspace shell's export is not left for clones of {} ({reason}); \
                  each clone evaluates its own",
                 self.workspace_mount.display()
-            );
+            ),
         }
     }
 

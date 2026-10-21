@@ -308,9 +308,10 @@ them there; they contain the endpoint URL, whose userinfo is the workspace token
   never answers for the clone, and no shared writable cache, however content-addressed, serves executable shell exports.
   What a clone does take is its origin's export carried in its own image (`.cowshed/shell-host/activation.json`,
   11_shell.md "Inherited shells"), and only within this boundary: keyed by the bytes of the activation's recorded inputs
-  and by its baseline environment, both recomputed at the clone; moved to the clone's root, runtime link and dotfile,
-  with any value still naming the origin refused; never carrying `DEVENV_TASK_FILE`, a shell hook, a variable the secret
-  convention names, or what `.cowshed/env` publishes per workspace, whose values the clone reads from its own
+  and by its baseline environment, both recomputed at the clone; taken only once its producer is certified, two
+  checkouts' own evaluations of those bytes having agreed after the move; moved to the clone's root, runtime link and
+  dotfile, with any value still naming the origin refused; never carrying `DEVENV_TASK_FILE`, a shell hook, a variable
+  the secret convention names, or what `.cowshed/env` publishes per workspace, whose values the clone reads from its own
   `.cowshed/env` and `.envrc-local`; recomputable by evaluation and deletable at any time, a lost record costing one
   evaluation. It is a byproduct of an activation that already ran, in the workspace it ran in, not a second store.
 

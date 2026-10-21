@@ -267,13 +267,16 @@ readiness. Its actual parent retains the child unreaped through the exit observa
 
 The inherited-shell equivalence fixture (`cowshed-shell` `shell_pool.rs`,
 `host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_evaluation`) is the two-root test 11_shell.md
-"Inherited shells" rests on. Three workspaces of one tree at different roots, port blocks and runtime links: the origin
-evaluates; the adopter receives the origin's record and must serve its first command without evaluating; the evaluator
-has no record and evaluates. Their job environments, with each fixture's own root and runtime link replaced by fixed
-names and the per-job and per-port-block variables left out, must be equal, a credential from `.envrc-local` included,
-and the record must hold no credential value. A fourth workspace with one changed input byte must evaluate and say why.
-The fixture's shell is cowshed's own `.envrc`, not a repository's; the sandboxed lane covers the record, key, move and
-host protocol (`shell_inherit.rs`, `script_host.rs`) without it.
+"Inherited shells" rests on. Workspaces of one tree at different roots, port blocks and runtime links: the origin
+evaluates; the first clone carries its record, may not adopt it uncertified, evaluates and, agreeing, certifies the
+origin's record; the adopter then carries that record and must serve its first command without evaluating; the evaluator
+has no record and evaluates. The adopter's and the evaluator's job environments, with each fixture's own root and
+runtime link replaced by fixed names and the per-job and per-port-block variables left out, must be equal, a credential
+from `.envrc-local` and `-I`/`-L`/`-Wl,-rpath` paths included, and the record must hold no credential value. A workspace
+with one changed input byte must evaluate and say why. A shell exporting a hash of `$PWD` must never certify: its later
+clone evaluates, says its producer is not certified, and holds its own hash. The fixture's shell is cowshed's own
+`.envrc`, not a repository's; the sandboxed lane covers the record, key, move, certification and host protocol
+(`shell_inherit.rs`, `script_host.rs`) without it.
 
 The build-state CLI probe launches the installed `cowshed` binary through private `tools/bin` beneath the executed-child
 profile in both read-write and read-only modes. Its program link and resolved executable have literal read access with

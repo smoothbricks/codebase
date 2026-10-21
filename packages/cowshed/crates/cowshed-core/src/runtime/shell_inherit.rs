@@ -174,6 +174,10 @@ struct ActivationRecord {
     /// The withheld names the export set that the adopting checkout's tail supplies. Names only;
     /// no value of a credential is ever written.
     from_tail: BTreeSet<String>,
+    /// The certification of this input generation's producer: two checkout roots whose own
+    /// evaluations of these input bytes, over equivalent baselines, gave exports equal after the
+    /// move. Without it the record serves only the checkout it was written in.
+    proof: Option<[PathBuf; 2]>,
 }
 
 /// Where a checkout's record lives.
@@ -387,23 +391,10 @@ pub enum RecordError {
     Publish(#[from] crate::metadata::MetadataError),
 }
 
-/// Leave an activation's export for the checkouts cloned from this one. `export` is direnv's
-/// export the host applied, `contents` the inputs' bytes certified when it finished, and
-/// `baseline_environment` the host's environment before it.
-pub fn write_record(
-    placement: &Placement<'_>,
-    baseline_environment: &BTreeMap<OsString, OsString>,
-    entries: &[WatchEntry],
-    contents: &Contents,
+/// Split an export into what a record carries and the withheld names its tail supplies.
+fn carried(
     export: &BTreeMap<String, Option<String>>,
-) -> Result<(), RecordError> {
-    let watches: Vec<RecordedWatch> = entries
-        .iter()
-        .map(|entry| RecordedWatch {
-            exists: entry.exists,
-            ..relative(placement.root, &entry.path)
-        })
-        .collect();
+) -> (BTreeMap<String, Option<String>>, BTreeSet<String>) {
     let mut environment = BTreeMap::new();
     let mut from_tail = BTreeSet::new();
     for (name, value) in export {
@@ -417,24 +408,135 @@ pub fn write_record(
             Some(_) => {}
         }
     }
+    (environment, from_tail)
+}
+
+/// What writing a record did about its producer's certification.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Certification {
+    /// No uncertified record of another checkout was inherited for these input bytes.
+    NotAttempted,
+    /// This evaluation agreed with the inherited export after the move: both records now carry
+    /// the proof. `origin` says whether the origin's own record still was the one inherited.
+    Certified { origin: bool },
+    /// This evaluation disagreed with the inherited export after the move — a value the move
+    /// cannot produce, such as a hash of the checkout path. Clones keep evaluating.
+    Differs { name: String },
+}
+
+/// Leave an activation's export for the checkouts cloned from this one. `export` is direnv's
+/// export the host applied, `contents` the inputs' bytes certified when it finished, and
+/// `baseline_environment` the host's environment before it. `inherited` is the verified but
+/// uncertified record this checkout carried for the same input bytes, if any: this evaluation
+/// is the second root its producer needs, and agreeing with it certifies both records.
+pub fn write_record(
+    placement: &Placement<'_>,
+    baseline_environment: &BTreeMap<OsString, OsString>,
+    entries: &[WatchEntry],
+    contents: &Contents,
+    export: &BTreeMap<String, Option<String>>,
+    inherited: Option<&Uncertified>,
+) -> Result<Certification, RecordError> {
+    let watches: Vec<RecordedWatch> = entries
+        .iter()
+        .map(|entry| RecordedWatch {
+            exists: entry.exists,
+            ..relative(placement.root, &entry.path)
+        })
+        .collect();
+    let (environment, from_tail) = carried(export);
+    let key = key(placement.root, &watches, contents);
+    let baseline = baseline(placement, baseline_environment);
+    let certification = match inherited {
+        Some(inherited) if inherited.key == key && inherited.baseline == baseline => {
+            match inherited.differs_from(&environment, &from_tail) {
+                Some(name) => Certification::Differs { name },
+                None => Certification::Certified {
+                    origin: inherited.certify_origin(placement.root)?,
+                },
+            }
+        }
+        _ => Certification::NotAttempted,
+    };
+    let proof = match (&certification, inherited) {
+        (Certification::Certified { .. }, Some(inherited)) => {
+            Some([inherited.origin.clone(), placement.root.to_path_buf()])
+        }
+        _ => None,
+    };
     let record = ActivationRecord {
         v: RECORD_VERSION,
         places: placement.places().map(|place| place.map(Path::to_path_buf)),
         ports: placement.ports,
-        key: key(placement.root, &watches, contents),
-        baseline: baseline(placement, baseline_environment),
+        key,
+        baseline,
         watches,
         environment,
         from_tail,
+        proof,
     };
     crate::metadata::write_atomic_bytes(
         &record_path(placement.root),
         &serde_json::to_vec(&record)?,
     )?;
-    Ok(())
+    Ok(certification)
+}
+
+/// A record of another checkout that verified for this one in every way but certification:
+/// what this checkout's own evaluation must agree with to certify its producer.
+#[derive(Debug)]
+pub struct Uncertified {
+    origin: PathBuf,
+    /// SHA-256 of the origin's record file as it was read, so the origin's record gains the
+    /// proof only if it is still that record.
+    digest: [u8; 32],
+    key: String,
+    baseline: String,
+    /// The origin's export moved to this checkout, without the rebuilt watch list.
+    environment: BTreeMap<String, Option<String>>,
+    from_tail: BTreeSet<String>,
+}
+
+impl Uncertified {
+    /// The first variable on which this checkout's own export disagrees with the moved one.
+    fn differs_from(
+        &self,
+        environment: &BTreeMap<String, Option<String>>,
+        from_tail: &BTreeSet<String>,
+    ) -> Option<String> {
+        let names: BTreeSet<&String> = self.environment.keys().chain(environment.keys()).collect();
+        names
+            .into_iter()
+            .find(|name| self.environment.get(*name) != environment.get(*name))
+            .cloned()
+            .or_else(|| {
+                self.from_tail
+                    .symmetric_difference(from_tail)
+                    .next()
+                    .cloned()
+            })
+    }
+
+    /// Give the origin's record the proof, if it is still the record this checkout read.
+    fn certify_origin(&self, root: &Path) -> Result<bool, RecordError> {
+        let path = record_path(&self.origin);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(false);
+        };
+        if <[u8; 32]>::from(Sha256::digest(&bytes)) != self.digest {
+            return Ok(false);
+        }
+        let Ok(mut record) = serde_json::from_slice::<ActivationRecord>(&bytes) else {
+            return Ok(false);
+        };
+        record.proof = Some([self.origin.clone(), root.to_path_buf()]);
+        crate::metadata::write_atomic_bytes(&path, &serde_json::to_vec(&record)?)?;
+        Ok(true)
+    }
 }
 
 /// Why a host evaluates instead of adopting. Each is reported on the activating job's stderr.
+/// `Uncertified` carries what a certifying evaluation compares with; it is not reported whole.
 #[derive(Debug, thiserror::Error)]
 pub enum AdoptionMiss {
     #[error("no inherited shell record")]
@@ -455,6 +557,21 @@ pub enum AdoptionMiss {
     Residue { name: String },
     #[error("the inherited shell record carries {name}, which no record may")]
     Withheld { name: String },
+    #[error(
+        "the inherited shell's producer is not certified: no second checkout has evaluated these \
+         inputs to the same export; this evaluation is that check"
+    )]
+    Uncertified(Box<Uncertified>),
+}
+
+impl AdoptionMiss {
+    /// The record this checkout's evaluation can certify, when that is why adoption missed.
+    pub fn into_uncertified(self) -> Option<Uncertified> {
+        match self {
+            Self::Uncertified(inherited) => Some(*inherited),
+            _ => None,
+        }
+    }
 }
 
 /// An inherited export proven for this checkout. Built only by [`verify`].
@@ -494,7 +611,8 @@ impl VerifiedActivation {
     }
 }
 
-fn read_record(mount: &Path) -> Result<ActivationRecord, AdoptionMiss> {
+/// The record and the SHA-256 of its file's bytes.
+fn read_record(mount: &Path) -> Result<(ActivationRecord, [u8; 32]), AdoptionMiss> {
     let path = record_path(mount);
     let file = match std::fs::File::open(&path) {
         Ok(file) => file,
@@ -513,7 +631,7 @@ fn read_record(mount: &Path) -> Result<ActivationRecord, AdoptionMiss> {
     if record.v != RECORD_VERSION {
         return Err(AdoptionMiss::Version(record.v));
     }
-    Ok(record)
+    Ok((record, Sha256::digest(&bytes).into()))
 }
 
 /// Prove this checkout's inherited record, or say why it cannot serve.
@@ -521,7 +639,7 @@ pub fn verify(
     placement: &Placement<'_>,
     baseline_environment: &BTreeMap<OsString, OsString>,
 ) -> Result<VerifiedActivation, AdoptionMiss> {
-    let record = read_record(placement.root)?;
+    let (record, digest) = read_record(placement.root)?;
     if let Some((name, _)) = record
         .environment
         .iter()
@@ -599,6 +717,26 @@ pub fn verify(
         {
             return Err(AdoptionMiss::Residue { name: name.clone() });
         }
+    }
+    // A record moves to another checkout only once its producer is certified: two roots whose
+    // own evaluations of these input bytes agreed after the move ([`write_record`]). A value no
+    // move can produce — an `.envrc` exporting a hash of `$PWD`, arithmetic on the port block —
+    // makes those evaluations disagree, so such a record never certifies and every clone of it
+    // evaluates. The checkout the record was written in needs no proof: nothing moves.
+    let origin = record.places[0].clone().unwrap_or_default();
+    let certified = record
+        .proof
+        .as_ref()
+        .is_some_and(|[first, second]| first != second && (*first == origin || *second == origin));
+    if origin != placement.root && !certified {
+        return Err(AdoptionMiss::Uncertified(Box::new(Uncertified {
+            origin,
+            digest,
+            key: record.key,
+            baseline: record.baseline,
+            environment,
+            from_tail: record.from_tail,
+        })));
     }
     let entries: Vec<WatchEntry> = record
         .watches
@@ -728,14 +866,85 @@ mod tests {
         assert_eq!(withheld("DEVENV_ROOT", Some("/a")), None);
     }
 
-    /// Two checkouts of the same tree at different mounts, with their own per-workspace facts.
-    struct Pair {
-        scratch: PathBuf,
-        origin: PathBuf,
-        clone: PathBuf,
+    /// One checkout of the tree, with its own per-workspace facts.
+    struct Site {
+        root: PathBuf,
+        link: &'static str,
+        name: &'static str,
+        port: u32,
     }
 
-    impl Drop for Pair {
+    impl Site {
+        fn baseline(&self) -> BTreeMap<OsString, OsString> {
+            let (root, name, port) = (self.root.display(), self.name, self.port);
+            [
+                ("PATH", "/usr/bin:/bin".to_owned()),
+                ("HOME", format!("{root}/.cowshed/home")),
+                ("XDG_RUNTIME_DIR", self.link.to_owned()),
+                ("TMPDIR", format!("/store/tmp/{name}")),
+                ("COWSHED_PORT_BASE", port.to_string()),
+                ("COWSHED_PORT_BLOCK_SIZE", "64".to_owned()),
+                (
+                    "HTTPS_PROXY",
+                    format!("http://{name}-token@127.0.0.1:{port}"),
+                ),
+            ]
+            .into_iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect()
+        }
+
+        /// What this checkout's own evaluation exports, as devenv computes it here, plus
+        /// `extra`'s values for this checkout.
+        fn export(&self, extra: Extra) -> BTreeMap<String, Option<String>> {
+            let root = self.root.display();
+            let dotfile = format!("{root}/tooling/direnv/.devenv");
+            let digest = crate::api::dto::hex_lower(&Sha256::digest(dotfile.as_bytes()));
+            let mut export: BTreeMap<String, Option<String>> = [
+                ("DEVENV_ROOT", Some(format!("{root}/tooling/direnv"))),
+                (
+                    "DEVENV_RUNTIME",
+                    Some(format!("{}/devenv-{}", self.link, &digest[..7])),
+                ),
+                ("DEVENV_DOTFILE", Some(dotfile)),
+                (
+                    "PATH",
+                    Some(format!(
+                        "{root}/node_modules/.bin:/nix/store/abc-tool/bin:/usr/bin:/bin"
+                    )),
+                ),
+                ("HF_TOKEN", Some("hf_secret".to_owned())),
+                (
+                    "DEVENV_TASK_FILE",
+                    Some(format!("/nix/store/{}-tasks.json", self.name)),
+                ),
+                ("COWSHED_RUNTIME_LINK", Some(self.link.to_owned())),
+                ("REMOVED", None),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
+            for (name, value) in extra(self) {
+                export.insert(name.to_owned(), value);
+            }
+            export
+        }
+    }
+
+    type Extra = fn(&Site) -> Vec<(&'static str, Option<String>)>;
+
+    const NOTHING: Extra = |_| Vec::new();
+
+    /// The origin that evaluates first, a witness that evaluates the same inputs second, and the
+    /// clone that adopts.
+    struct Sites {
+        scratch: PathBuf,
+        origin: Site,
+        witness: Site,
+        clone: Site,
+    }
+
+    impl Drop for Sites {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.scratch);
         }
@@ -749,14 +958,35 @@ mod tests {
         "bun.lock",
     ];
 
-    fn pair(label: &str) -> Pair {
+    fn sites(label: &str) -> Sites {
         let scratch = std::env::temp_dir().join(format!(
             "cowshed-inherit-{label}-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let origin = scratch.join("dev/repo");
-        let clone = scratch.join("mnt/owner/repo/shed");
-        for (root, workspace) in [(&origin, "origin"), (&clone, "clone")] {
+        let site = |path: &str, link, name, port| Site {
+            root: scratch.join(path),
+            link,
+            name,
+            port,
+        };
+        let sites = Sites {
+            origin: site("dev/repo", "/tmp/cs-aaaaaaaaaaaa", "origin", 42240),
+            witness: site(
+                "mnt/owner/repo/first",
+                "/tmp/cs-cccccccccccc",
+                "first",
+                42368,
+            ),
+            clone: site(
+                "mnt/owner/repo/shed",
+                "/tmp/cs-bbbbbbbbbbbb",
+                "clone",
+                42304,
+            ),
+            scratch: scratch.clone(),
+        };
+        for checkout in [&sites.origin, &sites.witness, &sites.clone] {
+            let root = &checkout.root;
             std::fs::create_dir_all(root.join("tooling/direnv")).unwrap();
             std::fs::create_dir_all(root.join(SHELL_HOST_DIRECTORY)).unwrap();
             std::fs::write(root.join(".envrc"), "use devenv\n").unwrap();
@@ -764,125 +994,84 @@ mod tests {
             std::fs::write(root.join(".envrc-local"), "export HF_TOKEN=hf_secret\n").unwrap();
             std::fs::write(root.join("bun.lock"), "lock\n").unwrap();
             // Differs per workspace by construction: it holds the workspace's own token.
-            std::fs::write(root.join(".cowshed/env"), format!("export T={workspace}\n")).unwrap();
+            std::fs::write(
+                root.join(".cowshed/env"),
+                format!("export T={}\n", checkout.name),
+            )
+            .unwrap();
         }
-        Pair {
-            scratch,
-            origin,
-            clone,
-        }
+        sites
     }
 
-    fn baseline_of(
-        root: &Path,
-        link: &str,
-        workspace: &str,
-        port: u32,
-    ) -> BTreeMap<OsString, OsString> {
-        [
-            ("PATH", "/usr/bin:/bin".to_owned()),
-            ("HOME", format!("{}/.cowshed/home", root.display())),
-            ("XDG_RUNTIME_DIR", link.to_owned()),
-            ("TMPDIR", format!("/store/tmp/{workspace}")),
-            ("COWSHED_PORT_BASE", port.to_string()),
-            ("COWSHED_PORT_BLOCK_SIZE", "64".to_owned()),
-            (
-                "HTTPS_PROXY",
-                format!("http://{workspace}-token@127.0.0.1:{port}"),
-            ),
-        ]
-        .into_iter()
-        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
-        .collect()
-    }
-
-    fn entries(root: &Path) -> Vec<WatchEntry> {
-        INPUTS
+    /// Record `site`'s own evaluation as an activation would, certifying `inherited` if given.
+    fn evaluate(site: &Site, extra: Extra, inherited: Option<&Uncertified>) -> Certification {
+        let baseline = site.baseline();
+        let entries: Vec<WatchEntry> = INPUTS
             .iter()
             .map(|input| WatchEntry {
-                path: root.join(input),
+                path: site.root.join(input),
                 exists: true,
             })
-            .collect()
-    }
-
-    /// Evaluate nothing: record `export` at the origin as an activation would, and carry the
-    /// record to the clone as the APFS clone does.
-    fn record_and_clone(
-        pair: &Pair,
-        export: &BTreeMap<String, Option<String>>,
-    ) -> BTreeMap<OsString, OsString> {
-        let baseline = baseline_of(&pair.origin, "/tmp/cs-aaaaaaaaaaaa", "origin", 42240);
-        let entries = entries(&pair.origin);
+            .collect();
         let (_, contents) = certify(entries.iter().map(|entry| entry.path.as_path())).unwrap();
         write_record(
-            &Placement::of(&pair.origin, &baseline),
+            &Placement::of(&site.root, &baseline),
             &baseline,
             &entries,
             &contents,
-            export,
+            &site.export(extra),
+            inherited,
         )
-        .unwrap();
-        std::fs::copy(record_path(&pair.origin), record_path(&pair.clone)).unwrap();
-        baseline_of(&pair.clone, "/tmp/cs-bbbbbbbbbbbb", "clone", 42304)
+        .unwrap()
     }
 
-    fn export_at(origin: &Path) -> BTreeMap<String, Option<String>> {
-        let root = origin.display();
-        [
-            ("DEVENV_ROOT", Some(format!("{root}/tooling/direnv"))),
-            (
-                "DEVENV_DOTFILE",
-                Some(format!("{root}/tooling/direnv/.devenv")),
-            ),
-            (
-                "DEVENV_RUNTIME",
-                Some("/tmp/cs-aaaaaaaaaaaa/devenv-0000000".to_owned()),
-            ),
-            (
-                "PATH",
-                Some(format!(
-                    "{root}/node_modules/.bin:/nix/store/abc-tool/bin:/usr/bin:/bin"
-                )),
-            ),
-            ("SIBLING", Some(format!("{root}-worktrees/other"))),
-            ("HF_TOKEN", Some("hf_secret".to_owned())),
-            (
-                "DEVENV_TASK_FILE",
-                Some("/nix/store/xyz-tasks.json".to_owned()),
-            ),
-            (
-                "COWSHED_RUNTIME_LINK",
-                Some("/tmp/cs-aaaaaaaaaaaa".to_owned()),
-            ),
-            ("REMOVED", None),
-        ]
-        .into_iter()
-        .map(|(name, value)| (name.to_owned(), value))
-        .collect()
+    fn verify_at(site: &Site) -> Result<VerifiedActivation, AdoptionMiss> {
+        let baseline = site.baseline();
+        verify(&Placement::of(&site.root, &baseline), &baseline)
+    }
+
+    /// The lineage as it happens: the origin evaluates; the witness carries its record, cannot
+    /// adopt an uncertified one, evaluates the same inputs and so certifies or not; the clone then
+    /// carries the origin's record as it stands. Returns what the witness's record did.
+    fn lineage(sites: &Sites, extra: Extra) -> Certification {
+        evaluate(&sites.origin, extra, None);
+        std::fs::copy(
+            record_path(&sites.origin.root),
+            record_path(&sites.witness.root),
+        )
+        .unwrap();
+        let certification = match verify_at(&sites.witness) {
+            Err(miss) => match miss.into_uncertified() {
+                Some(inherited) => evaluate(&sites.witness, extra, Some(&inherited)),
+                None => Certification::NotAttempted,
+            },
+            Ok(_) => panic!("an uncertified record of another checkout was adopted"),
+        };
+        std::fs::copy(
+            record_path(&sites.origin.root),
+            record_path(&sites.clone.root),
+        )
+        .unwrap();
+        certification
     }
 
     #[test]
-    fn a_clone_adopts_the_moved_export_and_never_its_credentials() {
-        let pair = pair("adopt");
-        let clone_baseline = record_and_clone(&pair, &export_at(&pair.origin));
-        let written = std::fs::read_to_string(record_path(&pair.clone)).unwrap();
+    fn a_clone_adopts_a_certified_export_moved_and_never_its_credentials() {
+        let sites = sites("adopt");
+        assert_eq!(
+            lineage(&sites, NOTHING),
+            Certification::Certified { origin: true }
+        );
+        let written = std::fs::read_to_string(record_path(&sites.clone.root)).unwrap();
         assert!(
             !written.contains("hf_secret"),
             "no credential value is written"
         );
-        assert!(
-            !written.contains("xyz-tasks"),
-            "the parent's task file is not carried"
-        );
+        assert!(!written.contains("tasks.json"), "no task file is carried");
 
-        let verified = verify(
-            &Placement::of(&pair.clone, &clone_baseline),
-            &clone_baseline,
-        )
-        .unwrap();
+        let verified = verify_at(&sites.clone).unwrap();
         let environment = verified.environment();
-        let clone = pair.clone.display();
+        let clone = sites.clone.root.display();
         let value = |name: &str| environment.get(name).cloned().flatten();
         assert_eq!(
             value("DEVENV_ROOT"),
@@ -895,15 +1084,13 @@ mod tests {
             ))
         );
         assert_eq!(
-            value("SIBLING"),
-            Some(format!("{}-worktrees/other", pair.origin.display())),
-            "a sibling of the origin is not the origin"
-        );
-        let dotfile = format!("{clone}/tooling/direnv/.devenv");
-        let digest = crate::api::dto::hex_lower(&Sha256::digest(dotfile.as_bytes()));
-        assert_eq!(
             value("DEVENV_RUNTIME"),
-            Some(format!("/tmp/cs-bbbbbbbbbbbb/devenv-{}", &digest[..7]))
+            sites
+                .clone
+                .export(NOTHING)
+                .remove("DEVENV_RUNTIME")
+                .flatten(),
+            "recomputed as devenv computes it here"
         );
         assert!(!environment.contains_key("HF_TOKEN"));
         assert!(!environment.contains_key("DEVENV_TASK_FILE"));
@@ -925,109 +1112,150 @@ mod tests {
         assert_eq!(
             verified.tail(),
             [
-                pair.clone.join(".cowshed/env"),
-                pair.clone.join(".envrc-local")
+                sites.clone.root.join(".cowshed/env"),
+                sites.clone.root.join(".envrc-local")
             ]
         );
     }
 
     #[test]
-    fn a_changed_input_byte_misses() {
-        let pair = pair("key");
-        let clone_baseline = record_and_clone(&pair, &export_at(&pair.origin));
-        std::fs::write(pair.clone.join("bun.lock"), "lock2\n").unwrap();
+    fn an_uncertified_export_serves_only_its_own_checkout() {
+        let sites = sites("uncertified");
+        evaluate(&sites.origin, NOTHING, None);
+        assert!(
+            verify_at(&sites.origin).is_ok(),
+            "nothing moves in the origin itself"
+        );
+        std::fs::copy(
+            record_path(&sites.origin.root),
+            record_path(&sites.clone.root),
+        )
+        .unwrap();
         assert!(matches!(
-            verify(
-                &Placement::of(&pair.clone, &clone_baseline),
-                &clone_baseline
-            ),
+            verify_at(&sites.clone),
+            Err(AdoptionMiss::Uncertified(_))
+        ));
+    }
+
+    /// The concrete case no runtime check can see: a value derived from a hash of the checkout
+    /// path. The witness's own evaluation disagrees with the moved one, so the producer never
+    /// certifies and the clone evaluates instead of taking the origin's hash.
+    #[test]
+    fn a_value_hashed_from_the_checkout_path_never_certifies() {
+        let sites = sites("hashed-pwd");
+        let hashed: Extra = |site| {
+            let digest = Sha256::digest(site.root.as_os_str().as_bytes());
+            vec![("PWD_HASH", Some(crate::api::dto::hex_lower(&digest)))]
+        };
+        assert_eq!(
+            lineage(&sites, hashed),
+            Certification::Differs {
+                name: "PWD_HASH".into()
+            }
+        );
+        assert!(matches!(
+            verify_at(&sites.clone),
+            Err(AdoptionMiss::Uncertified(_))
+        ));
+    }
+
+    #[test]
+    fn a_changed_input_byte_misses() {
+        let sites = sites("key");
+        lineage(&sites, NOTHING);
+        std::fs::write(sites.clone.root.join("bun.lock"), "lock2\n").unwrap();
+        assert!(matches!(
+            verify_at(&sites.clone),
             Err(AdoptionMiss::KeyMoved)
         ));
     }
 
     #[test]
     fn a_rewrite_of_the_same_bytes_still_adopts() {
-        let pair = pair("same-bytes");
-        let clone_baseline = record_and_clone(&pair, &export_at(&pair.origin));
-        std::fs::remove_file(pair.clone.join("bun.lock")).unwrap();
-        std::fs::write(pair.clone.join("bun.lock"), "lock\n").unwrap();
-        assert!(
-            verify(
-                &Placement::of(&pair.clone, &clone_baseline),
-                &clone_baseline
-            )
-            .is_ok()
-        );
+        let sites = sites("same-bytes");
+        lineage(&sites, NOTHING);
+        std::fs::remove_file(sites.clone.root.join("bun.lock")).unwrap();
+        std::fs::write(sites.clone.root.join("bun.lock"), "lock\n").unwrap();
+        assert!(verify_at(&sites.clone).is_ok());
     }
 
     #[test]
     fn another_baseline_misses() {
-        let pair = pair("baseline");
-        let mut clone_baseline = record_and_clone(&pair, &export_at(&pair.origin));
-        clone_baseline.insert("EXTRA".into(), "1".into());
+        let sites = sites("baseline");
+        lineage(&sites, NOTHING);
+        let mut baseline = sites.clone.baseline();
+        baseline.insert("EXTRA".into(), "1".into());
         assert!(matches!(
-            verify(
-                &Placement::of(&pair.clone, &clone_baseline),
-                &clone_baseline
-            ),
+            verify(&Placement::of(&sites.clone.root, &baseline), &baseline),
             Err(AdoptionMiss::BaselineMoved)
         ));
     }
 
     #[test]
     fn every_workspace_place_moves() {
-        let pair = pair("places");
-        let mut export = export_at(&pair.origin);
-        export.insert("SCRATCH".into(), Some("/store/tmp/origin/cache".into()));
-        export.insert(
-            "CONFIG".into(),
-            Some(format!("{}/.cowshed/home/.config", pair.origin.display())),
+        let sites = sites("places");
+        let places: Extra = |site| {
+            vec![
+                ("SCRATCH", Some(format!("/store/tmp/{}/cache", site.name))),
+                (
+                    "CONFIG",
+                    Some(format!("{}/.cowshed/home/.config", site.root.display())),
+                ),
+            ]
+        };
+        assert_eq!(
+            lineage(&sites, places),
+            Certification::Certified { origin: true }
         );
-        let clone_baseline = record_and_clone(&pair, &export);
-        let verified = verify(
-            &Placement::of(&pair.clone, &clone_baseline),
-            &clone_baseline,
-        )
-        .unwrap();
+        let verified = verify_at(&sites.clone).unwrap();
         let value = |name: &str| verified.environment().get(name).cloned().flatten();
         assert_eq!(value("SCRATCH"), Some("/store/tmp/clone/cache".into()));
         assert_eq!(
             value("CONFIG"),
-            Some(format!("{}/.cowshed/home/.config", pair.clone.display()))
+            Some(format!(
+                "{}/.cowshed/home/.config",
+                sites.clone.root.display()
+            ))
         );
     }
 
     #[test]
     fn a_value_the_move_cannot_reach_misses() {
         // A number inside the origin's port block.
-        let pair = pair("port-residue");
-        let mut export = export_at(&pair.origin);
-        export.insert("LEFTOVER".into(), Some("http://127.0.0.1:42250/".into()));
-        let clone_baseline = record_and_clone(&pair, &export);
+        let sites = self::sites("port-residue");
+        let port: Extra = |site| {
+            vec![(
+                "LEFTOVER",
+                Some(format!("http://127.0.0.1:{}/", site.port + 10)),
+            )]
+        };
+        lineage(&sites, port);
         assert!(matches!(
-            verify(&Placement::of(&pair.clone, &clone_baseline), &clone_baseline),
+            verify_at(&sites.clone),
             Err(AdoptionMiss::Residue { name }) if name == "LEFTOVER"
         ));
         // A spelling the move does not reach: the origin inside a longer path.
-        let pair = self::pair("glued-residue");
-        let mut export = export_at(&pair.origin);
-        export.insert(
-            "LEFTOVER".into(),
-            Some(format!("/prefix{}/lib", pair.origin.display())),
-        );
-        let clone_baseline = record_and_clone(&pair, &export);
+        let sites = self::sites("glued-residue");
+        let glued: Extra = |site| {
+            vec![(
+                "LEFTOVER",
+                Some(format!("/prefix{}/lib", site.root.display())),
+            )]
+        };
+        lineage(&sites, glued);
         assert!(matches!(
-            verify(&Placement::of(&pair.clone, &clone_baseline), &clone_baseline),
+            verify_at(&sites.clone),
             Err(AdoptionMiss::Residue { name }) if name == "LEFTOVER"
         ));
         // A place of the origin this checkout has no counterpart for.
-        let pair = self::pair("place-residue");
-        let mut export = export_at(&pair.origin);
-        export.insert("LEFTOVER".into(), Some("/store/tmp/origin/cache".into()));
-        let mut clone_baseline = record_and_clone(&pair, &export);
-        clone_baseline.remove(std::ffi::OsStr::new("TMPDIR"));
+        let sites = self::sites("place-residue");
+        let scratch: Extra =
+            |site| vec![("LEFTOVER", Some(format!("/store/tmp/{}/cache", site.name)))];
+        lineage(&sites, scratch);
+        let mut baseline = sites.clone.baseline();
+        baseline.remove(std::ffi::OsStr::new("TMPDIR"));
         assert!(matches!(
-            verify(&Placement::of(&pair.clone, &clone_baseline), &clone_baseline),
+            verify(&Placement::of(&sites.clone.root, &baseline), &baseline),
             Err(AdoptionMiss::Residue { name }) if name == "LEFTOVER"
         ));
     }

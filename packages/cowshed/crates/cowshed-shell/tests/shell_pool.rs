@@ -531,52 +531,76 @@ fn normalized_environment(workspace: &Workspace, env: &str) -> Vec<String> {
     lines
 }
 
-/// The two-root equivalence the inherited shell rests on (11_shell.md, "Inherited shells"): a
-/// clone that adopts its origin's export ends with exactly the environment its own evaluation
-/// would have given it, credentials included, and never evaluates.
+/// A workspace of the fixture tree, with `envrc` as its shell and the record `from` carries.
+fn inheritor(label: &str, port: u16, envrc: &str, from: Option<&Workspace>) -> Workspace {
+    let workspace = Workspace::new(label, port);
+    std::fs::write(workspace.mount().join("bun.lock"), "v1").expect("lockfile");
+    std::fs::write(
+        workspace.mount().join(".envrc-local"),
+        "export LOCAL_TOKEN=from-local\n",
+    )
+    .expect(".envrc-local");
+    workspace.envrc(envrc);
+    if let Some(from) = from {
+        std::fs::create_dir_all(inherited_record(&workspace).parent().unwrap())
+            .expect("host directory");
+        std::fs::copy(inherited_record(from), inherited_record(&workspace))
+            .expect("the clone carries the record");
+    }
+    workspace
+}
+
+fn inherited_record(workspace: &Workspace) -> PathBuf {
+    workspace
+        .mount()
+        .join(".cowshed/shell-host/activation.json")
+}
+
+/// The two-root equivalence the inherited shell rests on (11_shell.md, "Inherited shells"). The
+/// origin evaluates; the first clone cannot adopt an uncertified record, evaluates, and its
+/// agreeing export certifies the origin's record; a later clone adopts it without evaluating
+/// and ends with exactly the environment its own evaluation gives, credentials and flag-glued
+/// paths included. A shell exporting a hash of `$PWD` never certifies, so its clones evaluate.
 #[tokio::test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_evaluation() {
-    let origin = Workspace::new("inherit-origin", 41_488);
-    let adopter = Workspace::new("inherit-adopter", 41_504);
-    let evaluator = Workspace::new("inherit-evaluator", 41_520);
-    for workspace in [&origin, &adopter, &evaluator] {
-        std::fs::write(workspace.mount().join("bun.lock"), "v1").expect("lockfile");
-        std::fs::write(
-            workspace.mount().join(".envrc-local"),
-            "export LOCAL_TOKEN=from-local\n",
-        )
-        .expect(".envrc-local");
-        // Flags glue the path to the flag, as NIX_CFLAGS_COMPILE and NIX_LDFLAGS do.
-        workspace.envrc(
-            "export AT_ROOT=\"$PWD/tool\"\n\
-             export FLAGS=\"-I$PWD/include -L$PWD/lib -Wl,-rpath,$PWD/lib\"\n\
-             watch_file bun.lock\nsource_env_if_exists .envrc-local\n",
-        );
-    }
-    let record = |workspace: &Workspace| {
-        workspace
-            .mount()
-            .join(".cowshed/shell-host/activation.json")
-    };
+    // Flags glue the path to the flag, as NIX_CFLAGS_COMPILE and NIX_LDFLAGS do.
+    let envrc = "export AT_ROOT=\"$PWD/tool\"\n\
+                 export FLAGS=\"-I$PWD/include -L$PWD/lib -Wl,-rpath,$PWD/lib\"\n\
+                 watch_file bun.lock\nsource_env_if_exists .envrc-local\n";
+    let origin = inheritor("inherit-origin", 41_488, envrc, None);
     run(&origin.supervisor(false), sh("true")).await.ok();
     assert_eq!(origin.activations(), 1);
-    let written = std::fs::read_to_string(record(&origin)).expect("the activation left its export");
+    let written =
+        std::fs::read_to_string(inherited_record(&origin)).expect("the activation left its export");
     assert!(
         !written.contains("from-local"),
         "no credential value is recorded"
     );
-    std::fs::create_dir_all(record(&adopter).parent().unwrap()).expect("host directory");
-    std::fs::copy(record(&origin), record(&adopter)).expect("the clone carries the record");
+
+    let first = inheritor("inherit-first", 41_504, envrc, Some(&origin));
+    let ran = run(&first.supervisor(false), sh("true")).await.ok();
+    assert_eq!(
+        first.activations(),
+        1,
+        "an uncertified record is never adopted"
+    );
+    assert!(
+        ran.stderr.contains("producer is not certified"),
+        "{}",
+        ran.stderr
+    );
 
     let probe = "env";
+    let adopter = inheritor("inherit-adopter", 41_520, envrc, Some(&origin));
     let adopted = run(&adopter.supervisor(false), sh(probe)).await.ok();
     assert_eq!(
         adopter.activations(),
         0,
-        "the clone adopted instead of evaluating: {}",
+        "the first clone certified the origin's record: {}",
         adopted.stderr
     );
+    let evaluator = inheritor("inherit-evaluator", 41_536, envrc, None);
     let evaluated = run(&evaluator.supervisor(false), sh(probe)).await.ok();
     assert_eq!(evaluator.activations(), 1);
     assert_eq!(
@@ -585,18 +609,8 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
     );
 
     // One changed input byte, and the clone evaluates for itself.
-    let changed = Workspace::new("inherit-changed", 41_536);
+    let changed = inheritor("inherit-changed", 41_552, envrc, Some(&origin));
     std::fs::write(changed.mount().join("bun.lock"), "v2").expect("lockfile");
-    std::fs::write(
-        changed.mount().join(".envrc-local"),
-        "export LOCAL_TOKEN=from-local\n",
-    )
-    .expect(".envrc-local");
-    changed.envrc(
-        "export AT_ROOT=\"$PWD/tool\"\nwatch_file bun.lock\nsource_env_if_exists .envrc-local\n",
-    );
-    std::fs::create_dir_all(record(&changed).parent().unwrap()).expect("host directory");
-    std::fs::copy(record(&origin), record(&changed)).expect("the clone carries the record");
     let ran = run(&changed.supervisor(false), sh("true")).await.ok();
     assert_eq!(changed.activations(), 1);
     assert!(
@@ -604,6 +618,31 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
             .contains("evaluating the workspace shell: the inherited shell's inputs differ"),
         "{}",
         ran.stderr
+    );
+
+    // A value derived from a hash of the checkout path: the first clone's evaluation disagrees
+    // with the moved one, nothing certifies, and every later clone evaluates its own.
+    let hashed = "export PWD_HASH=\"$(printf %s \"$PWD\" | shasum -a 256)\"\n\
+                  watch_file bun.lock\nsource_env_if_exists .envrc-local\n";
+    let hashed_origin = inheritor("inherit-hash-origin", 41_568, hashed, None);
+    run(&hashed_origin.supervisor(false), sh("true")).await.ok();
+    let hashed_first = inheritor("inherit-hash-first", 41_584, hashed, Some(&hashed_origin));
+    run(&hashed_first.supervisor(false), sh("true")).await.ok();
+    let hashed_later = inheritor("inherit-hash-later", 41_600, hashed, Some(&hashed_origin));
+    let handle = hashed_later.supervisor(false);
+    let ran = run(&handle, sh("printf %s \"$PWD_HASH\"")).await.ok();
+    assert_eq!(hashed_later.activations(), 1, "{}", ran.stderr);
+    assert!(
+        ran.stderr.contains("producer is not certified"),
+        "{}",
+        ran.stderr
+    );
+    let own = run(&handle, sh("printf %s \"$PWD\" | shasum -a 256"))
+        .await
+        .ok();
+    assert_eq!(
+        ran.stdout, own.stdout,
+        "the clone's hash is its own, not the origin's"
     );
 }
 
