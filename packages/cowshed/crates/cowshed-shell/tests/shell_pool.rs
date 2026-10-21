@@ -216,6 +216,17 @@ impl Workspace {
         Self { root, sandbox }
     }
 
+    /// A workspace mounted beside `beside`, under the same mount root, as sibling workspaces of
+    /// one repository are on a real host; its home, temp directory and store stay its own.
+    fn new_beside(label: &str, port_base: u16, beside: &Workspace) -> Self {
+        let mut workspace = Self::new(label, port_base);
+        let mount = beside.sandbox.mount_root.join(label);
+        std::fs::rename(workspace.mount(), &mount).expect("mount beside");
+        workspace.sandbox.mount_root = beside.sandbox.mount_root.clone();
+        workspace.sandbox.workspace_mount = mount;
+        workspace
+    }
+
     fn mount(&self) -> &Path {
         &self.sandbox.workspace_mount
     }
@@ -503,6 +514,7 @@ async fn host_controller_commands_reuse_one_activation_until_a_watched_file_chan
 /// be compared.
 fn normalized_environment(workspace: &Workspace, env: &str) -> Vec<String> {
     let link = cowshed_core::sandbox::workspace_runtime_link(workspace.mount());
+    let mount = workspace.mount().display().to_string();
     let root = workspace.root.display().to_string();
     let mut lines: Vec<String> = env
         .lines()
@@ -523,7 +535,8 @@ fn normalized_environment(workspace: &Workspace, env: &str) -> Vec<String> {
             .any(|part| name.contains(part))
         })
         .map(|line| {
-            line.replace(&root, "<root>")
+            line.replace(&mount, "<mount>")
+                .replace(&root, "<root>")
                 .replace(&*link.to_string_lossy(), "<link>")
         })
         .collect();
@@ -531,9 +544,19 @@ fn normalized_environment(workspace: &Workspace, env: &str) -> Vec<String> {
     lines
 }
 
-/// A workspace of the fixture tree, with `envrc` as its shell and the record `from` carries.
-fn inheritor(label: &str, port: u16, envrc: &str, from: Option<&Workspace>) -> Workspace {
-    let workspace = Workspace::new(label, port);
+/// A workspace of the fixture tree, with `envrc` as its shell, carrying the record `from`
+/// carries, mounted `beside` another workspace when given (as sibling sheds are).
+fn inheritor(
+    label: &str,
+    port: u16,
+    envrc: &str,
+    from: Option<&Workspace>,
+    beside: Option<&Workspace>,
+) -> Workspace {
+    let workspace = match beside {
+        Some(beside) => Workspace::new_beside(label, port, beside),
+        None => Workspace::new(label, port),
+    };
     std::fs::write(workspace.mount().join("bun.lock"), "v1").expect("lockfile");
     std::fs::write(
         workspace.mount().join(".envrc-local"),
@@ -541,6 +564,38 @@ fn inheritor(label: &str, port: u16, envrc: &str, from: Option<&Workspace>) -> W
     )
     .expect(".envrc-local");
     workspace.envrc(envrc);
+    // The controller's marker: a clone's lineage names the workspace it was cloned from, which
+    // is what lets its supervisor give that origin's record a proof.
+    let incarnation = uuid::Uuid::new_v4().simple().to_string();
+    let lineage = match from {
+        Some(from) => {
+            let marker: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(from.mount().join(".cowshed/workspace.json")).expect("marker"),
+            )
+            .expect("marker JSON");
+            serde_json::json!([marker["workspaceIncarnation"]])
+        }
+        None => serde_json::json!([]),
+    };
+    std::fs::write(
+        workspace.mount().join(".cowshed/workspace.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "repoId": "owner/repo",
+            "projectRoot": "/p",
+            "workspace": label,
+            "workspaceIncarnation": incarnation,
+            "role": "workspace",
+            "baseCommit": "0",
+            "createdAt": "2026-01-01T00:00:00Z",
+            "forkedFrom": null,
+            "createdTrace": "t",
+            "lineage": lineage,
+            "ownedLinksRevision": 1,
+        }))
+        .expect("marker bytes"),
+    )
+    .expect("marker");
     if let Some(from) = from {
         std::fs::create_dir_all(inherited_record(&workspace).parent().unwrap())
             .expect("host directory");
@@ -568,7 +623,7 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
     let envrc = "export AT_ROOT=\"$PWD/tool\"\n\
                  export FLAGS=\"-I$PWD/include -L$PWD/lib -Wl,-rpath,$PWD/lib\"\n\
                  watch_file bun.lock\nsource_env_if_exists .envrc-local\n";
-    let origin = inheritor("inherit-origin", 41_488, envrc, None);
+    let origin = inheritor("inherit-origin", 41_488, envrc, None, None);
     run(&origin.supervisor(false), sh("true")).await.ok();
     assert_eq!(origin.activations(), 1);
     let written =
@@ -578,7 +633,7 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
         "no credential value is recorded"
     );
 
-    let first = inheritor("inherit-first", 41_504, envrc, Some(&origin));
+    let first = inheritor("inherit-first", 41_504, envrc, Some(&origin), None);
     let ran = run(&first.supervisor(false), sh("true")).await.ok();
     assert_eq!(
         first.activations(),
@@ -592,7 +647,14 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
     );
 
     let probe = "env";
-    let adopter = inheritor("inherit-adopter", 41_520, envrc, Some(&origin));
+    // Beside the first clone: certification covers clones under a parent a measured root has.
+    let adopter = inheritor(
+        "inherit-adopter",
+        41_520,
+        envrc,
+        Some(&origin),
+        Some(&first),
+    );
     let adopted = run(&adopter.supervisor(false), sh(probe)).await.ok();
     assert_eq!(
         adopter.activations(),
@@ -600,7 +662,7 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
         "the first clone certified the origin's record: {}",
         adopted.stderr
     );
-    let evaluator = inheritor("inherit-evaluator", 41_536, envrc, None);
+    let evaluator = inheritor("inherit-evaluator", 41_536, envrc, None, None);
     let evaluated = run(&evaluator.supervisor(false), sh(probe)).await.ok();
     assert_eq!(evaluator.activations(), 1);
     assert_eq!(
@@ -609,7 +671,13 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
     );
 
     // One changed input byte, and the clone evaluates for itself.
-    let changed = inheritor("inherit-changed", 41_552, envrc, Some(&origin));
+    let changed = inheritor(
+        "inherit-changed",
+        41_552,
+        envrc,
+        Some(&origin),
+        Some(&first),
+    );
     std::fs::write(changed.mount().join("bun.lock"), "v2").expect("lockfile");
     let ran = run(&changed.supervisor(false), sh("true")).await.ok();
     assert_eq!(changed.activations(), 1);
@@ -624,11 +692,23 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
     // with the moved one, nothing certifies, and every later clone evaluates its own.
     let hashed = "export PWD_HASH=\"$(printf %s \"$PWD\" | shasum -a 256)\"\n\
                   watch_file bun.lock\nsource_env_if_exists .envrc-local\n";
-    let hashed_origin = inheritor("inherit-hash-origin", 41_568, hashed, None);
+    let hashed_origin = inheritor("inherit-hash-origin", 41_568, hashed, None, None);
     run(&hashed_origin.supervisor(false), sh("true")).await.ok();
-    let hashed_first = inheritor("inherit-hash-first", 41_584, hashed, Some(&hashed_origin));
+    let hashed_first = inheritor(
+        "inherit-hash-first",
+        41_584,
+        hashed,
+        Some(&hashed_origin),
+        None,
+    );
     run(&hashed_first.supervisor(false), sh("true")).await.ok();
-    let hashed_later = inheritor("inherit-hash-later", 41_600, hashed, Some(&hashed_origin));
+    let hashed_later = inheritor(
+        "inherit-hash-later",
+        41_600,
+        hashed,
+        Some(&hashed_origin),
+        Some(&hashed_first),
+    );
     let handle = hashed_later.supervisor(false);
     let ran = run(&handle, sh("printf %s \"$PWD_HASH\"")).await.ok();
     assert_eq!(hashed_later.activations(), 1, "{}", ran.stderr);

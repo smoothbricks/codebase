@@ -1494,27 +1494,39 @@ impl HostActivator {
         .await
         .map_err(|error| error.to_string())
         .and_then(|written| written);
+        use shell_inherit::{Certification, NotAttempted, Origin};
+        let mount = self.workspace_mount.display();
         match written {
-            Ok(shell_inherit::Certification::NotAttempted) => {}
-            Ok(shell_inherit::Certification::Certified { origin }) => eprintln!(
-                "cowshed: the workspace shell of {} certified its origin's export at a second root{}",
-                self.workspace_mount.display(),
-                if origin {
-                    "; clones of either adopt it"
-                } else {
-                    "; the origin's record had changed, so only clones of this one adopt it"
+            Ok(Certification::NotAttempted(NotAttempted::NothingInherited)) => {}
+            Ok(Certification::NotAttempted(NotAttempted::KeyMoved)) => eprintln!(
+                "cowshed: the workspace shell of {mount} could not check its origin's export: its \
+                 evaluation read other input bytes than the record keyed"
+            ),
+            Ok(Certification::NotAttempted(NotAttempted::BaselineMoved)) => eprintln!(
+                "cowshed: the workspace shell of {mount} could not check its origin's export: it \
+                 ran over another baseline environment than the record keyed"
+            ),
+            Ok(Certification::Certified { origin }) => eprintln!(
+                "cowshed: the workspace shell of {mount} certified its origin's export at another root{}",
+                match origin {
+                    Origin::Updated => "; clones of either adopt it".to_owned(),
+                    Origin::Changed => {
+                        "; the origin's record had changed, so only clones of this one adopt it"
+                            .to_owned()
+                    }
+                    Origin::Refused(reason) => {
+                        format!("; the origin's record was not given the proof ({reason})")
+                    }
                 }
             ),
-            Ok(shell_inherit::Certification::Differs { name }) => eprintln!(
-                "cowshed: the workspace shell of {} exports {name} differently from its origin's \
+            Ok(Certification::Differs { name }) => eprintln!(
+                "cowshed: the workspace shell of {mount} exports {name} differently from its origin's \
                  after the move (a value derived from the checkout path, not a path in it); its \
-                 producer is not certified and clones evaluate their own",
-                self.workspace_mount.display()
+                 producer is not certified and clones evaluate their own"
             ),
             Err(reason) => eprintln!(
-                "cowshed: the workspace shell's export is not left for clones of {} ({reason}); \
-                 each clone evaluates its own",
-                self.workspace_mount.display()
+                "cowshed: the workspace shell's export is not left for clones of {mount} ({reason}); \
+                 each clone evaluates its own"
             ),
         }
     }

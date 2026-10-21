@@ -39,6 +39,9 @@ use super::shell_watch::{
 /// The record's file in the workspace's host directory, which every job profile denies writes to.
 pub const RECORD_FILE: &str = "activation.json";
 
+/// The fence file every writer of [`RECORD_FILE`] locks ([`lock_record`]).
+const RECORD_LOCK_FILE: &str = "activation.lock";
+
 const RECORD_VERSION: u32 = 1;
 
 /// A record is one export plus its watch list; a larger file is not one this code wrote.
@@ -174,10 +177,12 @@ struct ActivationRecord {
     /// The withheld names the export set that the adopting checkout's tail supplies. Names only;
     /// no value of a credential is ever written.
     from_tail: BTreeSet<String>,
-    /// The certification of this input generation's producer: two checkout roots whose own
+    /// The certification of this input generation's producer: the checkout roots whose own
     /// evaluations of these input bytes, over equivalent baselines, gave exports equal after the
-    /// move. Without it the record serves only the checkout it was written in.
-    proof: Option<[PathBuf; 2]>,
+    /// move. Fewer than two distinct roots is no certification: the record then serves only the
+    /// checkout it was written in.
+    #[serde(default)]
+    proof: Vec<PathBuf>,
 }
 
 /// Where a checkout's record lives.
@@ -389,6 +394,23 @@ pub enum RecordError {
     Encode(#[from] serde_json::Error),
     #[error("cannot publish the activation record: {0}")]
     Publish(#[from] crate::metadata::MetadataError),
+    #[error("cannot lock the activation record {path:?}: {source}")]
+    Lock { path: PathBuf, source: io::Error },
+}
+
+/// The fence every writer of a checkout's record holds across what it reads, decides and
+/// writes: the activation that rewrites the record and a clone's certification of it. Without
+/// it a certification could read a record, lose a race to a newer one, and write the old record
+/// back with a proof it never earned. Released when the returned file closes.
+fn lock_record(mount: &Path) -> Result<std::fs::File, RecordError> {
+    let path = mount.join(SHELL_HOST_DIRECTORY).join(RECORD_LOCK_FILE);
+    let locked = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.lock().map(|()| file));
+    locked.map_err(|source| RecordError::Lock { path, source })
 }
 
 /// Split an export into what a record carries and the withheld names its tail supplies.
@@ -411,24 +433,53 @@ fn carried(
     (environment, from_tail)
 }
 
+/// Why a record was written without trying to certify an inherited producer.
+#[derive(Debug, Eq, PartialEq)]
+pub enum NotAttempted {
+    /// No uncertified record of another checkout was inherited.
+    NothingInherited,
+    /// The inputs this evaluation read are not the bytes the inherited record keyed (an
+    /// evaluation that rewrote one of its own inputs, a lock file say).
+    KeyMoved,
+    /// The baseline this evaluation ran over is not the one the inherited record keyed.
+    BaselineMoved,
+}
+
+/// What became of the origin's record when this evaluation certified its producer.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Origin {
+    /// The origin's record carries the proof now.
+    Updated,
+    /// The origin's record is no longer the one this checkout read; it stays as written.
+    Changed,
+    /// The origin's record could not be given the proof, and why: it is not this checkout's
+    /// ancestor, a link redirects its host directory, it cannot be locked or written.
+    Refused(String),
+}
+
 /// What writing a record did about its producer's certification.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Certification {
-    /// No uncertified record of another checkout was inherited for these input bytes.
-    NotAttempted,
-    /// This evaluation agreed with the inherited export after the move: both records now carry
-    /// the proof. `origin` says whether the origin's own record still was the one inherited.
-    Certified { origin: bool },
+    NotAttempted(NotAttempted),
+    /// This evaluation agreed with the inherited export after the move: this record carries
+    /// the proof, and `origin` says what became of the origin's.
+    Certified {
+        origin: Origin,
+    },
     /// This evaluation disagreed with the inherited export after the move — a value the move
     /// cannot produce, such as a hash of the checkout path. Clones keep evaluating.
-    Differs { name: String },
+    Differs {
+        name: String,
+    },
 }
 
 /// Leave an activation's export for the checkouts cloned from this one. `export` is direnv's
 /// export the host applied, `contents` the inputs' bytes certified when it finished, and
 /// `baseline_environment` the host's environment before it. `inherited` is the verified but
 /// uncertified record this checkout carried for the same input bytes, if any: this evaluation
-/// is the second root its producer needs, and agreeing with it certifies both records.
+/// is one more root its producer is measured at, and agreeing with it certifies this record
+/// and then the origin's. This checkout's own record is written first; nothing the origin does
+/// can cost it.
 pub fn write_record(
     placement: &Placement<'_>,
     baseline_environment: &BTreeMap<OsString, OsString>,
@@ -447,22 +498,22 @@ pub fn write_record(
     let (environment, from_tail) = carried(export);
     let key = key(placement.root, &watches, contents);
     let baseline = baseline(placement, baseline_environment);
-    let certification = match inherited {
-        Some(inherited) if inherited.key == key && inherited.baseline == baseline => {
-            match inherited.differs_from(&environment, &from_tail) {
-                Some(name) => Certification::Differs { name },
-                None => Certification::Certified {
-                    origin: inherited.certify_origin(placement.root)?,
-                },
-            }
+    let agreement = match inherited {
+        None => Err(Certification::NotAttempted(NotAttempted::NothingInherited)),
+        Some(inherited) if inherited.key != key => {
+            Err(Certification::NotAttempted(NotAttempted::KeyMoved))
         }
-        _ => Certification::NotAttempted,
+        Some(inherited) if inherited.baseline != baseline => {
+            Err(Certification::NotAttempted(NotAttempted::BaselineMoved))
+        }
+        Some(inherited) => match inherited.differs_from(&environment, &from_tail) {
+            Some(name) => Err(Certification::Differs { name }),
+            None => Ok(inherited),
+        },
     };
-    let proof = match (&certification, inherited) {
-        (Certification::Certified { .. }, Some(inherited)) => {
-            Some([inherited.origin.clone(), placement.root.to_path_buf()])
-        }
-        _ => None,
+    let proof = match &agreement {
+        Ok(inherited) => inherited.proof_with(placement.root),
+        Err(_) => Vec::new(),
     };
     let record = ActivationRecord {
         v: RECORD_VERSION,
@@ -475,11 +526,20 @@ pub fn write_record(
         from_tail,
         proof,
     };
-    crate::metadata::write_atomic_bytes(
-        &record_path(placement.root),
-        &serde_json::to_vec(&record)?,
-    )?;
-    Ok(certification)
+    {
+        let _fence = lock_record(placement.root)?;
+        crate::metadata::write_atomic_bytes(
+            &record_path(placement.root),
+            &serde_json::to_vec(&record)?,
+        )?;
+    }
+    match agreement {
+        Err(certification) => Ok(certification),
+        // The fence above is released: no writer holds two.
+        Ok(inherited) => Ok(Certification::Certified {
+            origin: inherited.certify_origin(placement.root),
+        }),
+    }
 }
 
 /// A record of another checkout that verified for this one in every way but certification:
@@ -490,6 +550,8 @@ pub struct Uncertified {
     /// SHA-256 of the origin's record file as it was read, so the origin's record gains the
     /// proof only if it is still that record.
     digest: [u8; 32],
+    /// The roots the producer was already measured at; the origin alone if none.
+    proof: Vec<PathBuf>,
     key: String,
     baseline: String,
     /// The origin's export moved to this checkout, without the rebuilt watch list.
@@ -517,21 +579,69 @@ impl Uncertified {
             })
     }
 
-    /// Give the origin's record the proof, if it is still the record this checkout read.
-    fn certify_origin(&self, root: &Path) -> Result<bool, RecordError> {
-        let path = record_path(&self.origin);
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Ok(false);
-        };
-        if <[u8; 32]>::from(Sha256::digest(&bytes)) != self.digest {
-            return Ok(false);
+    /// The roots measured so far, the origin's first, with `root` added.
+    fn proof_with(&self, root: &Path) -> Vec<PathBuf> {
+        let mut proof = vec![self.origin.clone()];
+        for measured in self.proof.iter().map(PathBuf::as_path).chain([root]) {
+            if !proof.iter().any(|known| known == measured) {
+                proof.push(measured.to_path_buf());
+            }
         }
-        let Ok(mut record) = serde_json::from_slice::<ActivationRecord>(&bytes) else {
-            return Ok(false);
+        proof
+    }
+
+    /// Give the origin's record the proof, if the origin is this checkout's ancestor and its
+    /// record is still the one this checkout read. The origin is a path from bytes in this
+    /// image, so it becomes a write target only once the controller's own markers say so: its
+    /// incarnation is in this checkout's lineage, and no link redirects its host directory. The
+    /// comparison and the write happen under the origin's record fence, so a newer record its
+    /// own activation wrote in between is never overwritten.
+    fn certify_origin(&self, root: &Path) -> Origin {
+        use crate::metadata::WorkspaceMarker;
+        use crate::storage::{WORKSPACE_MARKER_PATH, verify_no_symlinks};
+        let refused = |reason: String| Origin::Refused(reason);
+        let ours = match WorkspaceMarker::read_from(&root.join(WORKSPACE_MARKER_PATH)) {
+            Ok(marker) => marker,
+            Err(error) => return refused(format!("this checkout's marker is unreadable: {error}")),
         };
-        record.proof = Some([self.origin.clone(), root.to_path_buf()]);
-        crate::metadata::write_atomic_bytes(&path, &serde_json::to_vec(&record)?)?;
-        Ok(true)
+        let theirs = match WorkspaceMarker::read_from(&self.origin.join(WORKSPACE_MARKER_PATH)) {
+            Ok(marker) => marker,
+            Err(error) => return refused(format!("the origin's marker is unreadable: {error}")),
+        };
+        if !ours
+            .lineage
+            .as_ref()
+            .is_some_and(|lineage| lineage.contains(&theirs.workspace_incarnation))
+        {
+            return refused(format!(
+                "{} is not an ancestor of this checkout",
+                self.origin.display()
+            ));
+        }
+        if let Err(error) =
+            verify_no_symlinks(&self.origin, &self.origin.join(SHELL_HOST_DIRECTORY))
+        {
+            return refused(format!(
+                "the origin's host directory is not its own: {error}"
+            ));
+        }
+        let path = record_path(&self.origin);
+        let written = (|| -> Result<Origin, RecordError> {
+            let _fence = lock_record(&self.origin)?;
+            let Ok(bytes) = std::fs::read(&path) else {
+                return Ok(Origin::Changed);
+            };
+            if <[u8; 32]>::from(Sha256::digest(&bytes)) != self.digest {
+                return Ok(Origin::Changed);
+            }
+            let Ok(mut record) = serde_json::from_slice::<ActivationRecord>(&bytes) else {
+                return Ok(Origin::Changed);
+            };
+            record.proof = self.proof_with(root);
+            crate::metadata::write_atomic_bytes(&path, &serde_json::to_vec(&record)?)?;
+            Ok(Origin::Updated)
+        })();
+        written.unwrap_or_else(|error| refused(error.to_string()))
     }
 }
 
@@ -718,20 +828,27 @@ pub fn verify(
             return Err(AdoptionMiss::Residue { name: name.clone() });
         }
     }
-    // A record moves to another checkout only once its producer is certified: two roots whose
-    // own evaluations of these input bytes agreed after the move ([`write_record`]). A value no
-    // move can produce — an `.envrc` exporting a hash of `$PWD`, arithmetic on the port block —
-    // makes those evaluations disagree, so such a record never certifies and every clone of it
-    // evaluates. The checkout the record was written in needs no proof: nothing moves.
+    // A record moves to another checkout only once its producer is certified: roots whose own
+    // evaluations of these input bytes agreed after the move ([`write_record`]). A value no move
+    // can produce — an `.envrc` exporting a hash of `$PWD`, arithmetic on the port block — makes
+    // those evaluations disagree, so such a record never certifies and every clone of it
+    // evaluates. Agreeing roots certify only what differs between them: two siblings agree on
+    // anything derived from their shared parent directory or depth. So a clone adopts only when
+    // its own parent is the parent of a root the producer was measured at; any other clone
+    // evaluates, and agreeing adds its root to the proof. The checkout the record was written in
+    // needs no proof: nothing moves.
     let origin = record.places[0].clone().unwrap_or_default();
-    let certified = record
-        .proof
-        .as_ref()
-        .is_some_and(|[first, second]| first != second && (*first == origin || *second == origin));
+    let distinct: BTreeSet<&PathBuf> = record.proof.iter().collect();
+    let certified = distinct.len() >= 2
+        && distinct.contains(&origin)
+        && distinct
+            .iter()
+            .any(|root| root.parent() == placement.root.parent());
     if origin != placement.root && !certified {
         return Err(AdoptionMiss::Uncertified(Box::new(Uncertified {
             origin,
             digest,
+            proof: record.proof,
             key: record.key,
             baseline: record.baseline,
             environment,
@@ -999,6 +1116,32 @@ mod tests {
                 format!("export T={}\n", checkout.name),
             )
             .unwrap();
+            // The controller's marker: the origin is main, the others are its clones, and only an
+            // ancestor in a clone's lineage is ever written by that clone.
+            let (role, workspace, lineage) = match checkout.name {
+                "origin" => ("main", "main", "[]"),
+                _ => (
+                    "workspace",
+                    checkout.name,
+                    "[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]",
+                ),
+            };
+            let incarnation = match checkout.name {
+                "origin" => "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "first" => "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                _ => "cccccccccccccccccccccccccccccccc",
+            };
+            std::fs::write(
+                root.join(crate::storage::WORKSPACE_MARKER_PATH),
+                format!(
+                    "{{\"version\":1,\"repoId\":\"owner/repo\",\"projectRoot\":\"/p\",\
+                     \"workspace\":\"{workspace}\",\"workspaceIncarnation\":\"{incarnation}\",\
+                     \"role\":\"{role}\",\"baseCommit\":\"0\",\"createdAt\":\"2026-01-01T00:00:00Z\",\
+                     \"forkedFrom\":null,\"createdTrace\":\"t\",\"lineage\":{lineage},\
+                     \"ownedLinksRevision\":1}}"
+                ),
+            )
+            .unwrap();
         }
         sites
     }
@@ -1043,7 +1186,7 @@ mod tests {
         let certification = match verify_at(&sites.witness) {
             Err(miss) => match miss.into_uncertified() {
                 Some(inherited) => evaluate(&sites.witness, extra, Some(&inherited)),
-                None => Certification::NotAttempted,
+                None => Certification::NotAttempted(NotAttempted::NothingInherited),
             },
             Ok(_) => panic!("an uncertified record of another checkout was adopted"),
         };
@@ -1060,7 +1203,9 @@ mod tests {
         let sites = sites("adopt");
         assert_eq!(
             lineage(&sites, NOTHING),
-            Certification::Certified { origin: true }
+            Certification::Certified {
+                origin: Origin::Updated
+            }
         );
         let written = std::fs::read_to_string(record_path(&sites.clone.root)).unwrap();
         assert!(
@@ -1115,6 +1260,73 @@ mod tests {
                 sites.clone.root.join(".cowshed/env"),
                 sites.clone.root.join(".envrc-local")
             ]
+        );
+    }
+
+    /// A certification never writes over a record the origin rewrote after the clone read it:
+    /// the clone's own record certifies, the origin's newer one stays as written.
+    #[test]
+    fn a_certification_never_overwrites_a_newer_origin_record() {
+        let sites = sites("newer-origin");
+        evaluate(&sites.origin, NOTHING, None);
+        std::fs::copy(
+            record_path(&sites.origin.root),
+            record_path(&sites.witness.root),
+        )
+        .unwrap();
+        let inherited = verify_at(&sites.witness)
+            .expect_err("uncertified")
+            .into_uncertified()
+            .expect("only for want of certification");
+        let newer: Extra = |_| vec![("ADDED", Some("later".to_owned()))];
+        evaluate(&sites.origin, newer, None);
+        let rewritten = std::fs::read(record_path(&sites.origin.root)).unwrap();
+        assert_eq!(
+            evaluate(&sites.witness, NOTHING, Some(&inherited)),
+            Certification::Certified {
+                origin: Origin::Changed
+            }
+        );
+        assert_eq!(
+            std::fs::read(record_path(&sites.origin.root)).unwrap(),
+            rewritten,
+            "the origin's newer record is untouched"
+        );
+    }
+
+    /// Roots that agreed certify only what differs between them: a clone under a parent no
+    /// measured root has evaluates, however certified the record is.
+    #[test]
+    fn a_clone_under_an_unmeasured_parent_evaluates() {
+        let sites = sites("unmeasured-parent");
+        lineage(&sites, NOTHING);
+        let elsewhere = Site {
+            root: sites.scratch.join("slots/slot@1"),
+            link: "/tmp/cs-dddddddddddd",
+            name: "slot",
+            port: 42432,
+        };
+        for input in INPUTS
+            .iter()
+            .chain([&crate::storage::WORKSPACE_MARKER_PATH])
+        {
+            let to = elsewhere.root.join(input);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::copy(sites.clone.root.join(input), to).unwrap();
+        }
+        std::fs::create_dir_all(elsewhere.root.join(SHELL_HOST_DIRECTORY)).unwrap();
+        std::fs::copy(
+            record_path(&sites.origin.root),
+            record_path(&elsewhere.root),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_at(&elsewhere),
+            Err(AdoptionMiss::Uncertified(_))
+        ));
+        assert!(
+            verify_at(&sites.clone).is_ok(),
+            "a sibling of a measured root adopts"
         );
     }
 
@@ -1205,7 +1417,9 @@ mod tests {
         };
         assert_eq!(
             lineage(&sites, places),
-            Certification::Certified { origin: true }
+            Certification::Certified {
+                origin: Origin::Updated
+            }
         );
         let verified = verify_at(&sites.clone).unwrap();
         let value = |name: &str| verified.environment().get(name).cloned().flatten();

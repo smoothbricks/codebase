@@ -1473,7 +1473,7 @@ fn linux_refused_cgroup_placement_never_runs_the_command() {
 fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>) {
     use cowshed_core::runtime::shell_host::{Inherited, SHELL_HOST_DIRECTORY};
     use cowshed_core::runtime::shell_inherit::{
-        Certification, Placement, record_path, verify, write_record,
+        Certification, Origin, Placement, record_path, verify, write_record,
     };
     use cowshed_core::runtime::shell_watch::{WatchEntry, certify};
 
@@ -1495,6 +1495,34 @@ fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>
         )
         .unwrap();
         std::fs::write(root.join(".envrc-local"), local).unwrap();
+        // The controller's marker: the origin is main, the others its clones; a clone writes
+        // only an ancestor in its lineage.
+        let (role, workspace, incarnation, lineage) = match name.as_str() {
+            "origin" => ("main", "main", "a".repeat(32), "[]".to_owned()),
+            "witness" => (
+                "workspace",
+                "witness",
+                "b".repeat(32),
+                format!("[\"{}\"]", "a".repeat(32)),
+            ),
+            _ => (
+                "workspace",
+                "clone",
+                "c".repeat(32),
+                format!("[\"{}\"]", "a".repeat(32)),
+            ),
+        };
+        std::fs::write(
+            root.join(".cowshed/workspace.json"),
+            format!(
+                "{{\"version\":1,\"repoId\":\"owner/repo\",\"projectRoot\":\"/p\",\
+                 \"workspace\":\"{workspace}\",\"workspaceIncarnation\":\"{incarnation}\",\
+                 \"role\":\"{role}\",\"baseCommit\":\"0\",\"createdAt\":\"2026-01-01T00:00:00Z\",\
+                 \"forkedFrom\":null,\"createdTrace\":\"t\",\"lineage\":{lineage},\
+                 \"ownedLinksRevision\":1}}"
+            ),
+        )
+        .unwrap();
     }
     let baseline: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> = [
         ("PATH", std::env::var_os("PATH").expect("PATH")),
@@ -1547,7 +1575,9 @@ fn adopt_in_fixture(host: &Host, tail_supplies_token: bool) -> (PathBuf, Vec<u8>
         .expect("only for want of certification");
     assert_eq!(
         evaluate(&witness, Some(&uncertified)),
-        Certification::Certified { origin: true }
+        Certification::Certified {
+            origin: Origin::Updated
+        }
     );
     std::fs::copy(record_path(&origin), record_path(&clone)).unwrap();
     let verified =

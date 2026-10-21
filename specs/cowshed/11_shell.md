@@ -64,17 +64,33 @@ the first two: nothing moves):
   since a false refusal costs one evaluation and a false pass would hand the clone the origin's tree.
 - **The producer is certified.** No check of the values can see one derived from a hash of the checkout path (an
   `.envrc` exporting a hash of `$PWD`) or from a fact cowshed does not publish, so a record moves only once its input
-  generation's producer has been measured at two roots. A clone whose inherited record is uncertified evaluates, as
-  every clone used to; when its own export, for the same input bytes over an equivalent baseline, equals the moved one
-  variable for variable (withheld names by name), the supervisor writes its record with the proof — the two roots — and
-  gives the origin's record the same proof if that record is still the one the clone read (compared by its bytes'
-  SHA-256). Clones of either then adopt. Any disagreement leaves both uncertified, names the variable on the
-  supervisor's stderr, and every later clone of that generation evaluates; a hash of `$PWD` therefore never reaches a
-  clone. The cost is one evaluation per input generation, by its first clone. The two-root fixture (08_testing.md) runs
-  this end to end, the `$PWD` hash included, and a devenv monorepo's export was measured against a fresh evaluation of a
-  fork (of its 71 variables, 51 equal as recorded, 16 equal after the move, `DEVENV_RUNTIME` recomputed,
-  `DIRENV_WATCHES` rebuilt, `COWSHED_RUNTIME_LINK` read from the tail, and `DEVENV_TASK_FILE` dropped), the comparison a
-  certification makes.
+  generation's producer has been measured at more than one root. A clone whose inherited record is uncertified for it
+  evaluates, as every clone used to; when its own export, for the same input bytes over an equivalent baseline, equals
+  the moved one variable for variable (withheld names by name), the supervisor writes its own record first, with the
+  proof — the roots measured so far plus its own — and then gives the origin's record the same proof. Any disagreement
+  leaves both uncertified, names the variable on the supervisor's stderr, and every later clone of that generation
+  evaluates; a hash of `$PWD` therefore never reaches a clone. Agreeing roots certify only what differs between them:
+  two sibling sheds agree on anything derived from their common parent directory or depth. So a clone adopts only when
+  its parent directory is the parent of a measured root; a clone elsewhere (a slot, a worktree, another parent) is
+  uncertified for that record, evaluates, and on agreement joins the proof. The cost is one evaluation per input
+  generation per parent, by its first clone there.
+
+  The origin's record therefore has two writers: its own supervisor, whenever it activates, and the supervisor of a
+  clone that certifies it. Both hold an exclusive lock on `.cowshed/shell-host/activation.lock` across what they read,
+  compare and write, so the proof is given only if the record is still the one the clone read (compared by its bytes'
+  SHA-256) and a newer record is never overwritten. The origin's path comes from bytes in the clone's image, so it is a
+  write target only once the controller's markers agree: the origin's `workspaceIncarnation` must be in the clone's
+  marker `lineage`, and no link may redirect its `.cowshed/shell-host`. Anything else, an unwritable or retired origin
+  included, leaves the origin's record as it is and is reported; it never costs the clone its own record. When the
+  origin is main, this is a write into main's source image: one small copy-on-write extent per input generation, and it
+  moves main's image mtime, which the seed-freshness rule of 16_build_volumes.md reads.
+
+  The two-root fixture (08_testing.md) runs this end to end, the `$PWD` hash included, and a devenv monorepo's export
+  was measured against a fresh evaluation of a fork (of its 71 variables, 51 equal as recorded, 16 equal after the move,
+  `DEVENV_RUNTIME` recomputed, `DIRENV_WATCHES` rebuilt, `COWSHED_RUNTIME_LINK` read from the tail, and
+  `DEVENV_TASK_FILE` dropped), the comparison a certification makes. Two agreeing roots are evidence about the producer,
+  not a proof for every third root: a value that varies only along a dimension no two measured roots differ in, other
+  than their parent, would still pass.
 
 The record never carries direnv's own `DIRENV_WATCHES` and `DIRENV_DIFF` (the host rebuilds both for its checkout),
 `DEVENV_TASK_FILE` (the parent's task file runs scripts built with the parent's root; tasks and processes are not tools)
