@@ -1506,18 +1506,35 @@ impl HostActivator {
             FrameReader::new(&payload).map_err(|error| protocol_error("reply", error))?;
         let outcome = match tag {
             REPLY_ACTIVATED => {
-                if fields
+                let echoed = match fields
                     .u32()
                     .map_err(|error| protocol_error("reply", error))?
-                    != 0
                 {
-                    fields
-                        .bytes()
-                        .map_err(|error| protocol_error("reply", error))?;
-                }
+                    0 => None,
+                    _ => Some(
+                        fields
+                            .bytes()
+                            .map_err(|error| protocol_error("reply", error))?
+                            .to_vec(),
+                    ),
+                };
                 fields
                     .bytes()
                     .map_err(|error| protocol_error("reply", error))?;
+                // The host reports the watch list it now holds: anything but the one it was sent
+                // is a host that applied the export wrongly, and its shell is not the verified one.
+                let sent = verified
+                    .environment()
+                    .get("DIRENV_WATCHES")
+                    .cloned()
+                    .flatten()
+                    .map(String::into_bytes);
+                if echoed != sent {
+                    return Err(protocol_error(
+                        "reply",
+                        "the adopted shell holds another watch list than the one it was sent",
+                    ));
+                }
                 Ok(())
             }
             REPLY_ADOPTION_REFUSED => Err(String::from_utf8_lossy(

@@ -230,9 +230,10 @@ fn is_component_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+' | b'@' | b'~')
 }
 
-/// Replace every occurrence of `from` that is a whole path prefix: not the tail of a longer path
-/// component before it, and followed by the end, a `/`, or a byte no path component continues
-/// with: `/x/repo` moves `/x/repo/tooling`, never `/x/repo-worktrees` or `/w/x/repo`.
+/// Replace every occurrence of `from` that starts a path: not the tail of a longer path (walking
+/// back over the bytes a component is made of reaches a `/`), and followed by the end, a `/`,
+/// or a byte no path component continues with. `/x/repo` moves `/x/repo/tooling`,
+/// `-I/x/repo/include` and `-Wl,-rpath,/x/repo/lib`, never `/x/repo-worktrees` or `/w/x/repo`.
 pub fn rebase(value: &str, from: &str, to: &str) -> String {
     if from.is_empty() {
         return value.to_owned();
@@ -244,13 +245,13 @@ pub fn rebase(value: &str, from: &str, to: &str) -> String {
         if at < copied {
             continue;
         }
-        let before_ok = at == 0 || {
-            let previous = bytes[at - 1];
-            previous != b'/' && !is_component_byte(previous)
-        };
+        let inside_longer_path = bytes[..at]
+            .iter()
+            .rev()
+            .find(|byte| !is_component_byte(**byte))
+            == Some(&b'/');
         let end = at + from.len();
-        let after_ok = end == bytes.len() || bytes[end] == b'/' || !is_component_byte(bytes[end]);
-        if before_ok && after_ok {
+        if !inside_longer_path && ends_a_component(bytes, end) {
             out.push_str(&value[copied..at]);
             out.push_str(to);
             copied = end;
@@ -260,8 +261,19 @@ pub fn rebase(value: &str, from: &str, to: &str) -> String {
     out
 }
 
+fn ends_a_component(bytes: &[u8], end: usize) -> bool {
+    end == bytes.len() || bytes[end] == b'/' || !is_component_byte(bytes[end])
+}
+
+/// Whether `value` still names `path` after a move. Stricter than [`rebase`] on purpose: any
+/// occurrence that ends a component counts, wherever it starts, so a spelling the move did not
+/// reach refuses adoption. A false refusal costs one evaluation; a false pass would hand the
+/// clone the origin's tree.
 fn contains_path(value: &str, path: &str) -> bool {
-    rebase(value, path, "\0") != value
+    !path.is_empty()
+        && value
+            .match_indices(path)
+            .any(|(at, _)| ends_a_component(value.as_bytes(), at + path.len()))
 }
 
 fn relative(root: &Path, path: &Path) -> RecordedWatch {
@@ -593,13 +605,13 @@ pub fn verify(
         .iter()
         .map(|watch| {
             let path = absolute(watch);
-            let exists = path.exists();
+            let exists = snapshot.exists(&path);
             WatchEntry { path, exists }
         })
         .collect();
     environment.insert(
         "DIRENV_WATCHES".to_owned(),
-        Some(encode_direnv_watches(&entries)),
+        Some(encode_direnv_watches(&entries, &snapshot)),
     );
     let tail = entries
         .iter()
@@ -644,6 +656,37 @@ mod tests {
             "a=/mnt/owner/repo/shed b"
         );
         assert_eq!(rebase("/w/batch-25", "/w/batch-2", "/w/y"), "/w/batch-25");
+        // Compiler and linker flags glue the path to the flag: the path still starts there.
+        assert_eq!(
+            rebase("-I/home/dev/repo/include -L/home/dev/repo/lib", from, to),
+            "-I/mnt/owner/repo/shed/include -L/mnt/owner/repo/shed/lib"
+        );
+        assert_eq!(
+            rebase(
+                "-Wl,-rpath,/home/dev/repo/lib -isystem/home/dev/repo/x",
+                from,
+                to
+            ),
+            "-Wl,-rpath,/mnt/owner/repo/shed/lib -isystem/mnt/owner/repo/shed/x"
+        );
+    }
+
+    #[test]
+    fn the_residue_check_sees_what_the_move_left() {
+        let origin = "/home/dev/repo";
+        assert!(
+            contains_path("/w/home/dev/repo/x", origin),
+            "inside a longer path"
+        );
+        assert!(contains_path("-I/home/dev/repo", origin));
+        assert!(
+            !contains_path("/home/dev/repo-worktrees/x", origin),
+            "a sibling"
+        );
+        assert!(!contains_path(
+            &rebase("-I/home/dev/repo/include", origin, "/s"),
+            origin
+        ));
     }
 
     #[test]
@@ -960,6 +1003,18 @@ mod tests {
         let pair = pair("port-residue");
         let mut export = export_at(&pair.origin);
         export.insert("LEFTOVER".into(), Some("http://127.0.0.1:42250/".into()));
+        let clone_baseline = record_and_clone(&pair, &export);
+        assert!(matches!(
+            verify(&Placement::of(&pair.clone, &clone_baseline), &clone_baseline),
+            Err(AdoptionMiss::Residue { name }) if name == "LEFTOVER"
+        ));
+        // A spelling the move does not reach: the origin inside a longer path.
+        let pair = self::pair("glued-residue");
+        let mut export = export_at(&pair.origin);
+        export.insert(
+            "LEFTOVER".into(),
+            Some(format!("/prefix{}/lib", pair.origin.display())),
+        );
         let clone_baseline = record_and_clone(&pair, &export);
         assert!(matches!(
             verify(&Placement::of(&pair.clone, &clone_baseline), &clone_baseline),

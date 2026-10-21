@@ -547,8 +547,11 @@ async fn host_controller_a_clone_adopts_its_origins_shell_and_matches_its_own_ev
             "export LOCAL_TOKEN=from-local\n",
         )
         .expect(".envrc-local");
+        // Flags glue the path to the flag, as NIX_CFLAGS_COMPILE and NIX_LDFLAGS do.
         workspace.envrc(
-            "export AT_ROOT=\"$PWD/tool\"\nwatch_file bun.lock\nsource_env_if_exists .envrc-local\n",
+            "export AT_ROOT=\"$PWD/tool\"\n\
+             export FLAGS=\"-I$PWD/include -L$PWD/lib -Wl,-rpath,$PWD/lib\"\n\
+             watch_file bun.lock\nsource_env_if_exists .envrc-local\n",
         );
     }
     let record = |workspace: &Workspace| {

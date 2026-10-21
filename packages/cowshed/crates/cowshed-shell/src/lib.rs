@@ -585,6 +585,11 @@ impl Host {
         let baseline = self.environment.clone();
         let mut staged = baseline.clone();
         apply_to(&mut staged, &environment);
+        // The withheld names start unset, so one present in the dump is one the tail wrote: an
+        // ambient value of the host's own never stands in for what the activation exported.
+        for name in &from_tail {
+            staged.remove(OsStr::new(name));
+        }
         let dump = match self.source_tail(directory, &staged, &tail, stderr) {
             Ok(Ok(dump)) => dump,
             Ok(Err(reason)) => return refuse(reason),

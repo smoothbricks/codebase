@@ -55,16 +55,20 @@ instead of evaluating when three checks pass, and evaluates otherwise:
   record keeps the baseline's key: SHA-256 over that environment with the checkout's places (below) replaced by
   placeholders, every withheld name (below) and cowshed's per-workspace git identity (`GIT_CONFIG_GLOBAL`) left out.
 - **Nothing names the origin after the move.** Every value has each of the origin's per-workspace places — its root, its
-  runtime link (`XDG_RUNTIME_DIR`), its `TMPDIR` and its `HOME`, root first — replaced by the adopting checkout's at a
-  path-component boundary (`/x/repo` moves `/x/repo/tooling`, never `/x/repo-worktrees`); devenv's `DEVENV_RUNTIME`, a
-  hash of the dotfile path, is recomputed as devenv computes it. A value that still names a place of the origin this
-  checkout has no counterpart for, or holds a number inside the origin's port block, refuses adoption. A value derived
+  runtime link (`XDG_RUNTIME_DIR`), its `TMPDIR` and its `HOME`, root first — replaced by the adopting checkout's
+  wherever a path starts there and ends a component (`/x/repo` moves `/x/repo/tooling`, `-I/x/repo/include` and
+  `-Wl,-rpath,/x/repo/lib`, never `/x/repo-worktrees` or `/w/x/repo`); devenv's `DEVENV_RUNTIME`, a hash of the dotfile
+  path, is recomputed as devenv computes it. The check after the move is stricter than the move: a value in which an
+  origin place still ends a component anywhere, or that holds a number inside the origin's port block, refuses adoption,
+  since a false refusal costs one evaluation and a false pass would hand the clone the origin's tree. A value derived
   from a hash of the root or from a fact cowshed does not publish is invisible to that check. The two-root equivalence
   fixture (08_testing.md) proves the mechanism for cowshed's own fixture shell, and that monorepo's export was measured
   against a fresh evaluation of a fork (of its 71 variables, 51 equal as recorded, 16 equal after the move,
   `DEVENV_RUNTIME` recomputed, `DIRENV_WATCHES` rebuilt, `COWSHED_RUNTIME_LINK` read from the tail, and
   `DEVENV_TASK_FILE` dropped); no gate runs a repository's own shell at two roots, so a repository edit that adds such a
-  value is outside what adoption can verify.
+  value (an `.envrc` exporting a hash of `$PWD`, say) is adopted with the origin's value. That is an accepted limitation
+  of adoption, stated here so no reader takes an adopted shell for proof against it; the fix is the gate, not a runtime
+  check.
 
 The record never carries direnv's own `DIRENV_WATCHES` and `DIRENV_DIFF` (the host rebuilds both for its checkout),
 `DEVENV_TASK_FILE` (the parent's task file runs scripts built with the parent's root; tasks and processes are not tools)
@@ -74,10 +78,11 @@ or a `shellHook`, nor any variable the secret convention names — cowshed's wor
 multiplied by the number of workspaces and the depth of their lineage. Those values are not lost: the record names which
 ones the export set, and the adopting host reads them from its own checkout's tail files — `.cowshed/env` and
 `.envrc-local`, those of the two the activation's watch list names, in its order — through direnv's own bash, stdlib,
-`source_env_if_exists` and `direnv dump json`, exactly as the activation read them. A tail that does not supply one of
-them refuses the adoption, the host's environment untouched, and the host evaluates. So adopted and evaluated shells
-obtain those values one way. This is non-propagation, not isolation: the files they come from are in the image either
-way, and moving them out is the gateway vault's.
+`source_env_if_exists` and `direnv dump json`, exactly as the activation read them. The withheld names start unset for
+that reading, so a value the host already holds never stands in for one the activation exported, and a tail that does
+not supply one of them refuses the adoption, the host's environment untouched, and the host evaluates. So adopted and
+evaluated shells obtain those values one way. This is non-propagation, not isolation: the files they come from are in
+the image either way, and moving them out is the gateway vault's.
 
 Adoption runs no direnv evaluation, no devenv, no entry task and no approval; only the tail files run, and their output
 reaches the job that waited on the adoption as an activation's would. A miss says why on that job's stderr

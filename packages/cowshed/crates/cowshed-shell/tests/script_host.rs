@@ -226,6 +226,11 @@ impl Host {
     }
 
     fn start_with_path(label: &str, path: &std::ffi::OsStr) -> Self {
+        Self::start_with(label, path, &[])
+    }
+
+    /// A host whose environment also holds `ambient`, as a sandbox environment may.
+    fn start_with(label: &str, path: &std::ffi::OsStr, ambient: &[(&str, &str)]) -> Self {
         // Move the fixture controller before spawning the reusable host: neither belongs to a
         // job. Each host gets its own incarnation, even when tests run concurrently.
         #[cfg(target_os = "linux")]
@@ -253,6 +258,7 @@ impl Host {
                 .env("PATH", path)
                 .env("HOME", &canonical)
                 .current_dir(&canonical)
+                .envs(ambient.iter().copied())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
@@ -1561,15 +1567,22 @@ fn an_adopted_shell_takes_its_credentials_from_its_own_tail_files() {
 }
 
 /// A tail that does not supply a withheld value refuses the adoption and leaves the host as it
-/// was, so the supervisor evaluates on the same host.
+/// was, so the supervisor evaluates on the same host -- even when the host already holds a value
+/// of that name of its own, which must never stand in for the one the activation exported.
 #[test]
 fn a_tail_that_lacks_a_withheld_value_refuses_and_changes_nothing() {
-    let mut host = Host::start("adopt-refused");
+    let mut host = Host::start_with(
+        "adopt-refused",
+        &std::env::var_os("PATH").expect("PATH"),
+        &[("LOCAL_TOKEN", "ambient")],
+    );
     let (_, reply) = adopt_in_fixture(&host, false);
     let (tag, mut fields) = FrameReader::new(&reply).unwrap();
     assert_eq!(tag, REPLY_ADOPTION_REFUSED);
     let reason = String::from_utf8_lossy(fields.bytes().unwrap()).into_owned();
     assert!(reason.contains("LOCAL_TOKEN"), "{reason}");
-    let ran = host.run(&text("printf '%s' \"${AT_ROOT-unset}\""));
-    assert_eq!(ran.stdout, "unset");
+    let ran = host.run(&text(
+        "printf '%s|%s' \"${AT_ROOT-unset}\" \"$LOCAL_TOKEN\"",
+    ));
+    assert_eq!(ran.stdout, "unset|ambient");
 }

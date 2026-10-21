@@ -97,10 +97,12 @@ pub fn decode_direnv_watches(encoded: &str) -> Result<Vec<WatchEntry>, WatchList
     Ok(entries)
 }
 
-/// Encode a watch list as direnv does for `DIRENV_WATCHES`, recording each input's current
-/// whole-second modification time (0 for an absent one), as a fresh `direnv export` would.
-/// The inverse of [`decode_direnv_watches`]; an inherited shell sets it for its own checkout.
-pub fn encode_direnv_watches(entries: &[WatchEntry]) -> String {
+/// Encode a watch list as direnv does for `DIRENV_WATCHES`: each input's whole-second
+/// modification time and existence as `snapshot` read them (0 and absent for an input it does
+/// not hold or could not stat), as a fresh `direnv export` would record them. The inverse of
+/// [`decode_direnv_watches`]; an inherited shell sets it for its own checkout from the same
+/// reading its identities come from.
+pub fn encode_direnv_watches(entries: &[WatchEntry], snapshot: &Snapshot) -> String {
     #[derive(serde::Serialize)]
     struct Recorded<'a> {
         path: &'a Path,
@@ -109,13 +111,15 @@ pub fn encode_direnv_watches(entries: &[WatchEntry]) -> String {
     }
     let recorded: Vec<Recorded<'_>> = entries
         .iter()
-        .map(|entry| match std::fs::metadata(&entry.path) {
-            Ok(metadata) => Recorded {
+        .map(|entry| match snapshot.get(&entry.path) {
+            Some(FileState::Present { mtime_ns, .. }) => Recorded {
                 path: &entry.path,
-                modtime: metadata.mtime(),
+                // Nanoseconds built from i64 seconds divide back into i64 seconds.
+                modtime: i64::try_from(mtime_ns.div_euclid(1_000_000_000))
+                    .expect("whole seconds of an i64-second timestamp fit in i64"),
                 exists: true,
             },
-            Err(_) => Recorded {
+            Some(FileState::Missing | FileState::Unreadable(_)) | None => Recorded {
                 path: &entry.path,
                 modtime: 0,
                 exists: false,
@@ -500,6 +504,11 @@ impl Snapshot {
 
     fn get(&self, path: &Path) -> Option<FileState> {
         self.0.get(path).copied()
+    }
+
+    /// Whether `path` existed when this snapshot read it; `false` for a path it does not hold.
+    pub fn exists(&self, path: &Path) -> bool {
+        self.get(path).is_some_and(FileState::exists)
     }
 }
 
