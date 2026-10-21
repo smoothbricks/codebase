@@ -77,9 +77,11 @@ const QUEUE_CAPACITY: usize = 256;
 /// "Process segments").
 pub const PROCESS_SEAL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// The most process rows a writer gathers before it seals early, so a burst of events cannot
-/// hold an unbounded segment in memory until the interval ends.
-const PROCESS_SEAL_ROWS: usize = 16_384;
+/// The most process rows a writer gathers in one interval. A row past it is refused and counted
+/// in the trace health, never sealed early: the interval is the seal rate and this bound is only
+/// the memory a burst may hold, so a busy host loses rows rather than flushing the drive more
+/// often because a lot happened (13_telemetry.md, "Process segments").
+const PROCESS_GATHER_ROWS: usize = 16_384;
 
 /// The lmao thread a job's spans are written on: the first eight bytes of a domain-separated
 /// BLAKE3 of the job's durable key `(repo_id, workspace_incarnation, job_id)` (13_telemetry.md,
@@ -398,14 +400,21 @@ fn lock(health: &Mutex<TraceHealth>) -> MutexGuard<'_, TraceHealth> {
 }
 
 fn refuse(health: &Mutex<TraceHealth>, reason: String) {
+    refuse_rows(health, 1, reason);
+}
+
+/// Count `rows` refusals at once, under one lock.
+fn refuse_rows(health: &Mutex<TraceHealth>, rows: usize, reason: String) {
     let mut health = lock(health);
-    health.failed = health.failed.saturating_add(1);
+    health.failed = health
+        .failed
+        .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
     health.last_failure = Some(reason);
 }
 
 /// Seal segments in queue order. Job rows seal as they come; process rows are gathered and sealed
-/// together once [`PROCESS_SEAL_INTERVAL`] has passed since the first of them, or once
-/// [`PROCESS_SEAL_ROWS`] wait. Whatever is gathered seals first, before a job row, before a health
+/// together once [`PROCESS_SEAL_INTERVAL`] has passed since the first of them, and rows past
+/// [`PROCESS_GATHER_ROWS`] in that interval are refused. Whatever is gathered seals first, before a job row, before a health
 /// answer, which promises every row queued before it, and when the queue closes, so segments
 /// keep queue order and nothing queued is left behind by a writer that ends in order. Sealing
 /// syncs files and directories, so it runs on the blocking pool; the order advances on every
@@ -436,11 +445,17 @@ async fn write_rows(
         match request {
             Some(Request::Seal(Segment::Processes(rows))) => {
                 due.get_or_insert_with(|| Instant::now() + PROCESS_SEAL_INTERVAL);
-                gathered.extend(rows);
-                if gathered.len() >= PROCESS_SEAL_ROWS {
-                    sealer.seal_gathered(&mut gathered).await;
-                    due = None;
+                let room = PROCESS_GATHER_ROWS.saturating_sub(gathered.len());
+                if rows.len() > room {
+                    refuse_rows(
+                        &sealer.health,
+                        rows.len() - room,
+                        format!(
+                            "{PROCESS_GATHER_ROWS} process rows are already gathered this interval"
+                        ),
+                    );
                 }
+                gathered.extend(rows.into_iter().take(room));
             }
             Some(Request::Seal(job)) => {
                 sealer.seal_gathered(&mut gathered).await;
@@ -740,12 +755,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The seal interval is a budget, not a lossy buffer: every fold batch queued inside one
-    /// interval seals as exactly one segment once it ends, with no reader asking, and a batch
-    /// after it seals as a second. A process fold batch is not a durability event; one seal per
-    /// batch saturated the drive with full flushes (`PROCESS_SEAL_INTERVAL`).
+    /// The seal interval is the only seal rate: every fold batch queued inside one interval seals
+    /// as exactly one segment once it ends, with no reader asking, and a batch after it seals as a
+    /// second. A burst past [`PROCESS_GATHER_ROWS`] does not seal early: the rows past it are
+    /// refused and counted, and the interval's rows still seal once, at its end. A process fold
+    /// batch is not a durability event; one seal per batch saturated the drive with full flushes
+    /// (`PROCESS_SEAL_INTERVAL`).
     #[tokio::test(start_paused = true)]
-    async fn fold_batches_within_one_interval_seal_once_and_a_later_batch_seals_again() {
+    async fn fold_batches_seal_once_per_interval_and_never_early_on_a_count() {
         use crate::api::dto::{CommandArg, UtcTimestamp};
         use crate::api::process::{JobProcessEvent, JobProcessSample};
         use crate::runtime::process_spans::{
@@ -844,6 +861,32 @@ mod tests {
         let both = segments(&root);
         assert_eq!(both.len(), 2, "a batch after the interval is a second seal");
         assert_eq!(read_process_segment(&both[1]).unwrap().len(), 1);
+
+        let burst = u32::try_from(PROCESS_GATHER_ROWS).unwrap() + 3;
+        publisher.record_process((7..7 + burst).map(&mut born).collect::<Vec<_>>());
+        settle().await;
+        assert_eq!(
+            segments(&root).len(),
+            2,
+            "a burst past the gather bound waits for the interval like any other batch"
+        );
+        tokio::time::advance(PROCESS_SEAL_INTERVAL).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while segments(&root).len() < 3 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let all = segments(&root);
+        assert_eq!(all.len(), 3, "the burst's interval is one seal");
+        assert_eq!(
+            read_process_segment(&all[2]).unwrap().len(),
+            PROCESS_GATHER_ROWS
+        );
+        let health = publisher.health().await.unwrap();
+        assert_eq!(
+            (health.recorded, health.failed),
+            (3, 3),
+            "the three rows past the bound are refused and counted: {health:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
