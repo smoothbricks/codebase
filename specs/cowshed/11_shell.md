@@ -78,12 +78,17 @@ the first two: nothing moves):
   The origin's record therefore has two writers: its own supervisor, whenever it activates, and the supervisor of a
   clone that certifies it. Both hold an exclusive lock on `.cowshed/shell-host/activation.lock` across what they read,
   compare and write, so the proof is given only if the record is still the one the clone read (compared by its bytes'
-  SHA-256) and a newer record is never overwritten. The origin's path comes from bytes in the clone's image, so it is a
-  write target only once the controller's markers agree: the origin's `workspaceIncarnation` must be in the clone's
-  marker `lineage`, and no link may redirect its `.cowshed/shell-host`. Anything else, an unwritable or retired origin
-  included, leaves the origin's record as it is and is reported; it never costs the clone its own record. When the
-  origin is main, this is a write into main's source image: one small copy-on-write extent per input generation, and it
-  moves main's image mtime, which the seed-freshness rule of 16_build_volumes.md reads.
+  SHA-256) and a newer record is never overwritten. The origin's own activation waits for that lock as long as it is
+  held; the clone tries it every 20 ms for at most 1 s (50 tries), so an origin supervisor that hangs holding it parks
+  no thread of the clone's, and a lock still busy then leaves the origin's record as it is and is reported, like an
+  unwritable origin. That second is a production bound on how long a clone keeps trying, not an ordering anything relies
+  on: the clone's own record is already written, nothing waits for the origin's proof, and no test contends for the
+  lock, so none races the bound. The origin's path comes from bytes in the clone's image, so it is a write target only
+  once the controller's markers agree: the origin's `workspaceIncarnation` must be in the clone's marker `lineage`, and
+  no link may redirect its `.cowshed/shell-host`. Anything else, an unwritable or retired origin included, leaves the
+  origin's record as it is and is reported; it never costs the clone its own record. When the origin is main, this is a
+  write into main's source image: one small copy-on-write extent per input generation, and it moves main's image mtime,
+  which the seed-freshness rule of 16_build_volumes.md reads.
 
   The two-root fixture (08_testing.md) runs this end to end, the `$PWD` hash included, and a devenv monorepo's export
   was measured against a fresh evaluation of a fork (of its 71 variables, 51 equal as recorded, 16 equal after the move,

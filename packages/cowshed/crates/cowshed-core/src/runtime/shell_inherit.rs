@@ -404,13 +404,39 @@ pub enum RecordError {
 /// back with a proof it never earned. Released when the returned file closes.
 fn lock_record(mount: &Path) -> Result<std::fs::File, RecordError> {
     let path = mount.join(SHELL_HOST_DIRECTORY).join(RECORD_LOCK_FILE);
-    let locked = std::fs::OpenOptions::new()
+    let locked = open_record_lock(&path).and_then(|file| file.lock().map(|()| file));
+    locked.map_err(|source| RecordError::Lock { path, source })
+}
+
+fn open_record_lock(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
-        .and_then(|file| file.lock().map(|()| file));
-    locked.map_err(|source| RecordError::Lock { path, source })
+        .open(path)
+}
+
+/// The origin's fence, for a clone: waited on for at most a second, so an origin supervisor
+/// that hangs holding it parks no thread of the clone's; `None` when it stayed busy. The
+/// clone's own record is already written by then.
+fn lock_origin_record(mount: &Path) -> Result<Option<std::fs::File>, RecordError> {
+    let path = mount.join(SHELL_HOST_DIRECTORY).join(RECORD_LOCK_FILE);
+    let file = open_record_lock(&path).map_err(|source| RecordError::Lock {
+        path: path.clone(),
+        source,
+    })?;
+    for _ in 0..50 {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(RecordError::Lock { path, source });
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Split an export into what a record carries and the withheld names its tail supplies.
@@ -627,7 +653,19 @@ impl Uncertified {
         }
         let path = record_path(&self.origin);
         let written = (|| -> Result<Origin, RecordError> {
-            let _fence = lock_record(&self.origin)?;
+            let Some(_fence) = lock_origin_record(&self.origin)? else {
+                return Ok(Origin::Refused(
+                    "the origin record's fence stayed busy".into(),
+                ));
+            };
+            // Checked again under the fence: the link check above and this write are one act.
+            if let Err(error) =
+                verify_no_symlinks(&self.origin, &self.origin.join(SHELL_HOST_DIRECTORY))
+            {
+                return Ok(Origin::Refused(format!(
+                    "the origin's host directory is not its own: {error}"
+                )));
+            }
             let Ok(bytes) = std::fs::read(&path) else {
                 return Ok(Origin::Changed);
             };
