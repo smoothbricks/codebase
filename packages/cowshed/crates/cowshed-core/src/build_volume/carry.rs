@@ -36,7 +36,8 @@
 //!    directory is deleted.
 //!
 //! The entries cross from one image to another, so they are copied, never cloned;
-//! `copyfile(3)` keeps every file's bytes, mode and times. A crashed carry leaves only the
+//! `fcopyfile(3)` on descriptors this process opens close-on-exec keeps every object's mode,
+//! times and attributes (`crate::copy::native`). A crashed carry leaves only the
 //! staging directory, which the next [`stage`] or [`unstage`] on that volume deletes.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,8 +56,6 @@ use super::sqlite::Connection;
 pub const STAGING: &str = ".carry";
 /// Where stock Nx keeps each entry's terminal output, inside its cache directory.
 const TERMINAL_OUTPUTS: &str = "terminalOutputs";
-/// Data plus every attribute `copyfile(3)` carries, mode and times included.
-const COPYFILE_ALL: libc::copyfile_flags_t = libc::COPYFILE_METADATA | libc::COPYFILE_DATA;
 
 /// The target's entries the landing volume lacks, most recently used first, so a carry that
 /// stops has carried the ones most likely to hit. Nx names an entry by a decimal hash
@@ -852,53 +851,72 @@ impl Budget {
         self.copy_bytes -= charged;
         Ok(())
     }
+}
 
-    /// Walk once, charging each object before it is written. Recursive copyfile would hide a
-    /// huge file behind a small cache row; a preliminary whole-tree size scan would walk twice.
-    /// Directory metadata is copied last so child creation cannot change its preserved times.
-    fn copy(
-        &mut self,
-        source: &Path,
-        destination: &Path,
-        metadata: &fs::Metadata,
-    ) -> io::Result<()> {
-        #[cfg(test)]
-        tests::record_walk();
-        if metadata.is_dir() {
-            self.charge(0)?;
-            fs::create_dir(destination)?;
-            for entry in fs::read_dir(source)? {
-                let entry = entry?;
-                let metadata = entry.metadata()?;
-                self.copy(
-                    &entry.path(),
-                    &destination.join(entry.file_name()),
-                    &metadata,
-                )?;
-            }
-            copyfile(
-                source,
-                destination,
-                libc::COPYFILE_METADATA | libc::COPYFILE_NOFOLLOW,
-            )
-        } else if metadata.is_file() {
-            let mut input = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(source)?;
-            let bytes = input.metadata()?.len();
-            self.charge(bytes)?;
-            let mut output = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(destination)?;
-            copy_data(&mut input, &mut output, bytes)?;
-            copy_metadata(&input, &output)
-        } else {
-            self.charge(metadata.len())?;
-            copyfile(source, destination, COPYFILE_ALL | libc::COPYFILE_NOFOLLOW)
+/// Walk once, charging each object to `budget`, when the carry is bounded, before it is written.
+/// A recursive copy would hide a huge file behind a small cache row, and a preliminary
+/// whole-tree size scan would walk twice. Every object is copied through descriptors this
+/// process opens close-on-exec (`crate::copy::native`). Directory metadata is copied last so
+/// child creation cannot change its preserved times.
+fn copy_tree(
+    mut budget: Option<&mut Budget>,
+    source: &Path,
+    destination: &Path,
+    metadata: &fs::Metadata,
+) -> io::Result<()> {
+    #[cfg(test)]
+    tests::record_walk();
+    if metadata.is_dir() {
+        charge(&mut budget, 0)?;
+        fs::create_dir(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            copy_tree(
+                budget.as_deref_mut(),
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                &metadata,
+            )?;
         }
+        copied_metadata(crate::copy::native::directory_metadata(source, destination))
+    } else if metadata.is_file() {
+        let mut input = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(source)?;
+        let bytes = input.metadata()?.len();
+        charge(&mut budget, bytes)?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        copy_data(&mut input, &mut output, bytes)?;
+        copy_metadata(&input, &output)
+    } else if metadata.file_type().is_symlink() {
+        charge(&mut budget, metadata.len())?;
+        copied_metadata(crate::copy::native::copy_symlink(source, destination))
+    } else {
+        Err(io::Error::other(format!(
+            "{} is neither a directory, a regular file nor a symlink",
+            source.display()
+        )))
     }
+}
+
+fn charge(budget: &mut Option<&mut Budget>, bytes: u64) -> io::Result<()> {
+    budget
+        .as_deref_mut()
+        .map_or(Ok(()), |budget| budget.charge(bytes))
+}
+
+/// `copied`, counted in tests as one metadata copy when it succeeded.
+fn copied_metadata(copied: io::Result<()>) -> io::Result<()> {
+    #[cfg(test)]
+    if copied.is_ok() {
+        tests::record_metadata();
+    }
+    copied
 }
 
 /// Never let a source rewritten during staging write more than the admitted length. A growth
@@ -1009,30 +1027,18 @@ fn copy_row(
     remove_entry(into, hash)?;
     fs::create_dir_all(into)?;
     let output = from.join(TERMINAL_OUTPUTS).join(hash);
-    let copied = match budget.as_deref_mut() {
-        Some(budget) => budget.copy(&source, &into.join(hash), &metadata),
-        None => copyfile(
-            &source,
-            &into.join(hash),
-            COPYFILE_ALL | libc::COPYFILE_RECURSIVE | libc::COPYFILE_NOFOLLOW,
-        ),
-    }
-    .and_then(|()| match fs::symlink_metadata(&output) {
-        Ok(metadata) => {
-            fs::create_dir_all(into.join(TERMINAL_OUTPUTS))?;
-            let destination = into.join(TERMINAL_OUTPUTS).join(hash);
-            match budget {
-                Some(budget) => budget.copy(&output, &destination, &metadata),
-                None => copyfile(
-                    &output,
-                    &destination,
-                    COPYFILE_ALL | libc::COPYFILE_NOFOLLOW,
-                ),
+    let copied =
+        copy_tree(budget.as_deref_mut(), &source, &into.join(hash), &metadata).and_then(|()| {
+            match fs::symlink_metadata(&output) {
+                Ok(metadata) => {
+                    fs::create_dir_all(into.join(TERMINAL_OUTPUTS))?;
+                    let destination = into.join(TERMINAL_OUTPUTS).join(hash);
+                    copy_tree(budget, &output, &destination, &metadata)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
             }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    });
+        });
     if let Err(error) = copied {
         return Err(match remove_entry(into, hash) {
             Ok(()) => error,
@@ -1120,27 +1126,6 @@ fn copy_metadata(input: &fs::File, output: &fs::File) -> io::Result<()> {
             output.as_raw_fd(),
             std::ptr::null_mut(),
             libc::COPYFILE_METADATA,
-        )
-    };
-    if status == 0 {
-        #[cfg(test)]
-        tests::record_metadata();
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn copyfile(source: &Path, destination: &Path, flags: libc::copyfile_flags_t) -> io::Result<()> {
-    let source = super::sqlite::c_path(source)?;
-    let destination = super::sqlite::c_path(destination)?;
-    // SAFETY: both C strings outlive the call; a null state requests a one-shot copy.
-    let status = unsafe {
-        libc::copyfile(
-            source.as_ptr(),
-            destination.as_ptr(),
-            std::ptr::null_mut(),
-            flags,
         )
     };
     if status == 0 {

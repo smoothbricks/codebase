@@ -1073,7 +1073,7 @@ fn apply_directory_metadata(source: &Path, destination: &Path) -> Result<bool> {
     }
 }
 
-mod native;
+pub(crate) mod native;
 
 fn copy_leaf_native(source: &Path, destination: &Path) -> io::Result<native::LeafMaterialization> {
     native::copy_leaf(source, destination)

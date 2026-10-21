@@ -22,7 +22,7 @@ pub(super) fn clone_fallback_error(error: &std::io::Error) -> bool {
 #[cfg(not(target_os = "macos"))]
 pub use linux::{copy_leaf, directory_metadata};
 #[cfg(target_os = "macos")]
-pub use macos::{copy_leaf, directory_metadata};
+pub use macos::{copy_leaf, copy_symlink, directory_metadata};
 
 /// Observe a logical hole in a freshly opened regular file. Physical compression alone is not
 /// a hole: SEEK_HOLE answers in the logical data stream. Restore offset zero before the caller
