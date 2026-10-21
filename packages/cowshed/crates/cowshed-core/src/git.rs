@@ -3978,13 +3978,21 @@ fn sandboxed_git_command_with_paths(
     })?;
     let profile = crate::exec::ProfileLaunch::write(&config.profile_directory(), &profile)
         .map_err(|error| {
-            CowshedError::environment_missing(
-                format!(
-                    "cannot write controller git's sandbox profile into {}: {error}",
-                    config.profile_directory().display()
-                ),
-                "run `cowshed setup` so the store's run directory exists and is yours",
-            )
+            let message = format!(
+                "cannot write controller git's sandbox profile into {}: {error}",
+                config.profile_directory().display()
+            );
+            if error.raw_os_error() == Some(libc::EPERM) {
+                CowshedError::sandbox_denied(
+                    format!("{message}: the process running cowshed is sandboxed away from cowshed's store"),
+                    "rerun the command from a shell whose sandbox allows writing the cowshed store",
+                )
+            } else {
+                CowshedError::environment_missing(
+                    message,
+                    "run `cowshed setup` so the store's run directory exists and is yours",
+                )
+            }
         })?;
     let build = || -> Result<std::process::Command> {
         let git = git_command_at(&canonical);

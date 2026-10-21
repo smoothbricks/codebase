@@ -61,7 +61,8 @@ impl ProfileFile {
         DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(directory)?;
+            .create(directory)
+            .map_err(|error| denied_as_present(directory, error))?;
         let staged = directory.join(format!(
             "{digest}.{}.{}.staged",
             std::process::id(),
@@ -86,6 +87,18 @@ impl ProfileFile {
     }
 }
 
+/// `error` from creating `directory`, with a sandbox's denial named as one. Seatbelt answers a
+/// lookup of a path its profile denies as absent, so the profile's touch sees no file, the create
+/// meets the directory and answers EEXIST, and a look at it finds nothing: the directory is there
+/// and this process may not touch it. That is EPERM, the operation not permitted, which is what
+/// its callers report as a sandbox's denial; every other error is the create's own.
+fn denied_as_present(directory: &Path, error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::AlreadyExists && fs::symlink_metadata(directory).is_err() {
+        io::Error::from_raw_os_error(libc::EPERM)
+    } else {
+        error
+    }
+}
 /// Set `path`'s access and modification times to now, without following a symlink.
 fn touch(path: &Path) -> io::Result<()> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())

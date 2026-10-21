@@ -188,8 +188,8 @@ fn host_controller_build_state_answers_with_only_the_installed_executable_grant(
 /// the installed CLI (build-state above) but its sandbox denies cowshed's store, where every
 /// project's records, the daemon's socket and every workspace supervisor's socket live, and
 /// admits no controller socket (04_sandbox.md). So `exec --host` from inside a job is refused at
-/// every class at the CLI's first write into that store, before any route is asked: the host
-/// command never starts.
+/// every class at the CLI's first write into that store, before any route is asked, and the
+/// refusal says so: sandbox-denied, exit 6, naming the denied path. The host command never starts.
 #[test]
 #[ignore = "host-controller authority: nx run cowshed:host-controller-test outside every cow sandbox"]
 fn host_controller_a_jobs_cli_is_refused_the_host_scope_at_every_class() {
@@ -223,14 +223,16 @@ fn host_controller_a_jobs_cli_is_refused_the_host_scope_at_every_class() {
             ],
         );
         let stderr = String::from_utf8_lossy(&refused.stderr);
-        assert!(
-            !refused.status.success(),
-            "{class}: a job's CLI admitted host work; stdout={}, stderr={stderr}",
+        assert_eq!(
+            refused.status.code(),
+            Some(6),
+            "{class}: refused as sandbox-denied; stdout={}, stderr={stderr}",
             String::from_utf8_lossy(&refused.stdout)
         );
         assert!(
-            stderr.contains(cowshed_gateway_types::STORE_ROOT),
-            "{class}: refused at the store, as the sandbox denies it: {stderr}"
+            stderr.contains("sandboxed away from cowshed's store")
+                && stderr.contains(cowshed_gateway_types::STORE_ROOT),
+            "{class}: the refusal names the sandbox and the store path it denied: {stderr}"
         );
         assert!(!marker.exists(), "{class}: the host command ran");
     }
