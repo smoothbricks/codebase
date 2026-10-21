@@ -984,14 +984,15 @@ variables. No ordinary workspace sandbox is widened. The single sandbox builder 
 in the gateway-derived workspace CPU-pool scope, not directory data, file writes, socket binding, the global control
 socket or another workspace's pool.
 
-Job records use layout11: layout10's cpu_class, cpu_want, cpu_wait_ms, cpu_tokens, cpu_nice and cpu_scope columns remain
-an exact prefix, followed by admission_env_sha256 for the complete non-withheld authored environment. cpu_wait_ms is
-retired since gate admission lost its bound (05_gateway.md, "No admission deadline, for any class"): layouts grow only
-by trailing columns, so it stays, written null; an earlier record's positive bound still reads, a zero one is damage,
-and no bound is read into the record. JobAdmission.env is the public plaintext projection only for every scope; keyed
-Env comparison uses the digest, including after restart. Records retain typed cpuAdmission/priority failures. Earlier
-histories are retained untouched and set aside. Per 07_api.md Keyed admission, existing incarnations must be renewed
-before new keyed exec: unverifiable historical keys are refused as unprovable, never migrated into an attestation they
-did not record. Unkeyed operator CLI exec remains available. Controller-only discovery runs locate-project/metadata
---no-deps --offline under its ordinary child sandbox outside job admission, retaining the explicit noncompiling
-exemption rather than claiming a grant or recorded nice.
+Job records use layout12: layout10's cpu_class, cpu_want, cpu_wait_ms, cpu_tokens, cpu_nice and cpu_scope columns remain
+an exact prefix, followed by layout11's admission_env_sha256 for the complete non-withheld authored environment and
+layout12's admission_want, the want a keyed request named (07_api.md, "Keyed admission and restart attachment").
+cpu_want is the want its admission resolved. cpu_wait_ms is retired since gate admission lost its bound (05_gateway.md,
+"No admission deadline, for any class"): layouts grow only by trailing columns, so it stays, written null; an earlier
+record's positive bound still reads, a zero one is damage, and no bound is read into the record. JobAdmission.env is the
+public plaintext projection only for every scope; keyed Env comparison uses the digest, including after restart. Records
+retain typed cpuAdmission/priority failures. Earlier histories are retained untouched and set aside. Per 07_api.md Keyed
+admission, existing incarnations must be renewed before new keyed exec: unverifiable historical keys are refused as
+unprovable, never migrated into an attestation they did not record. Unkeyed operator CLI exec remains available.
+Controller-only discovery runs locate-project/metadata --no-deps --offline under its ordinary child sandbox outside job
+admission, retaining the explicit noncompiling exemption rather than claiming a grant or recorded nice.

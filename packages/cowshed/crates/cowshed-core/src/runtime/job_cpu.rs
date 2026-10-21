@@ -47,6 +47,10 @@ pub fn requester_cpu_pool() -> Option<String> {
 
 pub trait JobCpuAdmission: Send + Sync + fmt::Debug + 'static {
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>>;
+    /// The background share of this budget: the most tokens its background-class work holds at
+    /// once, and what a background or interactive job that names no want asks for
+    /// (05_gateway.md "Room for a gate", "The task server owns the live grant and nice").
+    fn background_share(&self) -> NonZeroUsize;
     /// One background token for a shell activation that has no command yet to use it -- a
     /// resident's start, or a shell pool's spare (05_gateway.md "A resident holds no token";
     /// 11_shell.md, spare) -- for `checkout`, `command` naming what activates. It waits as any
@@ -345,6 +349,11 @@ fn wire_command(command: &str) -> &str {
 }
 
 impl JobCpuAdmission for GatewayJobCpu {
+    /// The host gateway's ledger holds one token per core this host reports.
+    fn background_share(&self) -> NonZeroUsize {
+        cowshed_gateway_types::background_share()
+    }
+
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
         let socket = Arc::clone(&self.socket);
         Box::pin(async move {

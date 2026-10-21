@@ -1316,12 +1316,16 @@ records remain typed; no JSON string column carries a process tree or metric pay
 direct callers and mandatory for an executor admitting an idempotent operation. Before spawn, cowshed commits the key,
 the authored request identity and the allocated job id in the job's first record, under the lock ordering the workspace
 incarnation's records. The identity is the request before a session lends it a cwd or environment: command, cwd, the
-full authored environment less withheld credential names, sandbox mode, session, publications and stdin source. The
-environment binds the key through the typed envSha256 commitment, not the public plaintext projection recorded in
-JobAdmission.env. Custom/private changes therefore remain Env keyConflict after a restart without storing their values.
-Inline input is identified by its SHA-256 and length, a workspace file by its path, and a stream only by its kind, never
-its bytes. Named sessions compare by name; unnamed sessions carry a distinct UUID, including across supervisor restart.
-The command remains the record's own, not a second copy inside admission metadata.
+full authored environment less withheld credential names, sandbox mode, session, publications, stdin source and
+scheduling: scope, class and the CPU want as the request named it, or none. An unnamed want resolves to the background
+share of whichever supervisor admits it, which may differ from one supervisor to the next, so the record keeps the named
+want (`admission_want`) beside the resolved one (`cpu_want`) and a repeat compares the named one. Measured 2026-10-21 in
+a land gate with the resolved want compared: a replay was refused as a want change. The environment binds the key
+through the typed envSha256 commitment, not the public plaintext projection recorded in JobAdmission.env. Custom/private
+changes therefore remain Env keyConflict after a restart without storing their values. Inline input is identified by its
+SHA-256 and length, a workspace file by its path, and a stream only by its kind, never its bytes. Named sessions compare
+by name; unnamed sessions carry a distinct UUID, including across supervisor restart. The command remains the record's
+own, not a second copy inside admission metadata.
 
 Open remains distinct from Stream on the wire and has no live reader, while its durable stdin identity uses the existing
 stream kind. A repeated keyed Open answers the same job before or after termination, starts no reader and sends no EOF.
@@ -1909,12 +1913,13 @@ JobInfo and SealedJob expose admitted class/scope, actual cpuTokens and observed
 CowshedError carries typed cpuAdmission (the gateway's refusal, an invalid request or a protocol failure) and priority
 (actual pid, requested/observed nice and errno). A failed or absent observation is never fabricated.
 
-Records now use layout11: layout10's columns remain an exact prefix, followed by nullable Binary admission_env_sha256,
-exactly 32 bytes and present exactly for keyed job records. Earlier histories are retained untouched and set aside, not
-migrated or re-keyed. On an existing incarnation that may have served keyed work, new keyed exec is refused as
-unprovable until the incarnation is renewed. **Operators must renew existing incarnations before keyed exec after
-upgrading.** Unkeyed operator CLI exec remains available. This is the existing strict history-attestation contract, not
-silent compatibility.
+Records now use layout12: layout11's columns remain an exact prefix, followed by nullable UInt64 admission_want, the
+want a keyed request named, null for one that named none and for every unkeyed record. Layout11 appended nullable Binary
+admission_env_sha256 to layout10, exactly 32 bytes and present exactly for keyed job records. Earlier histories are
+retained untouched and set aside, not migrated or re-keyed. On an existing incarnation that may have served keyed work,
+new keyed exec is refused as unprovable until the incarnation is renewed. **Operators must renew existing incarnations
+before keyed exec after upgrading.** Unkeyed operator CLI exec remains available. This is the existing strict
+history-attestation contract, not silent compatibility.
 
 ## CLI and API exec parity
 

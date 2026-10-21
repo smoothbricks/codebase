@@ -2569,6 +2569,11 @@ impl RunningProcess for ScriptedProcess {
 struct GrantingCpu;
 
 impl cowshed_core::runtime::job_cpu::JobCpuAdmission for GrantingCpu {
+    /// Neither one token nor a host's share.
+    fn background_share(&self) -> NonZeroUsize {
+        NonZeroUsize::new(5).unwrap()
+    }
+
     fn admit(
         &self,
         ask: cowshed_core::runtime::job_cpu::JobCpuAsk,

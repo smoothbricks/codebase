@@ -1016,7 +1016,9 @@ core count.
   on its grant ("Work a holder starts draws on its grant"). Measured 2026-10-21 with a default of one token: an
   `nx run-many` under `cowshed exec` handed that one token to its bounded-exec runners in turn, which waited 261, 473,
   664 and 887 s for it, and the run took 21m19s against 5m54s on the host route. `JobScheduling::requested` resolves the
-  want, the validation both surfaces share (07_api.md, "CLI and API exec parity"); a requester that awaits the result
+  want, the validation both surfaces share (07_api.md, "CLI and API exec parity"), from the share the supervisor's CPU
+  admission reports; a keyed request binds its want as named, so an unnamed want is the same request whatever share each
+  supervisor resolves it to (07_api.md, "Keyed admission and restart attachment"); a requester that awaits the result
   asks Interactive ("Bands"), which a worker may ask for, since it buys a band and no token; a resident (below) is
   Resident or InteractiveResident, which a worker may ask for, and names no want. The supervisor records Queued, asks
   the gateway off its actor path and spawns only after a real grant. **The exec answers at that admission, never at the

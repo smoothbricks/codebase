@@ -484,7 +484,14 @@ fn held(tokens: NonZeroUsize) -> HeldTokens {
 #[derive(Debug)]
 struct ImmediateCpu;
 
+/// The background share every test budget here reports: neither one token nor a host's.
+const TEST_SHARE: NonZeroUsize = NonZeroUsize::new(5).unwrap();
+
 impl JobCpuAdmission for ImmediateCpu {
+    fn background_share(&self) -> NonZeroUsize {
+        TEST_SHARE
+    }
+
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
         Box::pin(async move {
             let pool = PathBuf::from(TEST_POOL);
@@ -552,6 +559,10 @@ impl Drop for Signal {
 }
 
 impl JobCpuAdmission for ScriptedCpu {
+    fn background_share(&self) -> NonZeroUsize {
+        TEST_SHARE
+    }
+
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
         let requests = self.requests.clone();
         Box::pin(async move {
@@ -3255,12 +3266,9 @@ async fn a_streamed_stdin_reaches_a_served_job_whole_and_in_order() {
     assert_eq!(remote.wait(job).await.unwrap().state, JobState::Exited);
 }
 
-/// A keyed request that names its one token, so a repeat that changes its class changes nothing
-/// else it asked for.
 fn keyed(key: &str, stdin: StdinSource) -> ExecRequest {
     ExecRequest {
         admission_key: Some(AdmissionKey::new(key).unwrap()),
-        want: Some(NonZeroUsize::MIN),
         ..request(stdin)
     }
 }
@@ -3604,6 +3612,109 @@ async fn a_keyed_repeat_compares_each_authored_field_and_ignores_withheld_env() 
     assert!(
         h.spawned.try_recv().is_err(),
         "every repeat spawned nothing"
+    );
+}
+
+/// The CPU budget of [`ImmediateCpu`], reporting a background share of its own.
+#[derive(Debug)]
+struct ShareCpu(NonZeroUsize);
+
+impl JobCpuAdmission for ShareCpu {
+    fn background_share(&self) -> NonZeroUsize {
+        self.0
+    }
+
+    fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
+        ImmediateCpu.admit(ask)
+    }
+
+    fn activation(
+        &self,
+        checkout: PathBuf,
+        command: String,
+        parent: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ActivationStake>> + Send>> {
+        ImmediateCpu.activation(checkout, command, parent)
+    }
+}
+
+/// A keyed request is the request its caller named (07_api.md "Keyed admission and restart
+/// attachment"). One that names no want resolves to the background share of whichever
+/// supervisor admits it, and that share may differ from one supervisor to the next, so a replay
+/// that names none is the same request and answers its one job; a replay that names the share
+/// the first admission resolved to is another request. Measured in train j's land gate: a
+/// replay compared by its resolved want was refused as a want change.
+#[tokio::test]
+async fn a_keyed_exec_that_names_no_want_answers_its_one_job_whatever_share_each_supervisor_has() {
+    let (mut supervisor_config, _root) = isolated_config("keyed-share");
+    let three = NonZeroUsize::new(3).unwrap();
+    supervisor_config.cpu = Arc::new(ShareCpu(three));
+    let mut first = real_store_harness(supervisor_config.clone());
+    let (remote, _path) = served(&first.handle).await;
+    let job = remote
+        .exec(
+            None,
+            None,
+            keyed("op-share", StdinSource::Empty),
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap();
+    let spawned = first.spawned.recv().await.unwrap();
+    assert_eq!(
+        spawned.request.cpu.held.as_ref().map(|held| held.tokens),
+        Some(three),
+        "the first supervisor resolved the unnamed want to its share"
+    );
+    complete(&spawned, b"", b"", ExitStatus::Exited { code: 0 }).await;
+    first.handle.wait(job).await.unwrap();
+    first.handle.quiesce().await.unwrap();
+    first
+        .handle
+        .retire(NxDaemonRetirement::Recorded)
+        .await
+        .unwrap();
+    drop(first);
+
+    supervisor_config.cpu = Arc::new(ShareCpu(NonZeroUsize::new(7).unwrap()));
+    let mut second = real_store_harness(supervisor_config);
+    let (remote, _path) = served(&second.handle).await;
+    assert_eq!(
+        remote
+            .exec(
+                None,
+                None,
+                keyed("op-share", StdinSource::Empty),
+                AdmissionSource::Worker,
+            )
+            .await
+            .unwrap(),
+        job,
+        "the same unnamed request answers its one job under another share"
+    );
+    let named = remote
+        .exec(
+            None,
+            None,
+            ExecRequest {
+                want: Some(three),
+                ..keyed("op-share", StdinSource::Empty)
+            },
+            AdmissionSource::Worker,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        named.admission_source(),
+        Some(&AdmissionRefusal::KeyConflict {
+            job_id: job,
+            fields: vec![AdmissionField::Want],
+        }),
+        "naming the share it resolved to is another request"
+    );
+    assert!(
+        second.spawned.try_recv().is_err(),
+        "no repeat spawned anything"
     );
 }
 
@@ -8378,9 +8489,9 @@ async fn per_job_fixed_cost_measurement() {
     }
 }
 
-/// An exec that names no want asks the CPU budget for the background share of the host, ⌊N/2⌋
-/// of its N cores and at least one (05_gateway.md "The task server owns the live grant and
-/// nice"), not one token. Measured 2026-10-21 with one: an `nx run-many` under a default
+/// An exec that names no want asks the CPU budget for the background share it reports, ⌊N/2⌋
+/// of the host's N tokens and at least one (05_gateway.md "The task server owns the live grant
+/// and nice"), not one token. Measured 2026-10-21 with one: an `nx run-many` under a default
 /// `cowshed exec` handed that token to its runners one after another, which waited up to 887 s
 /// for it, 21m19s against 5m54s on the host route.
 #[tokio::test]
@@ -8398,11 +8509,10 @@ async fn an_exec_that_names_no_want_asks_for_the_background_share() {
             .await
     });
     let cpu = asked.recv().await.expect("the job asks the CPU budget");
-    let cores = std::thread::available_parallelism().unwrap().get();
     assert_eq!(
-        (cpu.ask.class, cpu.ask.want.get()),
-        (ExecClass::Background, (cores / 2).max(1)),
-        "an unnamed want is the background share of {cores} cores"
+        (cpu.ask.class, cpu.ask.want),
+        (ExecClass::Background, TEST_SHARE),
+        "an unnamed want is the budget's background share"
     );
     exec.await
         .unwrap()

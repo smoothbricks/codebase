@@ -89,10 +89,10 @@ const JOB_FLOOR: CounterFile = CounterFile {
     magic: b"CSJOB001",
     what: "job id floor",
 };
-/// Layout 11 keeps every column of layout 10, including its [`CPU_COLUMNS`], and appends
-/// `admission_env_sha256`. A store holding a record in an earlier layout is set aside whole
-/// ([`SetAsideStore`]), never read or migrated.
-const RECORD_SCHEMA_VERSION: u64 = 11;
+/// Layout 12 keeps every column of layout 11, which kept every column of layout 10 and appended
+/// `admission_env_sha256`, and appends `admission_want`. A store holding a record in an earlier
+/// layout is set aside whole ([`SetAsideStore`]), never read or migrated.
+const RECORD_SCHEMA_VERSION: u64 = 12;
 /// The first layout whose job records carry admission keys. A store in it or a later layout set
 /// aside while serving an incarnation took that incarnation's keyed admissions along, so the
 /// keys it named can no longer be proven absent ([`AdmissionLookup::Unprovable`]).
@@ -187,6 +187,11 @@ const CPU_COLUMN: usize = SAMPLE_COLUMN + SAMPLE_COLUMNS.len();
 /// The authored non-withheld environment commitment layout 11 appends after [`CPU_COLUMNS`]:
 /// present exactly for keyed job records, never derived from their public environment projection.
 const ADMISSION_ENV_SHA256_COLUMN: usize = CPU_COLUMN + CPU_COLUMNS.len();
+/// The want a keyed request named, which layout 12 appends after
+/// [`ADMISSION_ENV_SHA256_COLUMN`]: null for an unkeyed record and for a keyed request that named
+/// none. `cpu_want` holds the want its admission resolved, which may differ from one supervisor to
+/// the next for the same unnamed request; keyed identity is the request as named.
+const ADMISSION_WANT_COLUMN: usize = ADMISSION_ENV_SHA256_COLUMN + 1;
 /// [`JobAccounting::LinuxCgroupV2`] in its source column: its wire kind.
 const CGROUP_SOURCE: &str = "linuxCgroupV2";
 #[cfg(unix)]
@@ -443,6 +448,8 @@ pub struct JobAdmission {
     pub env: BTreeMap<String, String>,
     /// Commitment to the full authored environment, less withheld credentials.
     pub env_sha256: Sha256Digest,
+    /// The CPU want the request named; `None` when it named none and took its class's own.
+    pub want: Option<NonZeroUsize>,
     pub stdin: AdmittedStdin,
     pub session: AdmittedSession,
     pub stdout_copy: Option<OutputPublication>,
@@ -463,21 +470,21 @@ pub struct JobScheduling {
 impl JobScheduling {
     /// The scheduling a request asks for. A want it names is taken as named; one it leaves
     /// unnamed is its class's own (05_gateway.md "The task server owns the live grant and
-    /// nice"): background and interactive work ask for the background share of the host, the
-    /// ⌊N/2⌋ of its N tokens their class may hold at once ("Room for a gate"); a gate asks for
-    /// the one token its orchestrator uses, since its pool asks the host for each of its tasks;
-    /// a resident asks for none. `None` for a resident that names a want.
+    /// nice"): background and interactive work ask for the background share `share`, the
+    /// ⌊N/2⌋ of the host's N tokens their class may hold at once ("Room for a gate"), as the CPU
+    /// admission that will ask for it reports it; a gate asks for the one token its
+    /// orchestrator uses, since its pool asks the host for each of its tasks; a resident asks for
+    /// none. `None` for a resident that names a want.
     pub fn requested(
         scope: ExecScope,
         class: ExecClass,
         want: Option<NonZeroUsize>,
+        share: NonZeroUsize,
     ) -> Option<Self> {
         let want = match (class, want) {
             (ExecClass::Resident | ExecClass::InteractiveResident, Some(_)) => return None,
             (ExecClass::Background | ExecClass::Interactive | ExecClass::Gate, Some(want)) => want,
-            (ExecClass::Background | ExecClass::Interactive, None) => {
-                cowshed_gateway_types::background_share()
-            }
+            (ExecClass::Background | ExecClass::Interactive, None) => share,
             (ExecClass::Gate | ExecClass::Resident | ExecClass::InteractiveResident, None) => {
                 NonZeroUsize::MIN
             }
@@ -4212,6 +4219,7 @@ fn build_protected_record_schema() -> Arc<Schema> {
         field(CPU_COLUMNS[4], DataType::Int32, true),
         field(CPU_COLUMNS[5], DataType::Utf8, true),
         field("admission_env_sha256", DataType::Binary, true),
+        field("admission_want", DataType::UInt64, true),
     ]))
 }
 
@@ -4610,6 +4618,14 @@ fn job_record_to_batch(record: &JobArtifactRecord) -> Result<RecordBatch, Artifa
             .admission
             .as_ref()
             .map(|admission| admission.env_sha256.as_bytes().as_slice()),
+    ])));
+    columns.push(Arc::new(UInt64Array::from(vec![
+        record
+            .admission
+            .as_ref()
+            .and_then(|admission| admission.want)
+            .map(token_column)
+            .transpose()?,
     ])));
     RecordBatch::try_new(protected_record_schema(), columns)
         .map_err(|error| ArtifactError::Arrow(error.to_string()))
@@ -5165,8 +5181,9 @@ fn admission_columns(admission: Option<&JobAdmission>) -> Result<Vec<ArrayRef>, 
     ])
 }
 
-/// The admission in the layout 8 columns from `first` and the layout 11 environment digest:
-/// none when its key is null, and then every other admission column must be null too.
+/// The admission in the layout 8 columns from `first`, the layout 11 environment digest and the
+/// layout 12 named want: none when its key is null, and then every other admission column must be
+/// null too.
 fn decode_admission(
     batch: &RecordBatch,
     first: usize,
@@ -5187,6 +5204,7 @@ fn decode_admission(
     let Some(key) = text(0)? else {
         return if (1..ADMISSION_COLUMNS).any(present)
             || !batch.column(ADMISSION_ENV_SHA256_COLUMN).is_null(0)
+            || !batch.column(ADMISSION_WANT_COLUMN).is_null(0)
         {
             Err(ArtifactError::Arrow(
                 "an unkeyed job record carries admission columns".into(),
@@ -5197,6 +5215,12 @@ fn decode_admission(
     };
     let key = AdmissionKey::new(key)?;
     let env_sha256 = required_digest(batch, ADMISSION_ENV_SHA256_COLUMN, 0)?;
+    let want = (!batch.column(ADMISSION_WANT_COLUMN).is_null(0))
+        .then(|| {
+            uint64(batch, ADMISSION_WANT_COLUMN)
+                .and_then(|column| decode_tokens(column.value(0), "admission_want"))
+        })
+        .transpose()?;
     let cwd = text(1)?.map(path).transpose()?;
     let mode = parse_mode(required(2, "sandbox mode")?)?;
     if !present(3) {
@@ -5269,6 +5293,7 @@ fn decode_admission(
         mode,
         env,
         env_sha256,
+        want,
         stdin,
         session,
         stdout_copy: publication(10)?,
@@ -7603,6 +7628,7 @@ mod tests {
             mode: RunSandboxMode::ReadOnly,
             env,
             env_sha256,
+            want: None,
             stdin,
             session: AdmittedSession::Named("build".into()),
             stdout_copy: Some(OutputPublication {
@@ -7796,9 +7822,7 @@ mod tests {
         };
         let batch = job_record_to_batch(&record).unwrap();
         let schema = batch.schema();
-        assert_eq!(RECORD_SCHEMA_VERSION, 11);
         assert_eq!(ADMISSION_ENV_SHA256_COLUMN, 84);
-        assert_eq!(schema.fields().len(), ADMISSION_ENV_SHA256_COLUMN + 1);
         assert_eq!(
             schema.field(ADMISSION_ENV_SHA256_COLUMN - 1).name(),
             "cpu_scope"
@@ -7824,6 +7848,81 @@ mod tests {
             &prior,
             "layout 10 cannot attest to an environment commitment",
         );
+    }
+
+    /// Layout 12 appends only the want a keyed request named; every layout 11 field stays in the
+    /// same position with its original type and nullability. A keyed request that named a want
+    /// records it, one that named none records null beside the want its admission resolved, and
+    /// an unkeyed record or a lifecycle record names none.
+    #[test]
+    fn layout_twelve_appends_the_named_want_after_the_complete_layout_eleven_prefix() {
+        let named = JobArtifactRecord {
+            admission: Some(JobAdmission {
+                want: NonZeroUsize::new(2),
+                ..keyed("op-layout-twelve", AdmittedStdin::Empty)
+            }),
+            scheduling: JobScheduling::new(
+                ExecScope::Workspace,
+                ExecClass::Background,
+                NonZeroUsize::new(2).unwrap(),
+            )
+            .unwrap(),
+            ..valid_job_record(9)
+        };
+        let batch = job_record_to_batch(&named).unwrap();
+        let schema = batch.schema();
+        assert_eq!(RECORD_SCHEMA_VERSION, 12);
+        assert_eq!(ADMISSION_WANT_COLUMN, 85);
+        assert_eq!(schema.fields().len(), ADMISSION_WANT_COLUMN + 1);
+        assert_eq!(
+            schema.field(ADMISSION_WANT_COLUMN),
+            &field("admission_want", DataType::UInt64, true)
+        );
+        assert_eq!(uint64(&batch, ADMISSION_WANT_COLUMN).unwrap().value(0), 2);
+        assert_eq!(round_trip(&named), named);
+
+        let unnamed = JobArtifactRecord {
+            admission: Some(keyed("op-layout-twelve-unnamed", AdmittedStdin::Empty)),
+            scheduling: JobScheduling::new(
+                ExecScope::Workspace,
+                ExecClass::Background,
+                NonZeroUsize::new(9).unwrap(),
+            )
+            .unwrap(),
+            ..valid_job_record(9)
+        };
+        let unnamed_batch = job_record_to_batch(&unnamed).unwrap();
+        assert!(unnamed_batch.column(ADMISSION_WANT_COLUMN).is_null(0));
+        assert_eq!(
+            round_trip(&unnamed),
+            unnamed,
+            "an unnamed want stays unnamed beside the share it resolved"
+        );
+        let zero: ArrayRef = Arc::new(UInt64Array::from(vec![Some(0)]));
+        assert_damage(
+            &replace_column(&unnamed_batch, ADMISSION_WANT_COLUMN, Arc::clone(&zero)),
+            "a named want of zero tokens",
+        );
+        let two: ArrayRef = Arc::new(UInt64Array::from(vec![Some(2)]));
+        let unkeyed = admitted(&valid_job_record(9));
+        assert!(unkeyed.column(ADMISSION_WANT_COLUMN).is_null(0));
+        assert_damage(
+            &replace_column(&unkeyed, ADMISSION_WANT_COLUMN, Arc::clone(&two)),
+            "an unkeyed record carrying a named want",
+        );
+
+        let prefix_schema = Arc::new(Schema::new(
+            schema.fields()[..ADMISSION_WANT_COLUMN].to_vec(),
+        ));
+        let mut prefix_columns = batch.columns()[..ADMISSION_WANT_COLUMN].to_vec();
+        prefix_columns[1] = Arc::new(UInt64Array::from(vec![11]));
+        let prior = RecordBatch::try_new(prefix_schema, prefix_columns).unwrap();
+        assert_eq!(
+            earlier_layout(&prior),
+            Some(11),
+            "layout 11 remains the exact prefix"
+        );
+        assert_damage(&prior, "layout 11 cannot say whether its want was named");
     }
 
     /// A commitment carries the full authored identity without persisting private names or values
@@ -7941,7 +8040,7 @@ mod tests {
             admission: Some(admission.clone()),
             ..valid_job_record(5)
         };
-        append_batch(&root, &earlier_batch(&historical, 1, 10));
+        append_batch(&root, &earlier_batch(&historical, 2, 10));
         let old_records = fs::read(records_path(&root)).unwrap();
         let set_aside = root
             .join(PROTECTED_DIRECTORY)
@@ -8136,6 +8235,8 @@ mod tests {
         let cores = std::thread::available_parallelism().unwrap().get();
         let share = NonZeroUsize::new((cores / 2).max(1)).unwrap();
         let two = NonZeroUsize::new(2).unwrap();
+        // The share the CPU admission reports, here a host's: a supervisor never assumes it.
+        assert_eq!(cowshed_gateway_types::background_share(), share);
         for scope in [ExecScope::Workspace, ExecScope::HostGate] {
             for (class, unnamed) in [
                 (ExecClass::Background, share),
@@ -8145,7 +8246,7 @@ mod tests {
                 (ExecClass::InteractiveResident, NonZeroUsize::MIN),
             ] {
                 assert_eq!(
-                    JobScheduling::requested(scope, class, None).map(JobScheduling::want),
+                    JobScheduling::requested(scope, class, None, share).map(JobScheduling::want),
                     Some(unnamed),
                     "{class:?} in {scope:?}"
                 );
@@ -8157,7 +8258,7 @@ mod tests {
             ] {
                 for named in [NonZeroUsize::MIN, two] {
                     assert_eq!(
-                        JobScheduling::requested(scope, class, Some(named))
+                        JobScheduling::requested(scope, class, Some(named), share)
                             .map(JobScheduling::want),
                         Some(named),
                         "{class:?} in {scope:?}"
@@ -8166,7 +8267,8 @@ mod tests {
             }
             for class in [ExecClass::Resident, ExecClass::InteractiveResident] {
                 assert!(
-                    JobScheduling::requested(scope, class, Some(NonZeroUsize::MIN)).is_none(),
+                    JobScheduling::requested(scope, class, Some(NonZeroUsize::MIN), share)
+                        .is_none(),
                     "a resident names no want, in {scope:?} too"
                 );
             }

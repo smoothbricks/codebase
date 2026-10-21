@@ -345,6 +345,10 @@ pub(crate) struct ImmediateCpu;
 
 #[cfg(test)]
 impl JobCpuAdmission for ImmediateCpu {
+    fn background_share(&self) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(4).expect("four")
+    }
+
     fn admit(
         &self,
         ask: JobCpuAsk,
@@ -5090,20 +5094,20 @@ impl SupervisorActor {
                     ),
                 },
             },
+            want: request.want,
             stdout_copy: request.stdout_copy.clone(),
             stderr_copy: request.stderr_copy.clone(),
         })
     }
 
     /// Compare the authored request by borrowing it; only a new admission needs owned metadata.
-    /// Its scheduling is compared as `requested` resolved it, so a want it leaves unnamed is its
-    /// class's own, as the first admission's was.
+    /// Its want is compared as the caller named it: an unnamed want is the same request whatever
+    /// share each supervisor resolved it to.
     fn admission_differences(
         &self,
         admitted: &JobAdmission,
         command: &ExecCommand,
-        bound: JobScheduling,
-        requested: JobScheduling,
+        scheduling: JobScheduling,
         request: &ExecRequest,
         session: Option<&SessionToken>,
     ) -> Vec<AdmissionField> {
@@ -5151,9 +5155,9 @@ impl SupervisorActor {
                 AdmissionField::StderrCopy,
                 admitted.stderr_copy != request.stderr_copy,
             ),
-            (AdmissionField::Scope, bound.scope() != requested.scope()),
-            (AdmissionField::Class, bound.class() != requested.class()),
-            (AdmissionField::Want, bound.want() != requested.want()),
+            (AdmissionField::Scope, scheduling.scope() != request.scope),
+            (AdmissionField::Class, scheduling.class() != request.class),
+            (AdmissionField::Want, admitted.want != request.want),
         ]
         .into_iter()
         .filter_map(|(field, differs)| differs.then_some(field))
@@ -5192,14 +5196,16 @@ impl SupervisorActor {
         // The host boundary takes no session overlay a worker controls. Environment names do
         // not restrict execution; the public-name projection is applied only when recording.
         crate::api::dto::validate_host_gate_request(request.scope, session.is_some())?;
-        let scheduling = JobScheduling::requested(request.scope, request.class, request.want)
-            .ok_or_else(|| {
-                CowshedError::usage(
-                    "a resident holds no CPU token, so it wants none: its descendants ask its \
+        let share = self.cpu.background_share();
+        let scheduling =
+            JobScheduling::requested(request.scope, request.class, request.want, share)
+                .ok_or_else(|| {
+                    CowshedError::usage(
+                        "a resident holds no CPU token, so it wants none: its descendants ask its \
                      pool for their own",
-                    "drop --want from a resident exec",
-                )
-            })?;
+                        "drop --want from a resident exec",
+                    )
+                })?;
         // The host boundary has no sandbox to narrow and no exec host to interpret a script.
         if scheduling.scope() == ExecScope::HostGate {
             if matches!(request.command, ExecCommand::Script(_)) {
@@ -5234,7 +5240,6 @@ impl SupervisorActor {
                         admitted,
                         command,
                         bound,
-                        scheduling,
                         &request,
                         session.as_ref(),
                     );

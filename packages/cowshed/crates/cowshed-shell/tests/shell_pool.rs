@@ -72,6 +72,11 @@ struct GrantingCpu {
 }
 
 impl JobCpuAdmission for GrantingCpu {
+    /// Neither one token nor a host's share.
+    fn background_share(&self) -> NonZeroUsize {
+        NonZeroUsize::new(5).unwrap()
+    }
+
     fn admit(&self, ask: JobCpuAsk) -> Pin<Box<dyn Future<Output = Result<JobCpuGrant>> + Send>> {
         let fifo = self.fifo.clone();
         Box::pin(async move {
