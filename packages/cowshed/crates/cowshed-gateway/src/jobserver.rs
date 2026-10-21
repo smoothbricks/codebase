@@ -363,9 +363,9 @@ async fn retire_pool_listener(
         // closing it: aborting the listener can strand a concurrent Darwin connect forever.
         // Tokio's readiness cache can still be empty while the kernel already has connections.
         match accept_pool_connection(listener) {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 refused += 1;
-                refuse_retired_pool(&mut stream).await;
+                refuse_retired_pool(stream).await;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(refused),
             Err(error) => return Err(error),
@@ -373,7 +373,13 @@ async fn retire_pool_listener(
     }
 }
 
-async fn refuse_retired_pool(stream: &mut cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>) {
+/// Answer a connection the retiring pool will not serve, then close it only after the client
+/// closes its end. Linux resets a unix stream closed while it still holds unread bytes, such as
+/// a request the pool never read, so the client would read the refusal and then `ECONNRESET`
+/// where the end of stream belongs; macOS reports the end of stream either way. Shutting down the
+/// write half gives the client its end of stream now; the detached read discards whatever the
+/// client still sends, however late its request arrives, so retirement never waits on a client.
+async fn refuse_retired_pool(mut stream: cowshed_os::fork_lock::Fenced<tokio::net::UnixStream>) {
     use tokio::io::AsyncWriteExt as _;
 
     if let Err(error) = stream
@@ -385,6 +391,11 @@ async fn refuse_retired_pool(stream: &mut cowshed_os::fork_lock::Fenced<tokio::n
     if let Err(error) = stream.shutdown().await {
         eprintln!("cowshed: CPU pool could not close refused connection: {error}");
     }
+    tokio::spawn(async move {
+        if let Err(error) = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await {
+            eprintln!("cowshed: CPU pool could not read refused connection to its end: {error}");
+        }
+    });
 }
 
 async fn serve_pool_until_retired(
@@ -399,7 +410,7 @@ async fn serve_pool_until_retired(
         _ = serve_pool(&mut stream, ledger, directory) => false,
     };
     if retired {
-        refuse_retired_pool(&mut stream).await;
+        refuse_retired_pool(stream).await;
     }
     retired
 }
